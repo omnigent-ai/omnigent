@@ -3,22 +3,12 @@
 from __future__ import annotations
 
 import json
-import shutil
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-
-def write_skill(
-    skills_dir: Path, name: str, description: str, *, label: str | None = None
-) -> Path:
-    skill = skills_dir / name
-    skill.mkdir(parents=True)
-    front = f"name: {label}\n" if label else f"name: {name}\n"
-    (skill / "SKILL.md").write_text(f"---\n{front}description: {description}\n---\nDo {name}.\n")
-    (skill / "notes.txt").write_text("supporting file\n")
-    return skill
+from tests._helpers.skill_repos import copying_cloner, write_skill
 
 
 @pytest.fixture
@@ -54,21 +44,6 @@ def marketplace_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def fake_clone(tmp_path: Path) -> Callable[[Path], Callable[[str, str | None, Path], None]]:
+def fake_clone() -> Callable[[Path], Callable[..., None]]:
     """Build a cloner that copies a fixture repo instead of running git."""
-
-    def make(repo: Path):
-        calls: list[tuple[str, str | None]] = []
-        tokens: list[str | None] = []
-
-        def clone(url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
-            calls.append((url, ref))
-            tokens.append(token)
-            shutil.copytree(repo, dest, symlinks=True)
-
-        clone.tokens = tokens  # type: ignore[attr-defined]
-
-        clone.calls = calls  # type: ignore[attr-defined]
-        return clone
-
-    return make
+    return copying_cloner

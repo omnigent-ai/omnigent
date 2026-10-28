@@ -50,6 +50,15 @@ export function useSourceCatalog(sourceId: string | undefined, enabled: boolean)
   });
 }
 
+/** Re-fetch a source's catalog past the server's cache and show the result in place. */
+export function useRefreshCatalog() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (sourceId: string) => fetchSourceCatalog(sourceId, true),
+    onSuccess: (catalog, sourceId) => client.setQueryData(catalogKey(sourceId), catalog),
+  });
+}
+
 export function useInstalledSkillContent(skillId: string | undefined) {
   return useQuery({
     queryKey: ["skill-marketplace", "content", skillId],

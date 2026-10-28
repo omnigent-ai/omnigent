@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import io
 import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import pytest
 from click.testing import CliRunner
 
 from omnigent import cli as cli_mod
+from omnigent.skills import git_source
 
 
 class _FakeServer:
@@ -326,30 +328,48 @@ def test_clone_github_source_translates_git_failures(
 ) -> None:
     # The clone flags are covered in tests/skills; here the CLI wraps the shared
     # error into a ClickException, keeping the SHA hint.
-    def run(cmd: list[str], **kwargs: object) -> object:
-        return type("P", (), {"returncode": 128, "stderr": "fatal: not found\n"})()
+    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: not found\n")
 
-    monkeypatch.setattr(cli_mod.subprocess, "run", run)
+    monkeypatch.setattr(git_source, "_run_clone", run)
     with pytest.raises(click.ClickException, match=r"Could not clone .*: fatal: not found"):
         cli_mod._clone_github_source("https://github.com/a/b.git", "v1", tmp_path / "r")
     with pytest.raises(click.ClickException, match="not commit SHAs"):
         cli_mod._clone_github_source("https://github.com/a/b.git", "deadbee", tmp_path / "r")
 
 
+class _HangingGit:
+    """A git that never finishes: every wait times out until it is killed."""
+
+    returncode: int | None = None
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        self.killed = False
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        if self.killed:
+            self.returncode = -9
+            return "", ""
+        raise subprocess.TimeoutExpired("git", timeout or 0)
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _no_git(*_args: object, **_kwargs: object) -> None:
+    raise FileNotFoundError("git")
+
+
 @pytest.mark.parametrize(
-    ("error", "message"),
-    [
-        (FileNotFoundError("git"), "needs git on your PATH"),
-        (cli_mod.subprocess.TimeoutExpired("git", 300), "Timed out cloning"),
-    ],
+    ("popen", "message"),
+    [(_no_git, "needs git on your PATH"), (_HangingGit, "Timed out cloning")],
 )
 def test_clone_github_source_reports_tool_failures(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception, message: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, popen: object, message: str
 ) -> None:
-    def run(*_args: object, **_kwargs: object) -> None:
-        raise error
-
-    monkeypatch.setattr(cli_mod.subprocess, "run", run)
+    monkeypatch.setattr(git_source.subprocess, "Popen", popen)
+    monkeypatch.setattr(git_source, "CLONE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 0.01)
     with pytest.raises(click.ClickException, match=message):
         cli_mod._clone_github_source("https://github.com/a/b.git", None, tmp_path / "r")
 

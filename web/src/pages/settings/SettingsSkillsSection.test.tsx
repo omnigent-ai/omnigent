@@ -60,6 +60,7 @@ const catalog: SkillCatalog = {
       path: "skills/review",
       plugin: null,
       installed_id: "sk1",
+      installed_scopes: ["user"],
     },
     {
       name: "triage",
@@ -84,7 +85,9 @@ const calls: { method: string; url: string; body?: unknown }[] = [];
 const state = {
   installed: [review] as InstalledSkill[],
   sources: [source] as SkillSource[],
+  moreSources: null as SkillSource[] | "fail" | null,
   failPatch: false,
+  failDeleteSource: false,
   secondPage: null as InstalledSkill[] | null,
 };
 const page = <T,>(data: T[], has_more = false, last_id: string | null = null) => ({
@@ -104,8 +107,19 @@ function script() {
         page(state.installed, state.secondPage !== null, state.secondPage ? "cursor" : null),
       );
     }
-    if (url.startsWith("/v1/skill-sources?") && method === "GET") return json(page(state.sources));
+    if (url.startsWith("/v1/skill-sources?") && method === "GET") {
+      if (url.includes("after=")) {
+        if (state.moreSources === "fail")
+          return json({ error: { message: "sources are unavailable" } }, 503);
+        return json(page(state.moreSources ?? []));
+      }
+      return json(
+        page(state.sources, state.moreSources !== null, state.moreSources ? "src-cursor" : null),
+      );
+    }
     if (url === "/v1/skill-sources" && method === "POST") return json(source, 201);
+    if (url === "/v1/skill-sources/src1" && method === "DELETE" && state.failDeleteSource)
+      return json({ error: { message: "This source is set in the server config" } }, 403);
     if (url === "/v1/skill-sources/src1" && method === "DELETE")
       return new Response(null, { status: 204 });
     if (url === "/v1/installed-skills/sk1" && method === "PATCH" && state.failPatch)
@@ -149,7 +163,9 @@ beforeEach(() => {
   flags.urlInstall = true;
   state.installed = [review];
   state.sources = [source];
+  state.moreSources = null;
   state.failPatch = false;
+  state.failDeleteSource = false;
   state.secondPage = null;
   calls.length = 0;
   fetchMock.mockReset();
@@ -199,6 +215,10 @@ describe("SettingsSkillsSection", () => {
     expect(screen.getByText("1 entries were skipped")).toBeInTheDocument();
 
     fireEvent.change(screen.getByTestId("install-scope"), { target: { value: "org" } });
+    // Installed for the user only: it can still be installed for everyone.
+    expect(
+      within(screen.getByTestId("catalog-skill-review")).getByTestId("install-skill-review"),
+    ).toBeInTheDocument();
     fireEvent.click(within(triage).getByTestId("install-skill-triage"));
     await waitFor(() =>
       expect(calls).toContainEqual({
@@ -212,6 +232,39 @@ describe("SettingsSkillsSection", () => {
         },
       }),
     );
+    expect(await within(triage).findByText("Installed for everyone")).toBeInTheDocument();
+
+    // Refresh re-fetches past the server's cache.
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.url === "/v1/skill-sources/src1/catalog?refresh=true")).toBe(true),
+    );
+
+    // Search narrows the cards.
+    fireEvent.change(screen.getByLabelText("Search skills"), { target: { value: "tri" } });
+    expect(screen.queryByTestId("catalog-skill-review")).toBeNull();
+    expect(screen.getByTestId("catalog-skill-triage")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Search skills"), { target: { value: "zzz" } });
+    expect(screen.getByTestId("skill-catalog-empty")).toHaveTextContent("No skills match");
+  });
+
+  it("pages sources on request and keeps them when a further page fails", async () => {
+    state.moreSources = [{ ...source, id: "src2", name: "acme/more" }];
+    renderSection();
+    openBrowse();
+    await screen.findByTestId("skill-source-src1");
+    fireEvent.click(screen.getByRole("button", { name: "More sources" }));
+    expect(await screen.findByTestId("skill-source-src2")).toBeInTheDocument();
+
+    cleanup();
+    calls.length = 0;
+    state.moreSources = "fail";
+    renderSection();
+    openBrowse();
+    await screen.findByTestId("skill-source-src1");
+    fireEvent.click(screen.getByRole("button", { name: "More sources" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("sources are unavailable");
+    expect(screen.getByTestId("skill-source-src1")).toBeInTheDocument();
   });
 
   it("previews a repository by URL and can install from the preview", async () => {
@@ -246,6 +299,11 @@ describe("SettingsSkillsSection", () => {
         },
       }),
     );
+    // The preview is local state, so the card itself records the install.
+    expect(
+      await within(screen.getByTestId("catalog-skill-triage")).findByText("Installed"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("install-skill-triage")).toBeNull();
   });
 
   it("updates, and removes behind a confirmation that can be cancelled", async () => {
@@ -332,6 +390,16 @@ describe("SettingsSkillsSection", () => {
         body: undefined,
       }),
     );
+
+    // A refused removal says why, next to the source that stayed.
+    cleanup();
+    state.failDeleteSource = true;
+    renderSection();
+    openBrowse();
+    await screen.findByTestId("skill-source-src1");
+    fireEvent.click(screen.getByRole("button", { name: "Remove source acme/skills" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("set in the server config");
+    expect(screen.getByTestId("skill-source-src1")).toBeInTheDocument();
   });
 
   it("hides source management from non-admins", async () => {

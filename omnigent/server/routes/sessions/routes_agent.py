@@ -91,7 +91,7 @@ from omnigent.server.schemas import (
 from omnigent.server.skill_injection import (
     SkillDeliveryError,
     bundle_spec,
-    session_spec,
+    session_target,
     with_installed_skills,
 )
 from omnigent.skills.policy import DEFAULT_POLICY
@@ -281,7 +281,9 @@ def register_agent_routes(
                         owner_id=owner_id,
                         skill_store=skill_store,
                         artifact_store=artifact_store,
-                        spec=session_spec(bundle_spec(agent_cache, agent), conv.sub_agent_name),
+                        target=session_target(
+                            bundle_spec(agent_cache, agent), conv.sub_agent_name
+                        ),
                         policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
                     )
                 except SkillDeliveryError as exc:

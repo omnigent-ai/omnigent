@@ -59,20 +59,31 @@ def validate_skill_tarball(data: bytes) -> None:
         raise SkillTarballError("skill tarball has no SKILL.md at its root")
 
 
-def bundle_skill_names(bundle_bytes: bytes) -> set[str]:
-    """Directory names of every ``SKILL.md`` under ``skills/``, at any depth.
+def _prefix_parts(prefix: str) -> list[str]:
+    return [part for part in PurePosixPath(prefix).parts if part not in ("", ".")]
+
+
+def bundle_skill_names(bundle_bytes: bytes, *, prefix: str = "") -> set[str]:
+    """Directory names of every ``SKILL.md`` under ``<prefix>skills/``, at any depth.
 
     The parser names a skill after its directory, so ``skills/team/triage``
     is ``triage``. Callers that have the parsed agent spec should pass its
     canonical names to :func:`overlay_skills` as well; this scan is the
     fallback for a bundle whose spec is unavailable.
+
+    :param prefix: The agent directory to look under: ``""`` for the root,
+        ``agents/<dir>/`` for a child.
     """
+    lead = _prefix_parts(prefix)
     names: set[str] = set()
     with _open(bundle_bytes) as tf:
         for member in tf:
             parts = [part for part in PurePosixPath(member.name).parts if part != "."]
-            if len(parts) >= 3 and parts[0] == "skills" and parts[-1] == "SKILL.md":
-                names.add(parts[-2])
+            if parts[: len(lead)] != lead:
+                continue
+            rest = parts[len(lead) :]
+            if len(rest) >= 3 and rest[0] == "skills" and rest[-1] == "SKILL.md":
+                names.add(rest[-2])
     return names
 
 
@@ -81,19 +92,24 @@ def overlay_skills(
     skills: Sequence[tuple[str, bytes]],
     *,
     reserved: Collection[str] = (),
+    prefix: str = "",
 ) -> bytes:
-    """Return *bundle_bytes* with each ``(name, tarball)`` added as ``skills/<name>/``.
+    """Return *bundle_bytes* with each ``(name, tarball)`` added as ``<prefix>skills/<name>/``.
 
-    A name the bundle already has, or one in *reserved* (the parsed spec's
-    canonical skill names), is left alone. The archive is rebuilt once for
-    all skills, with a fixed gzip timestamp so the same inputs give the same
-    bytes and the runner's content-addressed cache hits. An unsafe tarball
-    raises rather than being skipped, so a bad row is noticed instead of
-    silently missing from the menu.
+    A name the target directory already has, or one in *reserved* (the parsed
+    spec's canonical skill names), is left alone. The archive is rebuilt once
+    for all skills, with a fixed gzip timestamp so the same inputs give the
+    same bytes and the runner's content-addressed cache hits. An unsafe
+    tarball raises rather than being skipped, so a bad row is noticed instead
+    of silently missing from the menu.
+
+    :param prefix: Where the session's spec lives: ``""`` for the root agent,
+        ``agents/<dir>/`` for a child, which the runner reads instead of the root.
     """
     if not skills:
         return bundle_bytes
-    present = bundle_skill_names(bundle_bytes) | set(reserved)
+    lead = _prefix_parts(prefix)
+    present = bundle_skill_names(bundle_bytes, prefix=prefix) | set(reserved)
     out = io.BytesIO()
     with (
         _open(bundle_bytes) as src,
@@ -112,7 +128,9 @@ def overlay_skills(
                     parts = [p for p in rel.parts if p != "."]
                     if not parts:
                         continue
-                    copied = tarfile.TarInfo(name=str(PurePosixPath("skills", name, *parts)))
+                    copied = tarfile.TarInfo(
+                        name=str(PurePosixPath(*lead, "skills", name, *parts))
+                    )
                     copied.size = member.size
                     copied.mode = member.mode
                     copied.mtime = member.mtime

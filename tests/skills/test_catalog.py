@@ -39,14 +39,26 @@ def test_empty_or_missing_layouts_index_nothing(tmp_path: Path) -> None:
     assert index_checkout(tmp_path) == []
 
 
-def test_a_catalog_stops_at_its_entry_cap(
+def test_a_catalog_stops_reading_at_its_entry_cap(
     plain_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The cap bounds the manifests opened, not just the entries returned: a
+    # repository of ten thousand skills costs the same as one of the cap.
     from omnigent.skills import catalog
+    from tests._helpers.skill_repos import write_skill
 
+    write_skill(plain_repo / "skills", "zzz", "Never read")
+    parsed: list[str] = []
+    real_parse = catalog._parse_skill
+    monkeypatch.setattr(
+        catalog,
+        "_parse_skill",
+        lambda manifest: (parsed.append(manifest.parent.name), real_parse(manifest))[1],
+    )
     monkeypatch.setattr(catalog, "MAX_CATALOG_ENTRIES", 1)
     skipped: list[str] = []
     assert [e.name for e in index_checkout(plain_repo, skipped=skipped)] == ["review"]
+    assert parsed == ["review"]
     assert "catalog truncated at 1 skills" in skipped
 
 

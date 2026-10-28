@@ -6,7 +6,9 @@ import base64
 import io
 import os
 import subprocess
+import sys
 import tarfile
+import time
 from pathlib import Path
 
 import pytest
@@ -46,11 +48,11 @@ def test_non_github_sources_are_rejected(source: str) -> None:
 def test_clone_is_hardened(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     seen: list[tuple[list[str], dict[str, str]]] = []
 
-    def run(cmd: list[str], **kwargs: object) -> object:
-        seen.append((cmd, kwargs["env"]))  # type: ignore[arg-type]
-        return type("P", (), {"returncode": 128, "stderr": "fatal: not found\n"})()
+    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+        seen.append((cmd, env))
+        return subprocess.CompletedProcess(cmd, 128, "", "fatal: not found\n")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(git_source, "_run_clone", run)
     with pytest.raises(git_source.GitSourceError, match=r"Could not clone .*: fatal: not found"):
         git_source.clone_github_source("https://github.com/a/b.git", "v1", tmp_path / "r")
     cmd, env = seen[0]
@@ -103,12 +105,11 @@ def test_isolated_clone_drops_inherited_git_config_and_helpers(
     monkeypatch.setenv("PATH", "/usr/bin")
     seen: list[tuple[list[str], dict[str, str], list[str]]] = []
 
-    def run(cmd: list[str], **kwargs: object) -> object:
-        env = kwargs["env"]  # type: ignore[index]
-        seen.append((cmd, env, os.listdir(env["HOME"])))  # type: ignore[arg-type]
-        return type("P", (), {"returncode": 0, "stderr": ""})()
+    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+        seen.append((cmd, env, os.listdir(env["HOME"])))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(git_source, "_run_clone", run)
     git_source.clone_github_source(
         "https://github.com/a/b.git", None, tmp_path / "r", isolated=True
     )
@@ -170,11 +171,11 @@ def test_token_travels_in_the_environment_not_the_command_line(
 ) -> None:
     seen: list[tuple[list[str], dict[str, str]]] = []
 
-    def run(cmd: list[str], **kwargs: object) -> object:
-        seen.append((cmd, kwargs["env"]))  # type: ignore[arg-type]
-        return type("P", (), {"returncode": 0, "stderr": ""})()
+    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+        seen.append((cmd, env))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(git_source, "_run_clone", run)
     git_source.clone_github_source(
         "https://github.acme.internal/team/skills.git",
         None,
@@ -195,3 +196,40 @@ def test_token_travels_in_the_environment_not_the_command_line(
         "https://github.com/a/b.git", None, tmp_path / "r2", isolated=True
     )
     assert "GIT_CONFIG_COUNT" not in seen[1][1]
+
+
+def test_a_clone_is_killed_once_it_exceeds_its_byte_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A stand-in for git that keeps writing into the destination: the watchdog
+    # stops it at the budget instead of letting it fill the disk.
+    fake_git = tmp_path / "fake-git.py"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys, time\n"
+        "dest = sys.argv[-1]\n"
+        "os.makedirs(dest)\n"
+        "with open(os.path.join(dest, 'blob'), 'ab') as fh:\n"
+        "    for _ in range(400):\n"
+        "        fh.write(b'x' * 65536); fh.flush(); time.sleep(0.01)\n"
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setattr(git_source, "GIT", str(fake_git))
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 0.05)
+    dest = tmp_path / "checkout"
+    started = time.monotonic()
+    with pytest.raises(git_source.GitSourceError, match="exceeds 1 MB on disk"):
+        git_source.clone_github_source(
+            str(fake_git), None, dest, isolated=True, max_bytes=1024 * 1024
+        )
+    assert time.monotonic() - started < 10
+    assert git_source._tree_bytes(dest) < 4 * 1024 * 1024
+
+    # Within the budget the stand-in finishes and the clone succeeds.
+    small = tmp_path / "small-git.py"
+    small.write_text(f"#!{sys.executable}\nimport os, sys\nos.makedirs(sys.argv[-1])\n")
+    small.chmod(0o755)
+    monkeypatch.setattr(git_source, "GIT", str(small))
+    git_source.clone_github_source(
+        str(small), None, tmp_path / "ok", isolated=True, max_bytes=1024
+    )

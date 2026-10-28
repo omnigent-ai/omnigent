@@ -4,7 +4,8 @@ Mounted only when the ``skills_marketplace`` feature is on and a skill store
 is configured. Sources are admin-managed; installs are per user unless an
 admin installs for the whole org. The operator's ``skills_marketplace:``
 policy is checked on every fetch path, admins included. Fetching runs off the
-event loop and uses the same hardened clone as ``omnigent agent add``.
+event loop, one fetch per account at a time and two per server, and uses the
+same hardened clone as ``omnigent agent add``.
 """
 
 from __future__ import annotations
@@ -27,10 +28,16 @@ from omnigent.skills.git_source import GitSourceError, repository_label
 from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_NAMES_PER_INSTALL
 from omnigent.skills.overlay import SkillTarballError, validate_skill_tarball
 from omnigent.skills.policy import DEFAULT_POLICY, SkillPolicyError, SkillsMarketplacePolicy
-from omnigent.skills.service import FetchedCatalog, SkillFetcher, resolve_source
+from omnigent.skills.service import FetchedCatalog, PackagedSkill, SkillFetcher, resolve_source
 from omnigent.stores import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.stores.skill_store import DEFAULT_PAGE, MAX_PAGE, SkillStore, SkillValueError
+from omnigent.stores.skill_store import (
+    DEFAULT_PAGE,
+    MAX_PAGE,
+    SkillInstall,
+    SkillStore,
+    SkillValueError,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -63,7 +70,7 @@ class SkillSourceList(BaseModel):
 
 
 class SkillSourceCreate(BaseModel):
-    """``source`` is ``owner/repo`` or a github.com URL; ``ref`` a branch or tag."""
+    """``source`` is ``owner/repo`` or a GitHub URL; ``ref`` a branch or tag."""
 
     source: str = Field(min_length=1, max_length=512)
     ref: str | None = Field(default=None, max_length=255)
@@ -71,14 +78,16 @@ class SkillSourceCreate(BaseModel):
 
 
 class CatalogSkill(BaseModel):
-    """One skill a repository offers, with the caller's install of it if any."""
+    """One skill a repository offers, with the caller's installs of it if any."""
 
     name: str
     display_name: str | None
     description: str
     path: str
     plugin: str | None
+    # The caller's own install, else the org's; and every scope it is installed in.
     installed_id: str | None
+    installed_scopes: list[Literal["user", "org"]] = []
 
 
 class SkillCatalogResponse(BaseModel):
@@ -108,6 +117,7 @@ class InstalledSkillObject(BaseModel):
     path: str
     scope: Literal["user", "org"]
     owner_user_id: str | None
+    bundle_bytes: int
     enabled: bool
     installed_by: str | None
     installed_at: int
@@ -123,6 +133,8 @@ class InstalledSkillList(BaseModel):
 
 
 class InstallSkillsRequest(BaseModel):
+    """Installs are all-or-nothing: a refused name leaves nothing installed."""
+
     source: str = Field(min_length=1, max_length=512)
     ref: str | None = Field(default=None, max_length=255)
     names: list[str] = Field(min_length=1, max_length=MAX_NAMES_PER_INSTALL)
@@ -159,6 +171,7 @@ def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
         path=skill.path,
         scope=skill.scope,
         owner_user_id=skill.owner_user_id,
+        bundle_bytes=skill.bundle_bytes,
         enabled=skill.enabled,
         installed_by=skill.installed_by,
         installed_at=skill.installed_at,
@@ -166,25 +179,25 @@ def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
     )
 
 
-def _is_admin(user_id: str | None, permission_store: PermissionStore | None) -> bool:
+async def _is_admin(user_id: str | None, permission_store: PermissionStore | None) -> bool:
     """Single-user mode (no permission store) is all-admin, like the other admin gates."""
     if permission_store is None:
         return True
-    return user_id is not None and permission_store.is_admin(user_id)
+    return user_id is not None and await asyncio.to_thread(permission_store.is_admin, user_id)
 
 
-def _require_admin(user_id: str | None, permission_store: PermissionStore | None) -> None:
-    if not _is_admin(user_id, permission_store):
+async def _require_admin(user_id: str | None, permission_store: PermissionStore | None) -> None:
+    if not await _is_admin(user_id, permission_store):
         raise OmnigentError("Administrator access required", code=ErrorCode.FORBIDDEN)
 
 
-def _require_can_mutate(
+async def _require_can_mutate(
     skill: InstalledSkill, user_id: str | None, permission_store: PermissionStore | None
 ) -> None:
     """Admins may change any row; a user only their own user-scoped installs."""
-    if _is_admin(user_id, permission_store):
-        return
     if skill.scope == "user" and skill.owner_user_id == user_id:
+        return
+    if await _is_admin(user_id, permission_store):
         return
     raise OmnigentError("Not the owner of this skill", code=ErrorCode.FORBIDDEN)
 
@@ -198,22 +211,30 @@ def _skill_location(skill_name: str, scope: str, owner: str | None, tarball: byt
 def _catalog_response(
     fetched: FetchedCatalog, installed: list[InstalledSkill]
 ) -> SkillCatalogResponse:
-    mine = {(s.source_url, s.name): s.id for s in installed}
-    return SkillCatalogResponse(
-        url=fetched.url,
-        ref=fetched.ref,
-        commit=fetched.commit,
-        skills=[
+    """Mark each entry with the caller's installs of it, scope by scope."""
+    by_name: dict[str, dict[str, str]] = {}
+    for skill in installed:
+        if skill.source_url == fetched.url:
+            by_name.setdefault(skill.name, {})[skill.scope] = skill.id
+    skills = []
+    for entry in fetched.entries:
+        scopes = by_name.get(entry.name, {})
+        skills.append(
             CatalogSkill(
                 name=entry.name,
                 display_name=entry.display_name,
                 description=entry.description,
                 path=entry.path,
                 plugin=entry.plugin,
-                installed_id=mine.get((fetched.url, entry.name)),
+                installed_id=scopes.get("user") or scopes.get("org"),
+                installed_scopes=[s for s in ("user", "org") if s in scopes],  # type: ignore[misc]
             )
-            for entry in fetched.entries
-        ],
+        )
+    return SkillCatalogResponse(
+        url=fetched.url,
+        ref=fetched.ref,
+        commit=fetched.commit,
+        skills=skills,
         skipped=list(fetched.skipped),
     )
 
@@ -261,13 +282,27 @@ def create_skill_marketplace_router(
     router = APIRouter()
     mutating = [Depends(require_trusted_origin), Depends(require_json_content_type)]
     fetch_slots = asyncio.Semaphore(_FETCH_CONCURRENCY)
+    # Accounts with a clone in flight: one at a time each, so one signed-in
+    # user cannot hold both server slots or queue up repository fetches.
+    fetching: set[str] = set()
 
     def fetcher(request: Request) -> SkillFetcher:
         return request.app.state.skill_fetcher
 
-    async def fetch(fn, *args, **kwargs):  # type: ignore[no-untyped-def]  # thin thread hop
-        async with fetch_slots:
-            return await asyncio.to_thread(fn, *args, **kwargs)
+    async def fetch(user_id: str | None, fn, *args, **kwargs):  # type: ignore[no-untyped-def]  # thread hop
+        account = user_id or ""
+        if account in fetching:
+            raise OmnigentError(
+                "Another repository fetch for your account is still running; "
+                "try again in a moment.",
+                code=ErrorCode.CONFLICT,
+            )
+        fetching.add(account)
+        try:
+            async with fetch_slots:
+                return await asyncio.to_thread(fn, *args, **kwargs)
+        finally:
+            fetching.discard(account)
 
     def resolve_allowed(source: str, ref: str | None) -> tuple[str, str | None]:
         """``(clone_url, ref)`` for a source within ``allowed_sources``, before any fetch."""
@@ -275,8 +310,8 @@ def create_skill_marketplace_router(
         policy.require_allowed(url)
         return url, ref
 
-    async def require_room_for(user_id: str | None, scope: str, names: list[str]) -> None:
-        """Hold each owner to the per-owner cap, so delivery reads a known number of rows."""
+    async def refuse_when_full(user_id: str | None, scope: str, names: list[str]) -> None:
+        """Save a clone when the principal is plainly full; the store's check is the authority."""
         present = await asyncio.to_thread(skill_store.find_for_user, user_id, names)
         replacing = {skill.name for skill in present if skill.scope == scope}
         adding = len([name for name in names if name not in replacing])
@@ -299,6 +334,14 @@ def create_skill_marketplace_router(
                 "choose a repository from the sources list.",
                 code=ErrorCode.FORBIDDEN,
             )
+
+    def checked(skill: PackagedSkill) -> None:
+        """Validate a tarball and its stored values before anything is written."""
+        try:
+            validate_skill_tarball(skill.tarball)
+            _check_metadata(skill.entry.name, skill.entry.display_name, skill.entry.description)
+        except (SkillTarballError, SkillValueError) as exc:
+            raise _invalid(exc) from None
 
     # ── sources ──
 
@@ -324,7 +367,7 @@ def create_skill_marketplace_router(
     async def add_skill_source(request: Request, body: SkillSourceCreate) -> SkillSourceObject:
         """Add a repository to browse (administrators only, within ``allowed_sources``)."""
         user_id = require_user(request, auth_provider)
-        _require_admin(user_id, permission_store)
+        await _require_admin(user_id, permission_store)
         try:
             url, ref = resolve_allowed(body.source, body.ref)
         except GitSourceError as exc:
@@ -345,7 +388,7 @@ def create_skill_marketplace_router(
     async def delete_skill_source(request: Request, source_id: str) -> Response:
         """Remove a repository from the browse list; installed skills stay."""
         user_id = require_user(request, auth_provider)
-        _require_admin(user_id, permission_store)
+        await _require_admin(user_id, permission_store)
         source = await asyncio.to_thread(skill_store.get_source, source_id)
         if source is None:
             raise OmnigentError("Skill source not found", code=ErrorCode.NOT_FOUND)
@@ -371,7 +414,7 @@ def create_skill_marketplace_router(
             # A source added under a looser policy is refused once it is outside it.
             policy.require_allowed(source.url)
             fetched = await fetch(
-                fetcher(request).catalog, source.url, source.ref, refresh=refresh
+                user_id, fetcher(request).catalog, source.url, source.ref, refresh=refresh
             )
         except GitSourceError as exc:
             raise _invalid(exc) from None
@@ -386,7 +429,7 @@ def create_skill_marketplace_router(
         try:
             url, ref = resolve_allowed(body.source, body.ref)
             await require_browsable(url, ref)
-            fetched = await fetch(fetcher(request).catalog, url, ref)
+            fetched = await fetch(user_id, fetcher(request).catalog, url, ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
         return _catalog_response(fetched, await _installed_among(skill_store, user_id, fetched))
@@ -415,35 +458,28 @@ def create_skill_marketplace_router(
 
     @router.post("/installed-skills", status_code=201, dependencies=mutating)
     async def install_skills(request: Request, body: InstallSkillsRequest) -> InstalledSkillList:
-        """Fetch the named skills from a repository and install them."""
+        """Fetch the named skills from a repository and install them, all or none."""
         user_id = require_user(request, auth_provider)
         if body.scope == "org":
-            _require_admin(user_id, permission_store)
+            await _require_admin(user_id, permission_store)
         names = list(dict.fromkeys(body.names))
         try:
             url, ref = resolve_allowed(body.source, body.ref)
             await require_browsable(url, ref)
-            await require_room_for(user_id, body.scope, names)
-            commit, packaged = await fetch(fetcher(request).package, url, ref, names)
+            await refuse_when_full(user_id, body.scope, names)
+            commit, packaged = await fetch(user_id, fetcher(request).package, url, ref, names)
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        # Validate every tarball and every stored value before the first write,
-        # so a bad request leaves no artifact and no row behind.
         for skill in packaged:
-            try:
-                validate_skill_tarball(skill.tarball)
-                _check_metadata(
-                    skill.entry.name, skill.entry.display_name, skill.entry.description
-                )
-            except (SkillTarballError, SkillValueError) as exc:
-                raise _invalid(exc) from None
-        installed: list[InstalledSkill] = []
+            checked(skill)
+        # Every tarball is stored first; the rows then commit in one transaction
+        # under the principal's lock, so a refusal leaves no row and no new object.
+        items: list[SkillInstall] = []
         for skill in packaged:
             location = _skill_location(skill.entry.name, body.scope, user_id, skill.tarball)
             await asyncio.to_thread(artifact_store.put, location, skill.tarball)
-            try:
-                row = await asyncio.to_thread(
-                    skill_store.install,
+            items.append(
+                SkillInstall(
                     name=skill.entry.name,
                     display_name=skill.entry.display_name,
                     description=skill.entry.description,
@@ -451,23 +487,35 @@ def create_skill_marketplace_router(
                     ref=ref,
                     commit=commit,
                     path=skill.entry.path,
-                    scope=body.scope,
-                    owner_user_id=user_id,
                     bundle_location=location,
-                    installed_by=user_id,
+                    bundle_bytes=len(skill.tarball),
                 )
-            except SkillValueError as exc:
-                _drop_artifact(artifact_store, location)
-                raise _invalid(exc) from None
-            installed.append(row)
-        return InstalledSkillList(data=[_skill_object(s) for s in installed])
+            )
+        try:
+            results = await asyncio.to_thread(
+                skill_store.install_many,
+                items,
+                scope=body.scope,
+                owner_user_id=user_id,
+                installed_by=user_id,
+            )
+        except SkillValueError as exc:
+            for item in items:
+                _drop_artifact(artifact_store, item.bundle_location)
+            raise _invalid(exc) from None
+        # A reinstall with changed content leaves its old object unreferenced.
+        kept = {item.bundle_location for item in items}
+        for result in results:
+            if result.replaced_location and result.replaced_location not in kept:
+                _drop_artifact(artifact_store, result.replaced_location)
+        return InstalledSkillList(data=[_skill_object(r.skill) for r in results])
 
     async def _load(skill_id: str, user_id: str | None) -> InstalledSkill:
         skill = await asyncio.to_thread(skill_store.get, skill_id)
         visible = skill is not None and (
             skill.scope == "org"
             or skill.owner_user_id == user_id
-            or _is_admin(user_id, permission_store)
+            or await _is_admin(user_id, permission_store)
         )
         if skill is None or not visible:
             raise OmnigentError("Installed skill not found", code=ErrorCode.NOT_FOUND)
@@ -488,18 +536,17 @@ def create_skill_marketplace_router(
         """Refetch the skill from its repository at the same ref."""
         user_id = require_user(request, auth_provider)
         skill = await _load(skill_id, user_id)
-        _require_can_mutate(skill, user_id, permission_store)
+        await _require_can_mutate(skill, user_id, permission_store)
         try:
             policy.require_allowed(skill.source_url)
             await require_browsable(skill.source_url, skill.ref)
             commit, packaged = await fetch(
-                fetcher(request).package, skill.source_url, skill.ref, [skill.name]
+                user_id, fetcher(request).package, skill.source_url, skill.ref, [skill.name]
             )
-            validate_skill_tarball(packaged[0].tarball)
-            fresh = packaged[0]
-            _check_metadata(fresh.entry.name, fresh.entry.display_name, fresh.entry.description)
-        except (GitSourceError, SkillTarballError, SkillValueError) as exc:
+        except GitSourceError as exc:
             raise _invalid(exc) from None
+        fresh = packaged[0]
+        checked(fresh)
         location = _skill_location(skill.name, skill.scope, skill.owner_user_id, fresh.tarball)
         await asyncio.to_thread(artifact_store.put, location, fresh.tarball)
         try:
@@ -508,12 +555,14 @@ def create_skill_marketplace_router(
                 skill.id,
                 commit=commit,
                 bundle_location=location,
+                bundle_bytes=len(fresh.tarball),
                 description=fresh.entry.description,
                 display_name=fresh.entry.display_name,
                 path=fresh.entry.path,
             )
         except SkillValueError as exc:
-            _drop_artifact(artifact_store, location)
+            if location != skill.bundle_location:
+                _drop_artifact(artifact_store, location)
             raise _invalid(exc) from None
         if updated is None:
             raise OmnigentError("Installed skill not found", code=ErrorCode.NOT_FOUND)
@@ -528,8 +577,11 @@ def create_skill_marketplace_router(
         """Enable or disable a skill without removing it."""
         user_id = require_user(request, auth_provider)
         skill = await _load(skill_id, user_id)
-        _require_can_mutate(skill, user_id, permission_store)
-        updated = await asyncio.to_thread(skill_store.set_enabled, skill.id, body.enabled)
+        await _require_can_mutate(skill, user_id, permission_store)
+        try:
+            updated = await asyncio.to_thread(skill_store.set_enabled, skill.id, body.enabled)
+        except SkillValueError as exc:
+            raise _invalid(exc) from None
         if updated is None:
             raise OmnigentError("Installed skill not found", code=ErrorCode.NOT_FOUND)
         return _skill_object(updated)
@@ -539,7 +591,7 @@ def create_skill_marketplace_router(
         """Remove an installed skill and its stored tarball."""
         user_id = require_user(request, auth_provider)
         skill = await _load(skill_id, user_id)
-        _require_can_mutate(skill, user_id, permission_store)
+        await _require_can_mutate(skill, user_id, permission_store)
         removed = await asyncio.to_thread(skill_store.delete, skill.id)
         if removed is not None:
             _drop_artifact(artifact_store, removed.bundle_location)

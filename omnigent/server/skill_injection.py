@@ -1,7 +1,8 @@
 """Fold a session owner's installed skills into the agent bundle a runner fetches.
 
-The runner discovers ``skills/<name>/SKILL.md`` inside its bundle for every
-harness, so adding installed skills there needs no runner change. One bad
+The runner discovers ``skills/<name>/SKILL.md`` inside the directory of the
+spec it runs (the bundle root, or ``agents/<dir>/`` for a child), so adding
+installed skills under that directory needs no runner change. One bad
 tarball drops only itself; exceeding the delivery bounds is an error the
 caller sees rather than a skill silently missing from the menu.
 """
@@ -9,6 +10,7 @@ caller sees rather than a skill silently missing from the menu.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from omnigent.entities import Agent, InstalledSkill
 from omnigent.runtime.agent_cache import AgentCache
@@ -29,6 +31,18 @@ class SkillDeliveryError(Exception):
     """The installed skills exceed what one session can be given; the message is user-facing."""
 
 
+@dataclass(frozen=True)
+class SessionTarget:
+    """The spec a session runs and where its files live inside the bundle.
+
+    :param spec: The parsed spec, or ``None`` when the bundle could not be loaded.
+    :param prefix: ``""`` for the root agent, else ``agents/<dir>/`` per level of nesting.
+    """
+
+    spec: AgentSpec | None
+    prefix: str
+
+
 def bundle_spec(agent_cache: AgentCache | None, agent: Agent) -> AgentSpec | None:
     """The agent's parsed spec, for its ``skills:`` filter; ``None`` when unavailable."""
     if agent_cache is None:
@@ -42,14 +56,26 @@ def bundle_spec(agent_cache: AgentCache | None, agent: Agent) -> AgentSpec | Non
         return None
 
 
-def session_spec(spec: AgentSpec | None, sub_agent_name: str | None) -> AgentSpec | None:
-    """The spec whose ``skills:`` filter governs a session: the sub-agent's when it runs one."""
+def session_target(spec: AgentSpec | None, sub_agent_name: str | None) -> SessionTarget:
+    """Resolve the child a session runs, by declared name at any depth, and its directory.
+
+    An unknown name falls back to the root, as the runner does.
+    """
     if spec is None or not sub_agent_name:
-        return spec
-    for sub_agent in spec.sub_agents:
-        if sub_agent.name == sub_agent_name:
-            return sub_agent
-    return spec
+        return SessionTarget(spec, "")
+    found = _find_sub_agent(spec, sub_agent_name, "")
+    return found if found is not None else SessionTarget(spec, "")
+
+
+def _find_sub_agent(spec: AgentSpec, name: str, prefix: str) -> SessionTarget | None:
+    for child in spec.sub_agents:
+        child_prefix = f"{prefix}agents/{child.source_rel_dir or child.name}/"
+        if child.name == name:
+            return SessionTarget(child, child_prefix)
+        nested = _find_sub_agent(child, name, child_prefix)
+        if nested is not None:
+            return nested
+    return None
 
 
 def skill_allowed(spec: AgentSpec | None, name: str) -> bool:
@@ -68,25 +94,28 @@ def with_installed_skills(
     owner_id: str | None,
     skill_store: SkillStore,
     artifact_store: ArtifactStore,
-    spec: AgentSpec | None = None,
+    target: SessionTarget | None = None,
     policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
 ) -> bytes:
-    """Return the bundle with the owner's enabled installed skills added under ``skills/``.
+    """Return the bundle with the owner's enabled installed skills under the target's ``skills/``.
 
-    The bundle's own skills, by their canonical parsed names, always win a
-    collision; a user-scoped install wins over an org-scoped one of the same
+    The target spec's own skills, by their canonical parsed names, always win
+    a collision; a user-scoped install wins over an org-scoped one of the same
     name. A tarball that fails validation drops only itself, and so does a
     skill whose repository the server's policy no longer allows.
 
+    :param target: The spec the session runs and its directory in the bundle;
+        ``None`` means the root agent with no filter.
     :raises SkillDeliveryError: When the skills exceed :data:`MAX_DELIVERED_SKILLS`
         or :data:`MAX_DELIVERY_BYTES` together.
     """
+    target = target or SessionTarget(None, "")
     installed = effective_installed_skills(skill_store, owner_id, policy=policy)
-    reserved = {skill.name for skill in getattr(spec, "skills", None) or []}
+    reserved = {skill.name for skill in getattr(target.spec, "skills", None) or []}
     accepted: list[tuple[str, bytes]] = []
     total = 0
     for skill in installed:
-        if not skill_allowed(spec, skill.name) or skill.name in reserved:
+        if not skill_allowed(target.spec, skill.name) or skill.name in reserved:
             continue
         try:
             tarball = artifact_store.get(skill.bundle_location)
@@ -107,7 +136,7 @@ def with_installed_skills(
             )
         accepted.append((skill.name, tarball))
     try:
-        return overlay_skills(bundle_bytes, accepted, reserved=reserved)
+        return overlay_skills(bundle_bytes, accepted, reserved=reserved, prefix=target.prefix)
     except SkillTarballError:
         _logger.warning(
             "could not overlay installed skills; serving the bundle as is", exc_info=True
@@ -141,12 +170,12 @@ def effective_installed_skills(
             if current is None or (current.scope == "org" and skill.scope == "user"):
                 by_name[skill.name] = skill
         seen += len(page.data)
-        if not page.has_more or page.last_id is None:
-            break
-        if seen >= MAX_DELIVERED_SKILLS:
+        if seen > MAX_DELIVERED_SKILLS:
             raise SkillDeliveryError(
                 f"More than {MAX_DELIVERED_SKILLS} installed skills are visible to this "
                 "session; remove some in Settings → Skills."
             )
+        if not page.has_more or page.last_id is None:
+            break
         after = page.last_id
     return list(by_name.values())

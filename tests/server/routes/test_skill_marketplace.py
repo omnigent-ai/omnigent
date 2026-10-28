@@ -7,8 +7,8 @@ network and no git; everything else (store, artifact store, routes) is real.
 from __future__ import annotations
 
 import io
-import shutil
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -32,6 +32,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+from tests._helpers.skill_repos import copying_cloner, write_skill
 
 ALICE = {"X-Forwarded-Email": "alice@example.com"}
 BOB = {"X-Forwarded-Email": "bob@example.com"}
@@ -39,28 +40,16 @@ BOB = {"X-Forwarded-Email": "bob@example.com"}
 REPO_URL = "https://github.com/acme/skills.git"
 
 
-def _write_skill(skills_dir: Path, name: str, description: str) -> None:
-    skill = skills_dir / name
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: {description}\n---\nDo {name}.\n"
-    )
-    (skill / "notes.txt").write_text("supporting file\n")
-
-
 @pytest.fixture()
 def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
-    _write_skill(root / "skills", "review", "Review a diff")
-    _write_skill(root / "skills", "triage", "Triage issues")
+    write_skill(root / "skills", "review", "Review a diff")
+    write_skill(root / "skills", "triage", "Triage issues")
     return root
 
 
 def _fetcher(repo: Path) -> SkillFetcher:
-    def clone(url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
-        shutil.copytree(repo, dest)
-
-    return SkillFetcher(clone=clone)
+    return SkillFetcher(clone=copying_cloner(repo))
 
 
 def _build(
@@ -100,6 +89,7 @@ def _bind_session(db_uri: str, artifact_store: LocalArtifactStore, bundle: bytes
 async def market(db_uri: str, tmp_path: Path, repo: Path, runtime_init: None):
     app, artifact_store = _build(db_uri, tmp_path)
     app.state.skill_fetcher = _fetcher(repo)
+    app.state.skill_fetcher_repo = repo
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client, app, artifact_store
@@ -136,7 +126,19 @@ async def test_sources_catalog_and_install_round_trip(market) -> None:
         "user",
         True,
     )
-    assert artifact_store.exists(await _location(app, row["id"]))
+    first_location = await _location(app, row["id"])
+    assert artifact_store.exists(first_location)
+
+    # Reinstalling changed content keeps the id, stores the new object and drops the old one.
+    repo_dir = app.state.skill_fetcher_repo
+    (repo_dir / "skills" / "triage" / "notes.txt").write_text("changed\n")
+    again = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert again.status_code == 201 and again.json()["data"][0]["id"] == row["id"]
+    second_location = await _location(app, row["id"])
+    assert second_location != first_location
+    assert artifact_store.exists(second_location) and not artifact_store.exists(first_location)
 
     # The catalog now marks it, and the listing and content routes see it.
     catalog = (await client.get(f"/v1/skill-sources/{source['id']}/catalog")).json()
@@ -208,7 +210,7 @@ async def test_lists_paginate_with_a_continuation_cursor(market) -> None:
 async def test_oversized_metadata_is_rejected_before_anything_is_written(
     db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
 ) -> None:
-    _write_skill(repo / "skills", "wordy", "é" * 1025)
+    write_skill(repo / "skills", "wordy", "é" * 1025)
     app, _artifacts = _build(db_uri, tmp_path)
     app.state.skill_fetcher = _fetcher(repo)
     transport = httpx.ASGITransport(app=app)
@@ -244,6 +246,7 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
         scope="org",
         owner_user_id=None,
         bundle_location="skills/review.tar.gz",
+        bundle_bytes=1,
         installed_by=None,
     )
     session_id = _bind_session(db_uri, artifacts, _tar({"config.yaml": b"name: bundled\n"}))
@@ -373,9 +376,11 @@ async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
 ) -> None:
     from omnigent.server import skill_injection
     from omnigent.server.routes import skill_marketplace
+    from omnigent.stores.skill_store import sqlalchemy_store
 
     client, _app, artifact_store = market
     monkeypatch.setattr(skill_marketplace, "MAX_INSTALLED_PER_OWNER", 1)
+    monkeypatch.setattr(sqlalchemy_store, "MAX_INSTALLED_PER_OWNER", 1)
     first = await client.post(
         "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
     )
@@ -390,19 +395,117 @@ async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
         "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
     )
     assert capped.status_code == 400 and "At most 1 skills" in capped.text
+    # A batch is all or nothing: one name over the cap installs neither.
+    assert len(list((tmp_path / "artifacts").rglob("*.tar.gz"))) == 1
     assert [s["name"] for s in (await client.get("/v1/installed-skills")).json()["data"]] == [
         "review"
     ]
 
-    # Delivery has its own byte bound, and exceeding it is an error the caller
-    # sees rather than a skill silently missing from the bundle.
+    # The byte budget is enforced when a set would become undeliverable, at
+    # install, update and enable time, so a later session launch cannot fail.
+    monkeypatch.setattr(skill_marketplace, "MAX_INSTALLED_PER_OWNER", 10)
+    monkeypatch.setattr(sqlalchemy_store, "MAX_INSTALLED_PER_OWNER", 10)
+    review = first.json()["data"][0]
+    # Room for one tarball of about this size (the two fixtures differ by a few
+    # bytes of gzip output), never for two.
+    budget = review["bundle_bytes"] + 64
+    monkeypatch.setattr(sqlalchemy_store, "MAX_DELIVERY_BYTES_PER_SCOPE", budget)
+    over = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert over.status_code == 400 and "would exceed" in over.text
+    assert len(list((tmp_path / "artifacts").rglob("*.tar.gz"))) == 1
+    # Disabling frees the budget; enabling again must fit.
+    disabled = await client.patch(f"/v1/installed-skills/{review['id']}", json={"enabled": False})
+    assert disabled.status_code == 200
+    triage = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert triage.status_code == 201
+    enable = await client.patch(f"/v1/installed-skills/{review['id']}", json={"enabled": True})
+    assert enable.status_code == 400 and "Enabling review" in enable.text
+    update = await client.post(f"/v1/installed-skills/{review['id']}/update")
+    assert update.status_code == 200  # the disabled row's size is not counted
+
+    # Delivery keeps a backstop: exceeding it is an error the caller sees
+    # rather than a skill silently missing from the bundle.
     session_id = _bind_session(db_uri, artifact_store, _tar({"config.yaml": b"name: bundled\n"}))
-    assert "skills/review/SKILL.md" in _names(
+    assert "skills/triage/SKILL.md" in _names(
         (await client.get(f"/v1/sessions/{session_id}/agent/contents")).content
     )
     monkeypatch.setattr(skill_injection, "MAX_DELIVERY_BYTES", 10)
     over = await client.get(f"/v1/sessions/{session_id}/agent/contents")
     assert over.status_code == 400 and "Installed skills exceed" in over.text
+
+
+@pytest.mark.asyncio
+async def test_a_fetch_in_flight_refuses_a_second_from_the_same_account(market) -> None:
+    import asyncio
+
+    from omnigent.server.routes import skill_marketplace
+
+    client, app, _ = market
+    started = asyncio.Event()
+    release = asyncio.Event()
+    real_package = app.state.skill_fetcher.package
+
+    def slow_package(*args, **kwargs):  # type: ignore[no-untyped-def]
+        loop.call_soon_threadsafe(started.set)
+        asyncio.run_coroutine_threadsafe(release.wait(), loop).result(timeout=5)
+        return real_package(*args, **kwargs)
+
+    loop = asyncio.get_running_loop()
+    app.state.skill_fetcher.package = slow_package
+    first = asyncio.create_task(
+        client.post("/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]})
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    second = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert second.status_code == 409 and "still running" in second.text
+    release.set()
+    assert (await first).status_code == 201
+    assert skill_marketplace._FETCH_CONCURRENCY == 2
+
+
+def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import skill_injection
+    from omnigent.stores.skill_store import SkillInstall
+
+    store = SqlAlchemySkillStore(db_uri)
+    monkeypatch.setattr(skill_injection, "MAX_PAGE", 2)
+    monkeypatch.setattr(skill_injection, "MAX_DELIVERED_SKILLS", 5)
+    items = [
+        SkillInstall(
+            name=f"s{i}",
+            display_name=None,
+            description="d",
+            source_url=REPO_URL,
+            ref=None,
+            commit=None,
+            path=f"skills/s{i}",
+            bundle_location=f"skills/s{i}.tar.gz",
+            bundle_bytes=1,
+        )
+        for i in range(5)
+    ]
+    store.install_many(items, scope="org", owner_user_id=None, installed_by=None)
+    # Five rows across three pages of two: every one is returned.
+    assert sorted(s.name for s in effective_installed_skills(store, "alice")) == [
+        f"s{i}" for i in range(5)
+    ]
+    # One row past the delivery limit raises instead of silently stopping.
+    store.install_many(
+        [replace(items[0], name="s5", path="skills/s5", bundle_location="skills/s5.tar.gz")],
+        scope="org",
+        owner_user_id=None,
+        installed_by=None,
+    )
+    with pytest.raises(skill_injection.SkillDeliveryError, match="More than 5"):
+        effective_installed_skills(store, "alice")
 
 
 # ── bundle injection ──
@@ -443,6 +546,7 @@ def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: 
             scope=scope,
             owner_user_id=owner,
             bundle_location=f"skills/{name}.tar.gz",
+            bundle_bytes=1,
             installed_by=owner,
         )
         if not enabled:
@@ -512,6 +616,7 @@ def test_a_users_install_wins_over_the_orgs_whatever_the_order(
             scope=scope,
             owner_user_id="alice" if scope == "user" else None,
             bundle_location=f"skills/{scope}.tar.gz",
+            bundle_bytes=1,
             installed_by="alice",
         )
 

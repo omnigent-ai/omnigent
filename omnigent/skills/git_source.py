@@ -15,6 +15,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -34,6 +35,10 @@ DEFAULT_HOST = "github.com"
 LFS_POINTER = b"version https://git-lfs.github.com/spec/"
 
 CLONE_TIMEOUT_S = 300
+# How often the clone watchdog measures the checkout on disk.
+CHECKOUT_POLL_S = 0.25
+# The git executable; tests point it at a script.
+GIT = "git"
 
 # Inherited git configuration is dropped for a server-side fetch so a request
 # from one user can never borrow the operator's credential helpers or config.
@@ -143,6 +148,61 @@ def isolated_git_env(home: str) -> dict[str, str]:
     return env
 
 
+def _tree_bytes(path: Path) -> int:
+    """Bytes on disk under *path*, links counted by their own size, never followed."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for filename in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, filename)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def _run_clone(
+    cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None
+) -> subprocess.CompletedProcess[str]:
+    """Run git, killing it once *dest* holds more than *max_bytes* on disk.
+
+    A shallow clone or a blob filter does not bound what the server writes,
+    since the checkout may fetch what the filter omitted; the watchdog does.
+
+    :raises GitSourceError: When git is missing, the clone times out, or it
+        exceeds the byte budget.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+    except FileNotFoundError:
+        raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
+    deadline = time.monotonic() + CLONE_TIMEOUT_S
+    over_budget = False
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=CHECKOUT_POLL_S)
+            break
+        except subprocess.TimeoutExpired:
+            if max_bytes is not None and dest.exists() and _tree_bytes(dest) > max_bytes:
+                over_budget = True
+            if over_budget or time.monotonic() > deadline:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                break
+    if over_budget:
+        raise GitSourceError(
+            f"The repository exceeds {max_bytes // (1024 * 1024)} MB on disk; refusing it."  # type: ignore[operator]
+        )
+    if proc.returncode in (-9, 137) or time.monotonic() > deadline:
+        raise GitSourceError(f"Timed out cloning {cmd[-2]}.")
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
 def clone_github_source(
     clone_url: str,
     ref: str | None,
@@ -150,6 +210,7 @@ def clone_github_source(
     *,
     isolated: bool = False,
     token: str | None = None,
+    max_bytes: int | None = None,
 ) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts.
 
@@ -158,9 +219,12 @@ def clone_github_source(
         developer's own git setup.
     :param token: An operator-scoped token for this host, sent as an
         authorization header through the environment (:func:`auth_header_env`).
-    :raises GitSourceError: When git is missing, the clone times out, or git fails.
+    :param max_bytes: Kill the clone once the checkout holds more than this on
+        disk; ``None`` for the developer's own CLI.
+    :raises GitSourceError: When git is missing, the clone times out, exceeds
+        *max_bytes*, or git fails.
     """
-    cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+    cmd = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
            "-c", "protocol.https.allow=always"]  # fmt: skip
     if isolated:
         cmd += ["-c", "credential.helper="]
@@ -175,19 +239,7 @@ def clone_github_source(
         )
         if token:
             env.update(auth_header_env(clone_url, token))
-        try:
-            proc = subprocess.run(
-                [*cmd, "--", clone_url, str(dest)],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=False,
-                timeout=CLONE_TIMEOUT_S,
-            )
-        except FileNotFoundError:
-            raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
-        except subprocess.TimeoutExpired:
-            raise GitSourceError(f"Timed out cloning {clone_url}.") from None
+        proc = _run_clone([*cmd, "--", clone_url, str(dest)], env, dest, max_bytes)
     if proc.returncode != 0:
         hint = (
             "\n(Only branch and tag names work as a ref, not commit SHAs.)"

@@ -23,6 +23,7 @@ def test_column_bounds_match_the_schema() -> None:
         "ref": limits.MAX_REF_CHARS,
         "commit": limits.MAX_COMMIT_CHARS,
         "path": limits.MAX_PATH_CHARS,
+        "principal": limits.MAX_PRINCIPAL_CHARS,
         "owner_user_id": limits.MAX_USER_ID_CHARS,
         "bundle_location": limits.MAX_LOCATION_CHARS,
         "installed_by": limits.MAX_USER_ID_CHARS,
@@ -41,8 +42,6 @@ def test_column_bounds_match_the_schema() -> None:
     assert widest * 4 < STORED_VALUE_LIMIT_BYTES
 
 
-def test_delivery_reads_a_known_number_of_pages() -> None:
-    from omnigent.server.skill_injection import MAX_DELIVERED_SKILLS
-
-    assert MAX_DELIVERED_SKILLS == 2 * limits.MAX_INSTALLED_PER_OWNER
+def test_the_delivery_budget_is_two_principals_worth() -> None:
+    assert limits.MAX_DELIVERY_BYTES == 2 * limits.MAX_DELIVERY_BYTES_PER_SCOPE
     assert limits.MAX_INSTALLED_PER_OWNER <= limits.MAX_PAGE

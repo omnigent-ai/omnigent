@@ -1,4 +1,4 @@
-"""The skill store: source dedup, scoped visibility, replace-on-reinstall, and deletes."""
+"""The skill store: source dedup, principal visibility, atomic installs, budgets and deletes."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from omnigent.db.utils import get_or_create_engine
-from omnigent.stores.skill_store import SkillValueError
+from omnigent.stores.skill_store import SkillInstall, SkillQuotaError, SkillValueError
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+
+URL = "https://github.com/acme/skills.git"
 
 
 @pytest.fixture()
@@ -16,42 +18,60 @@ def store(db_uri: str) -> SqlAlchemySkillStore:
     return SqlAlchemySkillStore(db_uri)
 
 
-def _install(store: SqlAlchemySkillStore, name: str, *, scope="user", owner="alice", **over):
+def _item(name: str, **over) -> SkillInstall:  # type: ignore[no-untyped-def]  # test inputs
     fields = {
         "name": name,
         "display_name": None,
         "description": f"{name} description",
-        "source_url": "https://github.com/acme/skills.git",
+        "source_url": URL,
         "ref": None,
         "commit": "a" * 40,
         "path": f"skills/{name}",
-        "scope": scope,
-        "owner_user_id": owner,
         "bundle_location": f"skills/{name}.tar.gz",
-        "installed_by": owner,
+        "bundle_bytes": 10,
     }
     fields.update(over)
-    return store.install(**fields)
+    return SkillInstall(**fields)  # type: ignore[arg-type]
+
+
+def _install(store: SqlAlchemySkillStore, name: str, *, scope="user", owner="alice", **over):  # type: ignore[no-untyped-def]
+    return store.install_many(
+        [_item(name, **over)], scope=scope, owner_user_id=owner, installed_by=owner
+    )[0].skill
 
 
 def test_sources_dedupe_on_url_and_ref(store: SqlAlchemySkillStore) -> None:
-    first = store.add_source(
-        url="https://github.com/acme/skills.git", ref=None, name="Acme", created_by="a"
-    )
-    again = store.add_source(
-        url="https://github.com/acme/skills.git", ref=None, name="Other", created_by="b"
-    )
-    tagged = store.add_source(
-        url="https://github.com/acme/skills.git", ref="v2", name="Acme v2", created_by="a"
-    )
+    first = store.add_source(url=URL, ref=None, name="Acme", created_by="a")
+    again = store.add_source(url=URL, ref=None, name="Other", created_by="b")
+    tagged = store.add_source(url=URL, ref="v2", name="Acme v2", created_by="a")
 
-    assert again.id == first.id and again.name == "Acme"
-    assert tagged.id != first.id
+    assert again.id == first.id and again.name == "Acme" and first.ref is None
+    assert tagged.id != first.id and tagged.ref == "v2"
     assert sorted(s.name for s in store.list_sources().data) == ["Acme", "Acme v2"]
     assert store.get_source(first.id) == first
+    assert store.find_source(URL, None) == first and store.find_source(URL, "v9") is None
     assert store.delete_source(first.id) is True
     assert store.delete_source(first.id) is False
     assert [s.name for s in store.list_sources().data] == ["Acme v2"]
+
+
+def test_concurrent_source_seeding_ends_on_one_row(
+    store: SqlAlchemySkillStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two replicas seed the same configured source: the second one's lookup
+    # misses, its insert hits the unique index, and the retry returns the winner.
+    first = store.add_source(url=URL, ref=None, name="Acme", created_by=None)
+    misses = [True]
+    real_scalar = Session.scalar
+
+    def scalar_missing_once(self: Session, statement, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if misses and misses.pop():
+            return None
+        return real_scalar(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "scalar", scalar_missing_once)
+    assert store.add_source(url=URL, ref=None, name="Acme", created_by=None).id == first.id
+    assert len(store.list_sources().data) == 1
 
 
 def test_users_see_org_skills_and_their_own_only(store: SqlAlchemySkillStore) -> None:
@@ -82,28 +102,144 @@ def test_org_scope_ignores_the_owner_argument(store: SqlAlchemySkillStore) -> No
     assert row.owner_user_id is None and row.scope == "org"
 
 
+def test_a_batch_installs_all_or_nothing_within_the_budgets(store: SqlAlchemySkillStore) -> None:
+    results = store.install_many(
+        [_item("a"), _item("b", bundle_bytes=30)],
+        scope="user",
+        owner_user_id="alice",
+        installed_by="alice",
+    )
+    assert [r.skill.name for r in results] == ["a", "b"]
+    assert all(r.replaced_location is None for r in results)
+
+    # Past the row cap: nothing of the batch is written, not even the first name.
+    with pytest.raises(SkillQuotaError, match="At most 3 skills"):
+        store.install_many(
+            [_item("c"), _item("d")],
+            scope="user",
+            owner_user_id="alice",
+            installed_by="alice",
+            max_rows=3,
+        )
+    assert sorted(s.name for s in store.list_for_user("alice").data) == ["a", "b"]
+
+    # Past the byte budget, counting only enabled rows; a disabled one frees its bytes.
+    with pytest.raises(SkillQuotaError, match="exceed 0 MB"):
+        store.install_many(
+            [_item("c", bundle_bytes=70)],
+            scope="user",
+            owner_user_id="alice",
+            installed_by="alice",
+            max_bytes=100,
+        )
+    store.set_enabled(results[1].skill.id, False)
+    store.install_many(
+        [_item("c", bundle_bytes=70)],
+        scope="user",
+        owner_user_id="alice",
+        installed_by="alice",
+        max_bytes=100,
+    )
+    with pytest.raises(SkillQuotaError, match="Enabling b"):
+        store.set_enabled(results[1].skill.id, True, max_bytes=100)
+    with pytest.raises(SkillQuotaError, match="Updating c"):
+        store.update(
+            store.find_for_user("alice", ["c"])[0].id,
+            commit=None,
+            bundle_location="skills/c2.tar.gz",
+            bundle_bytes=95,
+            description="d",
+            display_name=None,
+            max_bytes=100,
+        )
+    # A repeated name in one batch is refused before anything is written.
+    with pytest.raises(SkillValueError, match="repeated"):
+        store.install_many(
+            [_item("x"), _item("x")], scope="user", owner_user_id="alice", installed_by="alice"
+        )
+
+
+def test_concurrent_installs_near_capacity_cannot_both_pass(
+    store: SqlAlchemySkillStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two distinct-name installs race for the last slot from two threads. The
+    # first holds the principal's lock (SQLite: the immediate transaction)
+    # while the second starts, so the second counts after the first committed
+    # and is refused; without the lock both would count one row and both pass.
+    import threading
+
+    from omnigent.stores.skill_store import sqlalchemy_store as module
+
+    _install(store, "first")
+    real_lock = module.SqlAlchemySkillStore._lock_principal
+    first_writer_holds = threading.Event()
+    second_writer_started = threading.Event()
+    slow = [True]
+
+    def lock_slowly(session: Session, principal: str) -> None:
+        real_lock(session, principal)
+        if slow and slow.pop():
+            first_writer_holds.set()
+            second_writer_started.wait(timeout=5)
+
+    monkeypatch.setattr(module.SqlAlchemySkillStore, "_lock_principal", staticmethod(lock_slowly))
+    outcomes: dict[str, object] = {}
+
+    def install(name: str) -> None:
+        try:
+            store.install_many(
+                [_item(name)],
+                scope="user",
+                owner_user_id="alice",
+                installed_by="alice",
+                max_rows=2,
+            )
+            outcomes[name] = "ok"
+        except SkillQuotaError as exc:
+            outcomes[name] = exc
+
+    first = threading.Thread(target=install, args=("second",))
+    first.start()
+    assert first_writer_holds.wait(timeout=5)
+    second = threading.Thread(target=install, args=("third",))
+    second.start()
+    second_writer_started.set()
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    assert outcomes["second"] == "ok"
+    assert isinstance(outcomes["third"], SkillQuotaError)
+    assert sorted(s.name for s in store.list_for_user("alice").data) == ["first", "second"]
+
+
 def test_concurrent_installs_of_one_identity_end_on_one_row(
     store: SqlAlchemySkillStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The race: this writer's pre-insert lookup misses while another writer
-    # inserts the same (owner, name, scope). The unique index rejects the
-    # second insert and the retry replaces the winner in place.
+    # The pre-insert lookup misses while another writer inserts the same
+    # (principal, name); the unique index rejects the insert and the caller sees it.
     first = _install(store, "review", commit="a" * 40)
+    real_scalars = Session.scalars
     misses = [True]
-    real_scalar = Session.scalar
 
-    def scalar_missing_once(self: Session, statement, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if misses and misses.pop():
-            return None
-        return real_scalar(self, statement, *args, **kwargs)
+    def scalars_missing_once(self: Session, statement, *args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_scalars(self, statement, *args, **kwargs)
+        if misses and "installed_skills" in str(statement) and "name IN" in str(statement):
+            misses.pop()
+            return real_scalars(self, statement.where(False), *args, **kwargs)  # type: ignore[arg-type]
+        return result
 
-    monkeypatch.setattr(Session, "scalar", scalar_missing_once)
+    monkeypatch.setattr(Session, "scalars", scalars_missing_once)
+    from sqlalchemy.exc import IntegrityError
+
+    with pytest.raises(IntegrityError):
+        _install(store, "review", commit="b" * 40)
+    monkeypatch.undo()
     second = _install(store, "review", commit="b" * 40)
     assert second.id == first.id and second.commit == "b" * 40
     assert [s.name for s in store.list_for_user("alice").data] == ["review"]
 
 
-def test_visibility_reads_stay_on_the_owner_indexes(
+def test_visibility_reads_stay_on_the_principal_indexes(
     store: SqlAlchemySkillStore, db_uri: str
 ) -> None:
     if not db_uri.startswith("sqlite"):
@@ -119,14 +255,14 @@ def test_visibility_reads_stay_on_the_owner_indexes(
     for index in range(3):
         _install(store, f"s{index}")
         _install(store, f"o{index}", scope="org", owner=None)
-    store.add_source(url="https://github.com/acme/skills.git", ref=None, name="a", created_by=None)
+    store.add_source(url=URL, ref=None, name="a", created_by=None)
     event.listen(engine, "before_cursor_execute", capture)
     try:
         page = store.list_for_user("alice", limit=2)
         store.list_for_user("alice", limit=2, after=page.last_id)
         store.find_for_user("alice", ["s1", "o2"])
         store.count_installed("user", "alice")
-        store.find_source("https://github.com/acme/skills.git", None)
+        store.find_source(URL, None)
     finally:
         event.remove(engine, "before_cursor_execute", capture)
 
@@ -134,19 +270,41 @@ def test_visibility_reads_stay_on_the_owner_indexes(
     # Every read is an index search; nothing scans a table or sorts in a temp B-tree.
     assert all("SEARCH" in plan and "USING" in plan for plan in plans), plans
     assert not any("SCAN " in plan or "TEMP B-TREE" in plan for plan in plans), plans
-    assert any("ix_installed_skills_owner_order" in plan for plan in plans)
+    assert any("ix_installed_skills_principal_order" in plan for plan in plans)
     assert any("ux_installed_skills_identity" in plan for plan in plans)
-    assert any("ix_skill_sources_identity" in plan for plan in plans)
+    assert any("ux_skill_sources_identity" in plan for plan in plans)
 
 
-def test_reinstall_replaces_in_place_and_keeps_the_id(store: SqlAlchemySkillStore) -> None:
+def test_reinstall_replaces_in_place_and_reports_the_old_tarball(
+    store: SqlAlchemySkillStore,
+) -> None:
     first = _install(store, "review", commit="a" * 40)
-    second = _install(store, "review", commit="b" * 40, description="newer")
-
+    results = store.install_many(
+        [
+            _item(
+                "review", commit="b" * 40, description="newer", bundle_location="skills/r2.tar.gz"
+            )
+        ],
+        scope="user",
+        owner_user_id="alice",
+        installed_by="alice",
+    )
+    second = results[0].skill
+    assert results[0].replaced_location == "skills/review.tar.gz"
     assert second.id == first.id
     assert second.commit == "b" * 40 and second.description == "newer"
     assert second.updated_at is not None and second.installed_at == first.installed_at
     assert len(store.list_for_user("alice").data) == 1
+    # Same content again: nothing to drop.
+    assert (
+        store.install_many(
+            [_item("review", commit="b" * 40, bundle_location="skills/r2.tar.gz")],
+            scope="user",
+            owner_user_id="alice",
+            installed_by="alice",
+        )[0].replaced_location
+        is None
+    )
     # The same name under another user is a different row.
     other = _install(store, "review", owner="bob")
     assert other.id != first.id
@@ -159,17 +317,19 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
         row.id,
         commit="c" * 40,
         bundle_location="skills/review-2.tar.gz",
+        bundle_bytes=42,
         description="d2",
         display_name="Review",
         path="skills/moved/review",
     )
     assert updated is not None
-    assert (updated.commit, updated.bundle_location, updated.display_name, updated.path) == (
-        "c" * 40,
-        "skills/review-2.tar.gz",
-        "Review",
-        "skills/moved/review",
-    )
+    assert (
+        updated.commit,
+        updated.bundle_location,
+        updated.bundle_bytes,
+        updated.display_name,
+        updated.path,
+    ) == ("c" * 40, "skills/review-2.tar.gz", 42, "Review", "skills/moved/review")
 
     disabled = store.set_enabled(row.id, False)
     assert disabled is not None and disabled.enabled is False
@@ -180,7 +340,14 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
     assert store.get(row.id) is None
     assert store.delete(row.id) is None
     assert (
-        store.update(row.id, commit=None, bundle_location="x", description="", display_name=None)
+        store.update(
+            row.id,
+            commit=None,
+            bundle_location="x",
+            bundle_bytes=1,
+            description="",
+            display_name=None,
+        )
         is None
     )
     assert store.set_enabled(row.id, True) is None
@@ -240,13 +407,20 @@ def test_values_that_would_not_fit_are_rejected_before_writing(
     with pytest.raises(SkillValueError, match="owner_user_id"):
         _install(store, "whose", owner="u" * 129)
     with pytest.raises(SkillValueError, match="installed_by"):
-        _install(store, "whose", installed_by="u" * 129)
+        store.install_many(
+            [_item("whose")], scope="user", owner_user_id="alice", installed_by="u" * 129
+        )
     with pytest.raises(SkillValueError, match="created_by"):
         store.add_source(url="https://github.com/a/b", ref=None, name="x", created_by="u" * 129)
     assert store.list_for_user("alice").data == []
     row = _install(store, "ok")
     with pytest.raises(SkillValueError, match="description"):
         store.update(
-            row.id, commit=None, bundle_location="x", description="z" * 1025, display_name=None
+            row.id,
+            commit=None,
+            bundle_location="x",
+            bundle_bytes=1,
+            description="z" * 1025,
+            display_name=None,
         )
     assert store.get(row.id).description == "ok description"

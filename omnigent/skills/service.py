@@ -23,7 +23,12 @@ from omnigent.skills.git_source import (
     parse_github_source,
     tar_untrusted_dir,
 )
-from omnigent.skills.limits import MAX_INSTALL_BYTES, MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
+from omnigent.skills.limits import (
+    MAX_CHECKOUT_BYTES,
+    MAX_INSTALL_BYTES,
+    MAX_SKILL_BYTES,
+    MAX_SKILL_ENTRIES,
+)
 from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
 
 CATALOG_TTL_S = 600.0
@@ -41,8 +46,10 @@ class Cloner(Protocol):
 
 
 def server_clone(clone_url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
-    """The marketplace's clone: isolated from the server's own git credentials."""
-    clone_github_source(clone_url, ref, dest, isolated=True, token=token)
+    """The marketplace's clone: isolated from the server's own git credentials and disk-bounded."""
+    clone_github_source(
+        clone_url, ref, dest, isolated=True, token=token, max_bytes=MAX_CHECKOUT_BYTES
+    )
 
 
 @dataclass(frozen=True)

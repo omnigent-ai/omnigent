@@ -13,14 +13,17 @@ export interface SkillSource {
   managed: boolean;
 }
 
-/** One skill a repository offers, with the caller's install of it if any. */
+/** One skill a repository offers, with the caller's installs of it if any. */
 export interface CatalogSkill {
   name: string;
   display_name: string | null;
   description: string;
   path: string;
   plugin: string | null;
+  /** The caller's own install, else the org's. */
   installed_id: string | null;
+  /** Every scope it is installed in; absent on older servers. */
+  installed_scopes?: SkillScope[];
 }
 
 export interface SkillCatalog {

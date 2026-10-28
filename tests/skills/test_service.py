@@ -99,14 +99,15 @@ def test_fetcher_clones_isolated_from_server_credentials(monkeypatch: pytest.Mon
         *,
         isolated: bool = False,
         token: str | None = None,
+        max_bytes: int | None = None,
     ) -> None:
-        seen["isolated"], seen["token"] = isolated, token
+        seen["isolated"], seen["token"], seen["max_bytes"] = isolated, token, max_bytes
         raise GitSourceError("stop")
 
     monkeypatch.setattr(service, "clone_github_source", clone)
     with pytest.raises(GitSourceError):
         service.server_clone("https://github.com/a/b.git", None, Path("/nonexistent"), token="t")
-    assert seen == {"isolated": True, "token": "t"}
+    assert seen == {"isolated": True, "token": "t", "max_bytes": service.MAX_CHECKOUT_BYTES}
 
 
 def test_fetcher_refuses_a_source_outside_the_policy_before_cloning(

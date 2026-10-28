@@ -914,7 +914,7 @@
         "type": "object"
       },
       "CatalogSkill": {
-        "description": "One skill a repository offers, with the caller's install of it if any.",
+        "description": "One skill a repository offers, with the caller's installs of it if any.",
         "properties": {
           "description": {
             "title": "Description",
@@ -941,6 +941,18 @@
               }
             ],
             "title": "Installed Id"
+          },
+          "installed_scopes": {
+            "default": [],
+            "items": {
+              "enum": [
+                "user",
+                "org"
+              ],
+              "type": "string"
+            },
+            "title": "Installed Scopes",
+            "type": "array"
           },
           "name": {
             "title": "Name",
@@ -3650,6 +3662,7 @@
         "type": "object"
       },
       "InstallSkillsRequest": {
+        "description": "Installs are all-or-nothing: a refused name leaves nothing installed.",
         "properties": {
           "names": {
             "items": {
@@ -3744,6 +3757,11 @@
       "InstalledSkillObject": {
         "description": "An installed skill as the UI lists it.",
         "properties": {
+          "bundle_bytes": {
+            "format": "int64",
+            "title": "Bundle Bytes",
+            "type": "integer"
+          },
           "commit": {
             "anyOf": [
               {
@@ -3865,6 +3883,7 @@
           "path",
           "scope",
           "owner_user_id",
+          "bundle_bytes",
           "enabled",
           "installed_by",
           "installed_at",
@@ -10136,7 +10155,7 @@
         "type": "object"
       },
       "SkillSourceCreate": {
-        "description": "`source` is `owner/repo` or a github.com URL; `ref` a branch or tag.",
+        "description": "`source` is `owner/repo` or a GitHub URL; `ref` a branch or tag.",
         "properties": {
           "name": {
             "anyOf": [
@@ -13831,7 +13850,7 @@
         ]
       },
       "post": {
-        "description": "Fetch the named skills from a repository and install them.",
+        "description": "Fetch the named skills from a repository and install them, all or none.",
         "operationId": "install_skills_v1_installed_skills_post",
         "requestBody": {
           "content": {

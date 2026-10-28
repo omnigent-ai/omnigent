@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -137,11 +138,28 @@ def _plugin_dirs(root: Path, skipped: list[str]) -> list[tuple[str, Path]]:
     return out
 
 
+class _Budget:
+    """How many candidate manifests may still be opened; a hostile tree stops here."""
+
+    def __init__(self, candidates: int) -> None:
+        self.remaining = candidates
+        self.exhausted = False
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            self.exhausted = True
+            return False
+        self.remaining -= 1
+        return True
+
+
 def _entries_under(
-    skills_dir: Path, root: Path, plugin: str | None, skipped: list[str]
-) -> list[CatalogEntry]:
-    out: list[CatalogEntry] = []
+    skills_dir: Path, root: Path, plugin: str | None, skipped: list[str], budget: _Budget
+) -> Iterator[CatalogEntry]:
+    """Yield entries lazily; nothing is read once *budget* runs out."""
     for skill_dir in _candidate_skill_dirs(skills_dir, root, skipped):
+        if not budget.take():
+            return
         rel = skill_dir.relative_to(root).as_posix()
         manifest = skill_dir / "SKILL.md"
         if manifest.is_symlink() or not _inside(root, manifest):
@@ -165,16 +183,13 @@ def _entries_under(
         if display_name is not None and len(display_name) > MAX_DISPLAY_NAME_CHARS:
             skipped.append(f"{rel}: display name is too long")
             continue
-        out.append(
-            CatalogEntry(
-                name=spec.name,
-                display_name=display_name,
-                description=spec.description,
-                path=str(PurePosixPath(rel)),
-                plugin=plugin,
-            )
+        yield CatalogEntry(
+            name=spec.name,
+            display_name=display_name,
+            description=spec.description,
+            path=str(PurePosixPath(rel)),
+            plugin=plugin,
         )
-    return out
 
 
 def index_checkout(root: Path, *, skipped: list[str] | None = None) -> list[CatalogEntry]:
@@ -182,24 +197,27 @@ def index_checkout(root: Path, *, skipped: list[str] | None = None) -> list[Cata
 
     The first occurrence of a name wins, so a root skill shadows a plugin's
     skill of the same name. Problems that drop an entry are appended to
-    *skipped* as human-readable lines.
+    *skipped* as human-readable lines. At most :data:`MAX_CATALOG_ENTRIES`
+    manifests are opened, so a repository of ten thousand skills costs the
+    same as one of five hundred.
     """
     notes: list[str] = [] if skipped is None else skipped
     seen: set[str] = set()
     out: list[CatalogEntry] = []
+    budget = _Budget(MAX_CATALOG_ENTRIES)
 
-    def add(entries: list[CatalogEntry]) -> None:
+    def add(entries: Iterator[CatalogEntry]) -> None:
         for entry in entries:
             if entry.name in seen:
                 continue
-            if len(out) >= MAX_CATALOG_ENTRIES:
-                notes.append(f"catalog truncated at {MAX_CATALOG_ENTRIES} skills")
-                return
             seen.add(entry.name)
             out.append(entry)
 
     for rel in SKILL_ROOTS:
-        add(_entries_under(root / rel, root, None, notes))
-    for plugin, plugin_dir in _plugin_dirs(root, notes):
-        add(_entries_under(plugin_dir / "skills", root, plugin, notes))
+        add(_entries_under(root / rel, root, None, notes, budget))
+    if not budget.exhausted:
+        for plugin, plugin_dir in _plugin_dirs(root, notes):
+            add(_entries_under(plugin_dir / "skills", root, plugin, notes, budget))
+    if budget.exhausted:
+        notes.append(f"catalog truncated at {MAX_CATALOG_ENTRIES} skills")
     return out

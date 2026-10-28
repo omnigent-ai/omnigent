@@ -1,21 +1,30 @@
 """SQLAlchemy implementation of :class:`SkillStore`.
 
-``owner_user_id`` is never NULL in the table: an org-scoped row stores ``""``
-and a user-scoped row installed without a user id (single-user mode) stores
-:data:`LOCAL_OWNER`, so ``ux_installed_skills_identity`` is unique on every
-engine and each visibility query is one range of the owner-ordered index.
+Every installed row belongs to a *principal* (``"org"``, ``"local"`` for the
+single local user, or ``"user:<id>"``), never absent, so each visibility
+query is one range of the principal-ordered index and the identity index is
+unique on every engine. A write that adds to a principal's set first locks
+that principal's row in ``skill_principals`` (``SELECT ... FOR UPDATE``;
+SQLite serializes through its immediate transaction), checks the budgets,
+and writes everything in that one transaction.
 """
 
 from __future__ import annotations
 
+import contextlib
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Sequence
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlInstalledSkill, SqlSkillSource, current_workspace_id
+from omnigent.db.db_models import (
+    SqlInstalledSkill,
+    SqlSkillPrincipal,
+    SqlSkillSource,
+    current_workspace_id,
+)
 from omnigent.db.enum_codecs import decode_installed_skill_scope, encode_installed_skill_scope
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -27,6 +36,7 @@ from omnigent.entities import InstalledSkill, SkillSource
 from omnigent.entities.skill import SkillScope
 from omnigent.stores.skill_store import (
     DEFAULT_PAGE,
+    MAX_DELIVERY_BYTES_PER_SCOPE,
     MAX_DESCRIPTION_CHARS,
     MAX_DISPLAY_NAME_CHARS,
     MAX_INSTALLED_PER_OWNER,
@@ -37,35 +47,44 @@ from omnigent.stores.skill_store import (
     MAX_REF_CHARS,
     MAX_URL_CHARS,
     MAX_USER_ID_CHARS,
+    InstallResult,
+    SkillInstall,
     SkillPage,
+    SkillQuotaError,
     SkillStore,
     SkillValueError,
     check_bound,
 )
 
-ORG_OWNER = ""
-# A user-scoped install with no user id (single-user mode); not a valid user id.
-LOCAL_OWNER = "*local"
+ORG_PRINCIPAL = "org"
+LOCAL_PRINCIPAL = "local"
+# git's own name for the remote's default branch: what a source without a ref fetches.
+DEFAULT_REF = "HEAD"
 # Names per IN-list, under every supported engine's parameter limit.
 _NAMES_PER_QUERY = 100
 
 
-def _owner_key(scope: SkillScope, owner_user_id: str | None) -> str:
+def principal_for(scope: SkillScope, owner_user_id: str | None) -> str:
+    """The principal a row belongs to; ``owner_user_id`` is ignored for the org."""
     if scope == "org":
-        return ORG_OWNER
-    return LOCAL_OWNER if owner_user_id is None else owner_user_id
+        return ORG_PRINCIPAL
+    return LOCAL_PRINCIPAL if owner_user_id is None else f"user:{owner_user_id}"
 
 
-def _visible_owner_keys(user_id: str | None) -> list[str]:
-    """The owner partitions a reader sees: the org's, plus their own."""
-    return [ORG_OWNER, LOCAL_OWNER if user_id is None else user_id]
+def _visible_principals(user_id: str | None) -> list[str]:
+    """The partitions a reader sees: the org's, plus their own."""
+    return [ORG_PRINCIPAL, principal_for("user", user_id)]
+
+
+def _who(scope: SkillScope) -> str:
+    return "everyone" if scope == "org" else "a user"
 
 
 def _source_entity(row: SqlSkillSource) -> SkillSource:
     return SkillSource(
         id=row.id,
         url=row.url,
-        ref=row.ref,
+        ref=None if row.ref == DEFAULT_REF else row.ref,
         name=row.name,
         created_by=row.created_by,
         created_at=row.created_at,
@@ -83,8 +102,9 @@ def _skill_entity(row: SqlInstalledSkill) -> InstalledSkill:
         commit=row.commit,
         path=row.path,
         scope="org" if decode_installed_skill_scope(row.scope) == "org" else "user",
-        owner_user_id=None if row.owner_user_id in (ORG_OWNER, LOCAL_OWNER) else row.owner_user_id,
+        owner_user_id=row.owner_user_id,
         bundle_location=row.bundle_location,
+        bundle_bytes=row.bundle_bytes,
         enabled=bool(row.enabled),
         installed_by=row.installed_by,
         installed_at=row.installed_at,
@@ -101,6 +121,15 @@ def _chunks(values: Iterable[str], size: int) -> Iterable[list[str]]:
             batch = []
     if batch:
         yield batch
+
+
+def _source_identity(url: str, ref: str | None):  # type: ignore[no-untyped-def]  # Select
+    """The lookup ``ux_skill_sources_identity`` serves."""
+    return select(SqlSkillSource).where(
+        SqlSkillSource.workspace_id == current_workspace_id(),
+        SqlSkillSource.url == url,
+        SqlSkillSource.ref == (DEFAULT_REF if ref is None else ref),
+    )
 
 
 class SqlAlchemySkillStore(SkillStore):
@@ -130,7 +159,7 @@ class SqlAlchemySkillStore(SkillStore):
             row = SqlSkillSource(
                 id=uuid.uuid4().hex,
                 url=url,
-                ref=ref,
+                ref=DEFAULT_REF if ref is None else ref,
                 name=name,
                 created_by=created_by,
                 created_at=now_epoch(),
@@ -139,7 +168,11 @@ class SqlAlchemySkillStore(SkillStore):
             session.flush()
             return _source_entity(row)
 
-        return run_write_transaction(self._session_immediate, "add_skill_source", write)
+        try:
+            return run_write_transaction(self._session_immediate, "add_skill_source", write)
+        except IntegrityError:
+            # Another replica seeded the same source first; it is the one row.
+            return run_write_transaction(self._session_immediate, "add_skill_source_retry", write)
 
     def find_source(self, url: str, ref: str | None) -> SkillSource | None:
         with self._session("find_skill_source") as session:
@@ -195,71 +228,143 @@ class SqlAlchemySkillStore(SkillStore):
 
     # ── installed skills ─────────────────────────────────────────────────
 
-    def install(
-        self,
-        *,
-        name: str,
-        display_name: str | None,
-        description: str,
-        source_url: str,
-        ref: str | None,
-        commit: str | None,
-        path: str,
-        scope: SkillScope,
-        owner_user_id: str | None,
-        bundle_location: str,
-        installed_by: str | None,
-    ) -> InstalledSkill:
-        owner = _owner_key(scope, owner_user_id)
-        check_bound("name", name, MAX_NAME_CHARS)
-        check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
-        check_bound("description", description, MAX_DESCRIPTION_CHARS)
-        check_bound("source_url", source_url, MAX_URL_CHARS)
-        check_bound("ref", ref, MAX_REF_CHARS)
-        check_bound("path", path, MAX_PATH_CHARS)
-        check_bound("owner_user_id", owner, MAX_USER_ID_CHARS)
-        check_bound("bundle_location", bundle_location, MAX_LOCATION_CHARS)
-        check_bound("installed_by", installed_by, MAX_USER_ID_CHARS)
-        identity = (
-            SqlInstalledSkill.workspace_id == current_workspace_id(),
-            SqlInstalledSkill.owner_user_id == owner,
-            SqlInstalledSkill.name == name,
-            SqlInstalledSkill.scope == encode_installed_skill_scope(scope),
+    def _ensure_principal(self, principal: str) -> None:
+        """Make sure the principal's lock row exists; a concurrent creator is fine."""
+
+        def write(session: Session) -> None:
+            if session.get(SqlSkillPrincipal, (current_workspace_id(), principal)) is None:
+                session.add(SqlSkillPrincipal(principal=principal, created_at=now_epoch()))
+                session.flush()
+
+        with contextlib.suppress(IntegrityError):
+            run_write_transaction(self._session_immediate, "ensure_skill_principal", write)
+
+    @staticmethod
+    def _lock_principal(session: Session, principal: str) -> None:
+        """Hold the principal's row until the transaction ends; engines without
+        row locks (SQLite) serialize through the immediate transaction instead."""
+        session.get(SqlSkillPrincipal, (current_workspace_id(), principal), with_for_update=True)
+
+    @staticmethod
+    def _enabled_bytes(session: Session, principal: str) -> int:
+        """Compressed bytes of the principal's enabled skills (a partition of at most the cap)."""
+        return int(
+            session.scalar(
+                select(func.coalesce(func.sum(SqlInstalledSkill.bundle_bytes), 0)).where(
+                    SqlInstalledSkill.workspace_id == current_workspace_id(),
+                    SqlInstalledSkill.principal == principal,
+                    SqlInstalledSkill.enabled.is_(True),
+                )
+            )
+            or 0
         )
 
-        def write(session: Session) -> InstalledSkill:
-            # Reinstalling replaces the row in place so the id stays stable.
-            row = session.scalar(select(SqlInstalledSkill).where(*identity))
-            now = now_epoch()
-            if row is None:
-                row = SqlInstalledSkill(
-                    id=uuid.uuid4().hex,
-                    name=name,
-                    scope=encode_installed_skill_scope(scope),
-                    owner_user_id=owner,
-                    enabled=True,
-                    installed_by=installed_by,
-                    installed_at=now,
-                )
-                session.add(row)
-            else:
-                row.updated_at = now
-            row.display_name = display_name
-            row.description = description
-            row.source_url = source_url
-            row.ref = ref
-            row.commit = commit
-            row.path = path
-            row.bundle_location = bundle_location
-            session.flush()
-            return _skill_entity(row)
+    def install_many(
+        self,
+        items: Sequence[SkillInstall],
+        *,
+        scope: SkillScope,
+        owner_user_id: str | None,
+        installed_by: str | None,
+        max_rows: int | None = None,
+        max_bytes: int | None = None,
+    ) -> list[InstallResult]:
+        max_rows = MAX_INSTALLED_PER_OWNER if max_rows is None else max_rows
+        max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
+        principal = principal_for(scope, owner_user_id)
+        owner = owner_user_id if scope == "user" else None
+        check_bound("owner_user_id", owner, MAX_USER_ID_CHARS)
+        check_bound("installed_by", installed_by, MAX_USER_ID_CHARS)
+        for item in items:
+            check_bound("name", item.name, MAX_NAME_CHARS)
+            check_bound("display_name", item.display_name, MAX_DISPLAY_NAME_CHARS)
+            check_bound("description", item.description, MAX_DESCRIPTION_CHARS)
+            check_bound("source_url", item.source_url, MAX_URL_CHARS)
+            check_bound("ref", item.ref, MAX_REF_CHARS)
+            check_bound("path", item.path, MAX_PATH_CHARS)
+            check_bound("bundle_location", item.bundle_location, MAX_LOCATION_CHARS)
+        if len({item.name for item in items}) != len(items):
+            raise SkillValueError("a skill name is repeated in one install")
+        self._ensure_principal(principal)
 
-        try:
-            return run_write_transaction(self._session_immediate, "install_skill", write)
-        except IntegrityError:
-            # A concurrent install of the same identity won the insert; the
-            # retry finds that row and replaces it in place.
-            return run_write_transaction(self._session_immediate, "install_skill_retry", write)
+        def write(session: Session) -> list[InstallResult]:
+            self._lock_principal(session, principal)
+            existing = {
+                row.name: row
+                for row in session.scalars(
+                    select(SqlInstalledSkill).where(
+                        SqlInstalledSkill.workspace_id == current_workspace_id(),
+                        SqlInstalledSkill.principal == principal,
+                        SqlInstalledSkill.name.in_([item.name for item in items]),
+                    )
+                )
+            }
+            held = len(
+                session.scalars(
+                    select(SqlInstalledSkill.id)
+                    .where(
+                        SqlInstalledSkill.workspace_id == current_workspace_id(),
+                        SqlInstalledSkill.principal == principal,
+                    )
+                    .limit(max_rows + 1)
+                ).all()
+            )
+            adding = [item for item in items if item.name not in existing]
+            if held + len(adding) > max_rows:
+                raise SkillQuotaError(
+                    f"At most {max_rows} skills can be installed for {_who(scope)}; "
+                    "remove some first."
+                )
+            # A replaced row keeps its enabled flag; only enabled bytes count.
+            after = self._enabled_bytes(session, principal)
+            for item in items:
+                row = existing.get(item.name)
+                if row is None:
+                    after += item.bundle_bytes
+                elif row.enabled:
+                    after += item.bundle_bytes - row.bundle_bytes
+            if after > max_bytes:
+                raise SkillQuotaError(
+                    f"Installed skills for {_who(scope)} would exceed "
+                    f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
+                )
+            now = now_epoch()
+            results: list[InstallResult] = []
+            for item in items:
+                row = existing.get(item.name)
+                replaced = None
+                if row is None:
+                    row = SqlInstalledSkill(
+                        id=uuid.uuid4().hex,
+                        name=item.name,
+                        scope=encode_installed_skill_scope(scope),
+                        principal=principal,
+                        owner_user_id=owner,
+                        enabled=True,
+                        installed_by=installed_by,
+                        installed_at=now,
+                    )
+                    session.add(row)
+                else:
+                    replaced = (
+                        row.bundle_location
+                        if row.bundle_location != item.bundle_location
+                        else None
+                    )
+                    row.updated_at = now
+                row.display_name = item.display_name
+                row.description = item.description
+                row.source_url = item.source_url
+                row.ref = item.ref
+                row.commit = item.commit
+                row.path = item.path
+                row.bundle_location = item.bundle_location
+                row.bundle_bytes = item.bundle_bytes
+                session.flush()
+                results.append(InstallResult(skill=_skill_entity(row), replaced_location=replaced))
+            return results
+
+        return run_write_transaction(self._session_immediate, "install_skills", write)
 
     def get(self, skill_id: str) -> InstalledSkill | None:
         with self._session("get_installed_skill") as session:
@@ -269,11 +374,11 @@ class SqlAlchemySkillStore(SkillStore):
     def list_for_user(
         self, user_id: str | None, *, limit: int = DEFAULT_PAGE, after: str | None = None
     ) -> SkillPage[InstalledSkill]:
-        """Merge one bounded keyset read per visible owner partition.
+        """Merge one bounded keyset read per visible principal.
 
-        Each partition is a single range of ``ix_installed_skills_owner_order``
-        (``workspace_id, owner_user_id, installed_at, id``), so the rows
-        scanned are at most ``2 * (limit + 1)``.
+        Each partition is a single range of ``ix_installed_skills_principal_order``
+        (``workspace_id, principal, installed_at, id``), so the rows scanned
+        are at most ``2 * (limit + 1)``.
         """
         limit = max(1, min(limit, MAX_PAGE))
         with self._session("list_installed_skills") as session:
@@ -283,12 +388,12 @@ class SqlAlchemySkillStore(SkillStore):
                 if cursor is None:
                     raise SkillValueError("unknown cursor")
             rows: list[SqlInstalledSkill] = []
-            for owner in _visible_owner_keys(user_id):
+            for principal in _visible_principals(user_id):
                 stmt = (
                     select(SqlInstalledSkill)
                     .where(
                         SqlInstalledSkill.workspace_id == current_workspace_id(),
-                        SqlInstalledSkill.owner_user_id == owner,
+                        SqlInstalledSkill.principal == principal,
                     )
                     .order_by(SqlInstalledSkill.installed_at, SqlInstalledSkill.id)
                     .limit(limit + 1)
@@ -317,21 +422,20 @@ class SqlAlchemySkillStore(SkillStore):
             for batch in _chunks(sorted(set(names)), _NAMES_PER_QUERY):
                 stmt = select(SqlInstalledSkill).where(
                     SqlInstalledSkill.workspace_id == current_workspace_id(),
-                    SqlInstalledSkill.owner_user_id.in_(_visible_owner_keys(user_id)),
+                    SqlInstalledSkill.principal.in_(_visible_principals(user_id)),
                     SqlInstalledSkill.name.in_(batch),
                 )
                 found.extend(_skill_entity(row) for row in session.scalars(stmt))
         return found
 
     def count_installed(self, scope: SkillScope, owner_user_id: str | None) -> int:
-        """Rows of one scope in one owner partition, read no further than the cap."""
+        """Rows of one principal, read no further than the cap."""
         with self._session("count_installed_skills") as session:
             stmt = (
                 select(SqlInstalledSkill.id)
                 .where(
                     SqlInstalledSkill.workspace_id == current_workspace_id(),
-                    SqlInstalledSkill.owner_user_id == _owner_key(scope, owner_user_id),
-                    SqlInstalledSkill.scope == encode_installed_skill_scope(scope),
+                    SqlInstalledSkill.principal == principal_for(scope, owner_user_id),
                 )
                 .limit(MAX_INSTALLED_PER_OWNER + 1)
             )
@@ -343,10 +447,13 @@ class SqlAlchemySkillStore(SkillStore):
         *,
         commit: str | None,
         bundle_location: str,
+        bundle_bytes: int,
         description: str,
         display_name: str | None,
         path: str | None = None,
+        max_bytes: int | None = None,
     ) -> InstalledSkill | None:
+        max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
         check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
         check_bound("description", description, MAX_DESCRIPTION_CHARS)
         check_bound("bundle_location", bundle_location, MAX_LOCATION_CHARS)
@@ -356,8 +463,19 @@ class SqlAlchemySkillStore(SkillStore):
             row = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
             if row is None:
                 return None
+            self._lock_principal(session, row.principal)
+            if row.enabled:
+                after = (
+                    self._enabled_bytes(session, row.principal) - row.bundle_bytes + bundle_bytes
+                )
+                if after > max_bytes:
+                    raise SkillQuotaError(
+                        f"Updating {row.name} would take the installed skills past "
+                        f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
+                    )
             row.commit = commit
             row.bundle_location = bundle_location
+            row.bundle_bytes = bundle_bytes
             row.description = description
             row.display_name = display_name
             if path is not None:
@@ -368,11 +486,23 @@ class SqlAlchemySkillStore(SkillStore):
 
         return run_write_transaction(self._session_immediate, "update_installed_skill", write)
 
-    def set_enabled(self, skill_id: str, enabled: bool) -> InstalledSkill | None:
+    def set_enabled(
+        self, skill_id: str, enabled: bool, *, max_bytes: int | None = None
+    ) -> InstalledSkill | None:
+        max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
+
         def write(session: Session) -> InstalledSkill | None:
             row = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
             if row is None:
                 return None
+            if enabled and not row.enabled:
+                self._lock_principal(session, row.principal)
+                after = self._enabled_bytes(session, row.principal) + row.bundle_bytes
+                if after > max_bytes:
+                    raise SkillQuotaError(
+                        f"Enabling {row.name} would take the installed skills past "
+                        f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
+                    )
             row.enabled = enabled
             row.updated_at = now_epoch()
             session.flush()
@@ -390,12 +520,3 @@ class SqlAlchemySkillStore(SkillStore):
             return entity
 
         return run_write_transaction(self._session_immediate, "delete_installed_skill", write)
-
-
-def _source_identity(url: str, ref: str | None):  # type: ignore[no-untyped-def]  # Select
-    """The lookup ``ix_skill_sources_identity`` serves."""
-    return select(SqlSkillSource).where(
-        SqlSkillSource.workspace_id == current_workspace_id(),
-        SqlSkillSource.url == url,
-        SqlSkillSource.ref.is_(None) if ref is None else SqlSkillSource.ref == ref,
-    )

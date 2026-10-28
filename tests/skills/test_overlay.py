@@ -121,3 +121,24 @@ def test_overlay_bytes_do_not_depend_on_the_clock(monkeypatch: pytest.MonkeyPatc
     second = overlay_skills(BUNDLE, [("review", SKILL)])
     assert first == second
     assert _names(first) == _names(second) and "skills/review/SKILL.md" in _names(first)
+
+
+def test_overlay_targets_a_child_agents_directory() -> None:
+    # A session running a child reads skills from agents/<dir>/skills, not the root.
+    bundle = _tar(
+        {
+            "config.yaml": b"name: a\n",
+            "agents/child/config.yaml": b"name: child\n",
+            "agents/child/skills/own/SKILL.md": b"---\nname: own\n---\n",
+        }
+    )
+    merged = overlay_skills(bundle, [("review", SKILL), ("own", SKILL)], prefix="agents/child/")
+    assert _names(merged) == [
+        "agents/child/config.yaml",
+        "agents/child/skills/own/SKILL.md",
+        "agents/child/skills/review/SKILL.md",
+        "agents/child/skills/review/notes.txt",
+        "config.yaml",
+    ]
+    assert bundle_skill_names(merged, prefix="agents/child/") == {"own", "review"}
+    assert bundle_skill_names(merged) == set()

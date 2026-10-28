@@ -26,6 +26,7 @@ import {
   useInstalledSkillContent,
   useInstalledSkills,
   usePreviewCatalog,
+  useRefreshCatalog,
   useSetInstalledSkillEnabled,
   useSkillSources,
   useSourceCatalog,
@@ -256,6 +257,7 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
   );
   const activeId = selectedId ?? list[0]?.id;
   const catalog = useSourceCatalog(preview ? undefined : activeId, true);
+  const refresh = useRefreshCatalog();
   const shown = preview ?? catalog.data ?? null;
 
   return (
@@ -339,7 +341,15 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
         )}
         {!preview && catalog.isPending && activeId && <Loading label="Fetching the catalog" />}
         {!preview && catalog.isError && <ErrorLine error={catalog.error} />}
-        {shown && <CatalogGrid catalog={shown} isAdmin={isAdmin} />}
+        {!preview && refresh.error && <ErrorLine error={refresh.error} />}
+        {shown && (
+          <CatalogGrid
+            catalog={shown}
+            isAdmin={isAdmin}
+            onRefresh={!preview && activeId ? () => refresh.mutate(activeId) : undefined}
+            refreshing={refresh.isPending}
+          />
+        )}
       </section>
     </div>
   );
@@ -348,16 +358,19 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
 function DeleteSourceButton({ id, name }: { id: string; name: string }) {
   const remove = useDeleteSkillSource();
   return (
-    <Button
-      variant="ghost"
-      size="icon"
-      aria-label={`Remove source ${name}`}
-      disabled={remove.isPending}
-      onClick={() => remove.mutate(id)}
-      componentId="settings.skills.source_remove"
-    >
-      <TrashIcon />
-    </Button>
+    <>
+      <Button
+        variant="ghost"
+        size="icon"
+        aria-label={`Remove source ${name}`}
+        disabled={remove.isPending}
+        onClick={() => remove.mutate(id)}
+        componentId="settings.skills.source_remove"
+      >
+        <TrashIcon />
+      </Button>
+      {remove.error && <ErrorLine error={remove.error} />}
+    </>
   );
 }
 
@@ -456,10 +469,28 @@ function AddFromUrlForm({ onPreview }: { onPreview: (catalog: SkillCatalog) => v
   );
 }
 
-function CatalogGrid({ catalog, isAdmin }: { catalog: SkillCatalog; isAdmin: boolean }) {
+function CatalogGrid({
+  catalog,
+  isAdmin,
+  onRefresh,
+  refreshing = false,
+}: {
+  catalog: SkillCatalog;
+  isAdmin: boolean;
+  onRefresh?: () => void;
+  refreshing?: boolean;
+}) {
   const install = useInstallSkills();
   const [search, setSearch] = useState("");
   const [scope, setScope] = useState<SkillScope>("user");
+  // Installs made from this catalog view (a URL preview is local state and
+  // never refetched), keyed by name and scope.
+  const [justInstalled, setJustInstalled] = useState<Set<string>>(() => new Set());
+  const installedIn = (skill: CatalogSkill, target: SkillScope) =>
+    justInstalled.has(`${skill.name}:${target}`) ||
+    (skill.installed_scopes
+      ? skill.installed_scopes.includes(target)
+      : skill.installed_id !== null);
   const term = search.trim().toLowerCase();
   const skills = useMemo(
     () =>
@@ -471,7 +502,12 @@ function CatalogGrid({ catalog, isAdmin }: { catalog: SkillCatalog; isAdmin: boo
     [catalog.skills, term],
   );
   const installOne = (skill: CatalogSkill) =>
-    install.mutate({ source: catalog.url, ref: catalog.ref, names: [skill.name], scope });
+    install.mutate(
+      { source: catalog.url, ref: catalog.ref, names: [skill.name], scope },
+      {
+        onSuccess: () => setJustInstalled((prev) => new Set(prev).add(`${skill.name}:${scope}`)),
+      },
+    );
 
   return (
     <div className="flex flex-col gap-3" data-testid="skill-catalog">
@@ -506,6 +542,18 @@ function CatalogGrid({ catalog, isAdmin }: { catalog: SkillCatalog; isAdmin: boo
             at <code>{shortCommit(catalog.commit)}</code>
           </span>
         )}
+        {onRefresh && (
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={refreshing}
+            onClick={onRefresh}
+            componentId="settings.skills.catalog_refresh"
+          >
+            <RefreshCwIcon className={refreshing ? "animate-spin" : undefined} />
+            Refresh
+          </Button>
+        )}
       </div>
       {install.error && <ErrorLine error={install.error} />}
       {skills.length === 0 ? (
@@ -530,8 +578,10 @@ function CatalogGrid({ catalog, isAdmin }: { catalog: SkillCatalog; isAdmin: boo
               <span className="text-ui text-muted-foreground">{skill.description}</span>
               <div className="mt-auto flex items-center justify-between gap-2 text-xs text-muted-foreground">
                 <code className="truncate">{skill.path}</code>
-                {skill.installed_id ? (
-                  <Badge variant="secondary">Installed</Badge>
+                {installedIn(skill, scope) ? (
+                  <Badge variant="secondary">
+                    {scope === "org" ? "Installed for everyone" : "Installed"}
+                  </Badge>
                 ) : (
                   <Button
                     size="sm"

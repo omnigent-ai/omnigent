@@ -26,7 +26,7 @@ from omnigent.server.skill_injection import (
     SkillDeliveryError,
     bundle_spec,
     effective_installed_skills,
-    session_spec,
+    session_target,
     skill_allowed,
 )
 from omnigent.skills.git_source import repository_label
@@ -123,9 +123,9 @@ def create_skills_router(
                 installed_owner = await asyncio.to_thread(
                     get_session_owner_id, conv.id, permission_store
                 )
-                installed_spec = session_spec(
+                installed_spec = session_target(
                     await asyncio.to_thread(bundle_spec, agent_cache, agent), sub_agent_name
-                )
+                ).spec
         else:
             if host_id is None or harness is None or path is None:
                 raise HTTPException(
@@ -188,16 +188,16 @@ def create_skills_router(
         if spec is not None and result.agent_id != agent_id:
             raise HTTPException(status_code=502, detail="update the host to discover agent skills")
         skills = [SkillSummary.model_validate(skill) for skill in result.skills]
+        # Hidden bundled skills also reserve their names against collisions.
+        bundled = {skill.name for skill in spec.skills} if spec is not None else set()
         if spec is not None:
-            # Hidden bundled skills also reserve their names against host collisions.
-            reserved = {skill.name for skill in spec.skills}
             skills = [
                 SkillSummary(
                     name=skill.name, description=skill.description, display_name=skill.display_name
                 )
                 for skill in spec.skills
                 if skill.user_invocable
-            ] + [skill for skill in skills if skill.name not in reserved]
+            ] + [skill for skill in skills if skill.name not in bundled]
         if skill_store is not None:
             try:
                 installed = await asyncio.to_thread(
@@ -208,9 +208,12 @@ def create_skills_router(
                 )
             except SkillDeliveryError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from None
-            skills += installed_skill_summaries(
-                installed, installed_spec, {s.name for s in skills}
-            )
+            # Runtime precedence is bundle, then installed, then host: an
+            # installed skill is delivered as bundle content and shadows the
+            # host's, so the menu shows the installed one.
+            added = installed_skill_summaries(installed, installed_spec, bundled)
+            shadowed = {skill.name for skill in added}
+            skills = [skill for skill in skills if skill.name not in shadowed] + added
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router
@@ -267,18 +270,18 @@ async def request_host_skills(
 
 
 def installed_skill_summaries(
-    installed: list[InstalledSkill], spec: AgentSpec | None, taken: set[str]
+    installed: list[InstalledSkill], spec: AgentSpec | None, bundled: set[str]
 ) -> list[SkillSummary]:
-    """Installed skills the menu should list: allowed by the spec and not shadowed.
+    """Installed skills the menu should list: allowed by the spec and not bundled.
 
     *installed* is already enabled-only and one per name
-    (:func:`effective_installed_skills`).
+    (:func:`effective_installed_skills`); a bundled skill of the same name
+    wins, a host skill of the same name loses.
     """
     out: list[SkillSummary] = []
     for skill in installed:
-        if skill.name in taken or not skill_allowed(spec, skill.name):
+        if skill.name in bundled or not skill_allowed(spec, skill.name):
             continue
-        taken.add(skill.name)
         out.append(
             SkillSummary(
                 name=skill.name,

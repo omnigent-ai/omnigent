@@ -43,6 +43,7 @@ class InstalledSkill:
     :param scope: ``"user"`` for one user's install, ``"org"`` for everyone.
     :param owner_user_id: The installing user for a user-scoped row, else ``None``.
     :param bundle_location: Artifact-store key of the skill tarball.
+    :param bundle_bytes: Size of that tarball, counted against the owner's delivery budget.
     :param enabled: Whether sessions receive it.
     :param installed_by: User who installed it, or ``None`` in single-user mode.
     :param installed_at: Unix epoch seconds.
@@ -60,6 +61,7 @@ class InstalledSkill:
     scope: SkillScope
     owner_user_id: str | None
     bundle_location: str
+    bundle_bytes: int
     enabled: bool
     installed_by: str | None
     installed_at: int

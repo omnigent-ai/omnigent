@@ -56,10 +56,18 @@ include them.
   it (a managed host, or the owner's own host); someone the session is
   shared with downloads the agent's own files without them, and sees the
   owner's installs, not their own, in that session's slash menu.
-- Each user can hold at most 200 installed skills, and so can **Everyone**,
-  so a session's bundle is built from a known number of rows; a bundle whose
-  installed skills would exceed 200 MB together is refused with a message
-  rather than silently thinned.
+- Each user can hold at most 200 installed skills and 100 MB of enabled
+  skill tarballs, and so can **Everyone**; the limits are checked when a
+  skill is installed, updated or enabled, under one lock per owner, so two
+  requests cannot overrun them and a session's bundle (one user's set plus
+  Everyone's) always fits. An install of several skills is all or nothing.
+  Delivery keeps a 200 MB backstop that answers with a message rather than
+  a thinner bundle.
+- A session that runs a child agent gets installed skills under that child's
+  own directory (`agents/<dir>/skills/`), under the child's `skills:` filter,
+  since that is where the runner reads the child's skills from.
+- Before launch the menu follows runtime precedence: a bundled skill wins its
+  name, then an installed skill, then a host skill of the same name.
 - Only administrators add or remove browsable sources. Deleting a source does
   not remove skills already installed from it.
 - Anyone can preview a repository by URL and install from it for themselves,
@@ -133,10 +141,13 @@ The server's clone runs with an empty temporary home and no inherited git,
 ssh or gpg settings, so neither git nor libcurl can find the operator's
 `.netrc`, `.config/git` or credential helpers: a user cannot reach a private
 repository through the operator's credentials, only through a token the
-[operator policy](#operator-policy) scopes to it. Limits are checked while
-packing, before more is read: at most 20 skills per request, 20 MB and 2,000
-files per skill, 100 MB per request, and two fetches at a time; a catalog
-holds at most 500 skills and the server keeps at most 64 catalogs in memory.
+[operator policy](#operator-policy) scopes to it. A clone is killed once it
+writes more than 500 MB to disk, each account has one fetch in flight at a
+time and the server two. Packaging limits are checked while packing, before
+more is read: at most 20 skills per request, 20 MB and 2,000 files per
+skill, and 100 MB of compressed tarballs per request (the stored and
+delivered form). A catalog opens at most 500 manifests, whatever the
+repository holds, and the server keeps at most 64 catalogs in memory.
 Repository metadata that would not fit its column is rejected before
 anything is stored, and the served bundle is rebuilt with a fixed timestamp
 so the same skills give the same bytes and the runner's cache hits.
