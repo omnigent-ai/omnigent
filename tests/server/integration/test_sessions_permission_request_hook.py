@@ -2635,6 +2635,29 @@ async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
         pending_elicitations.reset_for_tests()
 
 
+async def test_card_cleared_elsewhere_ends_terminal_hold(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hold stops waiting mid-turn once another path has cleared its card."""
+    from omnigent.runtime import pending_elicitations
+
+    session_id, _payload, collector = await _sever_hook_mid_turn(
+        client, monkeypatch, "test-terminal-fallback-cleared-elsewhere"
+    )
+    try:
+        waiting = await _next_elicitation_event(collector)
+        assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
+
+        pending_elicitations.resolve(session_id, _REATTACH_ELICITATION_ID)
+        await _finish_deferred_clears()
+        assert sessions_route._session_status_cache.get(session_id) == "running"
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+    finally:
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
 async def test_reattach_id_waiting_in_terminal_rejected_for_other_session(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2796,38 +2819,48 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
         pending_elicitations.reset_for_tests()
 
 
-@pytest.mark.parametrize("waiting_in_terminal", [True, False])
+@pytest.mark.parametrize(
+    ("waiting_in_terminal", "delete_parent"), [(True, False), (False, False), (True, True)]
+)
 async def test_deleting_session_releases_prompt_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     waiting_in_terminal: bool,
+    delete_parent: bool,
 ) -> None:
     """
-    A deleted session's status can stay mid-turn, so delete ends its terminal hold.
+    A deleted session's status can stay mid-turn, so deleting it or an ancestor ends its hold.
 
     Deleting during the re-park grace or the hold also clears the surviving parent's mirror.
     """
     from omnigent.runtime import pending_elicitations
 
-    parent_agent = await create_test_agent(
-        client, f"test-terminal-fallback-deleted-parent-{waiting_in_terminal}"
-    )
+    name = f"test-terminal-fallback-deleted-{waiting_in_terminal}-{delete_parent}"
+    parent_agent = await create_test_agent(client, f"{name}-parent")
     parent_id = await _create_session(client, parent_agent["id"])
+    parent_collector = await start_session_stream_collector(parent_id)
     session_id, _payload, collector = await _sever_hook_mid_turn(
         client,
         monkeypatch,
-        f"test-terminal-fallback-deleted-{waiting_in_terminal}",
+        name,
         grace_s=0.2 if waiting_in_terminal else 2.0,
         parent_session_id=parent_id,
     )
     try:
         unparked = _harness_unparked_elicitations[_REATTACH_ELICITATION_ID]
+        mirrored = await _next_elicitation_event(parent_collector)
+        assert "terminal_fallback" not in mirrored["params"]
         if waiting_in_terminal:
             waiting = await _next_elicitation_event(collector)
             assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
-        assert pending_elicitations.count_for(parent_id) == 1
+            mirrored = await _next_elicitation_event(parent_collector)
+            assert mirrored["params"]["terminal_fallback"] == {"answer_undelivered": False}
+        parent_cards = pending_elicitations.snapshot_for(parent_id)
+        assert [card["params"].get("terminal_fallback") for card in parent_cards] == [
+            {"answer_undelivered": False} if waiting_in_terminal else None
+        ]
 
-        deleted = await client.delete(f"/v1/sessions/{session_id}")
+        deleted = await client.delete(f"/v1/sessions/{parent_id if delete_parent else session_id}")
         assert deleted.status_code == 200, deleted.text
         assert sessions_route._session_status_cache.get(session_id) == "running"
         await _finish_deferred_clears()
@@ -2837,6 +2870,7 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         assert pending_elicitations.count_for(parent_id) == 0
     finally:
         await collector.stop()
+        await parent_collector.stop()
         pending_elicitations.reset_for_tests()
 
 

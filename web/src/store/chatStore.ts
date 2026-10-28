@@ -5470,7 +5470,7 @@ async function reconcileActiveSessionStatus(
   }
 }
 
-/** Whether a re-publish moves a prompt into or out of the terminal hold, or re-holds it. */
+/** Whether a re-publish enters or leaves the terminal hold, or flips `answerUndelivered`. */
 function terminalHoldChanged(incoming: ElicitationBlock, current: ElicitationBlock): boolean {
   return (
     incoming.terminalFallback?.answerUndelivered !== current.terminalFallback?.answerUndelivered
@@ -5535,7 +5535,7 @@ function reconcileElicitationBlocks(
       changed = true;
       return { ...currentDelivery, ctx: b.ctx };
     }
-    // The prompt moved between chat and the agent's terminal, or was re-held, during the gap.
+    // During the gap the prompt entered or left the terminal hold, or flipped `answerUndelivered`.
     if (
       currentDelivery &&
       terminalHoldChanged(currentDelivery, b) &&
@@ -7042,8 +7042,9 @@ export async function pumpStreamEvents(
           if (
             block.nativeDelivery ||
             terminalHoldChanged(block, buffer[buffered] as ElicitationBlock)
-          )
+          ) {
             buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
+          }
           continue;
         }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
