@@ -637,6 +637,11 @@ _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
 # Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+# ``false`` is the widest JSON value ``runner_online`` can take, so sizing pages
+# with it keeps the output budget valid after real values are filled in.
+_RUNNER_ONLINE_SIZING_PLACEHOLDER = False
+# Max concurrent ``GET /v1/runners/{id}/status`` lookups per ``sys_session_list``.
+_RUNNER_STATUS_CONCURRENCY = 8
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
 # Match the existing default ceiling for ``sys_os_shell`` output. Discovery
@@ -6025,7 +6030,7 @@ async def _session_list_via_rest(
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
     )
-    return _bounded_discovery_result(
+    result = _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
         limit=limit,
         cursor_state=cursor_state,
@@ -6035,6 +6040,33 @@ async def _session_list_via_rest(
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
+    return await _fill_returned_runner_online(result, server_client)
+
+
+async def _fill_returned_runner_online(result: str, server_client: httpx.AsyncClient) -> str:
+    """
+    Resolve ``runner_online`` for the session rows the tool actually returns.
+
+    The global view fetches up to :data:`_AGENT_LIST_PAGE_LIMIT` sessions but
+    the output budget usually keeps far fewer, so resolving before paging
+    fired one status call per runner across the whole fetch. Rows are sized
+    with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`, the widest value, so
+    the chosen page stays within the budget once real values replace it.
+
+    :param result: Serialized ``sys_session_list`` result from
+        :func:`_bounded_discovery_result`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The same result with each returned row's ``runner_online``
+        resolved; error results pass through unchanged.
+    """
+    payload = json.loads(result)
+    rows = payload.get("sessions")
+    if not isinstance(rows, list) or not rows:
+        return result
+    online = await _resolve_runner_online_map(rows, server_client)
+    for row in rows:
+        row["runner_online"] = online.get(_optional_string(row.get("runner_id")) or "")
+    return json.dumps(payload)
 
 
 async def _open_file_via_rest(
@@ -6238,9 +6270,15 @@ async def _resolve_runner_online_map(
         if isinstance(rid, str) and rid and rid not in seen:
             seen.add(rid)
             unique_ids.append(rid)
-    results = await asyncio.gather(
-        *(_runner_online_or_none(rid, server_client) for rid in unique_ids)
-    )
+    # Spread the lookups so one tool call can't burst the server (and the
+    # caller's per-user rate limit) with a status call per runner at once.
+    concurrency = asyncio.Semaphore(_RUNNER_STATUS_CONCURRENCY)
+
+    async def _bounded_lookup(runner_id: str) -> bool | None:
+        async with concurrency:
+            return await _runner_online_or_none(runner_id, server_client)
+
+    results = await asyncio.gather(*(_bounded_lookup(rid) for rid in unique_ids))
     # strict=True: results is gathered in unique_ids order, so lengths
     # match by construction — assert it rather than silently truncating.
     return dict(zip(unique_ids, results, strict=True))
@@ -6254,12 +6292,13 @@ async def _collect_global_sessions(
     limit: int,
 ) -> _DiscoveryPage:
     """
-    Fetch the global session list via ``GET /v1/sessions``, with connectivity.
+    Fetch the global session list via ``GET /v1/sessions``.
 
     Projects each accessible session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id}``.
-    ``runner_online`` is resolved once per unique bound runner (see
-    :func:`_resolve_runner_online_map`). An optional ``agent_name``
+    ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
+    :func:`_fill_returned_runner_online` resolves it for the rows that
+    survive paging. An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
@@ -6290,7 +6329,6 @@ async def _collect_global_sessions(
     if page.failed:
         return page
     rows = page.rows
-    online = await _resolve_runner_online_map(rows, server_client)
     return _DiscoveryPage(
         [
             {
@@ -6303,7 +6341,7 @@ async def _collect_global_sessions(
                 "title": r.get("title"),
                 "status": r.get("status"),
                 "runner_id": r.get("runner_id"),
-                "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                "runner_online": _RUNNER_ONLINE_SIZING_PLACEHOLDER,
                 "parent_session_id": r.get("parent_session_id"),
                 "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
                     CREATED_BY_SESSION_LABEL_KEY
