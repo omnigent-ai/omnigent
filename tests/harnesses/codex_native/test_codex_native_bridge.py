@@ -31,6 +31,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_timeout,
     read_bridge_state,
     read_certificate_failure,
+    read_child_usage_baselines,
     read_codex_config_effort,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -39,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_policy_hook_config,
     record_app_server_stopped,
     record_certificate_failure,
+    record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -548,6 +550,32 @@ def test_clear_active_turn_id_if_matches(
     assert state.active_turn_id == expected_active_after
 
 
+@pytest.mark.parametrize(
+    ("active_turn_id", "next_turn_id"),
+    [(None, None), ("turn_a", "turn_a"), (None, "turn_a"), ("turn_a", "turn_b"), ("turn_a", None)],
+)
+def test_active_turn_update_requires_storage_only_when_state_changes(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_turn_id: str | None,
+    next_turn_id: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, active_turn_id)
+    before = read_bridge_state(bridge_dir)
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(codex_native_bridge.tempfile, "mkstemp", disk_full)
+    if active_turn_id == next_turn_id:
+        update_active_turn_id(bridge_dir, next_turn_id)
+    else:
+        with pytest.raises(OSError) as raised:
+            update_active_turn_id(bridge_dir, next_turn_id)
+        assert raised.value.errno == errno.ENOSPC
+    assert read_bridge_state(bridge_dir) == before
+
+
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
     """
     With no bridge state on disk, clearing reports cleared and runs ``on_cleared``.
@@ -983,6 +1011,45 @@ def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     clear_bridge_state(bridge_dir)
 
     assert read_mcp_startup(bridge_dir) == {}
+
+
+@pytest.mark.parametrize(
+    ("patched_owner", "patched_name"),
+    [(Path, "open"), (codex_native_bridge.tempfile, "mkstemp")],
+    ids=["read-fails", "write-fails"],
+)
+def test_child_usage_baseline_storage_failure_keeps_recorded_baselines(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    patched_owner: object,
+    patched_name: str,
+) -> None:
+    """
+    A failed read or write while recording one child keeps the others' baselines
+    and is logged, so a restarted forwarder still subtracts their inherited usage.
+    """
+    record_child_usage_baseline(bridge_dir, "thread_forked", (5000, 4000, 100))
+    record_child_usage_baseline(bridge_dir, "thread_fresh", (0, 0, 0))
+
+    def storage_error(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    with (
+        monkeypatch.context() as patch,
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.bridge"),
+    ):
+        patch.setattr(patched_owner, patched_name, storage_error)
+        record_child_usage_baseline(bridge_dir, "thread_new", (300, 0, 30))
+
+    assert read_child_usage_baselines(bridge_dir) == {
+        "thread_forked": (5000, 4000, 100),
+        "thread_fresh": (0, 0, 0),
+    }
+    assert any(
+        "Could not record inherited Codex child usage" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

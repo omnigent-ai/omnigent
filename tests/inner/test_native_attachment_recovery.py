@@ -14,6 +14,46 @@ from omnigent.inner import native_attachments
 
 
 @pytest.mark.asyncio
+async def test_resolve_compaction_snapshot_attachments() -> None:
+    """Rebuilt snapshots read attachments and retain references whose reads fail."""
+    paths: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("/missing-file"):
+            return httpx.Response(404)
+        if request.url.path.endswith("/content"):
+            return httpx.Response(200, content=b"synthetic attachment")
+        return httpx.Response(200, json={"content_type": "text/plain", "name": "notes.txt"})
+
+    blocks = [
+        {"type": "input_file", "file_id": "fork-file"},
+        {"type": "input_file", "file_id": "missing-file"},
+        {"type": "input_text", "text": "Read the attachments"},
+    ]
+    snapshot = {"type": "message", "role": "user", "content": blocks}
+    items = [{"type": "compaction", "summary": "Read", "compacted_messages": [snapshot]}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="https://example.test"
+    ) as client:
+        result = await native_attachments.resolve_session_item_file_references(
+            client, session_id="fork-session", items=items
+        )
+
+    assert result is items
+    assert paths == [
+        "/v1/sessions/fork-session/resources/files/fork-file",
+        "/v1/sessions/fork-session/resources/files/fork-file/content",
+        "/v1/sessions/fork-session/resources/files/missing-file",
+    ]
+    resolved = snapshot["content"]
+    assert base64.b64decode(resolved[0]["file_data"].split(",", 1)[1]) == b"synthetic attachment"
+    assert resolved[0]["filename"] == "notes.txt"
+    assert "file_id" not in resolved[0]
+    assert resolved[1:] == blocks[1:]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["metadata", "content"])
 @pytest.mark.parametrize("failure", ["timeout", 502, 503, 504])
 async def test_transient_attachment_read_recovers(

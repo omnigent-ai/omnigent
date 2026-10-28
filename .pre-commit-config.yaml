@@ -4,6 +4,11 @@
 # A built web-UI bundle may be committed at this path (vendored, minified
 # JS/CSS) — never lint or "fix" it.
 exclude: ^omnigent/server/static/web-ui/
+# `pre-commit install` (run by `just ensure`) wires both stages: the hooks run on
+# each commit, and again on push over the commits being pushed, so a commit made
+# with --no-verify or before the hooks were installed still cannot leave the
+# machine unchecked.
+default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: local
     hooks:
@@ -59,7 +64,7 @@ repos:
           bash -c '.venv/bin/python -m dev.lint.custom_lint &&
           node --test dev/lint/session_list_visibility.test.mjs'
         pass_filenames: false
-        files: \.(py|[cm]?[jt]sx?|sh)$|^(\.pre-commit-config\.yaml|\.github/workflows/lint\.yml|pyproject\.toml|uv\.lock)$
+        files: \.(py|[cm]?[jt]sx?|sh)$|^(\.pre-commit-config\.yaml|\.github/.*\.ya?ml|pyproject\.toml|uv\.lock)$
 
       - id: web-prettier
         name: web prettier
@@ -142,7 +147,7 @@ repos:
 
       # iOS Swift formatting + linting via Apple's `swift format` (config:
       # web/ios/.swift-format). The wrapper no-ops when the Swift toolchain
-      # is absent, so these run on macOS dev machines but skip the ubuntu-latest
+      # is absent, so these run on macOS dev machines but skip the Ubuntu
       # CI pre-commit job — there is no Swift there. Enforcement is local.
       - id: web-ios-swift-format
         name: web ios swift-format

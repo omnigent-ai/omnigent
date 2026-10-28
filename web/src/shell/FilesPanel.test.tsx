@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { type ComponentProps, useState } from "react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -236,7 +236,12 @@ function renderPanel({
     searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
   );
 
-  return render(
+  return render(panelAt(conversationId, { flatView, onFileSelect, showHidden, onClose }));
+}
+
+/** A fresh routed FilesPanel element, so rerenders re-read the hook mocks. */
+function panelAt(conversationId: string, props: Partial<ComponentProps<typeof FilesPanel>> = {}) {
+  return (
     <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
       <Routes>
         <Route
@@ -245,16 +250,16 @@ function renderPanel({
             <FilesPanel
               sort="recent"
               onSortChange={vi.fn()}
-              flatView={flatView}
-              onFileSelect={onFileSelect}
-              showHidden={showHidden}
+              flatView={false}
+              onFileSelect={vi.fn()}
+              showHidden={false}
               onShowHiddenChange={vi.fn()}
-              onClose={onClose}
+              {...props}
             />
           }
         />
       </Routes>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
 }
 
@@ -1474,28 +1479,7 @@ describe("FilesPanel scroll position persistence", () => {
     useDirectoryMock.mockReturnValue(directoryResult());
     useEnvironmentMock.mockReturnValue(environmentResult(null));
     useSearchMock.mockReturnValue(searchResult());
-    // Fresh JSX per render — reusing the same element would let React bail
-    // out of the re-render without re-reading the updated hook mocks.
-    const panel = () => (
-      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={false}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>
-    );
-    const view = render(panel());
+    const view = render(panelAt(conversationId));
     const section = view.container.querySelector("section");
     if (!section) throw new Error("scroll section not found");
     section.scrollTop = 0;
@@ -1504,7 +1488,7 @@ describe("FilesPanel scroll position persistence", () => {
     // Files arrive: the saved position survives the clamp and is restored.
     useAllFilesMock.mockReturnValue(allFilesResult(files));
     useChangedFilesMock.mockReturnValue(changedFilesResult([]));
-    view.rerender(panel());
+    view.rerender(panelAt(conversationId));
     expect(section.scrollTop).toBe(120);
 
     // Let the restore's animation-frame loop settle (jsdom has no layout, so
