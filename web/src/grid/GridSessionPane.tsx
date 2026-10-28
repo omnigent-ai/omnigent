@@ -16,6 +16,7 @@ import {
   livenessRowFromSession,
   STARTING_GRACE_S,
   useSessionLiveness,
+  waitsForOfflineHost,
 } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
@@ -106,6 +107,7 @@ export function GridSessionPane({
     turnActive: state.status === "streaming",
     launchedAt: state.runnerLaunchedAt,
   });
+  const hostOffline = waitsForOfflineHost(liveness, state.sandboxStatus);
   const wrapper = session?.labels?.["omnigent.wrapper"];
   const terminalFirst = session?.labels?.["omnigent.ui"] === "terminal";
   const rootSessionId = useRootSessionId(sessionId, session?.parentSessionId);
@@ -365,7 +367,12 @@ export function GridSessionPane({
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div className={cn("h-full", showTerminal && "hidden")} inert={showTerminal}>
-              <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+              <SideChatPane
+                childId={sessionId}
+                fullSession
+                readOnly={!canEdit}
+                hostOffline={hostOffline}
+              />
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal) && (
               <div
@@ -423,6 +430,7 @@ export function GridSessionPane({
                 contained
                 conversationId={sessionId}
                 sessionHarness={state.sessionHarness}
+                hostOffline={hostOffline}
                 agentId={state.boundAgentId ?? session?.agentId ?? null}
                 {...workspacePanel}
                 open={selected && workspacePanel.open}

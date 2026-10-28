@@ -608,6 +608,7 @@ from omnigent.server.routes._sessions.helpers import (
 # Higher-layer orchestration flows (runner relay, session-event dispatch,
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
+    HOST_BACK_WITHOUT_RUNNER_S as HOST_BACK_WITHOUT_RUNNER_S,
     HOST_OFFLINE_HOLD_S as HOST_OFFLINE_HOLD_S,
     HOST_OFFLINE_RECHECK_S as HOST_OFFLINE_RECHECK_S,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,

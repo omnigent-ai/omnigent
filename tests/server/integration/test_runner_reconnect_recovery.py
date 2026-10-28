@@ -173,6 +173,143 @@ async def test_multiple_slow_roots_recover_independently_with_descendants(
     assert not app.state.runner_session_initializer.invalidate_runner(_RUNNER_ID)
 
 
+@pytest.mark.parametrize("cleanup_stage", ["route", "initializer"])
+async def test_replaced_tunnel_cleanup_cannot_settle_a_newer_outage_as_idle(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cleanup_stage: str,
+) -> None:
+    """A retired connection's delayed teardown cannot attest a newer turn was idle."""
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+
+    registry = app.state.tunnel_registry
+    store = app.state.runner_router._conversation_store
+    first_ready, second_ready = asyncio.Event(), asyncio.Event()
+    cleanup_started, release_cleanup = asyncio.Event(), asyncio.Event()
+    real_hook = runner_tunnel._run_connect_hook
+
+    async def delayed_cleanup(hook: Any, connection: Any) -> None:
+        await real_hook(hook, connection)
+        if not first_ready.is_set():
+            first_ready.set()
+            if cleanup_stage == "route":
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+        else:
+            second_ready.set()
+
+    monkeypatch.setattr(runner_tunnel, "_run_connect_hook", delayed_cleanup)
+    monkeypatch.setattr(sessions, "RUNNER_DISCONNECT_GRACE_S", 0.5)
+    first = await _connect_route(app, _TUNNEL_PATH)
+    second = None
+    conv = None
+    init_task = None
+    init_client = None
+    try:
+        await _send_hello(first, registry, connection_id="old-idle-tunnel")
+        await asyncio.wait_for(first_ready.wait(), budget(2))
+        if cleanup_stage == "initializer":
+            init_started = asyncio.Event()
+
+            async def delayed_runner_request(_: httpx.Request) -> httpx.Response:
+                init_started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cleanup_started.set()
+                    await release_cleanup.wait()
+                return httpx.Response(201)
+
+            init_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(delayed_runner_request), base_url="http://runner"
+            )
+            init_conv = store.create_conversation(agent_id=agent.id, runner_id=_RUNNER_ID)
+            init_task = asyncio.create_task(
+                app.state.runner_session_initializer.initialize(
+                    init_conv, init_client, timeout=budget(5)
+                )
+            )
+            await asyncio.wait_for(init_started.wait(), budget(2))
+        await first.send_input(
+            {
+                "type": "websocket.disconnect",
+                "code": 1000,
+                "reason": RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
+            }
+        )
+        await asyncio.wait_for(cleanup_started.wait(), budget(2))
+        if cleanup_stage == "initializer":
+            assert registry.get(_RUNNER_ID) is None
+            # Remove the old session so the replacement only owns the new turn below.
+            await store.delete_conversation(init_conv.id)
+        second = await _connect_route(app, _TUNNEL_PATH)
+        await _send_hello(second, registry, connection_id="new-active-tunnel")
+        await asyncio.wait_for(second_ready.wait(), budget(2))
+        conv = store.create_conversation(agent_id=agent.id, runner_id=_RUNNER_ID)
+        store.set_session_live_status(conv.id, "running")
+        sessions._session_status_cache[conv.id] = "running"
+        await second.send_input({"type": "websocket.disconnect", "code": 1006})
+        await asyncio.wait_for(second.future, budget(2))
+        grace_tasks = {
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+        }
+        assert len(grace_tasks) == 1
+        release_cleanup.set()
+        await asyncio.wait_for(first.future, budget(2))
+        if init_task is not None:
+            with pytest.raises(ConnectionError, match="initialization was cancelled"):
+                await init_task
+        assert grace_tasks == {
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+        }
+        await asyncio.wait_for(asyncio.gather(*grace_tasks), budget(3))
+        assert all(not task.cancelled() for task in grace_tasks)
+        assert sessions._session_status_cache[conv.id] == "failed"
+        final = store.get_conversation(conv.id)
+        assert final is not None
+        assert final.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+        failures = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "session_turn_failed"
+            and getattr(record, "session_id", None) == conv.id
+        ]
+        assert len(failures) == 1
+        assert failures[0].attributes["drop_close_code"] == "1006"
+        assert failures[0].attributes["drop_close_reason_category"] == "abnormal"
+    finally:
+        release_cleanup.set()
+        for communicator in (first, second):
+            if communicator is not None and not communicator.future.done():
+                await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+                await communicator.wait(timeout=budget(2))
+        if init_task is not None:
+            init_task.cancel()
+            await asyncio.gather(init_task, return_exceptions=True)
+        if init_client is not None:
+            await init_client.aclose()
+        pending_grace = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{_RUNNER_ID}"
+        ]
+        for task in pending_grace:
+            task.cancel()
+        await asyncio.gather(*pending_grace, return_exceptions=True)
+        if conv is not None:
+            sessions._session_status_cache.pop(conv.id, None)
+            sessions._intentional_stop_sessions.pop(conv.id, None)
+
+
 @pytest.mark.parametrize("superseded", [False, True])
 async def test_large_mirror_tree_attaches_without_blocking_or_per_child_reads(
     app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch, superseded: bool

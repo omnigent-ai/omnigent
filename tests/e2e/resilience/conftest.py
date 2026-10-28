@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Callable, Generator, Iterator
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,7 @@ from tests.e2e.resilience.lab.lab import Lab, LabConfig, LabMode
 
 #: Set to ``1`` to keep every lab root, not only failing ones.
 KEEP_ENV = "OMNIGENT_RESILIENCE_KEEP"
+_WEB_UI = Path(__file__).resolve().parents[3] / "omnigent" / "server" / "static" / "web-ui"
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -66,3 +68,21 @@ def lab_factory(request: pytest.FixtureRequest) -> Iterator[Callable[..., Lab]]:
             errors.append(exc)
     if errors:
         raise errors[0]
+
+
+@pytest.fixture
+def browser_page() -> Iterator[object]:
+    """A Chromium page for driving the web UI; skips without Playwright or a built UI."""
+    sync_api = pytest.importorskip("playwright.sync_api")
+    if not (_WEB_UI / "index.html").is_file():
+        pytest.skip("web UI is not built; run `pnpm --filter web run build`")
+    with sync_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch()
+        except sync_api.Error as exc:
+            pytest.skip(f"Playwright Chromium unavailable: {exc}")
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        try:
+            yield page
+        finally:
+            browser.close()

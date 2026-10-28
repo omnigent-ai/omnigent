@@ -29,6 +29,9 @@ uv run --no-sync pytest tests/e2e/resilience -v
 OMNIGENT_E2E_RESILIENCE_FULL=1 uv run --no-sync pytest tests/e2e/resilience/scenarios -n 2  # 60 s/120 s outages
 ```
 
+S9 always runs its 120 s outage: it tests what happens after the grace, so it
+has no short variant.
+
 To poke at the UI by hand, start a lab with a fault console:
 
 ```sh
@@ -70,8 +73,8 @@ single check fails, it gets `report.check(..., known_gap="R5")` instead, so
 the row's other checks still guard against regressions. Either way, a fix that
 makes the row pass must also remove the marker.
 
-S6 drives a real page with Playwright's Chromium against the built web UI
-(`pnpm --filter web run build`). It is skipped when either is missing.
+S6 and S9 drive a real page with Playwright's Chromium against the built web
+UI (`pnpm --filter web run build`). They are skipped when either is missing.
 
 ## Recording what the user sees
 

@@ -189,6 +189,15 @@ describe("WorkingIndicator", () => {
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
   });
 
+  it("announces a turn held for an offline host", () => {
+    useChatStore.setState({ backgroundTaskCount: 0, blockedOn: null, sessionStatus: "running" });
+    render(<WorkingIndicator hostOffline />);
+
+    const expected = "Host is offline. Waiting for it to reconnect…";
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent(expected);
+    expect(screen.getByRole("status")).toHaveTextContent(expected);
+  });
+
   describe("parked on a terminal permission prompt", () => {
     const sideChatId = "conv_side_child";
     const terminalFirstSession: TerminalFirstContextValue = {

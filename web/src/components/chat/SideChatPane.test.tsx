@@ -176,6 +176,14 @@ describe("side-chat working indicator", () => {
     expect(screen.getByRole("button", { name: "Interrupt side chat" })).toBeEnabled();
   });
 
+  it("says a turn held for its offline host is waiting for the host", () => {
+    renderPane(<SideChatPane childId={childId} hostOffline />);
+
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+      "Host is offline. Waiting for it to reconnect…",
+    );
+  });
+
   it("shows progress while creating a fork and restores the draft after failure", async () => {
     let rejectStart: ((error: Error) => void) | undefined;
     const onStart = vi.fn(

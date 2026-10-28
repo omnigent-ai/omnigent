@@ -8,7 +8,7 @@
 import { useRef } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
-import type { Session } from "@/lib/types";
+import type { SandboxStatus, Session } from "@/lib/types";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 
 /**
@@ -225,6 +225,18 @@ export function useSessionLiveness(
   if (prev.current !== null && livenessEqual(prev.current, raw)) return prev.current;
   prev.current = raw;
   return raw;
+}
+
+/**
+ * Whether a running turn is waiting for its offline host. A managed sandbox
+ * that is still launching can read as offline, but the server parks its turn.
+ */
+export function waitsForOfflineHost(
+  liveness: SessionLiveness | undefined,
+  sandboxStatus: SandboxStatus | null | undefined,
+): boolean {
+  const sandboxLaunching = sandboxStatus != null && sandboxStatus.stage !== "failed";
+  return !sandboxLaunching && liveness?.kind === "host_offline";
 }
 
 /** Structural equality for the small `SessionLiveness` union. */

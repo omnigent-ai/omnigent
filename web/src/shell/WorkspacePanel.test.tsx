@@ -88,8 +88,10 @@ vi.mock("@/hooks/useAgents", () => ({
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 // A side chat's pane is covered by its own suite; the stub just names its child.
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => (
-    <div data-testid="side-chat-pane-stub">{childId}</div>
+  SideChatPane: ({ childId, hostOffline }: { childId: string; hostOffline?: boolean }) => (
+    <div data-testid="side-chat-pane-stub" data-host-offline={String(hostOffline)}>
+      {childId}
+    </div>
   ),
 }));
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
@@ -143,6 +145,7 @@ function renderWorkspace(
     selectedTerminalKey?: string | null;
     maximized?: boolean;
     liveness?: SessionLiveness;
+    hostOffline?: boolean;
     pending?: boolean;
     open?: boolean;
     animateVisibility?: boolean;
@@ -209,6 +212,7 @@ function renderWorkspace(
         filesPanelShowHidden={false}
         onShowHiddenChange={vi.fn()}
         liveness={overrides.liveness}
+        hostOffline={overrides.hostOffline}
         pending={overrides.pending}
         mobileSideChatsOpen={overrides.mobileSideChatsOpen}
         onMobileSideChatsOpenChange={onMobileSideChatsOpenChange}
@@ -1337,6 +1341,15 @@ describe("WorkspacePanel mobile side chats", () => {
       stop.mockRestore();
     },
   );
+
+  it("tells the selected side chat that its source session's host is offline", () => {
+    openTabs();
+    const { rerender } = renderWorkspace({ rightRailTab: "sidechat", hostOffline: true });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-host-offline", "true");
+    rerender({ hostOffline: false });
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-host-offline", "false");
+  });
 
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);

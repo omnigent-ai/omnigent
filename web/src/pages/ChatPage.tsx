@@ -196,6 +196,7 @@ import {
   IMPORT_SOURCE_LABEL_KEY,
   livenessRowFromSession,
   useSessionLiveness,
+  waitsForOfflineHost,
 } from "@/hooks/useSessionLiveness";
 import { useMessageDeepLinkChatView } from "@/hooks/useMessageDeepLink";
 import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
@@ -1830,6 +1831,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             loadingMoreHistory={loadingMoreHistory}
             isMobileViewport={isMobileViewport}
             showsWorking={showsWorking}
+            hostOffline={waitsForOfflineHost(liveness, sandboxStatus)}
             agentsError={agentsError}
             sandboxLaunching={sandboxLaunching}
             spacerMeasureRef={spacerMeasureRef}

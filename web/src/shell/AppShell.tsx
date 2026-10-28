@@ -111,6 +111,7 @@ import {
   STARTING_GRACE_S,
   livenessRowFromSession,
   useSessionLiveness,
+  waitsForOfflineHost,
 } from "@/hooks/useSessionLiveness";
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
@@ -2653,6 +2654,7 @@ function AppShellImpl() {
                     filesPanelShowHidden={filesPanelShowHidden}
                     onShowHiddenChange={setFilesPanelShowHidden}
                     liveness={liveness}
+                    hostOffline={waitsForOfflineHost(liveness, sandboxStatus)}
                     onShellCreateStart={markShellCreateStarted}
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}

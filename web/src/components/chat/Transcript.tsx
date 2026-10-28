@@ -82,6 +82,8 @@ export interface TranscriptProps {
   isMobileViewport: boolean;
   /** Display-only "Working…" gate (edge-driven, from the parent). */
   showsWorking: boolean;
+  /** The session's host is offline, so the working row says so instead. */
+  hostOffline: boolean;
   agentsError: unknown;
   /** True while a managed-sandbox launch is in flight (cold-launch spinner). */
   sandboxLaunching: boolean;
@@ -122,6 +124,7 @@ function TranscriptImpl({
   loadingMoreHistory,
   isMobileViewport,
   showsWorking,
+  hostOffline,
   agentsError,
   sandboxLaunching,
   spacerMeasureRef,
@@ -406,7 +409,7 @@ function TranscriptImpl({
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                {showWorkingIndicator && <WorkingIndicator hostOffline={hostOffline} />}
                 {/* Managed-sandbox stage cue; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the

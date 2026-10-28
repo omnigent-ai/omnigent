@@ -1132,6 +1132,14 @@ describe("workingIndicatorLabel — parked on a dialog", () => {
   });
 });
 
+describe("workingIndicatorLabel — host offline", () => {
+  it("says the turn is waiting for the host instead of rotating", () => {
+    const expected = "Host is offline. Waiting for it to reconnect…";
+    expect(workingIndicatorLabel(3, null, { hostOffline: true })).toBe(expected);
+    expect(workingIndicatorLabel(0, "permission prompt", { hostOffline: true })).toBe(expected);
+  });
+});
+
 describe("workingIndicatorLabel", () => {
   it("shows the plain Working label at the first tick", () => {
     expect(workingIndicatorLabel(0)).toBe("Working…");

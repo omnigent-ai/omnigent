@@ -148,6 +148,7 @@ export function SideChatPane({
   onStart,
   readOnly: restoredReadOnly = false,
   fullSession = false,
+  hostOffline = false,
 }: {
   childId: string;
   selectionParentId?: string;
@@ -156,6 +157,8 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
+  /** The session's host is offline, so a running turn waits for it. */
+  hostOffline?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
@@ -384,7 +387,9 @@ export function SideChatPane({
                   recoveryDisabled={readOnly}
                 />
               ))}
-              {shouldShowWorkingIndicator(showsWorking, bubbles) && <WorkingIndicator />}
+              {shouldShowWorkingIndicator(showsWorking, bubbles) && (
+                <WorkingIndicator hostOffline={hostOffline} />
+              )}
               <div ref={bottomRef} />
             </div>
           )}

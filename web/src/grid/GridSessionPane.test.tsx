@@ -1,3 +1,4 @@
+import type * as SessionLivenessModule from "@/hooks/useSessionLiveness";
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { type ComponentProps, useContext, useState } from "react";
@@ -19,6 +20,7 @@ const fixture = vi.hoisted(() => ({
   permissionLevel: null as number | null,
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
+  offlineSessionId: null as string | null,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -53,9 +55,11 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: () => true,
 }));
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
-vi.mock("@/hooks/useSessionLiveness", () => ({
+vi.mock("@/hooks/useSessionLiveness", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionLivenessModule>()),
   livenessRowFromSession: () => null,
-  useSessionLiveness: () => ({ kind: "online" }),
+  useSessionLiveness: (id: string) =>
+    id === fixture.offlineSessionId ? { kind: "host_offline", isOwner: true } : { kind: "online" },
 }));
 vi.mock("@/hooks/useChildSessions", () => ({ useChildSessions: () => ({ children: [] }) }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -75,12 +79,12 @@ vi.mock("./GridSessionsContext", () => ({
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: () => {
+  SideChatPane: ({ hostOffline }: { hostOffline?: boolean }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     return (
       <>
-        <input aria-label="Message" />
+        <input aria-label="Message" data-host-offline={String(hostOffline)} />
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -106,6 +110,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
         data-end-line={props.filePosition?.endLine}
+        data-host-offline={String(props.hostOffline)}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
         <span>{props.filePosition?.line}</span>
@@ -138,6 +143,7 @@ afterEach(() => {
   fixture.permissionLevel = null;
   fixture.terminals = [];
   fixture.terminalPending = false;
+  fixture.offlineSessionId = null;
   vi.restoreAllMocks();
 });
 
@@ -161,6 +167,25 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+it("tells each cell's chat and workspace whether its own session's host is offline", () => {
+  fixture.offlineSessionId = "second";
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "offline-grid", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = screen.getByRole("region", { name: "first (active)" });
+  const second = screen.getByRole("region", { name: "second" });
+  expect(within(first).getByLabelText("Message")).toHaveAttribute("data-host-offline", "false");
+  expect(within(second).getByLabelText("Message")).toHaveAttribute("data-host-offline", "true");
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-host-offline", "false");
+  expect(screen.getByTestId("workspace-second")).toHaveAttribute("data-host-offline", "true");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {

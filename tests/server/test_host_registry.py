@@ -264,6 +264,42 @@ async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
     closed_mcp.cancel()
 
 
+async def test_wait_for_host_wakes_on_registration_in_its_workspace() -> None:
+    """A waiter wakes for its own workspace's registration, in any id spelling."""
+    registry = HostRegistry()
+    host_id = "00112233445566778899aabbccddeeff"
+    with workspace_scope(111):
+        waiter = asyncio.ensure_future(registry.wait_for_host(f"host_{host_id}", timeout_s=5.0))
+    await asyncio.sleep(0)
+    assert registry.connect_waiter_count() == 1
+
+    with workspace_scope(222):
+        registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    with workspace_scope(111):
+        conn = registry.register(host_id, FakeWebSocket(), _make_hello(), owner="alice")
+
+    assert await waiter is conn
+    assert registry.connect_waiter_count() == 0
+    with workspace_scope(111):
+        assert await registry.wait_for_host(host_id, timeout_s=5.0) is conn
+
+
+async def test_wait_for_host_timeout_and_cancel_remove_the_waiter() -> None:
+    """Waiters that end without a registration leave nothing behind."""
+    registry = HostRegistry()
+    assert await registry.wait_for_host("host_gone", timeout_s=0.01) is None
+    waiter = asyncio.ensure_future(registry.wait_for_host("host_gone", timeout_s=5.0))
+    await asyncio.sleep(0)
+    assert registry.connect_waiter_count() == 1
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert registry.connect_waiter_count() == 0
+
+
 def test_deregister_returns_false_for_unknown() -> None:
     """
     Verify that deregister reports whether it removed an entry.

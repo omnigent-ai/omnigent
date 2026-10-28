@@ -239,7 +239,7 @@ class UserViewRecorder:
                     for view in self._views:
                         page = context.new_page()
                         page.goto(self._url)
-                        _prepare(page, view)
+                        show_view(page, view)
                         page.evaluate(
                             _SHOW_BADGE, [f"{self._title} · {view}", self._started * 1000]
                         )
@@ -309,8 +309,11 @@ def _dismiss_lab_noise(page: object) -> None:
             consent.get_by_role("button", name="Block", exact=True).first.click(timeout=2000)
 
 
-def _prepare(page: object, view: str) -> None:
-    """Dismiss first-run dialogs and switch the session to *view*."""
+def show_view(page: object, view: str) -> None:
+    """Dismiss first-run dialogs and switch the open session to *view*.
+
+    :param view: ``"chat"`` or ``"terminal"``.
+    """
     from playwright.sync_api import expect
 
     toggle = page.get_by_test_id("view-mode-toggle")  # type: ignore[attr-defined]

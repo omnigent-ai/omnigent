@@ -427,12 +427,15 @@ function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
  *
  * @param options.answerableInChat - A pending chat card can answer the block.
  * @param options.terminalView - The Chat/Terminal toggle reaches the agent's terminal.
+ * @param options.hostOffline - The session's host is offline, so the turn waits for it.
  */
 export function workingIndicatorLabel(
   tick = 0,
   blockedOn: string | null = null,
-  { answerableInChat = false, terminalView = false } = {},
+  { answerableInChat = false, terminalView = false, hostOffline = false } = {},
 ): string {
+  // Nothing, including a block, can progress until the host reconnects.
+  if (hostOffline) return "Host is offline. Waiting for it to reconnect…";
   if (blockedOn) {
     // A "dialog open" block lives only in the terminal tab, so point the user
     // there to respond rather than leaving the session looking hung.
@@ -449,7 +452,7 @@ export function workingIndicatorLabel(
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
 
-export function WorkingIndicator() {
+export function WorkingIndicator({ hostOffline = false }: { hostOffline?: boolean } = {}) {
   const scopedConversationId = useContext(ConversationScopeContext);
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
@@ -476,13 +479,14 @@ export function WorkingIndicator() {
     answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
     terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
+    hostOffline,
   });
   return (
     <>
-      {/* Sole aria-live region: a stable "Working…" or block reason, so the rotating
-          label isn't re-announced. The visible shimmer below stays aria-hidden. */}
+      {/* Sole aria-live region: a stable "Working…", block reason or offline host, so
+          the rotating label isn't re-announced. The visible shimmer stays aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
-        {blockedOn ? label : "Working…"}
+        {blockedOn || hostOffline ? label : "Working…"}
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>

@@ -5,6 +5,7 @@ import {
   type LivenessRow,
   livenessRowFromSession,
   useSessionLiveness,
+  waitsForOfflineHost,
 } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import type { Session } from "@/lib/types";
@@ -375,5 +376,17 @@ describe("useSessionLiveness — derivation truth table", () => {
       const row = livenessRowFromSession(session({ hostId: "h1", permissionLevel: null }));
       expect(derive(false, false, row)).toEqual({ kind: "host_offline", isOwner: true });
     });
+  });
+});
+
+describe("waitsForOfflineHost", () => {
+  const offline = { kind: "host_offline", isOwner: true } as const;
+
+  it("is true only for an offline host outside a managed-sandbox launch", () => {
+    expect(waitsForOfflineHost(offline, null)).toBe(true);
+    expect(waitsForOfflineHost(offline, { stage: "failed", error: "quota exceeded" })).toBe(true);
+    expect(waitsForOfflineHost(offline, { stage: "provisioning" })).toBe(false);
+    expect(waitsForOfflineHost({ kind: "host_asleep" }, null)).toBe(false);
+    expect(waitsForOfflineHost(undefined, null)).toBe(false);
   });
 });

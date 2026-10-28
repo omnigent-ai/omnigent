@@ -22,6 +22,7 @@ from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
 from tests.e2e.resilience.lab.driver import SessionDriver, Turn
 from tests.e2e.resilience.lab.lab import Harness, Lab, wait_for
 from tests.e2e.resilience.lab.observe import SessionWatcher
+from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.recorder import UserViewRecorder
 from tests.e2e.resilience.lab.report import ScenarioReport, report_dir
 
@@ -243,6 +244,18 @@ def check_no_failure(
         if failed
         else "",
     )
+
+
+def host_offline(lab: Lab) -> list[Fault]:
+    """Refuse the host's and model's links and reset open ones, as a laptop losing its network.
+
+    :returns: The faults; clear them to bring the network back.
+    """
+    links = (lab.proxies.host, lab.proxies.model)
+    faults = [link.refuse() for link in links]
+    for link in links:
+        link.reset()
+    return faults
 
 
 def eventually(predicate: Callable[[], object | None], *, timeout: float) -> object | None:

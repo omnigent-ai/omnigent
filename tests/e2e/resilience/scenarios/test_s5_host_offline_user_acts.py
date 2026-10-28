@@ -17,7 +17,6 @@ import pytest
 
 from tests.e2e.resilience.lab.driver import SessionDriver
 from tests.e2e.resilience.lab.lab import Harness, Lab
-from tests.e2e.resilience.lab.proxy import Fault
 from tests.e2e.resilience.lab.report import ScenarioReport
 from tests.e2e.resilience.scenarios import _contract as contract
 
@@ -44,14 +43,6 @@ _KNOWN_GAPS = {
 _PROMPT_REFUSAL_S = 35.0
 
 
-def _host_offline(lab: Lab) -> list[Fault]:
-    links = (lab.proxies.host, lab.proxies.model)
-    faults = [link.refuse() for link in links]
-    for link in links:
-        link.reset()
-    return faults
-
-
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
     ("harness", "action", "outage_s"),
@@ -69,7 +60,7 @@ def test_s5_host_offline_user_acts(
     with contract.observe(lab, driver, report) as watcher:
         entered = contract.enter(driver, _ACTIONS[action], outage_s=outage_s)
         started = time.time()
-        faults = _host_offline(lab)
+        faults = contract.host_offline(lab)
         try:
             time.sleep(2.0)
             response, elapsed = _act(driver, entered, action)
