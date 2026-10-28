@@ -27,6 +27,14 @@ Precedence (first non-empty wins):
   2. config ``harness.<canonical>.args``
   3. ``[]``
 
+``harness.codex-native.app_server`` (``command`` plus optional ``args``)
+wraps the Codex app-server rather than the terminal: Omnigent runs it with
+its ``-c`` overrides and ``app-server --listen …`` appended, for each
+session's app-server. Model probes keep running Codex directly. No env var
+outranks it.
+The wrapper chooses which Codex it runs; ``OMNIGENT_CODEX_PATH`` still names the
+binary Omnigent version-checks and keys the model catalog on, so keep them the same.
+
 Validation is warn+skip: an unknown harness id or a structurally
 malformed entry warns and is ignored, so a bad config never crashes
 ``config list`` / ``doctor`` / every command's config load.
@@ -64,11 +72,13 @@ _LEGACY_PATH_WARNED: set[str] = set()
 # Keys read from a per-harness override entry in the ``harness:`` mapping.
 _OVERRIDE_KEY_COMMAND = "command"
 _OVERRIDE_KEY_ARGS = "args"
+_OVERRIDE_KEY_APP_SERVER = "app_server"
 
 
 class _HarnessOverride(TypedDict, total=False):
     command: str
     args: list[str]
+    app_server: list[str]
 
 
 def _canonicalize(harness: str) -> str:
@@ -240,16 +250,13 @@ def resolve_harness_config(
     return default, overrides
 
 
-def _parse_override_entry(
-    key: str,
-    value: object,
-) -> _HarnessOverride | None:
-    """Validate one per-harness override entry; warn+skip on malformed.
+def _parse_launch_fields(key: str, value: object) -> _HarnessOverride | None:
+    """Validate a ``{command, args}`` mapping; warn+skip on malformed fields.
 
-    :param key: The raw harness id as written in config (for messages).
+    :param key: The config path as written, for messages, e.g. ``"codex-native"``.
     :param value: The entry value — expected ``{command: str, args: list}``.
-    :returns: A validated ``{command?, args?}`` dict, or ``None`` when the
-        entry is structurally invalid (already warned).
+    :returns: A validated ``{command?, args?}`` dict, or ``None`` when *value*
+        is not a mapping (already warned).
     """
     from omnigent.inner import ui
 
@@ -274,6 +281,45 @@ def _parse_override_entry(
         else:
             ui.warn(f"config `harness.{key}.args` must be a list of strings — ignoring it.")
     return parsed
+
+
+def _parse_override_entry(
+    key: str,
+    value: object,
+) -> _HarnessOverride | None:
+    """Validate one per-harness override entry; warn+skip on malformed.
+
+    :param key: The raw harness id as written in config (for messages).
+    :param value: The entry value — expected ``{command: str, args: list, app_server?}``.
+    :returns: A validated ``{command?, args?, app_server?}`` dict, or ``None``
+        when the entry is structurally invalid (already warned).
+    """
+    from omnigent.inner import ui
+
+    parsed = _parse_launch_fields(key, value)
+    if parsed is None or not isinstance(value, dict):
+        return parsed
+    # Only `command` and `args` are read from the nested entry, so a cyclic YAML
+    # anchor there can't recurse.
+    app_server = value.get(_OVERRIDE_KEY_APP_SERVER)
+    if app_server is not None:
+        launch = _parse_launch_fields(f"{key}.{_OVERRIDE_KEY_APP_SERVER}", app_server)
+        if launch is not None and "command" in launch:
+            parsed["app_server"] = [launch["command"], *launch.get("args", [])]
+        elif launch is not None and isinstance(app_server, dict) and "command" not in app_server:
+            ui.warn(f"config `harness.{key}.app_server` needs a `command` — ignoring it.")
+    return parsed
+
+
+def resolve_codex_app_server_command(cfg: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the configured native Codex app-server launch command, or ``()``.
+
+    :param cfg: Effective config dict.
+    :returns: ``harness.codex-native.app_server`` as ``(command, *args)``, e.g.
+        ``("ucode", "codex")``, or ``()`` to launch the Codex binary directly.
+    """
+    _, overrides = resolve_harness_config(cfg)
+    return tuple((overrides.get("codex-native") or {}).get("app_server") or ())
 
 
 def resolve_harness_command(
