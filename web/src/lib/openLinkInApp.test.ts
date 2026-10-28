@@ -3,9 +3,11 @@ import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import { resolveBrowserSessionHostId } from "@/lib/browserSessionHost";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+vi.mock("@/lib/browserSessionHost", () => ({ resolveBrowserSessionHostId: vi.fn() }));
 
 const CONV = "conv-1";
 const URL_ = "https://example.com/page";
@@ -17,6 +19,7 @@ let surfaced: { conversationId: string; tabId: string }[];
 let unsubscribe: () => void;
 
 beforeEach(() => {
+  vi.mocked(resolveBrowserSessionHostId).mockResolvedValue(null);
   openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
   hasView = vi.fn().mockResolvedValue({ exists: false });
   closeView = vi.fn().mockResolvedValue({ ok: true });
@@ -53,16 +56,16 @@ it.each([true, false])(
       vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     }
     expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
-    expect(openOrNavigate).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
     // Model-authored links get the agent navigation policy (no internal hosts).
     const firstViewId = openOrNavigate.mock.calls[0][0];
     expect(firstViewId).toMatch(/^browser-tab:conv-1:[^:]+$/);
-    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, { agent: true });
-    expect(surfaced).toEqual([]);
+    expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, {});
     await vi.waitFor(() =>
       expect(surfaced).toEqual([{ conversationId: CONV, tabId: firstViewId.split(":")[2] }]),
     );
     expect(maybeOpenLinkInApp(CONV, "https://example.com/other")).toBe(true);
+    await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledTimes(2));
     const secondViewId = openOrNavigate.mock.calls[1][0];
     expect(secondViewId).not.toBe(firstViewId);
     await vi.waitFor(() => expect(surfaced).toHaveLength(2));
@@ -119,7 +122,7 @@ it("coalesces repeated clicks before the first navigation is accepted", async ()
 
   maybeOpenLinkInApp(CONV, URL_);
   maybeOpenLinkInApp(CONV, URL_);
-  expect(openOrNavigate).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
   accept({ ok: true });
   await vi.waitFor(() => expect(surfaced).toHaveLength(1));
 });
@@ -245,4 +248,19 @@ it.each([
   ["http://[", null],
 ])("parseHttpUrl(%j) keeps only http(s) URLs", (href, expected) => {
   expect(parseHttpUrl(href)?.href ?? null).toBe(expected);
+});
+
+it("passes the owning session host when opening a localhost link", async () => {
+  vi.mocked(resolveBrowserSessionHostId).mockResolvedValue("local-host");
+  maybeOpenLinkInApp(CONV, "http://localhost:3000");
+  await vi.waitFor(() => expect(openOrNavigate).toHaveBeenCalledOnce());
+  expect(resolveBrowserSessionHostId).toHaveBeenCalledWith(CONV);
+  expect(openOrNavigate).toHaveBeenCalledWith(
+    expect.any(String),
+    "http://localhost:3000/",
+    undefined,
+    {
+      sourceHostId: "local-host",
+    },
+  );
 });

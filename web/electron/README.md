@@ -505,67 +505,39 @@ port collisions.
 1. Ask the agent to start the app on the remote host and report its URL.
 2. Use Companion to forward the app's port to your Mac. Check the actual
    forwarded address: the local port may differ from the remote port.
-3. In the Omnigent desktop app, open the session's Workspace **+** menu and
-   choose **Browser**. Type the forwarded URL, for example
-   `http://localhost:5273/`, in the address bar and press Enter. Here
-   `localhost` is the desktop machine, not the agent's remote host.
-4. Hide and reopen the Workspace, or switch tabs or sessions and return.
-   The existing page is retained without navigating or reloading it. Closing
-   the Browser tab destroys that view; opening a new tab does not restore it.
+3. Open the forwarded URL, for example `http://localhost:5273/`, in your regular
+   browser. Here `localhost` is the desktop machine, not the remote agent host.
 
 If the page is unreachable, check that the app is still running and that the
 forwarded URL reaches the intended app in your Mac's regular browser. Check
 Companion's forwarding and local port selection separately. Normal TLS, CORS,
-authentication, and local-network permission rules still apply. This pane is
-desktop-only; it is not available in the plain web UI.
+authentication, and local-network permission rules still apply.
 
-For local or unrecognized hosts, `browser_navigate` keeps its restrictions on
-localhost and private addresses, even after you open a page manually.
-A manually opened page in the session's
-agent browser view remains available to existing agent inspection and
-interaction, including navigation caused by interacting with the page. Manual
-opening is therefore not a read-only boundary for that view. The user-created
-Browser tab opened through **+** > **Browser** is separate from the agent relay
-and is not targeted by the session's agent browser actions.
+### Local-session browser tools
 
-### Agent previews on Arca
+Only sessions executing on the desktop machine can use agent browser tools:
+navigation, screenshots, DOM snapshots, clicks, and typing. The relay reads the
+source session's current bound host (or nearest host-bound parent), and main
+compares it with the local CLI host ID for the connected server. Remote hosts,
+including Arca, and unknown identities cannot read or control the laptop browser,
+even if a view is already open. Model arguments and host display names cannot
+grant access. A remote Omnigent server is fine when the agent itself runs locally.
 
-On a Databricks-managed server with internal desktop features enabled, an
-Arca session's agent can open and inspect an app through Companion forwarding
-using the existing browser tools and tool approval or autoapproval policy.
-Provide the actual forwarded URL to the agent; its local port may differ from
-the app's remote port. Omnigent does not establish or verify forwarding or
-prove that the local endpoint belongs to the Arca host.
+Verified local sessions may browse any HTTP(S) destination, including loopback,
+private networks, and names that resolve to private addresses. This applies to
+redirects, frames, and links opening in the same pane. Non-web schemes remain
+blocked, and Chromium sandbox, TLS, CORS, and permission controls still apply.
 
-The desktop captures the remote daemon's exact host ID during its existing
-Arca connect flow, including when the daemon is already running. Only a
-source session on that host, or a subagent inheriting that host, is eligible.
-An older CLI or an unrecognized, failed, or missing identity leaves localhost
-navigation denied; the remembered host-picker label alone does not grant it.
-Eligibility is scoped to the selected server/workspace, not all sessions on
-a Databricks server.
+Human-created Browser tabs stay separate from the agent view and remain usable
+in remote sessions. Their navigation retains the public-network policy unless
+the owning session is verified local. For a remote app forwarded to localhost,
+open it manually in your regular browser. Forwarding does not grant a remote
+agent access to the laptop. User-initiated Design mode can still send a selected
+element and screenshot to the session as part of an explicit chat message.
 
-After restarting the desktop, launch-time auto-connect restores this identity
-for users who opted into it. Otherwise, the first loopback preview request with
-a remembered Arca host offers the shell-owned reconnect console and returns the
-denial immediately; nothing runs until the user confirms, and the agent retries
-after recovery finishes. Concurrent retries share the same prompt or run.
-Opted-in recovery stays silent only when the remembered and source hosts match;
-a mismatch requires consent and is offered only when the host list identifies
-the source as Arca, so an incorrect remembered host can be recaptured and
-corrected without prompting from sandbox sessions. Both paths verify that the
-captured host ID matches the source session. Consent or auto-connect opt-in, the
-captured identity check, and the agent-context gate remain the trust boundaries. A decline briefly
-suppresses repeat prompts, while failed runs remain retryable. **Run on Arca** is
-hidden for an online remembered host only when the desktop advertises preview
-recovery; older shells keep the action visible.
-
-The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
-redirects and links that would open a new window (which stay in the same pane).
-Other loopback addresses, private-network and metadata destinations, hostnames
-that resolve to any of them, and non-web schemes remain restricted. Existing
-tool approvals are unchanged; whether a tool call asks for approval depends on
-the harness and its policy.
+New web bundles require the shell's `browserLocalAgentOnly` capability before
+executing agent actions; older shells return an update instruction. Older web
+bundles without source provenance are denied by the new main-process gate.
 
 ### Local network permission
 
@@ -607,8 +579,8 @@ policy must be configured to allow it; the pane does not rewrite those headers.
 
 ### Browser implementation
 
-The browser runs on the user's machine (a native `WebContentsView`); the agent —
-which may run on a different host — drives it purely by messages: an action
+The browser runs on the user's machine (a native `WebContentsView`); a verified
+local agent drives it by messages: an action
 request fans out over the session stream, the renderer claims and executes it
 against its local Chromium, and the result is posted back.
 
@@ -624,8 +596,9 @@ against its local Chromium, and the result is posted back.
   http(s) target navigates the same view in place (still allowlist-checked on
   an agent-locked view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
-- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
-  no loopback, private, link-local, metadata, or other non-public address in
+- `src/browserUrlPolicy.js` — HTTP(S) validation, with private destinations allowed
+  for verified local sessions. Other renderer navigation blocks
+  loopback, private, link-local, metadata, or other non-public address in
   any literal form (including IPv4-mapped and other IPv6 spellings). A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
@@ -738,10 +711,8 @@ console listener is stored on the registry entry
 the native view); no server flag.
 
 All renderer IPC navigation uses the same URL policy, including the URL bar.
-A renderer's `agent: false` flag does not exempt a tab from address checks.
-Main-owned Arca preview eligibility still applies. Other internal sites must be
-opened in a separate browser; this also keeps later redirects in these tabs
-under the same policy.
+A renderer's `agent: false` flag cannot bypass the local-session gate for the
+reserved agent view. User tabs retain address checks unless verified local.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the

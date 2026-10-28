@@ -43,7 +43,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
+const { registerLocalhostCors } = require("./localhost_cors");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -76,7 +76,7 @@ const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { registerBrowserIpc } = require("./browserIpc");
-const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
+const { arcaTarget } = require("./arcaIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
 const { DEV_DOMAIN, getDevUserDefault } = require("./dev_preferences");
 const {
@@ -334,16 +334,12 @@ function databricksInternalFeaturesEnabled() {
  * a repeat connect while one is in flight re-focuses the existing console and
  * shares its outcome, so a refreshed SPA can always get back to it.
  */
-const arcaIdentities = createArcaIdentityStore();
-
 function startArcaHostConnect(serverUrl, deps) {
-  const finish = arcaIdentities.begin(serverUrl);
-  const run = arca.startArcaConnect(serverUrl, {
+  return arca.startArcaConnect(serverUrl, {
     ...deps,
     onIdentityUnavailable: (reason) =>
       console.log(`[omnigent] Arca daemon identity unavailable: ${reason}`),
   });
-  return { ...run, promise: run.promise.then(finish) };
 }
 
 const arcaConnectFlow = createArcaConnectFlow({
@@ -382,10 +378,8 @@ let arcaProbe = null;
  *
  * @returns {Promise<string | null>}
  */
-function refreshArcaBinary({ previewRecoveryRequested = false } = {}) {
-  // With auto-connect off, wait to probe until a preview explicitly requests
-  // recovery; that request is the demand signal, not consent to run anything.
-  if (!previewRecoveryRequested && !arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
+function refreshArcaBinary() {
+  if (!arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
   if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) {
     return Promise.resolve(cachedArcaPath.path);
   }
@@ -443,11 +437,6 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
-/** Agent retry bursts after a deliberate decline should not reopen the prompt immediately. */
-const ARCA_PREVIEW_DECLINE_COOLDOWN_MS = 10 * 1000;
-const arcaPreviewRecoveries = new Set();
-const arcaPreviewDeclinedUntil = new Map();
-
 /**
  * The auto-connect opt-in shared by overlapping onboarding connects: how many
  * are running, the preference from before the first of them, and whether any
@@ -3774,79 +3763,16 @@ function guardAgentPartitionRequests(partition, registry) {
   );
 }
 
-/**
- * Main-owned recovery scope for a loopback preview request, excluding the
- * renderer-supplied host match that decides whether this session may ask.
- */
-function arcaPreviewRecoveryTargetForEvent(event, url) {
-  const win = BrowserWindow.fromWebContents(event.sender);
-  if (
-    !isLocalhostUrl(url) ||
-    !isPinnedOriginSender(event) ||
-    !win ||
-    win.isDestroyed() ||
-    !databricksInternalFeaturesEnabled()
-  ) {
-    return null;
-  }
-  const target = arcaTarget(windowArcaServerUrl(win));
-  if (
-    !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
-    !isDatabricksManagedServerUrl(target) ||
-    arcaIdentities.get(target)
-  ) {
-    return null;
-  }
-  return { win, target };
-}
-
-/** A mismatched remembered host additionally requires renderer identification as Arca. */
-function arcaPreviewRecoveryContextForEvent(
-  event,
-  url,
-  sourceHostId,
-  rememberedArcaHostId,
-  sourceIsArcaHost,
-) {
-  const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
-  if (
-    !targetContext ||
-    typeof sourceHostId !== "string" ||
-    typeof rememberedArcaHostId !== "string" ||
-    (sourceHostId !== rememberedArcaHostId && sourceIsArcaHost !== true)
-  ) {
-    return null;
-  }
-  return {
-    ...targetContext,
-    sourceHostId,
-    rememberedMatchesSource: sourceHostId === rememberedArcaHostId,
-  };
-}
-
-/** Open one shared consent flow and let the requesting agent retry afterward. */
-function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
-  if (arcaPreviewRecoveries.has(target)) return;
-  arcaPreviewRecoveries.add(target);
-  void arcaConnectFlow
-    .run(win, target, { reason: "preview-reconnect" })
-    .then((result) => {
-      if (result?.canceled) {
-        arcaPreviewDeclinedUntil.set(target, Date.now() + ARCA_PREVIEW_DECLINE_COOLDOWN_MS);
-      }
-      const captured = arcaIdentities.get(target);
-      if (result?.ok && captured?.hostId !== sourceHostId) {
-        console.warn("[omnigent] Arca preview recovery captured a different host identity");
-      }
-      return result;
-    })
-    .catch((error) => {
-      console.warn(`[omnigent] Arca preview recovery failed: ${String(error)}`);
-      return { ok: false, error: String(error) };
-    })
-    .finally(() => {
-      arcaPreviewRecoveries.delete(target);
-    });
+/** Local browser tools belong only to sessions executing on this desktop. */
+function isLocalBrowserAgentContext(win, context) {
+  return !!(
+    win &&
+    !win.isDestroyed() &&
+    pinnedOrigin(win) &&
+    context?.sourceHostId &&
+    context.serverTarget === arcaTarget(windowArcaServerUrl(win)) &&
+    context.sourceHostId === omnigentCli.localHostId()
+  );
 }
 
 /**
@@ -3884,16 +3810,7 @@ function createBrowserRegistryForWindow(win) {
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
-    isArcaAgentContext: (context) => {
-      const target = windowArcaServerUrl(win);
-      return isArcaAgentContext(arcaIdentities.get(target), context, {
-        enabled: !win.isDestroyed() && !!pinnedOrigin(win) && databricksInternalFeaturesEnabled(),
-        managed:
-          isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) &&
-          isDatabricksManagedServerUrl(target),
-        serverTarget: target,
-      });
-    },
+    isLocalAgentContext: (context) => isLocalBrowserAgentContext(win, context),
     createBoundsController: createBrowserViewBoundsController,
     attachToHost: (view) => {
       win.contentView.addChildView(view);
@@ -4849,7 +4766,7 @@ function registerIpc() {
       databricksInternalFeatures: enabled,
       canExtendArca: enabled,
       canRefreshDbcert: enabled,
-      arcaPreviewRecovery: true,
+      arcaPreviewRecovery: false,
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
@@ -5009,75 +4926,8 @@ function registerIpc() {
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
-    recoverAgentNavigationForEvent: async (
-      event,
-      url,
-      sourceHostId,
-      rememberedArcaHostId,
-      sourceIsArcaHost,
-    ) => {
-      const context = arcaPreviewRecoveryContextForEvent(
-        event,
-        url,
-        sourceHostId,
-        rememberedArcaHostId,
-        sourceIsArcaHost,
-      );
-      if (!context) return false;
-      const { target } = context;
-      if (arcaPreviewRecoveries.has(target)) return false;
-      const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
-      if (declinedUntil > Date.now()) return false;
-      arcaPreviewDeclinedUntil.delete(target);
-      try {
-        if ((await refreshArcaBinary({ previewRecoveryRequested: true })) === null) return false;
-        if (context.win.isDestroyed()) return false;
-        if (!arcaAutoConnectFeatureEnabled() || !context.rememberedMatchesSource) {
-          startArcaPreviewConsentRecovery(context);
-          return false;
-        }
-        const current = arcaAutoConnect.getStatus(target);
-        const status =
-          current.state === "failed"
-            ? await arcaAutoConnect.retry(target)
-            : await arcaAutoConnect.ensure(target);
-        return status.state === "online" && arcaIdentities.get(target)?.hostId === sourceHostId;
-      } catch (error) {
-        console.warn(`[omnigent] Arca preview recovery failed: ${String(error)}`);
-        return false;
-      }
-    },
-    getAgentNavigationHintForEvent: (
-      event,
-      url,
-      sourceHostId,
-      rememberedArcaHostId,
-      sourceIsArcaHost,
-    ) => {
-      const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
-      if (!targetContext) return null;
-      if (typeof rememberedArcaHostId !== "string") {
-        return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
-      }
-      const context = arcaPreviewRecoveryContextForEvent(
-        event,
-        url,
-        sourceHostId,
-        rememberedArcaHostId,
-        sourceIsArcaHost,
-      );
-      if (!context) {
-        return "This session's host can't be verified as Arca, so its localhost preview remains unavailable.";
-      }
-      const { target } = context;
-      if ((arcaPreviewDeclinedUntil.get(target) ?? 0) > Date.now()) {
-        return "Reconnect was declined. Wait a moment, then retry the preview to show the prompt again.";
-      }
-      if (arcaPreviewRecoveries.has(target)) {
-        return "Finish the Arca reconnect in Omnigent, then retry the preview.";
-      }
-      return "Omnigent couldn't restore the Arca connection details. Retry the preview to reconnect.";
-    },
+    isLocalAgentContext: (event, context) =>
+      isLocalBrowserAgentContext(BrowserWindow.fromWebContents(event.sender), context),
   });
 }
 

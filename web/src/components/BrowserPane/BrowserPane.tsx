@@ -43,6 +43,8 @@ import {
 } from "@/components/ui/select";
 import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
 import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
+import { resolveBrowserSessionHostId } from "@/lib/browserSessionHost";
+import { browserViewOwnerId } from "@/lib/browserTabs";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 
@@ -77,7 +79,7 @@ interface BrowserPaneBridge {
     conversationId: string,
     url: string,
     bounds: Bounds | undefined,
-    opts: { force?: boolean } | undefined,
+    opts: { force?: boolean; sourceHostId?: string } | undefined,
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserGoBack?: (conversationId: string) => Promise<NavResult>;
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
@@ -260,20 +262,24 @@ export function BrowserPane({
   // Submit the URL bar. Normalize the typed value (add scheme) and reuse the
   // relay's own navigate path with force:true so it reloads even if the typed
   // URL matches the current one (explicit "go there" intent).
-  const submitUrl = useCallback(() => {
+  const submitUrl = useCallback(async () => {
     const bridge = getBridge();
     if (!bridge?.browserOpenOrNavigate) return;
     const raw = currentUrl.trim();
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
     setNavigationError(null);
-    void bridge
-      .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
-      .then((result) => {
-        if (result.ok) setCurrentUrl(navUrl);
-        else setNavigationError(result.error ?? "Unable to open this page.");
-      })
-      .catch(() => setNavigationError("Unable to open this page."));
+    try {
+      const sourceHostId = await resolveBrowserSessionHostId(browserViewOwnerId(conversationId));
+      const result = await bridge.browserOpenOrNavigate(conversationId, navUrl, undefined, {
+        force: true,
+        ...(sourceHostId ? { sourceHostId } : {}),
+      });
+      if (result.ok) setCurrentUrl(navUrl);
+      else setNavigationError(result.error ?? "Unable to open this page.");
+    } catch {
+      setNavigationError("Unable to open this page.");
+    }
   }, [conversationId, currentUrl]);
 
   const handleBack = useCallback(() => {

@@ -1,6 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
+import { resolveBrowserSessionHostId } from "@/lib/browserSessionHost";
+
+vi.mock("@/lib/browserSessionHost", () => ({ resolveBrowserSessionHostId: vi.fn() }));
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
@@ -64,6 +67,7 @@ beforeEach(() => {
     unobserve() {}
     disconnect() {}
   };
+  vi.mocked(resolveBrowserSessionHostId).mockResolvedValue(null);
   installBridge();
 });
 
@@ -323,23 +327,28 @@ describe("BrowserPane design-mode toggle", () => {
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
-  it("opens a manually typed localhost preview through the user navigation path", async () => {
-    const bridge = installBridge();
-    render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
-    const bar = screen.getByRole("textbox", { name: "Address bar" });
-    fireEvent.change(bar, { target: { value: "localhost:5273/preview" } });
-    fireEvent.keyDown(bar, { key: "Enter" });
+  it.each([null, "local-host"])(
+    "passes the owning session host for typed previews (%s)",
+    async (hostId) => {
+      vi.mocked(resolveBrowserSessionHostId).mockResolvedValue(hostId);
+      const bridge = installBridge();
+      render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      fireEvent.change(bar, { target: { value: "localhost:5273/preview" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
 
-    await waitFor(() =>
-      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
-        "browser-tab:conv_preview:two",
-        "http://localhost:5273/preview",
-        undefined,
-        { force: true },
-      ),
-    );
-    expect(bar).toHaveValue("http://localhost:5273/preview");
-  });
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+          "browser-tab:conv_preview:two",
+          "http://localhost:5273/preview",
+          undefined,
+          { force: true, ...(hostId ? { sourceHostId: hostId } : {}) },
+        ),
+      );
+      expect(resolveBrowserSessionHostId).toHaveBeenCalledWith("conv_preview");
+      expect(bar).toHaveValue("http://localhost:5273/preview");
+    },
+  );
 
   /** Render the pane, activate a view (so toolbar buttons enable), and return
    *  the bridge + handles to the captured event callbacks. */

@@ -14,17 +14,13 @@ import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
-import { useQueryClient } from "@tanstack/react-query";
-import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
-import { getSessionSlim } from "@/lib/sessionsApi";
-import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
-import type { Host } from "@/hooks/useHosts";
-import type { Session } from "@/lib/types";
+import { resolveBrowserSessionHostId } from "@/lib/browserSessionHost";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
  *  relay feature-detects before calling. */
 interface BrowserDesktopBridge {
+  browserLocalAgentOnly?: boolean;
   browserOpenOrNavigate?: (
     conversationId: string,
     url: string,
@@ -33,37 +29,24 @@ interface BrowserDesktopBridge {
       force?: boolean;
       agent?: boolean;
       sourceHostId?: string;
-      rememberedArcaHostId?: string;
-      sourceIsArcaHost?: boolean;
     },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
+    sourceHostId?: string,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
   /** @deprecated Compatibility with pre-typed desktops until v0.21. */
   browserExecute?: (
     conversationId: string,
     script: string,
+    sourceHostId?: string,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
   browserPerformAction?: (
     conversationId: string,
     action: "snapshot" | "click" | "type",
     args?: Record<string, unknown>,
+    sourceHostId?: string,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
-}
-
-function isLoopbackPreview(url: string): boolean {
-  try {
-    const { hostname } = new URL(url);
-    return (
-      hostname === "localhost" ||
-      hostname.endsWith(".localhost") ||
-      hostname === "127.0.0.1" ||
-      hostname === "[::1]"
-    );
-  } catch {
-    return false;
-  }
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -85,14 +68,19 @@ async function performAction(
   desktop: BrowserDesktopBridge,
   conversationId: string,
   action: "snapshot" | "click" | "type",
-  args?: Record<string, unknown>,
+  args: Record<string, unknown> | undefined,
+  sourceHostId: string,
 ) {
   if (desktop.browserPerformAction) {
-    return desktop.browserPerformAction(conversationId, action, args);
+    return desktop.browserPerformAction(conversationId, action, args, sourceHostId);
   }
-  // Pre-typed desktops retain their existing executor until the v0.21 transition.
+  // Keep the fixed-template transport until v0.21; main still checks the source host.
   if (desktop.browserExecute) {
-    return desktop.browserExecute(conversationId, buildBrowserActionScript(action, args));
+    return desktop.browserExecute(
+      conversationId,
+      buildBrowserActionScript(action, args),
+      sourceHostId,
+    );
   }
   return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
@@ -107,9 +95,16 @@ async function dispatch(
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
   sourceHostId: string | null,
-  rememberedArcaHostId: string | null,
-  sourceIsArcaHost: boolean,
 ): Promise<ActionResult> {
+  if (!desktop.browserLocalAgentOnly) {
+    return { ok: false, error: "Update Omnigent Desktop to use local-session browser tools." };
+  }
+  if (!sourceHostId) {
+    return {
+      ok: false,
+      error: "Browser tools require a verified session running on this desktop.",
+    };
+  }
   try {
     switch (action) {
       case "navigate": {
@@ -118,37 +113,25 @@ async function dispatch(
         if (!desktop.browserOpenOrNavigate) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        // force: honor the explicit agent nav even on same-URL. agent: mark it
-        // model-issued so the registry applies the scheme/host allowlist (Risk).
+        // Main compares the source session host with this desktop's local host.
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
-          ...(sourceHostId ? { sourceHostId } : {}),
-          ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
-          ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
+          sourceHostId,
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
-        if (
-          isLoopbackPreview(url) &&
-          sourceHostId &&
-          rememberedArcaHostId &&
-          sourceHostId !== rememberedArcaHostId
-        ) {
-          // Main only approves this after consent captures the source host.
-          writeArcaHostId(sourceHostId);
-        }
         return { ok: true, data: { final_url: url } };
       }
       case "screenshot": {
         if (!desktop.browserScreenshot) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        const r = await desktop.browserScreenshot(conversationId);
+        const r = await desktop.browserScreenshot(conversationId, sourceHostId);
         if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
         return { ok: true, data_url: r.dataUrl };
       }
       case "snapshot": {
-        const r = await performAction(desktop, conversationId, "snapshot");
+        const r = await performAction(desktop, conversationId, "snapshot", undefined, sourceHostId);
         if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
@@ -158,12 +141,12 @@ async function dispatch(
         }
       }
       case "click": {
-        const r = await performAction(desktop, conversationId, "click", args);
+        const r = await performAction(desktop, conversationId, "click", args, sourceHostId);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         return { ok: true };
       }
       case "type": {
-        const r = await performAction(desktop, conversationId, "type", args);
+        const r = await performAction(desktop, conversationId, "type", args, sourceHostId);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
         return { ok: true };
       }
@@ -233,7 +216,6 @@ async function postResult(
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
   const relayEnabled = !!conversationId;
-  const queryClient = useQueryClient();
   useEffect(() => {
     if (!relayEnabled) return;
     if (!supportsBrowser()) return;
@@ -246,55 +228,10 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      let sourceHostId: string | null = null;
-      if (evt.action === "navigate") {
-        try {
-          // Parent hints cannot establish which ancestor has the nearest own host binding.
-          const visited = new Set<string>();
-          let id: string | null = sourceConversationId;
-          while (id !== null && !visited.has(id)) {
-            visited.add(id);
-            const hopId: string = id;
-            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
-            const source: Session = await queryClient.fetchQuery({
-              queryKey: ["session", hopId],
-              queryFn: () => getSessionSlim(hopId),
-              staleTime: Infinity,
-              retry: false,
-            });
-            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
-            setSessionParent(source.id, source.parentSessionId);
-            if (source.hostId) {
-              sourceHostId = source.hostId;
-              break;
-            }
-            id = source.parentSessionId;
-          }
-        } catch {
-          // Unknown provenance stays denied for localhost; public browsing still works.
-        }
-      }
-      const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
-      const sourceIsArcaHost =
-        evt.action === "navigate" && sourceHostId !== null
-          ? queryClient
-              .getQueriesData<Host[]>({ queryKey: ["hosts"] })
-              .flatMap(([, rows]) => rows ?? [])
-              .some(
-                (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
-              )
-          : false;
+      const sourceHostId = await resolveBrowserSessionHostId(sourceConversationId);
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(
-            sourceConversationId,
-            evt.action,
-            evt.args,
-            desktop,
-            sourceHostId,
-            rememberedArcaHostId,
-            sourceIsArcaHost,
-          );
+        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
@@ -303,5 +240,5 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       cancelled = true;
       unsubscribe();
     };
-  }, [relayEnabled, queryClient]);
+  }, [relayEnabled]);
 }

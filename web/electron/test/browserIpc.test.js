@@ -45,13 +45,7 @@ function makeIpcMain() {
 const allowAgentNavigation = async () => ({ ok: true });
 
 describe("browser IPC pending navigation lifecycle", () => {
-  for (const action of [
-    "supersede",
-    "close",
-    "closeAll",
-    "recovery teardown",
-    "sender trust revoked",
-  ]) {
+  for (const action of ["supersede", "close", "closeAll", "sender trust revoked"]) {
     it(`drops pending DNS after ${action}`, async () => {
       const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
       const registry = createBrowserViewRegistry();
@@ -67,17 +61,12 @@ describe("browser IPC pending navigation lifecycle", () => {
         return { ok: true, created: false };
       };
       const ipcMain = makeIpcMain();
-      let recoveries = 0;
       let trusted = true;
       registerBrowserIpc({
         ipcMain,
         isPinnedOriginSender: () => trusted,
         getRegistryForEvent: () => registry,
-        recoverAgentNavigationForEvent: async () => {
-          recoveries++;
-          registry.closeAll();
-          return true;
-        },
+        isLocalAgentContext: () => true,
       });
       const navigate = (url) =>
         ipcMain.invoke(
@@ -99,207 +88,16 @@ describe("browser IPC pending navigation lifecycle", () => {
       } else if (action === "sender trust revoked") {
         trusted = false;
       }
-      deferred.resolve(
-        action === "recovery teardown" ? { ok: false, error: "blocked" } : { ok: true },
-      );
+      deferred.resolve({ ok: true });
       const result = await first;
       assert.equal(result.ok, false);
       assert.match(result.error, /superseded or closed/);
       assert.deepEqual(opened, action === "supersede" ? ["https://second.example/"] : []);
-      assert.equal(recoveries, action === "recovery teardown" ? 1 : 0);
     });
   }
 });
 
-describe("browser IPC Arca context", () => {
-  it("adds a main-owned recovery hint only to a denied agent navigation", async () => {
-    const ipcMain = makeIpcMain();
-    let allowed = false;
-    let hints = 0;
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => ({
-        beginAgentNavigation: () => () => true,
-        checkAgentNavigation: allowAgentNavigation,
-        openOrNavigate: () => ({ ok: allowed, error: allowed ? undefined : "blocked" }),
-      }),
-      getAgentNavigationHintForEvent: () => {
-        hints++;
-        return "Run on Arca";
-      },
-    });
-    const invoke = (agent) =>
-      ipcMain.invoke(
-        "omnigent:browser-open-or-navigate",
-        {},
-        { conversationId: "source", url: "http://localhost", opts: { agent } },
-      );
-    assert.equal((await invoke(true)).error, "blocked Run on Arca");
-    assert.equal((await invoke(false)).error, "blocked");
-    allowed = true;
-    assert.equal((await invoke(true)).ok, true);
-    assert.equal(hints, 1);
-  });
-
-  it("retries a denied agent navigation once after identity recovery", async () => {
-    const ipcMain = makeIpcMain();
-    let allowed = false;
-    let navigations = 0;
-    let recoveries = 0;
-    const calls = [];
-    const registry = {
-      beginAgentNavigation: () => () => true,
-      checkAgentNavigation: async () => {
-        calls.push(allowed ? "allowed" : "denied");
-        return allowed ? { ok: true } : { ok: false, error: "blocked" };
-      },
-      openOrNavigate: () => {
-        calls.push("navigate");
-        navigations++;
-        assert.equal(allowed, true);
-        return { ok: true, created: false };
-      },
-    };
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => registry,
-      recoverAgentNavigationForEvent: async (
-        _event,
-        url,
-        sourceHostId,
-        rememberedArcaHostId,
-        sourceIsArcaHost,
-      ) => {
-        calls.push("recover");
-        recoveries++;
-        assert.equal(url, "http://localhost:5173");
-        assert.equal(sourceHostId, "arca-host");
-        assert.equal(rememberedArcaHostId, "arca-host");
-        assert.equal(sourceIsArcaHost, true);
-        allowed = true;
-        return true;
-      },
-      getAgentContextForEvent: () => {
-        return { sourceHostId: "arca-host" };
-      },
-    });
-    const result = await ipcMain.invoke(
-      "omnigent:browser-open-or-navigate",
-      {},
-      {
-        conversationId: "source",
-        url: "http://localhost:5173",
-        opts: {
-          agent: true,
-          sourceHostId: "arca-host",
-          rememberedArcaHostId: "arca-host",
-          sourceIsArcaHost: true,
-        },
-      },
-    );
-    assert.equal(result.ok, true);
-    assert.equal(recoveries, 1);
-    assert.equal(navigations, 1);
-    assert.deepEqual(calls, ["denied", "recover", "allowed", "navigate"]);
-  });
-
-  it("leaves a denied navigation untouched when recovery captures no eligible identity", async () => {
-    const ipcMain = makeIpcMain();
-    let navigations = 0;
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => ({
-        beginAgentNavigation: () => () => true,
-        checkAgentNavigation: allowAgentNavigation,
-        openOrNavigate: () => {
-          navigations++;
-          return { ok: false, error: "blocked", created: false };
-        },
-      }),
-      recoverAgentNavigationForEvent: async () => false,
-    });
-
-    const result = await ipcMain.invoke(
-      "omnigent:browser-open-or-navigate",
-      {},
-      {
-        conversationId: "source",
-        url: "http://localhost:5173",
-        opts: {
-          agent: true,
-          sourceHostId: "arca-host",
-          rememberedArcaHostId: "arca-host",
-        },
-      },
-    );
-    assert.equal(result.ok, false);
-    assert.equal(navigations, 1);
-  });
-
-  it("returns a structured denial when recovery rejects", async () => {
-    const ipcMain = makeIpcMain();
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => ({
-        beginAgentNavigation: () => () => true,
-        checkAgentNavigation: allowAgentNavigation,
-        openOrNavigate: () => ({ ok: false, error: "blocked", created: false }),
-      }),
-      recoverAgentNavigationForEvent: async () => {
-        throw new Error("recovery failed");
-      },
-    });
-
-    const result = await ipcMain.invoke(
-      "omnigent:browser-open-or-navigate",
-      {},
-      {
-        conversationId: "source",
-        url: "http://localhost:5173",
-        opts: { agent: true, sourceHostId: "arca-host", rememberedArcaHostId: "arca-host" },
-      },
-    );
-    assert.deepEqual(result, { ok: false, created: false, error: "blocked" });
-  });
-
-  it("re-gates the sender registry after awaited recovery", async () => {
-    const ipcMain = makeIpcMain();
-    let registryCalls = 0;
-    const first = {
-      beginAgentNavigation: () => () => true,
-      checkAgentNavigation: allowAgentNavigation,
-      openOrNavigate: () => ({ ok: false, error: "blocked" }),
-    };
-    const second = {
-      beginAgentNavigation: () => () => true,
-      checkAgentNavigation: allowAgentNavigation,
-      openOrNavigate: () => ({ ok: true, created: false }),
-    };
-    registerBrowserIpc({
-      ipcMain,
-      isPinnedOriginSender: () => true,
-      getRegistryForEvent: () => (++registryCalls === 1 ? first : second),
-      recoverAgentNavigationForEvent: async () => true,
-    });
-
-    const result = await ipcMain.invoke(
-      "omnigent:browser-open-or-navigate",
-      {},
-      {
-        conversationId: "source",
-        url: "http://localhost:5173",
-        opts: { agent: true, sourceHostId: "arca-host", rememberedArcaHostId: "arca-host" },
-      },
-    );
-    assert.equal(result.ok, false);
-    assert.match(result.error, /superseded or closed/);
-    assert.equal(registryCalls, 2);
-  });
-
+describe("browser IPC session context", () => {
   it("pairs the renderer's source host with main's context and ignores caller exception flags", async () => {
     const ipcMain = makeIpcMain();
     const calls = [];
@@ -308,6 +106,7 @@ describe("browser IPC Arca context", () => {
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
+      isLocalAgentContext: () => true,
       getRegistryForEvent: () => ({
         beginAgentNavigation: () => () => true,
         checkAgentNavigation: async (...args) => {
@@ -351,6 +150,7 @@ describe("browser IPC Arca context", () => {
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
+      isLocalAgentContext: () => true,
       getRegistryForEvent: () => ({
         beginAgentNavigation: () => () => true,
         checkAgentNavigation: async (_id, url) => {
@@ -518,6 +318,7 @@ function setup({
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender: () => pinned,
+    isLocalAgentContext: () => true,
     getRegistryForEvent: () => registry,
     chromeCookieStore,
     platform,
@@ -1437,6 +1238,7 @@ it("applies navigation policy even when renderer options claim user intent", asy
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
+      isLocalAgentContext: () => true,
       getRegistryForEvent: () => ({
         beginAgentNavigation: () => () => true,
         checkAgentNavigation: allowAgentNavigation,
@@ -1460,5 +1262,90 @@ it("applies navigation policy even when renderer options claim user intent", asy
     assert.equal(result.ok, false);
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0][3], { force: false, agent: true, agentContext: context });
+  }
+});
+
+describe("browser IPC local-only tools", () => {
+  for (const sourceHostId of [undefined, "remote-host", "arca-host", "local-host"]) {
+    it(`checks every tool against source host ${sourceHostId}`, async () => {
+      const ipcMain = makeIpcMain();
+      const effects = [];
+      const wc = makeWebContents();
+      wc.capturePage = async () => {
+        effects.push("capture");
+        return { toPNG: () => Buffer.from("png") };
+      };
+      wc.executeJavaScript = async () => {
+        effects.push("execute");
+        return "{}";
+      };
+      const registry = makeRegistry("conv", wc);
+      registry.openOrNavigate = () => {
+        effects.push("navigate");
+        return { ok: true };
+      };
+      registerBrowserIpc({
+        ipcMain,
+        isPinnedOriginSender: () => true,
+        getRegistryForEvent: () => registry,
+        getAgentContextForEvent: (_event, host) => ({ sourceHostId: host }),
+        isLocalAgentContext: (_event, context) => context.sourceHostId === "local-host",
+      });
+      const requests = [
+        [
+          "open-or-navigate",
+          {
+            url: "https://example.com",
+            opts: { sourceHostId, agent: false, allowPrivateNetwork: true },
+          },
+        ],
+        [
+          "open-or-navigate",
+          { url: "http://localhost", opts: { sourceHostId, agent: true, sourceIsArcaHost: true } },
+        ],
+        ["screenshot", {}],
+        ...["snapshot", "click", "type"].map((action) => [
+          "perform-action",
+          {
+            action,
+            params:
+              action === "snapshot"
+                ? {}
+                : action === "click"
+                  ? { selector: "input" }
+                  : { selector: "input", text: "hi" },
+          },
+        ]),
+        [
+          "execute",
+          { js: require("../src/browserActionScript.mjs").buildBrowserActionScript("snapshot") },
+        ],
+      ];
+      for (const [channel, args] of requests) {
+        // oxlint-disable-next-line no-await-in-loop -- Verify each tool before the next request.
+        const result = await ipcMain.invoke(
+          `omnigent:browser-${channel}`,
+          {},
+          { conversationId: "conv", sourceHostId, ...args },
+        );
+        assert.equal(result.ok, sourceHostId === "local-host", channel);
+        if (!result.ok) assert.match(result.error, /running on this desktop/);
+      }
+      assert.equal(effects.length, sourceHostId === "local-host" ? requests.length : 0);
+      // Human tabs keep working even when their session runs remotely.
+      assert.equal(
+        (
+          await ipcMain.invoke(
+            "omnigent:browser-open-or-navigate",
+            {},
+            {
+              conversationId: "browser-tab:conv:user-tab",
+              url: "https://example.com",
+            },
+          )
+        ).ok,
+        true,
+      );
+    });
   }
 });

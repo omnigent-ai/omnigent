@@ -5,6 +5,7 @@
 
 import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
+import { resolveBrowserSessionHostId } from "./browserSessionHost";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
 import { isNativeShell, supportsBrowser } from "./nativeBridge";
@@ -15,7 +16,7 @@ type OpenOrNavigate = (
   conversationId: string,
   url: string,
   bounds: undefined,
-  opts: { agent: boolean },
+  opts: { sourceHostId?: string },
 ) => Promise<{ ok: boolean; error?: string }>;
 
 interface BrowserBridge {
@@ -65,10 +66,11 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     }
     const tabId = randomUUID();
     newViewId = browserViewId(conversationId, tabId);
-    // Chat and workspace-file links are agent- or repo-authored and the agent can
-    // read the view, so they get the agent's navigation policy (no loopback/private
-    // hosts, even via redirect).
-    const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, { agent: true });
+    // Chat and workspace-file links use the owning session's browser policy.
+    const sourceHostId = await resolveBrowserSessionHostId(conversationId);
+    const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, {
+      ...(sourceHostId ? { sourceHostId } : {}),
+    });
     if (result?.ok) {
       newViewId = undefined;
       for (const listener of listeners) listener(conversationId, tabId);
