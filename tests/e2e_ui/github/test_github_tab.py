@@ -267,7 +267,9 @@ def test_pr_diff_retry_keeps_associations(
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
         page.get_by_test_id("composer-pr-link").click()
-    panel.get_by_role("button", name=re.compile(rf"^example.com/acme/app #{_PR_NUMBER} —")).click()
+    panel.get_by_role(
+        "button", name=f"example.com/acme/app #{_PR_NUMBER} — Add the GitHub tab", exact=True
+    ).click()
     panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
         "tab", name="Changes", exact=True
     ).click()
@@ -421,7 +423,9 @@ def test_composer_pr_link_opens_github_tab(
             )
         if pr_count > 1:
             panel.get_by_role(
-                "button", name=re.compile(rf"^example.com/acme/app #{_PR_NUMBER} —")
+                "button",
+                name=f"example.com/acme/app #{_PR_NUMBER} — Add the GitHub tab",
+                exact=True,
             ).click()
         expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
         expect(panel.get_by_label("Pull request status: Open")).to_be_visible()

@@ -236,6 +236,6 @@ def test_created_pr_is_tracked(
     # The created PR must be associated with the session: the Pull Requests tab's
     # session PR list names it, and the composer status line links it.
     expect(
-        rail.get_by_role("button", name=re.compile(r"^example/project #42(?: —|$)"))
+        rail.get_by_role("button", name=re.compile(r"^example\/project #42(?: —|$)"))
     ).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")

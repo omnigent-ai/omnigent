@@ -245,7 +245,7 @@ def test_pr_appears_in_composer_and_workspace(
         "aria-selected", "true"
     )
     rail.get_by_role("list", name="Pull requests").get_by_role(
-        "button", name=re.compile(r"^.*#42 — " + re.escape(_TITLE) + r"$")
+        "button", name=re.compile(r"^.*#42(?: \(from branch\))? — " + re.escape(_TITLE) + r"$")
     ).click()
     expect(rail.get_by_role("link", name=f"{_TITLE} #42")).to_have_attribute("href", _URL)
     expect(rail.get_by_text("Created from the active session checkout.")).to_be_visible()

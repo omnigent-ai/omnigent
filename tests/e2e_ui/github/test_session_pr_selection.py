@@ -242,8 +242,8 @@ def test_session_pr_list_long_title(
     assert title_text.evaluate("element => element.scrollWidth > element.clientWidth")
     assert title_text.evaluate("element => element.scrollHeight <= element.clientHeight")
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_in_viewport()
-    menu = panel.get_by_role("button", name=f"Actions for {label}", exact=True)
-    expect(menu).to_be_in_viewport()
+    menu = panel.get_by_role("button", name="Actions for example/one #42", exact=True)
+    expect(menu).to_be_in_viewport(ratio=1)
     for element in (row, menu):
         box = element.bounding_box()
         assert box and box["x"] >= 0 and box["x"] + box["width"] <= viewport_width
