@@ -108,6 +108,11 @@ POLICY_SCOPE: dict[str, int] = {
     "session": 2,
 }
 
+INSTALLED_SKILL_SCOPE: dict[str, int] = {
+    "user": 1,
+    "org": 2,
+}
+
 SCHEDULED_TASK_STATE: dict[str, int] = {
     "active": 1,
     "paused": 2,
@@ -355,3 +360,13 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+def encode_installed_skill_scope(name: str) -> int:
+    """Encode an ``installed_skills.scope`` name to its int code."""
+    return _encode(INSTALLED_SKILL_SCOPE, name, field="installed_skills.scope")
+
+
+def decode_installed_skill_scope(code: int) -> str:
+    """Decode an ``installed_skills.scope`` int code to its name."""
+    return _decode(INSTALLED_SKILL_SCOPE, code, field="installed_skills.scope")

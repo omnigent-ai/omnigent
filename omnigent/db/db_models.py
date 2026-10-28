@@ -1703,3 +1703,100 @@ class SqlScheduledTaskRun(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlSkillSource(OmnigentBase):
+    """
+    SQLAlchemy model for the ``skill_sources`` table.
+
+    A git repository the skills marketplace browses (see
+    ``omnigent.skills``). Rows are added by administrators; deleting one
+    leaves the skills already installed from it in place.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
+    :param url: Clone URL, e.g. ``"https://github.com/acme/skills.git"``.
+    :param ref: Branch or tag to fetch, or ``None`` for the default branch.
+    :param name: Label shown in the UI.
+    :param created_by: User who added the source, or ``None`` in single-user mode.
+    :param created_at: Unix epoch seconds at row creation.
+    """
+
+    __tablename__ = "skill_sources"
+    __table_args__ = (
+        # Keyset pagination over (created_at, id); ends in the primary key.
+        Index("ix_skill_sources_order", "workspace_id", "created_at", "id"),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        primary_key=True,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    url: Mapped[str] = mapped_column(String(512), nullable=False)
+    ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class SqlInstalledSkill(OmnigentBase):
+    """
+    SQLAlchemy model for the ``installed_skills`` table.
+
+    A skill fetched from a repository and stored as a tarball in the artifact
+    store; the session agent-contents route folds enabled rows into the
+    served bundle so every harness discovers them as bundle skills.
+
+    :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
+    :param name: Invocation identifier, the skill's directory name.
+    :param display_name: Human-facing label from the frontmatter, or ``None``.
+    :param description: One-line summary from the frontmatter.
+    :param source_url: Clone URL the skill came from.
+    :param ref: Branch or tag it was fetched at, or ``None``.
+    :param commit: Commit it was packaged from, or ``None`` when unknown.
+    :param path: Skill directory inside the repository, POSIX form.
+    :param scope: ``"user"`` (one user's install) or ``"org"`` (everyone).
+        Stored as a stable int code (see omnigent.db.enum_codecs
+        INSTALLED_SKILL_SCOPE); the store converts at the row↔entity boundary.
+    :param owner_user_id: The installing user for a user-scoped row, else ``None``.
+    :param bundle_location: Artifact-store key of the skill tarball.
+    :param enabled: Whether sessions receive the skill.
+    :param installed_by: User who installed it, or ``None`` in single-user mode.
+    :param installed_at: Unix epoch seconds at row creation.
+    :param updated_at: Unix epoch seconds of the last write, or ``None``.
+    """
+
+    __tablename__ = "installed_skills"
+    __table_args__ = (
+        # Owner-scoped keyset pagination over (installed_at, id) and the
+        # replace-on-reinstall lookup by name; both end in the primary key.
+        Index(
+            "ix_installed_skills_owner_order",
+            "workspace_id",
+            "owner_user_id",
+            "installed_at",
+            "id",
+        ),
+        Index("ix_installed_skills_owner_name", "workspace_id", "owner_user_id", "name", "id"),
+        CheckConstraint("scope IN (1, 2)", name="ck_installed_skills_scope"),
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        primary_key=True,
+        default=current_workspace_id,
+    )
+    id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    description: Mapped[str] = mapped_column(String(1024), nullable=False)
+    source_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    scope: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    bundle_location: Mapped[str] = mapped_column(String(512), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    installed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    installed_at: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
