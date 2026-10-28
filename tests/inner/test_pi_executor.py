@@ -24,6 +24,7 @@ import pytest
 from omnigent.debug_logging import record_to_row
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -6339,37 +6340,161 @@ def test_settled_eof_before_settlement_is_an_error() -> None:
     _run(_test())
 
 
-def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
+def _overflow_compaction_frames(compaction_end: dict, *after_settled: str) -> list[str]:
+    """pi's frames for an overflow it compacts and retries into "RECOVERED"."""
+    overflow = _assistant_message(
+        stop_reason="error", error_message="Context overflow: prompt is too long"
+    )
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=overflow),
+        _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+        _rpc_frame(type="compaction_start", reason="overflow"),
+        _rpc_frame(type="compaction_end", reason="overflow", **compaction_end),
+        *_plain_answer_frames("RECOVERED")[1:],
+        *after_settled,
+    ]
+
+
+def _sent_command_types(rpc: _PiRpcSession) -> list[str]:
+    written = b"".join(rpc.process.stdin.data).decode()
+    return [json.loads(line)["type"] for line in written.splitlines()]
+
+
+def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
     """A context-overflow error that pi repairs by compacting and re-running
-    the prompt completes with the recovered answer."""
+    the prompt completes with the recovered answer, after reporting pi's
+    compacted context so a restarted pi resumes from it."""
 
     async def _test() -> None:
-        overflow = _assistant_message(
-            stop_reason="error", error_message="Context overflow: prompt is too long"
-        )
+        pi_context = [
+            {"role": "compactionSummary", "summary": "Earlier: SUMMARY", "tokensBefore": 9000},
+            {"role": "user", "content": [{"type": "text", "text": "kept question"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "private"},
+                    {"type": "toolCall", "id": "c1", "name": "read", "arguments": {}},
+                ],
+            },
+            {"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "x"}]},
+            _assistant_message("kept answer"),
+            {"role": "user", "content": "hello"},
+            _assistant_message("RECOVERED"),
+        ]
         executor, rpc = _session_executor(
-            [
-                _rpc_frame(type="response", success=True),
-                _rpc_frame(type="message_start", message={"role": "assistant"}),
-                _rpc_frame(type="message_end", message=overflow),
-                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
-                _rpc_frame(type="compaction_start", reason="overflow"),
+            _overflow_compaction_frames(
+                {
+                    "result": {"summary": "Earlier: SUMMARY", "estimatedTokensAfter": 1200},
+                    "aborted": False,
+                    "willRetry": True,
+                },
                 _rpc_frame(
-                    type="compaction_end",
-                    reason="overflow",
-                    result={"summary": "..."},
-                    aborted=False,
-                    willRetry=True,
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={"messages": pi_context},
                 ),
-                *_plain_answer_frames("RECOVERED")[1:],
-            ]
+            )
         )
 
         events = await _run_session_turn(executor, "hello")
 
         assert [e.message for e in events if isinstance(e, ExecutorError)] == []
-        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert [type(e) for e in events[-2:]] == [CompactionComplete, TurnComplete]
+        compaction, turn_complete = events[-2:]
         assert turn_complete.response == "RECOVERED"
+        assert compaction.summary == "Earlier: SUMMARY"
+        assert compaction.token_count == 1200
+        assert compaction.compacted_messages == [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "The conversation history before this point was compacted into "
+                            "the following summary:\n\n<summary>\nEarlier: SUMMARY\n</summary>"
+                        ),
+                    }
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "kept question"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "kept answer"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        ]
+        assert _sent_command_types(rpc) == ["prompt", "get_messages"]
+        assert rpc._line_queue.empty()
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+def test_settled_compaction_without_exported_context_reports_summary_only() -> None:
+    """If pi does not return its context, the summary is still reported so
+    the runner replays it instead of the full uncompacted history."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor(
+            _overflow_compaction_frames(
+                {"result": {"summary": "SUMMARY"}, "aborted": False, "willRetry": True},
+                _rpc_frame(type="response", command="get_messages", success=False, error="busy"),
+            )
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events[-2:]] == [CompactionComplete, TurnComplete]
+        compaction = events[-2]
+        assert compaction.summary == "SUMMARY"
+        assert compaction.token_count == 0
+        assert compaction.compacted_messages is None
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_settled_failed_compaction_reports_no_compaction() -> None:
+    """A compaction that pi aborts or fails leaves the history unchanged, so
+    nothing is reported and pi is not asked for its context."""
+
+    async def _test() -> None:
+        answer_frames = _plain_answer_frames("ANSWER")
+        executor, rpc = _session_executor(
+            [
+                *answer_frames[:-1],
+                _rpc_frame(type="compaction_start", reason="threshold"),
+                _rpc_frame(
+                    type="compaction_end",
+                    reason="threshold",
+                    aborted=False,
+                    willRetry=False,
+                    errorMessage="Auto-compaction failed: timeout",
+                ),
+                answer_frames[-1],
+            ]
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert not any(isinstance(e, CompactionComplete) for e in events)
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+        assert turn_complete.response == "ANSWER"
+        assert _sent_command_types(rpc) == ["prompt"]
         assert rpc._line_queue.empty()
 
     _run(_test())

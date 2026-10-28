@@ -99,6 +99,8 @@ from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactedMessages,
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -1527,6 +1529,60 @@ def _extract_latest_user_content(
     return ""
 
 
+# Pi's own framing for a compaction summary in model context (core/messages.js).
+_PI_COMPACTION_SUMMARY_PREFIX = (
+    "The conversation history before this point was compacted into the following "
+    "summary:\n\n<summary>\n"
+)
+_PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>"
+
+
+def _pi_compacted_history(pi_messages: list[JsonValue]) -> CompactedMessages:
+    """
+    Convert Pi's post-compaction context into Omnigent replay messages.
+
+    Messages after the last user prompt are this turn's output, which the
+    runner persists after the compaction item, so they are left out. Tool
+    calls and results are dropped because Pi replay carries text only.
+
+    :param pi_messages: ``get_messages`` data from Pi after compaction.
+    :returns: Text messages for the runner's compaction item.
+    """
+    messages = [m for m in pi_messages if isinstance(m, dict)]
+    last_prompt = max(
+        (index for index, m in enumerate(messages) if m.get("role") == "user"),
+        default=-1,
+    )
+    history: CompactedMessages = []
+    for message in messages[: last_prompt + 1]:
+        role = message.get("role")
+        if role == "compactionSummary":
+            summary = message.get("summary")
+            text = (
+                _PI_COMPACTION_SUMMARY_PREFIX + summary + _PI_COMPACTION_SUMMARY_SUFFIX
+                if isinstance(summary, str)
+                else ""
+            )
+            history_role, block_type = "user", "input_text"
+        elif role in ("user", "custom"):
+            text = _extract_text(message)
+            history_role, block_type = "user", "input_text"
+        elif role == "assistant":
+            text = _extract_text(message)
+            history_role, block_type = "assistant", "output_text"
+        else:
+            continue
+        if text:
+            history.append(
+                {
+                    "type": "message",
+                    "role": history_role,
+                    "content": [{"type": block_type, "text": text}],
+                }
+            )
+    return history
+
+
 def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str]]]:
     """Split content blocks into Pi's prompt ``message`` text and ``images``.
 
@@ -2702,6 +2758,41 @@ class PiExecutor(Executor):
             return None
         return [level for level in levels if isinstance(level, str)]
 
+    async def _compaction_complete(
+        self,
+        rpc: _PiRpcSession,
+        result: dict[str, JsonValue],
+        model: str | None,
+    ) -> CompactionComplete:
+        """Report a settled turn's compaction with Pi's compacted context.
+
+        :param rpc: The settled Pi RPC session; idle, so ``get_messages`` is safe.
+        :param result: The ``compaction_end`` result carrying Pi's summary.
+        :param model: The turn's model.
+        :returns: The compaction event; summary-only if Pi did not export its context.
+        """
+        try:
+            response = await rpc.request(
+                {"type": "get_messages", "id": "compacted_messages"},
+                "get_messages",
+            )
+        except Exception:  # a failed export still persists the summary
+            logger.debug("PiExecutor: get_messages failed after compaction", exc_info=True)
+            response = None
+        data = response.get("data") if response else None
+        pi_messages = data.get("messages") if isinstance(data, dict) else None
+        tokens_after = result.get("estimatedTokensAfter")
+        return CompactionComplete(
+            summary=cast(str, result["summary"]),
+            token_count=tokens_after if isinstance(tokens_after, int) else 0,
+            model=model,
+            compacted_messages=(
+                _pi_compacted_history(pi_messages) or None
+                if isinstance(pi_messages, list)
+                else None
+            ),
+        )
+
     async def _apply_thinking_level(
         self,
         state: _PiSessionState,
@@ -2950,6 +3041,9 @@ class PiExecutor(Executor):
         # True between an errored ``message_end`` and the ``agent_end`` pi
         # emits right after it; only that gap uses the short drain budget.
         awaiting_error_agent_end = False
+        # Latest successful compaction this turn, reported at settlement so a
+        # restarted Pi process resumes from the compacted context.
+        compaction_result: dict[str, JsonValue] | None = None
 
         while True:
             line = await rpc.read_line(
@@ -3186,6 +3280,8 @@ class PiExecutor(Executor):
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
+                if compaction_result is not None:
+                    yield await self._compaction_complete(rpc, compaction_result, model)
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 yield TurnComplete(
@@ -3242,6 +3338,9 @@ class PiExecutor(Executor):
                         )
                     )
                     return
+                result = event.get("result")
+                if isinstance(result, dict) and isinstance(result.get("summary"), str):
+                    compaction_result = result
                 continue
 
             if event_type == "extension_ui_request":
