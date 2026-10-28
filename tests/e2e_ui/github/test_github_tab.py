@@ -33,6 +33,7 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
     open_right_rail,
+    stub_session_pull_requests,
     workspace_bar_needs_collapse,
 )
 
@@ -156,6 +157,9 @@ def _stub_github(page: Page, *, pr_count: int = 1) -> None:
             ],
         }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=info))
+    if pr_count > 1:
+        # The server's stored list matches the live payload it would have answered.
+        stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.route(re.compile(r"/resources/github/changes"), lambda r: r.fulfill(json=_CHANGES))
     page.route(re.compile(r"/resources/github/diff(?:\?|$)"), lambda r: r.fulfill(json=_PR_DIFF))
     page.route(
@@ -533,3 +537,102 @@ def test_no_pr_keeps_linking_when_another_provider_discovery_fails(
     expect(rail.get_by_role("status")).to_have_text("GitLab discovery failed. Refresh to retry.")
     rail.get_by_role("button", name="Link a PR", exact=True).click()
     expect(rail.get_by_role("textbox", name="Pull request URL")).to_be_visible()
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+def test_post_top_level_pr_comment(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """The same composer posts and retains drafts through every PR-panel entry point."""
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    pr_url = _INFO["pr"]["url"]
+    comments = [
+        {
+            **_INFO["pr"]["comments"][0],
+            "body": f"Earlier comment {index + 1}",
+            "url": f"{pr_url}#comment-{index}",
+        }
+        for index in range(30)
+    ]
+    info = {
+        **_INFO,
+        "selected_pr_url": pr_url,
+        "capabilities": {"comment_posting": True},
+        "selected_account": "octocat",
+        "pr": {**_INFO["pr"], "comments": comments},
+    }
+    page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    posts = []
+
+    def post_comment(route: Route) -> None:
+        posts.append(route.request.post_data_json)
+        comment = {
+            "author": "octocat",
+            "body": posts[-1]["body"],
+            "created_at": "2026-10-26T12:00:00Z",
+            "url": pr_url + "#issuecomment-99",
+        }
+        info["pr"]["comments"].append(comment)
+        route.fulfill(json={"object": "session.github.pr_comment", "comment": comment})
+
+    page.route(re.compile(r"/resources/github/comments$"), post_comment)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Comments 30", exact=True).click()
+    textbox = panel.get_by_role("textbox", name="New PR comment")
+    post_button = panel.get_by_role("button", name="Post comment", exact=True)
+    expect(textbox).to_be_in_viewport()
+    expect(post_button).to_be_in_viewport()
+    feed = panel.get_by_role("region", name="PR comments", exact=True)
+    assert feed.evaluate("el => el.scrollHeight > el.clientHeight")
+    composer_top = textbox.evaluate("el => el.getBoundingClientRect().top")
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Earlier comment 30", exact=True)).to_be_in_viewport()
+    assert textbox.evaluate("el => el.getBoundingClientRect().top") == pytest.approx(
+        composer_top, abs=1
+    )
+    feed.evaluate("el => { el.scrollTop = 0; }")
+    expect(panel.get_by_text("Earlier comment 1", exact=True)).to_be_in_viewport()
+    textbox.fill("Preview paragraph.\n\n" * 80)
+    panel.get_by_role("tab", name="Preview", exact=True).click()
+    expect(post_button).to_be_in_viewport()
+    assert feed.evaluate("el => el.clientHeight") > 0
+    if mobile:
+        page.set_viewport_size({"width": 390, "height": 540})
+        expect(post_button).to_be_in_viewport()
+        assert feed.evaluate("el => el.clientHeight") > 0
+        page.set_viewport_size({"width": 390, "height": 900})
+    panel.get_by_role("tab", name="Write", exact=True).click()
+    textbox.fill("**Thanks for reviewing!**")
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    tabs.get_by_role("tab", name="Comments 30", exact=True).click()
+    expect(textbox).to_have_value("**Thanks for reviewing!**")
+    panel.get_by_role("tab", name="Preview", exact=True).click()
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"comment-{entry}-preview.png"))
+    panel.get_by_role("button", name="Post comment", exact=True).click()
+    expect(tabs.get_by_role("tab", name="Comments 31", exact=True)).to_be_visible()
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    panel.get_by_role("tab", name="Write", exact=True).click()
+    expect(textbox).to_have_value("")
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_in_viewport()
+    expect(post_button).to_be_in_viewport()
+    assert posts == [{"pr_url": pr_url, "body": "**Thanks for reviewing!**"}]
+    page.screenshot(path=str(tmp_path / f"comment-{entry}-posted.png"))

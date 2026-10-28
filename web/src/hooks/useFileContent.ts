@@ -17,6 +17,7 @@ import {
   browseLocationSegment,
   useWorkspaceServeable,
 } from "@/hooks/useWorkspaceChangedFiles";
+import { fileWritesSettled } from "@/hooks/useWriteFileContent";
 import { useChatStore } from "@/store/chatStore";
 
 // The primary workspace environment is always "default".  This hook targets
@@ -79,8 +80,9 @@ export async function fetchWorkspaceFileBlob(
 export async function fetchFileContent(
   conversationId: string,
   path: string,
+  signal?: AbortSignal,
 ): Promise<FileContentResponse> {
-  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path));
+  const res = await authenticatedFetch(workspaceFileUrl(conversationId, path), { signal });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as FileContentResponse;
 }
@@ -166,23 +168,57 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
   triggerBrowserDownload(await res.blob(), filename);
 }
 
+/** How often an on-screen text file is re-read to show other writers' edits. */
+export const FILE_CONTENT_POLL_MS = 2_000;
+
+/** Larger files refresh only when shown again: every poll downloads the whole file. */
+export const FILE_CONTENT_POLL_MAX_BYTES = 256 * 1024;
+
+/** While refreshes keep failing (e.g. the file was deleted), re-check this often. */
+export const FILE_CONTENT_FAILING_POLL_MS = 30_000;
+
+/**
+ * Decide how often to re-read an on-screen file.
+ *
+ * Polls only UTF-8 files up to :data:`FILE_CONTENT_POLL_MAX_BYTES`. Binary
+ * previews and large (including truncated) files are skipped.
+ *
+ * :param data: The last successful response, or undefined before the first load.
+ * :param failing: True when the latest refresh failed after its retries.
+ * :returns: The interval in milliseconds, or ``false`` to not poll.
+ */
+export function fileContentPollInterval(
+  data: FileContentResponse | undefined,
+  failing: boolean,
+): number | false {
+  if (data?.encoding !== "utf-8" || data.bytes > FILE_CONTENT_POLL_MAX_BYTES) return false;
+  return failing ? FILE_CONTENT_FAILING_POLL_MS : FILE_CONTENT_POLL_MS;
+}
+
 /**
  * Fetch the content of a workspace file for the given conversation.
  *
  * Disabled (no request made) when `conversationId` or `path` is
  * null / undefined, or when `conversationId` is a client-only temp id.
  *
- * Fires one trailing invalidation when the session transitions from active
- * (running/waiting) to idle so the viewer picks up any file writes the agent
- * made during the turn. No polling is used — the invalidation fires exactly
- * once at end-of-turn, avoiding continuous refetches that would reset the
- * editor's scroll and cursor position.
+ * Keeps the viewer current with writes from the agent, other sessions and
+ * other processes:
+ *   - While `visible`, re-reads at {@link fileContentPollInterval}. Hidden
+ *     browser tabs pause.
+ *   - Re-reads once when the viewer or its browser tab is shown again, and
+ *     when the focused session goes from active (running/waiting) to idle.
+ * An unchanged read keeps the cached data, so the editors see no change.
+ * Changed content is applied in place by `useMarkdownEditorSync`.
+ *
+ * :param options.visible: True while the viewer is on screen, e.g. an open
+ *     panel in the active viewport.
  */
 export function useFileContent(
   conversationId: string | undefined,
   path: string | null,
-  options: { retry?: boolean } = {},
+  options: { retry?: boolean; visible?: boolean } = {},
 ) {
+  const visible = options.visible ?? false;
   // A `temp:*` id (navigate-first new-chat window) has no server session yet,
   // so never request `/v1/sessions/temp:*/resources/*` for it.
   const serverId = isTempConvId(conversationId) ? undefined : conversationId;
@@ -198,26 +234,39 @@ export function useFileContent(
   const serveable = useWorkspaceServeable(serverId);
   const queryClient = useQueryClient();
 
-  const prevRef = useRef<{ id: string | undefined; active: boolean }>({
+  const prevRef = useRef<{ id: string | undefined; active: boolean; visible: boolean }>({
     id: serverId,
     active: sessionActive,
+    visible,
   });
   useEffect(() => {
     const sameSession = prevRef.current.id === serverId;
     const justWentIdle = sameSession && prevRef.current.active && !sessionActive;
-    prevRef.current = { id: serverId, active: sessionActive };
-    if (justWentIdle && serverId && path) {
+    // A hidden viewer doesn't poll, so catch up as soon as it is shown again.
+    const justShown = visible && !prevRef.current.visible;
+    prevRef.current = { id: serverId, active: sessionActive, visible };
+    if ((justWentIdle || justShown) && serverId && path) {
       void queryClient.invalidateQueries({
         queryKey: ["file-content", serverId, path],
       });
     }
-  }, [serverId, path, sessionActive, queryClient]);
+  }, [serverId, path, sessionActive, visible, queryClient]);
 
   return useQuery({
     queryKey: ["file-content", serverId, path],
-    queryFn: () => fetchFileContent(serverId!, path!),
+    queryFn: async ({ signal }) => {
+      await fileWritesSettled(serverId!, path!);
+      // Cancelled while waiting (a newer write started): don't send the read.
+      signal.throwIfAborted();
+      return fetchFileContent(serverId!, path!, signal);
+    },
     enabled: !!serverId && !!path && serveable !== false,
     staleTime: 5_000,
+    refetchInterval: visible
+      ? (query) => fileContentPollInterval(query.state.data, query.state.status === "error")
+      : false,
+    // Catch up as soon as the browser tab returns, even within staleTime.
+    refetchOnWindowFocus: visible ? "always" : false,
     ...(options.retry === undefined ? {} : { retry: options.retry }),
   });
 }
