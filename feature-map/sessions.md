@@ -385,6 +385,10 @@ beside the microphone, open its configuration row, and select a model or effort.
 Switch tabs and return to confirm the draft keeps the choice. Send the first
 question and check it uses that selection. Change it again before a follow-up;
 the parent's selection should stay unchanged. Repeat in the mobile drawer.
+Changing only the model preserves unspecified effort and compatible explicit effort;
+an incompatible explicit effort is cleared. Sending waits until a settings save
+finishes, including after reopening the pane. A failed save preserves the message
+draft and allows retrying the settings or sending with the previous selection.
 If the native session's model list is empty, the picker uses the same host
 catalog as the main composer until the session's list arrives.
 Available choices follow the harness's capabilities; viewers and closed chats

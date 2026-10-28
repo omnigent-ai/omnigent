@@ -22,6 +22,14 @@ const PI_NATIVE_EFFORT_LEVELS = [
 export type NativeModelPickerKind =
   "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
 
+/** Preserve inherited effort; clear an explicit choice that the new model cannot use. */
+export function effortAfterModelChange(
+  effort: string | null,
+  supportedEfforts: readonly string[],
+): string | null {
+  return effort !== null && supportedEfforts.includes(effort) ? effort : null;
+}
+
 /** Claude/Codex reports win over requests that the runner may not have applied. */
 export function selectedModelForPicker(
   kind: NativeModelPickerKind | null,

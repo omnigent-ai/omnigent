@@ -12,7 +12,7 @@ import {
 } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
 import {
   type Bubble,
@@ -468,6 +468,9 @@ function SideChatComposer({
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
   const queryClient = useQueryClient();
+  const settingsSaving = useIsMutating({ mutationKey: ["side-chat-settings", childId] }) > 0;
+  const settingsSavePending = () =>
+    queryClient.isMutating({ mutationKey: ["side-chat-settings", childId] }) > 0;
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   // Unsent text + attachments live in the store, keyed by child id, NOT in
   // component state: this pane mounts in the desktop rail or the mobile
@@ -491,8 +494,8 @@ function SideChatComposer({
   // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
   const queues = !pending && !fullSession;
   useEffect(() => {
-    if (queues && queuedMessages.length > 0) maybeFlushQueuedHead(childId);
-  }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead]);
+    if (queues && queuedMessages.length > 0 && !settingsSaving) maybeFlushQueuedHead(childId);
+  }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead, settingsSaving]);
   const info = useServerInfo();
   const attachmentPolicy = info === "loading" ? null : (info.filesystem_attachments ?? null);
   useEffect(() => {
@@ -642,7 +645,7 @@ function SideChatComposer({
   // state first — so unmounting in the meantime (closing the mobile drawer,
   // switching tabs) defers the send instead of discarding the only copy.
   useEffect(() => {
-    if (autoSend === undefined || agentId === null) return;
+    if (autoSend === undefined || agentId === null || settingsSaving) return;
     // Re-read and consume the LIVE draft rather than the one captured at
     // render: a replayed mount effect (React StrictMode in development) would
     // otherwise send the captured question a second time.
@@ -652,9 +655,9 @@ function SideChatComposer({
     void send(question, agentId, undefined, { pinnedConversationId: childId }).finally(
       refreshLabels,
     );
-  }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
+  }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels, settingsSaving]);
 
-  const ready = pending ? !starting : agentId !== null;
+  const ready = (pending ? !starting : agentId !== null) && !settingsSaving;
   const canSend =
     serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
   const addFiles = (incoming: File[]) => {
@@ -786,6 +789,7 @@ function SideChatComposer({
   };
 
   const submit = () => {
+    if (settingsSavePending()) return;
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
       if (!canSend || starting || !onStart) return;
@@ -859,6 +863,7 @@ function SideChatComposer({
     // Mod+Enter submits any draft, then steers the whole queue into the running turn.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
+      if (settingsSavePending()) return;
       submit();
       steerAllQueuedMessages(childId);
       return;
@@ -916,7 +921,13 @@ function SideChatComposer({
               dequeueMessage(queueId);
               tailTextareaRef.current?.focus();
             }}
-            onSteer={steerMessage}
+            onSteer={
+              settingsSaving
+                ? undefined
+                : (queueId) => {
+                    if (!settingsSavePending()) steerMessage(queueId);
+                  }
+            }
             onReorder={reorderQueuedMessage}
             widthClassName="mx-3 w-auto"
           />

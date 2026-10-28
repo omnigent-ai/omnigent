@@ -3,11 +3,13 @@ import type { NativeModelOption } from "@/lib/types";
 
 import {
   effortLevelsForConv,
+  shouldShowEffortPicker,
+  shouldShowModelPicker,
+} from "@/lib/composerCapabilities";
+import {
   shouldShowCodexApprovalModeControl,
   shouldShowCodexPlanModeControl,
-  shouldShowEffortPicker,
   shouldShowGoalControl,
-  shouldShowModelPicker,
   shouldShowPollyClaudeGoalControl,
   shouldShowPollyCodexGoalControl,
 } from "./ChatPage";

@@ -1,5 +1,5 @@
-import { useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import {
@@ -24,6 +24,7 @@ import { useSession } from "@/hooks/useSession";
 import { useHostModelOptions } from "@/hooks/useHosts";
 import { useHarnessEffortFamilies } from "@/lib/agentLabels";
 import {
+  effortAfterModelChange,
   effortLevelsForConv,
   sdkEffortFamilyForHarness,
   selectedModelForPicker,
@@ -62,9 +63,25 @@ export function SideChatSettings({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const savingRef = useRef(false);
+  const mutationKey = ["side-chat-settings", session.id];
+  const saving = useIsMutating({ mutationKey }) > 0;
   const [error, setError] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationKey,
+    mutationFn: (updates: SideChatModelSettings) => updateSession(session.id, updates),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<Session>(["session", session.id], (previous) => ({
+        ...previous,
+        ...updated,
+      }));
+    },
+    onError: (cause) => {
+      const message =
+        cause instanceof Error ? cause.message : "Couldn't update side chat settings.";
+      setError(message);
+      toast.error(message);
+    },
+  });
   const catalogs = [state.codexModelOptions, session.codexModelOptions];
   const sessionOptions = catalogs.find((catalog) => catalog?.length) ?? [];
   const kind = modelPickerKindForConv(session, sessionOptions);
@@ -115,30 +132,14 @@ export function SideChatSettings({
     !isEditorLevel(session.permissionLevel) ||
     session.labels?.["omnigent.closed"] === "true";
 
-  async function save(updates: SideChatModelSettings) {
-    if (disabled || savingRef.current) return;
+  function save(updates: SideChatModelSettings) {
+    if (disabled || queryClient.isMutating({ mutationKey }) > 0) return;
     if (draft) {
       draft.onChange(updates);
       return;
     }
-    savingRef.current = true;
-    setSaving(true);
     setError(null);
-    try {
-      const updated = await updateSession(session.id, updates);
-      queryClient.setQueryData<Session>(["session", session.id], (previous) => ({
-        ...previous,
-        ...updated,
-      }));
-    } catch (cause) {
-      const message =
-        cause instanceof Error ? cause.message : "Couldn't update side chat settings.";
-      setError(message);
-      toast.error(message);
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
+    mutation.mutate(updates);
   }
 
   const configContent = (
@@ -167,15 +168,12 @@ export function SideChatSettings({
                     const nextEfforts = supportsEffort
                       ? effortLevelsForConv(session, options, nextModel, family)
                       : [];
-                    const defaultEffort = option.defaultReasoningEffort;
-                    let nextEffort =
-                      defaultEffort && nextEfforts.includes(defaultEffort)
-                        ? defaultEffort
-                        : (nextEfforts[0] ?? null);
-                    if (effort && nextEfforts.includes(effort)) nextEffort = effort;
+                    const nextEffort = effortAfterModelChange(effort, nextEfforts);
                     void save({
                       modelOverride: nextModel,
-                      ...(supportsEffort ? { reasoningEffort: nextEffort } : {}),
+                      ...(supportsEffort && nextEffort !== effort
+                        ? { reasoningEffort: nextEffort }
+                        : {}),
                     });
                   },
                   data: { "data-model-id": option.id },

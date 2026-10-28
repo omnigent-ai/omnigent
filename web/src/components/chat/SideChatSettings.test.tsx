@@ -106,7 +106,7 @@ it("changes only the side session and uses the selected model's effort ladder", 
   await waitFor(() =>
     expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", {
       modelOverride: "model-b",
-      reasoningEffort: "low",
+      reasoningEffort: null,
     }),
   );
   await waitFor(() => expect(screen.getByRole("menuitemcheckbox", { name: "Max" })).toBeEnabled());
@@ -218,7 +218,6 @@ it("keeps compatible effort when changing a configured generic side chat model",
   await waitFor(() =>
     expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", {
       modelOverride: "model-b",
-      reasoningEffort: "high",
     }),
   );
   cleanup();
@@ -403,7 +402,7 @@ it("keeps unsent settings per draft across remounts without updating the parent"
   await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
   expect(useChatStore.getState().sideChatComposers["pending:one"].settings).toEqual({
     modelOverride: "model-b",
-    reasoningEffort: "low",
+    reasoningEffort: null,
   });
   expect(sessionsApi.updateSession).not.toHaveBeenCalled();
   view.unmount();
@@ -413,7 +412,7 @@ it("keeps unsent settings per draft across remounts without updating the parent"
     </QueryClientProvider>,
   );
   expect(screen.getByRole("button", { name: "Side chat model and effort" })).toHaveTextContent(
-    "Model BLow",
+    /Model B$/,
   );
   act(() =>
     useChatStore
@@ -466,12 +465,12 @@ it.each(["live", "draft", "nested-draft"] as const)(
     await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
     expect(fetch).toHaveBeenCalledWith("/v1/hosts/host/harnesses/devin-native/model-options");
     if (draft) {
-      expect(onChange).toHaveBeenCalledWith({ modelOverride: "model-b", reasoningEffort: "low" });
+      expect(onChange).toHaveBeenCalledWith({ modelOverride: "model-b", reasoningEffort: null });
       expect(sessionsApi.updateSession).not.toHaveBeenCalled();
     } else {
       expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", {
         modelOverride: "model-b",
-        reasoningEffort: "low",
+        reasoningEffort: null,
       });
     }
     expect(cache.getQueryData(["session", "parent"])).toEqual(source);
@@ -494,14 +493,21 @@ it.each([
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
 
-it.each([false, true])(
-  "ignores catalog defaults outside the harness effort ladder (draft=%s)",
-  async (draft) => {
+it.each([
+  { harness: "claude-native", draft: false },
+  { harness: "claude-native", draft: true },
+  { harness: "pi-native", draft: false },
+  { harness: "pi-native", draft: true },
+])(
+  "preserves unspecified effort when selecting a model ($harness, draft=$draft)",
+  async ({ harness, draft }) => {
     const onChange = vi.fn();
     const session = {
       ...child,
-      harness: "claude-native",
-      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      harness,
+      labels: {
+        "omnigent.wrapper": harness === "claude-native" ? "claude-code-native-ui" : "pi-native-ui",
+      },
       reasoningEffort: null,
       codexModelOptions: [models[0], { ...models[1], defaultReasoningEffort: "unsupported" }],
     };
@@ -517,7 +523,7 @@ it.each([false, true])(
     await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
     await user.click(screen.getByTestId("side-chat-model-edit"));
     await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
-    const updates = { modelOverride: "model-b", reasoningEffort: "low" };
+    const updates = { modelOverride: "model-b" };
     if (draft) expect(onChange).toHaveBeenCalledWith(updates);
     else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
   },
@@ -585,7 +591,7 @@ it.each([false, true])("preserves an inherited Devin Fusion pairing (draft=%s)",
   expect(fusion).toHaveAttribute("aria-checked", "true");
   expect(screen.queryByTestId("side-chat-efforts")).not.toBeInTheDocument();
   await user.click(fusion);
-  const updates = { modelOverride: model, reasoningEffort: null };
+  const updates = { modelOverride: model };
   if (draft) expect(onChange).toHaveBeenCalledWith(updates);
   else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
 });

@@ -4,7 +4,7 @@ import {
   modelPickerKindForConv,
   shouldShowEffortPicker,
   shouldShowModelPicker,
-} from "./ChatPage";
+} from "@/lib/composerCapabilities";
 
 // These pin the composer capability gates (effort levels, model picker, effort
 // picker). Wrapper labels are authoritative; the resolved harness is the fallback

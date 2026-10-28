@@ -267,6 +267,7 @@ import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import {
+  effortAfterModelChange,
   effortLevelsForConv,
   sdkEffortFamilyForHarness,
   selectedModelForPicker,
@@ -275,12 +276,6 @@ import {
   type NativeModelPickerKind,
 } from "@/lib/composerCapabilities";
 
-export {
-  effortLevelsForConv,
-  modelPickerKindForConv,
-  shouldShowModelPicker,
-  shouldShowEffortPicker,
-} from "@/lib/composerCapabilities";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -4904,7 +4899,10 @@ function SessionHarnessPicker({
       (isFusionModelUid(modelId) ||
         (nextEffort === undefined &&
           modelPickerKind === "codex" &&
-          !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)))
+          effortAfterModelChange(
+            selectedEffort,
+            codexEffortLevelsForModel(codexModelOptions, modelId),
+          ) === null))
     )
       await store.setEffort(null);
     if (
