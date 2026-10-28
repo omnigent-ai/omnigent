@@ -33,6 +33,7 @@ def _crdb_engine(db_uri: str) -> Engine:
 def test_cockroachdb_bootstrap_is_at_head(db_uri: str) -> None:
     engine = _crdb_engine(db_uri)
     assert _get_current_db_revision(engine) == _get_head_db_revision(db_uri)
+    assert "runner_connections" in inspect(engine).get_table_names()
 
 
 def test_cockroachdb_uses_read_committed(db_uri: str) -> None:
