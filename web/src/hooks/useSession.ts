@@ -41,6 +41,17 @@ interface UseSessionResult {
   error: Error | null;
 }
 
+/** The shared ``["session", id]`` snapshot query, disabled for a null id; see {@link useSession}. */
+export function sessionQueryOptions(sessionId: string | null) {
+  return {
+    queryKey: ["session", sessionId] as const,
+    queryFn: () => getSessionSlim(sessionId as string, { refreshState: true }),
+    enabled: sessionId !== null,
+    staleTime: Infinity,
+    retry: false,
+  };
+}
+
 /**
  * Read the cached single-session snapshot for a conversation, falling
  * back to ``GET /v1/sessions/{id}`` when nothing is cached yet.
@@ -65,13 +76,7 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   // caller can leak a `GET /v1/sessions/temp:*` — cheaper than gating every
   // call site.
   const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
-  const { data, isLoading, error } = useQuery({
-    queryKey: serverId ? ["session", serverId] : ["session", null],
-    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
-    enabled: serverId !== null,
-    staleTime: Infinity,
-    retry: false,
-  });
+  const { data, isLoading, error } = useQuery(sessionQueryOptions(serverId));
   return {
     session: data ?? null,
     isLoading,

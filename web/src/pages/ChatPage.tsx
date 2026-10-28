@@ -44,6 +44,7 @@ import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
+import { subAgentComposerLabel } from "@/shell/subagentLabel";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import {
   ComposerWorkspaceBar,
@@ -100,8 +101,6 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import {
-  claudeNativeSubagentLabel,
-  codexNativeSubagentLabel,
   isNativeTerminalSession,
   nativeCodingAgentForSession,
   nativeCodingAgentForHarness,
@@ -266,6 +265,7 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
   effortAfterModelChange,
   effortLevelsForConv,
@@ -2251,51 +2251,6 @@ function ComposerStatusLine() {
       </div>
     </div>
   );
-}
-
-/**
- * Resolve the sub-agent instance label for the composer's "Chatting with
- * sub-agent …" tray, mirroring the Agents rail's child-row label
- * (``childPrimaryLabel`` in ``SubagentsPanel``).
- *
- * The spawn tool seeds a sub-agent's title as ``"{tool}:{name}"`` (e.g.
- * ``"claude_code:check-account-eligibility"``), so the human instance name
- * is the suffix after the first ``":"``. User-added rows carry a reserved
- * ``"ui:<agent>:<name>"`` sentinel; the ``"ui:"`` marker is stripped first
- * so the suffix is still the human name. Falls back to the bare title,
- * then the sub-agent type, then the bound agent name.
- *
- * @param session - The active session snapshot, or ``null`` while it loads
- *   / on the new-chat landing.
- * @returns The tray label, e.g. ``"check-account-eligibility"``; ``null``
- *   for a top-level session (no ``parentSessionId``) or when no snapshot is
- *   loaded — both hide the tray.
- */
-export function subAgentComposerLabel(
-  session: Pick<
-    Session,
-    "parentSessionId" | "title" | "subAgentName" | "agentName" | "labels"
-  > | null,
-): string | null {
-  if (!session || session.parentSessionId == null) return null;
-  const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
-  if (claudeLabel) return claudeLabel;
-  // Codex children (incl. /side forks) title as "codex-native-ui-subagent:<uuid>";
-  // show the friendly nickname label ("Side chat") instead of that UUID suffix.
-  const codexLabel = codexNativeSubagentLabel(session.labels);
-  if (codexLabel) return codexLabel;
-  // Strip the user-added "ui:" sentinel so its "agent:name" suffix reads
-  // like an LLM-spawned title.
-  let title = session.title ?? null;
-  if (title?.startsWith("ui:")) title = title.slice(3);
-  if (title?.includes(":")) {
-    const suffix = title.split(":").slice(1).join(":");
-    if (suffix) return suffix;
-  }
-  // Last-resort display string: a sub-agent session always has a seeded
-  // title in practice, so the final "sub-agent" only guards a degenerate
-  // all-null snapshot (the tray still needs something to render).
-  return title ?? session.subAgentName ?? session.agentName ?? "sub-agent";
 }
 
 /**
@@ -4597,50 +4552,6 @@ export function unboundSessionResumableInApp(params: {
 }): boolean {
   if (!params.unbound || !params.isOwner) return false;
   return params.importSource == null || HOST_PORTABLE_IMPORT_SOURCES.has(params.importSource);
-}
-
-type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
-
-/**
- * Resolve a structural read-only reason from session labels.
- *
- * The live session snapshot is checked first because child sessions do
- * not appear in the sidebar list and because labels can change after
- * initial navigation (for example ``sys_session_close`` marks a child
- * ``omnigent.closed=true``). The sidebar row is only a fallback.
- *
- * @param activeSession - Live session snapshot, if loaded.
- * @param activeConv - Sidebar/session-list row fallback.
- * @returns Placeholder text for the composer when the session is
- *   structurally read-only, or ``null`` when normal permissions apply.
- */
-export function readOnlyReasonForSessionLabels(
-  activeSession: LabelSource,
-  activeConv: LabelSource,
-): string | null {
-  const closed =
-    activeSession?.labels?.["omnigent.closed"] ?? activeConv?.labels?.["omnigent.closed"];
-  if (closed === "true") {
-    // A codex /side child is sealed (server-computed) once its ephemeral fork's
-    // runner is gone; give it a side-chat-specific reason rather than the
-    // generic sub-agent one so the user understands it's read-only for good.
-    // "Side chat" is the nickname the server stamps on a /side fork.
-    const wrapperLabel =
-      activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
-    const nickname =
-      activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
-      activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
-    if (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat") {
-      return "This side chat has ended and can't receive new messages";
-    }
-    return "This sub-agent session is closed";
-  }
-  const wrapper =
-    activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
-  if (wrapper === "claude-code-native-ui-subagent") {
-    return "Claude Code sub-agents are read-only";
-  }
-  return null;
 }
 
 export function shouldShowCodexPlanModeControl(

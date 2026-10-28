@@ -26,7 +26,6 @@ import {
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
-  readOnlyReasonForSessionLabels,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -40,13 +39,14 @@ import {
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
-  subAgentComposerLabel,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
+import { subAgentComposerLabel } from "@/shell/subagentLabel";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
