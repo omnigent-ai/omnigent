@@ -718,8 +718,15 @@ def test_inline_databricks_gateway_without_default_or_listing_uses_pi_login() ->
     assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
 
 
+@pytest.mark.parametrize(
+    "tiers",
+    [
+        {"smart": "system.ai.gpt-5"},
+        {"fast": "system.ai.gpt-5-mini", "smart": "system.ai.gpt-5"},
+    ],
+)
 def test_inline_databricks_gateway_without_default_preserves_named_tiers(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tiers: dict[str, str]
 ) -> None:
     """A tier map without a default is a deliberate shortlist; it is not widened."""
     listings: list[str] = []
@@ -737,7 +744,7 @@ def test_inline_databricks_gateway_without_default_preserves_named_tiers(
                 "openai": {
                     "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
                     "api_key": "gw-token",
-                    "models": {"fast": "system.ai.gpt-5-mini", "smart": "system.ai.gpt-5"},
+                    "models": tiers,
                 },
             }
         }

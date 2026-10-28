@@ -1562,8 +1562,9 @@ def _inline_family_pi_provider(
     the selected family's ``base_url`` is a workspace-hosted Databricks AI
     Gateway, the whole workspace is enumerated instead (Claude, GPT and Gemini
     surfaces) with the configured default kept as the launch model; see
-    :func:`_databricks_gateway_pi_provider`. When no family pins a default,
-    such a gateway is still enumerated and launches a model the workspace lists.
+    :func:`_databricks_gateway_pi_provider`. When no family pins a default and
+    such a gateway names no models, it is still enumerated and launches a model
+    the workspace lists.
 
     :param entry: The resolved default provider entry.
     :param model: Session model override, or ``None`` to use the family default.
@@ -1604,7 +1605,7 @@ def _inline_family_pi_provider(
             if (
                 unpinned_gateway is None
                 and not preserve_model_ids
-                and len(_family_tier_ids(family)) <= 1
+                and not _family_tier_ids(family)
                 and _databricks_workspace_gateway_surface(family.base_url) is not None
             ):
                 unpinned_gateway = family
