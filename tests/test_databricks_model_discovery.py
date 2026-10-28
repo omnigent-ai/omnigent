@@ -114,9 +114,9 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     ).families
 
     assert families == {
-        "opus": "databricks-claude-opus-4-8",
-        "sonnet": "databricks-claude-3-7-sonnet",
-        "haiku": "databricks-claude-3-5-haiku",
+        "opus": "system.ai.claude-opus-4-8",
+        "sonnet": "system.ai.claude-3-7-sonnet",
+        "haiku": "system.ai.claude-3-5-haiku",
     }
     assert paths == [
         "/api/2.1/unity-catalog/model-services",
@@ -129,12 +129,12 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     [
         # Two successful empty listings return empty instead of inventing models.
         (_UC_EMPTY, _GATEWAY_EMPTY, {}, ()),
-        # A transient model-services failure does not hide the legacy catalog.
+        # A transient model-services failure canonicalizes the legacy catalog.
         (
             _UC_DOWN,
             (200, {"data": [{"id": "databricks-claude-haiku-4-5"}]}),
-            {"haiku": "databricks-claude-haiku-4-5"},
-            ("databricks-claude-haiku-4-5",),
+            {"haiku": "system.ai.claude-haiku-4-5"},
+            ("system.ai.claude-haiku-4-5",),
         ),
         # Removed UC services do not revive stale models when legacy 404s.
         (_UC_EMPTY, _GATEWAY_GONE, {}, ()),
@@ -172,8 +172,8 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
                     ]
                 },
             ),
-            {"opus": "databricks-claude-opus-5"},
-            ("databricks-claude-opus-5", "databricks-claude-opus-4-8"),
+            {"opus": "system.ai.claude-opus-5"},
+            ("system.ai.claude-opus-5", "system.ai.claude-opus-4-8"),
         ),
         # An authoritative listing with no Claude at all yields an empty
         # catalog, not an error.
@@ -271,13 +271,13 @@ def test_duplicate_spellings_collapse_onto_the_databricks_id() -> None:
         ),
     )
     assert catalog.families == {  # type: ignore[attr-defined]
-        "opus": "databricks-claude-opus-5",
-        "sonnet": "databricks-claude-sonnet-5",
+        "opus": "system.ai.claude-opus-5",
+        "sonnet": "system.ai.claude-sonnet-5",
     }
     assert catalog.model_ids == (  # type: ignore[attr-defined]
-        "databricks-claude-sonnet-5",
-        "databricks-claude-opus-5",
-        "databricks-claude-opus-4-8",
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
     )
 
 
@@ -287,7 +287,7 @@ def test_a_model_only_unity_catalog_serves_keeps_its_own_spelling() -> None:
         (200, {"data": [{"id": "databricks-claude-opus-5"}]}),
     )
     assert catalog.families == {  # type: ignore[attr-defined]
-        "opus": "databricks-claude-opus-5",
+        "opus": "system.ai.claude-opus-5",
         "haiku": "system.ai.claude-haiku-4-5",
     }
 

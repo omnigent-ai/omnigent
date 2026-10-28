@@ -86,6 +86,7 @@ describe("KeyboardShortcutsList settings layout", () => {
 
     const heading = screen.getByRole("heading", { name: "General" });
     const list = heading.closest("section")?.querySelector("ul");
+    expect(heading.closest("section")?.parentElement).toHaveClass("gap-10");
     expect(heading).toHaveClass("text-ui", "text-foreground");
     expect(list).toHaveClass("rounded-xl", "border-border", "bg-card");
   });

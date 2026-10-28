@@ -13,7 +13,6 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
-import { cn } from "@/lib/utils";
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
@@ -100,15 +99,12 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
                   type="button"
                   aria-label="Choose project icon"
                   data-testid="new-project-icon"
-                  className={cn(
-                    "flex size-[38px] shrink-0 cursor-pointer items-center justify-center outline-none transition-colors",
-                    icon ? "bg-muted" : "bg-tag-pink",
-                  )}
+                  className="flex size-[38px] shrink-0 cursor-pointer items-center justify-center bg-primary/10 outline-none transition-colors"
                 >
                   {icon ? (
                     <span className="text-xl leading-none">{icon}</span>
                   ) : (
-                    <SmilePlusIcon className="size-4 text-brand-accent" />
+                    <SmilePlusIcon className="size-4 text-primary" />
                   )}
                 </button>
               </PopoverTrigger>

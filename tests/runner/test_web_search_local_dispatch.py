@@ -65,9 +65,18 @@ def test_dispatch_preserves_openai_passthrough_fence() -> None:
     assert mock_post.call_count == 0, "OpenAI passthrough must never hit a search backend."
 
 
-def test_dispatch_databricks_model_uses_function_mode() -> None:
-    """A ``databricks-*`` model skips passthrough and runs the configured backend."""
-    spec = _spec_with_model("databricks-claude-sonnet-4-6")
+@pytest.mark.parametrize(
+    "model",
+    [
+        "databricks-claude-sonnet-4-6",
+        "system.ai.gpt-5-4",
+        "system.ai.glm-5-2",
+        "system.ai.kimi-k2-6",
+    ],
+)
+def test_dispatch_databricks_model_uses_function_mode(model: str) -> None:
+    """A Databricks model (``databricks-*`` or ``system.ai.*``) skips passthrough."""
+    spec = _spec_with_model(model)
     fake_response = MagicMock()
     fake_response.json.return_value = {"choices": [{"message": {"content": "answer"}}]}
     with patch("omnigent.tools.builtins.web_search_perplexity.httpx.post") as mock_post:
@@ -75,5 +84,5 @@ def test_dispatch_databricks_model_uses_function_mode() -> None:
         result = asyncio.run(
             _execute_web_search_tool({"query": "x"}, agent_spec=spec, conversation_id="c")
         )
-    assert mock_post.call_count == 1, "databricks-* must run the backend (function mode)."
+    assert mock_post.call_count == 1, f"{model} must run the backend (function mode)."
     assert "answer" in result

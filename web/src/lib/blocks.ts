@@ -1,3 +1,4 @@
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -387,6 +388,8 @@ export interface TextDone {
   hasCodeBlocks: boolean;
   /** True when this persisted assistant text came from an interrupted turn. */
   interrupted?: boolean;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
   /** UI-only marker for a provisional native preview with missing live output. */
   previewInterrupted?: boolean;
   /** Last native chunk index rendered in this provisional preview. */
@@ -750,6 +753,19 @@ export type AnyBlock =
   | ElicitationBlock
   | PolicyDeniedBlock
   | ResponseEndBlock;
+
+/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
+export function hasPendingOwnElicitation(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): boolean {
+  return blocks.some(
+    (b) =>
+      b.type === "elicitation" &&
+      b.status === "pending" &&
+      (b.targetSessionId == null || b.targetSessionId === sessionId),
+  );
+}
 
 /**
  * Item-id prefix marking a provisional, in-flight assistant-text block —

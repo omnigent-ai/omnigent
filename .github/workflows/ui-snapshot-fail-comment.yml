@@ -33,7 +33,7 @@ jobs:
     if: >-
       github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'failure'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Upsert the failure comment
@@ -56,7 +56,7 @@ jobs:
           # List every update path that applies to where the branch lives. All
           # render in the same pinned image, so any of them matches this gate.
           # (workflow_dispatch is for non-PR branches; see the README.) This job
-          # runs on ubuntu-latest, so bash arrays are fine.
+          # runs on Ubuntu, so bash arrays are fine.
           if [ "$HEAD_REPO" = "$REPO" ]; then
             opts=(
               "- **Label the PR (recommended):** add the \`update-ui-snapshot\` label — the bot regenerates the baseline in the pinned image, pushes it back here, and re-runs the checks."

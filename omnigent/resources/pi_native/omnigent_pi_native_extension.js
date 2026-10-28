@@ -797,7 +797,7 @@ function toInt(value) {
  * full input a turn sent is ``input + cacheRead + cacheWrite``.
  *
  * @returns {{input:number,output:number,cacheRead:number,cacheWrite:number,
- *   total:number,model:(string|null)}|null} the per-message counts, or
+ *   total:number,cost:(number|null),model:(string|null)}|null} the per-message counts, or
  *   ``null`` when ``message`` is not an assistant message carrying usage.
  */
 function extractPiUsage(message) {
@@ -821,8 +821,16 @@ function extractPiUsage(message) {
     cacheRead,
     cacheWrite,
     total: toInt(usage.totalTokens),
+    // Pi also uses zero when its model has no price; let the server price that.
+    cost: validCost(usage.cost?.total) > 0 ? usage.cost.total : null,
     model,
   };
+}
+
+function validCost(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
 }
 
 function headers(config) {
@@ -1829,6 +1837,8 @@ module.exports = function (pi) {
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
   let cumulativeCacheReadTokens = 0;
+  let cumulativeCostUsd = 0;
+  let completeCost = true;
   let usageModel = null;
   let lastPostedUsageKey = "";
 
@@ -1874,27 +1884,32 @@ module.exports = function (pi) {
     cumulativeInputTokens += usage.input + usage.cacheRead + usage.cacheWrite;
     cumulativeOutputTokens += usage.output;
     cumulativeCacheReadTokens += usage.cacheRead;
+    if (usage.cost === null) completeCost = false;
+    else cumulativeCostUsd += usage.cost;
     if (usage.model) usageModel = usage.model;
     return true;
   }
 
-  // POST the cumulative session usage so the server prices it and publishes a
-  // ``session.usage`` event. Cumulative (SET) semantics — the server overwrites
-  // its stored totals each flush. Deduped so a flush with no advance is a
-  // no-op. Fail-open via ``postEvent`` so a failed POST never wedges Pi.
+  function usagePostKey() {
+    return `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${completeCost ? cumulativeCostUsd : "unknown"}-${usageModel || ""}`;
+  }
+
+  // Persist before reporting; unchanged totals need no additional POST.
   async function postSessionUsage() {
     if (!(cumulativeInputTokens || cumulativeOutputTokens)) return;
-    const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    const postKey = usagePostKey();
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
     // Persist the running total before the POST so a relaunch restores it even
     // when the flush fails and the server never records this report.
     persistCumulativeUsage();
     const data = {
+      cost_complete: completeCost,
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
       cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
     };
+    if (completeCost) data.cumulative_cost_usd = cumulativeCostUsd;
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
   }
@@ -1918,6 +1933,8 @@ module.exports = function (pi) {
           cumulative_input_tokens: cumulativeInputTokens,
           cumulative_output_tokens: cumulativeOutputTokens,
           cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+          cost_complete: completeCost,
+          ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
           model: usageModel,
         }),
       );
@@ -1935,6 +1952,14 @@ module.exports = function (pi) {
     const input = toInt(saved.cumulative_input_tokens);
     const output = toInt(saved.cumulative_output_tokens);
     const cacheRead = toInt(saved.cumulative_cache_read_input_tokens);
+    const cost = validCost(saved.cumulative_cost_usd);
+    const coversCurrent = input >= cumulativeInputTokens && output >= cumulativeOutputTokens;
+    if (coversCurrent && (input || output)) {
+      completeCost = cost !== null && saved.cost_complete !== false;
+    } else if (input > cumulativeInputTokens || output > cumulativeOutputTokens) {
+      completeCost = false;
+    }
+    if (completeCost && cost !== null) cumulativeCostUsd = Math.max(cumulativeCostUsd, cost);
     // Only raise the counters; a stale file must never pull a live total down.
     if (input > cumulativeInputTokens) cumulativeInputTokens = input;
     if (output > cumulativeOutputTokens) cumulativeOutputTokens = output;
@@ -1957,9 +1982,10 @@ module.exports = function (pi) {
       baseline &&
       cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
       cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
-      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens)
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens) &&
+      (!completeCost || cumulativeCostUsd === (validCost(baseline.cumulative_cost_usd) ?? 0))
     ) {
-      lastPostedUsageKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+      lastPostedUsageKey = usagePostKey();
     }
   }
 

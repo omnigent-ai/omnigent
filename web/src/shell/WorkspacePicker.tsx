@@ -878,7 +878,7 @@ export function WorkspacePicker({
             data-testid="workspace-picker-search-row"
           >
             <div
-              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30"
+              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input"
               data-testid="workspace-picker-search-field"
             >
               <SearchIcon

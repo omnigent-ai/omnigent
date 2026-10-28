@@ -31,7 +31,8 @@ def config(monkeypatch, tmp_path):
     [
         ("claude-native", None, None, False, "claude", "default"),
         ("codex-native", None, None, False, "codex", "default"),
-        ("claude-native", "tool", "missing", False, "tool", "config"),
+        # The host forwards Claude's override like Codex's, with or without passthrough.
+        ("claude-native", "tool", "missing", False, "missing", "env"),
         ("claude-native", "tool", "missing", True, "missing", "env"),
         ("codex-native", "tool", "other", False, "tool", "config"),
         ("codex-native", None, "tool", False, "tool", "env"),

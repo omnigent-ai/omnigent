@@ -498,6 +498,66 @@ def _build_branding_app(
 
 
 @pytest.mark.asyncio
+async def test_info_harness_install_gate_overrides_feature_snapshot(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static and callable gates keep both info fields synchronized."""
+    monkeypatch.setenv("OMNIGENT_FEATURES", "harness_install")
+    env_app = _build_branding_app(db_uri, tmp_path, "install-env")
+    static_off_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "install-off",
+        harness_install=False,
+    )
+    monkeypatch.setenv("OMNIGENT_FEATURES", "")
+    static_on_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "install-on",
+        harness_install=True,
+    )
+    values = iter([False, True])
+    callable_app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "install-callable",
+        harness_install=lambda: next(values),
+    )
+
+    async def info(app: FastAPI) -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return (await client.get("/v1/info")).json()
+
+    env_info = await info(env_app)
+    assert env_info["features"]["harness_install"] is True
+    assert env_info["harness_install_enabled"] is True
+
+    off_info = await info(static_off_app)
+    assert off_info["features"]["harness_install"] is False
+    assert off_info["harness_install_enabled"] is False
+    assert off_info["installable_harnesses"] == []
+
+    on_info = await info(static_on_app)
+    assert on_info["features"]["harness_install"] is True
+    assert on_info["harness_install_enabled"] is True
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=callable_app), base_url="http://test"
+    ) as client:
+        first = (await client.get("/v1/info")).json()
+        second = (await client.get("/v1/info")).json()
+    assert first["features"]["harness_install"] is first["harness_install_enabled"] is False
+    assert second["features"]["harness_install"] is second["harness_install_enabled"] is True
+    assert second["installable_harnesses"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_config", "create_app_kwargs", "expected"),
     [
