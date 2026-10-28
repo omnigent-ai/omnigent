@@ -8,11 +8,11 @@ import contextlib
 import functools
 import mimetypes
 import ntpath
-import re
 import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
+from re import fullmatch
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import httpx
@@ -145,7 +145,7 @@ def _runner_resource_write_payload(
             response_bytes=len(response.content),
             content_type=content_type or "missing",
             server_request_id=request_id
-            if re.fullmatch(r"[0-9a-fA-F-]{16,64}", request_id)
+            if fullmatch(r"[0-9a-fA-F-]{16,64}", request_id)
             else None,
         ),
     )
