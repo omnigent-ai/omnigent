@@ -29,6 +29,7 @@
  *   Unarchive opens the restored session.
  */
 
+import { toast } from "sonner";
 import {
   type ComponentType,
   lazy,
@@ -1784,8 +1785,9 @@ function OpenSubagentsInPanelControl() {
   const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
-    setEnabled(next);
-    writeOpenSubagentsInPanel(next);
+    // Sub-agent clicks read the stored value, so only show what was saved.
+    if (writeOpenSubagentsInPanel(next)) setEnabled(next);
+    else toast.error("Couldn't save this setting. Check that your browser allows site storage.");
   }, []);
 
   return (

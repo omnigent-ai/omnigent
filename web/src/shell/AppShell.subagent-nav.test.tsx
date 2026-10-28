@@ -395,6 +395,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     const tree: Record<string, ReturnType<typeof summary>[]> = {
       conv_root: [summary("conv_child", "auth"), summary("conv_sibling", "billing")],
       conv_child: [summary("conv_grandchild", "tokens")],
+      conv_grandchild: [summary("conv_greatgrandchild", "expiry")],
     };
     vi.mocked(useChildSessions).mockImplementation((id) => ({
       children: tree[id ?? ""] ?? [],
@@ -423,6 +424,11 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       conv_child: snapshot("conv_child", "conv_root", "researcher:auth"),
       conv_sibling: snapshot("conv_sibling", "conv_root", "researcher:billing"),
       conv_grandchild: snapshot("conv_grandchild", "conv_child", "researcher:tokens"),
+      conv_greatgrandchild: snapshot(
+        "conv_greatgrandchild",
+        "conv_grandchild",
+        "researcher:expiry",
+      ),
     };
     vi.mocked(useSession).mockImplementation((id) => ({
       session: sessions[id ?? ""] ?? null,
@@ -468,6 +474,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
         </SidebarDataProvider>
       </QueryClientProvider>,
     );
+    return qc;
   }
 
   /** The Agents-tab row for `childId`, once the rail has rooted its tree. */
@@ -528,16 +535,26 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       tabs: undefined,
     },
     {
+      name: "navigates to an ancestor whose descendants' snapshots aren't loaded",
+      page: "conv_greatgrandchild",
+      clicked: "conv_child",
+      tabs: undefined,
+      uncached: "conv_grandchild",
+    },
+    {
       name: "opens a sibling as a tab and stays on the chat on screen",
       page: "conv_child",
       clicked: "conv_sibling",
       tabs: [subagentTabId("conv_sibling")],
     },
-  ])("$name", async ({ page, clicked, tabs }) => {
+  ])("$name", async ({ page, clicked, tabs, uncached }) => {
     writeOpenSubagentsInPanel(true);
-    renderSubagentTree(`/c/${page}`);
+    const qc = renderSubagentTree(`/c/${page}`);
+    const row = await agentRow(clicked);
+    // The parent chain can't be walked past a snapshot that hasn't loaded.
+    if (uncached) qc.removeQueries({ queryKey: ["session", uncached] });
 
-    fireEvent.click(await agentRow(clicked));
+    fireEvent.click(row);
 
     expect(screen.getByTestId("page")).toHaveTextContent(
       tabs === undefined ? `/c/${clicked}` : `/c/${page}`,

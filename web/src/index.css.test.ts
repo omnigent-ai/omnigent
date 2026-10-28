@@ -636,6 +636,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
     shell.setAttribute("data-android-native", "");
     document.body.appendChild(shell);
     shells.push(shell);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       createElement(
         TooltipProvider,
@@ -680,7 +681,7 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
         container: shell,
         // The panel reads session snapshots for its tab labels.
         wrapper: ({ children }) =>
-          createElement(QueryClientProvider, { client: new QueryClient() }, children),
+          createElement(QueryClientProvider, { client: queryClient }, children),
       },
     );
     const rail = shell.querySelector<HTMLElement>('aside[aria-label="Workspace"]');

@@ -42,8 +42,8 @@ describe("subagentPanelPreferences", () => {
     vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
       throw new Error("access denied");
     });
-    expect(() => writeOpenSubagentsInPanel(true)).not.toThrow();
-    expect(() => writeOpenSubagentsInPanel(false)).not.toThrow();
+    expect(writeOpenSubagentsInPanel(true)).toBe(false);
+    expect(writeOpenSubagentsInPanel(false)).toBe(false);
     expect(readOpenSubagentsInPanel()).toBe(false);
   });
 });

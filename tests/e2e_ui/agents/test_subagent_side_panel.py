@@ -54,6 +54,18 @@ def _child_busy(base_url: str, parent_id: str, child_id: str) -> bool:
     return any(child.get("id") == child_id and child.get("busy") for child in children)
 
 
+def _session_texts(base_url: str, session_id: str) -> list[str]:
+    """Text of every message item in a session's snapshot."""
+    response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+    response.raise_for_status()
+    return [
+        part.get("text", "")
+        for item in response.json().get("items") or []
+        if item.get("type") == "message"
+        for part in item.get("data", {}).get("content") or []
+    ]
+
+
 def _gate_pending(mock_url: str) -> bool:
     response = httpx.get(f"{mock_url}/gate/pending", timeout=5.0)
     response.raise_for_status()
@@ -257,4 +269,12 @@ def test_transcript_and_agents_tab_reuse_one_tab_and_close_keeps_child_running(
         "data-activity", "working"
     )
     assert _child_busy(sub.base_url, sub.parent_id, sub.child_id)
+    _hold_for_recording(page, 1000)
+
+    # A delayed stop would still look busy here; the held turn must finish normally.
+    assert _release_gate(sub.mock_url), "no model call was waiting on the gate"
+    poll_until(lambda: _CHILD_REPLY in _session_texts(sub.base_url, sub.child_id), timeout_s=60)
+    expect(row.get_by_test_id("subagent-status-avatar")).not_to_have_attribute(
+        "data-activity", "working", timeout=30_000
+    )
     _hold_for_recording(page, 1500)

@@ -12,6 +12,8 @@ interface SideChatTabsState {
   selected: string | null;
 }
 
+type TabsChange = (current: SideChatTabsState) => SideChatTabsState;
+
 function readSideChatTabsState(conversationId: string): SideChatTabsState {
   const saved = readSessionWorkspaceState(conversationId);
   const tabs = saved.openSideChats ?? [];
@@ -43,9 +45,9 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
  */
 export function useSideChats(conversationId: string) {
   const [state, setState] = useState(() => readSideChatTabsState(conversationId));
-  // Tabs a failed storage write couldn't save. Changes build on these until a
-  // write succeeds, then on storage again so other windows' changes are kept.
-  const unsaved = useRef<{ conversationId: string; state: SideChatTabsState } | null>(null);
+  // Changes a failed storage write couldn't save. Each update replays them on
+  // fresh storage, so they survive without undoing other windows' changes.
+  const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
   // WorkspacePanel isn't remounted when the user navigates to another
   // conversation (conversationId is a prop, not a key), so reload this
   // conversation's own tabs on change — otherwise the previous conversation's
@@ -55,19 +57,21 @@ export function useSideChats(conversationId: string) {
     setState(readSideChatTabsState(conversationId));
   }, [conversationId]);
   const update = useCallback(
-    (mutate: (current: SideChatTabsState) => SideChatTabsState) => {
-      const base =
-        unsaved.current?.conversationId === conversationId
-          ? unsaved.current.state
-          : readSideChatTabsState(conversationId);
-      const next = mutate(base);
+    (mutate: TabsChange) => {
+      const pending =
+        unsaved.current?.conversationId === conversationId ? unsaved.current.changes : [];
+      const changes = [...pending, mutate];
+      const next = changes.reduce(
+        (current, change) => change(current),
+        readSideChatTabsState(conversationId),
+      );
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
       });
-      unsaved.current = saved ? null : { conversationId, state: next };
+      unsaved.current = saved ? null : { conversationId, changes };
       setState(next);
     },
     [conversationId],

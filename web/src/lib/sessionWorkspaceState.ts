@@ -85,6 +85,15 @@ interface StoredEntry {
 
 type Store = StoredEntry[];
 
+/** The non-empty strings in `values`, first occurrence kept. */
+function uniqueIds(values: unknown[]): string[] {
+  return [
+    ...new Set(
+      values.filter((value): value is string => typeof value === "string" && value !== ""),
+    ),
+  ];
+}
+
 function sanitize(entry: unknown): SessionWorkspaceState {
   if (typeof entry !== "object" || entry === null) return {};
   const record = entry as Record<string, unknown>;
@@ -118,36 +127,13 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedTerminalKey === null || typeof record.selectedTerminalKey === "string") {
     state.selectedTerminalKey = record.selectedTerminalKey;
   }
-  if (Array.isArray(record.openBrowsers)) {
-    state.openBrowsers = [
-      ...new Set(
-        record.openBrowsers.filter(
-          (value): value is string => typeof value === "string" && value.length > 0,
-        ),
-      ),
-    ];
-  }
+  if (Array.isArray(record.openBrowsers)) state.openBrowsers = uniqueIds(record.openBrowsers);
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }
-  if (Array.isArray(record.openSideChats)) {
-    state.openSideChats = [
-      ...new Set(
-        record.openSideChats.filter(
-          (value): value is string => typeof value === "string" && value.length > 0,
-        ),
-      ),
-    ];
-  }
-  if (Array.isArray(record.openSubagentTabs)) {
-    state.openSubagentTabs = [
-      ...new Set(
-        record.openSubagentTabs.filter(
-          (value): value is string => typeof value === "string" && value.length > 0,
-        ),
-      ),
-    ];
-  }
+  if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
+  if (Array.isArray(record.openSubagentTabs))
+    state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }

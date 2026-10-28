@@ -390,6 +390,14 @@ describe("SettingsPage", () => {
     fireEvent.click(toggle);
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBeNull();
+
+    // A save that storage refuses leaves the switch showing what is stored.
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    setItem.mockRestore();
   });
 
   it("asks before terminal copying by default and explains the scope", () => {

@@ -16,16 +16,18 @@ export function readOpenSubagentsInPanel(): boolean {
   }
 }
 
-/** Persist the preference, clearing the key for the default. */
-export function writeOpenSubagentsInPanel(enabled: boolean): void {
-  if (typeof window === "undefined") return;
+/** Persist the preference, clearing the key for the default; false if storage refused it. */
+export function writeOpenSubagentsInPanel(enabled: boolean): boolean {
+  if (typeof window === "undefined") return false;
   try {
     if (enabled) {
       window.localStorage.setItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY, "on");
     } else {
       window.localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
     }
+    return true;
   } catch {
     // localStorage failures should not make Settings unusable.
+    return false;
   }
 }

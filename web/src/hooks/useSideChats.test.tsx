@@ -241,6 +241,34 @@ describe("sub-agent tabs", () => {
 });
 
 describe("side-chat tabs when storage writes fail", () => {
+  it.each([
+    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"]],
+    ["opens a tab", (hook: SideChatsHook) => hook.open("conv_y"), ["conv_z", "conv_y", "conv_x"]],
+  ])(
+    "replay an unsaved change on top of what another window then %s",
+    (_change, otherWindowChange, sideChats) => {
+      const subagentTab = subagentTabId("conv_child");
+      const first = renderHook(() => useSideChats("session-a"));
+      act(() => first.result.current.open("conv_z"));
+      act(() => first.result.current.open(subagentTab));
+      const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new DOMException("Quota exceeded", "QuotaExceededError");
+      });
+      act(() => first.result.current.open("conv_x"));
+      setItem.mockRestore();
+
+      const second = renderHook(() => useSideChats("session-a"));
+      act(() => otherWindowChange(second.result.current));
+      act(() => first.result.current.select(subagentTab));
+
+      expect(readSessionWorkspaceState("session-a")).toEqual({
+        openSideChats: sideChats,
+        openSubagentTabs: [subagentTab],
+        selectedSideChatId: subagentTab,
+      });
+    },
+  );
+
   it("keep opening, selecting and closing, then save once storage works", () => {
     const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new DOMException("Quota exceeded", "QuotaExceededError");
