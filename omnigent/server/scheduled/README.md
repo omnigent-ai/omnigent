@@ -487,7 +487,7 @@ A deployment can pass `create_app(automations=...)`: a bool, or a zero-arg
 callable checked on each request, for example a per-workspace flag. When it is
 off for a request, every `/v1/scheduled-tasks` route returns 404, including the
 agent tools that call them, and `GET /v1/info` reports `automations_enabled`
-false so clients hide the feature. A callable that raises counts as off. The
+false so clients can hide the feature. A callable that raises counts as off. The
 gate does not stop the scheduler: tasks created while it was on keep running,
 and can be paused or deleted only once it is on again. Omitting it enables
 automations.

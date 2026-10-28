@@ -134,6 +134,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).agent_config_edit is False
     del data["session_event_types"]
     assert ServerInfoResponse.model_validate(data).session_event_types == []
+    del data["automations_enabled"]
+    assert ServerInfoResponse.model_validate(data).automations_enabled is False
 
 
 async def test_info_disables_config_edit_for_unsupported_store(
