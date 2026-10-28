@@ -239,6 +239,165 @@ items does not count as evidence either. Teardown only ever applies to
 server-managed sandbox hosts. It is safe to repeat, so two replicas can recover
 the same run.
 
+## Run states and interruptions
+
+These diagrams cover the database scheduler with the built-in executor. They show
+how one run moves between states, and what happens when the server preparing it
+dies, stalls, or loses its lease at each step.
+
+### Run lifecycle
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> Due : schedule time reached
+    [*] --> Pending : user clicks Run now
+
+    Pending --> Pending : target changed, wait for new host's server
+    Pending --> Skipped : task deleted before claim (task_deleted)
+    state Claim <<choice>>
+    Pending --> Claim : host owner claims
+
+    Due --> NotClaimed : already claimed, or task changed
+    NotClaimed --> [*]
+    Due --> Claim : claim
+    Claim --> Starting : run created with a startup lease
+
+    state Starting {
+        direction TB
+        [*] --> Checks
+        Checks : 1. Owner still exists, target supported,<br/>host online on this server (connected host only)
+        Checks --> Session
+        Session : 2. Create session and attach it to the run
+        Session --> Grant
+        Grant : 3. Give the owner access to the session
+        Grant --> Connected
+        Grant --> Managed
+        Connected : 4a. Connected host - start runner,<br/>wait up to 30s for it, send prompt
+        Managed : 4b. Managed sandbox - save prompt, start sandbox,<br/>wait up to 12 min for it to connect
+    }
+
+    Starting --> Running : prompt sent, or sandbox bound
+    Starting --> Failed : known error, e.g. host_offline
+    Starting --> Skipped : unsupported target
+    Starting --> Recovering : lease expired
+
+    Recovering --> Running : startup was handed off
+    Recovering --> Succeeded : prompt delivered, turn already finished
+    Recovering --> Failed : startup_expired
+    Recovering --> Recovering : uncertain, retry later
+
+    state Running {
+        direction TB
+        [*] --> Deliver
+        Deliver : Managed sandbox only - the server holding the<br/>sandbox's connection starts the runner if needed<br/>and delivers the saved prompt
+        Deliver --> Turn
+        Turn : Agent turn in progress
+    }
+
+    Running --> Succeeded : session idle
+    Running --> Failed : session failed, or runner gone (incomplete)
+
+    Succeeded --> [*]
+    Failed --> [*]
+    Skipped --> [*]
+```
+
+- A claim creates the `starting` run with its startup lease and moves the task
+  to its next time, or marks it `completed`, in one transaction. It does not
+  apply if the occurrence was already claimed or the task changed.
+- A heartbeat renews the lease every 30 seconds. If the server dies or stalls,
+  renewals stop; after expiry the store rejects its writes and recovery decides.
+  An unexpected executor error also leaves the run for recovery.
+- Startup failures use the executor's `error_code`, such as `host_offline`,
+  `launch_failed`, or `sandbox_registration_timeout`. Recovery uses
+  `startup_expired`.
+- Any idle edge records `succeeded`. A failed session records `failed`, including
+  a saved prompt that could not be delivered. A runner gone past its liveness
+  window is failed as `incomplete` when sessions are listed or stopped, and a run
+  still `running` after 6 hours is failed as `incomplete` when the task's runs are
+  read.
+
+### When the server stops partway
+
+Recovery starts within about one lease plus one poll after renewals stop
+(about 2.5 minutes with the defaults). It runs on the server that owns the run's
+host; with a single replica, that is the restarted server.
+
+| Server stops… | Saved state | What happens next | Result |
+| --- | --- | --- | --- |
+| Before the claim commits | Nothing changed | The next poll claims the occurrence | Runs normally, just late |
+| After the claim, before the session exists | Run is `starting`, no session | Recovery finds nothing was launched | `failed` (`startup_expired`); the occurrence is not retried |
+| Connected host, session created, prompt not sent | Session without the prompt | Recovery finds no prompt, agent output, or active turn | `failed`; the prompt is never resent, and a runner already started on the host is left idle |
+| Connected host, prompt sent, `running` not recorded | Session has the prompt | Recovery reads the session | `running`, `succeeded` if the turn already ended, or `failed` if the session failed |
+| Managed sandbox, prompt saved, sandbox still starting | Saved prompt, no host bound | Recovery waits `shutdown_drain_s` past the lease expiry, because a shutting-down server may still bind the sandbox | Bound in time: `running`, and the sandbox's server delivers the prompt. Otherwise: sandbox torn down, prompt failed, `failed` |
+| Managed sandbox, launch already failed | Session startup marked failed | Recovery tears down any sandbox for the run | `failed` |
+| Managed sandbox, after `running`, before the runner started | `running`, host bound, prompt pending | The server holding the sandbox's connection starts the runner and delivers the prompt | Normal `succeeded` or `failed` |
+| Session deleted | Run points to a missing session | Recovery tears down the sandbox of a managed run | `failed` |
+| Alive but stalled past the lease | Lease expired | Its late `running` or `failed` write is rejected, it stops local work, and recovery decides as above | As above |
+| Executor raised unexpectedly | Run still `starting` | Logged as `interrupted`; recovery decides once the lease expires | As above |
+| Mid-turn, after `running` | `running`, no lease | If the host reconnects, the turn ends normally. If the runner is gone, the run fails as `incomplete` when sessions are listed or stopped, or after 6 hours when the task's runs are read | `succeeded` or `failed` |
+| Recovery cannot decide (database error, temporary identity error, timeout) | Unchanged | A later sweep checks again | Decided later |
+| Owner authorization revoked | Unchanged | Recovery does not inspect or clean up; a sandbox is left to the provider's lifetime cap | `failed` |
+
+### How recovery decides
+
+```mermaid
+flowchart TD
+    A["Run's startup lease expired"] --> Own{"Does this server<br/>own the run's host?"}
+    Own -- No --> Skip["Skip: the owner recovers it"]
+    Own -- Yes --> L["Cancel any local startup for the run"]
+    L --> Id{"Act as the task owner"}
+    Id -- "authorization revoked" --> FX["failed, no cleanup"]
+    Id -- "temporary error" --> U0["Check again on a later sweep"]
+    Id -- ok --> B{"Session attached<br/>to the run?"}
+    B -- No --> F1["failed<br/>nothing was launched"]
+    B -- Yes --> C{"Session still exists?"}
+    C -- No --> T1["Tear down sandbox if managed"] --> F2["failed"]
+    C -- Yes --> D{"Managed sandbox run?<br/>(from the run's host ID,<br/>not the task's current target)"}
+
+    D -- "No, connected host" --> E{"Prompt or agent output<br/>in the transcript,<br/>or a turn active?"}
+    E -- No --> F3["failed<br/>prompt never sent, never resent"]
+    E -- Yes --> O{"Session state"}
+
+    D -- Yes --> G{"Launch already<br/>marked failed?"}
+    G -- Yes --> T2["Tear down sandbox"] --> F4["failed"]
+    G -- No --> H{"Host bound<br/>to the session?"}
+    H -- Yes --> P{"Prompt still pending?"}
+    P -- Yes --> R1["running"]
+    P -- No --> O
+    H -- No --> I{"Still starting on this server,<br/>or within shutdown_drain_s<br/>after the lease expired?"}
+    I -- Yes --> U["Check again on a later sweep"]
+    I -- No --> T3["Tear down sandbox,<br/>fail the saved prompt"] --> F5["failed"]
+
+    O -- "session failed" --> F6["failed"]
+    O -- "idle, newest item is the agent's reply" --> S["succeeded"]
+    O -- otherwise --> R2["running"]
+
+    R1 & R2 & S & F1 & F2 & F3 & F4 & F5 & F6 & FX --> W{"Does the run still have<br/>the same expired lease?"}
+    W -- Yes --> Done["Result recorded<br/>failed uses startup_expired"]
+    W -- No --> Gone["Already recorded elsewhere"]
+```
+
+### Behavior to review
+
+These came from reading the code and have not been checked against a running
+deployment:
+
+- Any idle edge on a fired session records the run `succeeded`, including a user
+  pressing Stop or a policy denying the prompt. This would overstate fire success.
+- Recovery tears down only managed sandboxes. If a connected-host startup stops
+  after launching the runner but before sending the prompt, the run fails and the
+  idle runner stays on the host.
+- `host_offline` means the host is not connected to this server. With several
+  replicas, this relies on `owned_hosts` sending the run to the server that holds
+  the host's connection.
+- An interrupted occurrence is not retried. Recovery records `failed`, and the
+  task waits for its next scheduled time.
+- Each poll reads one page of pending Run now requests, so on a server with many
+  pending requests for other replicas' hosts, a request can wait a few polls.
+
 ## Timing and capacity
 
 These are the defaults in the server YAML configuration:
