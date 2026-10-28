@@ -33,15 +33,15 @@ vi.mock("@/components/ComposerMicButton", () => ({
     return null;
   },
 }));
-const sessionLabels = vi.hoisted(() => ({
-  current: {} as Record<string, string>,
+const mockSession = vi.hoisted(() => ({
+  labels: {} as Record<string, string>,
   snapshot: {} as Partial<Session>,
 }));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
-    session: { ...sessionLabels.snapshot, labels: sessionLabels.current },
+    session: { ...mockSession.snapshot, labels: mockSession.labels },
     isLoading: id != null && id === loadingSession.id,
     error: null,
   }),
@@ -74,8 +74,8 @@ const renderPane = (ui: ReactNode) =>
   });
 
 beforeEach(() => {
-  sessionLabels.current = {};
-  sessionLabels.snapshot = {};
+  mockSession.labels = {};
+  mockSession.snapshot = {};
   loadingSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
@@ -229,8 +229,8 @@ describe("side-chat working indicator", () => {
 it.each(["confirmed", "rejected"])(
   "holds a follow-up until the child's settings update is %s, including after remount",
   async (outcome) => {
-    sessionLabels.current = { "omnigent.wrapper": "claude-code-native-ui" };
-    sessionLabels.snapshot = {
+    mockSession.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+    mockSession.snapshot = {
       id: childId,
       harness: "claude-native",
       permissionLevel: 4,
@@ -252,7 +252,7 @@ it.each(["confirmed", "rejected"])(
         new Promise<Session>((resolve, reject) => {
           settle = () =>
             outcome === "confirmed"
-              ? resolve({ ...sessionLabels.snapshot, modelOverride: "alternate" } as Session)
+              ? resolve({ ...mockSession.snapshot, modelOverride: "alternate" } as Session)
               : reject(new Error("Model unavailable"));
         }),
     );
@@ -1225,7 +1225,7 @@ describe("unsent composer state survives the pane moving", () => {
 
 describe("side chat sealed by the server", () => {
   it("is read-only once the server marks the child closed", () => {
-    sessionLabels.current = { "omnigent.closed": "true" };
+    mockSession.labels = { "omnigent.closed": "true" };
     renderPane(<SideChatPane childId={childId} />);
 
     expect(
@@ -1382,7 +1382,7 @@ describe("side-chat slash commands", () => {
     // The child names its parent, but that snapshot is still loading, so the skill
     // target is unresolved. Reporting discovery as in-flight (not "unavailable")
     // is what later gates a quickly typed /skill from going out as plaintext.
-    sessionLabels.current = { "omnigent.side_chat.source_id": "conv_parent" };
+    mockSession.labels = { "omnigent.side_chat.source_id": "conv_parent" };
     loadingSession.id = "conv_parent";
     skillsFixture.current = { skills: [], skillsStatus: "loading" };
     renderPane(<SideChatPane childId={childId} />);
