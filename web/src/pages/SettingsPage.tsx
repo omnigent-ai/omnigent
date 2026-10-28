@@ -119,7 +119,7 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
+import { useOmnigentAnalytics } from "@/lib/analytics";
 import {
   type Conversation,
   useArchiveConversation,
@@ -301,10 +301,6 @@ export function SettingsPage() {
   // login_url; gates the Account section so SSO users get it too.
   const hasAuthSession = info !== "loading" && info.login_url !== null;
   const { section } = useSettingsRoute();
-  // Per-section page view: `settings.appearance`, `settings.account`, etc. The
-  // hook re-keys on pathname, so switching sections re-fires under the new id.
-  // `section` is a closed SettingsSectionId union (no PII / unbounded values).
-  useOmnigentPageView(`settings.${section}`);
 
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —

@@ -8,6 +8,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -333,7 +334,8 @@ function AppShellImpl() {
   // Restore the prior sidebar preference when leaving settings.
   const { inSettings } = useSettingsRoute();
   const sidebarOpenBeforeSettingsRef = useRef<boolean | null>(null);
-  useEffect(() => {
+  // Before paint, so a collapsed sidebar never shows a full-width Settings frame.
+  useLayoutEffect(() => {
     if (inSettings) {
       // Stash inside the updater so it reads the CURRENT value rather than a
       // closure captured before the pin, and so a re-render while already on

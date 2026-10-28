@@ -1,8 +1,10 @@
-import { cleanup, render, screen } from "@testing-library/react";
-import { Outlet, MemoryRouter } from "react-router-dom";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { useOmnigentPageView } from "@/lib/analytics";
+import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 
 vi.mock("@/lib/analytics", () => ({
   useOmnigentPageView: vi.fn(),
@@ -232,11 +234,30 @@ describe("Usage release feature route", () => {
   });
 });
 
+function HistoryBackButton() {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(-1)}>
+      history back
+    </button>
+  );
+}
+
 describe("Settings routes", () => {
-  it("redirects bare settings to the canonical General section", async () => {
-    renderRoute("/settings");
+  it("replaces bare settings with the canonical General section", async () => {
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <MemoryRouter initialEntries={["/c/session-one", "/settings"]} initialIndex={1}>
+          <App />
+          <HistoryBackButton />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
 
     expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+    // A pushed hop would leave bare /settings in history, so Back would redirect forward again.
+    fireEvent.click(screen.getByRole("button", { name: "history back" }));
+    expect(await screen.findByText("chat page")).toBeInTheDocument();
   });
 
   it("preserves an explicit settings section", async () => {
@@ -245,5 +266,36 @@ describe("Settings routes", () => {
     expect(await screen.findByTestId("settings-location")).toHaveTextContent(
       "/settings/appearance",
     );
+  });
+
+  it("canonicalizes bare settings under an embedded basename", async () => {
+    // The embed rebases navigate() targets under the mount (basenamedRouting), so
+    // the replacement must land on /mount/settings/general, not the host root.
+    render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <RoutingProvider value={basenamedRouting("/mount")}>
+          <MemoryRouter initialEntries={["/mount/settings"]}>
+            <App basename="/mount" />
+          </MemoryRouter>
+        </RoutingProvider>
+      </CapabilitiesProvider>,
+    );
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent(
+      "/mount/settings/general",
+    );
+  });
+
+  it("reports the settings page view only once the URL is canonical", async () => {
+    vi.mocked(useOmnigentPageView).mockClear();
+    renderRoute("/settings");
+
+    expect(await screen.findByTestId("settings-location")).toHaveTextContent("/settings/general");
+    // The bare-URL render passes null; the id arrives with the canonical URL, so
+    // the redirect hop is never counted as a page view of its own.
+    const pageIds = vi.mocked(useOmnigentPageView).mock.calls.map(([pageId]) => pageId);
+    const firstReported = pageIds.findIndex((pageId) => pageId !== null);
+    expect(firstReported).toBeGreaterThan(0);
+    expect(new Set(pageIds.slice(firstReported))).toEqual(new Set(["settings.general"]));
   });
 });
