@@ -19,6 +19,7 @@ pytestmark = pytest.mark.asyncio
     ("verdict", "expected", "fails"),
     [
         ({"result": "POLICY_ACTION_ALLOW"}, "private output", False),
+        ({"result": "POLICY_ACTION_ALLOW"}, "Request failed on the runner", True),
         ({"result": "POLICY_ACTION_ALLOW", "data": "redacted"}, "redacted", False),
         (
             {"result": "POLICY_ACTION_DENY", "reason": "blocked"},
@@ -83,7 +84,12 @@ async def test_slow_shell_runs_once_and_checks_its_final_output(
     assert len(requests) == 1
     event = requests[0]["event"]
     assert event["type"] == "PHASE_TOOL_RESULT"
-    assert event["data"]["result"] == full_output
+    if fails:
+        assert "Request failed on the runner" in event["data"]["result"]
+        assert "private output" not in event["data"]["result"]
+        assert len(event["data"]["result"]) < 1024
+    else:
+        assert event["data"]["result"] == full_output
     assert event["request_data"] == {"name": "sys_os_shell", "arguments": arguments}
     assert inbox.empty()
 

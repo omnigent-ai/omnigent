@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Coroutine
 from typing import Any
 
+from omnigent.runner.app_support import _client_safe_error_detail
 from omnigent.util.json_types import JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -60,7 +61,8 @@ async def execute_shell_with_yield(
             raise
         except Exception as exc:
             _logger.exception("background shell failed")
-            status, output = "failed", str(exc)
+            status = "failed"
+            output = _client_safe_error_detail(exc, context="background shell")
         finally:
             cancellation.cancel()
             if not execution_task.done():
