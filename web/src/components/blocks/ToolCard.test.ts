@@ -128,7 +128,6 @@ describe("ToolCard rendering", () => {
     expect(trigger.textContent).toContain("write · 1 item");
     expect(trigger).toHaveAttribute("title", "Manage todo list write · 1 item (manage_todo_list)");
     // WHY: a successful call's details wait behind the expand, so the row reads as its title.
-    expect(screen.queryByTestId("tool-failure-line")).toBeNull();
     expect(trigger.textContent).not.toContain("Task plan updated");
     expect(screen.getByText("3.3s")).toBeInTheDocument();
     // WHY: row text follows the Interface font size.
@@ -136,8 +135,8 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText("Manage todo list")).toHaveClass("font-medium");
   });
 
-  it("tags an MCP tool with its server and reports its failure on a line under it", () => {
-    renderCard({
+  it("tags an MCP tool with its server and shows its failure only when expanded", () => {
+    const { container } = renderCard({
       name: "mcp__github__create_pull_request",
       arguments: { owner: "omnigent-ai", repo: "omnigent", draft: true },
       output: "Error: 422 Validation Failed: A pull request already exists",
@@ -147,10 +146,13 @@ describe("ToolCard rendering", () => {
     // A known server shows its brand spelling rather than the config name.
     expect(screen.getByText("GitHub")).toBeInTheDocument();
     expect(screen.queryByText("github")).toBeNull();
-    const line = screen.getByTestId("tool-failure-line");
-    expect(line.textContent).toBe("Error: 422 Validation Failed: A pull request already exists");
-    // WHY: the failure sits one caption step below the row's Interface font size.
-    expect(line).toHaveClass("text-destructive", "text-sm");
+    const error = "Error: 422 Validation Failed: A pull request already exists";
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(screen.queryByText(error)).toBeNull();
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+    fireEvent.click(trigger);
+    expect(screen.queryByText(error)).toBeNull();
   });
 
   it("expands to labeled Input and Result fields, with the raw JSON behind a Fields | Raw switch", () => {
@@ -290,7 +292,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText(error)).toHaveLength(2);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
     expect(screen.getByTestId("tool-value-view").textContent).toBe(fields);
   });
 
@@ -338,7 +340,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("permission denied")).toHaveLength(2);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent("permission denied");
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
@@ -457,12 +459,11 @@ describe("ToolCard rendering", () => {
 });
 
 describe("ToolCard registered views", () => {
-  it("uses a registered view's title, failure line and body in place of the generic ones", () => {
+  it("uses a registered view's title and body in place of the generic ones", () => {
     // WHY: tool-specific renderers plug in through toolViews.ts without
     // touching ToolCard; each part replaces only its generic counterpart.
     registeredViews.set("fake_plan", {
       title: () => ({ verb: "Started 2 of 2", body: "Fetch open PRs" }),
-      failure: (call) => `Could not finish ${String(call.args.done)}`,
       Body: ({ call }) => createElement("div", null, `Checklist for ${call.name}`),
     });
     const { container } = renderCard({
@@ -472,9 +473,6 @@ describe("ToolCard registered views", () => {
       state: "output-available",
     });
     expect(screen.getByText("Started 2 of 2")).toBeInTheDocument();
-    expect(screen.getByTestId("tool-failure-line").textContent).toBe(
-      "Could not finish Find workflow",
-    );
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Checklist for fake_plan")).toBeInTheDocument();
     expect(screen.queryByText("Input")).toBeNull();
@@ -500,7 +498,6 @@ describe("ToolCard registered views", () => {
     expect(trigger.textContent).toBe("Edit /repo/config.py+1 -2");
     expect(within(counts).getByText("+1")).toHaveClass("text-green-600");
     expect(within(counts).getByText("-2")).toHaveClass("text-red-600");
-    expect(screen.queryByTestId("tool-failure-line")).toBeNull();
 
     fireEvent.click(trigger);
     const body = container.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
@@ -563,7 +560,7 @@ describe("ToolCard registered views", () => {
       diffText: "+y",
     },
   ])(
-    "shows a $producer's error under the row and above its diff",
+    "shows a $producer's error only inside its expanded diff",
     async ({ name, args, output, error, diffText }) => {
       await registerRealView(name);
       const { container } = renderCard({
@@ -572,9 +569,7 @@ describe("ToolCard registered views", () => {
         output,
         state: "output-available",
       });
-      const line = screen.getByTestId("tool-failure-line");
-      expect(line.textContent).toBe(error);
-      expect(line).toHaveClass("text-destructive");
+      expect(screen.queryByText(error)).toBeNull();
       expect(screen.queryByTestId("tool-line-counts")).toBeNull();
       fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
       // The expanded body repeats the error in a box, then labels the diff as not applied.
@@ -612,7 +607,6 @@ describe("ToolCard registered views", () => {
       output,
       state: "output-available",
     });
-    expect(screen.queryByTestId("tool-failure-line")).toBeNull();
     expect(screen.queryByTestId("tool-line-counts")).toBeNull();
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     const text = container.textContent ?? "";
@@ -724,7 +718,7 @@ describe("ToolCard registered views", () => {
   );
 
   it("falls back to the generic parts a view leaves out", () => {
-    registeredViews.set("fake_plan", { failure: () => null });
+    registeredViews.set("fake_plan", { lineCounts: () => null });
     const { container } = renderCard({
       name: "fake_plan",
       arguments: { step: "one" },
@@ -732,7 +726,7 @@ describe("ToolCard registered views", () => {
       state: "output-available",
     });
     expect(screen.getByText("Fake plan")).toBeInTheDocument();
-    expect(screen.queryByTestId("tool-failure-line")).toBeNull();
+    expect(screen.queryByTestId("tool-line-counts")).toBeNull();
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Input")).toBeInTheDocument();
   });
@@ -785,6 +779,32 @@ describe("ToolCard shell terminal panel", () => {
     expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
     expect(screen.queryByText("Parameters")).toBeNull();
     expect(container.textContent).toContain("\\u001b[1ma.txt\\u001b[0m");
+  });
+
+  it.each([
+    { name: "shell", output: "missing\n[exit code: 1]", detail: "exit 1" },
+    {
+      name: "sys_os_shell",
+      output: JSON.stringify({ stdout: "", stderr: "", exit_code: null, timed_out: true }),
+      detail: "timed out",
+    },
+    {
+      name: "Bash",
+      output: "<tool_use_error>Permission to use Bash was denied.</tool_use_error>",
+      detail: "Permission to use Bash was denied.",
+    },
+  ])("shows a $name failure only inside the expanded terminal", ({ name, output, detail }) => {
+    const { container } = renderCard({
+      name,
+      arguments: { command: "make" },
+      output,
+      state: "output-available",
+    });
+    expect(container).not.toHaveTextContent(detail);
+    expand(container);
+    expect(screen.getByTestId("shell-tool-terminal")).toHaveTextContent(detail);
+    expand(container);
+    expect(container).not.toHaveTextContent(detail);
   });
 
   it("reads the exit code in the output format of the tool that ran", () => {

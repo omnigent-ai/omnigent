@@ -4124,7 +4124,11 @@ export function NewChatLandingScreen() {
           <>
             <DropdownMenuCheckboxItem
               checked={routingOn}
-              onCheckedChange={() => selectPickerModel(MODEL_SELECT_SMART)}
+              // Unchecking returns to the harness default, so the pick stays
+              // reversible even when the Models list below has no row to click.
+              onCheckedChange={(checked) =>
+                selectPickerModel(checked ? MODEL_SELECT_SMART : MODEL_SELECT_DEFAULT)
+              }
               onSelect={(event) => event.preventDefault()}
               data-testid="new-chat-landing-agent-model-smart-routing"
             >

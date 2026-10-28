@@ -1,90 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  type ToolCall,
-  editApplied,
-  fileEditFailureLine,
-  fileEditLineCounts,
-  toolFailureLine,
-} from "./toolResultSummary";
-
-function failureOf(name: string, output: string | null, args: Record<string, unknown> = {}) {
-  return toolFailureLine({ name, args, output, state: "output-available" });
-}
-
-describe("toolFailureLine", () => {
-  it("has no line while running or before output arrives", () => {
-    expect(
-      toolFailureLine({ name: "my_tool", args: {}, output: null, state: "input-available" }),
-    ).toBeNull();
-    expect(failureOf("my_tool", null)).toBeNull();
-  });
-
-  it("has no line for a successful call of any kind", () => {
-    expect(
-      failureOf("Read", "     1\timport a\n     2\timport b", { file_path: "a.py" }),
-    ).toBeNull();
-    expect(failureOf("Grep", "Found 3 files\na.ts\nb.ts\nc.ts")).toBeNull();
-    expect(failureOf("Edit", "The file a.py has been updated successfully.")).toBeNull();
-    expect(failureOf("manage_todo_list", "Task plan updated (2 tasks).")).toBeNull();
-    const issue = { id: "OMNI-12243", title: "Claude mod replaces tmux paste", state: "In Review" };
-    const output = JSON.stringify([{ type: "text", text: JSON.stringify(issue) }]);
-    expect(failureOf("mcp__linear__get_issue", output)).toBeNull();
-    expect(failureOf("list_prs", "[1, 2, 3]")).toBeNull();
-  });
-
-  describe("shell tools", () => {
-    it("has no line on success", () => {
-      expect(failureOf("Bash", "README.md", { command: "ls" })).toBeNull();
-      expect(failureOf("shell", "ok\n[exit code: 0]", { command: "make" })).toBeNull();
-      // "[error] <message>" is an edit tool's failure form, not a shell's.
-      expect(failureOf("Bash", "[error] recovered cache entry", { command: "cat log" })).toBeNull();
-    });
-
-    it("reports a failing exit code with the output's last line", () => {
-      expect(
-        failureOf("shell", "collecting...\nFAILED tests/test_a.py::test_x\n[exit code: 1]", {
-          command: "pytest",
-        }),
-      ).toBe("Exit code 1: FAILED tests/test_a.py::test_x");
-    });
-
-    it("reports a failure from a shell format that carries no exit code", () => {
-      // WHY: Claude's Bash output has no exit code, so its failures show only in the text.
-      expect(
-        failureOf("Bash", "<tool_use_error>Permission to use Bash was denied.</tool_use_error>", {
-          command: "rm -rf build",
-        }),
-      ).toBe("Permission to use Bash was denied.");
-      expect(failureOf("sys_os_shell", '{"error": "command blocked"}', { command: "x" })).toBe(
-        "command blocked",
-      );
-    });
-
-    it("reports a sys_os_shell timeout", () => {
-      const output = JSON.stringify({ stdout: "", stderr: "", exit_code: null, timed_out: true });
-      expect(failureOf("sys_os_shell", output, { command: "sleep 99" })).toBe("Timed out");
-    });
-  });
-
-  it("reports each failure shape by its first line", () => {
-    expect(failureOf("sys_os_write", '{"error": "permission denied"}')).toBe("permission denied");
-    expect(
-      failureOf("mcp__github__create_pull_request", "Error: 422 Validation Failed\nmore detail"),
-    ).toBe("Error: 422 Validation Failed");
-    expect(
-      failureOf("github__create_pull_request", '{"result": "Error: 422 Validation Failed"}'),
-    ).toBe("Error: 422 Validation Failed");
-    expect(
-      failureOf("Edit", "<tool_use_error>String to replace not found in file.</tool_use_error>"),
-    ).toBe("String to replace not found in file.");
-    const piFailure = {
-      content: [{ type: "text", text: "Command exited with code 1" }],
-      details: { truncation: null },
-      isError: true,
-    };
-    expect(failureOf("bash", JSON.stringify(piFailure))).toBe("Command exited with code 1");
-  });
-});
+import { type ToolCall, editApplied, fileEditLineCounts } from "./toolResultSummary";
 
 const edit = (output: string | null, overrides: Partial<ToolCall> = {}): ToolCall => ({
   name: "Edit",
@@ -92,44 +7,6 @@ const edit = (output: string | null, overrides: Partial<ToolCall> = {}): ToolCal
   output,
   state: "output-available",
   ...overrides,
-});
-
-describe("fileEditFailureLine", () => {
-  it("reports each harness's edit failure, including the [error] form", () => {
-    expect(
-      fileEditFailureLine(edit("<tool_use_error>String to replace not found.</tool_use_error>")),
-    ).toBe("String to replace not found.");
-    expect(
-      fileEditFailureLine({
-        name: "apply_patch",
-        args: { changes: [{ path: "a.py", kind: { type: "add" }, diff: "x\n" }] },
-        output: "Error: File change ended with status declined.\nadd a.py",
-        state: "output-available",
-      }),
-    ).toBe("Error: File change ended with status declined.");
-    expect(
-      fileEditFailureLine({
-        name: "edit",
-        args: { filePath: "a.py", oldString: "x", newString: "y" },
-        output: "[error] Error: oldString not found in content",
-        state: "output-available",
-      }),
-    ).toBe("Error: oldString not found in content");
-    const piFailure = { content: [{ type: "text", text: "Could not find the text in a.py." }] };
-    expect(
-      fileEditFailureLine({
-        name: "edit",
-        args: { path: "a.py", oldText: "x", newText: "y" },
-        output: JSON.stringify({ ...piFailure, isError: true }),
-        state: "output-available",
-      }),
-    ).toBe("Could not find the text in a.py.");
-  });
-
-  it("has no line for an applied or running edit", () => {
-    expect(fileEditFailureLine(edit("The file a.py has been updated successfully."))).toBeNull();
-    expect(fileEditFailureLine(edit(null, { state: "input-available" }))).toBeNull();
-  });
 });
 
 describe("fileEditLineCounts", () => {
@@ -157,10 +34,16 @@ describe("fileEditLineCounts", () => {
     expect(fileEditLineCounts({ ...call, output: wrapped })).toEqual({ additions: 3, removals: 0 });
   });
 
-  it("has none for a failed edit", () => {
-    expect(
-      fileEditLineCounts(edit("<tool_use_error>String to replace not found.</tool_use_error>")),
-    ).toBeNull();
+  it.each([
+    "<tool_use_error>String to replace not found.</tool_use_error>",
+    "[error] Error: oldString not found in content",
+    JSON.stringify({
+      content: [{ type: "text", text: "Could not find the text." }],
+      isError: true,
+    }),
+    '{"error": "permission denied"}',
+  ])("has none for a failed edit's output %j", (output) => {
+    expect(fileEditLineCounts(edit(output))).toBeNull();
   });
 
   const patchArgs = {

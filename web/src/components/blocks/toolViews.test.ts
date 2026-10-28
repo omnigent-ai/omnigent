@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { type ToolView, toolViewFor } from "./toolViews";
 
 describe("toolViewFor", () => {
-  const plan: ToolView = { failure: () => null };
+  const plan: ToolView = { lineCounts: () => null };
   const views = new Map<string, ToolView>([["manage_todo_list", plan]]);
 
   it("finds a view by the tool name the harness reports", () => {

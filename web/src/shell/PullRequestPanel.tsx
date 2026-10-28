@@ -1039,7 +1039,14 @@ type Associations = Pick<
   "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
 >;
 
-export function PullRequestPanel({ conversationId }: { conversationId: string }) {
+export function PullRequestPanel({
+  conversationId,
+  active = true,
+}: {
+  conversationId: string;
+  /** False while the panel is mounted but hidden (collapsed rail); pauses the poll. */
+  active?: boolean;
+}) {
   const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [prPickerOpen, setPrPickerOpen] = useState(false);
@@ -1049,8 +1056,16 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
+  const info = usePullRequestInfo(conversationId, { poll: active, prUrl: selected });
   const queryClient = useQueryClient();
+  // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (active && !wasActive.current) {
+      void queryClient.refetchQueries({ queryKey: ["github-info", conversationId], stale: true });
+    }
+    wasActive.current = active;
+  }, [active, conversationId, queryClient]);
   const [refreshing, setRefreshing] = useState(false);
   const refresh = async () => {
     setRefreshing(true);

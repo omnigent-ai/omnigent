@@ -1,7 +1,6 @@
-// Tool-call row: icon and title, plus a failure line when the call failed,
-// expanding to labeled input and result fields with the raw payload one toggle
-// away. Kept light so the assistant's prose reads first; per-tool views plug in
-// through `toolViews.ts`.
+// Tool-call row: icon and title, expanding to labeled input and result fields
+// (errors included) with the raw payload one toggle away. Kept light so the
+// assistant's prose reads first; per-tool views plug in through `toolViews.ts`.
 
 import { ChevronRightIcon, CircleSlashIcon, Loader2Icon, XCircleIcon } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
@@ -26,7 +25,7 @@ import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOut
 import { terminalSurfaceStyle } from "@/lib/terminalPalette";
 import { iconForTool } from "@/lib/toolIcon";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
-import { type LineCounts, type ToolCall, toolFailureLine } from "@/lib/toolResultSummary";
+import type { LineCounts, ToolCall } from "@/lib/toolResultSummary";
 import {
   type ToolRunCall,
   type ToolTitle,
@@ -141,7 +140,6 @@ export function ToolCard({
     () => view?.title?.(args) ?? formatToolTitle(name, args),
     [view, name, args],
   );
-  const failure = useMemo(() => (view?.failure ?? toolFailureLine)(call), [view, call]);
   const lineCounts = useMemo(() => view?.lineCounts?.(call) ?? null, [view, call]);
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
@@ -164,7 +162,6 @@ export function ToolCard({
         nativeToolType={nativeToolType}
         state={state}
         duration={displayDuration}
-        failure={failure}
         lineCounts={lineCounts}
         onBodyClick={onBodyClick}
       />
@@ -467,7 +464,7 @@ function toolRunCall(item: RenderItem): ToolRunCall {
 /**
  * Muted trigger for a tool call. Status/category icon at left, title (verb
  * medium + dynamic body) truncated to one line, an edit's line counts, MCP
- * server tag, optional duration, and chevron; a failure sits on a second line.
+ * server tag, optional duration, and chevron.
  */
 function ToolTriggerRow({
   title,
@@ -476,7 +473,6 @@ function ToolTriggerRow({
   nativeToolType,
   state,
   duration,
-  failure,
   lineCounts,
   onBodyClick,
 }: {
@@ -487,7 +483,6 @@ function ToolTriggerRow({
   nativeToolType: string | undefined;
   state: ToolState;
   duration: number | undefined;
-  failure: string | null;
   lineCounts: LineCounts | null;
   /** When set, the body text (e.g. file path) is rendered as a clickable link. */
   onBodyClick?: () => void;
@@ -526,15 +521,6 @@ function ToolTriggerRow({
         )}
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
       </span>
-      {failure !== null && (
-        // Indented to the title past the icon.
-        <span
-          data-testid="tool-failure-line"
-          className="mt-px block min-w-0 truncate pl-5 text-destructive text-sm"
-        >
-          {failure}
-        </span>
-      )}
     </CollapsibleTrigger>
   );
 }

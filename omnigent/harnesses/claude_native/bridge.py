@@ -6887,6 +6887,28 @@ def _wait_for_claude_prompt_ready(
             empty_polls += 1
         if _claude_prompt_rendered(pane):
             return
+        remaining = hard_deadline - time.monotonic()
+        if (
+            bridge_dir is not None
+            and remaining > 0
+            and _occupying_surface(pane) == _OVERLAY_SURFACE
+            and _ESCAPE_DISMISS_HINT.search(pane)
+            and _terminal_dialog_headline(pane) is None
+            and not _escape_quits_claude(pane)
+        ):
+            # A panel can appear after preflight or an empty startup capture.
+            surface = _restore_occupied_input(
+                socket_path,
+                tmux_target,
+                bridge_dir=bridge_dir,
+                timeout_s=min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, remaining),
+            )
+            if surface is not None:
+                raise ClaudeTerminalDialog(
+                    "A panel is covering Claude Code's input box, so nothing was sent. "
+                    "Open the terminal, dismiss the panel, then retry."
+                )
+            continue
         billing_notice = auto_mode_billing_notice_visible(pane)
         if billing_notice:
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)

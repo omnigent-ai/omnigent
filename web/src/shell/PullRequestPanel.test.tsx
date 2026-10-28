@@ -216,9 +216,9 @@ function file(
   };
 }
 
-function renderPanel() {
+function renderPanel(active?: boolean) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<PullRequestPanel conversationId="conv_1" />, {
+  return render(<PullRequestPanel conversationId="conv_1" active={active} />, {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
@@ -365,6 +365,26 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
     expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("polls only while active and refreshes stale info on reactivation", async () => {
+    const refetchQueries = vi.spyOn(QueryClient.prototype, "refetchQueries");
+    onTestFinished(() => refetchQueries.mockRestore());
+    const { rerender } = renderPanel(false);
+
+    // A collapsed rail keeps the panel mounted but must not poll.
+    expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false });
+
+    expect(refetchQueries).not.toHaveBeenCalled();
+
+    rerender(<PullRequestPanel conversationId="conv_1" active />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true });
+    // Turning the poll back on doesn't fetch by itself.
+    expect(refetchQueries).toHaveBeenCalledWith({
+      queryKey: ["github-info", "conv_1"],
+      stale: true,
+    });
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {

@@ -11,6 +11,7 @@ import { ComposerConfigSections } from "@/components/composer/ComposerConfigSect
 import {
   compactModelTriggerLabel,
   defaultModelLabel,
+  findModelLabelOption,
   formatStatusEffortLabel,
   formatStatusModelLabel,
   nativeModelLabel,
@@ -32,7 +33,6 @@ import {
   modelPickerKindForConv,
   shouldShowEffortPicker,
 } from "@/lib/composerCapabilities";
-import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { updateSession } from "@/lib/sessionsApi";
 import { parentIdFromLabels } from "@/lib/sessionHost";
@@ -128,16 +128,12 @@ export function SideChatSettings({
     reportedModel;
   const fusionModel =
     kind === "devin" && isFusionModelUid(model) ? fusionOption(options) : undefined;
-  const selectedModel = fusionModel ?? findNativeModelOption(options, model);
+  const selectedModel = fusionModel ?? findModelLabelOption(options, model);
   const nativeAgent =
     nativeCodingAgentForHarness(session.harness) ??
     (kind ? nativeCodingAgentForHarness(`${kind}-native`) : undefined);
   const harnessLabel = nativeAgent?.displayName ?? session.agentName ?? "Session";
-  const modelLabel =
-    (fusionModel ? formatStatusModelLabel(model, options) : null) ??
-    (selectedModel ? nativeModelLabel(selectedModel) : null) ??
-    model ??
-    defaultModelLabel(options);
+  const modelLabel = formatStatusModelLabel(model, options) ?? defaultModelLabel(options);
   const effort =
     draft?.settings?.reasoningEffort !== undefined
       ? draft.settings.reasoningEffort

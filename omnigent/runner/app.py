@@ -1709,6 +1709,15 @@ def create_runner_app(
         blocked_on: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if status == "failed":
+            # Structured status has no provider detail when its terminal hook is lost.
+            event["error"] = {
+                "code": "native_failure_detail_unavailable",
+                "message": (
+                    "The native agent reported an error, but its failure details did not "
+                    "arrive. Open the terminal to inspect the error before retrying."
+                ),
+            }
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)

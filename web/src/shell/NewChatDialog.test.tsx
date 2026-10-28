@@ -10480,18 +10480,79 @@ describe("NewChatLandingScreen smart routing", () => {
     expect(selectedPickerModel()).toBeTruthy();
   });
 
-  it("disables effort choices while Smart Routing owns effort", () => {
+  // A managed sandbox has no pre-launch catalog, so Codex's Model section lists
+  // no models there; unchecking Smart Routing must still turn it off, as the
+  // Default row does for Claude Code.
+  it("lets a Codex sandbox session switch back from Smart Routing to the default model", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_sandbox_unrouted" }),
+    } as unknown as Response);
+    renderLanding({
+      smart_routing_enabled: true,
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "lakebox",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
+        "Sandbox",
+      ),
+    );
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Smart Routing");
+    const smartRouting = () => screen.getByRole("menuitemcheckbox", { name: "Smart Routing" });
+    expect(smartRouting()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("new-chat-landing-agent-select").getAttribute("aria-label")).toBe(
+      "Codex, Model Smart Routing, Effort —",
+    );
+    // The checkbox is the only way out: no model or Default row is offered.
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(within(models).getByText("Models unavailable")).toBeVisible();
+    expect(within(models).queryByRole("menuitemcheckbox", { name: "Default" })).toBeNull();
+
+    fireEvent.click(smartRouting());
+
+    expect(smartRouting()).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByTestId("new-chat-landing-agent-select").getAttribute("aria-label")).toBe(
+      "Codex, Model Default",
+    );
+    closePrimaryPicker();
+
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({ agent_id: "a2", host_type: "managed" });
+    expect(body.cost_control_mode_override).toBeUndefined();
+    expect(body.smart_routing_message).toBeUndefined();
+    expect(body.model_override).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("disables effort choices while Smart Routing owns effort and hands them back once it is unchecked", () => {
     renderLanding({ smart_routing_enabled: true });
     openAgentModels("a1");
     pickPrimaryOption("effort", "High");
     expect(selectedPickerEffort()).toHaveTextContent("High");
     pickPrimaryOption("model", "Smart Routing");
-    for (const option of within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole(
-      "menuitemcheckbox",
-    )) {
+    const effortChoices = () =>
+      within(screen.getByTestId("new-chat-landing-agent-efforts")).getAllByRole("menuitemcheckbox");
+    for (const option of effortChoices()) {
       expect(option).toHaveAttribute("data-disabled");
       expect(option).toHaveAttribute("aria-checked", "false");
     }
+
+    // Unchecking lands on the harness default with the effort row usable again.
+    pickPrimaryOption("model", "Smart Routing");
+    expect(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(selectedPickerModel().textContent).toContain("Default");
+    expect(selectedPickerEffort()).toHaveTextContent("Default");
+    for (const option of effortChoices()) {
+      expect(option).not.toHaveAttribute("data-disabled");
+    }
+    expect(
+      JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}")["claude-native"],
+    ).toMatchObject({ routing: "off", model: "", effort: "" });
   });
 
   it("sends cost_control_mode_override 'on' and no model/effort override when routing is picked", async () => {

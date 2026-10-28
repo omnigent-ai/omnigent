@@ -1,6 +1,6 @@
 """E2E: real ``sys_os_edit`` outcomes cross the server and runner into edit rows.
 
-An applied and a missed edit check the row's counts, the failure line and the Diff | Raw view.
+An applied edit shows line counts after its title; a missed edit shows its error when expanded.
 """
 
 from __future__ import annotations
@@ -115,13 +115,13 @@ _VIEWPORT = {"width": 1280, "height": 720}
 
 
 @pytest.mark.timeout(300)
-# A recording at full viewport size keeps the rows' counts and failure line legible.
+# A recording at full viewport size keeps the rows' counts legible.
 @pytest.mark.browser_context_args(viewport=_VIEWPORT, record_video_size=_VIEWPORT)
 def test_edit_rows_show_line_counts_and_diff(
     request: pytest.FixtureRequest,
     edit_session: tuple[str, str, Path],
 ) -> None:
-    """An applied edit shows its line counts after its title; a failed edit keeps its error."""
+    """An applied edit shows its line counts; a failed edit's error waits behind the expand."""
     base_url, session_id, workspace = edit_session
     # Open the recorded page only after the session and runner are ready.
     page: Page = request.getfixturevalue("page")
@@ -146,20 +146,15 @@ def test_edit_rows_show_line_counts_and_diff(
     applied = page.locator('[data-slot="collapsible-trigger"]', has_text="greet.py").first
     counts = applied.get_by_test_id("tool-line-counts")
     expect(counts).to_have_text("+2 -3")
-    expect(applied.get_by_test_id("tool-failure-line")).to_have_count(0)
     failed = page.locator('[data-slot="collapsible-trigger"]', has_text="settings.py").first
-    failed_result = failed.get_by_test_id("tool-failure-line")
-    expect(failed_result).to_contain_text(
-        re.compile(r"Could not find oldText in '.*settings\.py'")
-    )
     expect(failed.get_by_test_id("tool-line-counts")).to_have_count(0)
+    expect(failed).not_to_contain_text("Could not find")
     color = "el => getComputedStyle(el).color"
     plain = applied.evaluate(color)
     added = counts.get_by_text("+2", exact=True).evaluate(color)
     removed = counts.get_by_text("-3", exact=True).evaluate(color)
-    # The counts and the failure use their own colors, not the row's muted text.
+    # The counts use diff colors, not the row's muted text.
     assert len({plain, added, removed}) == 3
-    assert failed_result.evaluate(color) != failed.evaluate(color)
 
     applied.click()
     card = applied.locator("xpath=..")
@@ -176,3 +171,9 @@ def test_edit_rows_show_line_counts_and_diff(
     expect(diff).to_have_count(0)
     diff_tab.click()
     expect(diff).to_be_visible()
+
+    failed.click()
+    failure = failed.locator("xpath=..").get_by_test_id("tool-error-box")
+    expect(failure).to_contain_text(re.compile(r"Could not find oldText in '.*settings\.py'"))
+    failed.click()
+    expect(failure).not_to_be_visible()

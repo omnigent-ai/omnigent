@@ -1,15 +1,10 @@
-// Per-tool presentation for ToolCard. A tool that needs its own title, failure
-// line, line counts, or expanded body registers a `ToolView` in TOOL_VIEWS;
-// every part is optional, and whatever a view leaves out uses the generic rendering.
+// Per-tool presentation for ToolCard. A tool that needs its own title, line
+// counts, or expanded body registers a `ToolView` in TOOL_VIEWS; every part is
+// optional, and whatever a view leaves out uses the generic rendering.
 
 import type { ComponentType } from "react";
 import { FILE_EDIT_TOOL_NAMES } from "@/lib/toolEditDiff";
-import {
-  type LineCounts,
-  type ToolCall,
-  fileEditFailureLine,
-  fileEditLineCounts,
-} from "@/lib/toolResultSummary";
+import { type LineCounts, type ToolCall, fileEditLineCounts } from "@/lib/toolResultSummary";
 import { type ToolTitle, splitToolName } from "@/lib/toolTitle";
 import { FileEditBody } from "./FileEditBody";
 
@@ -22,8 +17,6 @@ export interface ToolBodyProps {
 export interface ToolView {
   /** Row title; returning `null` falls back to `formatToolTitle`. */
   title?: (args: Record<string, unknown>) => ToolTitle | null;
-  /** Failure line under the row; returning `null` hides it. Replaces `toolFailureLine`. */
-  failure?: (call: ToolCall) => string | null;
   /** Added and removed line counts after the row's title, e.g. "+4 -2"; `null` shows none. */
   lineCounts?: (call: ToolCall) => LineCounts | null;
   /**
@@ -37,7 +30,6 @@ export interface ToolView {
 
 /** File edits: added/removed line counts on the row, and the diff when expanded. */
 const FILE_EDIT_VIEW: ToolView = {
-  failure: fileEditFailureLine,
   lineCounts: fileEditLineCounts,
   Body: FileEditBody,
   bodyLabel: "Diff",
