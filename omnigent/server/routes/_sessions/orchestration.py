@@ -544,9 +544,11 @@ async def _publish_and_wait_for_harness_elicitation(
     _harness_parked_elicitations[elicitation_id] = parked
     unparked = _harness_unparked_elicitations.get(elicitation_id)
     reclaimed_terminal_card = False
+    answered_in_terminal = False
     if unparked is not None and unparked.session_id == session_id:
         _harness_unparked_elicitations.pop(elicitation_id, None)
         reclaimed_terminal_card = unparked.in_terminal
+        answered_in_terminal = unparked.resolved_elsewhere.is_set()
     event_payload: dict[str, Any] | None = None
     # settled = verdict / terminal-resolved (clear the card now); a
     # severed wait instead defers the clear so a hook retry can re-park.
@@ -556,6 +558,10 @@ async def _publish_and_wait_for_harness_elicitation(
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
     try:
+        if answered_in_terminal:
+            # The terminal answered before this retry; clear the card instead of re-asking.
+            published_request = settled = True
+            return None
         tombstone = _consume_pre_resolved_harness_elicitation(
             session_id, elicitation_id, request_fingerprint
         )

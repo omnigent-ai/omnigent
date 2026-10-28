@@ -2713,19 +2713,21 @@ async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
 
 
 @pytest.mark.parametrize(
-    ("answered_during_grace", "ancestor_clear_fails"),
-    [(False, False), (True, False), (False, True)],
+    ("answered_during_grace", "ancestor_clear_fails", "hook_retries_after_answer"),
+    [(False, False, False), (True, False, False), (False, True, False), (True, False, True)],
 )
 async def test_terminal_answer_clears_card_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     answered_during_grace: bool,
     ancestor_clear_fails: bool,
+    hook_retries_after_answer: bool,
 ) -> None:
     """
     The gated tool's mirrored result clears the card as answered.
 
     An answer given during the re-park grace never points the card to the terminal.
+    A hook retry that arrives after the terminal answered clears the card, not re-asks.
     A failed clear in ancestor sessions must not fail the session's own clear.
     """
     from omnigent.runtime import pending_elicitations
@@ -2743,7 +2745,8 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
     session_id, payload, collector = await _sever_hook_mid_turn(
         client,
         monkeypatch,
-        f"test-terminal-fallback-answered-{answered_during_grace}-{ancestor_clear_fails}",
+        f"test-terminal-fallback-answered-{answered_during_grace}-{ancestor_clear_fails}"
+        f"-{hook_retries_after_answer}",
         grace_s=1.0 if answered_during_grace else 0.2,
     )
     try:
@@ -2754,6 +2757,12 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
         sessions_route._signal_terminal_resolved_harness_elicitation(
             session_id, payload["tool_name"], {"command": "ls -la"}
         )
+        if hook_retries_after_answer:
+            retry = await client.post(
+                f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+            )
+            assert retry.status_code == 200, retry.text
+            assert retry.content == b""
         resolved = await _next_elicitation_event(collector)
         assert resolved == {
             "type": "response.elicitation_resolved",
@@ -2761,6 +2770,7 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
         }
         assert pending_elicitations.count_for(session_id) == 0
         await _finish_deferred_clears()
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
     finally:
         await collector.stop()
         pending_elicitations.reset_for_tests()
