@@ -159,7 +159,11 @@ export function SideChatSettings({
                     const nextEfforts = supportsEffort
                       ? effortLevelsForConv(session, options, option.id, family)
                       : [];
-                    let nextEffort = option.defaultReasoningEffort ?? nextEfforts[0] ?? null;
+                    const defaultEffort = option.defaultReasoningEffort;
+                    let nextEffort =
+                      defaultEffort && nextEfforts.includes(defaultEffort)
+                        ? defaultEffort
+                        : (nextEfforts[0] ?? null);
                     if (effort && nextEfforts.includes(effort)) nextEffort = effort;
                     void save({
                       modelOverride: option.id,
@@ -195,7 +199,10 @@ export function SideChatSettings({
       open={menuOpen}
       onOpenChange={(open) => {
         if (!open || !disabled) setMenuOpen(open);
-        if (!open) setConfigOpen(false);
+        if (!open) {
+          setConfigOpen(false);
+          setError(null);
+        }
       }}
       trigger={{
         label: "Side chat model and effort",

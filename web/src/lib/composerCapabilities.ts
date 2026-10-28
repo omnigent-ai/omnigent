@@ -56,10 +56,7 @@ export function effortLevelsForConv(
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "devin-native-ui":
-      // Devin encodes effort as a model-variant suffix, and the rung set is
-      // PER MODEL (swe-2 exposes only medium/high/max; `swe-2-low` is a different
-      // Fusion model), so derive it from the selected model's catalog entry —
-      // its `supportedReasoningEfforts` — rather than a fixed ladder.
+      // Devin encodes effort as a model variant; each model declares its own ladder.
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "codex-native-ui":
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
@@ -113,10 +110,7 @@ export function modelPickerKindForConv(
       // (the executor types ``/model`` when a routed model changes).
       return "devin";
     case "pi-native-ui":
-      // Like cursor: the runner types a model switch into the live Pi process
-      // (via the bridge inbox → Pi's ``setModel``) and Pi mirrors its own
-      // ``/model`` picks back to ``model_override`` via the extension's
-      // model_select handler, so the picker surfaces that as the live model.
+      // Pi applies switches through setModel and mirrors /model picks to model_override.
       return "pi";
     default:
       if (conv?.inferenceConfigured) return "configured";

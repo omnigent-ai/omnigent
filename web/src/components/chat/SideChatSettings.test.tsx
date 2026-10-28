@@ -128,6 +128,10 @@ it("keeps the saved selection when the server rejects a change", async () => {
     "aria-checked",
     "true",
   );
+  await user.keyboard("{Escape}");
+  await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
 it("offers SDK effort controls without inventing a model catalog", async () => {
@@ -411,3 +415,32 @@ it.each([
   mount({ ...child, ...metadata } as Session);
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
+
+it.each([false, true])(
+  "ignores catalog defaults outside the harness effort ladder (draft=%s)",
+  async (draft) => {
+    const onChange = vi.fn();
+    const session = {
+      ...child,
+      harness: "claude-native",
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      reasoningEffort: null,
+      codexModelOptions: [models[0], { ...models[1], defaultReasoningEffort: "unsupported" }],
+    };
+    render(
+      <QueryClientProvider client={cache}>
+        <SideChatSettings
+          session={session}
+          draft={draft ? { onChange, disabled: false } : undefined}
+        />
+      </QueryClientProvider>,
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+    await user.click(screen.getByTestId("side-chat-model-edit"));
+    await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
+    const updates = { modelOverride: "model-b", reasoningEffort: "low" };
+    if (draft) expect(onChange).toHaveBeenCalledWith(updates);
+    else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
+  },
+);
