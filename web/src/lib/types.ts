@@ -273,6 +273,18 @@ export interface BackgroundTaskInfo {
   command?: string;
 }
 
+/** One way to open a session's workspace in a desktop code editor (server-built). */
+export interface EditorLink {
+  /** Editor key, e.g. `"cursor"` or `"vscode"`. */
+  editor: string;
+  /** Display name, e.g. `"Cursor"`. */
+  label: string;
+  /** Deep link handed to the OS, e.g. `"cursor://vscode-remote/ssh-remote+arca.ssh/home/me/repo"`. */
+  url: string;
+  /** Opens a path on the clicking machine; usable only when the session's host is that machine. */
+  local_only: boolean;
+}
+
 export interface Session {
   projectId?: string | null;
   id: string;
@@ -307,6 +319,11 @@ export interface Session {
    * dead-end. `false`/absent otherwise.
    */
   hostResumable?: boolean;
+  /**
+   * Server-built deep links that open the workspace in a desktop code editor,
+   * default editor first. Absent when the server offers none.
+   */
+  editorLinks?: EditorLink[];
   /**
    * Whether the session is archived. Carried on the snapshot because it is
    * the only carrier for a session opened directly by URL — the default

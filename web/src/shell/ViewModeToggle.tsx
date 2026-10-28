@@ -6,6 +6,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useViewModeToggleHotkey } from "@/hooks/useViewModeToggleHotkey";
 import { cn } from "@/lib/utils";
+import {
+  SEGMENT_ACTIVE,
+  SEGMENT_BASE,
+  SEGMENT_INACTIVE,
+  SEGMENTED_TRACK,
+} from "./segmentedControl";
 import { useTerminalFirst } from "./TerminalFirstContext";
 
 const ignoreViewChange = () => {};
@@ -51,7 +57,7 @@ export function ViewModeToggle({ hotkeyEnabled = true, alwaysVisible = false } =
       data-testid="view-mode-toggle"
       // Two 36×24 segments separated by 2px make a flush 74×24 track.
       // Desktop-only — mobile folds the switch into the header kebab.
-      className="flex h-6 w-[74px] shrink-0 items-center gap-0.5 rounded-[6px] bg-muted p-0 dark:bg-[var(--segmented-trough-bg)]"
+      className={cn(SEGMENTED_TRACK, "w-[74px]")}
     >
       <ViewModeSegment
         label="Chat view"
@@ -114,12 +120,7 @@ function ViewModeSegment({
             onClick={onClick}
             data-testid={testId}
             componentId={componentId}
-            className={cn(
-              "h-6 w-9 rounded-[6px] border px-2.5 py-0",
-              active
-                ? "border-border bg-background text-foreground shadow-sm hover:bg-background dark:border-transparent dark:bg-[var(--segmented-active-bg)] dark:hover:bg-[var(--segmented-active-bg)]"
-                : "border-transparent text-muted-foreground hover:bg-transparent hover:text-foreground dark:bg-[var(--segmented-inactive-bg)] dark:hover:bg-[var(--segmented-inactive-bg)]",
-            )}
+            className={cn(SEGMENT_BASE, "w-9 px-2.5", active ? SEGMENT_ACTIVE : SEGMENT_INACTIVE)}
           >
             {children}
           </Button>
