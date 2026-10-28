@@ -36,6 +36,7 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    EDITOR_LINKS = "editor_links"
 
 
 @dataclass(frozen=True)
@@ -135,6 +136,15 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Search workspace file contents through the session runner",
         owner="web",
         review_by_release="0.20.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.EDITOR_LINKS,
+        description="Open-in-editor links on session responses (chat header button)",
+        owner="server",
+        review_by_release="0.23.0",
+        # Surfaced per session as SessionResponse.editor_links instead, which
+        # also honors a per-request override passed to create_app.
+        frontend_visible=False,
     ),
 )
 

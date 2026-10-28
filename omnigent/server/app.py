@@ -1487,6 +1487,7 @@ def create_app(
     sharing_mode: SharingMode | Callable[[], SharingMode] | None = None,
     public_sharing: bool | Callable[[], bool] | None = None,
     public_sharing_max_level: str | Callable[[], str] | None = None,
+    editor_links_enabled: bool | Callable[[], bool] | None = None,
     default_public_sessions: str | Callable[[], str] | None = None,
     filesystem_attachment_allowed_extensions: (
         str | list[str] | Callable[[], str | list[str] | None] | None
@@ -1638,6 +1639,10 @@ def create_app(
         falsy — ``0``/``false``/``no``/``off``), failing open to enabled
         when unset. Reported by ``GET /v1/info`` as
         ``public_sharing_enabled``.
+    :param editor_links_enabled: Whether session responses carry
+        ``editor_links`` (the chat header's open-in-editor button). A static
+        bool or a zero-arg callable resolved per request. ``None`` follows the
+        ``editor_links`` release feature (``OMNIGENT_FEATURES``), off by default.
     :param public_sharing_max_level: Maximum effective ``__public__`` permission,
         ``"read"`` (default) or ``"edit"``. Edit requires authenticated multi-user
         access, including accounts, OIDC and trusted-header deployments.
@@ -2337,6 +2342,19 @@ def create_app(
         _public_static = bool(public_sharing)
         app.state.public_sharing = lambda: _public_static
         app.state.public_sharing_writable = False
+    if editor_links_enabled is None:
+        editor_links_enabled = resolved_feature_flags.enabled(Feature.EDITOR_LINKS)
+    if callable(editor_links_enabled):
+        _editor_links_callable = editor_links_enabled
+        app.state.editor_links_enabled = lambda: bool(_editor_links_callable())
+    else:
+        _editor_links_static = bool(editor_links_enabled)
+        app.state.editor_links_enabled = lambda: _editor_links_static
+    # With no auth provider every host is owned by the reserved local user (see
+    # the host tunnel), so an unauthenticated viewer is that owner.
+    app.state.editor_links_anonymous_viewer = (
+        RESERVED_USER_LOCAL if auth_provider is None else None
+    )
     from omnigent.server.sharing_settings import (
         DefaultPublicSessions,
         PublicSharingMaxLevel,

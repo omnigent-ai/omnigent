@@ -1935,6 +1935,39 @@
         "title": "DailyCost",
         "type": "object"
       },
+      "EditorLinkResponse": {
+        "description": "A deep link that opens the session's workspace in a desktop code editor.",
+        "properties": {
+          "editor": {
+            "description": "Editor key, e.g. `\"cursor\"` or `\"vscode\"`.",
+            "title": "Editor",
+            "type": "string"
+          },
+          "label": {
+            "description": "Display name, e.g. `\"Cursor\"`.",
+            "title": "Label",
+            "type": "string"
+          },
+          "local_only": {
+            "default": false,
+            "description": "The link opens a path on the clicking machine, so a client shows it only when the session's host is that machine.",
+            "title": "Local Only",
+            "type": "boolean"
+          },
+          "url": {
+            "description": "Deep link handed to the OS, e.g. `\"cursor://vscode-remote/ssh-remote+arclet_dev.ssh/home/me/repo\"`.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "editor",
+          "label",
+          "url"
+        ],
+        "title": "EditorLinkResponse",
+        "type": "object"
+      },
       "ElicitationRequestEvent": {
         "description": "Synchronous request for a decision from upstream.\n\nEmitted by Omnigent (or, under the new contract, by a harness)\nwhen the LLM / a tool / a policy needs a verdict before\nproceeding. The consumer replies via\n`POST /v1/sessions/{session_id}/events` with\n`type == \"approval\"` and\n`omnigent.server.schemas.ElicitationResult` fields in\n`data`. This preserves MCP request/reply correlation by id\nwithout threading elicitations through PATCH.\n\nWire shape matches the existing emit at\n`omnigent/runtime/policies/approval.py:175`.",
         "properties": {
@@ -8302,6 +8335,21 @@
             "format": "int64",
             "title": "Created At",
             "type": "integer"
+          },
+          "editor_links": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/EditorLinkResponse"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ways to open the workspace in a desktop code editor, default editor first. `None` unless the server enables editor links, the viewer owns the session's host, and the host is reachable from the viewer's machine.",
+            "title": "Editor Links"
           },
           "external_session_id": {
             "anyOf": [

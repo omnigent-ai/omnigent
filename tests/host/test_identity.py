@@ -14,6 +14,7 @@ from omnigent.host.identity import (
     export_configured_slice_key,
     host_identity_env_override_active,
     load_host_identity_if_present,
+    load_host_ssh_target,
     load_or_create_host_identity,
     reset_host_id,
 )
@@ -471,3 +472,32 @@ def test_export_configured_slice_key_defers_to_the_env_var(
     export_configured_slice_key(path)
 
     assert os.environ.get(HOST_SLICE_KEY_ENABLED_ENV_VAR) == expected
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        (
+            {"host": {"host_id": "a" * 32, "name": "dev", "ssh_target": "arclet_dev.ssh"}},
+            "arclet_dev.ssh",
+        ),
+        ({"host": {"name": "dev"}}, None),
+        ({"host": {"ssh_target": "evil/x?y"}}, "evil/x?y"),
+        ({"host": {"ssh_target": 7}}, None),
+        ({"host": "not-a-mapping"}, None),
+        (["not", "a", "mapping"], None),
+    ],
+)
+def test_load_host_ssh_target(tmp_path: Path, config: object, expected: str | None) -> None:
+    """A string ``host.ssh_target`` is reported as-is; anything else reads as unset."""
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    assert load_host_ssh_target(path) == expected
+
+
+def test_load_host_ssh_target_tolerates_missing_or_broken_config(tmp_path: Path) -> None:
+    """A missing or unparseable config never blocks the host connection."""
+    assert load_host_ssh_target(tmp_path / "absent.yaml") is None
+    broken = tmp_path / "broken.yaml"
+    broken.write_text("host: [unclosed")
+    assert load_host_ssh_target(broken) is None

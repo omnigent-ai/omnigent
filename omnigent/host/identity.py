@@ -349,3 +349,28 @@ def load_host_identity_if_present(
             return None
         return HostIdentity(host_id=host_id, name=host_section["name"])
     return None
+
+
+def load_host_ssh_target(path: Path | None = None) -> str | None:
+    """Return ``host.ssh_target`` from the host config, or ``None``.
+
+    The SSH destination the owner reaches this host by from their own machine,
+    e.g. ``"arclet_dev.ssh"``. Read on each connect so an edit applies on the
+    next reconnect. Tolerant like :func:`load_host_identity_if_present`: a
+    missing, unreadable or non-string value yields ``None`` and never blocks
+    the connection. The server validates the value when it decodes the hello.
+
+    :param path: Optional config YAML path. Defaults to the user-level path,
+        honoring ``OMNIGENT_CONFIG_HOME`` when set.
+    """
+    path = host_config_path(path)
+    try:
+        with open(path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    host_section = cfg.get("host") if isinstance(cfg, dict) else None
+    if not isinstance(host_section, dict):
+        return None
+    ssh_target = host_section.get("ssh_target")
+    return ssh_target if isinstance(ssh_target, str) else None

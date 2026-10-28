@@ -77,6 +77,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    normalize_ssh_target,
     workspace_missing_message,
 )
 
@@ -854,6 +855,42 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
     assert decoded.connection_id is None
+
+
+def test_hello_frame_ssh_target_round_trip() -> None:
+    """The host's SSH destination survives encode → decode; older hosts omit it."""
+    original = HostHelloFrame(
+        version="0.1.0", frame_protocol_version=1, name="dev", ssh_target="arclet_dev.ssh"
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.ssh_target == "arclet_dev.ssh"
+
+    legacy = decode_host_frame(
+        json.dumps(
+            {"kind": "host.hello", "version": "0.1.0", "frame_protocol_version": 1, "name": "x"}
+        )
+    )
+    assert isinstance(legacy, HostHelloFrame)
+    assert legacy.ssh_target is None
+
+
+@pytest.mark.parametrize("ssh_target", [{"oops": 1}, "-oProxyCommand=sh", "box/x?y"])
+def test_hello_frame_invalid_ssh_target_decodes_to_none(ssh_target: object) -> None:
+    """An invalid ssh_target decodes to None instead of rejecting the hello."""
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "x",
+                "ssh_target": ssh_target,
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.ssh_target is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:
@@ -2810,3 +2847,31 @@ def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) ->
                 }
             )
         )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["arclet_dev.ssh", "arca.ssh", "me@box.example.com", "box-1", "a" * 255],
+)
+def test_normalize_ssh_target_accepts_aliases(value: str) -> None:
+    assert normalize_ssh_target(value) == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "a" * 256,
+        "box/../x",
+        "box name",
+        "box#frag",
+        "box?q",
+        "x+y",
+        "-oProxyCommand=sh",
+        "@box",
+        42,
+    ],
+)
+def test_normalize_ssh_target_rejects_invalid_values(value: object) -> None:
+    assert normalize_ssh_target(value) is None

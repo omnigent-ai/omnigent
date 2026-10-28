@@ -2974,3 +2974,85 @@ async def test_on_runner_connect_reassign_http_status_levels(
     assert row.levelno == level
     assert row.exc_info is None
     assert f"HTTP {status}: runner said no" in row.getMessage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_get_session_serves_editor_links_behind_the_gate(
+    db_uri: str, tmp_path: Path, enabled: bool
+) -> None:
+    """GET /v1/sessions/{id} returns server-built editor links only when enabled.
+
+    No auth provider: the host is owned by the reserved local user, which is
+    also who an unauthenticated viewer is, so the owner check passes.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    host_store = HostStore(db_uri)
+    host_id = "3c4d5e6f708192a3b4c5d6e7f8091a2b"
+    host_store.upsert_on_connect(
+        host_id=host_id, name="dev", user_id="local", ssh_target="arclet_dev.ssh"
+    )
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_id = "4d5e6f708192a3b4c5d6e7f8091a2b3c"
+    agent_store.create(agent_id, name="links-agent", bundle_location="test:///bundle")
+    conversation_store = SqlAlchemyConversationStore(db_uri)
+    conv = conversation_store.create_conversation(
+        agent_id=agent_id, host_id=host_id, workspace="/home/me/repo"
+    )
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=agent_store,
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        host_store=host_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        editor_links_enabled=lambda: enabled,
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get(f"/v1/sessions/{conv.id}")
+
+    assert resp.status_code == 200
+    links = resp.json()["editor_links"]
+    if not enabled:
+        assert links is None
+        return
+    assert links == [
+        {
+            "editor": "cursor",
+            "label": "Cursor",
+            "url": "cursor://vscode-remote/ssh-remote+arclet_dev.ssh/home/me/repo",
+            "local_only": False,
+        },
+        {
+            "editor": "vscode",
+            "label": "VS Code",
+            "url": "vscode://vscode-remote/ssh-remote+arclet_dev.ssh/home/me/repo",
+            "local_only": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize(("features", "expected"), [("", False), ("editor_links", True)])
+def test_editor_links_default_follows_release_feature(
+    db_uri: str, tmp_path: Path, features: str, expected: bool
+) -> None:
+    """Without an explicit gate, ``OMNIGENT_FEATURES=editor_links`` turns links on."""
+    from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import resolve_feature_flags
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": features}),
+    )
+    assert app.state.editor_links_enabled() is expected

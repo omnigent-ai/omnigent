@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import json
 import math
@@ -31,6 +32,7 @@ from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
+from omnigent.editor_links import build_editor_links
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -372,6 +374,7 @@ from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
+    EditorLinkResponse,
     ElicitationRequestEvent,
     ElicitationRequestParams,
     ElicitationResult,
@@ -13610,12 +13613,22 @@ async def _get_session_snapshot(
     # host_offline dead-end. Computed independently of liveness_lookup (the web
     # chat passes include_liveness=False, so host_online is None here and
     # liveness arrives via the poll/stream). One indexed host read, gated to
-    # host-bound sessions.
-    host_resumable = False
-    if host_store is not None and sandbox_config is not None and conv.host_id is not None:
-        host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
-        if host_for_resume is not None:
-            host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    # host-bound sessions, shared with the editor links below.
+    app_state = request.app.state if request is not None else None
+    editor_links_gate = getattr(app_state, "editor_links_enabled", None)
+    want_editor_links = editor_links_gate is not None and editor_links_gate()
+    host_row = None
+    if (
+        host_store is not None
+        and conv.host_id is not None
+        and (sandbox_config is not None or want_editor_links)
+    ):
+        host_row = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    host_resumable = (
+        host_row is not None
+        and sandbox_config is not None
+        and host_resume_supported(host_row, sandbox_config)
+    )
     response = _build_session_response(
         conv,
         items,
@@ -13649,6 +13662,14 @@ async def _get_session_snapshot(
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage
+    if want_editor_links:
+        link_viewer = viewer_id
+        if link_viewer is None:
+            link_viewer = getattr(app_state, "editor_links_anonymous_viewer", None)
+        links = build_editor_links(workspace=conv.workspace, host=host_row, viewer_id=link_viewer)
+        response.editor_links = (
+            [EditorLinkResponse(**dataclasses.asdict(link)) for link in links] if links else None
+        )
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:
         queued = await startup.pending_snapshot(session_id)

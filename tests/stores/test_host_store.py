@@ -216,6 +216,52 @@ def test_upsert_reconnect_overwrites_and_nulls_configured_harnesses(
     assert fetched.configured_harnesses is None
 
 
+def test_upsert_writes_ssh_target_on_every_connect(host_store: HostStore) -> None:
+    """
+    Verify ssh_target is stored, replaced on reconnect, and reset to None
+    when a reconnect omits it.
+
+    A stale target would outlive an alias the host no longer reports, e.g.
+    after an Arclet rename.
+    """
+    host_id = "c6b2a1f0e9d84c7b9a1f0e9d84c7b9a1"
+    host_store.upsert_on_connect(
+        host_id=host_id, name="dev", user_id="alice@example.com", ssh_target="arclet_dev.ssh"
+    )
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.ssh_target == "arclet_dev.ssh"
+
+    host_store.upsert_on_connect(
+        host_id=host_id, name="dev", user_id="alice@example.com", ssh_target="arclet_dev2.ssh"
+    )
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.ssh_target == "arclet_dev2.ssh"
+
+    host_store.upsert_on_connect(host_id=host_id, name="dev", user_id="alice@example.com")
+    fetched = host_store.get_host(host_id)
+    assert fetched is not None
+    assert fetched.ssh_target is None
+
+
+def test_host_id_rotation_keeps_reported_ssh_target(host_store: HostStore) -> None:
+    """A regenerated host_id (same user + name) still carries the hello's ssh_target."""
+    host_store.upsert_on_connect(
+        host_id="0a1b2c3d4e5f60718293a4b5c6d7e8f9", name="box", user_id="alice@example.com"
+    )
+    rotated = host_store.upsert_on_connect(
+        host_id="f9e8d7c6b5a4938271605f4e3d2c1b0a",
+        name="box",
+        user_id="alice@example.com",
+        ssh_target="arca.ssh",
+    )
+    assert rotated.ssh_target == "arca.ssh"
+    fetched = host_store.get_host("f9e8d7c6b5a4938271605f4e3d2c1b0a")
+    assert fetched is not None
+    assert fetched.ssh_target == "arca.ssh"
+
+
 def test_update_harness_readiness_replaces_live_map(host_store: HostStore) -> None:
     """A live tunnel refresh replaces readiness without reconnecting."""
     host_id = "6d86ee544f1d5b7068ac56f5927a5b5c"

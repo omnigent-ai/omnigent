@@ -148,7 +148,11 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import (
+    HostIdentity,
+    load_host_ssh_target,
+    load_or_create_host_identity,
+)
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
@@ -1274,6 +1278,7 @@ class HostProcess:
         server_url: str,
         lifecycle_lock: DaemonLifecycleLock | None = None,
         interactive_shells: list[str] | None = None,
+        config_path: Path | None = None,
     ) -> None:
         """Initialize the host process.
 
@@ -1284,8 +1289,11 @@ class HostProcess:
             and self-terminates once the record is deleted or reassigned.
         :param interactive_shells: Optional shell inventory override for tests.
             By default the host discovers its installed shells once at startup.
+        :param config_path: The ``config.yaml`` the identity came from, re-read
+            for ``host.ssh_target`` on each connect. Defaults to the user-level path.
         """
         self._identity = identity
+        self._config_path = config_path
         self._server_url = server_url.rstrip("/")
         # One reader per workspace, so its registry keeps state between
         # requests (the changed-files snapshot search reuses for untracked
@@ -5424,6 +5432,7 @@ class HostProcess:
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
+            ssh_target=load_host_ssh_target(self._config_path),
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -6134,6 +6143,7 @@ def _serve_host_until_exit(
         server_url,
         lifecycle_lock=lifecycle_lock,
         interactive_shells=interactive_shells,
+        config_path=path,
     )
     try:
         asyncio.run(host.run())

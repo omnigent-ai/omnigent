@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -247,6 +248,9 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
+    :param ssh_target: SSH destination the owner's own machine reaches this
+        host by, from ``host.ssh_target`` in ``config.yaml``, e.g.
+        ``"arclet_dev.ssh"``. ``None`` when unset or from an older host.
     """
 
     version: str
@@ -261,6 +265,7 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    ssh_target: str | None = None
 
 
 @dataclass
@@ -1557,6 +1562,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "ssh_target": frame.ssh_target,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2602,6 +2608,27 @@ def _decode_known_host_frame(
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
+# An ssh_config Host alias or hostname, optionally with ``user@``. It must start
+# with a letter or digit: ssh parses a leading ``-`` as an option (e.g.
+# ``-oProxyCommand=...``, which runs a command on the connecting machine). ``/``,
+# ``?``, ``#``, ``+`` and spaces are excluded so the value can't spill into the
+# rest of a URL it's embedded in.
+_SSH_TARGET_RE = re.compile(r"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._-]*")
+# Matches the ``hosts.ssh_target`` column width.
+MAX_SSH_TARGET_LENGTH = 255
+
+
+def normalize_ssh_target(value: object) -> str | None:
+    """Return *value* if it is a valid SSH destination, else ``None``.
+
+    :param value: Raw ``host.hello`` value, e.g. ``"arclet_dev.ssh"`` or
+        ``"me@box"``.
+    """
+    if not isinstance(value, str) or len(value) > MAX_SSH_TARGET_LENGTH:
+        return None
+    return value if _SSH_TARGET_RE.fullmatch(value) else None
+
+
 def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     """Decode a host hello frame.
 
@@ -2625,6 +2652,8 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        # Optional metadata: an invalid value reads as unset instead of failing registration.
+        ssh_target=normalize_ssh_target(msg.get("ssh_target")),
     )
 
 

@@ -3573,3 +3573,76 @@ def test_native_terminal_fallback_respects_child_ownership(agent, ownership: str
     response = _build_session_response(conversation, [], "running", agent_name=agent.agent_name)
     assert response.labels.get("omnigent.ui") == (None if ownership == "mirror" else "terminal")
     assert conversation.labels == labels
+
+
+class _OneHostStore:
+    """Host store that serves one host row and counts reads."""
+
+    def __init__(self, host: Any) -> None:
+        self.host = host
+        self.reads = 0
+
+    def get_host(self, host_id: str) -> Any:
+        self.reads += 1
+        return self.host if host_id == self.host.host_id else None
+
+
+def _editor_links_snapshot(*, enabled: bool, viewer_id: str, host_store: _OneHostStore) -> Any:
+    session_id = "5b1f0c2d3e4a5b6c7d8e9f0a1b2c3d4e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        host_id=host_store.host.host_id,
+        workspace="/home/alice/universe",
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(editor_links_enabled=lambda: enabled))
+    )
+    return _get_session_snapshot(
+        _ConversationStore([], conversations={session_id: conv}),  # type: ignore[arg-type]
+        session_id,
+        host_store=host_store,  # type: ignore[arg-type]
+        viewer_id=viewer_id,
+        request=request,  # type: ignore[arg-type]
+    )
+
+
+def _arclet_host() -> SimpleNamespace:
+    return SimpleNamespace(
+        host_id="9a8b7c6d5e4f30211203f4e5d6c7b8a9",
+        user_id="alice@example.com",
+        sandbox_provider=None,
+        ssh_target="arclet_dev.ssh",
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_carries_editor_links_for_the_host_owner() -> None:
+    """With the gate on, the host's owner gets server-built Cursor/VS Code links."""
+    snapshot = await _editor_links_snapshot(
+        enabled=True, viewer_id="alice@example.com", host_store=_OneHostStore(_arclet_host())
+    )
+
+    assert [(link.editor, link.url, link.local_only) for link in snapshot.editor_links] == [
+        ("cursor", "cursor://vscode-remote/ssh-remote+arclet_dev.ssh/home/alice/universe", False),
+        ("vscode", "vscode://vscode-remote/ssh-remote+arclet_dev.ssh/home/alice/universe", False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_omits_editor_links_when_gated_off_or_not_owner() -> None:
+    """Gate off skips the host read entirely; a collaborator never sees links."""
+    gated_off = _OneHostStore(_arclet_host())
+    snapshot = await _editor_links_snapshot(
+        enabled=False, viewer_id="alice@example.com", host_store=gated_off
+    )
+    assert snapshot.editor_links is None
+    assert gated_off.reads == 0
+
+    snapshot = await _editor_links_snapshot(
+        enabled=True, viewer_id="bob@example.com", host_store=_OneHostStore(_arclet_host())
+    )
+    assert snapshot.editor_links is None

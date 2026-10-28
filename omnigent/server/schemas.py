@@ -2144,6 +2144,24 @@ class BackgroundTaskInfo(BaseModel):
     command: str | None = None
 
 
+class EditorLinkResponse(BaseModel):
+    """
+    A deep link that opens the session's workspace in a desktop code editor.
+
+    :param editor: Editor key, e.g. ``"cursor"`` or ``"vscode"``.
+    :param label: Display name, e.g. ``"Cursor"``.
+    :param url: Deep link handed to the OS, e.g.
+        ``"cursor://vscode-remote/ssh-remote+arclet_dev.ssh/home/me/repo"``.
+    :param local_only: The link opens a path on the clicking machine, so a
+        client shows it only when the session's host is that machine.
+    """
+
+    editor: str
+    label: str
+    url: str
+    local_only: bool = False
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -2209,6 +2227,10 @@ class SessionResponse(BaseModel):
         path resumes the sandbox) versus the terminal ``host_offline``
         dead-end (reconnect from your machine / fork). ``False`` for
         non-managed or non-resumable hosts.
+    :param editor_links: Ways to open the workspace in a desktop code editor,
+        default editor first. ``None`` unless the server enables editor links,
+        the viewer owns the session's host, and the host is reachable from the
+        viewer's machine.
     :param reasoning_effort: Per-session reasoning-effort hint.
         Accepted metadata values are ``"none"``, ``"minimal"``,
         ``"low"``, ``"medium"``, ``"high"``, ``"xhigh"``, and
@@ -2422,6 +2444,7 @@ class SessionResponse(BaseModel):
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
+    editor_links: list[EditorLinkResponse] | None = None
     reasoning_effort: str | None = None
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
