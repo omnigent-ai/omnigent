@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any
@@ -2089,6 +2090,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         reaped.append(bridge_dir)
 
     def run(cmd: list[str], **kwargs: Any) -> Any:
+        if processing is not None and cmd[3] == "display-message":
+            return subprocess.CompletedProcess(cmd, 0, stdout="80 24 latest\n", stderr="")
         commands.append(tuple(cmd))
         raise AssertionError("cancelled delivery sent keystrokes")
 
