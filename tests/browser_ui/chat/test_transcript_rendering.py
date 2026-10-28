@@ -6,6 +6,7 @@ import json
 import re
 from itertools import pairwise
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
@@ -167,17 +168,31 @@ def test_mermaid_fence_loads_its_chunk_and_renders_svg(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """The built SPA serves Mermaid's lazy chunk and renders a real diagram."""
+    """A multiline diagram renders and downloads as a decodable PNG and valid SVG."""
     chat = chat_session_contract
     _seed_assistant_message(
         chat,
-        "```mermaid\nflowchart LR\n  A[Client] --> B[Server]\n```",
+        '```mermaid\nflowchart LR\n  A["Client<br/>Second line"] --> B[Server]\n```',
     )
     page.goto(chat.url)
 
     block = page.locator('[data-streamdown="mermaid-block"]').first
     expect(block).to_be_visible(timeout=20_000)
     expect(block.locator("svg[aria-roledescription]")).to_be_visible(timeout=20_000)
+
+    for format_name in ("PNG", "SVG"):
+        block.get_by_role("button", name="Download diagram", exact=True).click()
+        with page.expect_download(timeout=10_000) as download_info:
+            block.get_by_role("button", name=format_name, exact=True).click()
+        download = download_info.value
+        assert download.suggested_filename == f"diagram.{format_name.lower()}"
+        data = Path(download.path()).read_bytes()
+        if format_name == "PNG":
+            assert data.startswith(b"\x89PNG\r\n\x1a\n")
+            assert len(data) > 1000
+        else:
+            svg = ElementTree.fromstring(data)
+            assert svg.find(".//{http://www.w3.org/1999/xhtml}br") is not None
 
 
 @pytest.mark.parametrize("diagram", ["semicolons", "separators", "invalid"])
