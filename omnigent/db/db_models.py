@@ -1705,6 +1705,17 @@ class SqlScheduledTaskRun(OmnigentBase):
     )
 
 
+def _exact_string(length: int) -> String:
+    """A ``String(n)`` compared byte for byte on MySQL too (``utf8mb4_bin``).
+
+    Identity columns such as a git ref or a skill name are case-sensitive;
+    MySQL's default collation would fold ``Main`` and ``main`` into one key.
+    """
+    return String(length).with_variant(
+        MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+    )
+
+
 class SqlSkillSource(OmnigentBase):
     """
     SQLAlchemy model for the ``skill_sources`` table.
@@ -1737,8 +1748,8 @@ class SqlSkillSource(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
-    url: Mapped[str] = mapped_column(String(255), nullable=False)
-    ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    url: Mapped[str] = mapped_column(_exact_string(255), nullable=False)
+    ref: Mapped[str] = mapped_column(_exact_string(255), nullable=False)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1815,7 +1826,7 @@ class SqlInstalledSkill(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(_exact_string(255), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     description: Mapped[str] = mapped_column(String(1024), nullable=False)
     source_url: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -1823,7 +1834,7 @@ class SqlInstalledSkill(OmnigentBase):
     commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     path: Mapped[str] = mapped_column(String(1024), nullable=False)
     scope: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    principal: Mapped[str] = mapped_column(String(133), nullable=False)
+    principal: Mapped[str] = mapped_column(_exact_string(133), nullable=False)
     owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     bundle_location: Mapped[str] = mapped_column(String(512), nullable=False)
     bundle_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1873,7 +1884,7 @@ class SqlSkillPrincipal(OmnigentBase):
         primary_key=True,
         default=current_workspace_id,
     )
-    principal: Mapped[str] = mapped_column(String(133), primary_key=True)
+    principal: Mapped[str] = mapped_column(_exact_string(133), primary_key=True)
     installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)

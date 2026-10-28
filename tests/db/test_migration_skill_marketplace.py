@@ -77,7 +77,20 @@ def test_upgrade_creates_the_tables_and_downgrade_removes_them(tmp_path: Path) -
         command.downgrade(config, PREVIOUS)
         assert _schema(connection)[0] == set()
 
-        # A pre-existing table with a different shape is refused, not stamped over.
+        # An index of the right name but the wrong uniqueness is refused, not kept.
+        command.upgrade(config, "head")
+        connection.execute(sa.text("DROP INDEX ux_skill_sources_identity"))
+        connection.execute(
+            sa.text("CREATE INDEX ux_skill_sources_identity ON skill_sources (workspace_id, url)")
+        )
+        command.stamp(config, PREVIOUS)
+        with pytest.raises(RuntimeError, match=r"ux_skill_sources_identity.*unique=False"):
+            command.upgrade(config, "head")
+        connection.execute(sa.text("DROP INDEX ux_skill_sources_identity"))
+        command.upgrade(config, "head")
+        command.downgrade(config, PREVIOUS)
+
+        # A pre-existing table with a different column set is refused, not stamped over.
         connection.execute(sa.text("CREATE TABLE skill_sources (workspace_id INTEGER, id BLOB)"))
         with pytest.raises(RuntimeError, match="skill_sources already exists"):
             command.upgrade(config, "head")
@@ -124,45 +137,73 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
         session.rollback()
 
 
+def _source(url: str, ref: str) -> SqlSkillSource:
+    return SqlSkillSource(
+        id=uuid.uuid4().hex, url=url, ref=ref, name="Acme", created_by=None, created_at=0
+    )
+
+
+def _installed(name: str, principal: str, *, scope: int = 2) -> SqlInstalledSkill:
+    return SqlInstalledSkill(
+        id=uuid.uuid4().hex,
+        name=name,
+        display_name=None,
+        description="d",
+        source_url="https://github.com/acme/skills.git",
+        ref=None,
+        commit=None,
+        path=f"skills/{name}",
+        scope=scope,
+        principal=principal,
+        owner_user_id=None if principal == "org" else principal.removeprefix("user:"),
+        bundle_location=f"skills/{name}.tar.gz",
+        bundle_bytes=1,
+        enabled=True,
+        installed_by=None,
+        installed_at=0,
+    )
+
+
 def test_identities_are_unique_on_the_engine(db_uri: str) -> None:
-    # A second row for the same (principal, name) or (url, ref) is refused by the index.
+    # An exact duplicate of (url, ref) or (principal, name) is refused by the index,
+    # while rows that differ only in case, ref or principal coexist: git refs,
+    # repository paths and skill names are case-sensitive, so the identity
+    # columns compare byte for byte on every engine (utf8mb4_bin on MySQL).
     engine = get_or_create_engine(db_uri)
+    url = "https://github.com/acme/skills.git"
     with Session(engine) as session:
-        for _ in range(2):
-            session.add(
-                SqlSkillSource(
-                    id=uuid.uuid4().hex,
-                    url="https://github.com/acme/skills.git",
-                    ref="HEAD",
-                    name="Acme",
-                    created_by=None,
-                    created_at=0,
-                )
-            )
+        session.add_all(
+            [
+                _source(url, "main"),
+                _source(url, "Main"),
+                _source(url, "HEAD"),
+                _source("https://github.com/acme/Skills.git", "main"),
+            ]
+        )
+        session.flush()
+        session.add(_source(url, "main"))
         with pytest.raises(sa.exc.IntegrityError):
             session.flush()
         session.rollback()
-        for _ in range(2):
-            session.add(
-                SqlInstalledSkill(
-                    id=uuid.uuid4().hex,
-                    name="review",
-                    display_name=None,
-                    description="d",
-                    source_url="https://github.com/acme/skills.git",
-                    ref=None,
-                    commit=None,
-                    path="skills/review",
-                    scope=2,
-                    principal="org",
-                    owner_user_id=None,
-                    bundle_location="skills/review.tar.gz",
-                    bundle_bytes=1,
-                    enabled=True,
-                    installed_by=None,
-                    installed_at=0,
-                )
-            )
+
+        session.add_all(
+            [
+                _installed("review", "org"),
+                _installed("Review", "org"),
+                _installed("review", "user:alice"),
+                _installed("review", "user:Alice"),
+            ]
+        )
+        session.flush()
+        session.add(_installed("review", "org"))
         with pytest.raises(sa.exc.IntegrityError):
+            session.flush()
+        session.rollback()
+
+
+def test_a_scope_outside_the_codec_is_refused_by_the_table(db_uri: str) -> None:
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.add(_installed("review", "org", scope=3))
+        with pytest.raises(sa.exc.IntegrityError, match=r"ck_installed_skills_scope|CHECK"):
             session.flush()
         session.rollback()

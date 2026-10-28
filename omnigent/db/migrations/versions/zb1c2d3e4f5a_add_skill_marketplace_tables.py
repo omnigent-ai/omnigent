@@ -15,8 +15,10 @@ application supplies every value.
 
 Additive. No existing data is touched. Tables and indexes are checked and
 created independently, so a run interrupted between the two is repaired by
-the next run; a pre-existing table with a different column set is refused
-rather than stamped over.
+the next run. The guard compares names only: a pre-existing table whose
+column names differ, or an index of the same name with the wrong uniqueness,
+is refused rather than stamped over; it does not compare column types or
+constraints.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import mysql
 
 from omnigent.db.db_models import Uuid16
 
@@ -34,13 +37,20 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+def _exact_string(length: int) -> sa.String:
+    """Identity text compared byte for byte on MySQL too; see ``db_models._exact_string``."""
+    return sa.String(length).with_variant(
+        mysql.VARCHAR(length, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
+    )
+
+
 def _skill_sources_columns() -> list[sa.Column]:
     return [
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
-        sa.Column("url", sa.String(255), nullable=False),
+        sa.Column("url", _exact_string(255), nullable=False),
         # "HEAD", git's name for the remote's default branch, when none was chosen.
-        sa.Column("ref", sa.String(255), nullable=False),
+        sa.Column("ref", _exact_string(255), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         sa.Column("created_by", sa.String(128), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
@@ -51,7 +61,7 @@ def _installed_skills_columns() -> list[sa.Column]:
     return [
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
-        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("name", _exact_string(255), nullable=False),
         sa.Column("display_name", sa.String(256), nullable=True),
         sa.Column("description", sa.String(1024), nullable=False),
         sa.Column("source_url", sa.String(255), nullable=False),
@@ -61,7 +71,7 @@ def _installed_skills_columns() -> list[sa.Column]:
         # Stable int code (omnigent.db.enum_codecs INSTALLED_SKILL_SCOPE: user=1, org=2).
         sa.Column("scope", sa.SmallInteger(), nullable=False),
         # "org", "local" or "user:<owner_user_id>": never absent, partitions every read.
-        sa.Column("principal", sa.String(133), nullable=False),
+        sa.Column("principal", _exact_string(133), nullable=False),
         sa.Column("owner_user_id", sa.String(128), nullable=True),
         sa.Column("bundle_location", sa.String(512), nullable=False),
         sa.Column("bundle_bytes", sa.Integer(), nullable=False),
@@ -75,7 +85,7 @@ def _installed_skills_columns() -> list[sa.Column]:
 def _skill_principals_columns() -> list[sa.Column]:
     return [
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
-        sa.Column("principal", sa.String(133), nullable=False),
+        sa.Column("principal", _exact_string(133), nullable=False),
         # Maintained under the row's lock: a quota check reads these, never the rows.
         sa.Column("installed_count", sa.Integer(), nullable=False),
         sa.Column("enabled_bytes", sa.BigInteger(), nullable=False),
@@ -127,8 +137,12 @@ def _existing_columns(table: str) -> set[str] | None:
     return {column["name"] for column in inspector.get_columns(table)}
 
 
-def _existing_indexes(table: str) -> set[str]:
-    return {index["name"] for index in sa.inspect(op.get_bind()).get_indexes(table)}
+def _existing_indexes(table: str) -> dict[str, bool]:
+    """The table's index names mapped to whether each is unique."""
+    return {
+        index["name"]: bool(index["unique"])
+        for index in sa.inspect(op.get_bind()).get_indexes(table)
+    }
 
 
 def upgrade() -> None:
@@ -147,6 +161,11 @@ def upgrade() -> None:
         for name, index_columns, unique in indexes:
             if name not in present:
                 op.create_index(name, table, index_columns, unique=unique)
+            elif present[name] != unique:
+                raise RuntimeError(
+                    f"index {name} on {table} already exists with unique={present[name]}; "
+                    "drop it before upgrading"
+                )
 
 
 def downgrade() -> None:
