@@ -4532,7 +4532,7 @@ async def _forward_available_status_events(
                                         extra={"session_id": session_id},
                                     )
                                     return durable
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             # Non-HTTP failure (e.g. reading Claude session
                             # messages). Hold the cursor and retry next poll.
                             _logger.warning(
@@ -5089,7 +5089,7 @@ async def _handle_compact_summary_item(
             extra={"session_id": session_id},
         )
         return False
-    except Exception:  # noqa: BLE001
+    except Exception:
         # Non-HTTP failure (e.g. reading Claude session messages). Retry.
         _logger.warning(
             "Unexpected error persisting compaction boundary (transcript path) for %s; seq=%s",
