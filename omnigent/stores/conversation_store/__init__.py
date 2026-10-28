@@ -638,6 +638,13 @@ class ConversationStore(ABC):
 
         Bulk variant for the sidebar runner-online dot path. Missing
         ids are omitted; ids without a bound runner map to ``None``.
+
+        Implementations must be read-after-write consistent with
+        ``set_runner_id`` / ``replace_runner_id``, even when
+        :meth:`get_conversation` / :meth:`get_conversations` are served
+        from a cache: the launch single-flight and the runner-connect
+        match decide the binding from this lookup, and a stale binding
+        there launches a second runner for the session.
         """
         ...
 

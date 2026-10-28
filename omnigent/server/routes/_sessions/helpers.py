@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import math
 import re
@@ -6376,6 +6377,12 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        # Conversation reads may come from a cache that lags a binding written
+        # a moment ago; take the binding from the authoritative lookup.
+        bound_runner_ids = await asyncio.to_thread(conversation_store.get_runner_ids, [conv.id])
+        bound_runner_id = bound_runner_ids.get(conv.id, fresh.runner_id)
+        if bound_runner_id != fresh.runner_id:
+            fresh = dataclasses.replace(fresh, runner_id=bound_runner_id)
         if fresh.runner_id and fresh.runner_id != conv.runner_id:
             last = _relaunch_last_attempt.get(conv.id)
             if last is not None and last.runner_id == fresh.runner_id:
