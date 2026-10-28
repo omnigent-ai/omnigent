@@ -547,15 +547,18 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         self.assertNotIn("always()", STEPS["receipt"]["if"])
         self.assertNotIn("!cancelled()", STEPS["receipt"]["if"])
 
-    def run_report(self, status, log="", resolved_head=HEAD):
+    def run_report(self, status, log="", resolved_head=HEAD, summary=None, failed=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "ocr-result.json").write_text(
                 json.dumps(
                     {
                         "status": status,
-                        "summary": {},
-                        "manifest": {"input": {"resolved_head": resolved_head}},
+                        "summary": summary or {},
+                        "manifest": {
+                            "input": {"resolved_head": resolved_head},
+                            "coverage": {"failed": failed or []},
+                        },
                     }
                 )
             )
@@ -594,6 +597,36 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
             with self.subTest(status=status):
                 result, _, _ = self.run_report(status)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_budget_only_partial_warns_without_completion_receipt(self):
+        budget = "aggregate token budget reached before dispatch completed"
+        result, summary, outputs = self.run_report(
+            "partial",
+            summary={"budget_exceeded": True},
+            failed=[{"path": "b.ts", "reason": budget}, {"path": "a.ts", "reason": budget}],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "::warning::OCR token budget reached; 2 file(s) were not reviewed: a.ts, b.ts",
+            result.stdout,
+        )
+        self.assertIn("- `a.ts`", summary)
+        self.assertEqual(outputs, "")
+        for summary_value, failed in (
+            (
+                {"budget_exceeded": True},
+                [{"path": "a.ts", "reason": budget}, {"path": "b.ts", "reason": "LLM error"}],
+            ),
+            ({"budget_exceeded": True}, []),
+            ({}, [{"path": "a.ts", "reason": budget}]),
+        ):
+            with self.subTest(summary=summary_value, failed=failed):
+                result, _, outputs = self.run_report(
+                    "partial", summary=summary_value, failed=failed
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("incomplete", result.stderr)
+                self.assertEqual(outputs, "")
 
     def test_filter_failure_remains_visible_for_complete_review(self):
         for log in (
