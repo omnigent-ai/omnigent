@@ -2126,6 +2126,47 @@ async def test_delete_reaped_managed_session_removes_durable_host(
     assert env.host_store.get_host(host.host_id) is None
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_capture"), [("?capture_logs=true", True), ("", False)]
+)
+async def test_delete_managed_session_forwards_capture_logs(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    expected_capture: bool,
+) -> None:
+    """``DELETE ?capture_logs=true`` asks managed teardown for the sandbox logs."""
+    from omnigent.server import managed_hosts
+
+    env = managed_session_env
+    host = env.host_store.register_managed_host(
+        host_id="3c4d5e6f7a8b49203a15c6d7e8f9a0b1",
+        name="managed-capture-delete",
+        user_id=RESERVED_USER_LOCAL,
+        token="managed-capture-delete-token",
+        provider="modal",
+        sandbox_id="sb-capture-delete",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    agent = await create_test_agent(env.client, name="managed-capture-delete-agent")
+    conversation = env.conv_store.create_conversation(
+        agent_id=agent["id"],
+        host_id=host.host_id,
+        workspace="/tmp/managed-capture-delete",
+    )
+    teardowns: list[bool] = []
+
+    async def record_teardown(*args: object, capture_logs: bool = False) -> None:
+        teardowns.append(capture_logs)
+
+    monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
+
+    response = await env.client.delete(f"/v1/sessions/{conversation.id}{query}")
+
+    assert response.status_code == 200, response.text
+    assert teardowns == [expected_capture]
+
+
 def _runner_exited_app(db_uri: str, tmp_path: Path) -> tuple[FastAPI, SqlAlchemyConversationStore]:
     """Build the full server app so ``host.runner_exited`` hits ``_on_runner_exited``.
 

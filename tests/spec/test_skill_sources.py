@@ -1175,7 +1175,7 @@ def test_antigravity_provider_reads_agents_skills_not_claude_skills(
 
 
 def _write_plugin_command(commands_dir: Path, name: str, text: str) -> None:
-    """Write a ``<commands_dir>/<name>.md`` plugin command file."""
+    """Write a ``<commands_dir>/<name>.md`` command file (plugin or ``.claude/commands``)."""
     commands_dir.mkdir(parents=True, exist_ok=True)
     (commands_dir / f"{name}.md").write_text(text)
 
@@ -1587,3 +1587,200 @@ def test_plugin_manifest_malformed_commands_field_is_logged(
         ]
     assert names == ["knowledge-base:kb-search"]
     assert "manifest 'commands' must be a path or a list of paths" in caplog.text
+
+
+def _claude_workspace(tmp_path: Path) -> tuple[Path, Path]:
+    """A fake home holding a git checkout, the layout a native Claude session runs in.
+
+    :returns: ``(home, workspace)``.
+    """
+    home = tmp_path / "home"
+    workspace = home / "repo"
+    (workspace / ".git").mkdir(parents=True)
+    return home, workspace
+
+
+def test_claude_native_lists_personal_and_project_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code loads ``.claude/commands`` files as slash commands, so the native menu does too.
+
+    A file's path names it (``ops/deploy.md`` is ``ops:deploy``), its frontmatter
+    ``name`` is ignored, and the description falls back to the first body line.
+    """
+    home, workspace = _claude_workspace(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_plugin_command(
+        home / ".claude" / "commands",
+        "team",
+        "---\ndescription: Orchestrate a team\nargument-hint: <task>\n---\nTask: $ARGUMENTS\n",
+    )
+    project = workspace / ".claude" / "commands"
+    _write_plugin_command(project / "ops", "deploy", "# Deploy the branch\n\nSteps.\n")
+    _write_plugin_command(project, "old", "---\nname: renamed\ndescription: kept\n---\nbody\n")
+    # Claude Code only lists lowercase ``.md`` files here.
+    (project / "notes.MD").write_text("Not a command.\n")
+    ctx = _ctx(workspace, home)
+
+    native = {s.name: s for s in resolve_harness_skills(ctx, "claude-native")}
+    assert set(native) == {"team", "ops:deploy", "old"}
+    assert native["team"].description == "Orchestrate a team"
+    assert native["ops:deploy"].description == "Deploy the branch"
+    assert native["old"].description == "kept"
+    assert all(spec.skill_dir is None for spec in native.values())
+    # The in-process SDK harness keeps its generic walk, which has no commands tier.
+    assert resolve_harness_skills(ctx, "claude-sdk") == []
+
+
+def test_claude_command_directory_with_skill_md_is_one_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``commands/<dir>/SKILL.md`` is the command ``<dir>``; siblings are not, subdirs are.
+
+    A ``SKILL.md`` at the root itself names the root, ``/commands``, as in Claude Code.
+    """
+    home, workspace = _claude_workspace(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    commands = workspace / ".claude" / "commands"
+    _write_plugin_command(commands, "SKILL", "---\ndescription: Root skill\n---\nbody\n")
+    _write_plugin_command(commands, "standup", "A root-level sibling.\n")
+    review = commands / "review"
+    _write_plugin_command(review, "SKILL", "---\ndescription: Review a PR\n---\nbody\n")
+    _write_plugin_command(review, "checklist", "Reference the skill reads.\n")
+    _write_plugin_command(review / "deep", "security", "Security pass.\n")
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert sorted((s.name, s.description) for s in out) == [
+        ("commands", "Root skill"),
+        ("review", "Review a PR"),
+        ("review:deep:security", "Security pass."),
+    ]
+
+
+def test_claude_skill_and_personal_command_win_name_collisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """As in Claude Code, skills beat same-named commands and personal ones beat project ones.
+
+    A command named like a plugin entry (``<plugin>/<name>.md``) beats that entry too.
+    """
+    home, workspace = _claude_workspace(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _claude_home_with_plugin_command(home)
+    _write_skill(home / ".claude" / "skills", "deploy")
+    personal = home / ".claude" / "commands"
+    project = workspace / ".claude" / "commands"
+    _write_plugin_command(project, "deploy", "---\ndescription: project deploy\n---\nbody\n")
+    _write_plugin_command(personal, "ship", "---\ndescription: personal ship\n---\nbody\n")
+    _write_plugin_command(project, "ship", "---\ndescription: project ship\n---\nbody\n")
+    _write_plugin_command(
+        project / "knowledge-base", "kb-review", "---\ndescription: project review\n---\nbody\n"
+    )
+
+    out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
+    assert sorted((s.name, s.description) for s in out) == [
+        ("deploy", "deploy desc"),
+        ("knowledge-base:kb-review", "project review"),
+        ("knowledge-base:kb-search", "kb-search desc"),
+        ("ship", "personal ship"),
+    ]
+
+
+@pytest.mark.parametrize("git_entry", ["directory", "file"])
+def test_claude_project_commands_stop_at_the_repository_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, git_entry: str
+) -> None:
+    """Project commands come from the workspace up to its repository root, not above it.
+
+    A linked worktree marks its root with a ``.git`` file rather than a directory.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    repo = home / "code" / "repo"
+    repo.mkdir(parents=True)
+    if git_entry == "directory":
+        (repo / ".git").mkdir()
+    else:
+        (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/repo\n")
+    workspace = repo / "service"
+    _write_plugin_command(workspace / ".claude" / "commands", "service-cmd", "Workspace.\n")
+    _write_plugin_command(repo / ".claude" / "commands", "repo-cmd", "Repository root.\n")
+    _write_plugin_command(home / "code" / ".claude" / "commands", "above-cmd", "Above it.\n")
+
+    names = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "claude-native")}
+    assert names == {"service-cmd", "repo-cmd"}
+
+
+def test_claude_project_commands_outside_home_and_any_repository_read_every_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With neither a repository root nor home above it, the walk reads each ancestor."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    scratch = tmp_path / "scratch"
+    workspace = scratch / "project"
+    _write_plugin_command(workspace / ".claude" / "commands", "here-cmd", "Workspace.\n")
+    _write_plugin_command(scratch / ".claude" / "commands", "above-cmd", "An ancestor.\n")
+
+    names = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "claude-native")}
+    # Directories above tmp_path are the test machine's own, so check only these two.
+    assert {"here-cmd", "above-cmd"} <= names
+
+
+def test_claude_personal_commands_follow_config_dir_and_skip_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``$CLAUDE_CONFIG_DIR`` moves the personal tier, and the project walk stops below home."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    workspace = home / "scratch"  # not a repository, so the project walk climbs to home
+    _write_plugin_command(workspace / ".claude" / "commands", "scratch-cmd", "Workspace.\n")
+    _write_plugin_command(home / ".claude" / "commands", "home-cmd", "Default user tier.\n")
+    config = tmp_path / "claude-config"
+    _write_plugin_command(config / "commands", "config-cmd", "Configured user tier.\n")
+
+    def names(ctx: SkillSourceContext) -> set[str]:
+        return {s.name for s in resolve_harness_skills(ctx, "claude-native")}
+
+    assert names(_ctx(workspace, home)) == {"home-cmd", "scratch-cmd"}
+    assert names(_ctx(workspace, home, claude_config_dir=config)) == {"config-cmd", "scratch-cmd"}
+
+
+def test_claude_commands_follow_symlinks_and_load_each_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Linked command dirs load, as Claude Code follows links; loops and aliases add no names."""
+    home, workspace = _claude_workspace(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    personal = home / ".claude" / "commands"
+    _write_plugin_command(personal, "team", "Team.\n")
+    (personal / "team-alias.md").symlink_to(personal / "team.md")
+    shared = tmp_path / "shared-commands"
+    _write_plugin_command(shared, "lint", "Lint the tree.\n")
+    (personal / "shared").symlink_to(shared, target_is_directory=True)
+    (personal / "loop").symlink_to(personal, target_is_directory=True)
+    # A project tier linked to the personal one (a dotfiles setup) repeats nothing.
+    (workspace / ".claude").mkdir()
+    (workspace / ".claude" / "commands").symlink_to(personal, target_is_directory=True)
+
+    names = [s.name for s in resolve_harness_skills(_ctx(workspace, home), "claude-native")]
+    assert len(names) == 2
+    assert "shared:lint" in names
+    assert len({"team", "team-alias"} & set(names)) == 1
+
+
+def test_claude_commands_respect_skills_filter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``skills`` list selects commands by name; ``none`` launches Claude without them."""
+    home, workspace = _claude_workspace(tmp_path)
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _write_plugin_command(home / ".claude" / "commands", "team", "Team.\n")
+    _write_plugin_command(home / ".claude" / "commands", "merge", "Merge.\n")
+
+    def names(skills_filter: str | list[str]) -> list[str]:
+        ctx = _ctx(workspace, home, skills_filter=skills_filter)
+        return [s.name for s in resolve_harness_skills(ctx, "claude-native")]
+
+    assert names(["team"]) == ["team"]
+    assert names("none") == []

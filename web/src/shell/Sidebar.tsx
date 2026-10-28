@@ -194,6 +194,7 @@ import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
+import { stateAsOf } from "@/hooks/useSessionPullRequests";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { SidebarEditRow } from "./SidebarEditRow";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
@@ -218,6 +219,7 @@ import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -269,7 +271,9 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import { useHarnessLabels } from "@/lib/agentLabels";
 import {
+  nativeCodingAgentForSession,
   nativeCodingAgentForWrapper,
   type NativeCodingAgentIconKind,
   WRAPPER_LABEL_KEY,
@@ -484,15 +488,18 @@ interface SidebarProps {
 }
 
 /**
- * Which top-level nav button (New session / Inbox) is active for the current
- * route.
+ * Which top-level nav button (New session / Inbox / Automations) is active for
+ * the current route.
  *
- * The inbox route has no param to key off, and the sidebar is basename-agnostic
- * (in embedded mode the routing seam rebases `to="/inbox"` → `${basename}/inbox`
- * behind its back), so `useMatch` / `NavLink` can't be used without knowing the
- * mount path. Instead compare the active route's last non-empty path segment,
- * which is `inbox` in both standalone and embedded modes. Conversation ids are
- * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
+ * The inbox/tasks routes have no `:conversationId` param to key off, and the
+ * sidebar is basename-agnostic (in embedded mode the routing seam rebases
+ * `to="/inbox"` → `${basename}/inbox` behind its back), so `useMatch` /
+ * `NavLink` can't be used without knowing the mount path. Instead compare path
+ * segments from the end:
+ *   - `/tasks` (leaf === "tasks")
+ *   - `/tasks/:taskId` (second-to-last segment === "tasks") — the detail route.
+ * Conversation ids are `conv_…`-prefixed, so a chat route's leaf can never
+ * collide with "inbox" or "tasks".
  */
 function useActiveNavItem(): {
   isNewChatPage: boolean;
@@ -511,12 +518,15 @@ function useActiveNavItem(): {
   const serverInfo = useServerInfo();
   const rebasePath = useRebasePath();
   const extensions = useExtensions();
-  const leaf = location.pathname.split("/").filter(Boolean).at(-1);
+  const segments = location.pathname.split("/").filter(Boolean);
+  const leaf = segments.at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
   const isCanvasPage =
     !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
-  const isTasksPage = !isExtensionRoute && leaf === "tasks";
+  // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
+  // match the "tasks" segment by position from the end, not an absolute path.
+  const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
@@ -919,6 +929,7 @@ function SidebarImpl({
   // visually open so it isn't `inert`/`aria-hidden` mid-gesture.
   const dragging = dragProgress != null;
   const effectiveOpen = open || dragging || peek;
+  const nativeSidebarSurface = isIOSShell() || isAndroidShell();
 
   // The mobile drawer is a `fixed inset-0` overlay, so the iOS shell-lock
   // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
@@ -1035,6 +1046,7 @@ function SidebarImpl({
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
           "conversations-sidebar flex flex-col bg-card md:select-none",
+          nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
           // Mobile (default): a fixed drawer that slides in via translate-x
           // and stops short of the right edge, leaving a tappable strip of the
           // chat behind it. The floating-card treatment below is desktop-only.
@@ -1096,6 +1108,7 @@ function SidebarImpl({
         // don't see the empty-state contents while focus is elsewhere.
         aria-hidden={!effectiveOpen}
         data-collapsed={!effectiveOpen || undefined}
+        data-floating={peek ? "true" : "false"}
         // Match the keyboard-focus story: when closed, the sidebar's
         // children shouldn't receive tabs.
         inert={!effectiveOpen}
@@ -1346,8 +1359,9 @@ function SidebarImpl({
                 // underneath it and can't be tapped.
                 className={cn(
                   "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
-                  // Reserve the gutter so toggling the thumb never reflows the list.
-                  "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
+                  // Reserve the gutter even when the list fits, so neither the thumb
+                  // nor a section collapsing out of overflow reflows the rows.
+                  "[scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
                     ? "[scrollbar-color:var(--muted-foreground)_transparent] [&::-webkit-scrollbar-thumb]:bg-muted-foreground"
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
@@ -1432,6 +1446,7 @@ function ProjectFolder({
   projectId,
   icon,
   windowConversations,
+  archived,
   activeConversationId,
   expanded,
   active,
@@ -1466,6 +1481,7 @@ function ProjectFolder({
       the folder's own pages — e.g. a just-moved row carries its optimistic
       membership here before the folder query returns it). */
   windowConversations: Conversation[];
+  archived: boolean;
   /** The active conversation's resolved top-level root id (see
       ConversationSection) — forwarded to the folder's section for row highlight. */
   activeConversationId: string | null;
@@ -1493,7 +1509,8 @@ function ProjectFolder({
   onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
 }) {
   const { registerFolder, sortBy } = useSidebarData();
-  const query = useProjectSessions(name, expanded, sortBy);
+  const viewerId = useViewerId();
+  const query = useProjectSessions(name, expanded, sortBy, archived);
   const watchedRows = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? [],
     [query.data],
@@ -1511,14 +1528,30 @@ function ProjectFolder({
     const byId = new Map<string, Conversation>();
     for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
     for (const c of windowConversations) byId.set(c.id, c);
-    // Pinned sessions live in the global Pinned section, not their folder.
+    // Pins take precedence over live folders.
     return sortConversations(
-      [...byId.values()].filter((c) => !pinnedSet.has(c.id)),
+      [...byId.values()].filter(
+        (c) =>
+          (c.archived === true) === archived &&
+          sessionBelongsToProject(c, { id: projectId, name }, viewerId) &&
+          (archived || !pinnedSet.has(c.id)),
+      ),
       activeOverride,
       frozenSortKeys,
       sortBy,
     );
-  }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys, sortBy]);
+  }, [
+    query.data,
+    windowConversations,
+    pinnedSet,
+    activeOverride,
+    frozenSortKeys,
+    sortBy,
+    archived,
+    projectId,
+    name,
+    viewerId,
+  ]);
   const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
@@ -1611,7 +1644,9 @@ function ProjectFolder({
         onToggleSelected={onToggleSelected}
         onProjectAssigned={onProjectAssigned}
         emptyMessage={
-          loadingFirstPage ? undefined : (
+          loadingFirstPage ? undefined : archived ? (
+            "No archived sessions"
+          ) : (
             <span className="block">
               No sessions. Start a{" "}
               <Link
@@ -1772,12 +1807,13 @@ function ConversationList({
     [view.grouping, saveView, selectionMode, onExitSelectionMode],
   );
   const grouped = view.grouping !== "default";
-  const groupOrder = useMemo(
-    () =>
-      view.grouping === "status"
-        ? STATUS_BUCKETS
-        : DATE_BUCKETS.map((bucket) => `${GROUPING_LABELS[view.grouping]} ${bucket}`),
-    [view.grouping],
+  const harnessLabels = useHarnessLabels(view.grouping === "harness");
+  const harnessLabel = useCallback(
+    (c: Conversation) =>
+      nativeCodingAgentForSession(c)?.displayName ??
+      harnessLabels[c.harness ?? ""] ??
+      (c.harness || "Unknown harness"),
+    [harnessLabels],
   );
   // Status buckets read the unread mirror and the drafts store; only a status
   // view subscribes, so other views don't re-render the list on those writes.
@@ -1790,6 +1826,15 @@ function ConversationList({
   const allConversations = useMemo(
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
+  );
+  const groupOrder = useMemo(
+    () =>
+      view.grouping === "harness"
+        ? [...new Set(allConversations.map(harnessLabel))].sort((a, b) => a.localeCompare(b))
+        : view.grouping === "status"
+          ? STATUS_BUCKETS
+          : DATE_BUCKETS.map((bucket) => `${GROUPING_LABELS[view.grouping]} ${bucket}`),
+    [view.grouping, allConversations, harnessLabel],
   );
   const workingIds = useSidebarWorkingIds(allConversations, startingId, statusView);
 
@@ -1934,15 +1979,10 @@ function ConversationList({
     const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // The Projects section renders the same folders on every filter (scope to
-    // notArchived, not tabScoped, so folders don't empty out on Shared or
-    // Archived). Filing is owner-only, though — UNLIKE pins — so membership is
-    // gated on ownership: a folder only ever holds the viewer's OWNED sessions.
-    // Without the guard the legacy label arm would match a shared session by
-    // project name alone, pulling a foreign session into the viewer's folder
-    // (and out of the flat Shared list via filedIds). Each folder holds its
-    // non-pinned sessions — pinning a project's last one leaves it empty.
-    // Grouped views drop the folders: filed sessions join the groups instead.
+    // Folders use live members on All / My / Shared and archives on Archived.
+    // Filing is owner-only so legacy label collisions cannot file shared rows.
+    // Pins precede live folders; grouped views omit folders.
+    const folderCandidates = activeTab === "archived" ? tabScoped : notArchived;
     const filedIds = new Set<string>();
     const projectGroups: {
       id: string | null;
@@ -1953,7 +1993,7 @@ function ConversationList({
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
-      const inProject = notArchived.filter(
+      const inProject = folderCandidates.filter(
         (c) => sessionBelongsToProject(c, { id, name }, viewerId) && !pinnedIdSet.has(c.id),
       );
       inProject.forEach((c) => filedIds.add(c.id));
@@ -2005,13 +2045,15 @@ function ConversationList({
         c.id,
         view.grouping === "status"
           ? statusOf(c)
-          : `${GROUPING_LABELS[view.grouping]} ${dateBucket(
-              view.grouping === "created"
-                ? c.created_at
-                : (frozenKeys?.get(c.id) ??
-                    (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at)),
-              now,
-            )}`,
+          : view.grouping === "harness"
+            ? harnessLabel(c)
+            : `${GROUPING_LABELS[view.grouping]} ${dateBucket(
+                view.grouping === "created"
+                  ? c.created_at
+                  : (frozenKeys?.get(c.id) ??
+                      (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at)),
+                now,
+              )}`,
       ]),
     );
     const sessions = groupConversations(ordered, (c) => groupTitles.get(c.id), groupOrder).flatMap(
@@ -2033,6 +2075,7 @@ function ConversationList({
     groupingUi,
     grouped,
     groupOrder,
+    harnessLabel,
     view.grouping,
     sortBy,
     unseenTick,
@@ -2842,6 +2885,7 @@ function ConversationList({
                             projectId={group.id}
                             icon={group.icon}
                             windowConversations={group.conversations}
+                            archived={activeTab === "archived"}
                             activeConversationId={displayedActiveId}
                             expanded={expandedProjects.includes(group.name)}
                             active={newSessionProjectName === group.name}
@@ -2900,7 +2944,7 @@ function ConversationList({
                             <ConversationSection
                               key={group.title}
                               title={
-                                index === 0
+                                index === 0 || view.grouping === "harness"
                                   ? group.title
                                   : group.title.replace(
                                       /^(?:Created|Updated) (.)/,
@@ -2945,11 +2989,8 @@ function ConversationList({
                       )}
                     </ChatsDropZone>
                   )}
-                  {/* Every filter renders this same Pinned / Projects / Shared /
-              Sessions tree; `sections` is scoped to the active filter's conversations,
-              and Projects is empty for Shared and Archived. */}
-                  {/* Archived sessions are no longer listed here — they live on the
-              Settings page ("Archived chats"), reachable from the footer. */}
+                  {/* Folders show archived members on Archived and live members on
+                      the other filters; pins always show live sessions. */}
                   {/* Infinite-scroll sentinel. A new page can land in any list section,
               so it hides only when all of them are collapsed (a loader under a
               collapsed group reads orphaned). */}
@@ -3298,6 +3339,7 @@ function SectionHeader({
 const GROUPING_LABELS: Record<SidebarGrouping, string> = {
   default: "Default",
   status: "Status",
+  harness: "Harness",
   created: "Created",
   updated: "Updated",
 };
@@ -4407,7 +4449,10 @@ function SessionTooltipDetail({
 }
 
 // GitHub's glyph and label for a PR state; gh reports a draft as OPEN + is_draft.
-function pullRequestStatus(pr: PullRequest): { icon: LucideIcon; label: string } {
+function pullRequestStatus(pr: Pick<PullRequest, "state" | "is_draft">): {
+  icon: LucideIcon;
+  label: string;
+} {
   const state = pr.state.toUpperCase();
   if (state === "MERGED") return { icon: GitMergeIcon, label: "Merged" };
   if (state === "CLOSED") return { icon: GitPullRequestClosedIcon, label: "Closed" };
@@ -4425,15 +4470,25 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   // `owner` is null when permissions are off; there's no creator to name then.
   const owner = conversation.owner ?? null;
   const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
-  const repo = github?.repo?.name_with_owner?.split("/").pop() ?? null;
+  // The server's stored first PR stands in while the host is offline.
+  const stored = conversation.pull_request ?? null;
+  const repo =
+    github?.repo?.name_with_owner?.split("/").pop() ?? stored?.repository.split("/").pop() ?? null;
   // Prefer the resolved PR (carries state); fall back to the tracked association
   // (number only) so the row still shows when gh can't resolve state — e.g. gh
   // isn't authenticated on the host.
   const pr = github?.pr ?? null;
   const association =
     github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
-  const prNumber = pr?.number ?? association?.number ?? null;
-  const prStatus = pr ? pullRequestStatus(pr) : null;
+  const prNumber = pr?.number ?? association?.number ?? stored?.number ?? null;
+  const fromStored = !pr && !association && !!stored?.state;
+  const prStatus = pr
+    ? pullRequestStatus(pr)
+    : fromStored && stored?.state
+      ? pullRequestStatus({ state: stored.state, is_draft: stored.is_draft === true })
+      : null;
+  // The stored state may be old while the host is offline; say how old.
+  const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;
   const branch = conversation.git_branch ?? github?.branch ?? null;
   if (createdBy === null && repo === null && prNumber === null && branch === null) return null;
   return (
@@ -4460,6 +4515,7 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
         >
           #{prNumber}
           {prStatus ? ` · ${prStatus.label}` : ""}
+          {asOf ? ` (as of ${asOf})` : ""}
         </SessionTooltipDetail>
       )}
       {branch !== null && (
@@ -4497,7 +4553,7 @@ function LegacySessionTooltipContent({
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title,
       // then muted, small-icon metadata lines.
-      className="w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      className="menu-surface w-64 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg p-2.5 text-popover-foreground whitespace-normal shadow-menu"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}
@@ -4562,7 +4618,7 @@ function SessionTooltipContent({
       data-testid="session-tooltip-content"
       // Mirror PinnedProjectFlyoutContent's compact HoverCard look: title and a
       // muted "updated · harness · environment" line, then label/value rows.
-      className="w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10"
+      className="menu-surface w-72 max-w-[calc(100vw-2rem)] flex-col items-stretch rounded-lg p-2.5 text-popover-foreground whitespace-normal shadow-menu"
     >
       <p className="sidebar-compact-text line-clamp-3 font-medium">
         {conversation.title ?? conversation.id}

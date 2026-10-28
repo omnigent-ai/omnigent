@@ -52,7 +52,7 @@ concurrency:
 jobs:
   plan:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       base_sha: ${{ steps.resolve.outputs.base_sha }}
@@ -188,7 +188,7 @@ jobs:
   cut:
     needs: plan
     if: needs.plan.outputs.should_cut == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       # Clean public resolution for `uv lock` — the committed lockfile must
@@ -218,7 +218,7 @@ jobs:
 
       - name: Install uv
         # This checkout is a prior passing main commit and may not contain the local action.
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: false
 

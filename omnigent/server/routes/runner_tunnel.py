@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import time
 import weakref
@@ -27,7 +28,7 @@ from typing import cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
@@ -47,7 +48,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import (
+    RunnerSession,
+    TunnelEnd,
+    TunnelRegistry,
+)
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
@@ -88,6 +93,40 @@ class _TunnelConnectionAttrs(TunnelDiagnosticAttrs):
     connection_id: str | None
     connection_age_s: float | None
     last_frame_age_s: float | None
+    helper_outcomes: str | None
+    receive_close_code: int | None
+    asgi_client_state: str
+    asgi_application_state: str
+
+
+def _tunnel_helper_outcomes(
+    tasks: list[asyncio.Task[None]], *, last_send_error_type: str | None = None
+) -> tuple[str | None, int | None]:
+    """Retain peer-close evidence even when another helper's error is raised first."""
+    outcomes: dict[str, str] = {}
+    receive_close_code: int | None = None
+    for task in tasks:
+        role = task.get_name().split(":", 1)[0].removeprefix("tunnel-")
+        if role not in {"receive", "sender", "ping"}:
+            continue
+        if not task.done():
+            outcomes[role] = "pending"
+        elif task.cancelled():
+            outcomes[role] = "cancelled"
+        elif (error := task.exception()) is None:
+            # A sender can consume its transport error when a concurrent close wins.
+            outcomes[role] = (
+                f"error:{last_send_error_type}"
+                if role == "sender" and last_send_error_type is not None
+                else "completed"
+            )
+        else:
+            outcomes[role] = f"error:{type(error).__name__[:64]}"
+            if role == "receive" and isinstance(error, WebSocketDisconnect):
+                code = error.code
+                if type(code) is int and 1000 <= code <= 4999:
+                    receive_close_code = code
+    return (json.dumps(outcomes, sort_keys=True) if outcomes else None, receive_close_code)
 
 
 def _is_loopback_websocket_client(ws: WebSocket) -> bool:
@@ -480,13 +519,24 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        # Attribute debug-log records for this tunnel to its owner, as the host
+        # tunnel does. The handler task is per-connection, so this cannot bleed
+        # across concurrent runners.
+        set_current_user_id(tunnel_owner)
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
+        peer_close_code: int | None = None
         owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
+            diagnostics: TunnelDiagnosticAttrs = (
+                session.diagnostics.snapshot() if session is not None else {}
+            )
+            helper_outcomes, receive_close_code = _tunnel_helper_outcomes(
+                owned, last_send_error_type=diagnostics.get("last_send_error_type")
+            )
             attrs: _TunnelConnectionAttrs = {
                 "runner_id": runner_id,
                 "ended_by": ended_by,
@@ -499,10 +549,12 @@ def create_runner_tunnel_router(
                     if session is not None
                     else None
                 ),
+                "helper_outcomes": helper_outcomes,
+                "receive_close_code": receive_close_code,
+                "asgi_client_state": ws.client_state.name,
+                "asgi_application_state": ws.application_state.name,
             }
-            if session is not None:
-                return {**attrs, **session.diagnostics.snapshot()}
-            return attrs
+            return {**attrs, **diagnostics}
 
         def _report_diagnostics() -> None:
             _logger.warning(
@@ -671,6 +723,7 @@ def create_runner_tunnel_router(
             if session is not None:
                 session.peer_close_reason = getattr(exc, "reason", None) or None
             close_code = getattr(exc, "code", None)
+            peer_close_code = close_code
             # A normal or going-away close (idle shutdown, host restart) is expected.
             _logger.log(
                 logging.INFO if close_code in _CLEAN_CLOSE_CODES else logging.WARNING,
@@ -693,10 +746,18 @@ def create_runner_tunnel_router(
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
         finally:
+            ended_at = time.time()
             for task in owned:
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                # Snapshot before deregister records its own cleanup close on the session.
+                session.ended = TunnelEnd(
+                    at=ended_at,
+                    peer_code=peer_close_code,
+                    peer_reason=session.peer_close_reason,
+                    server_code=session.close_code,
+                )
                 registry.deregister(runner_id, session, retire=False)
                 if on_runner_disconnect is not None:
                     try:
