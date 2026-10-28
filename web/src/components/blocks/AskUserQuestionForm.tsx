@@ -183,9 +183,12 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
         selections[currentKey]
       ? [selections[currentKey] as string]
       : [];
-  const previewsToShow = current.options.filter(
-    (opt) => selectedLabels.includes(opt.label) && opt.preview,
-  );
+  const optionsWithPreview = current.options.filter((opt) => opt.preview);
+  // Before any choice, show the first preview, as Claude's picker starts on its first option.
+  const nothingChosen = selectedLabels.length === 0 && !customSelected[currentKey];
+  const previewsToShow = nothingChosen
+    ? optionsWithPreview.slice(0, 1)
+    : optionsWithPreview.filter((opt) => selectedLabels.includes(opt.label));
 
   const allowCustomInput = current.isOther !== false;
   const customRowId = `${currentKey}__custom`;
@@ -306,12 +309,12 @@ export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQu
         {previewsToShow.length > 0 && (
           <div className="flex flex-col gap-1" data-testid="ask-user-question-previews">
             {previewsToShow.map((opt) => (
-              <pre
-                key={opt.label}
-                className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap"
-              >
-                {opt.preview}
-              </pre>
+              <div key={opt.label} className="flex flex-col gap-1">
+                <span className="text-muted-foreground text-sm">Preview: {opt.label}</span>
+                <pre className="overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap">
+                  {opt.preview}
+                </pre>
+              </div>
             ))}
           </div>
         )}

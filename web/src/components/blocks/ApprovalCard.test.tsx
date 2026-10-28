@@ -1431,10 +1431,9 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByTestId("ask-user-question-submit").hasAttribute("disabled")).toBe(false);
   });
 
-  it("renders the preview of selected options that carry a preview field", () => {
-    // Selected option's `preview` ride through into a <pre> below
-    // the options. Unselected previews stay hidden so the card
-    // doesn't dump every preview at once.
+  it("shows the first option preview while pending, then follows the selection", () => {
+    // Claude's picker shows the focused option's preview and starts on the
+    // first option, so a pending card shows one preview without a click.
     render(
       <ApprovalCard
         elicitationId="elic_preview"
@@ -1451,6 +1450,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
               question: "Layout?",
               header: "",
               options: [
+                { label: "Keep current", description: "No change" },
                 {
                   label: "Two-pane",
                   description: "Side-by-side",
@@ -1465,19 +1465,24 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    // No selection yet → no preview block.
-    expect(screen.queryByTestId("ask-user-question-previews")).toBeNull();
+    const pending = screen.getByTestId("ask-user-question-previews");
+    expect(pending.textContent).toContain("Two-pane");
+    expect(pending.textContent).toContain("[editor] | [output]");
+    expect(pending.textContent).not.toContain("[editor only]");
 
     // Description is concatenated into the label text by the DOM
-    // so a literal ``getByLabelText("Two-pane")`` doesn't match;
+    // so a literal ``getByLabelText("Single")`` doesn't match;
     // a regex picks out the label by its prefix.
-    fireEvent.click(screen.getByLabelText(/Two-pane/));
-    const previews = screen.getByTestId("ask-user-question-previews");
-    expect(previews.textContent).toContain("[editor] | [output]");
-    expect(previews.textContent).not.toContain("[editor only]");
-
     fireEvent.click(screen.getByLabelText(/Single/));
-    expect(screen.getByTestId("ask-user-question-previews").textContent).toContain("[editor only]");
+    const selected = screen.getByTestId("ask-user-question-previews");
+    expect(selected.textContent).toContain("[editor only]");
+    expect(selected.textContent).not.toContain("[editor] | [output]");
+
+    fireEvent.click(screen.getByLabelText(/Keep current/));
+    expect(screen.queryByTestId("ask-user-question-previews")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("ask-user-question-custom-toggle"));
+    expect(screen.queryByTestId("ask-user-question-previews")).toBeNull();
   });
 
   it("renders 'Submitted' with the answer summary in the responded state", () => {
