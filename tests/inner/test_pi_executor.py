@@ -1,6 +1,7 @@
 """Tests for PiExecutor."""
 
 import asyncio
+import contextlib
 import itertools
 import json
 import logging
@@ -20,8 +21,10 @@ from urllib.parse import urlparse
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -939,14 +942,15 @@ class TestToolServer(unittest.TestCase):
         finally:
             probe.close()
 
-    async def _run_generated_bridge_tool(
+    async def _run_generated_bridge_tools(
         self,
         *,
         port: int,
         token: str,
+        args: list[dict] | None = None,
         timeout: float = 5.0,
-    ) -> dict:
-        """Run the generated JS extension under Node and execute one tool.
+    ) -> list[dict]:
+        """Run sequential tool calls in one generated Node extension.
 
         This is intentionally cross-runtime: Python starts the real loopback
         server, while Node loads the generated Pi extension, captures the
@@ -969,6 +973,8 @@ class TestToolServer(unittest.TestCase):
             tmp_path = Path(tmp)
             extension_path = tmp_path / "omnigent_tools.js"
             runner_path = tmp_path / "run_bridge.js"
+            args_path = tmp_path / "args.json"
+            args_path.write_text(json.dumps(args if args is not None else [{"input": "hello"}]))
             extension_path.write_text(_generate_extension_js(port, schema, token))
             runner_path.write_text(
                 textwrap.dedent(
@@ -985,14 +991,14 @@ class TestToolServer(unittest.TestCase):
                       if (!registered) {
                         throw new Error("tool was not registered");
                       }
-                      const result = await registered.execute(
-                        "call-1",
-                        { input: "hello" },
-                        undefined,
-                        undefined,
-                        {}
-                      );
-                      process.stdout.write(JSON.stringify(result));
+                      const args = JSON.parse(require("fs").readFileSync(process.argv[3], "utf8"));
+                      const results = [];
+                      for (const [index, params] of args.entries()) {
+                        results.push(await registered.execute(
+                          `call-${index + 1}`, params, undefined, undefined, {}
+                        ));
+                      }
+                      process.stdout.write(JSON.stringify(results));
                     })().catch((err) => {
                       process.stderr.write(err && err.stack ? err.stack : String(err));
                       process.exit(1);
@@ -1005,6 +1011,7 @@ class TestToolServer(unittest.TestCase):
                 node_path,
                 str(runner_path),
                 str(extension_path),
+                str(args_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1021,6 +1028,147 @@ class TestToolServer(unittest.TestCase):
                 stderr.decode("utf-8", errors="replace"),
             )
             return json.loads(stdout.decode("utf-8"))
+
+    def test_generated_bridge_accepts_request_larger_than_default_stream_limit(self):
+        async def _test():
+            server = _ToolServer()
+            await server.start()
+            payload = "large-tool-input:" + "x" * (128 * 1024)
+            calls = []
+
+            async def executor(name, args, *, call_id=None):
+                calls.append((name, args, call_id))
+                return {"accepted_bytes": len(args["input"].encode())}
+
+            server._tool_executor = executor
+            try:
+                result, next_result = await self._run_generated_bridge_tools(
+                    port=server.port,
+                    token=server.token,
+                    args=[{"input": payload}, {"input": "hello"}],
+                )
+            finally:
+                await server.stop()
+
+            self.assertFalse(result["isError"])
+            self.assertEqual(
+                calls,
+                [
+                    ("exotic", {"input": payload}, "call-1"),
+                    ("exotic", {"input": "hello"}, "call-2"),
+                ],
+            )
+            self.assertEqual(
+                json.loads(result["content"][0]["text"]),
+                {"accepted_bytes": len(payload.encode())},
+            )
+            self.assertFalse(next_result["isError"])
+            self.assertEqual(json.loads(next_result["content"][0]["text"]), {"accepted_bytes": 5})
+
+        _run(_test())
+
+    def test_generated_bridge_rejects_oversized_request_without_dispatch_or_payload_logs(self):
+        async def _test():
+            server = _ToolServer()
+            executor = AsyncMock(return_value={"ok": True})
+            server._tool_executor = executor
+            with patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024):
+                await server.start()
+                try:
+                    with self.assertLogs("omnigent.inner.pi_executor", level="WARNING") as logs:
+                        result, next_result = await self._run_generated_bridge_tools(
+                            port=server.port,
+                            token=server.token,
+                            args=[
+                                {"input": "private-tool-value" + "x" * (8 * 1024 * 1024)},
+                                {"input": "hello"},
+                            ],
+                        )
+                finally:
+                    await server.stop()
+
+            executor.assert_awaited_once_with("exotic", {"input": "hello"}, call_id="call-2")
+            self.assertTrue(result["isError"])
+            self.assertEqual(
+                json.loads(result["content"][0]["text"]),
+                {"error": "tool request exceeds 65536-byte limit"},
+            )
+            self.assertFalse(next_result["isError"])
+            self.assertEqual(json.loads(next_result["content"][0]["text"]), {"ok": True})
+            row = record_to_row(logs.records[-1], source="runner")
+            self.assertEqual(row["event_name"], "pi_tool_request_rejected")
+            self.assertEqual(row["attributes"]["request_limit_bytes"], "65536")
+            self.assertNotIn("private-tool-value", json.dumps(row))
+            self.assertNotIn(server.token, json.dumps(row))
+
+        _run(_test())
+
+    def test_oversized_request_preserves_error_while_client_is_sending(self):
+        async def _test():
+            server = _ToolServer()
+            executor = AsyncMock()
+            server._tool_executor = executor
+            with patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024):
+                await server.start()
+                reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+                try:
+                    writer.write(
+                        json.dumps(
+                            {
+                                "id": "large-request",
+                                "token": server.token,
+                                "tool": "exotic",
+                                "args": {"input": "x" * (8 * 1024 * 1024)},
+                            }
+                        ).encode()
+                        + b"\n"
+                    )
+                    async with asyncio.timeout(5):
+                        await writer.drain()
+                        result = json.loads(await reader.readline())
+                        self.assertEqual(await reader.read(), b"")
+                finally:
+                    writer.close()
+                    with contextlib.suppress(ConnectionError):
+                        await writer.wait_closed()
+                    await server.stop()
+
+            executor.assert_not_awaited()
+            self.assertEqual(result["error"], "tool request exceeds 65536-byte limit")
+
+        _run(_test())
+
+    def test_oversized_request_with_incomplete_sender_is_bounded(self):
+        async def _test(send_eof):
+            server = _ToolServer()
+            executor = AsyncMock()
+            server._tool_executor = executor
+            with (
+                patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024),
+                patch("omnigent.inner.pi_executor._TOOL_REQUEST_DRAIN_TIMEOUT_S", 0.05),
+            ):
+                await server.start()
+                reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
+                try:
+                    writer.write(b"x" * (128 * 1024))
+                    await writer.drain()
+                    if send_eof:
+                        writer.write_eof()
+                    async with asyncio.timeout(1):
+                        result = json.loads(await reader.readline())
+                        self.assertEqual(await reader.read(), b"")
+                        while server._clients:
+                            await asyncio.sleep(0.01)
+                    self.assertEqual(result["error"], "tool request exceeds 65536-byte limit")
+                finally:
+                    writer.close()
+                    await writer.wait_closed()
+                    await server.stop()
+            executor.assert_not_awaited()
+
+        for send_eof in (True, False):
+            with self.subTest(sender="truncated" if send_eof else "stalled"):
+                _run(_test(send_eof))
 
     def test_start_and_stop(self):
         async def _test():
@@ -1197,7 +1345,7 @@ class TestToolServer(unittest.TestCase):
 
             server._tool_executor = executor
             try:
-                result = await self._run_generated_bridge_tool(
+                [result] = await self._run_generated_bridge_tools(
                     port=server.port,
                     token=server.token,
                 )
@@ -1228,7 +1376,7 @@ class TestToolServer(unittest.TestCase):
             server = await asyncio.start_server(close_without_response, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             try:
-                result = await self._run_generated_bridge_tool(
+                [result] = await self._run_generated_bridge_tools(
                     port=port,
                     token="close-token",
                 )
@@ -1962,10 +2110,8 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         encoding="utf-8",
     )
     (global_agent / "npm").mkdir()
-    monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
-        global_agent,
-    )
+    (global_agent / "mcp.json").write_text('{"mcpServers": {"custom": {}}}', encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
@@ -1976,6 +2122,10 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         executor = PiExecutor(gateway=True)
         _run(executor._get_gateway_token())
 
+    # Use the actual spawn environment, not a later change to the parent process.
+    executor._env["PI_CODING_AGENT_DIR"] = "pi-agent"
+    executor._cwd = str(tmp_path)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "wrong-root"))
     config = executor._build_env_and_dir(
         [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
     )
@@ -1985,6 +2135,7 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         assert settings["extensions"] == ["/ext/demo.ts"]
         assert settings["packages"] == ["npm:@x/y"]
         assert (managed_dir / "npm").is_symlink()
+        assert (managed_dir / "mcp.json").resolve() == (global_agent / "mcp.json").resolve()
     finally:
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
@@ -6189,43 +6340,252 @@ def test_settled_eof_before_settlement_is_an_error() -> None:
     _run(_test())
 
 
-def test_settled_overflow_compaction_retry_returns_recovered_answer() -> None:
-    """A context-overflow error that pi repairs by compacting and re-running
-    the prompt completes with the recovered answer."""
+def _overflow_compaction_frames(
+    compaction_end: dict, *after_settled: str, retry: list[str] | None = None
+) -> list[str]:
+    """pi's frames for an overflow it compacts and retries, by default into "RECOVERED"."""
+    overflow = _assistant_message(
+        stop_reason="error", error_message="Context overflow: prompt is too long"
+    )
+    return [
+        _rpc_frame(type="response", success=True),
+        _rpc_frame(type="message_start", message={"role": "assistant"}),
+        _rpc_frame(type="message_end", message=overflow),
+        _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
+        _rpc_frame(type="compaction_start", reason="overflow"),
+        _rpc_frame(type="compaction_end", reason="overflow", **compaction_end),
+        *(retry if retry is not None else _plain_answer_frames("RECOVERED")[1:]),
+        *after_settled,
+    ]
+
+
+@pytest.mark.parametrize("exported_context", ["with-tools", "without-tools", None])
+def test_settled_overflow_compaction_retry_reports_compacted_context(
+    exported_context: str | None,
+) -> None:
+    """Export kept text before completion, excluding tools, thinking and the final reply."""
+    pi_context = [
+        {"role": "compactionSummary", "summary": "SUMMARY"},
+        {"role": "user", "content": [{"type": "text", "text": "kept question"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private"},
+                {"type": "toolCall", "id": "c1", "name": "read", "arguments": {}},
+            ],
+        },
+        {"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "x"}]},
+        _assistant_message("kept answer"),
+        {"role": "user", "content": "hello"},
+    ]
+    if exported_context == "with-tools":
+        pi_context += [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading notes."},
+                    {"type": "toolCall", "id": "c2", "name": "read", "arguments": {}},
+                ],
+            },
+            {"role": "toolResult", "toolCallId": "c2", "content": [{"type": "text", "text": "y"}]},
+        ]
+    pi_context.append(_assistant_message("RECOVERED"))
+    result: dict = {"summary": "SUMMARY"}
+    if exported_context:
+        result["estimatedTokensAfter"] = 1200
+    executor, rpc = _session_executor(
+        _overflow_compaction_frames(
+            {"result": result, "aborted": False, "willRetry": True},
+            _rpc_frame(
+                type="response",
+                command="get_messages",
+                success=exported_context is not None,
+                **({"data": {"messages": pi_context}} if exported_context else {"error": "busy"}),
+            ),
+        )
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert [type(e) for e in events] == [TextChunk, CompactionComplete, TurnComplete]
+    _, compaction, turn_complete = events
+    assert turn_complete.response == "RECOVERED"
+    assert compaction.summary == "SUMMARY"
+    assert compaction.token_count == (1200 if exported_context else 0)
+    expected = [
+        (
+            "user",
+            "input_text",
+            "The conversation history before this point was compacted into "
+            "the following summary:\n\n<summary>\nSUMMARY\n</summary>",
+        ),
+        ("user", "input_text", "kept question"),
+        ("assistant", "output_text", "kept answer"),
+        ("user", "input_text", "hello"),
+    ]
+    if exported_context == "with-tools":
+        expected.append(("assistant", "output_text", "Reading notes."))
+    assert compaction.compacted_messages == (
+        [
+            {"type": "message", "role": role, "content": [{"type": block_type, "text": text}]}
+            for role, block_type, text in expected
+        ]
+        if exported_context
+        else None
+    )
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt", "get_messages"]
+    assert rpc._line_queue.empty()
+    assert _SESSION_KEY in executor._session_states
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "partial_text", "settlement"),
+    [
+        pytest.param("error", "", "settled", id="before-text"),
+        pytest.param("error", "partial", "settled", id="partial-error"),
+        pytest.param("aborted", "partial", "settled", id="partial-abort"),
+        pytest.param("aborted", "", "settled", id="abort-before-text"),
+        pytest.param("error", "partial", "eof", id="exit-before-settlement"),
+        pytest.param("aborted", "partial", "timeout", id="settlement-timeout"),
+        pytest.param("error", "partial", "abort-error", id="abort-write-failure"),
+    ],
+)
+def test_settled_compaction_then_failed_retry_reports_compaction_before_error(
+    stop_reason: str, partial_text: str, settlement: str
+) -> None:
+    """Preserve compaction before the original error, exporting only after settlement."""
 
     async def _test() -> None:
-        overflow = _assistant_message(
-            stop_reason="error", error_message="Context overflow: prompt is too long"
+        failed_retry = _assistant_message(
+            partial_text, stop_reason=stop_reason, error_message="upstream interrupted"
         )
-        executor, rpc = _session_executor(
-            [
-                _rpc_frame(type="response", success=True),
-                _rpc_frame(type="message_start", message={"role": "assistant"}),
-                _rpc_frame(type="message_end", message=overflow),
-                _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
-                _rpc_frame(type="compaction_start", reason="overflow"),
+        settled_frames = []
+        if settlement == "settled":
+            if partial_text:
+                settled_frames.append(_text_delta_frame("DO NOT REPLAY"))
+            settled_frames += [
+                _rpc_frame(type="agent_settled"),
                 _rpc_frame(
-                    type="compaction_end",
-                    reason="overflow",
-                    result={"summary": "..."},
-                    aborted=False,
-                    willRetry=True,
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "SUMMARY"},
+                            {"role": "user", "content": "hello"},
+                            failed_retry,
+                        ]
+                    },
                 ),
-                *_plain_answer_frames("RECOVERED")[1:],
             ]
+        executor, rpc = _session_executor(
+            _overflow_compaction_frames(
+                {"result": {"summary": "SUMMARY"}, "aborted": False, "willRetry": True},
+                retry=[
+                    _rpc_frame(type="agent_start"),
+                    _rpc_frame(type="message_start", message={"role": "assistant"}),
+                    *([_text_delta_frame(partial_text)] if partial_text else []),
+                    _rpc_frame(type="message_end", message=failed_retry),
+                    _rpc_frame(type="agent_end", messages=[failed_retry], willRetry=False),
+                    *settled_frames,
+                ],
+            )
         )
+        if settlement == "eof":
+            rpc._line_queue.put_nowait(None)
+        # An empty queue exercises the real drain deadline in the timeout case.
+        stdin = rpc.process.stdin
+        settled = False
+        read_line, send_command = rpc.read_line, rpc.send_command
 
-        events = await _run_session_turn(executor, "hello")
+        async def read_frame(*args, **kwargs):
+            nonlocal settled
+            line = await read_line(*args, **kwargs)
+            if line is not None and json.loads(line).get("type") == "agent_settled":
+                settled = True
+            return line
 
-        assert [e.message for e in events if isinstance(e, ExecutorError)] == []
-        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
-        assert turn_complete.response == "RECOVERED"
-        assert rpc._line_queue.empty()
+        async def send_checked(command):
+            if command["type"] == "get_messages":
+                assert settled, "context export must wait for agent_settled"
+            if command["type"] == "abort" and settlement == "abort-error":
+                raise BrokenPipeError("Pi exited before abort")
+            await send_command(command)
+
+        with (
+            patch.object(rpc, "read_line", side_effect=read_frame),
+            patch.object(rpc, "send_command", side_effect=send_checked),
+            patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+        ):
+            events = await asyncio.wait_for(_run_session_turn(executor, "hello"), timeout=1)
+
+        assert [type(e) for e in events if not isinstance(e, TextChunk)] == [
+            CompactionComplete,
+            ExecutorError,
+        ]
+        compaction, error = events[-2:]
+        assert error.message == "upstream interrupted"
+        assert compaction.summary == "SUMMARY"
+        assert [e.text for e in events if isinstance(e, TextChunk)] == (
+            [partial_text] if partial_text else []
+        )
+        commands = [json.loads(line)["type"] for line in stdin.data]
+        if settlement == "settled":
+            assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == [
+                "hello"
+            ]
+            assert rpc._line_queue.empty()
+        else:
+            assert compaction.compacted_messages is None
+        evicted = bool(partial_text) or stop_reason == "aborted"
+        assert commands == (
+            ["prompt"]
+            + (["abort"] if evicted and settlement != "abort-error" else [])
+            + (["get_messages"] if settlement == "settled" else [])
+        )
+        if evicted:
+            _assert_session_evicted(executor, rpc)
+        else:
+            assert _SESSION_KEY in executor._session_states
 
     _run(_test())
 
 
-def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+@pytest.mark.parametrize(
+    "compaction_end",
+    [
+        {"aborted": False, "errorMessage": "Auto-compaction failed: timeout"},
+        {"aborted": True},
+    ],
+    ids=["failed", "aborted"],
+)
+def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -> None:
+    """Failed or aborted compaction does not replace history or request an export."""
+    answer_frames = _plain_answer_frames("ANSWER")
+    executor, rpc = _session_executor(
+        [
+            *answer_frames[:-1],
+            _rpc_frame(type="compaction_start", reason="threshold"),
+            _rpc_frame(
+                type="compaction_end", reason="threshold", willRetry=False, **compaction_end
+            ),
+            answer_frames[-1],
+        ]
+    )
+
+    events = _run(_run_session_turn(executor, "hello"))
+
+    assert not any(isinstance(e, CompactionComplete) for e in events)
+    (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
+    assert turn_complete.response == "ANSWER"
+    assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
+    assert rpc._line_queue.empty()
+
+
+@pytest.mark.parametrize("settled", [True, False], ids=["settled", "exited"])
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts(
+    settled: bool,
+) -> None:
     """A truncated answer that already streamed is not followed by the
     regenerated one pi produces after overflow compaction."""
 
@@ -6246,15 +6606,38 @@ def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -
                     aborted=False,
                     willRetry=True,
                 ),
-                *_plain_answer_frames("REGENERATED")[1:],
             ]
         )
+        if settled:
+            for frame in _plain_answer_frames("REGENERATED")[1:]:
+                rpc._line_queue.put_nowait(frame)
+            rpc._line_queue.put_nowait(
+                _rpc_frame(
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "..."},
+                            {"role": "user", "content": "hello"},
+                            _assistant_message("REGENERATED"),
+                        ]
+                    },
+                )
+            )
+        else:
+            rpc._line_queue.put_nowait(None)
 
         events = await _run_session_turn(executor, "hello")
 
         assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
         assert not any(isinstance(e, TurnComplete) for e in events)
         assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        compaction, error = events[-2:]
+        assert isinstance(compaction, CompactionComplete)
+        assert compaction.summary == "..."
+        assert bool(compaction.compacted_messages) is settled
+        assert "partial response was already streamed" in error.message
         _assert_session_evicted(executor, rpc)
 
     _run(_test())

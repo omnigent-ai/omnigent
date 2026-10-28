@@ -2,6 +2,7 @@
 // fetch stubbed: edits post what the editor shows and settle to the host's answer,
 // a draft outlives the Summary tab unmounting, and pasted media upload into the draft.
 
+import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
@@ -30,6 +31,7 @@ afterEach(() => {
 interface PendingRequest<T> {
   body: T;
   respond: (response: Response) => void;
+  reject: (error: Error) => void;
 }
 
 /** Stub fetch: details posts and uploads wait for the test to answer. */
@@ -40,11 +42,11 @@ function stubFetch() {
     "fetch",
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const { pathname } = new URL(String(input), "http://localhost");
-      return new Promise<Response>((respond) => {
-        if (pathname === DETAILS_PATH)
-          edits.push({ body: JSON.parse(String(init?.body)), respond });
+      return new Promise<Response>((respond, reject) => {
+        if (pathname === DETAILS_PATH || pathname.endsWith("/github/comments"))
+          edits.push({ body: JSON.parse(String(init?.body)), respond, reject });
         else if (pathname === ATTACHMENTS_PATH)
-          uploads.push({ body: init?.body as FormData, respond });
+          uploads.push({ body: init?.body as FormData, respond, reject });
         else respond(new Response("{}", { status: 404 }));
       });
     }),
@@ -535,4 +537,131 @@ it.each([
   ["a word b", 2, 6, "a \nX\n b", 5],
 ])("puts an attachment on its own line in %j at %i–%i", (body, start, end, expected, caret) => {
   expect(insertOnOwnLine(body, "X", start, end)).toEqual({ body: expected, caret });
+});
+
+function mountCommentComposer(client: QueryClient, prUrl = PR_URL) {
+  return render(
+    <QueryClientProvider client={client}>
+      <PullRequestCommentComposer conversationId="conv_1" prUrl={prUrl} account="octocat" />
+    </QueryClientProvider>,
+  );
+}
+
+it("posts a comment once, keeps the draft through unmount, and updates only its PR", async () => {
+  const { edits } = stubFetch();
+  const { client, view } = renderDetails();
+  view.unmount();
+  const otherKey = ["github-info", "conv_1", "other"];
+  client.setQueryData(otherKey, {
+    ...client.getQueryData<PullRequestInfo>(INFO_KEY),
+    selected_pr_url: "other",
+  });
+  const composer = mountCommentComposer(client);
+  const textbox = screen.getByRole("textbox", { name: "New PR comment" });
+  const body = "  **Thanks**\n`literal`";
+  fireEvent.change(textbox, { target: { value: body } });
+  fireEvent.submit(textbox.closest("form")!);
+  fireEvent.submit(textbox.closest("form")!);
+  await waitFor(() => expect(edits).toHaveLength(1));
+  expect(edits[0].body).toEqual({ pr_url: PR_URL, body });
+  expect(screen.getByRole("button", { name: "Posting…" })).toBeDisabled();
+  composer.unmount();
+  const other = mountCommentComposer(client, "other");
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "Other draft" } });
+  await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Other draft"));
+  const comment = {
+    author: "octocat",
+    body,
+    created_at: "2026-10-26T12:00:00Z",
+    url: PR_URL + "#issuecomment-99",
+  };
+  // A poll can observe the new comment before its POST response reaches the UI.
+  client.setQueryData<PullRequestInfo>(INFO_KEY, (info) =>
+    info?.pr ? { ...info, pr: { ...info.pr, comments: [comment] } } : info,
+  );
+  await act(async () => edits[0].respond(json({ comment })));
+  expect(screen.getByRole("textbox")).toHaveValue("Other draft");
+  expect(client.getQueryData<PullRequestInfo>(INFO_KEY)?.pr?.comments).toEqual([comment]);
+  expect(client.getQueryData<PullRequestInfo>(otherKey)?.pr?.comments).toBeUndefined();
+  other.unmount();
+  mountCommentComposer(client);
+  expect(screen.getByRole("textbox")).toHaveValue("");
+});
+
+it.each([
+  [400, "A comment cannot be empty", false],
+  [403, "Permission denied", false],
+  [404, "Not found", false],
+  [422, "Validation failed", false],
+  [502, "Connection lost", true],
+  [500, "Internal error", true],
+  [400, "Could not confirm comment posting. Check GitHub before retrying.", true],
+  [400, "GitHub authentication timed out. Your comment was not sent.", false],
+  [503, "Runner unavailable", false],
+  [null, "Failed to fetch", true],
+])(
+  "retains drafts after %s errors without retrying or misleading hints",
+  async (status, message, uncertain) => {
+    const { edits } = stubFetch();
+    const client = new QueryClient({ defaultOptions: { mutations: { retry: 3 } } });
+    const composer = mountCommentComposer(client);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Please check this" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Post comment" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Post comment" }));
+    await waitFor(() => expect(edits).toHaveLength(1));
+    await act(async () => {
+      if (status === null) edits[0].reject(new TypeError(message));
+      else
+        edits[0].respond(
+          json(
+            status === 503
+              ? { error: { code: "runner_unavailable", message } }
+              : { detail: message },
+            status,
+          ),
+        );
+    });
+    const alert = await screen.findByRole("alert");
+    expect((alert.textContent?.match(/Check GitHub before retrying/g) ?? []).length).toBe(
+      uncertain ? 1 : 0,
+    );
+    composer.unmount();
+    mountCommentComposer(client);
+    expect(screen.getByRole("textbox")).toHaveValue("Please check this");
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+    expect(edits).toHaveLength(1);
+  },
+);
+
+it("blocks blank and oversized comments and previews Markdown", async () => {
+  const { edits } = stubFetch();
+  mountCommentComposer(new QueryClient());
+  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: " \n" } });
+  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: "x".repeat(65537) } });
+  expect(await screen.findByRole("alert")).toHaveTextContent("65536");
+  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  const draft = `**Ready for review**\n![Screenshot](${ASSET_URL})`;
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: draft } });
+  await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(draft));
+  fireEvent.mouseDown(screen.getByRole("tab", { name: "Preview" }), { button: 0, ctrlKey: false });
+  expect(await screen.findByText("Ready for review")).toBeInTheDocument();
+  expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveAttribute("src", ASSET_URL);
+  expect(edits).toHaveLength(0);
+});
+
+it("accepts a comment at the Unicode code-point limit and blocks the next character", async () => {
+  const { edits } = stubFetch();
+  mountCommentComposer(new QueryClient());
+  const body = "😀".repeat(65536);
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: body + "😀" } });
+  expect(await screen.findByRole("alert")).toHaveTextContent("65536");
+  expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: body } });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Post comment" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Post comment" }));
+  await waitFor(() => expect(edits).toHaveLength(1));
+  expect(edits[0].body).toEqual({ pr_url: PR_URL, body });
+  await act(async () => edits[0].respond(json({ detail: "Rejected by test" }, 400)));
 });

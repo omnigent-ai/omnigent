@@ -228,10 +228,11 @@ const ctx = {
 function usageEvents() {
   return postedEvents.filter((e) => e.type === "external_session_usage");
 }
-async function recordUsage(handlers, timestamp, input, output) {
+async function recordUsage(handlers, timestamp, input, output, cost) {
   await handlers.message_end({ message: {
     role: "assistant", model: "databricks-claude-sonnet-4-6", timestamp,
-    usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output },
+    usage: { input, output, cacheRead: 0, cacheWrite: 0,
+      totalTokens: input + output, cost: { total: cost } },
   }}, ctx);
 }
 """
@@ -477,10 +478,11 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
 (async () => {
 
   await handlers.session_start({}, ctx);
-  await recordUsage(handlers, 1000, 150000, 30000);
+  await recordUsage(handlers, 1000, 150000, 30000, 0.75);
   const saved = JSON.parse(fs.readFileSync(statePath));
   assert.equal(saved.cumulative_input_tokens, 150000);
   assert.equal(saved.cumulative_output_tokens, 30000);
+  assert.equal(saved.cumulative_cost_usd, 0.75);
   if (baselineSource !== "local") {
     const cfg = JSON.parse(fs.readFileSync(configPath));
     cfg.usageBaseline = { ...saved };
@@ -488,6 +490,7 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
     if (baselineSource === "unreported-local") {
       cfg.usageBaseline.cumulative_input_tokens = 100000;
       cfg.usageBaseline.cumulative_output_tokens = 20000;
+      cfg.usageBaseline.cumulative_cost_usd = 0.5;
     }
     fs.writeFileSync(configPath, JSON.stringify(cfg));
     if (baselineSource === "server") fs.unlinkSync(statePath);
@@ -499,14 +502,55 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
   postedEvents.length = 0;
   const resumed = launchExtension();
   await resumed.session_start({}, ctx);
-  await recordUsage(resumed, 2000, 900, 250);
+  await recordUsage(resumed, 2000, 900, 250, 0.25);
+  await recordUsage(resumed, 2000, 900, 250, 0.25);
   const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
   assert.deepEqual(usageEvents().map(({data}) => [
-    data.cumulative_input_tokens, data.cumulative_output_tokens, data.model,
+    data.cumulative_input_tokens, data.cumulative_output_tokens, data.cumulative_cost_usd,
   ]), [
-    ...(reasserts ? [[150000, 30000, "databricks-claude-sonnet-4-6"]] : []),
-    [150900, 30250, "databricks-claude-sonnet-4-6"],
+    ...(reasserts ? [[150000, 30000, 0.75]] : []),
+    [150900, 30250, 1],
   ]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("cost", [None, 0, -1, "0.5", True])
+@pytest.mark.parametrize("baseline_source", ["local", "server"])
+@pytest.mark.parametrize("priced_first", [False, True])
+def test_incomplete_pi_cost_keeps_server_pricing(
+    cost: object, baseline_source: str, priced_first: bool
+) -> None:
+    script = (
+        _usage_test_preamble()
+        + "\nconst cost = "
+        + json.dumps(cost)
+        + "; const baselineSource = "
+        + json.dumps(baseline_source)
+        + "; const pricedFirst = "
+        + json.dumps(priced_first)
+        + ";\n"
+        + r"""
+(async () => {
+  await recordUsage(handlers, 1000, 100, 20, pricedFirst ? 0.5 : cost);
+  await recordUsage(handlers, 2000, 100, 20, pricedFirst ? cost : 0.5);
+  assert.ok(!("cumulative_cost_usd" in usageEvents().at(-1).data));
+  assert.equal(usageEvents().at(-1).data.cost_complete, false);
+  postedEvents.length = 0;
+  const cfg = JSON.parse(fs.readFileSync(configPath));
+  cfg.usageBaseline = JSON.parse(fs.readFileSync(statePath));
+  delete cfg.usageBaseline.cost_complete;
+  if (baselineSource === "server") fs.unlinkSync(statePath);
+  else cfg.usageBaseline.cumulative_cost_usd = 0.75; // stale display subtotal
+  fs.writeFileSync(configPath, JSON.stringify(cfg));
+  const resumed = launchExtension();
+  await resumed.session_start({}, ctx);
+  await recordUsage(resumed, 3000, 100, 20, 0.5);
+  assert.ok(usageEvents().every(({data}) => !("cumulative_cost_usd" in data)));
+  assert.equal(usageEvents().at(-1).data.cumulative_input_tokens, 300);
 })().catch(error => { console.error(error); process.exit(1); });
 """
     )
@@ -982,6 +1026,23 @@ fs.writeFileSync(
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
+// Advance retry delays only; request timeouts still use real timers.
+const retryDelays = [];
+let now = Date.now();
+Date.now = () => now;
+const originalSetTimeout = global.setTimeout;
+global.setTimeout = (callback, delay, ...args) => {
+  if ([1000, 2000, 4000, 8000].includes(delay)) {
+    retryDelays.push(delay);
+    now += delay;
+    queueMicrotask(() => callback(...args));
+    return {};
+  }
+  return originalSetTimeout(callback, delay, ...args);
+};
+const diagnostics = [];
+console.error = (...args) => diagnostics.push(args.map(String).join(" "));
+
 const posted = [];
 let fetchCalls = 0;
 const responses = [];
@@ -999,7 +1060,9 @@ const pi = {
   on(name, handler) { handlers[name] = handler; },
 };
 require(extensionPath)(pi);
-const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
+const notices = [];
+const ctx = { ui: { setTitle() {}, setStatus() {}, notify(text) { notices.push(text); } } };
+const settleHistory = () => new Promise(setImmediate);
 function assistantItems() {
   return posted.filter(
     (event) =>
@@ -1028,6 +1091,7 @@ def test_assistant_message_retries_with_stable_source_and_exact_text(
   };
   await handlers.message_end({ message }, ctx);
 
+  await settleHistory();
   const attempts = assistantItems();
   assert.equal(fetchCalls, 2, JSON.stringify(posted));
   assert.equal(attempts.length, 2, JSON.stringify(attempts));
@@ -1055,10 +1119,10 @@ def test_assistant_message_retries_with_stable_source_and_exact_text(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_assistant_message_failure_propagates_and_400_is_not_retried(
+def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     tmp_path: Path,
 ) -> None:
-    """Exhausted transient failures reject, while a permanent 400 is single-shot."""
+    """Background failures notify the user; permanent errors are single-shot."""
     script = (
         _ASSISTANT_DURABILITY_HARNESS
         + r"""
@@ -1074,16 +1138,13 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     responseId: "pi-response-transient",
     content: [{ type: "text", text: "retry then surface" }],
   };
-  let failure;
-  try {
-    await handlers.message_end({ message: transientMessage }, ctx);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, "exhausted assistant persistence must reject");
-  assert.match(String(failure && failure.message), /HTTP 503/);
-  assert.equal(fetchCalls, 3, JSON.stringify(posted));
-  assert.equal(assistantItems().length, 3, JSON.stringify(posted));
+  await handlers.message_end({ message: transientMessage }, ctx);
+  await settleHistory();
+  assert.equal(notices.length, 1);
+  assert.match(diagnostics.join("\n"), /HTTP 503/);
+  assert.equal(fetchCalls, 5, JSON.stringify(posted));
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.equal(assistantItems().length, 5, JSON.stringify(posted));
   assert.equal(
     new Set(assistantItems().map((item) => item.data.source_id)).size,
     1,
@@ -1097,7 +1158,7 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     return { ok: true, status: 204 };
   };
   await handlers.message_end({ message: transientMessage }, ctx);
-  assert.equal(fetchCalls, 4, JSON.stringify(posted));
+  assert.equal(fetchCalls, 6, JSON.stringify(posted));
 
   global.fetch = async (_url, request) => {
     posted.push(JSON.parse(request.body));
@@ -1110,15 +1171,12 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     responseId: "pi-response-permanent",
     content: [{ type: "text", text: "bad request answer" }],
   };
-  failure = undefined;
-  try {
-    await handlers.message_end({ message: permanentMessage }, ctx);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, "permanent assistant persistence must reject");
-  assert.match(String(failure && failure.message), /HTTP 400/);
-  assert.equal(fetchCalls, 5, JSON.stringify(posted));
+  await handlers.message_end({ message: permanentMessage }, ctx);
+  await settleHistory();
+  assert.equal(notices.length, 2);
+  assert.match(diagnostics.join("\n"), /HTTP 400/);
+  assert.equal(fetchCalls, 7, JSON.stringify(posted));
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -1126,6 +1184,670 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user", "compaction"])
+def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const kind = process.argv[3];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "boundary", summary: "checkpoint" } }],
+      messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 100 }],
+    }),
+  };
+  const events = {
+    tool_call: ["message_update", { assistantMessageEvent: {
+      type: "toolcall_end", toolCall: { id: "call-1", name: "read", arguments: { path: "a" } },
+    } }],
+    tool_result: ["tool_result", {
+      toolCallId: "call-1", content: [{ type: "text", text: "result" }],
+    }],
+    reasoning: ["message_update", { assistantMessageEvent: {
+      type: "thinking_end", contentIndex: 0, content: "plan",
+    } }],
+    user: ["input", { text: "terminal prompt", source: "extension" }],
+    compaction: ["session_compact", {}],
+  };
+  if (kind === "tool_result") {
+    await handlers.message_update(events.tool_call[1], ctx);
+    await settleHistory();
+    posted.length = 0;
+  }
+  const [handler, event] = events[kind];
+  const invoke = () => handlers[handler](event, ctx);
+  let status = 503;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.type !== "external_conversation_item") return { ok: true, status: 204 };
+    return { ok: status === 204, status };
+  };
+  await invoke();
+  await settleHistory();
+  assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(
+    notices, kind === "compaction" ? ["Omnigent could not save the compaction checkpoint."] : [],
+  );
+  let items = posted.filter((body) => body.type === "external_conversation_item");
+  assert.equal(items.length, 5);
+  assert.ok(items[0].data.source_id);
+  for (const item of items) assert.deepEqual(item, items[0]);
+
+  status = 204;
+  await invoke();
+  await settleHistory();
+  items = posted.filter((body) => body.type === "external_conversation_item");
+  assert.equal(items.length, 6);
+  if (kind === "compaction") assert.equal(items[5].data.source_id, items[0].data.source_id);
+  if (kind !== "user" && kind !== "compaction") {
+    // A rejected delivery remains eligible; accepted callbacks are suppressed.
+    assert.deepEqual(items[0], items[5]);
+    await invoke();
+  await settleHistory();
+    assert.equal(posted.filter((body) => body.type === "external_conversation_item").length, 6);
+  }
+  if (kind === "reasoning") {
+    const deltas = posted.filter((body) => body.type === "external_output_reasoning_delta");
+    assert.equal(deltas.length, 1);
+  }
+})().catch((error) => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("receipt", ["valid", "unreadable", "absent", "timeout"])
+def test_compaction_snapshot_orders_history_and_tolerates_receipts(
+    tmp_path: Path, receipt: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const receiptMode = process.argv[3];
+  const messages = [
+    { role: "system", content: "", sections: {tools: "read"} },
+    { role: "compactionSummary", summary: "checkpoint", tokensBefore: 9000 },
+    { role: "branchSummary", summary: "branch work", fromId: "branch-1" },
+    { role: "user", content: [
+      {type: "text", text: "look"}, {type: "image", data: "SU1BR0U=", mimeType: "image/png"},
+    ] },
+    { role: "custom", customType: "note", content: "extension note", display: true },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "hidden reasoning" },
+      { type: "text", text: "reading" },
+      { type: "toolCall", id: "read-1", name: "read", arguments: {path: "a"} },
+    ] },
+    { role: "toolResult", toolCallId: "read-1", toolName: "read",
+      content: [{type: "text", text: "retained result"}] },
+    { role: "bashExecution", command: "ls", output: "in context", exitCode: 0 },
+    { role: "bashExecution", command: "make", output: "", exitCode: 2 },
+    { role: "bashExecution", command: "sleep 9", output: "partial", exitCode: null,
+      cancelled: true },
+    { role: "bashExecution", command: "cat big", output: "head", exitCode: 0, truncated: true,
+      fullOutputPath: "/tmp/full.log" },
+    { role: "bashExecution", command: "cat .env", output: "excluded", excludeFromContext: true },
+  ];
+  const userText = (text) => ({
+    type: "message", role: "user", content: [{type: "input_text", text}],
+  });
+  const expectedSnapshot = [
+    userText(
+      "The conversation history before this point was compacted into the following summary:" +
+      "\n\n<summary>\ncheckpoint\n</summary>",
+    ),
+    userText(
+      "The following is a summary of a branch that this conversation came back from:" +
+      "\n\n<summary>\nbranch work</summary>",
+    ),
+    userText("look"),
+    userText("extension note"),
+    { type: "message", role: "assistant", content: [{type: "output_text", text: "reading"}] },
+    { type: "function_call", call_id: "read-1", name: "read", arguments: '{"path":"a"}' },
+    { type: "function_call_output", call_id: "read-1", output: "retained result" },
+    userText("Ran `ls`\n```\nin context\n```"),
+    userText("Ran `make`\n(no output)\n\nCommand exited with code 2"),
+    userText("Ran `sleep 9`\n```\npartial\n```\n\n(command cancelled)"),
+    userText("Ran `cat big`\n```\nhead\n```\n\n[Output truncated. Full output: /tmp/full.log]"),
+  ];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+      messages,
+    }),
+  };
+  let release;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.data.item_type === "message") {
+      await new Promise(resolve => { release = resolve; });
+    }
+    const response = { ok: true, status: 200 };
+    if (receiptMode !== "absent") response.json = async () => {
+      if (receiptMode === "unreadable") throw new Error("receipt truncated after commit");
+      if (receiptMode === "timeout") await new Promise((_resolve, reject) => {
+        const fail = () => reject(new Error("receipt timed out"));
+        if (request.signal.aborted) return fail();
+        request.signal.addEventListener("abort", fail);
+      });
+      return { item_id: "persisted-user" };
+    };
+    return response;
+  };
+  await handlers.input({text: "covered input", source: "extension"}, ctx);
+  // Repeated summary text can make Pi's event point at an older checkpoint.
+  const compacting = handlers.session_compact(
+    {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
+  );
+  messages[6].content[0].text = "later mutation";
+  assert.equal(posted.length, 1, "checkpoint cannot overtake pending history");
+  release();
+  await compacting;
+  assert.equal(posted.length, 2);
+  const compact = posted[1].data;
+  assert.equal(compact.item_type, "compaction");
+  assert.equal(compact.source_id, "pi:compaction:native-1:latest");
+  assert.equal(compact.item_data.window_id, "latest");
+  assert.equal(compact.item_data.summary, "checkpoint");
+  assert.equal(compact.item_data.last_item_id,
+    receiptMode === "valid" ? "persisted-user" : "compact_boundary_session-1");
+  assert.deepEqual(compact.item_data.compacted_messages, expectedSnapshot);
+  assert.deepEqual(retryDelays, []);
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(notices, []);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unsupported",
+        "projection_error",
+        "unreadable_message",
+        "no_checkpoint",
+        "session_id_error",
+        "stalled",
+    ],
+)
+def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const failure = process.argv[3];
+  const projection = {
+    entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+    messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 1 }],
+  };
+  ctx.sessionManager = { getSessionId: () => {
+    if (failure === "session_id_error") throw new Error("session id unavailable");
+    return "native-1";
+  } };
+  if (failure === "no_checkpoint") projection.entries = [{ sourceEntry: { type: "message" } }];
+  if (failure !== "unsupported") {
+    ctx.sessionManager.buildSessionProjection = () => {
+      if (failure === "projection_error") throw new Error("projection failed");
+      return projection;
+    };
+  }
+  if (failure === "unreadable_message") {
+    projection.messages.push({ role: "custom", get content() { throw new Error("unreadable"); } });
+  }
+  let budgetWaits = 0;
+  if (failure === "stalled") {
+    global.fetch = async (_url, request) => {
+      posted.push(JSON.parse(request.body));
+      return new Promise(() => {});
+    };
+    await handlers.input({ text: "stuck input", source: "extension" }, ctx);
+    const harnessSetTimeout = global.setTimeout;
+    global.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 30000) return harnessSetTimeout(callback, delay, ...args);
+      budgetWaits += 1;
+      queueMicrotask(() => callback(...args));
+      return {};
+    };
+  }
+  let guard;
+  await Promise.race([
+    handlers.session_compact({}, ctx),
+    new Promise((_resolve, reject) => {
+      guard = originalSetTimeout(() => reject(new Error("session_compact blocked Pi")), 2000);
+    }),
+  ]).finally(() => clearTimeout(guard));
+  const items = posted.filter((body) => body.type === "external_conversation_item");
+  const itemTypes = items.map((body) => body.data.item_type);
+  assert.deepEqual(itemTypes, failure === "stalled" ? ["message"] : []);
+  assert.equal(budgetWaits, failure === "stalled" ? 1 : 0);
+  const failed = failure !== "unsupported" && failure !== "stalled";
+  assert.deepEqual(notices, failed ? ["Omnigent could not save the compaction checkpoint."] : []);
+  if (failed) assert.match(diagnostics.join("\n"), /Compaction snapshot failed/);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), failure)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const started = Date.now();
+  global.fetch = async () => {
+    fetchCalls += 1;
+    now += 5000;
+    return { ok: false, status: 503 };
+  };
+  await handlers.input({ text: "keep working", source: "extension" }, ctx);
+  await settleHistory();
+  assert.equal(fetchCalls, 4);
+  assert.deepEqual(retryDelays, [1000, 2000, 4000]);
+  assert.equal(Date.now() - started, 27000);
+  assert.match(diagnostics.join("\n"), /Failed to persist message/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("handler", ["message_end", "turn_end"])
+def test_failed_history_item_preserves_later_items_and_usage(tmp_path: Path, handler: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const handler = process.argv[3];
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    const failed = body.data?.item_data?.call_id === "failed";
+    if (!failed) accepted.push(body);
+    return { ok: !failed, status: failed ? 503 : 204 };
+  };
+  const message = {
+    role: "assistant", timestamp: 42, model: "test-model",
+    usage: { input: 10, output: 2 },
+    content: [
+      { type: "toolCall", id: "failed", name: "read", arguments: {} },
+      { type: "toolCall", id: "later", name: "read", arguments: {} },
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "answer" },
+    ],
+  };
+  await handlers[handler]({ message, toolResults: [
+    { toolCallId: "failed", content: [{ type: "text", text: "failed output" }] },
+    { toolCallId: "later", content: [{ type: "text", text: "later output" }] },
+  ] }, ctx);
+  await settleHistory();
+  const items = accepted.filter(item => item.type === "external_conversation_item");
+  assert.deepEqual(items.map(item => item.data.item_type), [
+    "function_call", "reasoning", handler === "message_end" ? "message" : "function_call_output",
+  ]);
+  assert.ok(accepted.some(item => item.type === "external_session_usage"));
+  await settleHistory();
+  assert.match(diagnostics.join("\n"), /Failed to persist function_call/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), handler)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_reasoning_identity_survives_lost_ack_across_callbacks(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let loseAck = true;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.data?.item_type === "reasoning" && loseAck) throw new Error("lost ack");
+    return { ok: true, status: 204 };
+  };
+  await handlers.message_update({ assistantMessageEvent: {
+    type: "thinking_end", contentIndex: 0, content: "plan",
+  } }, ctx);
+  await settleHistory();
+  loseAck = false;
+  await handlers.message_end({ message: { role: "assistant", content: [
+    { type: "thinking", thinking: "plan", thinkingSignature: "different-hint" },
+  ] } }, ctx);
+  await settleHistory();
+  const reasoning = posted.filter(item => item.data?.item_type === "reasoning");
+  assert.equal(reasoning.length, 6);
+  assert.equal(new Set(reasoning.map(item => item.data.source_id)).size, 1);
+  assert.equal(posted.filter(item => item.type === "external_output_reasoning_delta").length, 1);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("verdict", ["ALLOW", "DENY"])
+def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
+    tmp_path: Path, verdict: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let release, policyCalls = 0;
+  const accepted = [];
+  global.fetch = async (url, request) => {
+    if (!url.endsWith('/events')) {
+      policyCalls++;
+      return {ok: true,
+    text: async () => JSON.stringify({result: `POLICY_ACTION_${process.argv[3]}`})};
+    }
+    const body = JSON.parse(request.body);
+    if (body.type !== 'external_conversation_item') return {ok: true, status: 204};
+    if (!release) await new Promise(resolve => { release = resolve; });
+    accepted.push(body.data);
+    return {ok: true, status: 204};
+  };
+  const tool = {id: 'call-1', name: 'read', arguments: {path: 'example.txt'}};
+  const result = {toolCallId: 'call-1', content: [{type: 'text', text: 'contents'}]};
+  const message = {role: 'assistant', timestamp: 12, content: [
+    {type: 'toolCall', ...tool}, {type: 'thinking', thinking: 'plan'}, {type: 'text',
+    text: 'done'},
+  ]};
+  const watchdog = originalSetTimeout(() => { throw new Error('history blocked Pi hooks'); }, 500);
+  await handlers.input({text: 'read a file', source: 'extension'}, ctx);
+  await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
+    toolCall: tool}}, ctx);
+  const decision = await handlers.tool_call({toolCallId: tool.id, toolName: tool.name,
+    input: tool.arguments}, ctx);
+  assert.equal(policyCalls, 1);
+  assert.equal(Boolean(decision?.block), process.argv[3] === 'DENY');
+  if (!decision?.block) await handlers.tool_result(result, ctx);
+  await handlers.message_end({message}, ctx);
+  await handlers.turn_end({message, toolResults: decision?.block ? [] : [result]}, ctx);
+  clearTimeout(watchdog);
+  assert.equal(accepted.length, 0);
+  release();
+  await handlers.session_shutdown();
+  assert.deepEqual(accepted.map(item => item.item_type), [
+    'message', 'function_call', ...(decision?.block ? [] : ['function_call_output']),
+    'reasoning', 'message',
+  ]);
+  assert.equal(new Set(accepted.map(item => item.source_id)).size, accepted.length);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), verdict)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "saved",
+        "rejected",
+        "deadline",
+        "aborted",
+        "model-error",
+        "empty",
+        "no-response",
+        "tool-abort",
+        "early-abort",
+    ],
+)
+def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const mode = process.argv[3];
+  const aborted = ['aborted', 'tool-abort', 'early-abort'].includes(mode);
+  let release;
+  let completionAttempts = 0;
+  global.setTimeout = (callback, delay, ...args) =>
+    originalSetTimeout(callback, delay === 30000 ? 50 : delay, ...args);
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.type === 'external_conversation_item') {
+      await new Promise(resolve => { release = resolve; });
+      return {ok: mode !== 'rejected', status: mode === 'rejected' ? 400 : 204};
+    }
+    if (body.type === 'external_session_status' && body.data.status !== 'running') {
+      completionAttempts++;
+    }
+    return {ok: true, status: 204};
+  };
+  await handlers.agent_start({}, ctx);
+  if (mode.endsWith('-abort')) ctx.signal = AbortSignal.abort();
+  if (!['no-response', 'early-abort'].includes(mode)) {
+    await handlers.message_end({message: {role: 'assistant', timestamp: 20,
+      stopReason: mode === 'tool-abort' ? 'toolUse' : mode === 'aborted' ? 'aborted'
+        : mode === 'model-error' ? 'error' : 'stop',
+      errorMessage: mode === 'model-error' ? 'Provider refused this turn' : undefined,
+      content: mode === 'empty' ? [] : [{type: 'text', text: 'current result'}],
+    }}, ctx);
+  }
+  const finished = handlers.agent_end({}, ctx);
+  await settleHistory();
+  if (!['empty', 'no-response', 'early-abort'].includes(mode)) {
+    assert.equal(completionAttempts, 0);
+  }
+  assert.ok(posted.some(e => e.type === 'subagent.status' && e.data.idle === true));
+  if (mode === 'deadline') {
+    await finished;
+    release();
+  } else {
+    release?.();
+    await finished;
+  }
+  const terminal = posted.filter(e => e.type === 'external_session_status').at(-1).data;
+  const failed = ['rejected', 'deadline', 'model-error', 'no-response'].includes(mode);
+  assert.equal(terminal.status, failed ? 'failed' : 'idle');
+  assert.equal(terminal.turn_completed, !failed && !aborted);
+  const expectedOutcome = failed ? 'failed' : aborted ? 'cancelled' : 'completed';
+  assert.equal(terminal.turn_outcome, expectedOutcome);
+  assert.equal(terminal.output, ['empty', 'early-abort'].includes(mode) ? ''
+    : mode === 'no-response'
+    ? 'Pi turn ended without a final response.' : mode === 'model-error'
+    ? 'Pi model error: Provider refused this turn' : failed
+    ? 'Omnigent could not save the Pi turn output; see host logs.' : 'current result');
+  if (failed) assert.equal(terminal.failure_detail, terminal.output);
+  assert.equal(completionAttempts, 1);
+  await handlers.session_shutdown();
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), mode)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "mode", ["queued-input", "queued-followup", "superseded-history", "superseded-retry"]
+)
+def test_ending_turn_does_not_wait_for_later_input_or_retry_after_supersession(
+    tmp_path: Path, mode: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const mode = process.argv[3];
+  const releases = [];
+  const accepted = [];
+  let attempts = 0;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (body.type === 'external_conversation_item') {
+      await new Promise(resolve => releases.push(resolve));
+    }
+    if (body.data?.turn_outcome) {
+      attempts++;
+      if (mode === 'superseded-retry') {
+        await handlers.agent_start({}, ctx);
+        return {ok: false, status: 503};
+      }
+    }
+    accepted.push(body);
+    return {ok: true, status: 204};
+  };
+  await handlers.agent_start({}, ctx);
+  const firstId = accepted.at(-1).data.response_id;
+  await handlers.message_end({message: {role: 'assistant', timestamp: 1,
+    content: [{type: 'text', text: 'first answer'}], stopReason: 'stop'}}, ctx);
+  let finished = false;
+  const ending = handlers.agent_end({}, ctx).then(() => { finished = true; });
+  await settleHistory();
+  if (mode === 'superseded-history') await handlers.agent_start({}, ctx);
+  await handlers.input({text: 'next prompt', source: 'extension'}, ctx);
+  ctx.hasPendingMessages = () => mode === 'queued-followup';
+  releases.shift()();
+  await settleHistory();
+  assert.equal(finished, true, 'ending turn waited for a later queued prompt');
+  await ending;
+  const outcomes = accepted.filter(e => e.data?.turn_outcome);
+  if (mode === 'queued-input') {
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0].data.response_id, firstId);
+    assert.equal(outcomes[0].data.output, 'first answer');
+  } else {
+    assert.deepEqual(outcomes, []);
+    const statuses = accepted.filter(e => e.type === 'external_session_status');
+    assert.equal(statuses.at(-1).data.status, 'running');
+    if (mode !== 'queued-followup') {
+      assert.notEqual(statuses.at(-1).data.response_id, firstId);
+    }
+    assert.equal(attempts, mode === 'superseded-retry' ? 1 : 0);
+  }
+  releases.shift()();
+  await handlers.session_shutdown();
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), mode)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_result_retries_its_failed_call_before_delivery(tmp_path: Path, recover: bool) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let status = 503;
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (body.type !== 'external_conversation_item') return {ok: true, status: 204};
+    const code = body.data.item_type === 'function_call' ? status : 204;
+    if (code === 204) accepted.push(body.data.item_type);
+    return {ok: code === 204, status: code};
+  };
+  const tool = {id: 'call-1', name: 'read', arguments: {path: 'example.txt'}};
+  await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
+    toolCall: tool}}, ctx);
+  await settleHistory();
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  status = process.argv[3] === 'True' ? 204 : 400;
+  const result = {toolCallId: 'call-1', content: [{type: 'text', text: 'contents'}]};
+  await handlers.tool_result(result, ctx);
+  await handlers.turn_end({message: {role: 'assistant', content: [{type: 'toolCall',
+    ...tool}]}, toolResults: [result]}, ctx);
+  await handlers.tool_result({...result, toolCallId: 'unknown'}, ctx);
+  await handlers.session_shutdown();
+  assert.deepEqual(accepted, status === 204 ? ['function_call', 'function_call_output'] : []);
+  assert.match(diagnostics.join('\n'), /Withholding result without a queued call/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), str(recover))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
+    tmp_path: Path, shutdown: bool
+) -> None:
+    harness = _ASSISTANT_DURABILITY_HARNESS
+    if shutdown:
+        harness = harness.replace(
+            "assistantItemPostTimeoutMs: 10", "assistantItemPostTimeoutMs: 60000"
+        )
+    script = (
+        harness
+        + r"""
+(async () => {
+  let aborts = 0;
+  global.fetch = async (_url, request) => new Promise((_resolve, reject) => {
+    request.signal.addEventListener('abort', () => {
+      aborts++;
+      reject(request.signal.reason);
+    }, {once: true});
+  });
+  await handlers.input({text: 'hang', source: 'extension'}, ctx);
+  const start = performance.now();
+  await handlers.session_shutdown();
+  const elapsed = performance.now() - start;
+  assert.equal(aborts, process.argv[3] === 'True' ? 1 : 5, JSON.stringify({diagnostics,
+    retryDelays,elapsed}));
+  assert.ok(elapsed < 6500, String(elapsed));
+  if (process.argv[3] === 'True') assert.ok(elapsed >= 4900, String(elapsed));
+  assert.match(diagnostics.join('\n'), /Failed to persist/);
+  await handlers.input({text: 'after shutdown', source: 'extension'}, ctx);
+  assert.match(diagnostics.join('\n'), /History queue closed/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), str(shutdown))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("limit", ["items", "bytes"])
+def test_history_queue_bounds_backlog(tmp_path: Path, limit: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let release;
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (!release) await new Promise(resolve => { release = resolve; });
+    accepted.push(body.data.item_data.content[0].text);
+    return {ok: true, status: 204};
+  };
+  const items = process.argv[3] === 'items';
+  const count = items ? 257 : 3;
+  for (let index = 0; index < count; index++) {
+    await handlers.input({text: items ? String(index) : 'x'.repeat(8 * 1024 * 1024),
+    source: 'extension'}, ctx);
+  }
+  assert.match(diagnostics.join('\n'), /History queue full/);
+  release();
+  await handlers.session_shutdown();
+  assert.equal(accepted.length, items ? 256 : 1);
+  if (items) assert.deepEqual(accepted, Array.from({length: 256}, (_, i) => String(i)));
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), limit)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -4056,7 +4778,14 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
     assert.equal(statuses().at(-1).data.status, "running");
     await handlers.agent_end({}, ctx);
   }
-  assert.equal(statuses().at(-1).data.status, "idle");
+  if (outcome === "complete" || outcome === "error") {
+    assert.equal(statuses().at(-1).data.status, "idle", "runner must leave the busy state");
+    assert.equal(statuses().at(-1).data.turn_completed, false);
+    assert.equal(statuses().at(-1).data.turn_outcome, undefined);
+  } else {
+    assert.equal(statuses().at(-1).data.status, "failed");
+    assert.equal(statuses().at(-1).data.turn_completed, false);
+  }
   if (outcome === "complete") {
     await drain();
     assert.deepEqual(sends, [], "do not start a turn before idle is published");
@@ -4105,12 +4834,15 @@ const originalError = "API key auth failed for provider omnigent: " +
       kind: "failed_exit", piPid: process.pid, at: Date.now(), secret: "DO-NOT-SHOW", ...patch,
     }));
     const bodies = [];
+    let delivered;
+    const delivery = new Promise(resolve => { delivered = resolve; });
     global.fetch = async (_url, request) => {
       const body = JSON.parse(request.body);
       postedEvents.push(body);
       if (body.data && body.data.item_type === "error") {
         bodies.push(body);
         if (bodies.length === 1) throw new Error("socket closed during token resolution");
+        delivered();
       }
       return {ok: true};
     };
@@ -4118,6 +4850,8 @@ const originalError = "API key auth failed for provider omnigent: " +
       role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
       content: [],
     }}, ctx);
+    await delivery;
+    await new Promise(setImmediate);
     const error = postedEvents.find(e => e.data && e.data.item_type === "error");
     assert.ok(error);
     assert.equal(bodies.length, 2);
@@ -4135,6 +4869,7 @@ const originalError = "API key auth failed for provider omnigent: " +
         role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
         content: [], timestamp: Date.now(),
       }}, ctx);
+      await new Promise(setImmediate);
       const nextError = postedEvents.find(e => e.data && e.data.item_type === "error");
       assert.equal(nextError.data.item_data.code, "RuntimeError");
     }

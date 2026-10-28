@@ -55,6 +55,15 @@ mechanisms (env var / server config) on top of this default."""
 
 _logger = logging.getLogger(__name__)
 
+# Where the detached in-sandbox host writes its stdout and stderr.
+HOST_STDOUT_LOG_PATH: str = "/tmp/omnigent-host.log"
+# Bounds on each log tail read by ``capture_logs`` so a huge or single-line
+# log cannot bloat the server log.
+_LOG_TAIL_LINES: int = 100
+_LOG_TAIL_MAX_BYTES: int = 8192
+# In-sandbox process-log destinations tailed by ``capture_logs``.
+_CAPTURED_PROCESS_LOG_DESTINATIONS: tuple[str, ...] = ("host", "runner")
+
 MANAGED_KEEPALIVE_INTERVAL_ENV_VAR: str = "OMNIGENT_MANAGED_KEEPALIVE_INTERVAL_S"
 """Environment variable overriding the managed-sandbox keepalive cadence (seconds)."""
 
@@ -809,7 +818,7 @@ class SandboxExecTransport(SandboxLifecycle):
         """
 
     def run_background(
-        self, sandbox_id: str, command: str, *, log_path: str = "/tmp/omnigent-host.log"
+        self, sandbox_id: str, command: str, *, log_path: str = HOST_STDOUT_LOG_PATH
     ) -> RemoteCommandResult:
         """
         Start *command* under a supervisor as a detached background process.
@@ -966,6 +975,22 @@ class SandboxHostLauncher(SandboxLifecycle):
         """
         del resolve
 
+    def capture_logs(self, sandbox_id: str) -> str | None:
+        """
+        Read the tails of the in-sandbox host and runner logs.
+
+        Called just before the server terminates a sandbox whose teardown
+        asked for diagnostics, since termination destroys those logs.
+        Implementations should bound the read and may raise; the caller
+        treats any failure as "no logs".
+
+        :param sandbox_id: The sandbox about to be terminated.
+        :returns: The captured text, or ``None`` when the provider cannot
+            read files inside its sandboxes (the default).
+        """
+        del sandbox_id
+        return None
+
     @abstractmethod
     def start_host(
         self,
@@ -1018,6 +1043,31 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
     :class:`SandboxHostLauncher` directly and do NOT need ``run()`` or any
     exec transport.
     """
+
+    def capture_logs(self, sandbox_id: str) -> str | None:
+        """
+        Tail the host stdout log and the newest host and runner process logs.
+
+        Each log is cut to its last :data:`_LOG_TAIL_LINES` lines, then to its
+        last :data:`_LOG_TAIL_MAX_BYTES` bytes, keeping the end where the
+        final error usually is.
+
+        :param sandbox_id: The sandbox about to be terminated.
+        :returns: One section per log, each headed ``## <path>``, or
+            ``None`` when no log exists.
+        """
+        tail = f'tail -n {_LOG_TAIL_LINES} "$f" | tail -c {_LOG_TAIL_MAX_BYTES}'
+        logs_root = '"${OMNIGENT_DATA_DIR:-$HOME/.omnigent}/logs"'
+        sections = [f"f={shlex.quote(HOST_STDOUT_LOG_PATH)}"] + [
+            f"f=$(ls -t {logs_root}/{destination}/*.log 2>/dev/null | head -n 1)"
+            for destination in _CAPTURED_PROCESS_LOG_DESTINATIONS
+        ]
+        command = "; ".join(
+            f'{section}; [ -f "$f" ] && {{ printf "\\n## %s\\n" "$f"; {tail}; }}'
+            for section in sections
+        )
+        output = self.run(sandbox_id, command, check=False).stdout.strip()
+        return output or None
 
     def start_host(
         self,

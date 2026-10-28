@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import os
 import tarfile
 from dataclasses import replace
 from pathlib import Path
@@ -94,6 +95,52 @@ def test_session_catalog_matches_invocation_scope(
     resolved = resolve_session_skills(spec, (tmp_path, runner_bundle), runner_bundle)
     assert catalog == [{"name": s.name, "description": s.description} for s in resolved]
     assert resolved[0].skill_dir == runner_bundle / "skills" / "bundled"
+
+
+@pytest.mark.parametrize("remove_link", [True, False], ids=["removed", "permission-denied"])
+def test_session_catalog_handles_host_skill_symlink_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    remove_link: bool,
+) -> None:
+    skills_dir = Path.home() / ".codex" / "skills"
+    local = skills_dir / "local"
+    local.mkdir(parents=True)
+    (local / "SKILL.md").write_text(_skill("local"))
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "SKILL.md").write_text(_skill("changing"))
+    changing = skills_dir / "changing"
+    changing.symlink_to(installed, target_is_directory=True)
+    readlink = os.readlink
+
+    def readlink_during_update(path: str, *, dir_fd: int | None = None) -> str:
+        if path == str(changing):
+            if not remove_link:
+                raise PermissionError("synthetic access denial")
+            # The provider already read SKILL.md; resolve has just seen a symlink.
+            changing.unlink()
+        return readlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "readlink", readlink_during_update)
+    bundle = _bundle(
+        {"skills/bundled/SKILL.md": _skill("bundled")},
+        executor={"config": {"harness": "codex-native"}},
+    )
+    discovery = HostSkillDiscovery(lambda _: _response(bundle))
+    frame = HostSkillsFrame("request", "session", str(tmp_path), "session", "agent", "1")
+    if not remove_link:
+        with pytest.raises(PermissionError, match="synthetic access denial"):
+            discovery.discover(frame, tmp_path)
+        return
+
+    assert discovery.discover(frame, tmp_path) == [
+        {"name": "bundled", "description": "bundled description"},
+        {"name": "local", "description": "local description"},
+    ]
+    assert "Skipping host skill whose directory disappeared during discovery" in caplog.text
+    assert str(changing) not in caplog.text
 
 
 def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> None:

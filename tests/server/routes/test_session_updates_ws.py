@@ -350,6 +350,25 @@ def test_cleared_field_pushes_explicit_null(app: FastAPI, stores, fast_rescan: N
         assert item["runner_id"] is None
 
 
+def test_harness_override_is_streamed_and_cleared(app: FastAPI, stores, fast_rescan: None) -> None:
+    """Harness grouping follows streamed overrides and clears an unknown harness."""
+    conversation_store = stores[0]
+    session_id = _seed_session(stores, owner=ALICE, title="custom agent")
+    conversation_store.update_conversation(session_id, harness_override="pi")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["harness"] == "pi"
+        conversation_store.update_conversation(session_id, _unset_harness_override=True)
+        changed = _recv_until(ws, {"changed"})
+        item = {item["id"]: item for item in changed["items"]}[session_id]
+        # The seeded agent has no bundle, so its default harness is unknown.
+        assert "harness" in item
+        assert item["harness"] is None
+
+
 def test_no_change_emits_no_changed_frame(app: FastAPI, stores, fast_rescan: None) -> None:
     """An idle watched session produces no ``changed`` frames — only
     heartbeats — so a static list generates no diff traffic."""
@@ -685,6 +704,192 @@ def test_comment_add_pushes_changed_frame(
         # means the WS builder isn't reading the comment store.
         assert changed_items[s1]["comments_count"] == 1
         assert changed_items[s1]["comments_updated_at"] == 1_000 * _US
+
+
+def test_reported_pull_request_reaches_the_session_list_and_stream(
+    app: FastAPI, stores, db_uri: str, fast_rescan: None
+) -> None:
+    """A PR the host reports reaches the sidebar through the list and the stream's diff.
+
+    The sidebar tooltip and canvas cards read the session's first PR from
+    its list item instead of asking the runner, so they keep showing it
+    while the host is offline.
+    """
+    from omnigent.stores.session_pull_request_store import (
+        FetchedState,
+        PullRequestReport,
+        SessionPullRequestStore,
+    )
+
+    url = "https://github.com/example/one/pull/42"
+    s1 = _seed_session(stores, owner=ALICE, title="opened a PR")
+    pull_requests = SessionPullRequestStore(db_uri)
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["pull_request"] is None
+
+        report = PullRequestReport(
+            url=url,
+            provider="github",
+            host="github.com",
+            repository="example/one",
+            number=42,
+            relationship="created",
+            first_seen_at=1.0,
+            last_seen_at=1.0,
+        )
+        pull_requests.apply_report(s1, [report])
+        pull_requests.apply_report(
+            s1,
+            [report],
+            fetched=FetchedState(
+                url=url, number=42, state="MERGED", is_draft=False, title="Ship it"
+            ),
+            requested_at=2.0,
+            complete=True,
+        )
+        # A rescan may land between the two writes; wait for the fetched state.
+        for _ in range(5):
+            changed = _recv_until(ws, {"changed"})
+            if changed["items"][0]["pull_request"]["state"] is not None:
+                break
+        assert changed["items"][0]["pull_request"] == {
+            "url": url,
+            "provider": "github",
+            "provider_display": {
+                "id": "github",
+                "display_name": "GitHub",
+                "request_name": "pull request",
+                "number_prefix": "#",
+            },
+            "repository": "example/one",
+            "number": 42,
+            "title": "Ship it",
+            "state": "MERGED",
+            "is_draft": False,
+            "state_checked_at": 2.0,
+        }
+        assert changed["items"][0]["pull_requests_synced"] is True
+    listed = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    [item] = [item for item in listed.json()["data"] if item["id"] == s1]
+    assert item["pull_request"] == changed["items"][0]["pull_request"]
+
+
+def test_runner_reported_pull_requests_are_stored_without_a_read(
+    app: FastAPI, stores, db_uri: str
+) -> None:
+    """A PR the runner reports during a turn is listed even if nobody opened the session."""
+    url = "https://github.com/example/one/pull/42"
+    sid = _seed_session(stores, owner=ALICE, title="opened a PR")
+    client = TestClient(app)
+    headers = {"X-Forwarded-Email": ALICE}
+    event = {
+        "type": "external_pull_requests",
+        "data": {
+            "prs": [
+                {
+                    "url": url,
+                    "provider": "github",
+                    "host": "github.com",
+                    "repository": "example/one",
+                    "number": 42,
+                    "relationship": "created",
+                    "first_seen_at": 1.0,
+                    "last_seen_at": 1.0,
+                    "title": "Ship it",
+                }
+            ]
+        },
+    }
+    # A replay after a lost acknowledgement changes nothing.
+    for _ in range(2):
+        response = client.post(f"/v1/sessions/{sid}/events", json=event, headers=headers)
+        assert response.status_code == 202, response.text
+    stored = client.get(f"/v1/sessions/{sid}/pull-requests", headers=headers).json()
+    assert [(pr["url"], pr["title"]) for pr in stored["data"]] == [(url, "Ship it")]
+    [item] = [
+        item
+        for item in client.get("/v1/sessions", headers=headers).json()["data"]
+        if item["id"] == sid
+    ]
+    # Reports are not the host's whole list, so the session isn't synced yet.
+    assert (item["pull_request"]["url"], item["pull_requests_synced"]) == (url, False)
+
+    unlinked = client.delete(
+        f"/v1/sessions/{sid}/pull-requests", params={"url": url}, headers=headers
+    )
+    assert unlinked.status_code == 200, unlinked.text
+    client.post(f"/v1/sessions/{sid}/events", json=event, headers=headers)
+    assert client.get(f"/v1/sessions/{sid}/pull-requests", headers=headers).json()["data"] == []
+
+
+def test_listed_sessions_that_need_it_are_refreshed_in_the_background(
+    stores, liveness_state, comment_store, db_uri: str
+) -> None:
+    """Never-imported sessions and stale open PRs are refreshed; fresh ones are not."""
+    import time
+
+    from omnigent.server.session_pull_requests import PullRequestRefresher
+    from omnigent.stores.session_pull_request_store import (
+        FetchedState,
+        PullRequestReport,
+        SessionPullRequestStore,
+    )
+
+    class _Spy(PullRequestRefresher):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested: list[str] = []
+
+        def request(self, session_id: str) -> None:
+            self.requested.append(session_id)
+
+    conversation_store, agent_store, permission_store = stores
+    spy = _Spy()
+    app = FastAPI()
+    app.include_router(
+        create_sessions_router(
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+            auth_provider=UnifiedAuthProvider(source="header"),
+            permission_store=permission_store,
+            comment_store=comment_store,
+            pull_request_refresher=spy,
+        ),
+        prefix="/v1",
+    )
+    never_imported, fresh, stale = (
+        _seed_session(stores, owner=ALICE, title=title) for title in ("new", "fresh", "stale")
+    )
+    url = "https://github.com/example/one/pull/42"
+    report = PullRequestReport(
+        url=url,
+        provider="github",
+        host="github.com",
+        repository="example/one",
+        number=42,
+        relationship="created",
+        first_seen_at=1.0,
+        last_seen_at=1.0,
+    )
+    pull_requests = SessionPullRequestStore(db_uri)
+    for sid, checked_at in ((fresh, time.time()), (stale, time.time() - 600)):
+        pull_requests.apply_report(
+            sid,
+            [report],
+            fetched=FetchedState(url=url, number=42, state="OPEN", is_draft=False),
+            requested_at=checked_at,
+            complete=True,
+        )
+
+    listed = TestClient(app).get("/v1/sessions", headers={"X-Forwarded-Email": ALICE})
+    items = {item["id"]: item for item in listed.json()["data"]}
+    assert items[never_imported]["pull_requests_synced"] is False
+    assert items[fresh]["pull_requests_synced"] is True
+    assert sorted(spy.requested) == sorted([never_imported, stale])
 
 
 def test_comment_status_change_pushes_changed_frame(
