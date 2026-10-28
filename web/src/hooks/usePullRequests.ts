@@ -34,7 +34,7 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -187,6 +187,8 @@ export interface PullRequestCapabilities {
   label_editing?: boolean;
   /** The PR can be merged from the panel; absent from older hosts. */
   merging?: boolean;
+  /** Top-level comments can be posted; absent from older hosts. */
+  comment_posting?: boolean;
   /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
@@ -215,6 +217,12 @@ export interface PullRequestAssociation {
   /** Git provider id; absent from hosts that predate providers (GitHub). */
   provider?: string;
   provider_display?: GitProviderDisplay;
+  /** "OPEN" | "MERGED" | "CLOSED" as the host last fetched it; null until it does. */
+  state?: string | null;
+  /** Whether the PR was a draft at that fetch. */
+  is_draft?: boolean;
+  /** Epoch seconds of that fetch, or null. */
+  state_checked_at?: number | null;
 }
 
 function prQuery(prUrl?: string): string {
@@ -332,9 +340,18 @@ export interface PullRequestFileDiffResponse {
   after: string | null;
 }
 
+class PullRequestApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 /** Surface the server's error message (e.g. a git failure) rather than a bare
  *  status code, mirroring the workspace hooks. */
-async function errorFromResponse(res: Response): Promise<Error> {
+export async function errorFromResponse(res: Response): Promise<Error> {
   let message = `${res.status} ${res.statusText}`;
   try {
     const body = (await res.json()) as { error?: { message?: string }; detail?: unknown };
@@ -343,7 +360,7 @@ async function errorFromResponse(res: Response): Promise<Error> {
   } catch {
     // Non-JSON body (gateway/front-door error) — keep the status line.
   }
-  return new Error(message);
+  return new PullRequestApiError(message, res.status);
 }
 
 /** Classify a 404 body from the GitHub resource endpoint.
@@ -660,21 +677,30 @@ export function usePullRequestDiff(
   });
 }
 
+/** Link or unlink a PR through the runner or host; returns the refreshed info. */
+export async function updateSessionPr(
+  conversationId: string,
+  body: { url: string; action: "attach" | "remove" },
+): Promise<PullRequestInfo> {
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) throw await errorFromResponse(response);
+  return normalizePullRequestInfo((await response.json()) as PullRequestInfo);
+}
+
 export function useUpdateSessionPr(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (body: { url: string; action: "attach" | "remove" }) => {
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
-      );
-      if (!response.ok) throw await errorFromResponse(response);
-      return normalizePullRequestInfo((await response.json()) as PullRequestInfo);
-    },
+    // Per session, so a link still running after a session switch updates only its own.
+    mutationKey: ["update-session-pr", conversationId],
+    mutationFn: (body: { url: string; action: "attach" | "remove" }) =>
+      updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
       queryClient.setQueryData(["github-info", conversationId], info);
@@ -707,6 +733,7 @@ async function fetchPullRequestEditResource<T>(
   resource:
     | "labels"
     | "reviewers"
+    | "comments"
     | "details"
     | "attachments"
     | "merge-options"
@@ -1052,4 +1079,101 @@ export function uploadPullRequestAttachment(
   return fetchPullRequestEditResource<PullRequestAttachment>(conversationId, "attachments", {
     form,
   });
+}
+
+export const MAX_PULL_REQUEST_COMMENT_CHARACTERS = 65536;
+
+/** Match Python's Unicode code-point length, including astral characters. */
+export function pullRequestCommentTooLong(body: string): boolean {
+  return [...body].length > MAX_PULL_REQUEST_COMMENT_CHARACTERS;
+}
+
+function commentPostingError(error: Error): string {
+  const uncertain =
+    !(error instanceof RunnerOfflineError) &&
+    (!(error instanceof PullRequestApiError) || error.status >= 500);
+  return uncertain && !/check github before retrying/i.test(error.message)
+    ? `${error.message} Check GitHub before retrying if the comment may have been sent.`
+    : error.message;
+}
+
+interface PullRequestCommentDraft {
+  body: string;
+  pending: boolean;
+  error: string | null;
+}
+
+function commentDraftKey(conversationId: string, prUrl: string) {
+  return ["github-comment-draft", conversationId, prUrl] as const;
+}
+
+function mergePostedComments(comments: PullRequestComment[], posted: PullRequestComment[]) {
+  const urls = new Set(comments.map((comment) => comment.url));
+  return [...comments, ...posted.filter((comment) => !urls.has(comment.url))].sort((left, right) =>
+    (left.created_at ?? "").localeCompare(right.created_at ?? ""),
+  );
+}
+
+/** A PR-scoped draft survives tab/session switches and settles even after unmount. */
+export function usePullRequestCommentComposer(conversationId: string, prUrl: string) {
+  const queryClient = useQueryClient();
+  const key = commentDraftKey(conversationId, prUrl);
+  const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
+  const { data: draft = initialDraft } = useQuery<PullRequestCommentDraft>({
+    queryKey: key,
+    queryFn: skipToken,
+    initialData: initialDraft,
+    enabled: false,
+    gcTime: 24 * 60 * 60 * 1000,
+  });
+  const updateDraft = (update: Partial<PullRequestCommentDraft>) =>
+    queryClient.setQueryData<PullRequestCommentDraft>(key, (current) =>
+      current ? { ...current, ...update } : current,
+    );
+  const mutation = useMutation({
+    mutationKey: ["github-comment-create", conversationId, prUrl],
+    retry: false,
+    mutationFn: (body: string) =>
+      fetchPullRequestEditResource<{ comment: PullRequestComment }>(conversationId, "comments", {
+        body: { pr_url: prUrl, body },
+      }),
+    onSuccess: async ({ comment }) => {
+      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
+      updateDraft({ body: "", pending: false, error: null });
+      queryClient.setQueriesData<PullRequestInfo>(
+        { queryKey: ["github-info", conversationId] },
+        (info) =>
+          info?.pr && info.selected_pr_url === prUrl
+            ? {
+                ...info,
+                pr: {
+                  ...info.pr,
+                  comments: mergePostedComments(info.pr.comments ?? [], [comment]),
+                },
+              }
+            : info,
+      );
+    },
+    onError: (error: Error) =>
+      updateDraft({
+        pending: false,
+        error: commentPostingError(error),
+      }),
+  });
+  return {
+    draft,
+    setBody: (body: string) => updateDraft({ body, error: null }),
+    post: () => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (
+        !current ||
+        current.pending ||
+        !current.body.trim() ||
+        pullRequestCommentTooLong(current.body)
+      )
+        return;
+      updateDraft({ pending: true, error: null });
+      mutation.mutate(current.body);
+    },
+  };
 }

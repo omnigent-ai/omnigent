@@ -9,6 +9,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { SMART_ROUTING_LABEL } from "@/lib/agentLabels";
+import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
+import type { NativeModelOption } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 // Sentinel Select values for the Model row. Radix requires a non-empty value,
@@ -152,6 +155,25 @@ export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "xhigh", label: "xHigh" },
   { value: "max", label: "Max" },
 ];
+
+/**
+ * Create-time effort ladder for a native harness (`null` = none). Codex uses
+ * `model` or the catalog default; Devin is omitted (no project model default).
+ */
+export function nativeEffortOptions(
+  harness: string | null | undefined,
+  modelOptions: readonly NativeModelOption[],
+  model: string | null | undefined,
+): { value: string; label: string }[] | null {
+  if (harness === "claude-native") return CLAUDE_NATIVE_EFFORTS;
+  if (harness === "pi-native") return PI_NATIVE_EFFORTS;
+  if (harness !== "codex-native") return null;
+  const effortModel = model || modelOptions.find((option) => option.isDefault)?.id;
+  return codexEffortLevelsForModel(modelOptions, effortModel).map((value) => ({
+    value,
+    label: normalizeEffortLabel(value),
+  }));
+}
 
 /**
  * A labeled configuration row: bold label + muted sub-description on the left,
