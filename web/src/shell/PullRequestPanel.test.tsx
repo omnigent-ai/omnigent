@@ -216,9 +216,9 @@ function file(
   };
 }
 
-function renderPanel() {
+function renderPanel(active?: boolean) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<PullRequestPanel conversationId="conv_1" />, {
+  return render(<PullRequestPanel conversationId="conv_1" active={active} />, {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
@@ -365,6 +365,17 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
     expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("polls only while active, keeping the loaded PR on screen", async () => {
+    const { rerender } = renderPanel(false);
+
+    // A collapsed rail keeps the panel mounted but must not poll.
+    expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false });
+
+    rerender(<PullRequestPanel conversationId="conv_1" active />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true });
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {

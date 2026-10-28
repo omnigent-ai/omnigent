@@ -1813,7 +1813,7 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : scopeView === "github" ? (
-            <PullRequestPanel conversationId={conversationId} />
+            <PullRequestPanel conversationId={conversationId} active={open && !inert} />
           ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : scopeView === "empty" ? (
