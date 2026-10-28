@@ -158,6 +158,9 @@ export function useUnlinkSessionPr(conversationId: string) {
   const infoKey = ["github-info", conversationId];
   const storedKey = sessionPullRequestsKey(conversationId);
   return useMutation({
+    // The panel outlives a session switch; a per-session key leaves a running
+    // unlink its own session's callbacks and clears its state from the next one.
+    mutationKey: ["unlink-session-pr", conversationId],
     mutationFn: async (
       url: string,
     ): Promise<{ prs: PullRequestAssociation[]; page?: SessionPullRequestList }> => {

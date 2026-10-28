@@ -7,6 +7,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { PullRequestInfo } from "./usePullRequests";
 import {
   fetchSessionPullRequests,
+  sessionPullRequestsKey,
   stateAsOf,
   useSessionPullRequests,
   useUnlinkSessionPr,
@@ -123,6 +124,42 @@ it("reads the whole list again when an unlink answers with only its first page",
   result.current.unlink.mutate(one);
 
   await waitFor(() => expect(result.current.list.data?.prs).toEqual([two, third]));
+});
+
+it("keeps an unlink to its own session when the panel switches sessions", async () => {
+  let answer: (response: Response) => void = () => {};
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        }),
+    ),
+  );
+  const client = new QueryClient();
+  const other = { prs: [{ ...two, url: "https://github.com/example/three/pull/3" }], synced: true };
+  client.setQueryData(sessionPullRequestsKey("conv_2"), other);
+  const { result, rerender } = renderHook(({ id }) => useUnlinkSessionPr(id), {
+    initialProps: { id: "conv_1" },
+    wrapper: wrapper(client, serverInfo(true)),
+  });
+  result.current.mutate(one);
+  await waitFor(() => expect(result.current.isPending).toBe(true));
+
+  rerender({ id: "conv_2" });
+  // The next session shows neither the unlink nor, once it answers, its outcome.
+  expect(result.current.isIdle).toBe(true);
+  answer(page([two]));
+
+  await waitFor(() =>
+    expect(client.getQueryData(sessionPullRequestsKey("conv_1"))).toEqual({
+      prs: [two],
+      synced: true,
+    }),
+  );
+  expect(client.getQueryData(sessionPullRequestsKey("conv_2"))).toEqual(other);
+  expect(result.current.isIdle).toBe(true);
 });
 
 it("keeps an unlink when a read that started before it answers afterwards", async () => {

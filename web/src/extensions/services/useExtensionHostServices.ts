@@ -210,7 +210,8 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
               throw Object.assign(error, { cause: fallbackError });
             }
             const [first] = stored.prs;
-            // A PR without a fetched state, or a session not yet imported, isn't "no PR".
+            // A linked PR answers once it has a state, imported or not; an empty list
+            // means "no PR" only once the server has imported the session's PRs.
             if (first ? !first.state : !stored.synced) throw error;
             pr = first?.state
               ? {

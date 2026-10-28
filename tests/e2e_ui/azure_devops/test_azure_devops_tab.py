@@ -356,11 +356,16 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
 def test_azure_canvas_link_uses_provider_identity(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    from tests.e2e_ui.sessions.test_canvas_page import _serve_list, _session, _stub_server_info
+    from tests.e2e_ui.sessions.test_canvas_page import (
+        _refuse_live_pull_requests,
+        _serve_list,
+        _session,
+        _stub_server_info,
+    )
 
     base_url, session_id = seeded_session
-    _stub_azure(page)
-    _stub_server_info(page, canvas=True)
+    live_lookups = _refuse_live_pull_requests(page)
+    _stub_server_info(page, canvas=True, session_pull_requests=True)
     # Keep live session updates from replacing the mocked Canvas branch.
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     page.route(
@@ -384,4 +389,5 @@ def test_azure_canvas_link_uses_provider_identity(
     link = card.get_by_role("link", name="Open pull request !7", exact=True)
     expect(link).to_be_visible(timeout=30_000)
     expect(link).to_have_attribute("href", _PR_URL)
+    assert live_lookups == []
     page.screenshot(path=tmp_path / "azure-canvas.png", animations="disabled")

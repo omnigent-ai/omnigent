@@ -697,6 +697,8 @@ export async function updateSessionPr(
 export function useUpdateSessionPr(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
+    // Per session, so a link still running after a session switch updates only its own.
+    mutationKey: ["update-session-pr", conversationId],
     mutationFn: (body: { url: string; action: "attach" | "remove" }) =>
       updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {

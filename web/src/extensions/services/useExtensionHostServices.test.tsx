@@ -352,6 +352,9 @@ describe("useExtensionHostServices", () => {
                     state: "MERGED",
                   },
                 ],
+                // A linked PR with a fetched state answers even before the server imports
+                // the session; only an empty list then can't mean "no PR".
+                synced: false,
               }),
               { status: 200 },
             ),
