@@ -224,6 +224,12 @@ export interface ServerInfo {
    */
   session_search_scope?: boolean;
   /**
+   * True when scheduled tasks accept ``session_mode`` and ``session_id``.
+   * Older servers reject the fields, so the automation dialog hides its
+   * Session control there. Fails to ``false``.
+   */
+  scheduled_task_session_modes?: boolean;
+  /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
    * ``false``.
@@ -332,6 +338,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   archive_worktree_cleanup: false,
   session_search_scope: false,
+  scheduled_task_session_modes: false,
   request_managed_sandbox_host_id: false,
   branding: null,
 };
@@ -446,6 +453,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
+          scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,

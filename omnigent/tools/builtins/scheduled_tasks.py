@@ -112,6 +112,25 @@ class SysScheduledTaskCreateTool(Tool):
                                 "blocked once the limit is reached. Omit for no cap."
                             ),
                         },
+                        "session_mode": {
+                            "type": "string",
+                            "enum": ["new", "continue"],
+                            "description": (
+                                "Optional. 'new' (default) starts a new session for every "
+                                "run. 'continue' sends every run's prompt into one session, "
+                                "keeping its context: session_id when given, otherwise the "
+                                "session the first run creates."
+                            ),
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional, with session_mode 'continue'. An existing "
+                                "top-level session the owner owns, e.g. the current session, "
+                                "to send every run's prompt into. agent_id must be that "
+                                "session's agent."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": (
@@ -257,6 +276,22 @@ class SysScheduledTaskUpdateTool(Tool):
                             "type": "number",
                             "description": (
                                 "New per-firing cost budget in USD. Null clears the cap."
+                            ),
+                        },
+                        "session_mode": {
+                            "type": "string",
+                            "enum": ["new", "continue"],
+                            "description": (
+                                "'new' starts a new session for every run; 'continue' sends "
+                                "every run's prompt into one session."
+                            ),
+                        },
+                        "session_id": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "With session_mode 'continue': the existing session to "
+                                "continue, or null so the next run starts a new session "
+                                "that later runs continue."
                             ),
                         },
                         "workspace": {

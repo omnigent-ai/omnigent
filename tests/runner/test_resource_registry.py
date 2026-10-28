@@ -37,6 +37,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -196,7 +197,14 @@ async def test_claude_program_status_real_launch_and_fallback(
         async with asyncio.timeout(5):
             while reader.status is None or reader.status.state != "error":
                 await asyncio.sleep(0.02)
-        await asyncio.sleep(0.3)  # Longer than a poll, so a published failure would show here.
+        # Receiving the report does not mean the background poller has observed it yet.
+        await poll_until_async(
+            lambda: any(
+                getattr(record, "event_name", None) == "claude_program_error_observed"
+                for record in caplog.records
+            ),
+            timeout_s=5,
+        )
         assert statuses[-1] == ("running", None)
         observations = [
             record_to_row(record, source="runner")

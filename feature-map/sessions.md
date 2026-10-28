@@ -37,6 +37,11 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
+- `side-chat-settings`: choose a supported model or effort in the side-chat composer;
+  selections apply to that chat's next turn independently of its parent, in the
+  desktop panel and mobile drawer. Generic side chats allow selection before or
+  after the first message. Native Codex controls appear after child creation and
+  require a runner that supports side-chat settings.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.
@@ -49,6 +54,10 @@ the header menu), and each place is a separate entry point.
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
   unread dot offers Mark as read instead. Bulk selection also offers these actions.
+  Behind `automations_v2`, an automation's detail page shows the same unread state
+  on each run that started a session: a run that succeeds while the page is open
+  is marked unread, and opening its session from the run row clears it there and
+  in the sidebar.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
@@ -175,8 +184,9 @@ Double-click a grid title or use
 its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
-identify the session shown in Workspace. The grid header toggles the shared
-panel; it spans the full app height beside the grid header and cells. Its width
+identify the session shown in Workspace. ⌘/Ctrl+Alt+Shift+] / [ activate the
+next / previous cell and focus its terminal or composer. The grid header button
+or ⌘/Ctrl+Alt+] toggles the shared panel; it spans the full app height beside the grid header and cells. Its width
 is saved per grid and stays fixed when switching sessions; the header shrinks
 with the cells when the panel opens.
 Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
@@ -389,6 +399,28 @@ session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
 and forwards slash text to the vendor TUI.
 
+**Side-chat settings:** for harnesses other than native Codex, open an unsent
+side chat from the Workspace menu,
+composer add tray, or Ask in side chat. Before sending, open the model pill
+beside the microphone, open its configuration row, and select a model or effort.
+Switch tabs and return to confirm the draft keeps the choice. Send the first
+question and check it uses that selection. Change it again before a follow-up;
+the parent's selection should stay unchanged. Repeat in the mobile drawer.
+Changing only the model preserves unspecified effort and compatible explicit effort;
+an incompatible explicit effort is cleared. Sending waits until a settings save
+finishes, including after reopening the pane. A failed save preserves the message
+draft and allows retrying the settings or sending with the previous selection.
+If the native session's model list is empty, the picker uses the same host
+catalog as the main composer until the session's list arrives.
+Available choices follow the harness's capabilities; viewers and closed chats
+cannot change them. A failed start keeps the draft and selections for retry
+without changing the parent's settings. Native Codex shows these controls only
+once the side-chat child exists, when both server and runner support them.
+The first message uses the existing native fork flow and inherited settings;
+later model and effort changes apply to the child's next turn. Native Codex
+requires a concrete model selection; model-reset aliases are rejected without
+saving changes. Effort can still be reset to the selected model's default.
+
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
@@ -429,6 +461,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
   per-cell terminal input, switching without reattaching, active-cell shortcuts,
+  keyboard cell cycling and workspace toggling,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar
@@ -683,6 +716,22 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
   runner and verify parent recovery before binding; the hosted lifecycle test
   above proves live-parent reuse with actual runner processes.
+- **`side-chat-settings`, desktop panel and mobile drawer:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_sends_with_stale_branch_metadata`
+  checks that a legacy harness without advertised picker capabilities hides the
+  control after slash and Workspace creation;
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
+  checks the same gate in the mobile drawer.
+  `tests/browser_ui/chat/test_model_catalog.py::test_side_chat_model_settings_before_and_after_first_message`
+  checks the add tray and Workspace entry points on desktop and mobile with mocked
+  session APIs, including fork-time draft settings and later child-only updates.
+  `web/src/components/chat/SideChatSettings.test.tsx`
+  covers explicit child targeting, compatible effort choices, rejected updates,
+  harness capabilities, parent-runner reconnect recovery, and viewer/closed states.
+  `tests/server/integration/test_sessions_child_sessions.py::test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn`
+  covers a parent whose live reported model differs from its saved web selection:
+  an untouched child follow-up retains the live model. It also checks that model
+  reset aliases fail without changing the saved model or effort.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
   checks pending/live tab reuse, interleaved comments, pasted images, and replies
@@ -703,11 +752,14 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
   opens a runnerless child directly and sends a message without a directory
   picker. Session metadata and message dispatch are mocked.
-- **`side-chat-lifecycle`, native Codex:**
+- **`side-chat-lifecycle`, `side-chat-settings`, native Codex:**
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   drives a real Codex CLI and app-server with scripted model replies. It checks
   inherited context in the model request, isolated follow-ups, and a parent
-  that stays usable after closing its side chat.
+  that stays usable after closing its side chat. Desktop/mobile variants create
+  a side chat through the Workspace menu or `/side`, then change its model and
+  effort before a follow-up. Scripted provider requests verify the actual model
+  switch, inherited context, effort reset and unchanged parent settings.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,

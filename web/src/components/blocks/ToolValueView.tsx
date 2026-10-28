@@ -1,6 +1,6 @@
 // Renders any JSON value from a tool call as labeled fields: objects as a
 // key/value list, lists of records as rows with a title, detail and status
-// badge, and multi-line strings with their real line breaks.
+// badge, multi-line strings with their real line breaks, and prose as markdown.
 
 import type { ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
@@ -8,6 +8,7 @@ import { absoluteTime } from "@/lib/relativeTime";
 import {
   type StatusTone,
   humanizeKey,
+  isProseText,
   isRecord,
   isoTimestampMs,
   pickDetailField,
@@ -17,6 +18,7 @@ import {
   statusTone,
 } from "@/lib/toolValue";
 import { cn } from "@/lib/utils";
+import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 // Past this depth a value is shown as compact JSON instead of nested lists.
 const MAX_FIELD_DEPTH = 3;
@@ -26,20 +28,40 @@ const INLINE_CHIP_MAX_CHARS = 60;
 const INLINE_STRING_MAX_CHARS = 300;
 const EXTRA_ROW_FIELDS = 3;
 
-export function ToolValueView({ value }: { value: unknown }) {
+/** With `subgrid`, a record's labels join the parent grid's label column so sections line up. */
+export function ToolValueView({ value, subgrid = false }: { value: unknown; subgrid?: boolean }) {
+  if (subgrid && isRecord(value) && Object.keys(value).length > 0) {
+    return (
+      <div
+        className="col-span-2 grid min-w-0 grid-cols-subgrid text-sm"
+        data-testid="tool-value-view"
+      >
+        <FieldList entries={Object.entries(value)} depth={0} subgrid />
+      </div>
+    );
+  }
   return (
-    <div className="min-w-0 text-sm" data-testid="tool-value-view">
+    <div className={cn("min-w-0 text-sm", subgrid && "col-span-2")} data-testid="tool-value-view">
       <ValueNode value={value} depth={0} />
     </div>
   );
 }
 
-function ValueNode({ value, depth }: { value: unknown; depth: number }): ReactNode {
+function ValueNode({
+  value,
+  depth,
+  fieldKey,
+}: {
+  value: unknown;
+  depth: number;
+  /** The key this value sits under, which hints whether its text is prose. */
+  fieldKey?: string;
+}): ReactNode {
   if (value === null || value === undefined) return <EmptyValue />;
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (typeof value === "number") return <span className="tabular-nums">{String(value)}</span>;
-  if (typeof value === "string") return <StringValue text={value} />;
-  if (Array.isArray(value)) return <ListValue items={value} depth={depth} />;
+  if (typeof value === "string") return <StringValue text={value} fieldKey={fieldKey} />;
+  if (Array.isArray(value)) return <ListValue items={value} depth={depth} fieldKey={fieldKey} />;
   if (isRecord(value)) {
     if (depth >= MAX_FIELD_DEPTH) return <CompactJson value={value} />;
     return <FieldList entries={Object.entries(value)} depth={depth} />;
@@ -51,7 +73,18 @@ function EmptyValue() {
   return <span className="text-muted-foreground">None</span>;
 }
 
-function FieldList({ entries, depth }: { entries: [string, unknown][]; depth: number }) {
+function FieldList({
+  entries,
+  depth,
+  subgrid = false,
+  itemKey,
+}: {
+  entries: [string, unknown][];
+  depth: number;
+  subgrid?: boolean;
+  /** For list items, the list's own key, which hints at their text better than the index. */
+  itemKey?: string;
+}) {
   if (entries.length === 0) return <EmptyValue />;
   const shown = entries.slice(0, MAX_LIST_ROWS);
   const hidden = entries.length - shown.length;
@@ -61,17 +94,22 @@ function FieldList({ entries, depth }: { entries: [string, unknown][]; depth: nu
     <>
       <dl
         className={cn(
-          "grid grid-cols-[auto_minmax(0,1fr)]",
+          "grid",
+          subgrid ? "col-span-2 grid-cols-subgrid" : "grid-cols-[auto_minmax(0,1fr)]",
           framed ? "overflow-hidden rounded-md border" : "gap-x-4 gap-y-1",
         )}
       >
         {shown.map(([key, value]) => (
           <FieldRow key={key} label={humanizeKey(key)} title={key} framed={framed}>
-            <ValueNode value={value} depth={depth + 1} />
+            <ValueNode value={value} depth={depth + 1} fieldKey={itemKey ?? key} />
           </FieldRow>
         ))}
       </dl>
-      {hidden > 0 && <p className="mt-1 text-muted-foreground text-sm">and {hidden} more</p>}
+      {hidden > 0 && (
+        <p className={cn("mt-1 text-muted-foreground text-sm", subgrid && "col-span-2")}>
+          and {hidden} more
+        </p>
+      )}
     </>
   );
 }
@@ -116,9 +154,10 @@ function FieldRow({
   );
 }
 
-function StringValue({ text }: { text: string }) {
+function StringValue({ text, fieldKey }: { text: string; fieldKey?: string }) {
   if (text.length === 0) return <EmptyValue />;
   if (text.includes("\n") || text.length > INLINE_STRING_MAX_CHARS) {
+    if (isProseText(text, fieldKey)) return <ProseValue text={text} />;
     return (
       <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-sm">
         {text}
@@ -150,7 +189,35 @@ function StringValue({ text }: { text: string }) {
   return isToken ? <span className="font-mono text-[0.92em]">{text}</span> : text;
 }
 
-function ListValue({ items, depth }: { items: unknown[]; depth: number }) {
+// Keeps a description's headings near body size; `!` beats the unlayered rules in index.css.
+const PROSE_MARKDOWN_CLASS =
+  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-[1.05em]!";
+
+/** Long text written for people, as markdown in the interface font. */
+function ProseValue({ text }: { text: string }) {
+  return (
+    <div className="max-h-60 overflow-auto" data-testid="tool-prose-value">
+      <FilePathAwareMessageResponse
+        mode="static"
+        breaks
+        literalHtml
+        className={PROSE_MARKDOWN_CLASS}
+      >
+        {text}
+      </FilePathAwareMessageResponse>
+    </div>
+  );
+}
+
+function ListValue({
+  items,
+  depth,
+  fieldKey,
+}: {
+  items: unknown[];
+  depth: number;
+  fieldKey?: string;
+}) {
   if (items.length === 0) return <EmptyValue />;
   const isChipList =
     items.length <= MAX_INLINE_CHIPS &&
@@ -184,6 +251,7 @@ function ListValue({ items, depth }: { items: unknown[]; depth: number }) {
     <FieldList
       entries={items.map((item, index): [string, unknown] => [String(index + 1), item])}
       depth={depth}
+      itemKey={fieldKey}
     />
   );
 }

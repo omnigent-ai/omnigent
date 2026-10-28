@@ -80,6 +80,7 @@ from omnigent.harness_plugins import (
     DEVIN_NATIVE_CODING_AGENT,
     NativeCodingAgent,
 )
+from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
@@ -4317,6 +4318,7 @@ async def _create_and_publish_codex_child(
     # Stable title so the (parent, title) unique index prevents race-condition
     # duplicate rows when the forwarder retries a failed registration.
     title = f"codex-native-ui-subagent:{thread_id}"
+    side_chat = is_side_chat_child(labels)
     try:
         child = await asyncio.to_thread(
             conversation_store.create_conversation,
@@ -4326,6 +4328,12 @@ async def _create_and_publish_codex_child(
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
+            model_override=(
+                (concrete_reported_model(parent_conv.reported_model) or parent_conv.model_override)
+                if side_chat
+                else None
+            ),
+            reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -5721,6 +5729,30 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+async def _runner_supports_side_chat_settings(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+    tunnel_registry: TunnelRegistry | None,
+) -> bool:
+    """Read the parent runner's advertised support; a child's runner binding may be stale."""
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+
+    if (
+        tunnel_registry is None
+        or not _is_codex_native_subagent(conv)
+        or not is_side_chat_child(conv.labels)
+        or not conv.parent_conversation_id
+    ):
+        return False
+    parent = await asyncio.to_thread(
+        conversation_store.get_conversation, conv.parent_conversation_id
+    )
+    connection = (
+        tunnel_registry.get(parent.runner_id) if parent is not None and parent.runner_id else None
+    )
+    return connection is not None and CAP_SIDE_CHAT_SETTINGS in connection.hello.capabilities
 
 
 async def _get_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:

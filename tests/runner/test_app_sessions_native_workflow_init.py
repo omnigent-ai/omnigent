@@ -36,6 +36,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _build_app_for_spec,
     _build_app_with_mcp_tool,
@@ -46,6 +47,7 @@ from tests.runner.conftest import (
     _ReadTimeoutTransport,
     _runner_client,
     _ScriptedHarnessClient,
+    _spec_resolver_returning,
     _sse,
 )
 from tests.runner.helpers import NullServerClient
@@ -2308,7 +2310,9 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
 
 
 @pytest.mark.asyncio
-async def test_create_session_spawns_the_snapshot_harness_override() -> None:
+async def test_create_session_spawns_the_snapshot_harness_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Session init must spawn the session's overridden harness, not the spec's.
 
     ``get_client`` entries are keyed by conversation, so resolving the spawn
@@ -2319,6 +2323,7 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
     spec's harness is a native one, init also launches its terminal on top of
     that spawn, leaving two live processes for the one session.
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
@@ -2363,7 +2368,9 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_turn_resolves_the_recorded_harness_override() -> None:
+async def test_message_turn_resolves_the_recorded_harness_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A turn whose body has no ``harness_override`` still runs the override.
 
     The native terminal forward carries the override as session state, not
@@ -2373,6 +2380,7 @@ async def test_message_turn_resolves_the_recorded_harness_override() -> None:
     evicted the override harness mid-session (the split-brain on the turn
     after the kickoff).
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
@@ -2875,9 +2883,10 @@ async def test_create_session() -> None:
 
 
 class _NativeSeedServerClient(NullServerClient):
-    """Server client with one stored item; records item listings and event posts."""
+    """Server client with stored items; records item listings and event posts."""
 
-    def __init__(self) -> None:
+    def __init__(self, stored_items: list[dict[str, Any]] | None = None) -> None:
+        self.stored_items = [{"id": "item_latest"}] if stored_items is None else stored_items
         self.items_params: list[Any] = []
         self.file_calls: list[str] = []
         self.posted_events: list[dict[str, Any]] = []
@@ -2885,10 +2894,11 @@ class _NativeSeedServerClient(NullServerClient):
     async def get(self, url: str, **kwargs: Any) -> Any:
         if url.endswith("/items"):
             self.items_params.append(kwargs.get("params"))
+            stored_items = self.stored_items
 
             class _ItemsResponse(NullServerClient._Response):
                 def json(self) -> dict[str, Any]:
-                    return {"data": [{"id": "item_latest"}], "has_more": False}
+                    return {"data": stored_items, "has_more": False}
 
             return _ItemsResponse()
         if "/resources/files/" in url:
@@ -2991,6 +3001,133 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
 
     assert compactions, "harness compaction was never persisted to the server"
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("has_anchor", "full_context"),
+    [
+        pytest.param(True, True, id="compacted"),
+        pytest.param(True, False, id="summary-only"),
+        pytest.param(False, True, id="compaction-not-persisted"),
+    ],
+)
+async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
+    has_anchor: bool,
+    full_context: bool,
+) -> None:
+    """Replay pre-tool text once; leave history intact if compaction lacks an anchor."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
+
+    compacted_messages = [
+        {"type": "message", "role": role, "content": [{"type": block_type, "text": text}]}
+        for role, block_type, text in [
+            ("user", "input_text", "SUMMARY"),
+            ("user", "input_text", "hi"),
+            ("assistant", "output_text", "Reading notes."),
+        ]
+    ]
+    stream_finished = asyncio.Event()
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse(event)
+            for event in [
+                {"type": "response.created", "response": {"id": "resp_1"}},
+                {"type": "response.output_text.delta", "delta": "Reading notes."},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read",
+                        "arguments": "{}",
+                        "status": "completed",
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                },
+                {"type": "response.output_text.delta", "delta": "RECOVERED"},
+                {
+                    "type": "response.compaction.completed",
+                    "summary": "SUMMARY",
+                    "total_tokens": 5,
+                    "compacted_messages": compacted_messages if full_context else None,
+                },
+                {"type": "response.completed", "response": {"id": "resp_1"}},
+            ]
+        ],
+        stream_finished=stream_finished,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=_NativeSeedServerClient([{"id": "item_latest"}] if has_anchor else []),  # type: ignore[arg-type]
+    )
+
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert resp.status_code == 201, resp.text
+        for text in ("hi", "next"):
+            turn = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            assert turn.status_code == 202, turn.text
+            await asyncio.wait_for(stream_finished.wait(), timeout=5.0)
+            stream_finished.clear()
+            # The follow-up only captures history; no second reply mutates the recorded body.
+            harness_client._sse_frames = [
+                _sse({"type": "response.completed", "response": {"id": "resp_2"}})
+            ]
+
+    if not has_anchor:
+        expected_history = [
+            ("user", "hi"),
+            ("function_call", "call_1"),
+            ("function_call_output", "call_1"),
+            ("assistant", "Reading notes.RECOVERED"),
+        ]
+    elif full_context:
+        expected_history = [
+            ("user", "SUMMARY"),
+            ("user", "hi"),
+            ("assistant", "Reading notes."),
+            ("assistant", "RECOVERED"),
+        ]
+    else:
+        expected_history = [
+            (
+                "user",
+                "[Automatically generated summary of prior conversation context.]\n\n"
+                "Please provide a summary of our conversation so far.",
+            ),
+            ("assistant", "SUMMARY"),
+            ("assistant", "RECOVERED"),
+        ]
+    assert len(harness_client.posted_bodies) == 2
+    next_request = harness_client.posted_bodies[1]["content"]
+    assert [
+        (item["role"], "".join(part["text"] for part in item["content"]))
+        if item["type"] == "message"
+        else (item["type"], item["call_id"])
+        for item in next_request
+    ] == [*expected_history, ("user", "next")]
 
 
 def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
