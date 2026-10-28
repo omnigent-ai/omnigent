@@ -58,7 +58,7 @@ function jsonResponse(body: unknown, ok = true): Response {
  *  on the exact calls / scripted JS. */
 function installBridge(overrides: Record<string, unknown> = {}) {
   const bridge = {
-    browserLocalAgentOnly: true,
+    browserSessionNetworkPolicy: true,
     browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, created: true }),
     browserScreenshot: vi
       .fn()
@@ -403,24 +403,21 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it.each(["lookup failure", "cycle"])("denies all tools after %s", async (failure) => {
+  it.each(["lookup failure", "cycle"])("uses public-only provenance after %s", async (failure) => {
     const bridge = installBridge();
     getSessionSlim.mockImplementation(async (id: string) => {
       if (failure === "lookup failure") throw new Error("source unavailable");
       return { id, hostId: null, parentSessionId: id === CONV ? "parent" : CONV };
     });
     await runAction(actionEvent("screenshot", { sourceHostId: "local-host" }));
-    expect(bridge.browserScreenshot).not.toHaveBeenCalled();
-    expect(postedResult().result).toMatchObject({
-      ok: false,
-      error: expect.stringMatching(/verified session/),
-    });
+    expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, undefined);
+    expect(postedResult().result).toMatchObject({ ok: true });
   });
 
   it.each(["navigate", "screenshot", "snapshot", "click", "type"])(
     "fails closed on an older shell for %s",
     async (action) => {
-      const bridge = installBridge({ browserLocalAgentOnly: undefined });
+      const bridge = installBridge({ browserSessionNetworkPolicy: undefined });
       await runAction(actionEvent(action, { url: "https://example.com" }));
       expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
       expect(bridge.browserScreenshot).not.toHaveBeenCalled();

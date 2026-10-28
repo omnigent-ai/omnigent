@@ -513,31 +513,35 @@ forwarded URL reaches the intended app in your Mac's regular browser. Check
 Companion's forwarding and local port selection separately. Normal TLS, CORS,
 authentication, and local-network permission rules still apply.
 
-### Local-session browser tools
+### Session browser network access
 
-Only sessions executing on the desktop machine can use agent browser tools:
-navigation, screenshots, DOM snapshots, clicks, and typing. The relay reads the
+Local and remote sessions can navigate, take screenshots and DOM snapshots,
+click, and type in the embedded browser. The relay reads the
 source session's current bound host (or nearest host-bound parent), and main
 compares it with the local CLI host ID for the connected server. Remote hosts,
-including Arca, and unknown identities cannot read or control the laptop browser,
-even if a view is already open. Model arguments and host display names cannot
-grant access. A remote Omnigent server is fine when the agent itself runs locally.
+including Arca, and unknown identities can access public URLs and public preview
+or tunnel URLs, but cannot reach the laptop's loopback or private networks.
+Model arguments and host display names cannot grant private-network access.
+A remote Omnigent server is fine when the agent itself runs locally.
 
 Verified local sessions may browse any HTTP(S) destination, including loopback,
 private networks, and names that resolve to private addresses. This applies to
-redirects, frames, and links opening in the same pane. Non-web schemes remain
+redirects, frames, subresources, and links opening in the same pane. Non-web schemes remain
 blocked, and Chromium sandbox, TLS, CORS, and permission controls still apply.
 
-Human-created Browser tabs stay separate from the agent view and remain usable
-in remote sessions. Their navigation retains the public-network policy unless
+When a session changes from local to remote, its existing view is discarded
+before remote tools can read it. Navigate to a public URL to continue.
+
+Human-created Browser tabs stay separate from the agent view. Their navigation
+retains the public-network policy unless
 the owning session is verified local. For a remote app forwarded to localhost,
 open it manually in your regular browser. Forwarding does not grant a remote
 agent access to the laptop. User-initiated Design mode can still send a selected
 element and screenshot to the session as part of an explicit chat message.
 
-New web bundles require the shell's `browserLocalAgentOnly` capability before
+New web bundles require the shell's `browserSessionNetworkPolicy` capability before
 executing agent actions; older shells return an update instruction. Older web
-bundles without source provenance are denied by the new main-process gate.
+bundles without source provenance retain public-network access only.
 
 ### Local network permission
 

@@ -216,7 +216,7 @@ interface ElectronDesktopApi extends NativeShellApi {
   /** Clear the CLI-path override (revert to auto-detection); resolves status. */
   resetCliPath?: () => Promise<CliStatus | null>;
   /** Absent on older shells: browser tools must fail closed. */
-  browserLocalAgentOnly?: boolean;
+  browserSessionNetworkPolicy?: boolean;
   /**
    * Open/navigate a conversation's embedded browser view. Present only on
    * desktop shells new enough to ship the embedded browser feature — its

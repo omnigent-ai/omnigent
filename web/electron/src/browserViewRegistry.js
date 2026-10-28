@@ -155,6 +155,7 @@ function createBrowserViewRegistry({
       // internal host slips through (SSRF via screenshot).
       agentNavLocked: false,
       agentContext: null,
+      privateNetworkAllowed: false,
       // Design-mode listeners + webContents, set by browserIpc's enable handler
       // and cleared on disable/close (console-message forwarder + native-gesture
       // tracker). Null until design mode is enabled for this entry.
@@ -168,6 +169,28 @@ function createBrowserViewRegistry({
 
   function get(conversationId) {
     return entries.get(conversationId) || null;
+  }
+
+  function getForAgent(conversationId, agentContext) {
+    const entry = get(conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    // A local page may already contain private frames or fetched data. Discard
+    // it before a remote session can read it, even when its top-level URL is public.
+    if (
+      !isLocalAgentContext(agentContext) &&
+      (!entry.agentNavLocked || entry.privateNetworkAllowed)
+    ) {
+      close(conversationId, "browser-access-changed");
+      return {
+        ok: false,
+        error: "Browser access changed. Navigate to a public URL before using browser tools.",
+      };
+    }
+    return { ok: true, entry };
+  }
+
+  function allowsPrivateNetwork(entry) {
+    return entry.privateNetworkAllowed && isLocalAgentContext(entry.agentContext);
   }
 
   function getOrCreate(conversationId) {
@@ -217,7 +240,7 @@ function createBrowserViewRegistry({
       }
       if (entry.agentNavLocked) {
         const verdict = isAgentNavigationAllowed(url, {
-          allowPrivateNetwork: isLocalAgentContext(entry.agentContext),
+          allowPrivateNetwork: allowsPrivateNetwork(entry),
         });
         if (!verdict.ok) {
           sendToRenderer("browser-nav-blocked", {
@@ -276,7 +299,7 @@ function createBrowserViewRegistry({
     const guard = (event, targetUrl) => {
       if (!entry.agentNavLocked) return; // user-driven nav: permissive
       const verdict = isAgentNavigationAllowed(targetUrl, {
-        allowPrivateNetwork: isLocalAgentContext(entry.agentContext),
+        allowPrivateNetwork: allowsPrivateNetwork(entry),
       });
       if (!verdict.ok) {
         try {
@@ -401,14 +424,18 @@ function createBrowserViewRegistry({
   }
 
   // SECURITY (SSRF): network-layer half of the agent guard, wired by main.js
-  // to webRequest.onBeforeRequest for document requests on these views'
+  // to webRequest.onBeforeRequest for all network requests on these views'
   // partitions. Resolves true to cancel. Unlike the will-* guards it sees every
   // hop — redirects, window-open loads, history navigations — and can wait on
   // DNS, so a public name pointing at an internal address is refused too.
   async function shouldCancelAgentRequest({ webContentsId, url }) {
     const entry = agentLockedEntryFor(webContentsId);
     if (!entry) return false; // user-driven or unattributed: permissive
-    const verdict = await checkAgentNavigationFor(entry.conversationId, url, entry.agentContext);
+    const verdict = await checkAgentNavigationFor(
+      entry.conversationId,
+      url.replace(/^ws(s?):/, "http$1:"),
+      allowsPrivateNetwork(entry) ? entry.agentContext : null,
+    );
     if (verdict.ok) return false;
     sendToRenderer("browser-nav-blocked", {
       conversationId: entry.conversationId,
@@ -420,7 +447,7 @@ function createBrowserViewRegistry({
 
   // Wired to webRequest.onBeforeSendHeaders. A pure HTTP-cache hit reports no
   // connected address (Chromium's HttpCache::Transaction::GetRemoteEndpoint),
-  // so agent documents skip cache reads (`no-cache`, per http_cache_util's
+  // so agent requests skip cache reads (`no-cache`, per http_cache_util's
   // GetLoadFlagsForExtraHeaders) and every response checked below carries one.
   function agentRequestHeaders({ webContentsId, requestHeaders }) {
     if (!agentLockedEntryFor(webContentsId)) return {};
@@ -447,8 +474,8 @@ function createBrowserViewRegistry({
   async function shouldCancelAgentResponse({ webContentsId, url, ip }) {
     const entry = agentLockedEntryFor(webContentsId);
     if (!entry) return false;
-    const verdict = isAgentConnectionAllowed(url, ip, {
-      allowPrivateNetwork: isLocalAgentContext(entry.agentContext),
+    const verdict = isAgentConnectionAllowed(url.replace(/^ws(s?):/, "http$1:"), ip, {
+      allowPrivateNetwork: allowsPrivateNetwork(entry),
     });
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
@@ -480,6 +507,11 @@ function createBrowserViewRegistry({
         return { ok: false, error: verdict.error };
       }
     }
+    if (opts?.agent && !isLocalAgentContext(opts.agentContext)) {
+      const pendingNavigation = pendingNavigations.get(conversationId);
+      getForAgent(conversationId, opts.agentContext);
+      if (pendingNavigation) pendingNavigations.set(conversationId, pendingNavigation);
+    }
     const result = getOrCreate(conversationId);
     if (!result.ok) return result;
     const { entry, created } = result;
@@ -489,6 +521,7 @@ function createBrowserViewRegistry({
     if (url) {
       entry.agentNavLocked = !!(opts && opts.agent);
       entry.agentContext = entry.agentNavLocked ? (opts.agentContext ?? null) : null;
+      entry.privateNetworkAllowed = entry.agentNavLocked && isLocalAgentContext(entry.agentContext);
     }
     if (bounds) entry.boundsController.setRendererBounds(bounds);
     // Only attach immediately when this is the active conversation; otherwise
@@ -646,6 +679,7 @@ function createBrowserViewRegistry({
   return {
     // Lifecycle
     get,
+    getForAgent,
     getOrCreate,
     openOrNavigate,
     beginAgentNavigation,

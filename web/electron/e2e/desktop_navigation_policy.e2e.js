@@ -18,7 +18,7 @@ const {
 const deps = desktopDepsAvailable();
 
 it(
-  "allows local browser tools and denies remote access to an already-open view",
+  "allows remote browser tools on public pages and reserves private networks for local sessions",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 180_000 },
   async () => {
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-navigation-"));
@@ -29,7 +29,9 @@ it(
     fs.mkdirSync(configDir);
     fs.writeFileSync(path.join(configDir, "config.yaml"), "host:\n  host_id: local-preview-host\n");
     const evidence = {};
+    let fixtureRequests = 0;
     const fixture = http.createServer((req, res) => {
+      fixtureRequests++;
       if (req.url === "/redirect") {
         res.writeHead(302, { Location: `http://127.0.0.1:${fixture.address().port}/` }).end();
         return;
@@ -122,28 +124,48 @@ it(
       );
       evidence.remote = [];
       for (const sourceHostId of ["remote-host", "arca-host", null]) {
-        const results = [
-          await navigate(sourceHostId, "https://example.com/"),
-          await navigate(sourceHostId),
-          await screenshot(sourceHostId),
-          ...(await Promise.all(
-            ["snapshot", "click", "type"].map((action) =>
-              perform(sourceHostId, action, { selector: "input", text: "remote" }),
-            ),
-          )),
-          await window.evaluate(
-            (payload) =>
-              window.omnigentDesktop.browserExecute(payload.cid, payload.js, payload.sourceHostId),
-            { cid, sourceHostId, js: buildBrowserActionScript("snapshot") },
-          ),
-        ];
-        for (const result of results) {
-          assert.equal(result.ok, false);
-          assert.match(result.error, /running on this desktop/);
+        assert.equal((await navigate("local-preview-host")).ok, true);
+        await waitForPage();
+        assert.equal((await screenshot(sourceHostId)).ok, false, "cannot capture the local view");
+        const blocked = await navigate(sourceHostId);
+        assert.equal(blocked.ok, false);
+        assert.match(blocked.error, /navigation blocked/);
+        const publicNavigation = await navigate(sourceHostId, "https://example.com/");
+        assert.equal(publicNavigation.ok, true, publicNavigation.error);
+        await window.evaluate((viewId) => window.omnigentDesktop.browserSetActive(viewId), cid);
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const result = await observe("document.body?.innerText");
+          if (result.result?.includes("documentation examples")) break;
+          if (attempt === 99) throw new Error("Public preview did not load");
+          await window.waitForTimeout(100);
         }
-        evidence.remote.push({ sourceHostId, results });
+        const snapshot = await perform(sourceHostId, "snapshot");
+        assert.equal(snapshot.ok, true, snapshot.error);
+        assert.match(JSON.parse(snapshot.result).tree, /Learn more/);
+        assert.equal((await screenshot(sourceHostId)).ok, true);
+        const legacy = await window.evaluate(
+          (payload) =>
+            window.omnigentDesktop.browserExecute(payload.cid, payload.js, payload.sourceHostId),
+          { cid, sourceHostId, js: buildBrowserActionScript("snapshot") },
+        );
+        assert.equal(legacy.ok, true, legacy.error);
+        // A public document must not fetch or render laptop-only resources.
+        const before = fixtureRequests;
+        const resource = await observe(`new Promise(resolve => {
+          const image = new Image();
+          image.onload = () => resolve('loaded');
+          image.onerror = () => resolve('blocked');
+          image.src = ${JSON.stringify(url)};
+          document.body.append(image);
+        })`);
+        assert.equal(resource.result, "blocked");
+        assert.equal(
+          fixtureRequests,
+          before,
+          "no private subresource request reached the laptop server",
+        );
+        evidence.remote.push({ sourceHostId, blocked, publicNavigation, snapshot, resource });
       }
-      assert.equal((await observe("document.querySelector('input').value")).result, "Ada local");
       evidence.redirect = await navigate("local-preview-host", url + "redirect");
       assert.equal(evidence.redirect.ok, true, evidence.redirect.error);
       await waitForPage("127.0.0.1");

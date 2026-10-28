@@ -451,6 +451,42 @@ function makeEventCapturingRegistry(extra = {}) {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("discards local and unguarded content before remote reads, and recreates it for public navigation", () => {
+    let eligible = true;
+    const context = {};
+    const { registry } = makeEventCapturingRegistry({
+      isLocalAgentContext: (ctx) => eligible && ctx === context,
+    });
+    for (const url of ["http://localhost", "https://example.com"]) {
+      registry.openOrNavigate("conv", url, undefined, { agent: true, agentContext: context });
+      assert.equal(registry.getForAgent("conv", context).ok, true);
+      assert.equal(registry.getForAgent("conv", null).ok, false);
+      assert.equal(registry.has("conv"), false);
+    }
+    registry.openOrNavigate("conv", "https://example.com", undefined, {
+      agent: true,
+      agentContext: context,
+    });
+    const localEntry = registry.get("conv");
+    eligible = false;
+    assert.equal(registry.getForAgent("conv", context).ok, false);
+    registry.openOrNavigate("conv", "http://localhost");
+    assert.equal(registry.getForAgent("conv", null).ok, false);
+    eligible = true;
+    registry.openOrNavigate("conv", "https://example.com", undefined, {
+      agent: true,
+      agentContext: context,
+    });
+    const current = registry.beginAgentNavigation("conv");
+    assert.equal(
+      registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true }).ok,
+      true,
+    );
+    assert.equal(current(), true);
+    assert.notEqual(registry.get("conv"), localEntry);
+    assert.equal(registry.getForAgent("conv", null).ok, true);
+  });
+
   it("uses the same live local context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
@@ -595,6 +631,36 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
 }
 
 describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
+  it("applies public/private address checks to WebSockets", async () => {
+    const { registry, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true });
+    const webContentsId = idOf("conv");
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ webContentsId, url: "wss://example.com/live" }),
+      false,
+    );
+    assert.equal(
+      await registry.shouldCancelAgentResponse({
+        webContentsId,
+        url: "wss://example.com/live",
+        ip: "93.184.215.14",
+      }),
+      false,
+    );
+    assert.equal(
+      await registry.shouldCancelAgentRequest({ webContentsId, url: "ws://localhost/live" }),
+      true,
+    );
+    assert.equal(
+      await registry.shouldCancelAgentResponse({
+        webContentsId,
+        url: "wss://example.com/live",
+        ip: "127.0.0.1",
+      }),
+      true,
+    );
+  });
+
   it("refuses an agent first hop to a name that resolves to loopback", async () => {
     const { registry, lookups } = makeNetworkGuardRegistry();
     const verdict = await registry.checkAgentNavigation("conv_1", "http://lvh.me:8899/", null);

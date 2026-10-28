@@ -20,7 +20,7 @@ import { resolveBrowserSessionHostId } from "@/lib/browserSessionHost";
  *  nativeBridge). All optional — an older shell may predate the feature, so the
  *  relay feature-detects before calling. */
 interface BrowserDesktopBridge {
-  browserLocalAgentOnly?: boolean;
+  browserSessionNetworkPolicy?: boolean;
   browserOpenOrNavigate?: (
     conversationId: string,
     url: string,
@@ -69,7 +69,7 @@ async function performAction(
   conversationId: string,
   action: "snapshot" | "click" | "type",
   args: Record<string, unknown> | undefined,
-  sourceHostId: string,
+  sourceHostId: string | undefined,
 ) {
   if (desktop.browserPerformAction) {
     return desktop.browserPerformAction(conversationId, action, args, sourceHostId);
@@ -94,15 +94,12 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
-  sourceHostId: string | null,
+  sourceHostId: string | undefined,
 ): Promise<ActionResult> {
-  if (!desktop.browserLocalAgentOnly) {
-    return { ok: false, error: "Update Omnigent Desktop to use local-session browser tools." };
-  }
-  if (!sourceHostId) {
+  if (!desktop.browserSessionNetworkPolicy) {
     return {
       ok: false,
-      error: "Browser tools require a verified session running on this desktop.",
+      error: "Update Omnigent Desktop to use browser tools with session network permissions.",
     };
   }
   try {
@@ -228,7 +225,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const sourceHostId = await resolveBrowserSessionHostId(sourceConversationId);
+      const sourceHostId = (await resolveBrowserSessionHostId(sourceConversationId)) ?? undefined;
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
         : await dispatch(sourceConversationId, evt.action, evt.args, desktop, sourceHostId);

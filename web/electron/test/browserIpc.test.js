@@ -66,7 +66,6 @@ describe("browser IPC pending navigation lifecycle", () => {
         ipcMain,
         isPinnedOriginSender: () => trusted,
         getRegistryForEvent: () => registry,
-        isLocalAgentContext: () => true,
       });
       const navigate = (url) =>
         ipcMain.invoke(
@@ -106,7 +105,6 @@ describe("browser IPC session context", () => {
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
-      isLocalAgentContext: () => true,
       getRegistryForEvent: () => ({
         beginAgentNavigation: () => () => true,
         checkAgentNavigation: async (...args) => {
@@ -150,7 +148,6 @@ describe("browser IPC session context", () => {
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
-      isLocalAgentContext: () => true,
       getRegistryForEvent: () => ({
         beginAgentNavigation: () => () => true,
         checkAgentNavigation: async (_id, url) => {
@@ -270,6 +267,10 @@ function makeRegistry(conversationId, webContents) {
   let recentSessionCancelCount = 0;
   return {
     get: (id) => entries.get(id) ?? null,
+    getForAgent: (id) =>
+      entries.has(id)
+        ? { ok: true, entry: entries.get(id) }
+        : { ok: false, error: "No browser view" },
     has: (id) => entries.has(id),
     beginAgentNavigation: () => () => true,
     checkAgentNavigation: allowAgentNavigation,
@@ -318,7 +319,6 @@ function setup({
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender: () => pinned,
-    isLocalAgentContext: () => true,
     getRegistryForEvent: () => registry,
     chromeCookieStore,
     platform,
@@ -1238,7 +1238,6 @@ it("applies navigation policy even when renderer options claim user intent", asy
     registerBrowserIpc({
       ipcMain,
       isPinnedOriginSender: () => true,
-      isLocalAgentContext: () => true,
       getRegistryForEvent: () => ({
         beginAgentNavigation: () => () => true,
         checkAgentNavigation: allowAgentNavigation,
@@ -1265,48 +1264,52 @@ it("applies navigation policy even when renderer options claim user intent", asy
   }
 });
 
-describe("browser IPC local-only tools", () => {
-  for (const sourceHostId of [undefined, "remote-host", "arca-host", "local-host"]) {
-    it(`checks every tool against source host ${sourceHostId}`, async () => {
-      const ipcMain = makeIpcMain();
-      const effects = [];
-      const wc = makeWebContents();
-      wc.capturePage = async () => {
-        effects.push("capture");
-        return { toPNG: () => Buffer.from("png") };
-      };
-      wc.executeJavaScript = async () => {
-        effects.push("execute");
-        return "{}";
-      };
-      const registry = makeRegistry("conv", wc);
-      registry.openOrNavigate = () => {
-        effects.push("navigate");
-        return { ok: true };
-      };
-      registerBrowserIpc({
-        ipcMain,
-        isPinnedOriginSender: () => true,
-        getRegistryForEvent: () => registry,
-        getAgentContextForEvent: (_event, host) => ({ sourceHostId: host }),
-        isLocalAgentContext: (_event, context) => context.sourceHostId === "local-host",
-      });
-      const requests = [
-        [
-          "open-or-navigate",
-          {
-            url: "https://example.com",
-            opts: { sourceHostId, agent: false, allowPrivateNetwork: true },
-          },
-        ],
-        [
-          "open-or-navigate",
-          { url: "http://localhost", opts: { sourceHostId, agent: true, sourceIsArcaHost: true } },
-        ],
-        ["screenshot", {}],
-        ...["snapshot", "click", "type"].map((action) => [
-          "perform-action",
-          {
+it("routes every browser tool through the source session's network policy", async () => {
+  const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
+  const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
+  const registry = createBrowserViewRegistry({
+    WebContentsViewCtor: () => ({
+      webContents: Object.assign(makeWebContents(), {
+        loadURL() {},
+        close() {},
+        capturePage: async () => ({ toPNG: () => Buffer.from("png") }),
+      }),
+    }),
+    createBoundsController: createBrowserViewBoundsController,
+    sendToRenderer() {},
+    isLocalAgentContext: (ctx) => ctx?.sourceHostId === "local-host",
+    resolveHost: async () => ["93.184.215.14"],
+  });
+  const ipcMain = makeIpcMain();
+  registerBrowserIpc({
+    ipcMain,
+    isPinnedOriginSender: () => true,
+    getRegistryForEvent: () => registry,
+    getAgentContextForEvent: (_event, sourceHostId) => ({ sourceHostId }),
+  });
+  const invoke = (channel, sourceHostId, args = {}) =>
+    ipcMain.invoke(
+      `omnigent:browser-${channel}`,
+      {},
+      { conversationId: "conv", sourceHostId, ...args },
+    );
+  const navigate = (sourceHostId, url) =>
+    invoke("open-or-navigate", sourceHostId, {
+      url,
+      opts: { sourceHostId, agent: false, allowPrivateNetwork: true },
+    });
+  for (const sourceHostId of ["remote-host", undefined]) {
+    /* oxlint-disable no-await-in-loop -- Exercise the same view through host changes and each transport. */
+    assert.equal((await navigate("local-host", "http://localhost")).ok, true);
+    assert.equal((await invoke("screenshot", sourceHostId)).ok, false);
+    assert.equal(registry.has("conv"), false);
+    assert.equal((await navigate(sourceHostId, "http://localhost")).ok, false);
+    assert.equal((await navigate(sourceHostId, "https://example.com")).ok, true);
+    assert.equal((await invoke("screenshot", sourceHostId)).ok, true);
+    for (const action of ["snapshot", "click", "type"]) {
+      assert.equal(
+        (
+          await invoke("perform-action", sourceHostId, {
             action,
             params:
               action === "snapshot"
@@ -1314,38 +1317,39 @@ describe("browser IPC local-only tools", () => {
                 : action === "click"
                   ? { selector: "input" }
                   : { selector: "input", text: "hi" },
-          },
-        ]),
-        [
-          "execute",
-          { js: require("../src/browserActionScript.mjs").buildBrowserActionScript("snapshot") },
-        ],
-      ];
-      for (const [channel, args] of requests) {
-        // oxlint-disable-next-line no-await-in-loop -- Verify each tool before the next request.
-        const result = await ipcMain.invoke(
-          `omnigent:browser-${channel}`,
-          {},
-          { conversationId: "conv", sourceHostId, ...args },
-        );
-        assert.equal(result.ok, sourceHostId === "local-host", channel);
-        if (!result.ok) assert.match(result.error, /running on this desktop/);
-      }
-      assert.equal(effects.length, sourceHostId === "local-host" ? requests.length : 0);
-      // Human tabs keep working even when their session runs remotely.
-      assert.equal(
-        (
-          await ipcMain.invoke(
-            "omnigent:browser-open-or-navigate",
-            {},
-            {
-              conversationId: "browser-tab:conv:user-tab",
-              url: "https://example.com",
-            },
-          )
+          })
         ).ok,
         true,
       );
-    });
+    }
+    assert.equal(
+      (
+        await invoke("execute", sourceHostId, {
+          js: require("../src/browserActionScript.mjs").buildBrowserActionScript("snapshot"),
+        })
+      ).ok,
+      true,
+    );
+    /* oxlint-enable no-await-in-loop */
   }
 });
+
+for (const channel of ["screenshot", "perform-action"]) {
+  it(`drops a ${channel} result after the view is replaced`, async () => {
+    const pending = Promise.withResolvers();
+    const wc = makeWebContents();
+    wc.capturePage = () => pending.promise;
+    wc.executeJavaScript = () => pending.promise;
+    const { ipcMain, event, registry } = setup({ webContents: wc });
+    const result = ipcMain.invoke(`omnigent:browser-${channel}`, event, {
+      conversationId: "conv_1",
+      action: "snapshot",
+    });
+    registry.openOrNavigate("conv_1");
+    pending.resolve(channel === "screenshot" ? { toPNG: () => Buffer.from("private") } : "private");
+    assert.deepEqual(await result, {
+      ok: false,
+      error: "Browser view or session access changed during the action.",
+    });
+  });
+}

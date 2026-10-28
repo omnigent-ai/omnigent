@@ -269,8 +269,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserResize: (conversationId, bounds) =>
     ipcRenderer.invoke("omnigent:browser-resize", { conversationId, bounds }),
-  /** Capability marker for local-only browser tools; older web bundles fail closed in main. */
-  browserLocalAgentOnly: true,
+  /** Capability marker for session-scoped network policy on every browser tool. */
+  browserSessionNetworkPolicy: true,
   /**
    * Capture the conversation's view as a base64 PNG data URL.
    * @param {string} conversationId

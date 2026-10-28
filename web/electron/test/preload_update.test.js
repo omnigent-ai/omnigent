@@ -64,7 +64,7 @@ describe("browser action bridge", () => {
   it("forwards typed actions to main", async () => {
     const h = loadPreload();
     const params = { ref: 2, text: "hello" };
-    assert.equal(h.desktop.browserLocalAgentOnly, true);
+    assert.equal(h.desktop.browserSessionNetworkPolicy, true);
     await h.desktop.browserPerformAction("conversation", "type", params, "local-host");
     const { channel, args } = h.invokes.at(-1);
     assert.equal(channel, "omnigent:browser-perform-action");

@@ -1,6 +1,6 @@
 // Renderer-requested navigation shares one policy, including the URL bar.
 // Verified local sessions may reach private destinations. Other renderer
-// navigation retains the public-network policy; remote agents have no tools.
+// navigation retains the public-network policy for remote and unverified sessions.
 
 "use strict";
 

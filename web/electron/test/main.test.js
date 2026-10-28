@@ -2549,7 +2549,7 @@ describe("browser permission wiring", () => {
     }
   });
 
-  it("guards each agent partition's document requests through its own Chromium session", async () => {
+  it("guards each agent partition's network requests through its own Chromium session", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
       const sessions = new Map();
@@ -2599,13 +2599,13 @@ describe("browser permission wiring", () => {
       const ses = sessions.get(partitions[0]);
       assert.deepEqual(
         // main.js runs in its own vm realm, so copy its arrays before deepEqual.
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls]]),
         [
-          ["request", ["mainFrame", "subFrame", "object"]],
-          ["sendHeaders", ["mainFrame", "subFrame", "object"]],
-          ["headers", ["mainFrame", "subFrame", "object"]],
+          ["request", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"]],
+          ["sendHeaders", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"]],
+          ["headers", ["http://*/*", "https://*/*", "ws://*/*", "wss://*/*"]],
         ],
-        "installed once per partition, for document requests only",
+        "installed once per partition, including subresources and WebSockets",
       );
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
@@ -2641,9 +2641,9 @@ describe("browser permission wiring", () => {
       const otherSession = sessions.get(partitions[2]);
       assert.notEqual(otherSession, ses);
       assert.deepEqual(
-        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        "each independent session receives all document hooks",
+        otherSession.installs.map(([kind, filter]) => [kind, [...filter.urls]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.urls]]),
+        "each independent session receives all network hooks",
       );
       otherSession.dns["example.com"] = "127.0.0.1";
       ses.lookups.length = 0;
@@ -4295,10 +4295,6 @@ describe("browser-view teardown on server change (src/main.js)", () => {
           isAgentNavigationAllowed("file:///etc/passwd", { allowPrivateNetwork }).ok,
           false,
         );
-        assert.equal(
-          h.browserIpcDeps().isLocalAgentContext({ sender: h.webContents }, context),
-          localHostId !== null,
-        );
         assert.equal(eligible(null), false);
         assert.equal(eligible({ ...context, sourceHostId: null }), false);
         assert.equal(eligible({ ...context, sourceHostId: "remote-host" }), false);
@@ -4309,7 +4305,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     }
   });
 
-  it("does not grant browser access to a connected Arca host", async (t) => {
+  it("does not grant private-network access to a connected Arca host", async (t) => {
     const { arcaTarget } = require("../src/arcaIdentity");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
@@ -4325,7 +4321,6 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const event = { sender: h.webContents };
     const context = h.browserIpcDeps().getAgentContextForEvent(event, hostId);
     assert.equal(h.browserRegistryDeps().isLocalAgentContext(context), false);
-    assert.equal(h.browserIpcDeps().isLocalAgentContext(event, context), false);
   });
 
   it("closes the window's browserRegistry when pinWindow changes origin", () => {

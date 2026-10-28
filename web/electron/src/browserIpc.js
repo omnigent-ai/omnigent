@@ -8,7 +8,6 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { browserViewOwnerId } = require("./browserViewRegistry");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
@@ -354,7 +353,6 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
-  isLocalAgentContext = () => false,
   // Injected so native dialogs can be parented to the sender's window.
   getWindowForEvent = () => null,
   chromeCookieStore = chromeCookieStoreModule,
@@ -377,11 +375,6 @@ function registerBrowserIpc({
     return { registry };
   };
 
-  const localAgentError = (event, context) =>
-    isLocalAgentContext(event, context)
-      ? null
-      : "Browser tools require a session running on this desktop. Remote or unverified sessions cannot access the laptop browser.";
-
   /** A window-scoped sender for the event's own webContents. Used to push
    *  url/nav-state pings back to exactly the renderer that drives the view. */
   const senderFor = (event) => (channel, payload) => {
@@ -403,18 +396,9 @@ function registerBrowserIpc({
       return { ok: false, error: "conversationId is required" };
     }
     const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
-    // Agent tools target the reserved session view; user tabs have separate IDs.
-    // Omitting opts.agent cannot turn a tool request into a human navigation.
-    const requiresLocalAgent =
-      browserViewOwnerId(conversationId) === conversationId || !!opts?.agent;
-    const accessError = requiresLocalAgent && localAgentError(event, agentContext);
-    if (accessError) return { ok: false, error: accessError };
     const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
     const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
-    const isCurrent = () =>
-      isCurrentNavigation() &&
-      isPinnedOriginSender(event) &&
-      (!requiresLocalAgent || !localAgentError(event, agentContext));
+    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
     const navigate = async (registry) => {
       // The first-party renderer supplies the source-session host; main owns
       // the target and eligibility. Caller exception flags never establish identity.
@@ -494,41 +478,40 @@ function registerBrowserIpc({
     return { ok: true };
   });
 
-  // Capture the conversation's view as a base64 PNG.
-  ipcMain.handle("omnigent:browser-screenshot", async (event, args) => {
+  // Check access before execution and before returning screenshots or DOM data.
+  async function withAgentView(event, args, run) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const error = localAgentError(event, getAgentContextForEvent(event, args?.sourceHostId));
-    if (error) return { ok: false, error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const context = getAgentContextForEvent(event, args?.sourceHostId);
+    const access = g.registry.getForAgent(args?.conversationId, context);
+    if (!access.ok) return access;
     try {
-      const image = await entry.view.webContents.capturePage();
-      const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
-      return { ok: true, dataUrl };
+      const result = await run(access.entry.view.webContents);
+      const current = g.registry.getForAgent(args?.conversationId, context);
+      if (!isPinnedOriginSender(event) || !current.ok || current.entry !== access.entry) {
+        return { ok: false, error: "Browser view or session access changed during the action." };
+      }
+      return result;
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
-  });
+  }
+
+  ipcMain.handle("omnigent:browser-screenshot", (event, args) =>
+    withAgentView(event, args, async (webContents) => {
+      const image = await webContents.capturePage();
+      return { ok: true, dataUrl: `data:image/png;base64,${image.toPNG().toString("base64")}` };
+    }),
+  );
 
   // Both transports converge on main-owned scripts and the same sender gate.
   async function performBrowserAction(event, args, legacy = false) {
-    const g = gateRegistry(event);
-    if (g.error) return { ok: false, error: g.error };
-    const error = localAgentError(event, getAgentContextForEvent(event, args?.sourceHostId));
-    if (error) return { ok: false, error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
-    try {
+    return withAgentView(event, args, async (webContents) => {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
       const js = buildBrowserActionScript(action, params);
-      const result = await entry.view.webContents.executeJavaScript(js, false);
+      const result = await webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
-    } catch (e) {
-      return { ok: false, error: e && e.message ? e.message : String(e) };
-    }
+    });
   }
   ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
     performBrowserAction(event, args),
