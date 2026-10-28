@@ -4473,6 +4473,15 @@ async def test_shell_proxies_to_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("method", "suffix", "request_body"),
+    [
+        ("POST", "/shell", {"command": "private-shell-command"}),
+        ("PUT", "/filesystem/file.txt", {"content": "private-file-content"}),
+        ("PATCH", "/filesystem/file.txt", {"old_text": "old", "new_text": "new"}),
+        ("DELETE", "/filesystem/file.txt", None),
+    ],
+)
+@pytest.mark.parametrize(
     ("status", "response_body", "kind"),
     [
         (502, "", "empty"),
@@ -4481,25 +4490,28 @@ async def test_shell_proxies_to_runner(
     ],
     ids=["empty-gateway-error", "non-json-gateway-error", "non-object-success"],
 )
-async def test_shell_invalid_runner_response_is_diagnosed_without_replaying(
+async def test_mutation_invalid_runner_response_is_diagnosed_without_replaying(
     client: httpx.AsyncClient,
     caplog: pytest.LogCaptureFixture,
+    method: str,
+    suffix: str,
+    request_body: dict[str, str] | None,
     status: int,
     response_body: str,
     kind: str,
 ) -> None:
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/shell"
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default" + suffix
     fake_runner = _FakeRunnerClient(
         text_responses={path: (status, response_body, {"content-type": "text/html"})}
     )
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     with caplog.at_level(logging.ERROR):
-        response = await client.post(path, json={"command": "private-shell-command"})
+        response = await client.request(method, path, json=request_body)
 
     assert response.status_code == 502
     assert "operation may have completed" in response.json()["detail"]
-    assert fake_runner.calls == [("POST", path)]
+    assert fake_runner.calls == [(method, path)]
     records = [
         record
         for record in caplog.records
@@ -4508,11 +4520,45 @@ async def test_shell_invalid_runner_response_is_diagnosed_without_replaying(
     assert len(records) == 1
     attrs = records[0].attributes
     assert attrs["http_status"] == status
-    assert attrs["method"] == "POST"
+    assert attrs["method"] == method
     assert attrs["response_kind"] == kind
     assert attrs["response_bytes"] == len(response_body)
     assert attrs["content_type"] == "text/html"
     assert "private-" not in records[0].getMessage() + json.dumps(attrs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "suffix", "request_body"),
+    [
+        ("POST", "/shell", {"command": "echo hello"}),
+        ("PUT", "/filesystem/file.txt", {"content": "hello"}),
+        ("PATCH", "/filesystem/file.txt", {"old_text": "old", "new_text": "new"}),
+        ("DELETE", "/filesystem/file.txt", None),
+    ],
+)
+async def test_mutation_valid_runner_error_preserves_status_and_message(
+    client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    suffix: str,
+    request_body: dict[str, str] | None,
+) -> None:
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default" + suffix
+    fake_runner = _FakeRunnerClient(
+        responses={path: (403, {"error": {"message": "write access denied"}})}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    response = await client.request(method, path, json=request_body)
+
+    assert response.status_code == 403
+    assert response.json() == {"detail": "write access denied"}
+    assert fake_runner.calls == [(method, path)]
+    assert not any(
+        getattr(record, "event_name", None) == "runner_resource_response_invalid"
+        for record in caplog.records
+    )
 
 
 # ── Conversation deletion cleanup test ───────────────────────────
