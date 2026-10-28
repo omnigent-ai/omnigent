@@ -1,4 +1,5 @@
 import { renderHook } from "@testing-library/react";
+import type * as UseSessionPullRequestsModule from "@/hooks/useSessionPullRequests";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
@@ -7,6 +8,7 @@ import { useComposerGitStatus } from "./useComposerGitStatus";
 
 const useSessionWorktreesMock = vi.fn();
 const usePullRequestInfoMock = vi.fn();
+const useSessionPullRequestsMock = vi.fn(() => ({ data: undefined as unknown }));
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: (
@@ -17,6 +19,10 @@ vi.mock("@/hooks/useSessionWorktrees", () => ({
 }));
 vi.mock("@/hooks/usePullRequests", () => ({
   usePullRequestInfo: (id: string | undefined) => usePullRequestInfoMock(id),
+}));
+vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => ({
+  storedListToShow: (await importOriginal<typeof UseSessionPullRequestsModule>()).storedListToShow,
+  useSessionPullRequests: () => useSessionPullRequestsMock(),
 }));
 
 function wt(overrides: Partial<HostWorktree>): HostWorktree {
@@ -61,6 +67,8 @@ function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
 afterEach(() => {
   useSessionWorktreesMock.mockReset();
   usePullRequestInfoMock.mockReset();
+  useSessionPullRequestsMock.mockReset();
+  useSessionPullRequestsMock.mockReturnValue({ data: undefined });
 });
 
 const FORGE_DISPLAY = {
@@ -210,6 +218,30 @@ describe("useComposerGitStatus", () => {
     const { result } = run();
     expect(result.current.prCount).toBe(2);
     expect(result.current.prNumber).toBe(7);
+  });
+
+  it.each([
+    { live: "the host is offline", query: { isError: true, isFetching: false } },
+    { live: "live info still loads", query: { isError: false, isLoading: true, isFetching: true } },
+  ])("names the server's stored PRs while $live", ({ query }) => {
+    setWorktrees(undefined);
+    usePullRequestInfoMock.mockReturnValue({ data: undefined, refetch: vi.fn(), ...query });
+    useSessionPullRequestsMock.mockReturnValue({
+      data: {
+        prs: [{ url: "https://github.com/o/r/pull/42", number: 42, provider: "github" }],
+        synced: true,
+      },
+    });
+    expect(run().result.current).toMatchObject({ githubState: "ready", prCount: 1, prNumber: 42 });
+  });
+
+  it("keeps a live PR from a host without tracking over the empty stored list", () => {
+    setWorktrees({ status: "ok", worktrees: [wt({ branch: "main" })] });
+    setGithub({ pr: { number: 6000 } });
+    useSessionPullRequestsMock.mockReturnValue({ data: { prs: [], synced: true } });
+    const { result } = run();
+    expect(result.current.prCount).toBe(1);
+    expect(result.current.prNumber).toBe(6000);
   });
 
   it("styles the PR number by the primary PR's provider, then the session's", () => {

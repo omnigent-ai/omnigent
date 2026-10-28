@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
@@ -5460,12 +5461,19 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", [False, True], ids=["follow-up", "side-command"])
+@pytest.mark.parametrize(
+    "command,inherited",
+    [(False, False), (False, True), (True, False)],
+    ids=["follow-up", "inherited-default", "side-command"],
+)
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
+
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_misses", {})
 
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal",
@@ -5486,6 +5494,19 @@ async def test_events_codex_side_chat_preserves_indentation(
     fake_client = _RecordingCodexAppServerClient(
         transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
     )
+    fake_client.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-6-sol",
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "max"}],
+                    }
+                ]
+            }
+        }
+    ]
     monkeypatch.setattr(
         codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
     )
@@ -5499,12 +5520,18 @@ async def test_events_codex_side_chat_preserves_indentation(
     }
     if not command:
         payload["codex_side_thread_id"] = "thread_side"
+        payload["model_override"] = "gpt-6-sol"
+        if not inherited:
+            payload["reasoning_effort"] = "max"
     async with _runner_client(app) as client:
         created = await client.post(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
         )
         assert created.status_code == 201, created.text
         response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+        if not command:
+            repeated = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert repeated.status_code == 202, repeated.text
     assert response.status_code == 202, response.text
     if command:
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
@@ -5512,12 +5539,20 @@ async def test_events_codex_side_chat_preserves_indentation(
         ]
         assert fake_client.requests == []
     else:
-        assert fake_client.requests == [
+        assert [call for call in fake_client.requests if call[0] != "model/list"] == [
             (
                 "turn/start",
-                {"threadId": "thread_side", "input": [{"type": "text", "text": question}]},
+                {
+                    "threadId": "thread_side",
+                    "input": [{"type": "text", "text": question}],
+                    "model": "gpt-6-sol",
+                    **({"effort": "max"} if not inherited else {}),
+                },
             )
-        ]
+        ] * 2
+        assert sum(method == "model/list" for method, _ in fake_client.requests) == (
+            0 if inherited else 1
+        )
         assert fake_client.closed
 
 
@@ -5623,6 +5658,15 @@ async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
             "thread not found: 0199-abc",
         ),
         (ConnectionError("websocket closed 1011"), 503, "codex_side_chat_unavailable", None),
+        (
+            SideChatEffortUnavailable("No model default"),
+            409,
+            "codex_side_chat_settings_unavailable",
+            (
+                "Could not resolve the side chat's default effort. "
+                "Select an explicit effort and retry."
+            ),
+        ),
     ],
 )
 async def test_events_codex_side_chat_message_failure_is_structured(

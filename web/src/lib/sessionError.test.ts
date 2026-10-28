@@ -41,6 +41,20 @@ describe("latestActivityIsError", () => {
     expect(latestActivityErrorState([error], true)).toBe("error");
   });
 
+  it("retires a status-only failure card once the session has left failed", () => {
+    const statusCard: ErrorBlock = {
+      ...error,
+      ctx: { ...ctx, itemId: null },
+      code: "required_terminal_exited",
+      fromSessionStatus: true,
+    };
+    expect(latestActivityErrorState([text("Done."), statusCard], null, "failed")).toBe("error");
+    expect(latestActivityErrorState([text("Done."), statusCard], null, "idle")).toBeNull();
+    // A persisted fault behind the card still shows after a fresh load, so it still counts.
+    expect(latestActivityErrorState([error, statusCard], null, "idle")).toBe("error");
+    expect(latestActivityErrorState([statusCard])).toBe("error");
+  });
+
   it("preserves a genuine fault in a mixed fault and disconnect cascade", () => {
     const disconnected = { ...error, code: "runner_disconnected", message: "Tunnel dropped" };
     expect(latestActivityErrorState([error, disconnected], false)).toBe("error");
