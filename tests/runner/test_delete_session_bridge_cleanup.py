@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 import uuid
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -36,7 +37,14 @@ from fastapi import FastAPI
 from omnigent.harnesses.antigravity_native.bridge import (
     bridge_dir_for_bridge_id as antigravity_bridge_dir,
 )
-from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id, prepare_bridge_dir
+from omnigent.harnesses.claude_native.bridge import (
+    BRIDGE_ID_LABEL_KEY,
+    bridge_dir_for_bridge_id,
+    prepare_bridge_dir,
+    read_active_session_id,
+    write_active_session_id,
+    write_tmux_target,
+)
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id as claude_bridge_dir,
 )
@@ -73,6 +81,7 @@ from omnigent.inner.native_attachments import (
     materialize_text,
     pasted_text_cache_dir,
 )
+from omnigent.native.native_bridge_common import bridge_dir_preparation_lock
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import _runner_client
@@ -95,6 +104,16 @@ BRIDGE_DIR_RESOLVERS: dict[str, Callable[[str], Path]] = {
     "pi": pi_bridge_dir,
     "qwen": qwen_bridge_dir,
 }
+
+
+@pytest.fixture(autouse=True)
+def isolated_bridge_roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Deletion tests must never inspect the developer's native session roots."""
+    for family in BRIDGE_DIR_RESOLVERS:
+        monkeypatch.setattr(
+            f"omnigent.harnesses.{family}_native.bridge._BRIDGE_ROOT", tmp_path / family
+        )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
 
 
 @pytest.fixture
@@ -182,6 +201,205 @@ async def test_cleanup_resources_removes_native_bridge_dir(
     )
     assert not attachment_cache_dir(bridge_dir).exists()
     assert not pasted_text_cache_dir(bridge_dir).exists()
+
+
+@pytest.mark.parametrize("suffix", ["", "/resources"])
+@pytest.mark.parametrize("foreign_path", ["natural", "labeled"])
+async def test_cleanup_preserves_bridge_transferred_to_another_session(
+    tmp_path: Path,
+    suffix: str,
+    foreign_path: str,
+) -> None:
+    """Deleting the pre-clear session must keep its replacement's bridge usable."""
+    old_session = f"conv_{uuid.uuid4().hex}"
+    replacement = f"conv_{uuid.uuid4().hex}"
+    retired_bridge_id = f"{old_session}-cleared"
+    natural = prepare_bridge_dir(old_session, workspace=tmp_path)
+    labeled = prepare_bridge_dir(old_session, bridge_id=retired_bridge_id, workspace=tmp_path)
+    foreign, owned = (natural, labeled) if foreign_path == "natural" else (labeled, natural)
+    write_active_session_id(foreign, replacement)
+    write_tmux_target(foreign, socket_path=tmp_path / "replacement.sock", tmux_target="live:0.0")
+    attachment = {
+        "type": "input_file",
+        "filename": "input.txt",
+        "file_data": "data:text/plain;base64,aGk=",
+    }
+    foreign_attachment = materialize_attachment(attachment, foreign)
+    owned_attachment = materialize_attachment(attachment, owned)
+    assert foreign_attachment is not None and owned_attachment is not None
+    metadata = {path.name: path.read_bytes() for path in foreign.iterdir() if path.is_file()}
+
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, json={"labels": {BRIDGE_ID_LABEL_KEY: retired_bridge_id}}
+        )
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as server:
+        async with _runner_client(create_runner_app(server_client=server)) as runner:
+            response = await runner.delete(f"/v1/sessions/{old_session}{suffix}")
+
+    assert response.status_code == 200
+    assert read_active_session_id(foreign) == replacement
+    assert {
+        path.name: path.read_bytes() for path in foreign.iterdir() if path.is_file()
+    } == metadata
+    assert foreign_attachment.read_bytes() == b"hi"
+    assert not owned.exists()
+    assert not attachment_cache_dir(owned).exists()
+
+
+@pytest.mark.parametrize(
+    ("config", "preserved"),
+    [
+        ('{"conversation_id": "conv_other"}', True),
+        ('{"conversation_id": "conv_delete"}', False),
+        ('{"active_session_id": "conv_delete", "conversation_id": "conv_other"}', False),
+        ("{}", False),
+        ("{broken", False),
+        ('{"active_session_id": 7}', False),
+        (None, False),
+    ],
+)
+async def test_cleanup_honors_legacy_owner_and_cleans_unowned_metadata(
+    client: httpx.AsyncClient,
+    config: str | None,
+    preserved: bool,
+) -> None:
+    """A known legacy owner is protected; inconclusive old metadata still gets reclaimed."""
+    session_id = f"conv_{uuid.uuid4().hex}"
+    bridge_dir = claude_bridge_dir(session_id)
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    config_path = bridge_dir / "bridge.json"
+    if config is None:
+        config_path.unlink(missing_ok=True)
+    else:
+        config_path.write_text(config.replace("conv_delete", session_id))
+    attachment = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "input.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+        },
+        bridge_dir,
+    )
+    assert attachment is not None
+
+    response = await client.delete(f"/v1/sessions/{session_id}/resources")
+
+    assert response.status_code == 200
+    assert bridge_dir.exists() == preserved
+    assert attachment.exists() == preserved
+    if preserved:
+        assert read_active_session_id(bridge_dir) == "conv_other"
+        assert attachment.read_bytes() == b"hi"
+
+
+@pytest.mark.parametrize("suffix", ["", "/resources"])
+async def test_cleanup_preserves_bridge_and_cache_while_metadata_writer_holds_lock(
+    client: httpx.AsyncClient, tmp_path: Path, suffix: str
+) -> None:
+    """A busy metadata writer defers deletion; a subsequent cleanup can remove the owner."""
+    session_id = f"conv_{uuid.uuid4().hex}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    attachment = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "input.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+        },
+        bridge_dir,
+    )
+    assert attachment is not None
+    config = (bridge_dir / "bridge.json").read_bytes()
+
+    with bridge_dir_preparation_lock(bridge_dir):
+        response = await client.delete(f"/v1/sessions/{session_id}{suffix}")
+        assert response.status_code == 200
+        assert (bridge_dir / "bridge.json").read_bytes() == config
+        assert attachment.read_bytes() == b"hi"
+
+    response = await client.delete(f"/v1/sessions/{session_id}{suffix}")
+    assert response.status_code == 200
+    assert not bridge_dir.exists()
+    assert not attachment_cache_dir(bridge_dir).exists()
+
+
+async def test_cleanup_preserves_bridge_while_separate_process_updates_owner(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A real metadata writer excludes cleanup across processes, then releases the lock."""
+    session_id = f"conv_{uuid.uuid4().hex}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    attachment = materialize_attachment(
+        {
+            "type": "input_file",
+            "filename": "input.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+        },
+        bridge_dir,
+    )
+    assert attachment is not None
+    config = (bridge_dir / "bridge.json").read_bytes()
+    ready, release = tmp_path / "writer-ready", tmp_path / "writer-release"
+    script = """
+import sys
+import time
+from pathlib import Path
+from omnigent.harnesses.claude_native import bridge
+
+bridge_dir, ready, release = map(Path, sys.argv[1:4])
+bridge._BRIDGE_ROOT = bridge_dir.parent
+bridge._TRUSTED_PARENT = bridge_dir.parent
+original_read = bridge._read_json_file
+
+def paused_read(path):
+    value = original_read(path)
+    ready.touch()
+    deadline = time.monotonic() + 30
+    while not release.exists():
+        if time.monotonic() > deadline:
+            raise RuntimeError("writer release timed out")
+        time.sleep(0.01)
+    return value
+
+bridge._read_json_file = paused_read
+bridge.write_active_session_id(bridge_dir, sys.argv[4])
+"""
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        str(bridge_dir),
+        str(ready),
+        str(release),
+        session_id,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        async with asyncio.timeout(10):
+            while not ready.exists():
+                if process.returncode is not None:
+                    _, stderr = await process.communicate()
+                    pytest.fail(f"metadata writer exited before locking: {stderr.decode()}")
+                await asyncio.sleep(0.01)
+        response = await client.delete(f"/v1/sessions/{session_id}/resources")
+        assert response.status_code == 200
+        assert (bridge_dir / "bridge.json").read_bytes() == config
+        assert attachment.read_bytes() == b"hi"
+        release.touch()
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+        assert process.returncode == 0, stderr.decode()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+    assert read_active_session_id(bridge_dir) == session_id
+    response = await client.delete(f"/v1/sessions/{session_id}/resources")
+    assert response.status_code == 200
+    assert not bridge_dir.exists()
+    assert not attachment_cache_dir(bridge_dir).exists()
 
 
 # ── #3728: spec-fill generation guard ───────────────────────────────────────

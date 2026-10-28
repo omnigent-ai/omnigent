@@ -1015,30 +1015,32 @@ def _upsert_top_level_config_key(
 @contextlib.contextmanager
 def _bridge_state_lock(bridge_dir: Path, lock_file: str = _STATE_LOCK_FILE) -> Iterator[None]:
     """
-    Serialize bridge-state read/modify/write cycles across local processes.
+    Serialize bridge-state cycles and exclude directory cleanup.
 
     :param bridge_dir: Native Codex bridge directory.
-    :param lock_file: Lock file name, so unrelated cycles do not contend.
+    :param lock_file: Existing per-cycle process lock file name.
     :returns: Context manager holding the bridge's process lock.
     """
-    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover - native Codex is POSIX-only today.
-        yield
-        return
-    fd = os.open(
-        bridge_dir / lock_file,
-        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
-        0o600,
-    )
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+    # Keep the existing state flock inside the stable directory lock.
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - native Codex is POSIX-only today.
+            yield
+            return
+        fd = os.open(
+            bridge_dir / lock_file,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
 
 def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
