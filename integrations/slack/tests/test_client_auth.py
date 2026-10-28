@@ -3,8 +3,14 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 import respx
-from omnigent_slack.omnigent import ClientAuth, OmnigentClient, OmnigentClientPool
+from omnigent_slack.omnigent import (
+    AuthRequiredError,
+    ClientAuth,
+    OmnigentClient,
+    OmnigentClientPool,
+)
 
 _BASE = "http://omnigent.test"
 
@@ -179,6 +185,58 @@ async def test_invalidate_rebuilds_client_with_new_token() -> None:
         assert after is not before
         assert after._auth is not None
         assert after._auth.access_token == "tok-1"
+    finally:
+        await pool.aclose_all()
+
+
+@pytest.mark.parametrize("user_id", ["", "U1"])
+@respx.mock(assert_all_called=False)
+async def test_pool_requires_user_token_even_when_server_accepts_anonymous(
+    user_id: str,
+    respx_mock: respx.MockRouter,
+) -> None:
+    anonymous = respx_mock.route().mock(return_value=httpx.Response(200, json={"data": []}))
+
+    async def tokenless_user(server_url: str, resolved_user_id: str) -> None:
+        assert server_url == _BASE
+        assert resolved_user_id == user_id
+        return
+
+    pool = OmnigentClientPool(auth_resolver=tokenless_user if user_id else None)
+    try:
+        client = await pool.get(_BASE, user_id)
+        with pytest.raises(AuthRequiredError):
+            await client.list_agents()
+        with pytest.raises(AuthRequiredError):
+            async with client.stream_session_events("session-1"):
+                pytest.fail("Unauthenticated stream must not open")
+        assert not anonymous.called
+    finally:
+        await pool.aclose_all()
+
+
+@respx.mock(assert_all_called=False)
+async def test_cached_pool_client_fails_closed_after_token_is_cleared(
+    respx_mock: respx.MockRouter,
+) -> None:
+    auth = ClientAuth("token", _no_refresh)
+
+    async def resolver(server_url: str, user_id: str) -> ClientAuth:
+        return auth
+
+    route = respx_mock.get(_BASE + "/v1/agents").respond(200, json={"data": []})
+    pool = OmnigentClientPool(auth_resolver=resolver)
+    try:
+        client = await pool.get(_BASE, "U1")
+        await client.list_agents()
+        auth.access_token = None
+        with pytest.raises(AuthRequiredError):
+            await client.list_agents()
+        with pytest.raises(AuthRequiredError):
+            async with client.stream_session_events("session-1"):
+                pytest.fail("A cleared cached token must not open a stream")
+        assert route.call_count == 1
+        assert respx_mock.calls.call_count == 1
     finally:
         await pool.aclose_all()
 

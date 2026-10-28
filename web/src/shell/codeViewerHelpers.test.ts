@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_RICH_MARKDOWN_BYTES,
+  isMarkdownTooLargeForRichView,
   HTML_PREVIEW_HEAD,
   HTML_PREVIEW_SANDBOX,
   detectLang,
@@ -990,5 +992,18 @@ describe("getSelectionOffsets", () => {
 
     expect(getSelectionOffsets(range, container, ["abc"])).toBeNull();
     container.remove();
+  });
+});
+
+describe("large Markdown routing", () => {
+  it.each([
+    ["markdown", "a".repeat(MAX_RICH_MARKDOWN_BYTES), false],
+    ["markdown", "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true],
+    ["markdown", "é".repeat(MAX_RICH_MARKDOWN_BYTES / 2), false],
+    ["markdown", "é".repeat(MAX_RICH_MARKDOWN_BYTES / 2) + "a", true],
+    ["markdown", "😀".repeat(MAX_RICH_MARKDOWN_BYTES / 4) + "a", true],
+    ["text", "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), false],
+  ])("uses UTF-8 bytes for case %#", (lang, content, expected) => {
+    expect(isMarkdownTooLargeForRichView(lang, content)).toBe(expected);
   });
 });

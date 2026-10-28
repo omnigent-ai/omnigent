@@ -19,6 +19,7 @@ from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
@@ -35,6 +36,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _build_app_for_spec,
     _build_app_with_mcp_tool,
@@ -45,6 +47,7 @@ from tests.runner.conftest import (
     _ReadTimeoutTransport,
     _runner_client,
     _ScriptedHarnessClient,
+    _spec_resolver_returning,
     _sse,
 )
 from tests.runner.helpers import NullServerClient
@@ -244,6 +247,50 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
     assert env == {"CODEX_BRIDGE": "bridge_xyz"}
     assert captured == {"session_id": "conv_codex", "bridge_id": "bridge_xyz"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launched_into_label_dir", [True, False])
+async def test_resolve_native_spawn_env_codex_failed_label_read_keeps_the_launch_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launched_into_label_dir: bool,
+) -> None:
+    """A Codex spawn whose label read fails reads bridge state where the terminal was launched.
+
+    A rotated session's terminal is launched into its bridge-id label's
+    directory. If the spawn-time label read then fails, the executor must still
+    get that directory, not the session id's; with no launch on this runner it
+    keeps the session id's directory.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
+
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    label_dir = codex_bridge.bridge_dir_for_bridge_id("bridge_rotated_from")
+    if launched_into_label_dir:
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, "conv_codex", label_dir)
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        env = await _resolve_native_spawn_env(
+            "codex-native",
+            "conv_codex",
+            server_client=client,
+            optional_labels=None,
+        )
+
+    expected = (
+        label_dir
+        if launched_into_label_dir
+        else codex_bridge.bridge_dir_for_bridge_id("conv_codex")
+    )
+    assert env is not None
+    assert env[codex_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] == str(expected)
+    assert env[codex_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] == "conv_codex"
 
 
 @pytest.mark.asyncio
@@ -617,6 +664,32 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_launch_native_terminal_publishes_model_outside_allowlist_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model outside the harness's list is published as a setup error, not a crash."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    async def _reject_model(ctx: NativeLaunchContext) -> object:
+        raise ModelNotAllowedError("model-b", "pi-native", ("model-a",))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _reject_model)
+    events: list[dict[str, Any]] = []
+    result = await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(publish_event=lambda _name, event: events.append(event)),
+        ensure_locks={},
+    )
+
+    assert result is False
+    failed = next(event for event in events if event.get("status") == "failed")
+    assert failed["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert "Allowed models: 'model-a'." in failed["error"]["message"]
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -860,6 +933,27 @@ async def test_ensure_native_terminal_missing_workspace_returns_410_without_stac
     assert all(record.exc_info is None for record in caplog.records)
     assert "resource unavailable" in caplog.text
     assert "agent unavailable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_model_outside_allowlist_returns_412_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model outside the harness's list is a setup error, not a startup defect."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _reject_model(ctx: NativeLaunchContext) -> object:
+        raise ModelNotAllowedError("model-b", "goose-native", ("model-a",))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _reject_model)
+    resp = await _ensure_native_terminal(
+        "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+    )
+
+    assert resp is not None and resp.status_code == 412
+    assert json.loads(bytes(resp.body))["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -2216,7 +2310,9 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
 
 
 @pytest.mark.asyncio
-async def test_create_session_spawns_the_snapshot_harness_override() -> None:
+async def test_create_session_spawns_the_snapshot_harness_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Session init must spawn the session's overridden harness, not the spec's.
 
     ``get_client`` entries are keyed by conversation, so resolving the spawn
@@ -2227,6 +2323,7 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
     spec's harness is a native one, init also launches its terminal on top of
     that spawn, leaving two live processes for the one session.
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
@@ -2271,7 +2368,9 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_turn_resolves_the_recorded_harness_override() -> None:
+async def test_message_turn_resolves_the_recorded_harness_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A turn whose body has no ``harness_override`` still runs the override.
 
     The native terminal forward carries the override as session state, not
@@ -2281,6 +2380,7 @@ async def test_message_turn_resolves_the_recorded_harness_override() -> None:
     evicted the override harness mid-session (the split-brain on the turn
     after the kickoff).
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
@@ -2783,9 +2883,10 @@ async def test_create_session() -> None:
 
 
 class _NativeSeedServerClient(NullServerClient):
-    """Server client with one stored item; records item listings and event posts."""
+    """Server client with stored items; records item listings and event posts."""
 
-    def __init__(self) -> None:
+    def __init__(self, stored_items: list[dict[str, Any]] | None = None) -> None:
+        self.stored_items = [{"id": "item_latest"}] if stored_items is None else stored_items
         self.items_params: list[Any] = []
         self.file_calls: list[str] = []
         self.posted_events: list[dict[str, Any]] = []
@@ -2793,10 +2894,11 @@ class _NativeSeedServerClient(NullServerClient):
     async def get(self, url: str, **kwargs: Any) -> Any:
         if url.endswith("/items"):
             self.items_params.append(kwargs.get("params"))
+            stored_items = self.stored_items
 
             class _ItemsResponse(NullServerClient._Response):
                 def json(self) -> dict[str, Any]:
-                    return {"data": [{"id": "item_latest"}], "has_more": False}
+                    return {"data": stored_items, "has_more": False}
 
             return _ItemsResponse()
         if "/resources/files/" in url:
@@ -2899,6 +3001,133 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
 
     assert compactions, "harness compaction was never persisted to the server"
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("has_anchor", "full_context"),
+    [
+        pytest.param(True, True, id="compacted"),
+        pytest.param(True, False, id="summary-only"),
+        pytest.param(False, True, id="compaction-not-persisted"),
+    ],
+)
+async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
+    has_anchor: bool,
+    full_context: bool,
+) -> None:
+    """Replay pre-tool text once; leave history intact if compaction lacks an anchor."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
+
+    compacted_messages = [
+        {"type": "message", "role": role, "content": [{"type": block_type, "text": text}]}
+        for role, block_type, text in [
+            ("user", "input_text", "SUMMARY"),
+            ("user", "input_text", "hi"),
+            ("assistant", "output_text", "Reading notes."),
+        ]
+    ]
+    stream_finished = asyncio.Event()
+    harness_client = _ScriptedHarnessClient(
+        [
+            _sse(event)
+            for event in [
+                {"type": "response.created", "response": {"id": "resp_1"}},
+                {"type": "response.output_text.delta", "delta": "Reading notes."},
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read",
+                        "arguments": "{}",
+                        "status": "completed",
+                    },
+                },
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                },
+                {"type": "response.output_text.delta", "delta": "RECOVERED"},
+                {
+                    "type": "response.compaction.completed",
+                    "summary": "SUMMARY",
+                    "total_tokens": 5,
+                    "compacted_messages": compacted_messages if full_context else None,
+                },
+                {"type": "response.completed", "response": {"id": "resp_1"}},
+            ]
+        ],
+        stream_finished=stream_finished,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=_NativeSeedServerClient([{"id": "item_latest"}] if has_anchor else []),  # type: ignore[arg-type]
+    )
+
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert resp.status_code == 201, resp.text
+        for text in ("hi", "next"):
+            turn = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            assert turn.status_code == 202, turn.text
+            await asyncio.wait_for(stream_finished.wait(), timeout=5.0)
+            stream_finished.clear()
+            # The follow-up only captures history; no second reply mutates the recorded body.
+            harness_client._sse_frames = [
+                _sse({"type": "response.completed", "response": {"id": "resp_2"}})
+            ]
+
+    if not has_anchor:
+        expected_history = [
+            ("user", "hi"),
+            ("function_call", "call_1"),
+            ("function_call_output", "call_1"),
+            ("assistant", "Reading notes.RECOVERED"),
+        ]
+    elif full_context:
+        expected_history = [
+            ("user", "SUMMARY"),
+            ("user", "hi"),
+            ("assistant", "Reading notes."),
+            ("assistant", "RECOVERED"),
+        ]
+    else:
+        expected_history = [
+            (
+                "user",
+                "[Automatically generated summary of prior conversation context.]\n\n"
+                "Please provide a summary of our conversation so far.",
+            ),
+            ("assistant", "SUMMARY"),
+            ("assistant", "RECOVERED"),
+        ]
+    assert len(harness_client.posted_bodies) == 2
+    next_request = harness_client.posted_bodies[1]["content"]
+    assert [
+        (item["role"], "".join(part["text"] for part in item["content"]))
+        if item["type"] == "message"
+        else (item["type"], item["call_id"])
+        for item in next_request
+    ] == [*expected_history, ("user", "next")]
 
 
 def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:

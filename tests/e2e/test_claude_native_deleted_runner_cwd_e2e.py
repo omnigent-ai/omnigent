@@ -27,6 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
 )
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, token_bound_runner_id
+from omnigent.terminals.program_status import ProgramStatusReader
 from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.test_host_claude_native_e2e import _poll_for_assistant_marker
 from tests.e2e.test_host_claude_native_fork_e2e import _send_user_message
@@ -306,13 +307,18 @@ os_env:
                 send_direct(baseline)
             wait_reply(baseline)
             print("Baseline native reply received", flush=True)
-            claude_pid = int(
+            pane_pid = int(
                 subprocess.check_output(
                     [*tmux, "display-message", "-p", "-t", target, "#{pane_pid}"],
                     text=True,
                     timeout=5,
                 )
             )
+            # With OSC status enabled, the relay owns the pane and Claude is its child.
+            status_reader = ProgramStatusReader(
+                Path(pane["socket_path"]).parent / "program-status.json"
+            )
+            claude_pid = status_reader.child_pid or pane_pid
             assert Path(f"/proc/{claude_pid}/comm").read_text().strip() == "claude"
             assert os.readlink(f"/proc/{claude_pid}/cwd") == str(workspace)
             assert os.readlink(f"/proc/{runner.pid}/cwd") == str(runner_cwd)

@@ -31,9 +31,9 @@ from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
 from tests._helpers.live_server import terminate_process
 from tests._helpers.server_runner import server_runner
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
-from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
+from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODEL = "gpt-5.4-mini"
@@ -207,7 +207,7 @@ def test_connected_codex_resume_routes_to_configured_provider(
                     timeout=5,
                 ).raise_for_status()
             if terminal is None:
-                _send_user_text(client, session_id=session_id, text=prompt)
+                send_user_text(client, session_id=session_id, text=prompt)
             else:
                 tmux = [
                     "tmux",

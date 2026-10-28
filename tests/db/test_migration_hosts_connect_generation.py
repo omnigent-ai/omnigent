@@ -18,7 +18,7 @@ from omnigent.db.utils import (
     now_epoch,
 )
 
-_PARENT_REVISION = "mm1a2b3c4d5e"
+_PARENT_REVISION = "d0a1f879a01d"
 
 
 @pytest.fixture

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_startup_timeout,
     read_bridge_state,
     read_certificate_failure,
+    read_child_usage_baselines,
     read_codex_config_effort,
     read_codex_config_model,
     read_codex_home_config_effort,
@@ -38,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_policy_hook_config,
     record_app_server_stopped,
     record_certificate_failure,
+    record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -124,12 +127,53 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.cwd == str(tmp_path)
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state == state
+    assert observation.status == "ready"
+    assert observation.os_errno is None
 
     clear_active_turn_id_if_matches(tmp_path, "turn_1")
 
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("contents", "status"),
+    [
+        pytest.param(None, "missing", id="missing"),
+        pytest.param(b"\xff", "invalid_encoding", id="invalid-utf8"),
+        pytest.param(b"{", "invalid_json", id="invalid-json"),
+        pytest.param(b"[]", "invalid_state", id="invalid-shape"),
+        pytest.param(
+            b'{"session_id":"private-state-content"}', "invalid_state", id="missing-fields"
+        ),
+    ],
+)
+def test_invalid_bridge_state_is_unavailable_with_content_free_status(
+    tmp_path: Path, contents: bytes | None, status: str
+) -> None:
+    if contents is not None:
+        (tmp_path / "state.json").write_bytes(contents)
+
+    assert read_bridge_state(tmp_path) is None
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state is None
+    assert observation.status == status
+    assert observation.os_errno == (errno.ENOENT if contents is None else None)
+    assert "private-state-content" not in str(observation)
+
+
+def test_bridge_state_rejects_non_file_without_reading_it(tmp_path: Path) -> None:
+    (tmp_path / "state.json").mkdir()
+
+    assert read_bridge_state(tmp_path) is None
+    observation = codex_native_bridge.read_bridge_state_result(tmp_path)
+    assert observation.state is None
+    assert observation.status == "not_file"
+    assert observation.os_errno is None
+    assert str(tmp_path) not in str(observation)
 
 
 @pytest.fixture
@@ -504,6 +548,32 @@ def test_clear_active_turn_id_if_matches(
     # The cleared/preserved active turn id also governs steering: a turn
     # wrongly cleared here means later web messages stop steering it.
     assert state.active_turn_id == expected_active_after
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "next_turn_id"),
+    [(None, None), ("turn_a", "turn_a"), (None, "turn_a"), ("turn_a", "turn_b"), ("turn_a", None)],
+)
+def test_active_turn_update_requires_storage_only_when_state_changes(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_turn_id: str | None,
+    next_turn_id: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, active_turn_id)
+    before = read_bridge_state(bridge_dir)
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(codex_native_bridge.tempfile, "mkstemp", disk_full)
+    if active_turn_id == next_turn_id:
+        update_active_turn_id(bridge_dir, next_turn_id)
+    else:
+        with pytest.raises(OSError) as raised:
+            update_active_turn_id(bridge_dir, next_turn_id)
+        assert raised.value.errno == errno.ENOSPC
+    assert read_bridge_state(bridge_dir) == before
 
 
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
@@ -941,6 +1011,45 @@ def test_clear_bridge_state_removes_mcp_startup(bridge_dir: Path) -> None:
     clear_bridge_state(bridge_dir)
 
     assert read_mcp_startup(bridge_dir) == {}
+
+
+@pytest.mark.parametrize(
+    ("patched_owner", "patched_name"),
+    [(Path, "open"), (codex_native_bridge.tempfile, "mkstemp")],
+    ids=["read-fails", "write-fails"],
+)
+def test_child_usage_baseline_storage_failure_keeps_recorded_baselines(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    patched_owner: object,
+    patched_name: str,
+) -> None:
+    """
+    A failed read or write while recording one child keeps the others' baselines
+    and is logged, so a restarted forwarder still subtracts their inherited usage.
+    """
+    record_child_usage_baseline(bridge_dir, "thread_forked", (5000, 4000, 100))
+    record_child_usage_baseline(bridge_dir, "thread_fresh", (0, 0, 0))
+
+    def storage_error(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.EIO, "Input/output error")
+
+    with (
+        monkeypatch.context() as patch,
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.bridge"),
+    ):
+        patch.setattr(patched_owner, patched_name, storage_error)
+        record_child_usage_baseline(bridge_dir, "thread_new", (300, 0, 30))
+
+    assert read_child_usage_baselines(bridge_dir) == {
+        "thread_forked": (5000, 4000, 100),
+        "thread_fresh": (0, 0, 0),
+    }
+    assert any(
+        "Could not record inherited Codex child usage" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

@@ -274,7 +274,7 @@ def make_report(
             }
     report = build_report(
         journeys,
-        generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        generated_at=datetime.datetime.now(datetime.UTC).isoformat(),
         config={
             "iterations": args.iterations,
             "runs": args.runs,

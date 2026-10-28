@@ -46,6 +46,14 @@ _PERMISSION_PANE_REJECT_FOCUSED = _PERMISSION_PANE.replace(
     "  Yes, single permission\n   Trust, always allow in this session\n ❯ No (Tab to edit)",
 )
 _PERMISSION_PANE_DATE = _PERMISSION_PANE.replace("↓ Shell pwd", "↓ Shell date")
+# Kiro 2.31.1 renders a write preview between the tool heading and picker.
+_WRITE_PERMISSION_PANE = _PERMISSION_PANE.replace(
+    "↓ Shell pwd",
+    "↓ Write /workspace/kiro-approval-check.txt\n"
+    "  added 1 line in kiro-approval-check.txt\n"
+    "     1+  hello from Kiro\n"
+    "────────────────",
+).replace("shell requires approval", "write requires approval")
 
 
 @pytest.fixture
@@ -180,6 +188,7 @@ def test_send_kiro_permission_verdict_declines_with_slow_navigation(
         monkeypatch,
         pane_outputs=[
             _PERMISSION_PANE,
+            _PERMISSION_PANE,
             _PERMISSION_PANE_REJECT_FOCUSED,
         ],
     )
@@ -292,11 +301,11 @@ def test_send_kiro_permission_verdict_refuses_decline_when_reject_not_focused(
 
     with pytest.raises(RuntimeError, match="reject option was not safely focused"):
         send_kiro_permission_verdict(
-            bridge_dir, action="decline", expected_title="Running: pwd", timeout_s=0.01
+            bridge_dir, action="decline", expected_title="Running: pwd", timeout_s=5.0
         )
 
     sent_keys = [call[-1] for call in calls if "send-keys" in call]
-    assert sent_keys == ["Down", "Down"]
+    assert sent_keys == ["Down"]
 
 
 def test_inject_user_message_waits_for_forwarder_on_resumed_kiro_session(
@@ -683,3 +692,93 @@ def test_prepare_bridge_dir_rejects_symlinked_ancestor(
         bridge.prepare_bridge_dir("conv_kiro")
 
     assert not (elsewhere / "kiro-native").exists()
+
+
+@pytest.mark.parametrize(
+    ("tool_line", "title", "matches"),
+    [
+        ("Running: pwd", "Running: pwd", True),
+        ("✓ Running: old\nRunning: pwd", "Running: pwd", True),
+        ("↓ Shell rm 'safe name'", "Running: rm 'safe  name'", False),
+        ("↓ arbitrary echo fixture", "Running: echo fixture", False),
+        ("✓ Shell echo fixture", "Running: echo fixture", False),
+        ("↓ Shell echo tools", "Running: ls", False),
+        ("↓ Shell cd /tmp/long-\npath", "Running: cd /tmp/long-path", False),
+        ("↓ Shell pwd\n╰ working_dir=/tmp\n────", "Running: pwd", True),
+        (
+            "↓ Write /workspace/check.txt\n  added 1 line in check.txt\n     1+  hello\n────",
+            "Write /workspace/check.txt",
+            True,
+        ),
+        (
+            "↓ Write /other/check.txt\n  added 1 line in check.txt\n     1+  hello\n────",
+            "Write /workspace/check.txt",
+            False,
+        ),
+        ("• Write /workspace/check.txt", "Write /workspace/check.txt", False),
+        (
+            "↓ Write /workspace/check.txt\n  added 1 line in check.txt\n"
+            "     1+  ↓ Write /other/check.txt\n────",
+            "Write /other/check.txt",
+            False,
+        ),
+        ("↓ Write /workspace/check.txt\nunknown detail", "Write /workspace/check.txt", False),
+        ("↓ Shell pwd\n     1+  hello", "Running: pwd", False),
+        (
+            "↓ Write /workspace/check.txt\n  added 1 line, removed 1 line in check.txt\n"
+            "     1-  old text\n     1+  new text\n────",
+            "Write /workspace/check.txt",
+            True,
+        ),
+    ],
+)
+def test_permission_title_preserves_command_identity(
+    tool_line: str,
+    title: str,
+    matches: bool,
+) -> None:
+    pane = _PERMISSION_PANE.replace("↓ Shell pwd", tool_line)
+    assert bridge._kiro_permission_prompt_matches_title(pane, title) is matches
+
+
+def test_permission_does_not_send_after_receipt_arrives_during_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0)
+    calls = _install_fake_tmux(monkeypatch, pane_outputs=[_PERMISSION_PANE])
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+
+    def captures() -> int:
+        return sum("capture-pane" in call for call in calls)
+
+    send_kiro_permission_verdict(
+        tmp_path,
+        action="accept",
+        expected_title="Running: pwd",
+        timeout_s=0.1,
+        verdict_recorded=lambda: captures() >= 2,
+    )
+    assert not any("send-keys" in call for call in calls)
+    assert all("-J" in call for call in calls if "capture-pane" in call)
+
+
+@pytest.mark.parametrize("action", ["decline", "cancel"])
+def test_rejection_recovers_from_intermediate_focus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    monkeypatch.setattr(bridge, "_PERMISSION_KEY_INTERVAL_S", 0)
+    monkeypatch.setattr(bridge, "_PERMISSION_ENTER_SETTLE_S", 0)
+    calls = _install_fake_tmux(
+        monkeypatch,
+        pane_outputs=[
+            _PERMISSION_PANE_TRUST_FOCUSED,
+            _PERMISSION_PANE_TRUST_FOCUSED,
+            _PERMISSION_PANE_REJECT_FOCUSED,
+        ],
+    )
+    write_tmux_target(tmp_path, socket_path=Path("/tmp/tmux.sock"), tmux_target="main")
+    send_kiro_permission_verdict(
+        tmp_path, action=action, expected_title="Running: pwd", timeout_s=0.1
+    )
+    assert [call[-1] for call in calls if "send-keys" in call] == ["Down", "Enter"]

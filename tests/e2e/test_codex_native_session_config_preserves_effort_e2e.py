@@ -34,10 +34,10 @@ from __future__ import annotations
 
 import shutil
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 
 from tests.e2e._native_resume_helpers import cli_env, omnigent_console_script, spawn_cli_background
 from tests.e2e.helpers import POLL_INTERVAL_S

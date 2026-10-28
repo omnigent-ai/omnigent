@@ -28,9 +28,12 @@ cleared per test below.
 from __future__ import annotations
 
 import asyncio
+import gc
+import inspect
 import json
 import logging
-from collections.abc import Iterator
+import warnings
+from collections.abc import Coroutine, Iterator
 from typing import Any
 
 import pytest
@@ -47,6 +50,53 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.routes import sessions as sessions_route
 
 SESSION = "conv_test"
+
+
+def test_deferred_clear_does_not_leak_without_a_running_loop() -> None:
+    """Rejected scheduling must not leave an unawaited cleanup coroutine."""
+    before = set(sessions_route._deferred_elicitation_clear_tasks)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            sessions_route._schedule_deferred_elicitation_clear(SESSION, "e_unavailable", None)
+        gc.collect()
+
+    assert not [warning for warning in caught if "was never awaited" in str(warning.message)]
+    assert sessions_route._deferred_elicitation_clear_tasks == before
+
+
+@pytest.mark.parametrize(
+    "failure", [RuntimeError("scheduler unavailable"), asyncio.CancelledError()]
+)
+async def test_deferred_clear_closes_coroutine_when_task_factory_rejects(
+    failure: BaseException,
+) -> None:
+    """Keep the original scheduling failure and release its unowned coroutine."""
+    loop = asyncio.get_running_loop()
+    original_factory = loop.get_task_factory()
+    rejected: list[Coroutine[Any, Any, None]] = []
+    before = set(sessions_route._deferred_elicitation_clear_tasks)
+
+    def reject_task(
+        _loop: asyncio.AbstractEventLoop,
+        coroutine: Coroutine[Any, Any, None],
+        **_kwargs: Any,
+    ) -> asyncio.Task[None]:
+        rejected.append(coroutine)
+        raise failure
+
+    loop.set_task_factory(reject_task)
+    try:
+        with pytest.raises(type(failure)) as raised:
+            sessions_route._schedule_deferred_elicitation_clear(SESSION, "e_rejected", None)
+        assert raised.value is failure
+        assert len(rejected) == 1
+        assert inspect.getcoroutinestate(rejected[0]) == inspect.CORO_CLOSED
+        assert sessions_route._deferred_elicitation_clear_tasks == before
+    finally:
+        loop.set_task_factory(original_factory)
+        for coroutine in rejected:
+            coroutine.close()
 
 
 @pytest.fixture(autouse=True)

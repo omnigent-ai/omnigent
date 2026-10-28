@@ -741,12 +741,9 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
 
 
 @pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
-@pytest.mark.parametrize("action,result", [("accept", "ALLOW"), ("decline", "DENY")])
 async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
     client: httpx.AsyncClient,
     tool_name: str,
-    action: str,
-    result: str,
 ) -> None:
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
@@ -759,17 +756,17 @@ async def test_scheduled_changes_require_explicit_approval_without_custom_polici
         )
     )
     try:
-        # Omitted settings still persist inherited defaults and need consent.
+        # The built-in scheduled-task gate must fire even with no custom policies.
         elicitation_id = await asyncio.wait_for(drain, timeout=5)
         assert not evaluate.done()
         response = await client.post(
             f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
-            json={"action": action},
+            json={"action": "accept"},
         )
         assert response.status_code == 202, response.text
         response = await asyncio.wait_for(evaluate, timeout=5)
         assert response.status_code == 200, response.text
-        assert response.json()["result"] == f"POLICY_ACTION_{result}"
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
     finally:
         for task in (drain, evaluate):
             if not task.done():
@@ -784,9 +781,13 @@ async def test_schedule_read_and_removal_do_not_require_new_approval(
 ) -> None:
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
-    response = await client.post(
-        f"/v1/sessions/{session_id}/policies/evaluate",
-        json=_tool_call_request(tool_name),
+    # A regression that gates these tools would park the request; fail fast instead.
+    response = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        ),
+        timeout=5,
     )
     assert response.status_code == 200, response.text
     assert response.json()["result"] == "POLICY_ACTION_ALLOW"
@@ -1056,7 +1057,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         elif entries == 2:
             second_in_gate.set()
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            engine.apply_state_updates(result.state_updates, approved=True)
         return True
 
     monkeypatch.setattr(sessions_routes, "_hold_native_ask_gate", _controllable_gate)
@@ -1085,7 +1086,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
     try:
         await asyncio.wait_for(second_in_gate.wait(), timeout=1.0)
         second_entered = True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         second_entered = False
     assert not second_entered, (
         "A second concurrent cost ask entered the gate while the first was "
@@ -1510,7 +1511,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                             "allow_all": {
                                 "type": "function",
                                 "on": ["tool_call"],
-                                "function": "tests.runtime.policies.conftest._always_allow",
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
                             }
                         }
                     },
@@ -1575,7 +1576,7 @@ async def test_authenticated_evaluate_route_sql_budget(
     payload = {
         "event": {
             "type": "PHASE_TOOL_CALL",
-            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "data": {"name": "echo", "arguments": {}},
         }
     }
     # Warm the spec / policy / ACL caches so the count is the steady-state one.

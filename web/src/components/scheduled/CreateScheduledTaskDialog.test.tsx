@@ -10,6 +10,7 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
+import type React from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -37,6 +38,20 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
 }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
+// The project field (and the shared ProjectPicker inside it) lists projects
+// from this hook.
+const PROJECTS = [
+  { id: "proj_1", name: "Triage", icon: null },
+  { id: "proj_2", name: "Reports", icon: null },
+];
+const projectsQuery = vi.hoisted(() => ({
+  current: { data: undefined as unknown, isPending: false, isSuccess: false, isError: false },
+}));
+const resolveOrCreateProjectId = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useConversations", () => ({
+  useProjects: () => projectsQuery.current,
+  useResolveOrCreateProjectId: () => resolveOrCreateProjectId,
+}));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
   WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
@@ -144,8 +159,10 @@ const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
+  projectsQuery.current = { data: PROJECTS, isPending: false, isSuccess: true, isError: false };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
+  resolveOrCreateProjectId.mockReset();
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -193,9 +210,12 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -937,6 +957,220 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
   });
 });
 
+describe("CreateScheduledTaskDialog project", () => {
+  function renderWithProjects(
+    ui: React.ReactElement = <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />,
+  ) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}
+      >
+        {ui}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("hides the project field when the server does not accept task projects", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-project-field")).not.toBeInTheDocument();
+  });
+
+  function fillRequired() {
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+  }
+
+  function openProjectMenu() {
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+  }
+
+  async function submitCreate() {
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    return mutateAsync.mock.calls[0][0];
+  }
+
+  it("sends no project when none is picked", async () => {
+    renderWithProjects();
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    const arg = await submitCreate();
+    expect(arg).not.toHaveProperty("projectId");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("files runs into an existing project picked from the menu", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Triage" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+  });
+
+  it("blocks a second save while a typed project is being created", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    let finishCreate: (id: string) => void = () => undefined;
+    resolveOrCreateProjectId.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    await waitFor(() => expect(submit).toBeDisabled());
+    fireEvent.click(submit);
+    finishCreate("proj_new");
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(resolveOrCreateProjectId).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the picked project when it is renamed before saving", async () => {
+    const view = renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Triage" }));
+    // Another tab renames the project; the list refresh drops the old name.
+    projectsQuery.current = {
+      data: [{ id: "proj_1", name: "Bugs", icon: null }, PROJECTS[1]],
+      isPending: false,
+      isSuccess: true,
+      isError: false,
+    };
+    view.rerender(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    // The trigger follows the picked project's new name.
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Bugs");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("keeps the dialog open and retryable when creating its project fails", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    resolveOrCreateProjectId.mockRejectedValueOnce(new Error("500 Internal Server Error"));
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("create-error")).toHaveTextContent(
+      "500 Internal Server Error",
+    );
+    expect(mutateAsync).not.toHaveBeenCalled();
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ projectId: "proj_new" });
+  });
+
+  it("creates a project from a typed name", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_new" });
+    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Nightly reports");
+  });
+
+  function renderEditingFiledTask() {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_1" })}
+      />,
+    );
+  }
+
+  it("keeps an edited task's project when it is not changed", async () => {
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("projectId");
+  });
+
+  it("shows a deleted saved project as no project and clears it on save", async () => {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_deleted" })}
+      />,
+    );
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    openProjectMenu();
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Search or create project"), { key: "Escape" });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+
+  it("moves an edited task to another existing project", async () => {
+    renderEditingFiledTask();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reports" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Reports");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: "proj_2" });
+  });
+
+  it("shows a loading label, not a deleted one, while projects load", async () => {
+    projectsQuery.current = { data: undefined, isPending: true, isSuccess: false, isError: false };
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Loading…");
+    openProjectMenu();
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+  });
+
+  it("can unfile a task whose project list fails to load", async () => {
+    projectsQuery.current = { data: undefined, isPending: false, isSuccess: false, isError: true };
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Project unavailable");
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+
+  it("unfiles an edited task's runs when its project is removed", async () => {
+    renderEditingFiledTask();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from Triage" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+});
+
 describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", () => {
   // The guard's decision is pure DOM: is the interaction target inside a Radix
   // popper / Select portal? Unit-test that directly — jsdom can't faithfully
@@ -1047,5 +1281,91 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
     expect(shouldGuardDialogDismiss(plain, { selectOpen: false, msSinceSelectClose: 500 })).toBe(
       false,
     );
+  });
+});
+
+describe("CreateScheduledTaskDialog session mode", () => {
+  function renderWithSessionModes(editingTask?: ScheduledTasksApiModule.ScheduledTask) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />
+      </CapabilitiesProvider>,
+    );
+  }
+
+  function chooseContinue() {
+    const trigger = screen.getByTestId("task-session-mode-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("task-session-mode-continue"));
+  }
+
+  it("hides the Session control on a server that does not accept session modes", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("sends sessionMode only when continue is chosen on create", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    chooseContinue();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
+  });
+
+  it("leaves sessionMode out of a create that keeps a new session per run", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("says a sandbox automation that continues a session keeps one sandbox", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          managed_sandboxes_enabled: true,
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    chooseContinue();
+    const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(
+      screen.getByText(
+        "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("clears the continued session when asked to start a new one on the next run", async () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionId).toBeNull();
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("offers no new-session option before the first run creates a session", () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue" }));
+    expect(screen.queryByTestId("task-start-new-session")).toBeNull();
   });
 });

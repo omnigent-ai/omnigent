@@ -22,7 +22,7 @@ variables:
       The platform writes to <schema>.otel_logs, otel_metrics, otel_spans.
     default: main.omnigent_logs
   features:
-    description: "Comma-separated deployment-wide release features."
+    description: "Comma-separated feature overrides: name enables, -name disables; empty uses defaults."
     default: ""
   # OTel plumbing is gated on these three complex variables so a workspace
   # without an OTel collector / UC OTel tables can deploy cleanly. deploy.py

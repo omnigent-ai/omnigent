@@ -163,8 +163,9 @@ def compose_review(review: str, stats: dict) -> str:
         outside_parameters = re.sub(r"\[[^\]]*\]", "", identifier)
         return bool(outside_parameters.strip()) and "/" not in outside_parameters
 
-    case_only = all(is_case_only(row) for row in rows)
-    if len(stats["test_files"]) == 1 and rows and case_only and missing:
+    # Existing coverage from other files can appear beside the changed file's case-only rows.
+    has_case_only = any(is_case_only(row) for row in rows)
+    if len(stats["test_files"]) == 1 and has_case_only and missing:
         path = re.escape(missing[0])
         if re.search(rf"(?<![\w./~+-]){path}(?![\w/~+-]|\.[\w-])", sections["Tests"]):
             missing = []

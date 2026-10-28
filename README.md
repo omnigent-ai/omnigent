@@ -301,6 +301,28 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 
+To configure native agy credentials, run `omni setup` →
+**Antigravity** → **Configure native agy API key / gateway** → **Add a credential**
+and choose the option matching your connection:
+
+- **Gemini — API key** for a Google AI Studio key.
+- **Gemini API gateway — URL + key** for an external gateway implementing native
+  Gemini requests and `x-goog-api-key` authentication. Supply its API root, such
+  as `https://gateway.example/gemini`, without `/v1beta` or a model operation.
+- **Databricks — profile** for a Databricks workspace with native Gemini API
+  access. Omnigent manages profile authentication and model-name mapping; no
+  workspace URL or token needs to be pasted into the gateway form.
+
+OpenAI Responses and Chat Completions endpoints are **not supported by native
+agy**, even when they serve Gemini models. A separate protocol adapter would be
+required. The first Gemini credential becomes the default; select **Make default
+for Gemini** when switching, then start a fresh `omni agy` session.
+
+See the [native agy gateway guide](docs/native-agy-gateways.md) for compatibility
+requirements, model and authentication behavior, troubleshooting, and smoke
+steps. These settings configure native agy; the Antigravity Python SDK retains
+its separate key/Vertex setup.
+
 Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
@@ -380,6 +402,16 @@ Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
 
+Integrations can open the new-chat composer with text already filled in using
+`/?prompt=Explain%20this%20code`. Build links with
+`URLSearchParams` to preserve newlines, Unicode, and characters such as `&` and
+`+`. For a deployment under `/tools/omnigent`, use
+`/tools/omnigent/?prompt=Explain%20this%20code`.
+
+The text is an editable draft: the user chooses a host and agent and presses
+Send to start the session. The prompt parameter is removed from the current URL
+after loading, while other query parameters and the fragment are retained.
+
 To suppress the automatic browser tab, use `omni host --no-open` or set
 `OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
 --background` and `omni start`. Sign-in may still open a browser; use
@@ -423,6 +455,12 @@ session_title_instructions: |
 
 Server operators can set the same key in the YAML passed to
 `omnigent server --config`.
+
+Claude Code sessions generate titles with the `haiku` model alias. If that
+model answers the message instead of returning a title, set
+`OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL` to another Claude model alias, such as
+`sonnet`, in the environment of the `omnigent` or `omnigent host` process that
+runs the session.
 
 </details>
 

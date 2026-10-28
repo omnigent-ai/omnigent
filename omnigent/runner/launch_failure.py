@@ -29,9 +29,13 @@ __all__ = [
     "classify_terminal_failure",
     "describe_failure_code",
     "diagnose_client_update_required",
+    "diagnose_codex_compaction_model_failure",
     "diagnose_codex_model_rejection",
     "diagnose_model_unavailable",
 ]
+
+# A Codex turn failed while compacting on the thread's previous model, not the selected one.
+CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
 
 
 @dataclass(frozen=True)
@@ -181,6 +185,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+    # The gateway launcher checks the installed Claude Code before it starts it.
+    _TerminalMatcher(
+        "gateway_claude_too_old",
+        lambda s: s.output_contains_any(("ug requires claude code",)),
+        FailureDiagnosis(
+            title="Claude Code is too old for the Databricks gateway",
+            cause=(
+                "The gateway launcher needs a newer Claude Code than the one installed, "
+                "and it does not update a copy that a package manager manages."
+            ),
+            remediation=(
+                "Update Claude Code on the host using the same installer or package manager "
+                "you used to install it, then send your message again."
+            ),
+        ),
+    ),
 )
 
 
@@ -232,6 +252,10 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "currently experiencing high demand, which may cause temporary errors",
+)
+_CLAUDE_RESPONSE_STOPPED_MESSAGE = (
+    "api error: the response stopped arriving. the response above may be incomplete."
 )
 # 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
 _TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
@@ -262,6 +286,9 @@ def classify_native_turn_error(code: str, message: str) -> str:
     :param message: Native harness error text, from its status or transcript.
     :returns: The semantic error code, or the existing code if unrecognized.
     """
+    if code == CODEX_COMPACTION_MODEL_FAILED:
+        # Its budget text names the previous model's limit; the card explains it.
+        return code
     lowered = message.lower()
     if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
         return "budget_exhausted"
@@ -281,6 +308,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         status in _TRANSIENT_UPSTREAM_STATUSES
         or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
         or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
+        or lowered.strip().removesuffix(".") == "request timed out"
+        or lowered.strip() == _CLAUDE_RESPONSE_STOPPED_MESSAGE
     ):
         return "transient_upstream_error"
     return code
@@ -332,6 +361,9 @@ _MODEL_UNAVAILABLE_MARKER = "issue with the selected model"
 # `404 {"type":"error","error":{"type":"not_found_error","message":"model: <id>"}}`.
 _ANTHROPIC_MODEL_NOT_FOUND = re.compile(r'"message"\s*:\s*"model:\s*[^"\s]+"', re.IGNORECASE)
 _NOT_FOUND_STATUS = re.compile(r"\b404\b|not_found_error", re.IGNORECASE)
+# Claude Code's stop category when its hook carries no error text, e.g.
+# "Claude Code ended the turn with an API error (model_not_found)."
+_CLAUDE_STOP_MODEL_NOT_FOUND = re.compile(r"API error \(model_not_found\)", re.IGNORECASE)
 # OpenAI's rejection of an unknown or inaccessible model id; the prose form must
 # name the model so other "does not exist" resource errors stay unlabeled.
 _OPENAI_MODEL_NOT_FOUND = re.compile(
@@ -343,6 +375,8 @@ _OPENAI_MODEL_NOT_FOUND = re.compile(
 
 def _is_model_unavailable(message: str) -> bool:
     if _MODEL_UNAVAILABLE_MARKER in message.lower():
+        return True
+    if _CLAUDE_STOP_MODEL_NOT_FOUND.search(message):
         return True
     if _OPENAI_MODEL_NOT_FOUND.search(message):
         return True
@@ -366,6 +400,67 @@ def diagnose_model_unavailable(message: str) -> FailureDiagnosis | None:
             "Choose a different model with the model picker or /model, or check that the "
             "provider is configured and your account can access this model."
         ),
+    )
+
+
+def diagnose_codex_compaction_model_failure(
+    code: str, *, compaction_model: str, selected_model: str
+) -> FailureDiagnosis:
+    """Explain a turn that failed while Codex compacted on its previous model.
+
+    After a model switch, Codex compacts the conversation on the previous model
+    before the first turn on the new one, and retries that on every later turn.
+    A fork rebuilds the conversation from Omnigent's history without it.
+
+    :param code: Classified failure code, e.g. ``"budget_exhausted"``.
+    :param compaction_model: Model Codex compacted on, e.g.
+        ``"system.ai.gpt-6-astra"``.
+    :param selected_model: Model the session selected, e.g.
+        ``"system.ai.gpt-6-1-sol"``.
+    :returns: The failure diagnosis for the card.
+    """
+    from omnigent.models.codex_model_vocabulary import bare_model_id
+
+    previous = bare_model_id(compaction_model)
+    selected = bare_model_id(selected_model)
+    # Each cause is stored as a 256-character label, so it names each model once.
+    if code in {"rate_limit_exceeded", "transient_upstream_error"}:
+        return FailureDiagnosis(
+            title=f"Codex can't compact on {previous} right now",
+            cause=(
+                f"Codex compacts this conversation on the previous model, {previous}, "
+                f"before switching to {selected}, and that model is temporarily unavailable."
+            ),
+            # These keep their Retry action, so Fork is only in the session menu.
+            remediation=(
+                f"Retry later, or choose Fork in the session menu to continue on {selected}."
+            ),
+            category=ErrorCategory.UPSTREAM,
+        )
+    repeated = (
+        f"Codex retries it every turn before switching to {selected}, "
+        "so switching models doesn't help."
+    )
+    fork = (
+        f"Fork this session to continue on {selected}. The fork rebuilds the "
+        f"conversation from its history, so it doesn't need {previous}."
+    )
+    if code == "budget_exhausted":
+        # Lead with the gateway's refusal: the budget, not Codex, is the root cause.
+        return FailureDiagnosis(
+            title=f"{previous} is over its AI gateway budget",
+            cause=(
+                f"The AI gateway refused a compaction request on {previous}: its budget is "
+                f"exhausted. {repeated}"
+            ),
+            remediation=f"{fork} Or ask an admin to raise that budget.",
+            category=ErrorCategory.USER,
+        )
+    return FailureDiagnosis(
+        title=f"Codex can't compact on {previous}",
+        cause=f"{previous} rejected a compaction request. {repeated}",
+        remediation=fork,
+        category=ErrorCategory.UPSTREAM,
     )
 
 
@@ -394,6 +489,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    CODEX_COMPACTION_MODEL_FAILED: (
+        "Codex couldn't compact the conversation on the previous model, so this turn didn't run."
+    ),
     "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
     "agent_startup_pending": "The agent is still starting in the session terminal.",
     "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",

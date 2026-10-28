@@ -12,6 +12,8 @@ the same shape the peer native ``test_goose_native_executor.py`` uses.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -112,11 +114,18 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
     The token baked into ``config.json`` at launch dies with the ~1h
     Databricks OAuth lifetime; without a per-turn refresh the resident
     extension's policy/MCP POSTs fail closed once the session outlives it.
-    Both turn paths (``run_turn`` and live steering) must refresh.
+    Both turn paths (``run_turn`` and live steering) must refresh, and both
+    must mint off the event loop: minting is synchronous and can run CLI auth.
     """
     import omnigent.runner._entry as entry
 
-    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: lambda: "tok")
+    mint_threads: list[int] = []
+
+    def _mint() -> str:
+        mint_threads.append(threading.get_ident())
+        return "tok"
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
     monkeypatch.setattr(pne, "enqueue_user_message", lambda *a: "msg")
     refreshed: list[dict[str, str]] = []
     monkeypatch.setattr(
@@ -129,6 +138,45 @@ async def test_turn_refreshes_baked_bearer(tmp_path: Path, monkeypatch) -> None:
     [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "")]
     assert await ex.enqueue_session_message("main", "steer") is True
     assert refreshed == [{"Authorization": "Bearer tok"}, {"Authorization": "Bearer tok"}]
+    assert len(mint_threads) == 2
+    assert threading.get_ident() not in mint_threads
+
+
+async def test_slow_mint_keeps_overlapping_messages_in_arrival_order(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A steering message sent during a turn's slow mint must queue after that turn."""
+    import omnigent.runner._entry as entry
+
+    first_mint_started = threading.Event()
+    release_first_mint = threading.Event()
+    mint_calls: list[int] = []
+
+    def _mint() -> str:
+        mint_calls.append(len(mint_calls))
+        if len(mint_calls) == 1:
+            first_mint_started.set()
+            release_first_mint.wait(timeout=5)
+        return "tok"
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *a, **k: _mint)
+    monkeypatch.setattr(pne, "refresh_config_auth_headers", lambda *a: True)
+    queued: list[str] = []
+    monkeypatch.setattr(pne, "enqueue_user_message", lambda bridge_dir, text: queued.append(text))
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+
+    async def _run_turn() -> None:
+        [_ async for _ in ex.run_turn([{"role": "user", "content": "turn"}], [], "")]
+
+    turn = asyncio.create_task(_run_turn())
+    assert await asyncio.to_thread(first_mint_started.wait, 5)
+    steer = asyncio.create_task(ex.enqueue_session_message("main", "steer"))
+    # Give an unserialized steer time to mint and queue ahead of the stalled turn.
+    await asyncio.wait({steer}, timeout=0.2)
+    release_first_mint.set()
+    await asyncio.gather(turn, steer)
+
+    assert queued == ["turn", "steer"]
 
 
 async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
@@ -148,3 +196,38 @@ async def test_turn_refresh_is_best_effort(tmp_path: Path, monkeypatch) -> None:
     # Turn still completes; the swallowed mint error means no rewrite was tried.
     assert len(events) == 1 and isinstance(events[0], TurnComplete)
     assert called == []
+
+
+async def test_run_turn_queues_routed_model_before_message(tmp_path: Path) -> None:
+    """A Smart Routing pick (``config.model``) switches Pi before the turn runs.
+
+    The composer path routes a web message server-side and forwards the pick
+    as ``model_override`` → ``ExecutorConfig.model``. The executor must queue a
+    ``model_change`` that the extension's sorted inbox scan reads BEFORE the
+    message, or the routed turn would silently run on the old model.
+    """
+    import json
+
+    from omnigent.inner.executor import ExecutorConfig
+
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+    config = ExecutorConfig(model="omnigent/databricks-claude-haiku-4-5")
+    [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "", config=config)]
+
+    queued = [json.loads(p.read_text()) for p in sorted((tmp_path / "inbox").glob("*.json"))]
+    assert [(q["type"], q.get("model") or q.get("content")) for q in queued] == [
+        ("model_change", "omnigent/databricks-claude-haiku-4-5"),
+        ("user_message", "hi"),
+    ]
+
+
+async def test_run_turn_without_model_queues_only_message(tmp_path: Path) -> None:
+    import json
+
+    from omnigent.inner.executor import ExecutorConfig
+
+    ex = pne.PiNativeExecutor(bridge_dir=tmp_path)
+    [_ async for _ in ex.run_turn([{"role": "user", "content": "hi"}], [], "", ExecutorConfig())]
+
+    queued = [json.loads(p.read_text()) for p in (tmp_path / "inbox").glob("*.json")]
+    assert [q["type"] for q in queued] == ["user_message"]
