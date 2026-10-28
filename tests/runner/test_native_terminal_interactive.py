@@ -83,3 +83,39 @@ async def test_observer_records_unobserved_without_raising(
         if record.event_name == "terminal_interactive_unobserved"
     )
     assert record.attributes["reason"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("screens", "accepted", "expected_signal"),
+    [
+        # The pane never matches, but the TUI already took a prompt.
+        (["custom footer"], True, "claude_prompt_submit_hook"),
+        # A matching pane wins even when input evidence also exists.
+        (["composer ready"], True, "claude_composer"),
+    ],
+)
+async def test_observer_names_the_signal_that_proved_readiness(
+    caplog: pytest.LogCaptureFixture,
+    screens: list[str],
+    accepted: bool,
+    expected_signal: str,
+) -> None:
+    """Non-screen input evidence completes readiness and is labeled as such."""
+    terminal = _FakeTerminal(screens)
+
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.app"):
+        await _observe_terminal_interactive(
+            session_id="conv_hook_ready",
+            terminal_id="terminal_claude_main",
+            harness="claude-native",
+            readiness_signal="claude_composer",
+            instance=terminal,  # type: ignore[arg-type]
+            is_interactive=lambda pane: pane == "composer ready",
+            input_accepted=("claude_prompt_submit_hook", lambda _instance: accepted),
+            timeout_s=1.0,
+            poll_interval_s=0.0,
+        )
+
+    records = [record for record in caplog.records if record.event_name == "terminal_interactive"]
+    assert [record.attributes["readiness_signal"] for record in records] == [expected_signal]

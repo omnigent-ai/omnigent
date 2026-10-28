@@ -419,17 +419,29 @@ async def _observe_terminal_interactive(
     readiness_signal: str,
     instance: TerminalInstance,
     is_interactive: Callable[[str], bool],
+    input_accepted: tuple[str, Callable[[TerminalInstance], bool]] | None = None,
     timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
     poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
 ) -> None:
-    """Emit one semantic event when a native TUI can accept a message."""
+    """Emit one semantic event when a native TUI can accept a message.
+
+    ``input_accepted`` pairs a signal name with a non-screen check, such as a
+    hook proving the TUI already took a prompt, for panes the screen check misses.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
     try:
         while True:
             result = await instance.read()
             screen = result.get("screen")
+            matched_signal: str | None = None
             if isinstance(screen, str) and is_interactive(screen):
+                matched_signal = readiness_signal
+            elif input_accepted is not None and await asyncio.to_thread(
+                input_accepted[1], instance
+            ):
+                matched_signal = input_accepted[0]
+            if matched_signal is not None:
                 _logger.info(
                     "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
                     session_id,
@@ -441,7 +453,7 @@ async def _observe_terminal_interactive(
                         harness=harness,
                         terminal_id=terminal_id,
                         terminal_instance_id=instance.diagnostic_id,
-                        readiness_signal=readiness_signal,
+                        readiness_signal=matched_signal,
                     ),
                 )
                 return
@@ -481,6 +493,7 @@ def _schedule_terminal_interactive_observer(
     harness: str,
     readiness_signal: str,
     is_interactive: Callable[[str], bool],
+    input_accepted: tuple[str, Callable[[TerminalInstance], bool]] | None = None,
 ) -> None:
     """Start a non-blocking readiness observer for a registered terminal."""
     terminal_registry = getattr(resource_registry, "terminal_registry", None)
@@ -507,6 +520,7 @@ def _schedule_terminal_interactive_observer(
             readiness_signal=readiness_signal,
             instance=instance,
             is_interactive=is_interactive,
+            input_accepted=input_accepted,
         ),
         name=f"terminal-interactive-{session_id}-{terminal_name}",
     )
@@ -9704,7 +9718,12 @@ async def _auto_create_claude_terminal(
         terminal_name="claude",
         session_key="main",
     )
-    from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+    from omnigent.harnesses.claude_native.bridge import (
+        CLAUDE_COMPOSER_READINESS_SIGNAL,
+        CLAUDE_PROMPT_SUBMIT_READINESS_SIGNAL,
+        _claude_prompt_rendered,
+        claude_prompt_submitted,
+    )
 
     _schedule_terminal_interactive_observer(
         session_id=session_id,
@@ -9712,8 +9731,9 @@ async def _auto_create_claude_terminal(
         terminal_name="claude",
         session_key="main",
         harness="claude-native",
-        readiness_signal="claude_composer",
+        readiness_signal=CLAUDE_COMPOSER_READINESS_SIGNAL,
         is_interactive=_claude_prompt_rendered,
+        input_accepted=(CLAUDE_PROMPT_SUBMIT_READINESS_SIGNAL, claude_prompt_submitted),
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",

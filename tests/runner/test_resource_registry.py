@@ -2238,6 +2238,7 @@ async def test_claude_native_logs_input_ready_once_from_existing_snapshot(
     assert events[0].session_id == "child"
     assert events[0].attributes["harness"] == "claude-native"
     assert events[0].attributes["terminal_instance_id"] == instance.diagnostic_id
+    assert events[0].attributes["readiness_signal"] == "claude_composer"
 
 
 _AUTO_MODE_BILLING_NOTICE_PANE = """────────────────────────────────────────
