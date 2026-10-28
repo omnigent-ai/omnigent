@@ -1,7 +1,8 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New automation" button,
- * and tabs for existing automations and reusable templates.
+ * tasks, a search + Active/Paused filter, a project filter (when the server files
+ * runs into projects), a "New automation" button, and tabs for existing
+ * automations and reusable templates.
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
  * update/delete mutations, which invalidate the list. Share opens the shared
@@ -13,7 +14,7 @@
  * endpoint.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   ClockIcon,
   InfoIcon,
@@ -61,6 +62,8 @@ import {
   canShareAutomation,
   sharedAutomationsListed,
 } from "@/lib/permissionsApi";
+import { useProjects } from "@/hooks/useConversations";
+import { ProjectRowIcon } from "@/shell/ProjectPicker";
 import {
   cloneCreatedMessage,
   cloneFailedMessage,
@@ -77,6 +80,10 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "active", label: "Active" },
   { value: "paused", label: "Paused" },
 ];
+
+/** Project filter sentinels; any other value is a project id. Radix Select disallows "". */
+const ALL_PROJECTS = "__all_projects__";
+const UNFILED = "__unfiled__";
 
 type SortOrder = "next_run" | "name";
 
@@ -97,13 +104,15 @@ function filterAndSortTasks(
   search: string,
   filter: FilterTab,
   sort: SortOrder = "next_run",
+  // Own automations only by default: a shared automation's project belongs to its owner.
+  matchesProject: (task: ScheduledTask) => boolean = () => true,
 ): ScheduledTask[] {
   const q = search.trim().toLowerCase();
   const matches = tasks.filter((t) => {
     if (filter === "active" && t.state !== "active") return false;
     if (filter === "paused" && t.state !== "paused") return false;
     if (q && !t.name.toLowerCase().includes(q)) return false;
-    return true;
+    return matchesProject(t);
   });
   if (sort === "name") {
     return matches.slice().sort((a, b) => a.name.localeCompare(b.name));
@@ -202,6 +211,53 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       ? "Loading templates…"
       : "Automation templates are not available on this server. You can still create an automation from scratch.";
   const sessionLink = getShareableSessionLink(SESSION_LINK_ID_PLACEHOLDER, rebasePath);
+  // Same gate as the dialog's project field: older servers have no task projects.
+  const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS);
+  const {
+    data: projects,
+    isLoading: projectsLoading,
+    isError: projectsError,
+    refetch: refetchProjects,
+  } = useProjects({ enabled: projectsSupported });
+  const projectsById = useMemo(
+    () =>
+      new Map(
+        (projects ?? []).flatMap((project) => (project.id ? [[project.id, project] as const] : [])),
+      ),
+    [projects],
+  );
+  // The sidebar shares the projects cache, so gate on the flag, not on loaded data.
+  // With no automations the filter is hidden, so it can't keep narrowing the page.
+  const hasAnyTasks = (tasks ?? []).length > 0;
+  const activeProjectFilter = projectsSupported && hasAnyTasks ? projectFilter : ALL_PROJECTS;
+  const selectedProject =
+    activeProjectFilter === ALL_PROJECTS || activeProjectFilter === UNFILED
+      ? undefined
+      : projectsById.get(activeProjectFilter);
+
+  // A deleted project can't stay selected.
+  useEffect(() => {
+    const selectedId =
+      projectFilter === ALL_PROJECTS || projectFilter === UNFILED ? null : projectFilter;
+    if (selectedId && projects !== undefined && !projectsById.has(selectedId)) {
+      setProjectFilter(ALL_PROJECTS);
+    }
+  }, [projectFilter, projects, projectsById]);
+
+  const matchesProject = useMemo(
+    () => (task: ScheduledTask) => {
+      if (activeProjectFilter === UNFILED) {
+        // Unfiled includes a task whose project no longer exists: its runs file nowhere.
+        return (
+          task.projectId === null || (projects !== undefined && !projectsById.has(task.projectId))
+        );
+      }
+      if (activeProjectFilter !== ALL_PROJECTS) return task.projectId === activeProjectFilter;
+      return true;
+    },
+    [activeProjectFilter, projects, projectsById],
+  );
 
   // `?new=1&name=…&prompt=…&schedule=<RRULE>` opens New automation filled in, for review.
   useEffect(() => {
@@ -261,8 +317,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   const filtered = useMemo(
-    () => filterAndSortTasks(tasks ?? [], search, filter, sort),
-    [tasks, search, filter, sort],
+    () => filterAndSortTasks(tasks ?? [], search, filter, sort, matchesProject),
+    [tasks, search, filter, sort, matchesProject],
   );
   const sharedTasks = useMemo(
     () => sharedQuery.data?.pages.flatMap((page) => page.tasks) ?? [],
@@ -360,9 +416,52 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setShareOpen(true);
   }
 
-  const hasAnyTasks = (tasks ?? []).length > 0;
   const hasAnyShared = sharedTasks.length > 0;
-  const listControls = (hasAny: boolean) => (
+  // Suggestions are hidden whenever a filter narrows the list.
+  const showSuggestions = filter === "all" && activeProjectFilter === ALL_PROJECTS;
+  const projectFilterControl =
+    hasAnyTasks && projectsSupported ? (
+      <div className="flex flex-wrap items-center gap-3">
+        <Select value={activeProjectFilter} onValueChange={setProjectFilter}>
+          <SelectTrigger
+            data-testid="tasks-project-filter"
+            aria-label={`Filter by project: ${
+              activeProjectFilter === UNFILED
+                ? "Unfiled"
+                : (selectedProject?.name ?? "All projects")
+            }`}
+            className="min-w-40"
+            disabled={projectsLoading}
+          >
+            {projectsLoading ? "Loading projects…" : <SelectValue />}
+          </SelectTrigger>
+          <SelectContent position="popper" align="start">
+            <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+            {/* Unfiled needs the list to spot automations whose project was deleted. */}
+            <SelectItem value={UNFILED} disabled={projects === undefined}>
+              Unfiled
+            </SelectItem>
+            {[...projectsById.values()].map((project) => (
+              <SelectItem key={project.id} value={project.id as string}>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <ProjectRowIcon icon={project.icon} />
+                  <span className="truncate">{project.name}</span>
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        {projectsError && (
+          <p className="text-sm text-destructive" data-testid="tasks-projects-error">
+            Couldn’t load projects.{" "}
+            <button type="button" className="underline" onClick={() => void refetchProjects()}>
+              Retry
+            </button>
+          </p>
+        )}
+      </div>
+    ) : undefined;
+  const listControls = (hasAny: boolean, projectControl?: ReactNode) => (
     <TaskListControls
       search={search}
       onSearchChange={setSearch}
@@ -374,6 +473,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       sort={sort}
       onSortChange={setSort}
       showFilters={hasAny}
+      projectControl={projectControl}
     />
   );
 
@@ -387,6 +487,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       initialTrigger={selectedTemplate?.trigger}
       initialTemplateId={selectedTemplate?.id}
       sessionLink={sessionLink}
+      initialProject={
+        selectedProject?.id ? { id: selectedProject.id, name: selectedProject.name } : undefined
+      }
       editingTask={editingTask}
       onCreated={handleCreated}
     />
@@ -485,7 +588,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           </TabsTrigger>
         </TabsList>
         <TabsContent value="yours" className="mt-4">
-          {listControls(hasAnyTasks)}
+          {listControls(hasAnyTasks, projectFilterControl)}
 
           {isError ? (
             <div
@@ -517,6 +620,11 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                 <ScheduledTaskRow
                   key={task.id}
                   task={task}
+                  project={
+                    projectsSupported && activeProjectFilter === ALL_PROJECTS && task.projectId
+                      ? projectsById.get(task.projectId)
+                      : undefined
+                  }
                   now={now}
                   busy={busyId === task.id}
                   onEdit={handleEdit}
@@ -532,7 +640,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               ))}
             </div>
           )}
-          {!isError && !isLoading && filter === "all" && !search.trim() && triggersSupported && (
+          {!isError && !isLoading && showSuggestions && !search.trim() && triggersSupported && (
             <TemplateGallery onPick={openFromTemplate} preview />
           )}
         </TabsContent>
@@ -655,6 +763,7 @@ function TaskListControls({
   sort,
   onSortChange,
   showFilters,
+  projectControl,
 }: {
   search: string;
   onSearchChange: (value: string) => void;
@@ -663,6 +772,7 @@ function TaskListControls({
   sort: SortOrder;
   onSortChange: (value: SortOrder) => void;
   showFilters: boolean;
+  projectControl?: ReactNode;
 }) {
   return (
     <div className="mb-4 flex flex-col gap-5">
@@ -722,6 +832,7 @@ function TaskListControls({
           </Select>
         </div>
       )}
+      {projectControl}
     </div>
   );
 }
