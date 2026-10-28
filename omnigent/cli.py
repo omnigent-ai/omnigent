@@ -10026,7 +10026,7 @@ def _daemon_session_request_params(
     *,
     connected_only: bool,
     after: str | None,
-    include_sub_agents: bool = False,
+    kind: Literal["default", "sub_agent"] = "default",
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10035,8 +10035,7 @@ def _daemon_session_request_params(
         sessions only.
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
-    :param include_sub_agents: When ``True``, also list sub-agent sessions,
-        which the server omits from ``GET /v1/sessions`` by default.
+    :param kind: Session kind to fetch; the server omits sub-agents by default.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
@@ -10044,8 +10043,8 @@ def _daemon_session_request_params(
         "include_archived": "true",
         "visibility": "all",
     }
-    if include_sub_agents:
-        params["kind"] = "any"
+    if kind != "default":
+        params["kind"] = kind
     if connected_only:
         params["connected"] = "true"
     if after is not None:
@@ -10110,7 +10109,7 @@ def _fetch_session_pages(
     *,
     base_url: str,
     connected_only: bool,
-    include_sub_agents: bool = False,
+    kind: Literal["default", "sub_agent"] = "default",
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10119,7 +10118,7 @@ def _fetch_session_pages(
         ``"https://example.databricksapps.com"``.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
-    :param include_sub_agents: When ``True``, also fetch sub-agent sessions.
+    :param kind: Session kind to fetch, e.g. ``"sub_agent"``.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10132,7 +10131,7 @@ def _fetch_session_pages(
             params=_daemon_session_request_params(
                 connected_only=connected_only,
                 after=after,
-                include_sub_agents=include_sub_agents,
+                kind=kind,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10180,27 +10179,23 @@ def _daemon_owned_sessions(
     sessions: list[_HostSessionRow],
     *,
     host_id: str,
-    include_sub_agents: bool,
+    sub_agents: list[_HostSessionRow],
 ) -> list[_HostSessionRow]:
     """
     Select the sessions a daemon's host runs, optionally with their sub-agents.
 
     A sub-agent carries no host id of its own: it runs on its parent's host.
-    With *include_sub_agents*, a sub-agent joins when its parent chain reaches
+    A sub-agent joins when its parent chain reaches
     a session this host owns, so a stop reaches children mid-turn.
 
     :param sessions: Session rows from the server, e.g. ``[{"id": "conv_1", ...}]``.
     :param host_id: Host id the daemon advertises, e.g. ``"host_abc123"``.
-    :param include_sub_agents: Whether to add sub-agent rows to the owned set.
+    :param sub_agents: Rows fetched with ``kind=sub_agent``; list rows have no kind field.
     :returns: Owned session rows, parents before their children.
     """
     owned = [s for s in sessions if s.get("host_id") == host_id]
-    if not include_sub_agents:
-        return owned
     owned_ids = {s.get("id") for s in owned}
-    pending = [
-        s for s in sessions if s.get("kind") == "sub_agent" and s.get("id") not in owned_ids
-    ]
+    pending = [s for s in sub_agents if s.get("id") not in owned_ids]
     grew = True
     while grew and pending:
         grew = False
@@ -10254,7 +10249,6 @@ def _sessions_for_daemon(
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
-        include_sub_agents=include_sub_agents,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
@@ -10263,10 +10257,22 @@ def _sessions_for_daemon(
             error=pages.error,
             unreachable=pages.unreachable,
         )
+    sub_agents: list[_HostSessionRow] = []
+    if include_sub_agents:
+        children = _fetch_session_pages(
+            base_url=base_url,
+            connected_only=connected_only,
+            kind="sub_agent",
+        )
+        if children.error is not None:
+            # The root listing succeeded, so a child-list failure is not proof
+            # the server is dead. Keep the daemon running until the drain succeeds.
+            return _DaemonSessionsResult(base_url=base_url, sessions=[], error=children.error)
+        sub_agents = children.sessions
     owned = _daemon_owned_sessions(
         pages.sessions,
         host_id=host_id,
-        include_sub_agents=include_sub_agents,
+        sub_agents=sub_agents,
     )
     return _DaemonSessionsResult(base_url=base_url, sessions=owned, error=None)
 
