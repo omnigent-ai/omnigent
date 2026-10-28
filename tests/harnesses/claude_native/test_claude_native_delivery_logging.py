@@ -88,7 +88,11 @@ def test_delivery_diagnostics(
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            pane = {
+                "empty_capture": "",
+                "missing_glyph": "terminal output",
+                "unknown_command": "──────\n❯ \n──────\n",
+            }.get(scenario, "❯ ")
 
     monkeypatch.setattr(
         bridge,

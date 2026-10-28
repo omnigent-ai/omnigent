@@ -1,4 +1,4 @@
-"""Exercise injection into a real tmux pane the reader left scrolled back in copy mode."""
+"""Exercise native input through real tmux scrollback and clipped composer redraws."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ pytestmark = [
 _TERMINAL = r"""
 import json
 import os
+import signal
 import sys
 import tty
 from pathlib import Path
@@ -38,14 +40,16 @@ sys.stdout.write("\x1b[?2004h")
 
 
 def render(draft=""):
-    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 80 + "\r\n❯ " + draft + "\r\n" + "─" * 80 + "\r\n")
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 80 + "\r\n❯ " + draft + "\r\n" + "─" * 80
+                     + "\r\n  mode hints\r\n  status line\r\n  agent status\r\n")
     sys.stdout.flush()
 
 
-render()
 buffer = b""
 draft = None
 messages = []
+signal.signal(signal.SIGWINCH, lambda *_: render(draft or ""))
+render()
 while True:
     chunk = os.read(sys.stdin.fileno(), 65536)
     with received.open("ab") as log:
@@ -191,3 +195,81 @@ def test_watchers_leave_scrollback_alone_when_nothing_is_on_screen(pane: _Pane) 
 
     assert pane.in_mode(), "A watcher with nothing to confirm must not leave copy mode."
     assert not pane.received.exists(), "A watcher with nothing to confirm must not send keys."
+
+
+@pytest.mark.parametrize("pane", ["emacs"], indirect=True)
+@pytest.mark.parametrize("blocked_by", [None, "approval", "cancellation"])
+def test_five_row_delivery_restores_geometry_and_preserves_input_guards(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch, blocked_by: str | None
+) -> None:
+    """A clipped input row needs room before readiness can recognize the composer."""
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(bridge, "_OCCUPIED_INPUT_DISMISS_TIMEOUT_S", 0.1)
+    subprocess.run(
+        [*pane.tmux, "resize-window", "-t", "main", "-y", "5"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    deadline = time.monotonic() + 5.0
+    while bridge._claude_prompt_rendered(bridge._capture_pane(pane.tmux[2], "main")):
+        assert time.monotonic() < deadline, "The five-row redraw never clipped the input row."
+        time.sleep(0.05)
+    geometry = [
+        *pane.tmux,
+        "display-message",
+        "-p",
+        "-t",
+        "main",
+        "#{window_width} #{window_height} #{window-size}",
+    ]
+    original = subprocess.run(
+        geometry,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    ).stdout
+    assert original.startswith("120 5 ")
+
+    cancelled = threading.Event()
+    if blocked_by == "approval":
+        monkeypatch.setattr(bridge, "has_pending_user_prompt", lambda _: True)
+    elif blocked_by == "cancellation":
+        capture = bridge._capture_pane
+
+        def cancel_after_redraw(*args: str, **kwargs: bool) -> str:
+            screen = capture(*args, **kwargs)
+            if bridge._claude_prompt_rendered(screen):
+                cancelled.set()
+            return screen
+
+        monkeypatch.setattr(bridge, "_capture_pane", cancel_after_redraw)
+    with bridge.cancellable_injection(cancelled):
+        if blocked_by is None:
+            bridge.inject_user_message(
+                pane.bridge_dir, content="SENT_FROM_FIVE_ROWS", timeout_s=0.3
+            )
+            assert json.loads(pane.delivered.read_text()) == ["SENT_FROM_FIVE_ROWS"]
+        else:
+            error = (
+                bridge.ClaudeUserPromptPending
+                if blocked_by == "approval"
+                else bridge.ClaudeInjectionCancelled
+            )
+            with pytest.raises(error):
+                bridge.inject_user_message(
+                    pane.bridge_dir, content="SENT_FROM_FIVE_ROWS", timeout_s=0.3
+                )
+            assert not pane.received.exists(), "A blocked delivery must send no input bytes."
+            assert not pane.delivered.exists()
+    assert (
+        subprocess.run(
+            geometry,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        == original
+    )
