@@ -502,52 +502,61 @@ describe("authenticatedFetch", () => {
       expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_abc");
     });
 
-    it("retries keyless on wrong_replica 400 response", async () => {
-      vi.doMock("./sessionHost", () => ({
-        getSessionHost: vi.fn(() => "host_789"),
-        setSessionHost: vi.fn(),
-        isHostKeyless: vi.fn(() => false),
-        markHostKeyless: vi.fn(),
-        clearHostKeyless: vi.fn(),
-        modalHostId: vi.fn(() => null),
-        resolveModalHost: vi.fn(),
-        isModalHostResolved: vi.fn(() => true),
-      }));
-      vi.doMock("./host", () => ({
-        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
-        hostFetch: fetchMock,
-        isDatabricksWorkspace: vi.fn(() => true),
-        isHostRoutingEnabled: vi.fn(() => true),
-      }));
+    it.each([
+      ["/v1/sessions/sess_xyz/resources/terminals", {}],
+      [
+        "/v1/hosts/host_789?require_live=true",
+        { ssh_host_key_fingerprints: ["SHA256:Q6RvHQgdJwEw4iEKHeWflxXeAzMH0GjtxlozWyfpXT0"] },
+      ],
+    ] as const)(
+      "retries %s keyless on wrong_replica and remembers the route",
+      async (url, body) => {
+        const { setSessionHost, isHostKeyless } = await import("./sessionHost");
+        setSessionHost("sess_xyz", "host_789");
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
+        }));
 
-      const wrongReplicaResponse = {
-        ok: false,
-        status: 400,
-        statusText: "Bad Request",
-        json: async () => ({ error: { code: "wrong_replica" } }),
-        clone: function () {
-          return this;
-        },
-      } as unknown as Response;
+        const wrongReplicaResponse = {
+          ok: false,
+          status: 400,
+          statusText: "Bad Request",
+          json: async () => ({ error: { code: "wrong_replica" } }),
+          clone: function () {
+            return this;
+          },
+        } as unknown as Response;
 
-      fetchMock.mockResolvedValueOnce(wrongReplicaResponse);
-      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+        fetchMock.mockResolvedValueOnce(wrongReplicaResponse);
+        fetchMock.mockResolvedValue(mockJsonResponse(body));
 
-      const { authenticatedFetch } = await import("./identity");
-      const response = await authenticatedFetch("/v1/sessions/sess_xyz/resources/terminals");
+        const { authenticatedFetch } = await import("./identity");
+        const response = await authenticatedFetch(url);
 
-      // Should retry after the wrong_replica response
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      // First call should have the slice key
-      const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
-      const firstHeaders = new Headers(firstInit.headers);
-      expect(firstHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_789");
-      // Second call (retry) should NOT have the slice key
-      const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
-      const secondHeaders = new Headers(secondInit.headers);
-      expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
-      expect(response.status).toBe(200);
-    });
+        // Should retry after the wrong_replica response
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        // First call should have the slice key
+        const firstInit = fetchMock.mock.calls[0][1] as RequestInit;
+        const firstHeaders = new Headers(firstInit.headers);
+        expect(firstHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_789");
+        // Second call (retry) should NOT have the slice key
+        const secondInit = fetchMock.mock.calls[1][1] as RequestInit;
+        const secondHeaders = new Headers(secondInit.headers);
+        expect(secondHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual(body);
+        expect(isHostKeyless("host_789")).toBe(true);
+
+        expect(await (await authenticatedFetch(url)).json()).toEqual(body);
+        expect(fetchMock).toHaveBeenCalledTimes(3);
+        expect(fetchMock.mock.calls.map(([input]) => input)).toEqual([url, url, url]);
+        const refreshedHeaders = new Headers((fetchMock.mock.calls[2][1] as RequestInit).headers);
+        expect(refreshedHeaders.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
+      },
+    );
 
     it.each([200, 400, 500, 503])(
       "only drops the shared parent host key after a successful fallback (HTTP %s)",

@@ -379,9 +379,11 @@ test("does not advertise or launch workspace apps returned by Spotlight", async 
 });
 
 test("offers installed apps and the default app without launching anything", async (t) => {
-  const { list, calls } = setup(t);
+  const { list, installApp, calls } = setup(t);
+  installApp("Cursor", "cursor");
   assert.deepEqual(await list(), [
     { id: "vscode", label: "VS Code" },
+    { id: "cursor", label: "Cursor" },
     { id: "default", label: "Default app" },
   ]);
   assert.deepEqual(calls, []);
@@ -510,13 +512,6 @@ test("shares app discovery and refreshes installed and missing apps after its TT
   fs.rmSync(path.join(directory, "Cursor.app"), { recursive: true });
   time += 30_000;
   assert.ok(!(await list()).some((app) => app.id === "cursor"));
-});
-
-test("finds apps in standard directories even without Spotlight metadata", async (t) => {
-  const { list, installApp, calls } = setup(t);
-  installApp("Cursor", "cursor");
-  assert.ok((await list()).some((app) => app.id === "cursor"));
-  assert.deepEqual(calls, []);
 });
 
 test("opens files and folders with the selected editor using literal path arguments", async (t) => {

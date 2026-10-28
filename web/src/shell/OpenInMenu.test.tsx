@@ -266,7 +266,7 @@ it("discovers an existing Arca connection from host fingerprints without prompti
     ),
   );
   expect(fetchHost).toHaveBeenCalledWith(
-    "/v1/hosts/remote",
+    "/v1/hosts/remote?require_live=true",
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
   );
   expect(getFileOpenSshHost).toHaveBeenLastCalledWith("remote", fingerprints);
@@ -299,6 +299,10 @@ it.each(["primary", "menu"])(
     );
     await select();
     await waitFor(() => expect(fetchHost).toHaveBeenCalledTimes(1));
+    expect(fetchHost).toHaveBeenCalledWith(
+      "/v1/hosts/remote?require_live=true",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
     expect(openRemoteFileInApp).not.toHaveBeenCalled();
     await act(() =>
       provideMetadata({

@@ -68,9 +68,10 @@ async function discoverSshHost(hostId: string): Promise<string | null> {
   const cached = await getFileOpenSshHost(hostId);
   if (cached) return cached;
   try {
-    const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`, {
-      signal: AbortSignal.timeout(3000),
-    });
+    const response = await authenticatedFetch(
+      `/v1/hosts/${encodeURIComponent(hostId)}?require_live=true`,
+      { signal: AbortSignal.timeout(3000) },
+    );
     if (response.ok) {
       const detail = await response.json();
       if (

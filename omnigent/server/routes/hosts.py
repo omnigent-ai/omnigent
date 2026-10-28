@@ -944,15 +944,23 @@ def create_hosts_router(
         return {"hosts": result}
 
     @router.get("/hosts/{host_id}")
-    async def get_host(request: Request, host_id: str) -> dict[str, Any]:
+    async def get_host(
+        request: Request,
+        host_id: str,
+        require_live: bool = False,
+    ) -> dict[str, Any]:
         """Get details for a single host.
 
         :param request: The incoming request (for auth).
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param require_live: Require this replica's connection metadata, returning
+            a routing error when a live host is connected to another replica.
         :returns: Host details dict — the ``list_hosts`` fields (including
             ``gateway_inference``, ``None`` when unreported) plus ``runners``.
         :raises HTTPException: 404 if the host does not exist.
+        :raises OmnigentError: With ``require_live``, 400 for a wrong replica
+            or 409 when the host is offline.
         """
         # require_user: with an auth provider configured, an
         # unauthenticated caller must get 401 here — get_user_id would
@@ -970,6 +978,8 @@ def create_hosts_router(
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
         conn = host_registry.get(host.host_id)
+        if require_live and conn is None:
+            raise _host_absent_error(host)
         harness_setup_enabled = harness_install_enabled(harness_install_gate)
         result: dict[str, Any] = {
             "host_id": host.host_id,
