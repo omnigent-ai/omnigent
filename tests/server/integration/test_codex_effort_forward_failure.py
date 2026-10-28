@@ -557,7 +557,6 @@ async def test_refusal_after_the_runner_re_tunnelled_keeps_the_new_replicas_sele
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stale replica re-addresses its refusal instead of undoing a newer confirmed pick."""
-    import time
 
     from omnigent.server.routes import sessions as sessions_module
 
@@ -580,7 +579,8 @@ async def test_refusal_after_the_runner_re_tunnelled_keeps_the_new_replicas_sele
     try:
         await asyncio.wait_for(refused.wait(), timeout=5.0)
         # The runner reconnects to another replica, which confirms two newer picks.
-        session.store.touch_runner_liveness(["runner_sibling"], int(time.time()))
+        session.store.claim_runner_connection("runner_sibling", "a" * 32)
+        assert session.store.activate_runner_connection("runner_sibling", "a" * 32)
         session.store.update_conversation(session.session_id, reasoning_effort="medium")
         session.store.update_conversation(session.session_id, reasoning_effort="high")
     finally:

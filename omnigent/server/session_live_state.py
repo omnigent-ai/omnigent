@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
@@ -71,12 +72,18 @@ _executor: ThreadPoolExecutor | None = None
 # already logged, so repeats of either are suppressed. Unbounded like the
 # in-memory caches these writes mirror; entries live for the process.
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+# Epoch-ms stamp of this process's last queued status write per session.
+_last_status_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Newest stamp issued; keeps this process's stamps increasing across clock steps.
+_last_stamp = 0
+_stamp_lock = threading.Lock()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
 _last_liveness_stamp: dict[str, int] = {}
+_connection_epochs: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
 
 def configure(
@@ -96,8 +103,10 @@ def configure(
     _store = store
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
+    _last_status_at.clear()
     _last_pending.clear()
     _last_liveness_stamp.clear()
+    _connection_epochs.clear()
 
 
 def conversation_store() -> ConversationStore | None:
@@ -179,7 +188,12 @@ def persist_live_status(session_id: str, status: str) -> None:
         return
     if _last_status.get(session_id) == status:
         return
-    _last_status[session_id] = status
+    global _last_stamp
+    with _stamp_lock:
+        observed_at = max(time.time_ns() // 1_000_000, _last_stamp + 1)
+        _last_stamp = observed_at
+        _last_status[session_id] = status
+        _last_status_at[session_id] = observed_at
 
     def _evict() -> None:
         # A dropped write must not leave the dedupe cache asserting this
@@ -187,15 +201,39 @@ def persist_live_status(session_id: str, status: str) -> None:
         # swallowed and the row stays stale until a *different* status
         # arrives. Evict only if we still own the entry (a newer publish
         # may have overwritten it, and its write is the live one).
-        if _last_status.get(session_id) == status:
+        if _last_status_at.get(session_id) == observed_at:
             _last_status.pop(session_id, None)
+            _last_status_at.pop(session_id, None)
 
-    submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
+    store = _store
+
+    def _write() -> None:
+        store.set_session_live_status(session_id, status, observed_at=observed_at)
+
+    submit("live_status", _write, on_failure=_evict)
 
 
 def forget_live_status(session_id: str) -> None:
     """Drop this process's dedupe state for a session handed to another replica."""
     _last_status.pop(session_id, None)
+    _last_status_at.pop(session_id, None)
+
+
+def own_live_status_stamp(session_id: str, store: ConversationStore) -> int | None:
+    """
+    Return the stamp of THIS process's last queued status write for *session_id*.
+
+    A row stamped later was written by another replica after that write.
+
+    :param session_id: Session/conversation identifier.
+    :param store: Store the caller reads the row from; writes go elsewhere
+        unless it is the configured one.
+    :returns: Epoch ms, or ``None`` when *store* is not the configured one,
+        the write failed, or the session was handed off.
+    """
+    if _store is None or store is not _store:
+        return None
+    return _last_status_at.get(session_id)
 
 
 def persist_scheduled_run_completion(
@@ -352,3 +390,25 @@ def clear_runner_liveness(runner_id: str) -> None:
         runner_id,
         last_liveness_stamp(runner_id),
     )
+
+
+def remember_runner_connection(runner_id: str, epoch: str) -> None:
+    """Remember only a successfully activated connection for local comparisons."""
+    _connection_epochs[runner_id] = epoch
+
+
+def runner_connection_epoch(runner_id: str) -> str | None:
+    """Return this replica's latest admitted epoch, including after close."""
+    return _connection_epochs.get(runner_id)
+
+
+def heartbeat_runner_connection(
+    runner_id: str,
+    epoch: str,
+    *,
+    store: ConversationStore | None = None,
+) -> None:
+    """Queue a heartbeat carrying the exact connection epoch."""
+    target = store if store is not None else _store
+    if target is not None:
+        submit("runner_connection_heartbeat", target.heartbeat_runner_connection, runner_id, epoch)

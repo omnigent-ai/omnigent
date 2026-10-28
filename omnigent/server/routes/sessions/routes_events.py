@@ -289,7 +289,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.server.session_live_state import last_liveness_stamp
+from omnigent.server.session_live_state import runner_connection_epoch
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -306,7 +306,6 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
-    runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
@@ -496,39 +495,18 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
     runner_id: str | None,
     conversation_store: ConversationStore,
 ) -> None:
-    """
-    Re-address a rollout miss where the runner re-tunnelled to a sibling replica.
-
-    Re-reads runner liveness after the connect waits and raises ``WRONG_REPLICA``
-    only when the row's binding is unchanged and its ``runner_last_seen`` is
-    fresh and newer than this process's own last write — i.e. a sibling replica
-    the runner reconnected to during a rollout. The host-level
-    :func:`_raise_if_runner_on_another_replica` can miss this window because the
-    host's liveness has not re-settled when the message lands; the runner stamp
-    settles first.
-
-    Bounded worst case: if the replica that held the tunnel died ungracefully
-    (no ``clear_runner_liveness``) and the runner did not reconnect anywhere,
-    the stale stamp stays fresh for up to ``RUNNER_LIVENESS_TTL_S``; callers
-    retry on ``WRONG_REPLICA`` for that window before the real failure surfaces.
-
-    :param session_id: Session/conversation identifier.
-    :param runner_id: Runner id being classified (captured before the wait).
-    :param conversation_store: Store used to re-read the fresh runner stamp.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the bound runner's liveness
-        stamp is fresh evidence written by another replica.
-    """
+    """Re-address an unchanged binding with a fresh, different fenced epoch."""
     if runner_id is None:
         return
     fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if fresh is None:
         return
-    # Reuse the shared freshness+binding classifier: it only counts the row when
-    # it is still bound to ``runner_id`` (a concurrent relaunch rebinds without
-    # clearing the stamp) and the stamp is fresh and newer than this replica's
-    # own last write — i.e. written by a live sibling.
-    if _runner_live_on_another_replica_from_conversations(
-        [fresh], runner_id, last_liveness_stamp(runner_id)
+    if await asyncio.to_thread(
+        _runner_live_on_another_replica_from_conversations,
+        [fresh],
+        runner_id,
+        runner_connection_epoch(runner_id),
+        conversation_store=conversation_store,
     ):
         raise OmnigentError(
             "session runner re-tunnelled to another replica; retry",
@@ -1896,7 +1874,7 @@ def register_events_routes(
                 if (
                     stop_conn is not None
                     and stop_conn.runner_id is not None
-                    and not runner_seen_is_fresh(stop_conn.runner_last_seen)
+                    and not stop_conn.runner_online
                     and _session_status_from_cache(
                         session_id,
                         stop_conv.live_status if stop_conv is not None else None,

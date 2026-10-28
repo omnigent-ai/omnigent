@@ -165,7 +165,6 @@ from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     SessionConnectivity,
-    runner_seen_is_fresh,
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
@@ -2979,8 +2978,6 @@ def create_app(
             missing row as reachable).
         """
         connectivity = conversation_store.get_session_connectivity(ids)
-        # One consistent clock for the whole batch's freshness checks.
-        liveness_now = int(time.time())
 
         def _runner_up(conn: SessionConnectivity) -> bool:
             """A bound runner whose tunnel is registered here or fresh on the row."""
@@ -2988,11 +2985,8 @@ def create_app(
                 return False
             if tunnel_registry.get(conn.runner_id) is not None:
                 return True
-            # Another replica may hold the tunnel: it stamps
-            # ``runner_last_seen`` on connect + a periodic sweep, and
-            # clears it on graceful disconnect; an ungraceful death goes
-            # stale and self-corrects after the TTL.
-            return runner_seen_is_fresh(conn.runner_last_seen, now=liveness_now)
+            # The store classifies shared liveness against the database clock.
+            return conn.runner_online
 
         # Resolve host liveness for every bound host in one query, so
         # ``host_online`` can be reported even when the runner tunnel is
@@ -3749,7 +3743,7 @@ def create_app(
 
     async def _mark_disconnected_runner_failed(
         runner_id: str,
-        reference_stamp: int | None,
+        reference_epoch: str | None,
         *,
         idle_shutdown: bool = False,
         evidence: DisconnectEvidence | None = None,
@@ -3782,10 +3776,8 @@ def create_app(
         only ever knew about its own connections.
 
         :param runner_id: The disconnected runner's id.
-        :param reference_stamp: This replica's own last liveness stamp for
-            *runner_id*, captured in :func:`_on_runner_disconnect` before
-            the clear — the reference the cross-replica check compares
-            against.
+        :param reference_epoch: The disconnected connection's durable epoch,
+            captured before close for cross-replica handoff checks.
         :param idle_shutdown: Whether the runner closed with
             ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``. Its idle watchdog found no
             active work, so a stale mid-turn status is settled like a Stop.
@@ -3839,15 +3831,25 @@ def create_app(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
         # The runner may reconnect while the store returns an older snapshot.
-        if tunnel_registry.get(runner_id) is not None:
+        if tunnel_registry.get(runner_id) is not None or tunnel_registry.has_live_predecessor(
+            runner_id
+        ):
             _logger.info(
                 "Runner %s reconnected during offline lookup; skipping offline-marking",
                 runner_id,
             )
             return
-        if _runner_live_on_another_replica_from_conversations(
-            affected, runner_id, reference_stamp
-        ):
+        remote_liveness = await asyncio.to_thread(
+            _runner_live_on_another_replica_from_conversations,
+            affected,
+            runner_id,
+            reference_epoch,
+            conversation_store=conversation_store,
+            for_disconnect_decision=True,
+        )
+        if remote_liveness is None:
+            return
+        if remote_liveness:
             for conv in affected:
                 _relinquish_session_live_state(conv.id)
             _logger.info(
@@ -3871,9 +3873,17 @@ def create_app(
             )
             if tunnel_registry.get(runner_id) is not None:
                 return
-            if _runner_live_on_another_replica_from_conversations(
-                affected, runner_id, reference_stamp
-            ):
+            remote_liveness = await asyncio.to_thread(
+                _runner_live_on_another_replica_from_conversations,
+                affected,
+                runner_id,
+                reference_epoch,
+                conversation_store=conversation_store,
+                for_disconnect_decision=True,
+            )
+            if remote_liveness is None:
+                return
+            if remote_liveness:
                 for conv in affected:
                     _relinquish_session_live_state(conv.id)
                 return
@@ -4089,7 +4099,9 @@ def create_app(
         # If a live tunnel is registered for this runner, the runner is
         # NOT offline, so skip. Mirrors the registry's own
         # generation-guarded ``deregister``.
-        if tunnel_registry.get(runner_id) is not None:
+        if tunnel_registry.get(runner_id) is not None or tunnel_registry.has_live_predecessor(
+            runner_id
+        ):
             _logger.info(
                 "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
                 runner_id,
@@ -4112,20 +4124,8 @@ def create_app(
             # Relays decide at the same deadline as the grace timer below and
             # would fail a stale mid-turn status first; mark them now.
             _note_runner_idle_shutdown(runner_id)
-        # Capture this replica's own last stamp before clearing, so the grace
-        # timer can tell a fresher stamp another replica writes later from
-        # one we wrote ourselves (the clear itself never erases this record).
-        reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-        # Graceful disconnect: clear the persisted liveness stamp so other replicas
-        # flip offline at once. Not on our own shutdown or a handoff: the runner is
-        # alive and re-tunnels elsewhere, which must not settle its turns to idle.
-        if (
-            shutdown_state.server_shutting_down()
-            or shutdown_state.runner_handoff_reason(runner_id) is not None
-        ):
-            session_live_state.touch_runner_liveness([runner_id])
-        else:
-            session_live_state.clear_runner_liveness(runner_id)
+        # Compare retained heartbeats with this exact connection after the grace.
+        reference_epoch = connection.connection_epoch
 
         # Replace any pending timer so a rapid drop-reconnect-drop gives
         # each outage a full grace window.
@@ -4133,7 +4133,7 @@ def create_app(
         task = asyncio.create_task(
             _mark_disconnected_runner_failed(
                 runner_id,
-                reference_stamp,
+                reference_epoch,
                 idle_shutdown=idle_shutdown,
                 evidence=DisconnectEvidence.from_session(connection),
             ),
@@ -4180,7 +4180,7 @@ def create_app(
         # hosts fall back to this replica's observed liveness.
         runner_ran = (
             runner_exit_reports.was_connected(runner_id)
-            or session_live_state.last_liveness_stamp(runner_id) is not None
+            or session_live_state.runner_connection_epoch(runner_id) is not None
         )
         try:
             affected = await asyncio.to_thread(
@@ -4232,8 +4232,7 @@ def create_app(
         )
         # A runner back on this replica is this replica's to reconcile again.
         shutdown_state.clear_runner_handoff(runner_id)
-        # Other replicas must see the runner online before the first liveness sweep.
-        session_live_state.touch_runner_liveness([runner_id])
+        # Admission already activated the database fence before registry publication.
         # The by-runner lookup is read-after-write consistent and includes archived
         # sessions, whose streams still need to be attached after a reconnect.
         convs = await asyncio.to_thread(
@@ -4576,6 +4575,7 @@ def create_app(
         create_runner_tunnel_router(
             tunnel_registry,
             allowed_tunnel_tokens=runner_tunnel_tokens,
+            conversation_store=conversation_store,
             on_runner_disconnect=_on_runner_disconnect,
             on_runner_connect=_on_runner_connect,
             auth_provider=auth_provider,

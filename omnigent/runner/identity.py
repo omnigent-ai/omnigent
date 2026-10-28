@@ -69,6 +69,7 @@ RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 # runners, which have no host watching them.
 RUNNER_CONNECT_MARKER_ENV_VAR = "OMNIGENT_RUNNER_CONNECT_MARKER"
 RUNNER_SIGN_IN_PENDING_WAIT_S = 150.0
+RUNNER_CREDENTIAL_PENDING_WAIT_S = 120.0
 
 # Marker env var stamped into every agent-facing environment so any
 # process launched inside an Omnigent agent session can detect it is
@@ -121,10 +122,19 @@ def sign_in_pending_marker_path(connect_marker: Path) -> Path:
 
 def mark_sign_in_pending(runner_id: str, deadline: float | None) -> None:
     """Publish or clear a credential-free startup wait beside the connect marker."""
+    _mark_startup_wait(runner_id, deadline, ".sign-in-pending")
+
+
+def mark_credential_pending(runner_id: str, deadline: float | None) -> None:
+    """Publish the original missing-credential deadline for this exact launch."""
+    _mark_startup_wait(runner_id, deadline, ".credential-pending")
+
+
+def _mark_startup_wait(runner_id: str, deadline: float | None, suffix: str) -> None:
     configured = os.environ.get(RUNNER_CONNECT_MARKER_ENV_VAR)
     if not configured:
         return
-    marker = sign_in_pending_marker_path(Path(configured))
+    marker = Path(configured).with_suffix(suffix)
     try:
         if deadline is None:
             marker.unlink(missing_ok=True)
@@ -132,26 +142,44 @@ def mark_sign_in_pending(runner_id: str, deadline: float | None) -> None:
             marker.write_text(json.dumps({"runner_id": runner_id, "deadline": deadline}))
     except OSError:
         logging.getLogger(__name__).warning(
-            "could not update runner sign-in marker", exc_info=True
+            "could not update runner startup marker", exc_info=True
         )
 
 
 def runner_sign_in_is_pending(connect_marker: Path, runner_id: str) -> bool:
     """Read an unexpired wait belonging to this unconnected launch, failing closed."""
+    return (
+        _startup_wait_remaining(
+            connect_marker, runner_id, ".sign-in-pending", RUNNER_SIGN_IN_PENDING_WAIT_S
+        )
+        is not None
+    )
+
+
+def runner_credential_wait_remaining(connect_marker: Path, runner_id: str) -> float | None:
+    """Return the missing-credential budget left on this unconnected launch."""
+    return _startup_wait_remaining(
+        connect_marker, runner_id, ".credential-pending", RUNNER_CREDENTIAL_PENDING_WAIT_S
+    )
+
+
+def _startup_wait_remaining(
+    connect_marker: Path, runner_id: str, suffix: str, maximum: float
+) -> float | None:
     try:
         if connect_marker.exists():
-            return False
-        with sign_in_pending_marker_path(connect_marker).open() as source:
+            return None
+        with connect_marker.with_suffix(suffix).open() as source:
             state = json.loads(source.read(512))
         if not isinstance(state, dict) or state.get("runner_id") != runner_id:
-            return False
+            return None
         deadline = state.get("deadline")
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
-            return False
+            return None
         remaining = deadline - time.monotonic()
-        return math.isfinite(remaining) and 0 < remaining <= RUNNER_SIGN_IN_PENDING_WAIT_S
+        return float(remaining) if math.isfinite(remaining) and 0 < remaining <= maximum else None
     except (OSError, ValueError, OverflowError):
-        return False
+        return None
 
 
 def strip_runner_auth_secrets(env: Mapping[str, str]) -> dict[str, str]:

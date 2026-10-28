@@ -914,7 +914,12 @@ async def _receive_loop(
         if isinstance(frame, HostRunnerStatusResultFrame):
             status_future = conn.pending_runner_status.pop(frame.request_id, None)
             if status_future is not None and not status_future.done():
-                status_future.set_result({"status": frame.status})
+                status_future.set_result(
+                    {
+                        "status": frame.status,
+                        "credential_wait_remaining_s": frame.credential_wait_remaining_s,
+                    }
+                )
             continue
 
         if isinstance(frame, HostStatResultFrame):

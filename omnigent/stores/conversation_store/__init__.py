@@ -272,6 +272,35 @@ class ConversationUpdateResult:
 
 
 @dataclass(frozen=True)
+class RunnerConnectionLiveness:
+    """A fenced connection and its heartbeat evidence observed on the DB clock."""
+
+    runner_id: str | None
+    epoch: str | None
+    heartbeat_epoch: str | None
+    active: bool
+    last_seen: int | None
+    last_connected: int | None
+    observed_at: int
+
+    @property
+    def online(self) -> bool:
+        """Whether this epoch is active with a fresh database heartbeat."""
+        return self.active and runner_seen_is_fresh(self.last_seen, self.observed_at)
+
+    def live_elsewhere(self, reference_epoch: str | None, *, retained: bool = False) -> bool:
+        """Recognize another epoch using current or bounded retained evidence."""
+        stamp = self.last_connected if retained else self.last_seen
+        epoch = self.heartbeat_epoch if retained else self.epoch
+        return (
+            epoch is not None
+            and epoch != reference_epoch
+            and (retained or self.active)
+            and runner_seen_is_fresh(stamp, self.observed_at)
+        )
+
+
+@dataclass(frozen=True)
 class SessionConnectivity:
     """
     The minimal session fields the sidebar's online-dot needs.
@@ -298,12 +327,10 @@ class SessionConnectivity:
         an imported transcript has no live executor anywhere, so it must
         launch a runner on a host before it can run — reporting it offline
         routes the first message into the resume picker.
-    :param runner_last_seen: Epoch seconds the bound runner's tunnel was
-        last observed alive, written by the replica holding the tunnel.
-        ``None`` when never observed (or cleared on graceful disconnect).
-        Lets a replica that does NOT hold the tunnel derive
-        ``runner_online`` from freshness (see
-        :func:`runner_seen_is_fresh`) instead of its own empty registry.
+    :param runner_last_seen: Legacy per-session heartbeat, retained for diagnostics.
+        It has no connection fence and must not establish shared ownership.
+    :param runner_online: Current active epoch has a fresh heartbeat, measured
+        against the database observation clock in the same read.
     """
 
     runner_id: str | None
@@ -311,9 +338,10 @@ class SessionConnectivity:
     needs_workspace: bool
     imported: bool = False
     runner_last_seen: int | None = None
+    runner_online: bool = False
 
 
-# Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
+# Freshness window for shared runner heartbeat evidence. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
 # keepalive uses and the same shape as ``host_store.HOST_LIVENESS_TTL_S``.
@@ -623,6 +651,38 @@ class ConversationStore(ABC):
         """
         ...
 
+    def claim_runner_connection(
+        self,
+        runner_id: str,
+        epoch: str,
+        *,
+        expected_epoch: str | None = None,
+    ) -> None:
+        """Reserve a unique server epoch once, before admitting its tunnel."""
+        raise NotImplementedError
+
+    def activate_runner_connection(self, runner_id: str, epoch: str) -> bool:
+        """Activate only the exact reserved epoch, recording a DB-clock heartbeat."""
+        raise NotImplementedError
+
+    def heartbeat_runner_connection(self, runner_id: str, epoch: str) -> bool:
+        """Refresh only an existing active epoch; never claim or revive."""
+        raise NotImplementedError
+
+    def close_runner_connection(self, runner_id: str, epoch: str) -> bool:
+        """Close only this epoch while retaining its heartbeat evidence."""
+        raise NotImplementedError
+
+    def get_runner_connection(self, runner_id: str) -> RunnerConnectionLiveness | None:
+        """Read runner authority and database observation time together."""
+        raise NotImplementedError
+
+    def get_session_runner_connection(
+        self, conversation_id: str
+    ) -> RunnerConnectionLiveness | None:
+        """Join the session's current binding to runner-level authority."""
+        raise NotImplementedError
+
     @abstractmethod
     def get_runner_liveness(self, conversation_id: str) -> tuple[str | None, int | None] | None:
         """Return the bound runner ID and heartbeat from the metadata database.
@@ -635,6 +695,17 @@ class ConversationStore(ABC):
             metadata row is missing. Either field may be ``None``.
         """
         ...
+
+    def get_runner_disconnect_liveness(
+        self, conversation_id: str
+    ) -> tuple[str | None, int | None, int | None] | None:
+        """Return current and retained heartbeat evidence for disconnect decisions.
+
+        Stores without retained metadata keep their existing liveness behavior.
+        This does not change the two-field connectivity API.
+        """
+        current = self.get_runner_liveness(conversation_id)
+        return (*current, None) if current is not None else None
 
     @abstractmethod
     def get_session_connectivity(
@@ -1549,7 +1620,8 @@ class ConversationStore(ABC):
         so concurrent binders race safely: exactly one transitions the
         row from NULL → ``runner_id`` and gets ``True``; others (or an
         already-bound / missing row) get ``False``. Closes the TOCTOU on
-        host-launch binding (see ``resolve_host_launch``).
+        host-launch binding (see ``resolve_host_launch``). The winning bind
+        also resets ``runner_last_seen``/``runner_last_connected`` for the row.
 
         :param conversation_id: Conversation to pin, e.g.
             ``"conv_abc123"``.
@@ -1563,12 +1635,14 @@ class ConversationStore(ABC):
     @abstractmethod
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         """
-        Stamp ``runner_last_seen`` for every session bound to these runners.
+        Stamp ``runner_last_seen`` and ``runner_last_connected`` for these runners.
 
         Called by the replica holding the runner tunnels (on connect and
         on a periodic sweep of the live registry) so any replica can
-        derive ``runner_online`` from freshness. One bulk ``UPDATE``;
-        must NOT bump ``updated_at`` (it drives sidebar ordering).
+        derive ``runner_online`` from freshness. Both stamps advance
+        together here; only a graceful disconnect clears
+        ``runner_last_seen`` alone. One bulk ``UPDATE``; must NOT bump
+        ``updated_at`` (it drives sidebar ordering).
 
         :param runner_ids: Runner ids with a live tunnel,
             e.g. ``["runner_token_abc123"]``. Empty is a no-op.
@@ -1583,7 +1657,9 @@ class ConversationStore(ABC):
 
         Called on a graceful tunnel disconnect so the sidebar flips
         offline immediately instead of waiting out
-        :data:`RUNNER_LIVENESS_TTL_S`. Must NOT bump ``updated_at``.
+        :data:`RUNNER_LIVENESS_TTL_S`. Leaves ``runner_last_connected``
+        intact for the cross-replica liveness check. Must NOT bump
+        ``updated_at``.
 
         :param runner_id: The disconnected runner's id.
         :param not_after: When given, only clear a row whose
@@ -1595,7 +1671,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def set_session_live_status(self, conversation_id: str, status: str) -> None:
+    def set_session_live_status(
+        self, conversation_id: str, status: str, *, observed_at: int | None = None
+    ) -> None:
         """
         Persist the relay-observed turn status for one session.
 
@@ -1605,6 +1683,11 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
+        :param observed_at: Epoch ms the writer observed *status*. When given,
+            stamp ``live_status_at`` and skip the write if the row already
+            holds a newer stamp, so a delayed write from a replica that lost
+            the session cannot overwrite its new owner's status. ``None``
+            writes unconditionally and clears the observation stamp.
         """
         ...
 
@@ -1659,7 +1742,9 @@ class ConversationStore(ABC):
         Atomic last-write-wins write. Public session binding routes
         validate session-scoped agent ownership before calling this
         method; internal sub-agent code also uses it to keep child
-        conversations on the parent's current runner.
+        conversations on the parent's current runner. A real runner change
+        clears ``runner_last_seen``/``runner_last_connected`` so the previous
+        runner's liveness is not attributed to the new binding.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -1685,7 +1770,9 @@ class ConversationStore(ABC):
 
         Counterpart to :meth:`replace_runner_id` for the 1:1
         session↔runner invariant — /clear and /switch unbind the old
-        session before binding the runner to the new one.
+        session before binding the runner to the new one. Also clears
+        ``runner_last_seen``/``runner_last_connected`` so an unbound session
+        reads as not live.
 
         Runner/host binding is live state, not conversation activity, so
         this must NOT bump ``updated_at`` (it drives sidebar ordering
@@ -1703,7 +1790,8 @@ class ConversationStore(ABC):
     def clear_host_binding(self, conversation_id: str) -> Conversation:
         """
         Revert a session to fully unbound: NULL ``host_id``,
-        ``workspace``, ``git_branch``, and ``runner_id`` together.
+        ``workspace``, ``git_branch``, and ``runner_id`` together, and reset
+        ``runner_last_seen``/``runner_last_connected``.
 
         Used to undo a failed per-session bind (``POST
         /v1/hosts/{id}/runners``) after the runner was atomically

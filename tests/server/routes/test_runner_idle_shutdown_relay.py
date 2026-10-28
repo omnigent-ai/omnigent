@@ -134,7 +134,7 @@ class _LabelStore:
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
 
-    def get_runner_liveness(self, conversation_id: str) -> None:
+    def get_session_runner_connection(self, conversation_id: str) -> None:
         return None
 
     def get_conversation(self, conversation_id: str) -> None:

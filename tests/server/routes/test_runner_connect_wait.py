@@ -430,9 +430,11 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
     assert event.attributes["attempts"] == 0
 
 
+@pytest.mark.parametrize("pending_status", ["sign_in_pending", "credential_pending"])
 @pytest.mark.parametrize(
     "outcome",
     [
+        "ordinary_alive",
         "connected",
         "deadline_tie",
         "late_pending",
@@ -441,9 +443,14 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
         "cancelled",
         "dead",
         "expired",
+        "host_replaced",
+        "connected_after_deadline",
+        "interactive_transition",
     ],
 )
-async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) -> None:
+async def test_explicit_sign_in_wait_is_bounded_and_owned(
+    monkeypatch, outcome, pending_status
+) -> None:
     from omnigent.errors import OmnigentError
     from omnigent.server.routes._sessions import orchestration
 
@@ -492,18 +499,25 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
         finally:
             active.remove(task)
 
-    async def status(*_args):
+    async def status(*_args, on_credential_wait=None):
         nonlocal status_calls
         status_calls += 1
+        if outcome == "ordinary_alive":
+            status_poll_started.set()
+            return "alive"
         if outcome == "late_pending" and status_calls == 1:
             return "alive"
         # Late pending follows alive, a cancelled poll, then a fresh deadline query.
         if status_calls == 1 or (outcome == "late_pending" and status_calls == 3):
-            return "sign_in_pending"
-        status_poll_started.set()
-        if status_calls == (5 if outcome == "late_pending" else 3):
-            pending_rechecked.set()
-        return await next_status.get()
+            reply = pending_status
+        else:
+            status_poll_started.set()
+            if status_calls == (5 if outcome == "late_pending" else 3):
+                pending_rechecked.set()
+            reply = await next_status.get()
+        if reply == "credential_pending" and on_credential_wait is not None:
+            on_credential_wait(120.0)
+        return reply
 
     monkeypatch.setattr(orchestration, "_wait_for_runner_client", wait)
     monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
@@ -522,17 +536,26 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
     )
     try:
         async with asyncio.timeout(budget(5)):
+            if outcome == "ordinary_alive":
+                await status_poll_started.wait()
+                clock.now = 30.0
+                ordinary_expired.set()
+                assert await task is None
+                assert waits == [30.0]
+                return
             if outcome == "late_pending":
                 await status_poll_started.wait()
                 clock.now = 30.0
                 ordinary_expired.set()
             await pending_wait_started.wait()
-            assert waits == [30.0, 150.0]
+            pending_deadline = clock.now + 150 if pending_status == "sign_in_pending" else 120.0
+            expected_waits = [30.0, pending_deadline - clock.now]
+            assert waits == expected_waits
             if outcome in {"connected", "deadline_tie", "late_pending", "expired"}:
-                clock.now += 31.0
-                next_status.put_nowait("sign_in_pending")
+                clock.now = 60.0
+                next_status.put_nowait(pending_status)
                 await pending_rechecked.wait()
-                assert waits == [30.0, 150.0], "a repeated status renewed the sign-in wait"
+                assert waits == expected_waits, "a repeated status renewed the sign-in wait"
             if outcome in {"connected", "deadline_tie", "late_pending"}:
                 assert not task.done(), "ordinary startup grace discarded pending sign-in"
                 connection_results.put_nowait(client)
@@ -541,12 +564,12 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 monkeypatch.setitem(
                     orchestration._intentional_stop_sessions, "session-owned", "runner-owned"
                 )
-                next_status.put_nowait("sign_in_pending")
+                next_status.put_nowait(pending_status)
                 with pytest.raises(OmnigentError, match="was stopped"):
                     await task
             elif outcome == "rebound":
                 current.runner_id = "runner-replacement"
-                next_status.put_nowait("sign_in_pending")
+                next_status.put_nowait(pending_status)
                 with pytest.raises(OmnigentError, match="binding changed"):
                     await task
             elif outcome == "cancelled":
@@ -556,16 +579,38 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
             elif outcome == "dead":
                 next_status.put_nowait("dead")
                 assert await task is None
+            elif outcome == "host_replaced":
+                registry.get = lambda _host_id: object()
+                next_status.put_nowait(pending_status)
+                assert await task is None
+            elif outcome == "connected_after_deadline":
+                clock.now = pending_deadline
+                connection_results.put_nowait(client)
+                assert await task is None
+            elif outcome == "interactive_transition":
+                clock.now = 60.0
+                next_status.put_nowait(
+                    "credential_pending"
+                    if pending_status == "sign_in_pending"
+                    else "sign_in_pending"
+                )
+                await pending_rechecked.wait()
+                if pending_status == "sign_in_pending":
+                    expected_waits.append(60.0)
+                assert waits == expected_waits
+                clock.now = 120.0
+                connection_results.put_nowait(clock_tick)
+                assert await task is None
             else:
-                clock.now = 149.0
+                clock.now = pending_deadline - 1
                 connection_results.put_nowait(clock_tick)
                 await clock_checked.wait()
                 assert not task.done(), "sign-in wait expired before its deadline"
-                clock.now = 150.0
+                clock.now = pending_deadline
                 connection_results.put_nowait(clock_tick)
                 assert await task is None
             assert not active
-            assert len(waits) == 2
+            assert waits == expected_waits
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)

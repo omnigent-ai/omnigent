@@ -88,6 +88,29 @@ session impact or changes KPI eligibility.
   `recovery_prompt` or `none`) with its inputs `recovery_id`,
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
   `history_len`, `last_item_type`, and the resulting `status`.
+- `runner_tunnel_renewal_retry`: a planned replacement was not admitted while
+  its predecessor remains healthy. This is not an ordinary reconnect or an
+  authentication-cache rejection; the accepted work stays on the old socket.
+- `runner_tunnel_predecessor_drained`: `connection_id`, `retirement_expected`,
+  `error_type`, `close_code`, and the predecessor's final diagnostics. Only the
+  explicit drained close is expected retirement; real transport loss remains
+  an unexpected disconnect and fails its unfinished requests.
+
+Planned renewal requires `tunnel-renewal-v1` capability negotiation. The server
+issues a one-use permit tied to the current connection and an authenticated
+process-continuity token. The `/tunnel/renewal` route validates admission before
+changing registration. A different replica or older server rejects the planned
+attempt; the client keeps its old socket and accepted requests instead of
+falling back to an ordinary replacement. Older clients receive no new frames.
+
+On an admitted renewal, new requests use the replacement while predecessor-owned
+requests and terminal channels retain their original response routing. Only
+exact passive GET session streams are reopened, after protected work finishes
+and a current tunnel is available. A retained predecessor can deliver native
+events while its replacement reconnects, without admitting new commands.
+There is at most one draining predecessor, and another renewal waits until it drains. Long-lived terminal
+channels or unfinished commands can therefore defer renewal; genuine socket
+loss still fails those requests. No inference or accepted command is replayed.
 
 ### Stack capture during runner event-loop stalls
 

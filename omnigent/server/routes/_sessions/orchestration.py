@@ -414,7 +414,6 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
-    runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
@@ -4034,7 +4033,7 @@ async def _mark_runner_sessions_offline_impl(
     so the departure reaches every child bound to it — marking the idle
     ones ``failed`` painted a whole Agents rail red for sub-agents that had
     completed successfully. The runner's absence is already carried by
-    liveness (``clear_runner_liveness``), which is what drives the
+    the closed connection fence, which is what drives the
     reconnect affordances, so a session that was not mid-turn needs no
     status edge at all.
 
@@ -4258,14 +4257,14 @@ async def _wait_for_host_bound_runner_client(
     host_registry: HostRegistry,
     conversation_store: ConversationStore | None = None,
 ) -> httpx.AsyncClient | None:
-    """Wait for this runner, extending startup only for an explicit pending sign-in.
+    """Wait for this runner, extending startup only for a bounded authentication wait.
 
     Host liveness can end the ordinary grace early for a dead or untracked
-    process. A bounded sign-in wait keeps the same binding and input until
+    process. A bounded credential wait keeps the same binding and input until
     authentication finishes; old hosts retain the ordinary startup budget.
     Stop, rebind, cancellation and process exit still end the wait promptly.
 
-    :param conversation_store: Optional binding check while sign-in is pending.
+    :param conversation_store: Optional binding check while authentication is pending.
     """
     from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
 
@@ -4281,41 +4280,54 @@ async def _wait_for_host_bound_runner_client(
             )
         )
 
-    async def query_status(*, pause: bool = False) -> str | None:
+    async def query_status(*, pause: bool = False) -> tuple[str | None, float | None]:
         if pause:
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
-        return await _query_host_runner_status(host_conn, host_registry, runner_id)
+        credential_deadline = None
+
+        def record_credential_wait(deadline: float) -> None:
+            nonlocal credential_deadline
+            credential_deadline = deadline
+
+        status = await _query_host_runner_status(
+            host_conn, host_registry, runner_id, on_credential_wait=record_credential_wait
+        )
+        return status, credential_deadline
 
     async def check_pending_owner() -> None:
         if _intentional_stop_sessions.get(session_id) == runner_id:
             raise OmnigentError(
-                "The session was stopped while waiting for host sign-in; send the message again.",
+                "The session was stopped while waiting for runner authentication; "
+                "send the message again.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         if conversation_store is not None:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is None or current.runner_id != runner_id:
                 raise OmnigentError(
-                    "session runner binding changed while waiting for host sign-in; retry",
+                    "session runner binding changed while waiting for runner "
+                    "authentication; retry",
                     code=ErrorCode.WRONG_REPLICA,
                 )
 
     connect_task = wait_for_connection(timeout_s)
     status_task = asyncio.create_task(query_status())
-    sign_in_deadline: float | None = None
-    waiting_for_sign_in = False
+    startup_deadline: float | None = None
+    waiting_for_credentials = False
     try:
         while True:
             done, _pending = await asyncio.wait(
                 {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if sign_in_deadline is not None:
+            if startup_deadline is not None:
                 await check_pending_owner()
+                if time.monotonic() >= startup_deadline:
+                    return None
             if connect_task in done:
                 client = connect_task.result()
                 if client is not None:
                     return client
-                if waiting_for_sign_in:
+                if waiting_for_credentials:
                     return None
                 if (
                     runner_exit_reports is not None
@@ -4330,34 +4342,52 @@ async def _wait_for_host_bound_runner_client(
                     await asyncio.gather(status_task, return_exceptions=True)
                     status_task = asyncio.create_task(query_status())
                     await status_task
-                if status_task.result() != "sign_in_pending":
+                if status_task.result()[0] not in {"sign_in_pending", "credential_pending"}:
                     return None
-            status = status_task.result()
+            status, credential_deadline = status_task.result()
             if status in ("dead", "unknown"):
                 return None
-            if sign_in_deadline is None and status not in {"alive", "sign_in_pending"}:
+            if startup_deadline is None and status not in {
+                "alive",
+                "sign_in_pending",
+                "credential_pending",
+            }:
                 return await connect_task
-            if status == "sign_in_pending" and not waiting_for_sign_in:
-                if sign_in_deadline is None:
-                    sign_in_deadline = time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
-                await check_pending_owner()
-                budget_s = sign_in_deadline - time.monotonic()
-                if budget_s <= 0:
-                    return None
+            if status in {"sign_in_pending", "credential_pending"}:
+                if status == "credential_pending":
+                    if credential_deadline is None:
+                        return await connect_task
+                    next_deadline = (
+                        min(startup_deadline, credential_deadline)
+                        if startup_deadline is not None
+                        else credential_deadline
+                    )
+                else:
+                    next_deadline = (
+                        startup_deadline
+                        if startup_deadline is not None
+                        else time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
+                    )
+                if not waiting_for_credentials or next_deadline != startup_deadline:
+                    startup_deadline = next_deadline
+                    await check_pending_owner()
+                    budget_s = startup_deadline - time.monotonic()
+                    if budget_s <= 0:
+                        return None
+                    connect_task.cancel()
+                    await asyncio.gather(connect_task, return_exceptions=True)
+                    connect_task = wait_for_connection(budget_s)
+                    waiting_for_credentials = True
+            elif status == "alive" and waiting_for_credentials:
+                # Authentication resumed; normal startup must now make progress.
+                assert startup_deadline is not None
+                budget_s = min(timeout_s, max(0.0, startup_deadline - time.monotonic()))
                 connect_task.cancel()
                 await asyncio.gather(connect_task, return_exceptions=True)
                 connect_task = wait_for_connection(budget_s)
-                waiting_for_sign_in = True
-            elif status == "alive" and waiting_for_sign_in:
-                # Sign-in finished; normal startup must now make progress.
-                assert sign_in_deadline is not None
-                budget_s = min(timeout_s, max(0.0, sign_in_deadline - time.monotonic()))
-                connect_task.cancel()
-                await asyncio.gather(connect_task, return_exceptions=True)
-                connect_task = wait_for_connection(budget_s)
-                waiting_for_sign_in = False
+                waiting_for_credentials = False
             if (
-                sign_in_deadline is not None
+                startup_deadline is not None
                 and host_registry.get(host_conn.host_id) is not host_conn
             ):
                 return None
@@ -8365,32 +8395,32 @@ def _relinquish_session_live_state(session_id: str) -> None:
     session_live_state.forget_live_status(session_id)
 
 
-def _runner_stamp_is_live_elsewhere(
-    *,
-    stamp: int | None,
-    reference_stamp: int | None,
-) -> bool:
-    """Return whether *stamp* is fresh evidence written by another replica."""
-    return (
-        stamp is not None
-        and runner_seen_is_fresh(stamp)
-        and (reference_stamp is None or stamp > reference_stamp)
-    )
-
-
 def _runner_live_on_another_replica_from_conversations(
     conversations: Sequence[Conversation],
     runner_id: str,
-    reference_stamp: int | None,
-) -> bool:
-    """Check already-loaded runner-bound rows for a fresher replica's stamp."""
-    return any(
-        conv.runner_id == runner_id
-        and _runner_stamp_is_live_elsewhere(
-            stamp=conv.runner_last_seen,
-            reference_stamp=reference_stamp,
+    reference_epoch: str | None,
+    *,
+    conversation_store: ConversationStore | None = None,
+    for_disconnect_decision: bool = False,
+) -> bool | None:
+    """Read fenced DB-clock evidence only for the expected runner binding."""
+    if not any(conv.runner_id == runner_id for conv in conversations):
+        return False
+    store = conversation_store or session_live_state.conversation_store()
+    if store is None:
+        return False
+    try:
+        connection = store.get_runner_connection(runner_id)
+    except Exception:  # noqa: BLE001 — unreadable ownership preserves accepted work
+        _logger.warning(
+            "Runner liveness lookup failed for runner=%s; preserving accepted work",
+            runner_id,
+            exc_info=True,
         )
-        for conv in conversations
+        return None
+    return connection is not None and connection.live_elsewhere(
+        reference_epoch,
+        retained=for_disconnect_decision,
     )
 
 
@@ -8461,6 +8491,10 @@ async def _runner_disconnect_requires_failure(
     needs a fresh row: an offline sweep's snapshot may predate a child's idle
     observation. Recheck the cache after the read, even when the read fails.
 
+    A mid-turn cache is stale once another replica owns the session. When the
+    row holds a settled status stamped after this replica's last write, the
+    turn was handed off, not lost.
+
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
     establish that a turn was interrupted.
@@ -8473,9 +8507,14 @@ async def _runner_disconnect_requires_failure(
     the saved status alone is no evidence of an interruption.
     """
     cached = _session_status_cache.get(session_id)
+    own_stamp = (
+        session_live_state.own_live_status_stamp(session_id, conversation_store)
+        if cached in _MID_TURN_STATUSES
+        else None
+    )
     persisted: Conversation | None = None
     lookup = "not_needed"
-    if cached is None:
+    if cached is None or own_stamp is not None:
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
@@ -8488,12 +8527,22 @@ async def _runner_disconnect_requires_failure(
                 extra={"session_id": session_id},
             )
         cached = _session_status_cache.get(session_id)
+    # A local edge during the read leaves the row behind this replica again.
+    handed_off = (
+        own_stamp is not None
+        and session_live_state.own_live_status_stamp(session_id, conversation_store) == own_stamp
+        and persisted is not None
+        and persisted.live_status is not None
+        and persisted.live_status not in _MID_TURN_STATUSES
+        and persisted.live_status_at is not None
+        and persisted.live_status_at > own_stamp
+    )
 
     handle = _runner_relay_tasks.get(session_id)
     relay_snapshot = handle.status_snapshot if handle is not None else None
     fallback = snapshot if snapshot is not None else relay_snapshot
 
-    if cached is not None:
+    if cached is not None and not handed_off:
         live, source = cached, "cache"
     elif persisted is not None:
         live, source = persisted.live_status, "persisted"
@@ -8512,10 +8561,10 @@ async def _runner_disconnect_requires_failure(
     ):
         # A Stop can arrive while the sweep refreshes its row.
         decision = "intentional_stop"
-    elif shutdown_state.runner_handoff_reason(runner_id) is not None:
-        # This replica moved the runner's tunnel to another replica, which now
-        # owns the turn. A failed or stale local read must not fail a turn that
-        # is still running there.
+    elif handed_off or shutdown_state.runner_handoff_reason(runner_id) is not None:
+        # Another replica owns the turn: it settled the session after this
+        # replica's last write, or this replica moved the runner's tunnel to it.
+        # A failed or stale local read must not fail a turn that is running there.
         decision = "handed_off"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
@@ -8585,6 +8634,8 @@ async def _runner_disconnect_requires_failure(
             # The cache retains positive counts only; absence is not an observed zero.
             cached_background_task_count=_session_background_task_count_cache.get(session_id),
             persisted_session_status=persisted.live_status if persisted is not None else None,
+            own_live_status_at=own_stamp,
+            persisted_live_status_at=persisted.live_status_at if persisted is not None else None,
             snapshot_session_status=fallback.live_status if fallback is not None else None,
             status_lookup=lookup,
             session_kind=conv.kind if conv is not None else None,
@@ -8596,47 +8647,38 @@ async def _runner_disconnect_requires_failure(
             **shutdown_state.disconnect_attributes(runner_id),
         ),
     )
+    if decision == "handed_off":
+        _relinquish_session_live_state(session_id)
     return decision in ("failed_mid_turn", "failed_before_start")
 
 
 async def _relay_runner_live_elsewhere(
     session_id: str,
     conversation_store: ConversationStore,
-) -> bool:
-    """
-    Check this relay's bound runner using shared runner metadata.
-
-    A full-conversation read can depend on unrelated backends; their outage
-    must not hide a fresh heartbeat from another replica. Prefer the active
-    relay's runner binding, falling back to the metadata binding when called
-    without a registered relay.
-
-    :param session_id: Session/conversation identifier.
-    :param conversation_store: Store used to read runner metadata.
-    :returns: ``True`` when the bound runner is confirmed live on
-        another replica; ``False`` when unbound, unreadable, or not.
-    """
+) -> bool | None:
+    """Check current binding and bounded retained evidence using connection epochs."""
     try:
-        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
-    except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
-        _logger.warning(
-            "Relay: runner liveness lookup failed for session=%s",
+        connection = await asyncio.to_thread(
+            conversation_store.get_session_runner_connection,
             session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
         )
+    except Exception:  # noqa: BLE001 — unreadable ownership preserves accepted work
+        _logger.warning(
+            "Relay: fenced runner lookup failed for session=%s", session_id, exc_info=True
+        )
+        return None
+    if connection is None or connection.runner_id is None:
         return False
-    if liveness is None:
-        return False
-    bound_runner_id, runner_last_seen = liveness
     handle = _runner_relay_tasks.get(session_id)
-    runner_id = handle.runner_id if handle is not None else bound_runner_id
-    if runner_id is None:
-        return False
-    reference_stamp = session_live_state.last_liveness_stamp(runner_id)
-    return bound_runner_id == runner_id and _runner_stamp_is_live_elsewhere(
-        stamp=runner_last_seen,
-        reference_stamp=reference_stamp,
+    runner_id = handle.runner_id if handle is not None else connection.runner_id
+    reference_epoch = (
+        handle.connection_epoch
+        if handle is not None
+        else session_live_state.runner_connection_epoch(runner_id)
+    )
+    return connection.runner_id == runner_id and connection.live_elsewhere(
+        reference_epoch,
+        retained=True,
     )
 
 
@@ -8829,8 +8871,13 @@ async def _relay_runner_stream(
             elif shutdown_state.runner_handoff_reason(outage_runner_id) is not None:
                 # See _runner_disconnect_requires_failure.
                 decision = "handed_off"
-            elif await _relay_runner_live_elsewhere(session_id, conversation_store):
-                decision = "live_elsewhere"
+            elif (
+                remote_liveness := await _relay_runner_live_elsewhere(
+                    session_id,
+                    conversation_store,
+                )
+            ) is not False:
+                decision = "live_elsewhere" if remote_liveness else "liveness_unavailable"
             elif outage_bound_elsewhere and await _relay_session_rebound(
                 session_id, conversation_store, outage_runner_id
             ):
@@ -8911,7 +8958,7 @@ async def _relay_runner_stream(
                     outage_runner_id,
                     extra={"session_id": session_id},
                 )
-            elif decision == "held_host_offline":
+            elif decision in ("held_host_offline", "liveness_unavailable"):
                 # The disconnect task holds the turn; the reconnect restarts the relay.
                 pass
             elif decision == "idle_no_failure":
@@ -9916,7 +9963,11 @@ def _ensure_runner_relay(
         else None
     )
     handle = _RelayHandle(
-        runner_id=runner_id, task=task, ready=ready, status_snapshot=status_snapshot
+        runner_id=runner_id,
+        task=task,
+        ready=ready,
+        status_snapshot=status_snapshot,
+        connection_epoch=session_live_state.runner_connection_epoch(runner_id),
     )
     _runner_relay_tasks[session_id] = handle
 
@@ -9997,11 +10048,6 @@ async def _ensure_runner_relay_ready_impl(
             "Timed out waiting for runner stream relay to subscribe",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
-    # The runner just acknowledged this session's stream. A session bound after
-    # the tunnel connected has no ``runner_last_seen`` until the next ping; stamp
-    # it here so a server recycle in that window cannot read it as orphaned.
-    if runner_id is not None:
-        session_live_state.touch_runner_liveness([runner_id])
     return handle
 
 
@@ -13454,7 +13500,7 @@ async def _get_session_snapshot(
         exit_error = runner_exit_reports.get(conv.runner_id)
         runner_ran = (
             runner_exit_reports.was_connected(conv.runner_id)
-            or session_live_state.last_liveness_stamp(conv.runner_id) is not None
+            or session_live_state.runner_connection_epoch(conv.runner_id) is not None
         )
         # A cause recorded by a previous runner attempt is stale once a new
         # runner is bound; surface that runner's exit instead of hiding it.

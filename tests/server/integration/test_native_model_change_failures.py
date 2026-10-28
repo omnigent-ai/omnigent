@@ -527,7 +527,6 @@ async def test_refused_model_change_keeps_the_new_replicas_same_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stale refusal cannot restore over the same model confirmed on another replica."""
-    import time
 
     from omnigent.server.routes.sessions import routes_events
 
@@ -535,9 +534,10 @@ async def test_refused_model_change_keeps_the_new_replicas_same_selection(
     assert session.claude is not None
     session.claude.confirm = False
     monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
-    monkeypatch.setattr(routes_events, "last_liveness_stamp", lambda _runner: None)
+    monkeypatch.setattr(routes_events, "runner_connection_epoch", lambda _runner: None)
     async with _held_model_reply(client, session) as (first, release_refusal):
-        session.store.touch_runner_liveness(["runner_connected"], int(time.time()))
+        session.store.claim_runner_connection("runner_connected", "a" * 32)
+        assert session.store.activate_runner_connection("runner_connected", "a" * 32)
         session.store.update_conversation(session.session_id, model_override="claude-sonnet-4-6")
         session.store.update_conversation(
             session.session_id, model_override=session.requested_model

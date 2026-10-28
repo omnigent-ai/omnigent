@@ -714,9 +714,11 @@ def test_mid_turn_tunnel_blackout_recovers_without_failed_edge(
     ids=["healthy-store", "unavailable-conversation-backend"],
     indirect=True,
 )
+@pytest.mark.parametrize("settled_then_offline", [False, True], ids=["running", "settled-blip"])
 def test_reconnect_to_another_replica_does_not_fail_the_turn(
     reconnect_stack: _ReconnectStack,
     mock_llm_server_url: str,
+    settled_then_offline: bool,
 ) -> None:
     """A runner that reconnects to a different replica must not be failed by the first.
 
@@ -791,7 +793,21 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
             )
         assert _session_snapshot(replica_b.client, session_id).get("status") == "running"
 
-        # Keep the original turn in flight until A makes its disconnect decision.
+        if settled_then_offline:
+            release_mock_gate(mock_llm_server_url)
+            _poll_until(
+                lambda: _session_snapshot(replica_b.client, session_id).get("status") == "idle",
+                timeout=30.0,
+                what="replica B to settle the turn before its tunnel blips",
+            )
+            proxy.begin_blackout()
+            _poll_until(
+                lambda: not replica_b.runner_online(),
+                timeout=10.0,
+                what="replica B to lose its real runner tunnel",
+            )
+
+        # Wait for A's original grace period while B owns the newer state.
         recovered = f"Relay: runner transport lost for session={session_id} (live_elsewhere)"
         _poll_until(
             lambda: (
@@ -799,7 +815,7 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
                 or bool(_FAILURE_SIGNATURE.search(stack.process_log.read_text()))
             ),
             timeout=RUNNER_DISCONNECT_GRACE_S + 30.0,
-            what="replica A to resolve the disconnect while the turn is still running on B",
+            what="replica A to resolve the disconnect without overwriting B's newer state",
         )
 
         server_a_log = stack.process_log.read_text()
@@ -814,6 +830,15 @@ def test_reconnect_to_another_replica_does_not_fail_the_turn(
         assert recovered in server_a_log
         if stack.store_fault is not None:
             stack.store_fault.unlink()
+
+        if settled_then_offline:
+            assert _session_snapshot(replica_b.client, session_id).get("status") == "idle"
+            proxy.end_blackout()
+            _poll_until(
+                replica_b.runner_online,
+                timeout=_HEALTH_TIMEOUT_S,
+                what="the runner to reconnect to replica B after the second outage",
+            )
 
         release_mock_gate(mock_llm_server_url)
         _poll_until(

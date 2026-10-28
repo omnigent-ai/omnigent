@@ -13008,7 +13008,6 @@ async def test_runner_re_tunnelled_to_sibling_returns_wrong_replica(
     instead of persisting a ``runner_failed_to_start`` turn. This guards the
     wiring: the stamp check must run *before* failure persistence.
     """
-    import time
 
     agent = await create_test_agent(client)
     session = await _create_session(
@@ -13024,7 +13023,8 @@ async def test_runner_re_tunnelled_to_sibling_returns_wrong_replica(
     # last_liveness_stamp() returns None and the stamp reads as another replica's.
     store = SqlAlchemyConversationStore(db_uri)
     assert store.set_runner_id(sid, "runner_sibling")
-    store.touch_runner_liveness(["runner_sibling"], int(time.time()))
+    store.claim_runner_connection("runner_sibling", "b" * 32)
+    assert store.activate_runner_connection("runner_sibling", "b" * 32)
 
     resp = await client.post(
         f"/v1/sessions/{sid}/events",

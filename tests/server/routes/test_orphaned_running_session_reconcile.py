@@ -13,7 +13,7 @@ Both route through :func:`reconcile_orphaned_running_status`, whose own
 ``failed``-sticky invariant is unit-tested directly.
 
 The reconciliation only fires when the runner is confirmed gone from every
-replica (no live tunnel here AND ``runner_last_seen`` stale past the TTL);
+replica (no live tunnel here AND fenced heartbeat stale past the TTL);
 each facet is paired with a fresh-runner control that must be left running,
 proving the grace-window guard.
 """
@@ -25,7 +25,9 @@ import time
 import httpx
 import pytest
 import pytest_asyncio
+from sqlalchemy import update
 
+from omnigent.db.db_models import SqlRunnerConnection, current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.server.routes._sessions.helpers import (
     _session_status_cache,
@@ -41,10 +43,8 @@ def _seed_running_session(db_uri: str, *, runner_fresh: bool) -> str:
     """Seed a session persisted as ``running`` with a bound runner.
 
     :param db_uri: SQLite database URI shared with the test app.
-    :param runner_fresh: When ``True``, stamp ``runner_last_seen`` now so
-        the runner reads reachable (alive on another replica within the
-        grace window); when ``False``, leave it unset so the runner reads
-        confirmed-gone.
+    :param runner_fresh: Whether the runner has an active fresh fence or
+        an expired closed epoch that confirms it is gone.
     :returns: The seeded session/conversation id.
     """
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -59,8 +59,20 @@ def _seed_running_session(db_uri: str, *, runner_fresh: bool) -> str:
     runner_id = f"runner_{conv.id}"
     assert conv_store.set_runner_id(conv.id, runner_id)
     conv_store.set_session_live_status(conv.id, "running")
-    if runner_fresh:
-        conv_store.touch_runner_liveness([runner_id], int(time.time()))
+    epoch = "a" * 32
+    conv_store.claim_runner_connection(runner_id, epoch)
+    conv_store.activate_runner_connection(runner_id, epoch)
+    if not runner_fresh:
+        conv_store.close_runner_connection(runner_id, epoch)
+        with conv_store._session("seed_expired_runner_connection") as session:
+            session.execute(
+                update(SqlRunnerConnection)
+                .where(
+                    SqlRunnerConnection.workspace_id == current_workspace_id(),
+                    SqlRunnerConnection.runner_id == runner_id,
+                )
+                .values(last_connected=1)
+            )
     # Ensure no stale relay-cache entry: the reconciliation's suspect gate
     # is a cache MISS (the "running" came from the DB mirror, not a runner
     # this replica is actively relaying).

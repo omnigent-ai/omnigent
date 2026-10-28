@@ -103,6 +103,39 @@ raise SystemExit(23)
     assert all(child.poll() is not None for child in children)
 
 
+@pytest.mark.parametrize(
+    ("bootstrap", "wait_ready"),
+    [(None, False), ("from omnigent.cli import cli; cli()", True)],
+)
+def test_stack_binds_its_own_port_and_preserves_it_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bootstrap: str | None, wait_ready: bool
+):
+    import httpx
+
+    from tests._helpers.live_server import reserve_port
+    from tests._helpers.server_runner import server_runner
+
+    with reserve_port() as occupied:
+        occupied.listen()
+        occupied_port = occupied.getsockname()[1]
+        monkeypatch.setattr("tests._helpers.server_runner.find_free_port", lambda: occupied_port)
+        with server_runner(
+            tmp_path,
+            server_bootstrap=bootstrap,
+            wait_ready=wait_ready,
+            poll_interval=0.02,
+        ) as stack:
+            assert stack.port > 0 and stack.port != occupied_port
+            stack.start_runner()
+            original_url = stack.base_url
+            with httpx.Client(base_url=original_url, trust_env=False) as client:
+                assert client.get("/health").status_code == 200
+                stack.restart_server()
+                assert stack.base_url == original_url
+                assert client.get("/health").status_code == 200
+                assert client.get(f"/v1/runners/{stack.runner_id}/status").json()["online"]
+
+
 @pytest.mark.parametrize("exit_early", [True, False])
 def test_host_failed_readiness_reaps_child_and_retains_isolated_diagnostics(
     tmp_path: Path, exit_early: bool

@@ -225,7 +225,6 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
-    runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
@@ -1959,16 +1958,8 @@ def register_core_routes(
         # for the general case (see the note below the item build): the probe
         # is bounded to a tiny suspect set so the common path pays nothing.
         #
-        # Suspect = a row that (a) still says running/waiting, (b) has a bound
-        # runner, (c) has NO live entry in this replica's status cache — i.e.
-        # its "running" came from the cross-replica DB mirror, not a runner
-        # this replica is actively relaying — and (d) has a stale/absent
-        # runner_last_seen heartbeat. The freshness check reads the stamp
-        # already carried on the list row (no extra query): a runner up on
-        # another replica keeps it fresh, so such a session is filtered out
-        # here and never reaches the probe. Only stamp-stale candidates fall
-        # through to liveness_lookup, which additionally rules out a runner
-        # whose tunnel is live on THIS replica before we settle.
+        # Probe uncached running rows through the batch fenced-liveness reader.
+        # Settlement rechecks the bound runner under its database fence lock.
         if liveness_lookup is not None:
             orphan_suspects = [
                 conv
@@ -1977,7 +1968,6 @@ def register_core_routes(
                 and conv.runner_id is not None
                 and conv.live_status in ("running", "waiting")
                 and _session_status_cache.get(conv.id) is None
-                and not runner_seen_is_fresh(conv.runner_last_seen)
                 and (
                     permission_store is None
                     or _permission_level_from_grants(

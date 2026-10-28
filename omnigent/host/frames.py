@@ -457,6 +457,8 @@ class HostRunnerStatusResultFrame:
           running (booting or serving). The runner is coming; wait.
         * ``"sign_in_pending"`` — this live, unconnected runner is waiting
           within its bounded host sign-in window. Keep the original input.
+        * ``"credential_pending"`` — this live, unconnected runner is retrying
+          within its original missing-credential window.
         * ``"dead"`` — the host has this runner but its process has
           exited. It will never connect; relaunch now.
         * ``"unknown"`` — the host has no record of this runner (it was
@@ -466,6 +468,7 @@ class HostRunnerStatusResultFrame:
 
     request_id: str
     status: str
+    credential_wait_remaining_s: float | None = None
 
 
 @dataclass
@@ -1642,6 +1645,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_STATUS_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
+                "credential_wait_remaining_s": frame.credential_wait_remaining_s,
             }
         )
     if isinstance(frame, HostStatFrame):
@@ -2755,6 +2759,7 @@ def _decode_runner_status_result(
     return HostRunnerStatusResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
+        credential_wait_remaining_s=_optional_positive_float(msg, "credential_wait_remaining_s"),
     )
 
 

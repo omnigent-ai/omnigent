@@ -1413,3 +1413,26 @@ def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
     """max_attempts < 1 is a programming error, not a runtime retry."""
     with pytest.raises(ValueError, match="max_attempts"):
         run_migrations_with_retry("postgresql://x", max_attempts=0)
+
+
+@pytest.mark.parametrize(
+    "dialect_name, expected",
+    [
+        ("sqlite", "CAST(strftime('%s', 'now') AS BIGINT)"),
+        ("mysql", "CAST(UNIX_TIMESTAMP() AS SIGNED)"),
+        ("postgresql", "CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp())) AS BIGINT)"),
+        ("cockroachdb", "CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp())) AS BIGINT)"),
+    ],
+)
+def test_runner_database_clock_and_lock_compilation(dialect_name: str, expected: str) -> None:
+    from sqlalchemy import create_mock_engine, select
+
+    from omnigent.db.clock import database_epoch_seconds
+    from omnigent.db.db_models import SqlRunnerConnection
+
+    if dialect_name == "cockroachdb":
+        pytest.importorskip("sqlalchemy_cockroachdb")
+    dialect = create_mock_engine(f"{dialect_name}://", lambda *args, **kwargs: None).dialect
+    assert str(database_epoch_seconds().compile(dialect=dialect)) == expected
+    sql = str(select(SqlRunnerConnection).with_for_update().compile(dialect=dialect))
+    assert ("FOR UPDATE" in sql) == (dialect_name != "sqlite")

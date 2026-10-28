@@ -900,6 +900,7 @@ class _RelayHandle:
     runner_id: str
     task: asyncio.Task[None]
     ready: asyncio.Event
+    connection_epoch: str | None = None
     status_snapshot: _RelayStatusSnapshot | None = None
     intentional_stop_turn_ended: bool = False
     running_event_count: int = 0

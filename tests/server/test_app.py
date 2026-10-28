@@ -2113,23 +2113,20 @@ async def test_api_only_root_does_not_shadow_real_routes(
 
 
 @pytest.mark.asyncio
-async def test_health_derives_runner_online_from_fresh_row_stamp(
+async def test_health_derives_runner_online_from_fenced_heartbeat(
     db_uri: str,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A runner whose tunnel lives on ANOTHER replica reads online here.
+    """A fresh active fence reads online; stale, closed and legacy-only do not."""
+    from sqlalchemy import literal
 
-    Under host_id replica sharding, the replica holding a runner's tunnel
-    stamps ``conversations.runner_last_seen`` (on connect + each ping-loop
-    tick of that tunnel) and clears it on graceful disconnect. A replica
-    serving ``/health`` with an EMPTY tunnel registry — this app — must
-    derive ``runner_online`` from that stamp's freshness: fresh reads
-    online, past the TTL reads offline (the self-correcting path for an
-    ungraceful host/replica death), cleared reads offline immediately.
-    """
-    import time
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S, sqlalchemy_store
 
-    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+    database_now = [1000]
+    monkeypatch.setattr(
+        sqlalchemy_store, "database_epoch_seconds", lambda: literal(database_now[0])
+    )
 
     wired = _build_liveness_app(db_uri, tmp_path)
     app = wired.app
@@ -2138,15 +2135,20 @@ async def test_health_derives_runner_online_from_fresh_row_stamp(
     fresh = conversation_store.create_conversation(runner_id="rnr_remote_fresh")
     stale = conversation_store.create_conversation(runner_id="rnr_remote_stale")
     cleared = conversation_store.create_conversation(runner_id="rnr_remote_cleared")
-    now = int(time.time())
-    conversation_store.touch_runner_liveness(["rnr_remote_fresh"], now=now - 5)
-    conversation_store.touch_runner_liveness(
-        ["rnr_remote_stale"], now=now - RUNNER_LIVENESS_TTL_S - 5
-    )
-    conversation_store.touch_runner_liveness(["rnr_remote_cleared"], now=now - 5)
-    conversation_store.clear_runner_liveness("rnr_remote_cleared")
+    legacy = conversation_store.create_conversation(runner_id="rnr_remote_legacy")
+    for runner, stamp in (
+        ("rnr_remote_fresh", 995),
+        ("rnr_remote_stale", 1000 - RUNNER_LIVENESS_TTL_S - 5),
+        ("rnr_remote_cleared", 995),
+    ):
+        database_now[0] = stamp
+        conversation_store.claim_runner_connection(runner, "a" * 32)
+        assert conversation_store.activate_runner_connection(runner, "a" * 32)
+    assert conversation_store.close_runner_connection("rnr_remote_cleared", "a" * 32)
+    conversation_store.touch_runner_liveness(["rnr_remote_legacy"], now=10**12)
+    database_now[0] = 1000
 
-    ids = ",".join([fresh.id, stale.id, cleared.id])
+    ids = ",".join([fresh.id, stale.id, cleared.id, legacy.id])
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
         resp = await c.get(f"/health?session_ids={ids}")
@@ -2156,6 +2158,7 @@ async def test_health_derives_runner_online_from_fresh_row_stamp(
     assert sessions[fresh.id]["runner_online"] is True
     assert sessions[stale.id]["runner_online"] is False
     assert sessions[cleared.id]["runner_online"] is False
+    assert sessions[legacy.id]["runner_online"] is False
 
 
 # ── debug router loading (out-of-tree diagnostic endpoints) ──────────
@@ -2398,6 +2401,7 @@ def _build_minimal_app(
 
     def _capture_router(*args: object, **kwargs: object) -> object:
         captured["callback"] = kwargs.get("on_runner_connect")
+        captured["disconnect"] = kwargs.get("on_runner_disconnect")
         return real_create_router(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(app_module, "create_runner_tunnel_router", _capture_router)
@@ -2411,6 +2415,80 @@ def _build_minimal_app(
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
     )
     return app, captured
+
+
+@pytest.mark.asyncio
+async def test_current_tunnel_loss_preserves_owned_predecessor_until_real_loss(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.transports.ws_tunnel.frames import TUNNEL_RENEWAL_CAPABILITY, HelloFrame
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import sessions
+    from tests.server.test_host_registry import FakeWebSocket
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    registry = app.state.tunnel_registry
+    runner_id = "runner_live_predecessor"
+    [session_id] = _bind_sessions(db_uri, runner_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(session_id, "running")
+    sessions._session_status_cache[session_id] = "running"
+    monkeypatch.setattr(sessions, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+    old = registry.register(
+        runner_id,
+        FakeWebSocket(),
+        HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[TUNNEL_RENEWAL_CAPABILITY],
+        ),
+    )
+    pending = registry.open_request(runner_id, "accepted", method="POST", path="/command")
+    current = registry.register(
+        runner_id,
+        FakeWebSocket(),
+        HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[TUNNEL_RENEWAL_CAPABILITY],
+            renewal_permit=old.renewal_permit,
+            continuity_token=old.continuity_token,
+        ),
+    )
+
+    async def settle_timers() -> None:
+        timers = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+        ]
+        await asyncio.gather(*timers)
+
+    try:
+        registry.deregister(runner_id, current, retire=False)
+        assert registry.get(runner_id) is None
+        assert registry.has_live_predecessor(runner_id)
+        await captured["disconnect"](runner_id, current)  # type: ignore[operator]
+        await settle_timers()
+        assert sessions._session_status_cache[session_id] == "running"
+        assert store.get_conversation(session_id).live_status == "running"
+        assert not pending.head_future.done()
+        registry.deregister(runner_id, old, retire=False)
+        with pytest.raises(ConnectionError):
+            await pending.head_future
+        await captured["disconnect"](runner_id, old)  # type: ignore[operator]
+        await settle_timers()
+        assert sessions._session_status_cache[session_id] == "failed"
+        assert shutdown_state.runner_handoff_reason(runner_id) is None
+    finally:
+        registry.deregister(runner_id, old, retire=False)
+        if pending.head_future.done() and not pending.head_future.cancelled():
+            pending.head_future.exception()
+        else:
+            pending.head_future.cancel()
+        sessions._session_status_cache.pop(session_id, None)
 
 
 def _bind_sessions(db_uri: str, runner_id: str, count: int = 1) -> list[str]:

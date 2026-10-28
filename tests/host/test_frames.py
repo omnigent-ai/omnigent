@@ -1502,7 +1502,8 @@ def test_runner_status_frame_round_trip() -> None:
     assert decoded.runner_id == "runner_token_abc"
 
 
-def test_runner_status_result_frame_round_trip() -> None:
+@pytest.mark.parametrize("remaining", [None, 0.25, 60.0, 120])
+def test_runner_status_result_frame_round_trip(remaining) -> None:
     """
     Verify HostRunnerStatusResultFrame survives encode → decode for each
     verdict.
@@ -1511,15 +1512,40 @@ def test_runner_status_result_frame_round_trip() -> None:
     round-trip would make the server wait when it should relaunch, or
     vice versa.
     """
-    for status in ("alive", "dead", "unknown"):
+    for status in ("alive", "dead", "unknown", "sign_in_pending", "credential_pending"):
         original = HostRunnerStatusResultFrame(
             request_id="req_rs_1",
             status=status,
+            credential_wait_remaining_s=remaining,
         )
         decoded = decode_host_frame(encode_host_frame(original))
         assert isinstance(decoded, HostRunnerStatusResultFrame)
         assert decoded.request_id == "req_rs_1"
         assert decoded.status == status
+        assert decoded.credential_wait_remaining_s == remaining
+
+
+@pytest.mark.parametrize(
+    "remaining", [True, False, "60", [], {}, 0, -1, float("inf"), float("nan")]
+)
+def test_runner_status_rejects_malformed_credential_budget(remaining) -> None:
+    payload = {
+        "kind": "host.runner_status_result",
+        "request_id": "req_status",
+        "status": "credential_pending",
+        "credential_wait_remaining_s": remaining,
+    }
+    with pytest.raises(ValueError, match="credential_wait_remaining_s"):
+        decode_host_frame(json.dumps(payload))
+
+
+def test_runner_status_from_old_host_has_no_credential_budget() -> None:
+    decoded = decode_host_frame(
+        '{"kind":"host.runner_status_result","request_id":"req_old","status":"alive"}'
+    )
+    assert isinstance(decoded, HostRunnerStatusResultFrame)
+    assert decoded.status == "alive"
+    assert decoded.credential_wait_remaining_s is None
 
 
 def test_decode_unknown_kind_raises() -> None:

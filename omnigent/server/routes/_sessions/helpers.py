@@ -5781,9 +5781,11 @@ async def _query_host_runner_status(
     host_conn: HostConnection,
     host_registry: HostRegistry,
     runner_id: str,
+    *,
+    on_credential_wait: Callable[[float], None] | None = None,
 ) -> str | None:
     """
-    Ask the host for this runner's liveness or bounded pending-sign-in state.
+    Ask the host for this runner's liveness or bounded authentication wait.
 
     The host owns runner-process liveness (it holds the ``Popen``), so it
     can answer the one question the server's tunnel registry cannot: is an
@@ -5794,7 +5796,10 @@ async def _query_host_runner_status(
     :param host_conn: Live host connection to query.
     :param host_registry: Registry used to enqueue the outbound frame.
     :param runner_id: Runner to ask about, e.g. ``"runner_abc123..."``.
-    :returns: ``"alive"``, ``"sign_in_pending"``, ``"dead"``, or ``"unknown"``; or
+    :param on_credential_wait: Receives a conservative local deadline when the
+        host reports a valid missing-credential budget.
+    :returns: ``"alive"``, ``"sign_in_pending"``, ``"credential_pending"``,
+        ``"dead"``, or ``"unknown"``; or
         ``None`` when the host didn't reply in time, the connection
         dropped, or the host is too old to support the query. ``None``
         means "no authoritative answer" — the caller falls back to the
@@ -5804,7 +5809,10 @@ async def _query_host_runner_status(
     from omnigent.server.routes import sessions as _facade
 
     request_id = secrets.token_hex(8)
-    future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+    queried_at = time.monotonic()
+    future: asyncio.Future[dict[str, str | float | None]] = (
+        asyncio.get_running_loop().create_future()
+    )
     host_conn.pending_runner_status[request_id] = future
     frame = encode_host_frame(HostRunnerStatusFrame(request_id=request_id, runner_id=runner_id))
     try:
@@ -5819,11 +5827,8 @@ async def _query_host_runner_status(
     except TimeoutError:
         return None
     except Exception:  # noqa: BLE001
-        # Defensive: this query only ever *speeds up* the connect grace, so
-        # any unexpected failure (e.g. the future resolved with an error)
-        # must degrade to "no verdict" and fall back to the wait rather than
-        # break the message POST. CancelledError is a BaseException and still
-        # propagates, so the race helper's cancel/drain is unaffected.
+        # Unexpected query errors fall back to ordinary grace. Cancellation
+        # still propagates so the caller can cancel and drain the query.
         _logger.warning(
             "host.runner_status query for runner %s failed; falling back to grace",
             runner_id,
@@ -5832,7 +5837,22 @@ async def _query_host_runner_status(
         return None
     finally:
         host_conn.pending_runner_status.pop(request_id, None)
-    return result.get("status")
+    status = result.get("status")
+    if status == "credential_pending":
+        from omnigent.runner.identity import RUNNER_CREDENTIAL_PENDING_WAIT_S
+
+        remaining = result.get("credential_wait_remaining_s")
+        if (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, (int, float))
+            or not math.isfinite(remaining)
+            or not 0 < remaining <= RUNNER_CREDENTIAL_PENDING_WAIT_S
+        ):
+            return "alive"
+        if on_credential_wait is not None:
+            # Subtract the whole query round trip rather than granting transit time.
+            on_credential_wait(queried_at + remaining)
+    return status if isinstance(status, str) else None
 
 
 async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:

@@ -25,6 +25,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
@@ -1728,20 +1729,22 @@ async def test_message_relaunch_classifies_replacement_runner_liveness(
     old_runner_id = session["runner_id"]
     store = SqlAlchemyConversationStore(db_uri)
     store.set_labels(session_id, {"omnigent.wrapper": wrapper})
-    old_stamp = int(time.time())
-    store.touch_runner_liveness([old_runner_id], old_stamp)
-    own_stamps = {old_runner_id: old_stamp}
-    monkeypatch.setattr(routes_events, "last_liveness_stamp", own_stamps.get)
+    old_epoch = "a" * 32
+    store.claim_runner_connection(old_runner_id, old_epoch)
+    assert store.activate_runner_connection(old_runner_id, old_epoch)
+    own_epochs = {old_runner_id: old_epoch}
+    monkeypatch.setattr(routes_events, "runner_connection_epoch", own_epochs.get)
     waited_for: list[str] = []
 
     async def _replacement_connect_miss(*_args: Any, runner_id: str, **_kwargs: Any) -> None:
         assert runner_id != old_runner_id
         waited_for.append(runner_id)
         if liveness_source != "missing":
-            stamp = int(time.time())
-            store.touch_runner_liveness([runner_id], stamp)
+            epoch = "b" * 32
+            store.claim_runner_connection(runner_id, epoch)
+            assert store.activate_runner_connection(runner_id, epoch)
             if liveness_source == "local":
-                own_stamps[runner_id] = stamp
+                own_epochs[runner_id] = epoch
 
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _replacement_connect_miss)
     set_runner_client(None)
@@ -2739,13 +2742,13 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         await comm.wait(timeout=budget(5.0))
 
 
-@pytest.mark.parametrize("sign_in_pending", [False, True])
+@pytest.mark.parametrize("pending_status", [None, "sign_in_pending", "credential_pending"])
 async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    sign_in_pending: bool,
+    pending_status: str | None,
 ) -> None:
     """The first message waits for the already-bound runner to register.
 
@@ -2763,15 +2766,27 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     conversation ``runner_id``.
     """
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers, orchestration
 
-    if sign_in_pending:
-        from omnigent.server.routes._sessions import orchestration
+    clock = SimpleNamespace(now=0.0)
+    status_rechecked = asyncio.Event()
+    status_calls = 0
+    if pending_status is not None:
+        virtual_time = SimpleNamespace(**{**vars(time), "monotonic": lambda: clock.now})
+        monkeypatch.setattr(orchestration, "time", virtual_time)
+        monkeypatch.setattr(helpers, "time", virtual_time)
+        monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
 
-        monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
-        monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01, raising=False)
-        monkeypatch.setattr(
-            orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
-        )
+        async def status(*_args, on_credential_wait=None):
+            nonlocal status_calls
+            status_calls += 1
+            if pending_status == "credential_pending" and on_credential_wait is not None:
+                on_credential_wait(120.0)
+            if status_calls >= 2:
+                status_rechecked.set()
+            return pending_status
+
+        monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
 
     comm = await _connect_host(app)
     session = await _inline_launch_session(client, comm)
@@ -2843,9 +2858,10 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             )
         )
         await _wait_for_runner_connect_waiter(app, original_runner_id)
-        if sign_in_pending:
-            # Longer than normal startup grace, still inside the explicit sign-in window.
-            await asyncio.sleep(0.1)
+        if pending_status is not None:
+            await asyncio.wait_for(status_rechecked.wait(), budget(5))
+            clock.now = 60.0
+            # The original POST is still waiting after ordinary 30-second startup grace.
             current = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
             assert current is not None and current.runner_id == original_runner_id
             assert not post_task.done()
@@ -2889,6 +2905,7 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     )
 
 
+@pytest.mark.parametrize("pending_status", ["sign_in_pending", "credential_pending"])
 @pytest.mark.parametrize("interruption", ["cancel", "stop", "rebind"])
 async def test_pending_sign_in_interruption_does_not_consume_input(
     client: httpx.AsyncClient,
@@ -2896,6 +2913,7 @@ async def test_pending_sign_in_interruption_does_not_consume_input(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     interruption: str,
+    pending_status: str,
 ) -> None:
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
@@ -2903,9 +2921,14 @@ async def test_pending_sign_in_interruption_does_not_consume_input(
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
     monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
-    monkeypatch.setattr(
-        orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
-    )
+    deadline = time.monotonic() + 120.0
+
+    async def status(*_args, on_credential_wait=None):
+        if pending_status == "credential_pending" and on_credential_wait is not None:
+            on_credential_wait(deadline)
+        return pending_status
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
     comm = await _connect_host(app)
     session = await _inline_launch_session(client, comm)
     session_id, runner_id = session["id"], session["runner_id"]

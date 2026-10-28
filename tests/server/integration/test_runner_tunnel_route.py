@@ -46,7 +46,7 @@ from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("runtime_init")]
 
 _RUNNER_ID = "runner-route-test-1"
 _TUNNEL_PATH = f"/v1/runners/{_RUNNER_ID}/tunnel"
@@ -105,7 +105,7 @@ def _websocket_scope(
 
 
 async def _connect_route(
-    app: FastAPI,
+    app: ASGIApp,
     path: str,
     *,
     headers: list[tuple[bytes, bytes]] | None = None,
@@ -136,6 +136,7 @@ async def _connect_route(
 
 def _tunnel_route_app(
     *,
+    conversation_store=None,
     allowed_tunnel_tokens: frozenset[str] | None = None,
     auth_provider: AuthProvider | None = None,
     resolve_managed_runner_owner: Callable[[str], str | None] | None = None,
@@ -158,6 +159,7 @@ def _tunnel_route_app(
     app.include_router(
         create_runner_tunnel_router(
             registry,
+            conversation_store=conversation_store,
             allowed_tunnel_tokens=allowed_tunnel_tokens,
             auth_provider=auth_provider,
             resolve_managed_runner_owner=resolve_managed_runner_owner,
@@ -2176,52 +2178,50 @@ async def test_mint_token_endpoint_header_mode_unsupported_returns_400() -> None
 
 async def test_ping_loop_restamps_runner_liveness(
     monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
 ) -> None:
-    """The per-connection ping loop re-stamps ``runner_last_seen``.
-
-    Runner liveness is refreshed from the tunnel's own ping loop (not a
-    central lifespan sweep) so the write runs inside the handler's
-    ``workspace_scope`` — the same reason the host tunnel heartbeats from
-    its ping loop. Here we shrink the ping interval and lift the miss
-    threshold (so the loop never declares the runner dead), wire a
-    recording live-state store, and assert the loop stamps this runner's
-    id within a couple of intervals.
-
-    :returns: None.
-    """
+    """The ping worker retains this socket's workspace and exact durable epoch."""
     import omnigent.server.routes.runner_tunnel as tunnel_mod
-    from omnigent.server import session_live_state
+    from omnigent.db.db_models import current_workspace_id, workspace_scope
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
-    # Never trip the ping-timeout path during the test.
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    store = SqlAlchemyConversationStore(db_uri)
+    touches: list[tuple[int, str, str]] = []
+    heartbeat = store.heartbeat_runner_connection
 
-    touches: list[list[str]] = []
+    def recorded(runner_id: str, epoch: str) -> bool:
+        result = heartbeat(runner_id, epoch)
+        touches.append((current_workspace_id(), runner_id, epoch))
+        return result
 
-    class _RecordingStore:
-        def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
-            del now
-            touches.append(runner_ids)
+    monkeypatch.setattr(store, "heartbeat_runner_connection", recorded)
+    route_app = _tunnel_route_app(conversation_store=store)
 
-    session_live_state.configure(_RecordingStore())  # type: ignore[arg-type]
-    route_app = _tunnel_route_app()
-    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
-    try:
-        await _send_hello(communicator, route_app.registry)
-        # The loop should re-stamp within a couple of shortened intervals.
-        # A recorded touch means the executor already applied the write
-        # (the recording store appends inside the store call), so the poll
-        # loop breaking is itself the completion signal — no drain needed.
-        deadline = asyncio.get_event_loop().time() + 2.0
-        while not touches and asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(0.02)
-        assert touches, "ping loop never re-stamped runner liveness"
-        assert all(ids == [_RUNNER_ID] for ids in touches)
-    finally:
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
-        with contextlib.suppress(asyncio.TimeoutError):
-            await communicator.wait(timeout=budget(1.0))
-        session_live_state.configure(None)
+    async def scoped_app(scope: Scope, receive: Receive, send: Send) -> None:
+        with workspace_scope(37):
+            await route_app.app(scope, receive, send)
+
+    with workspace_scope(37):
+        communicator = await _connect_route(scoped_app, _TUNNEL_PATH)
+        try:
+            await _send_hello(communicator, route_app.registry)
+            session = route_app.registry.get(_RUNNER_ID)
+            assert session is not None and session.connection_epoch is not None
+            deadline = asyncio.get_running_loop().time() + budget(2)
+            while not touches and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            assert touches
+            assert all(row == (37, _RUNNER_ID, session.connection_epoch) for row in touches), (
+                touches
+            )
+            assert store.get_runner_connection(_RUNNER_ID).online
+        finally:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+            await communicator.wait(timeout=budget(1))
+        assert not store.get_runner_connection(_RUNNER_ID).online
+    assert store.get_runner_connection(_RUNNER_ID) is None
 
 
 @pytest.mark.parametrize("retire_during_timeout", [False, True], ids=["timeout", "retire-race"])
@@ -2697,3 +2697,154 @@ async def test_sender_loop_ends_quietly_when_a_close_wins_mid_send() -> None:
     await asyncio.wait_for(frame_in_transport.wait(), timeout=5)
     await ws.close(code=4000)
     await asyncio.wait_for(sender, timeout=5)  # returns instead of raising
+
+
+@pytest.mark.parametrize("phase", ["claim", "activate"])
+async def test_cancelled_connection_claim_closes_after_database_worker(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    from omnigent.server.runner_connection_admission import admit_runner_connection
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    entered, release = threading.Event(), threading.Event()
+    operation = f"{phase}_runner_connection"
+    original = getattr(store, operation)
+    epochs: list[str] = []
+
+    def paused(runner_id: str, epoch: str, **kwargs):
+        epochs.append(epoch)
+        entered.set()
+        assert release.wait(10)
+        return original(runner_id, epoch, **kwargs)
+
+    monkeypatch.setattr(store, operation, paused)
+    claim = asyncio.create_task(admit_runner_connection(store, "runner-cancel-claim"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 10)
+        claim.cancel()
+        await asyncio.sleep(0)
+        assert not claim.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await claim
+    connection = store.get_runner_connection("runner-cancel-claim")
+    assert connection is not None and connection.epoch == epochs[0] and not connection.online
+    assert not store.activate_runner_connection("runner-cancel-claim", epochs[0])
+    assert not store.heartbeat_runner_connection("runner-cancel-claim", epochs[0])
+    if phase == "claim":
+        assert connection.last_connected is None
+
+
+@pytest.mark.parametrize("phase", ["claim", "activate", "superseded"])
+async def test_connection_admission_failure_closes_only_its_epoch(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    from omnigent.server.runner_connection_admission import admit_runner_connection
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    runner_id = "runner-admission-failed"
+    operation = "claim_runner_connection" if phase == "claim" else "activate_runner_connection"
+    original = getattr(store, operation)
+    epochs: list[str] = []
+
+    def failed(runner_id: str, epoch: str, **kwargs):
+        epochs.append(epoch)
+        if phase == "superseded":
+            store.claim_runner_connection(runner_id, "b" * 32)
+            assert store.activate_runner_connection(runner_id, "b" * 32)
+            return False
+        original(runner_id, epoch, **kwargs)
+        raise ConnectionError("commit result unavailable")
+
+    if phase == "superseded":
+        # Avoid recursively calling the patched activation in the injected successor.
+        def superseded(runner_id: str, epoch: str):
+            epochs.append(epoch)
+            store.claim_runner_connection(runner_id, "b" * 32)
+            assert original(runner_id, "b" * 32)
+            return False
+
+        monkeypatch.setattr(store, operation, superseded)
+    else:
+        monkeypatch.setattr(store, operation, failed)
+    with pytest.raises((ConnectionError, RuntimeError)):
+        await admit_runner_connection(store, runner_id)
+    connection = store.get_runner_connection(runner_id)
+    assert connection is not None
+    if phase == "superseded":
+        assert connection.epoch == "b" * 32 and connection.online
+    else:
+        assert connection.epoch == epochs[0] and not connection.online
+
+
+@pytest.mark.parametrize("phase", ["claim", "activate", "success"])
+async def test_route_requires_durable_admission_before_registry_and_recovery(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    store = SqlAlchemyConversationStore(db_uri)
+    registry = TunnelRegistry()
+    recovered = asyncio.Event()
+
+    async def recover(runner_id: str, connection: RunnerSession) -> None:
+        persisted = store.get_runner_connection(runner_id)
+        assert persisted is not None and persisted.online
+        assert persisted.epoch == connection.connection_epoch
+        recovered.set()
+
+    if phase != "success":
+        operation = f"{phase}_runner_connection"
+        original = getattr(store, operation)
+
+        def failed(*args, **kwargs):
+            original(*args, **kwargs)
+            raise ConnectionError("commit response unavailable")
+
+        monkeypatch.setattr(store, operation, failed)
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(
+            registry,
+            conversation_store=store,
+            on_runner_connect=recover,
+        ),
+        prefix="/v1",
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        if phase == "success":
+            await _send_hello(communicator, registry)
+            await asyncio.wait_for(recovered.wait(), budget(2))
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        else:
+            await communicator.send_input(
+                {
+                    "type": "websocket.receive",
+                    "text": encode_frame(
+                        HelloFrame(
+                            frame_protocol_version=1,
+                            runner_version="test",
+                            harnesses=[],
+                        )
+                    ),
+                }
+            )
+            closed = await communicator.receive_output(timeout=budget(2))
+            assert closed["type"] == "websocket.close" and closed["code"] == 1013
+            assert registry.get(_RUNNER_ID) is None
+            assert not recovered.is_set()
+        await communicator.wait(timeout=budget(2))
+        assert not store.get_runner_connection(_RUNNER_ID).online
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)

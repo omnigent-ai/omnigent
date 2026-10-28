@@ -480,6 +480,7 @@ def test_get_runner_liveness_reads_only_metadata(
         with pytest.raises(ConnectionError, match="conversation database unavailable"):
             store.get_session_connectivity([conversation.id])
         assert store.get_runner_liveness(conversation.id) == (runner_id, stamp)
+        assert store.get_runner_disconnect_liveness(conversation.id) == (runner_id, stamp, stamp)
         assert store.get_runner_liveness("0" * 32) is None
         with workspace_scope(42):
             assert store.get_runner_liveness(conversation.id) is None

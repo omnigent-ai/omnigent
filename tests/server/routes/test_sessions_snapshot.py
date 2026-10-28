@@ -962,10 +962,11 @@ async def _snapshot_after_runner_exit(
         conversations={session_id: conv},
     )
     _use_runner_client(monkeypatch, None)
-    if connection_source == "replica":
-        monkeypatch.setitem(session_live_state._last_liveness_stamp, "runner_ran", 1)
-    else:
-        monkeypatch.delitem(session_live_state._last_liveness_stamp, "runner_ran", raising=False)
+    monkeypatch.setattr(
+        session_live_state,
+        "runner_connection_epoch",
+        lambda runner_id: "a" * 32 if connection_source == "replica" else None,
+    )
     reports = RunnerExitReports()
     reports.record(
         "runner_ran",

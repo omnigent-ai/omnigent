@@ -2372,9 +2372,9 @@ async def test_runner_exited_after_connect_keeps_idle_session_idle(
     conv = conv_store.create_conversation(agent_id=agent["id"], runner_id="runner_ran_idle")
     conv_store.set_session_live_status(conv.id, "idle")
     if connection_source == "replica":
-        session_live_state.touch_runner_liveness(["runner_ran_idle"])
+        session_live_state.remember_runner_connection("runner_ran_idle", "a" * 32)
     else:
-        assert session_live_state.last_liveness_stamp("runner_ran_idle") is None
+        assert session_live_state.runner_connection_epoch("runner_ran_idle") is None
 
     caplog.set_level("WARNING", logger="omnigent")
     _comm = await _report_runner_exited(
@@ -2456,9 +2456,9 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     conv = conv_store.create_conversation(agent_id=None, runner_id="runner_ran_mid_turn")
     conv_store.set_session_live_status(conv.id, "running")
     if connection_source == "replica":
-        session_live_state.touch_runner_liveness(["runner_ran_mid_turn"])
+        session_live_state.remember_runner_connection("runner_ran_mid_turn", "a" * 32)
     else:
-        assert session_live_state.last_liveness_stamp("runner_ran_mid_turn") is None
+        assert session_live_state.runner_connection_epoch("runner_ran_mid_turn") is None
 
     caplog.set_level("WARNING", logger="omnigent")
     _comm = await _report_runner_exited(
