@@ -28,20 +28,38 @@ async def test_async(page, mock, task, flag):
     assert task.result is None
     time.sleep(0.3)
     mock.assert_not_called()
-    await asyncio.sleep(0)
-    assert task.done()
     time.sleep(0.5)  # custom-lint: disable=sleep-then-assert -- simulates a slow peer
+    assert task.done()
+    await asyncio.sleep(0)
     assert task.done()
     time.sleep(0.4)
     worker.step()
     worker.step()
     worker.step()
     assert worker.done
+
+
+async def test_keywords_and_mixed_checks(page, task, worker, failed):
+    await asyncio.sleep(delay=0.1)
+    assert task.done()
+    await asyncio.sleep(delay=0)
+    assert task.done()
+    time.sleep(0.1)
+    assert not failed
+    assert worker.done
+    await page.wait_for_timeout(timeout=200)
+    await expect(page.get_by_text("ready")).to_be_visible()
+    assert worker.done
+    await asyncio.sleep(0.1)
+    result = await asyncio.to_thread(worker.result)
+    assert result
 """
 
 
 def test_flags_fixed_sleeps_that_an_instant_presence_assert_relies_on() -> None:
-    assert lint.sleep_then_assert_lines(_SOURCE) == [6, 11]
+    # Flagged: positional and keyword sleeps, a presence check after an absence check,
+    # and a check after an unrelated `to_*` call that is not Playwright's expect().
+    assert lint.sleep_then_assert_lines(_SOURCE) == [6, 11, 36, 40, 46]
 
 
 def test_baseline_rejects_new_cases_and_asks_to_lower_fixed_ones() -> None:
