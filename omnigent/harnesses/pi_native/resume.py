@@ -65,6 +65,9 @@ _PI_SESSION_VERSION = 3
 # 8-char hex entry ids, matching Pi's own ``SessionEntryBase.id`` shape.
 _ENTRY_ID_LEN = 8
 
+# Native forwarders can record a notice instead of an actual context summary.
+_COMPACTION_NOTICE_RE = re.compile(r"\[[^\]\n]+ compaction — context was compacted[^\]\n]*\]")
+
 
 def is_safe_pi_session_id(external_session_id: str) -> bool:
     """Return whether *external_session_id* is a safe Pi session id.
@@ -244,9 +247,9 @@ def pi_session_records_from_session_items(
       committed for a ``call_id`` is replayed: Anthropic rejects a history with
       two ``tool_result`` blocks for one ``tool_use``.
     - latest ``compaction`` -> its snapshot replaces earlier history and is
-      converted like the items above. A snapshot with nothing to convert (none,
-      or another harness's native shape) restores the summary and turns after
-      ``last_item_id``. An unavailable boundary falls back to full history.
+      converted like the items above. An incomplete or unsupported snapshot uses
+      a meaningful summary and turns after ``last_item_id``. An unavailable
+      boundary or a placeholder summary falls back to full history.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -292,6 +295,9 @@ def pi_session_records_from_session_items(
         snapshot = _compaction_snapshot_items(item)
         tail_start = index + 1
         if not snapshot:
+            summary = cast(str, item["summary"]).strip()
+            if not summary or _COMPACTION_NOTICE_RE.fullmatch(summary):
+                break
             # A summary covers its inclusive boundary, not every item before the checkpoint.
             last_item_id = item.get("last_item_id")
             if not isinstance(last_item_id, str) or not last_item_id:
@@ -411,7 +417,7 @@ def _compaction_snapshot_items(item: _JsonObject) -> list[_JsonObject]:
     one Pi assistant message with its parallel tool calls.
 
     :param item: A shared compaction item, possibly written by another harness.
-    :returns: The snapshot items, or ``[]`` when none converts to a Pi entry.
+    :returns: The snapshot items, or ``[]`` when any context cannot be converted.
     """
     snapshot = item.get("compacted_messages")
     if not isinstance(snapshot, list):
@@ -420,14 +426,21 @@ def _compaction_snapshot_items(item: _JsonObject) -> list[_JsonObject]:
     response_index = 0
     for index, message in enumerate(snapshot):
         if not isinstance(message, dict):
-            continue
+            return []
+        if message.get("type") == "message":
+            content = message.get("content")
+            api_type = "output_text" if message.get("role") == "assistant" else "input_text"
+            blocks = _pi_text_blocks_from_api_content(content, api_type=api_type)
+            # Even a readable message may hide an unsupported summary block.
+            if not isinstance(content, list) or len(blocks) != len(content):
+                return []
         replay: _JsonObject = {**message, "id": f"{item.get('id')}:snapshot:{index}"}
         if _pi_assistant_blocks_from_item(message) is None:
             response_index += 1
         else:
             replay["response_id"] = f"{item.get('id')}:snapshot-response:{response_index}"
         snapshot_items.append(replay)
-    converts = any(
+    converts = all(
         _pi_assistant_blocks_from_item(snapshot_item)
         or _pi_non_assistant_entry(
             snapshot_item,

@@ -248,6 +248,76 @@ def test_unconvertible_compaction_snapshot_preserves_unsummarized_history(
     assert "foreign" not in json.dumps(records)
 
 
+@pytest.mark.parametrize(
+    "snapshot,notice",
+    [
+        (
+            [_user_item("old question"), {"type": "compaction", "encrypted_content": "opaque"}],
+            "[Codex compaction — context was compacted in the terminal]",
+        ),
+        (
+            [{"role": "user", "content": [{"type": "text", "text": "native summary"}]}],
+            "[Claude Code compaction — context was compacted in the terminal]",
+        ),
+        (
+            [
+                {
+                    **_user_item("old question"),
+                    "content": [
+                        {"type": "input_text", "text": "old question"},
+                        {"type": "text", "text": "unsupported summary"},
+                    ],
+                }
+            ],
+            "[Codex compaction — context was compacted in the terminal]",
+        ),
+        (
+            [_user_item("old question"), None],
+            "[Codex compaction — context was compacted in the terminal]",
+        ),
+    ],
+    ids=["codex-encrypted", "claude-hook", "partial-message", "malformed-entry"],
+)
+@pytest.mark.parametrize("meaningful_summary", [False, True])
+def test_incomplete_foreign_checkpoint_preserves_context(
+    snapshot: list[Any], notice: str, meaningful_summary: bool
+) -> None:
+    history = [
+        _user_item("old question"),
+        _function_call_item(name="read", call_id="read_a", arguments='{"path":"a.txt"}'),
+        _function_output_item(call_id="read_a", output="file knowledge"),
+        _assistant_item("earlier answer", item_id="boundary"),
+    ]
+    tail = [_user_item("recent question", item_id="recent", response_id="recent")]
+    compaction = {
+        "id": "compact",
+        "type": "compaction",
+        "last_item_id": "boundary",
+        "summary": "Useful summary of the answer and file" if meaningful_summary else notice,
+        "compacted_messages": snapshot,
+    }
+    kwargs = {
+        "session_id": "conv_foreign",
+        "external_session_id": _EXTERNAL_ID,
+        "cwd": Path("/repo"),
+    }
+    records = pi_session_records_from_session_items([*history, *tail, compaction], **kwargs)
+    if meaningful_summary:
+        assert records[1]["type"] == "compaction"
+        assert records[1]["summary"] == compaction["summary"]
+        assert [record["message"]["content"][0]["text"] for record in records[2:]] == [
+            "recent question"
+        ]
+    else:
+        expected = pi_session_records_from_session_items([*history, *tail], **kwargs)
+        assert [record["message"] for record in records[1:]] == [
+            record["message"] for record in expected[1:]
+        ]
+        assert records[3]["message"]["toolCallId"] == "read_a"
+        assert records[3]["message"]["content"][0]["text"] == "file knowledge"
+        assert "earlier answer" in json.dumps(records)
+
+
 def test_late_result_for_retained_compaction_call_keeps_tool_name() -> None:
     compaction = {
         "id": "compact",
