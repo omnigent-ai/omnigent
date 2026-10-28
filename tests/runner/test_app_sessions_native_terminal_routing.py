@@ -1074,8 +1074,10 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         ("missing", True),
         ("failed_startup", True),
         ("dead_backend", True),
+        ("dead_backend_close_failed", True),
         ("unowned_dead_backend", False),
         ("starting", False),
+        ("starting_no_process", False),
         ("ready", False),
         ("detached", False),
         ("rotated", False),
@@ -1105,6 +1107,7 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
             "ready",
             "detached",
             "dead_backend",
+            "dead_backend_close_failed",
             "unowned_dead_backend",
             "rotated",
             "foreign_bridge",
@@ -1125,9 +1128,22 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
     if backend_state == "failed_startup":
         codex_native_bridge.record_app_server_stopped(bridge_dir)
     backend = None
-    if backend_state in ("starting", "ready", "dead_backend", "unowned_dead_backend") or rotating:
+    if (
+        backend_state
+        in (
+            "starting",
+            "starting_no_process",
+            "ready",
+            "dead_backend",
+            "dead_backend_close_failed",
+            "unowned_dead_backend",
+        )
+        or rotating
+    ):
         backend = SimpleNamespace(
-            proc=SimpleNamespace(returncode=1 if "dead_backend" in backend_state else None),
+            proc=None
+            if backend_state == "starting_no_process"
+            else SimpleNamespace(returncode=1 if "dead_backend" in backend_state else None),
             bridge_dir=bridge_dir,
             close=AsyncMock(),
         )
@@ -1140,7 +1156,11 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
 
     registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
-    close = AsyncMock()
+    close = AsyncMock(
+        side_effect=OSError("stopped pane close failed")
+        if backend_state == "dead_backend_close_failed"
+        else None
+    )
     monkeypatch.setattr(instance, "close", close)
     with registry._lock:
         registry._by_conversation[source_session_id] = {("codex", "main"): instance}
@@ -1238,8 +1258,8 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
 
     assert launches == ([session_id] if recreated else [])
     assert close.await_count == int(recreated)
-    if backend is not None and not recreated:
-        assert backend.close.await_count == 0
+    if backend is not None:
+        assert backend.close.await_count == int(recreated)
     if rotating:
         assert registry.get(session_id, "codex", "main") is instance
         assert orchestration._AUTO_CODEX_APP_SERVERS[source_session_id] is backend
