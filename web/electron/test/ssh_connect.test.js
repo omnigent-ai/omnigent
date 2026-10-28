@@ -4,6 +4,7 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const {
@@ -13,6 +14,7 @@ const {
   describeSshFailure,
   hostScript,
   installScript,
+  isPortFree,
   loginScript,
   parseSignInLink,
   parseSshConfigHosts,
@@ -72,7 +74,7 @@ describe("remote scripts", () => {
     for (const script of [loginScript(SERVER), hostScript(SERVER), installScript()]) {
       assert.match(remoteCommand(script), /^sh -c '[^'\\]*'$/);
     }
-    assert.match(loginScript(SERVER), /BROWSER=none omnigent login "https:/);
+    assert.match(loginScript(SERVER), /BROWSER=none \$group omnigent login "https:/);
   });
 });
 
@@ -86,9 +88,9 @@ describe("loginScript on a real shell", () => {
     fs.writeFileSync(script, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
     return home;
   }
-  function runLogin(home) {
+  function runLogin(home, pathDirs = "/usr/bin:/bin") {
     const child = require("node:child_process").spawn("/bin/sh", ["-c", loginScript(SERVER)], {
-      env: { PATH: "/usr/bin:/bin", HOME: home },
+      env: { PATH: pathDirs, HOME: home },
       stdio: ["pipe", "pipe", "pipe"],
     });
     const exited = new Promise((resolve) => {
@@ -97,27 +99,80 @@ describe("loginScript on a real shell", () => {
     return { child, exited };
   }
 
-  it("stops the login and its child when the session's stdin closes", async (t) => {
-    const home = fakeHome(
-      t,
-      'echo $$ > "$HOME/login.pid"; sleep 300 & echo $! > "$HOME/child.pid"; wait',
+  // The login's CLI child ignores its parent's death, so both must be stopped,
+  // including on minimal hosts without pkill. A survivor holds the pipes open,
+  // so the timeout turns it into a failure instead of a hang.
+  const toolSets = {
+    "all tools": null,
+    "no pkill": ["setsid"],
+    "no setsid, as on macOS": ["pkill"],
+  };
+  for (const [label, tools] of Object.entries(toolSets)) {
+    it(
+      `stops the login and its child when the session's stdin closes (${label})`,
+      { timeout: 15000 },
+      async (t) => {
+        const home = fakeHome(
+          t,
+          'echo $$ > "$HOME/login.pid"; sleep 300 & echo $! > "$HOME/child.pid"; wait',
+        );
+        let pathDirs;
+        if (tools) {
+          const bin = path.join(home, "bin");
+          fs.mkdirSync(bin);
+          for (const tool of ["sleep", ...tools]) {
+            const found = ["/usr/bin", "/bin"]
+              .map((dir) => path.join(dir, tool))
+              .find((p) => fs.existsSync(p));
+            if (!found) return t.skip(`${tool} not found`);
+            fs.symlinkSync(found, path.join(bin, tool));
+          }
+          pathDirs = bin;
+        }
+        const { child, exited } = runLogin(home, pathDirs);
+        const readPid = (name) => {
+          const file = path.join(home, name);
+          return fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8")) || null : null;
+        };
+        // Polling is sequential by design.
+        // oxlint-disable-next-line no-await-in-loop
+        while (readPid("child.pid") === null) await sleep(20);
+        const pids = [readPid("login.pid"), readPid("child.pid")];
+        t.after(() => {
+          for (const pid of pids) {
+            try {
+              process.kill(pid, "SIGKILL");
+            } catch {
+              // Already gone, as expected.
+            }
+          }
+        });
+
+        child.stdin.end();
+
+        await exited;
+        // An orphan stays a zombie until its new parent reaps it; that is still stopped.
+        const stopped = (pid) => {
+          try {
+            process.kill(pid, 0);
+          } catch {
+            return true;
+          }
+          const stat = `/proc/${pid}/stat`;
+          return fs.existsSync(stat) && / Z /.test(fs.readFileSync(stat, "utf8"));
+        };
+        for (let waited = 0; waited < 3000 && !pids.every(stopped); waited += 50) {
+          // Polling is sequential by design.
+          // oxlint-disable-next-line no-await-in-loop
+          await sleep(50);
+        }
+        assert.deepEqual(
+          pids.filter((pid) => !stopped(pid)),
+          [],
+        );
+      },
     );
-    const { child, exited } = runLogin(home);
-    const readPid = (name) => {
-      const file = path.join(home, name);
-      return fs.existsSync(file) ? Number(fs.readFileSync(file, "utf8")) || null : null;
-    };
-    // Polling is sequential by design.
-    // oxlint-disable-next-line no-await-in-loop
-    while (readPid("child.pid") === null) await sleep(20);
-    const pids = [readPid("login.pid"), readPid("child.pid")];
-
-    child.stdin.end();
-
-    await exited;
-    await sleep(200);
-    for (const pid of pids) assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
-  });
+  }
 
   it("returns the login's own exit code, including 127 when omnigent is missing", async (t) => {
     const ok = runLogin(fakeHome(t, "exit 0"));
@@ -530,6 +585,35 @@ describe("startSshConnect", () => {
   });
 });
 
+describe("isPortFree", () => {
+  it("sees a port held on either loopback address", async (t) => {
+    for (const host of ["127.0.0.1", "::1"]) {
+      const server = net.createServer();
+      // A listener left open by a failed assertion would keep the run alive.
+      t.after(() => server.close());
+      // One address at a time is the point of the test.
+      // oxlint-disable-next-line no-await-in-loop
+      const listening = await new Promise((resolve) => {
+        server.once("error", () => resolve(false));
+        server.listen(0, host, () => resolve(true));
+      });
+      if (!listening) {
+        t.diagnostic(`${host} isn't available here`);
+        continue;
+      }
+      const { port } = server.address();
+      // oxlint-disable-next-line no-await-in-loop
+      assert.equal(await isPortFree(port), false, `held on ${host}`);
+      // oxlint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => {
+        server.close(resolve);
+      });
+      // oxlint-disable-next-line no-await-in-loop
+      assert.equal(await isPortFree(port), true, `released on ${host}`);
+    }
+  });
+});
+
 describe("createSshSession", () => {
   it("reports a missing ssh as a plain message", async () => {
     const session = createSshSession({
@@ -571,7 +655,8 @@ describe("createSshSession", () => {
     await session.exec("true").promise;
 
     // The user's config reaches the connection and commands, but never its
-    // forwards; control requests skip the config so it can't empty theirs.
+    // forwards or RemoteCommand; control requests skip the config so it can't
+    // empty theirs.
     const control = ["ssh", "-F", "/dev/null", "-S", "/tmp/s/m", "-O"];
     assert.deepEqual(spawned, [
       [
@@ -593,7 +678,18 @@ describe("createSshSession", () => {
       [...control, "check", "my-ec2"],
       [...control, "forward", "-L", "8021:127.0.0.1:8021", "my-ec2"],
       [...control, "forward", "-R", "8020:127.0.0.1:9", "my-ec2"],
-      ["ssh", "-S", "/tmp/s/m", "-o", "ClearAllForwardings=yes", "-T", "my-ec2", "sh -c 'true'"],
+      [
+        "ssh",
+        "-S",
+        "/tmp/s/m",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "RemoteCommand=none",
+        "-T",
+        "my-ec2",
+        "sh -c 'true'",
+      ],
     ]);
   });
 });

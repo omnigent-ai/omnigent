@@ -22,6 +22,34 @@ const RUNNING_CONTENT_HEIGHT = 500;
 const MAX_CONTENT_HEIGHT = 680;
 
 /**
+ * What the server's page learns about a finished connect: app-authored fields
+ * only. Remote output, including error text, stays in the shell-owned window.
+ *
+ * @param {{ ok?: boolean, canceled?: boolean, alreadyRunning?: boolean, identity?: { serverUrl: string, hostId: string } | null }} result
+ * @returns {object}
+ */
+function pageResult(result) {
+  if (result.ok === true) {
+    const identity = result.identity
+      ? { serverUrl: String(result.identity.serverUrl), hostId: String(result.identity.hostId) }
+      : null;
+    return {
+      ok: true,
+      alreadyRunning: result.alreadyRunning === true,
+      identity,
+      shownInConsole: true,
+    };
+  }
+  return result.canceled === true
+    ? { ok: false, canceled: true, error: "Connecting was canceled.", shownInConsole: true }
+    : {
+        ok: false,
+        error: "Connecting over SSH failed. The connect window shows why.",
+        shownInConsole: true,
+      };
+}
+
+/**
  * @param {{
  *   BrowserWindow: typeof import("electron").BrowserWindow,
  *   ipcMain: import("electron").IpcMain,
@@ -175,7 +203,7 @@ function createSshConnectFlow({
             error:
               result.ok === true ? null : (result.error ?? `Connecting to ${destination} failed.`),
           });
-          settle({ ...result, shownInConsole: true });
+          settle(pageResult(result));
         });
       },
       onCancel: () => {

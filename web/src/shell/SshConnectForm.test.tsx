@@ -70,6 +70,17 @@ describe("SshConnectForm", () => {
     }
   });
 
+  it("keeps the dialog open to say a machine was already connected", async () => {
+    const { onConnected } = renderForm({ ok: true, alreadyRunning: true, identity: null });
+
+    connect("my-ec2");
+
+    expect(await screen.findByTestId("ssh-connect-message")).toHaveTextContent(
+      "my-ec2 was already connected to this server.",
+    );
+    expect(onConnected).not.toHaveBeenCalled();
+  });
+
   it("shows a failure that has no other surface", async () => {
     renderForm({ ok: false, error: "Enter a host from your SSH config." });
 

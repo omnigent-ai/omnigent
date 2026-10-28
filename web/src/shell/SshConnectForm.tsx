@@ -50,10 +50,12 @@ export function SshConnectForm({
       }
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
       if (!res.identity && res.alreadyRunning) {
+        // Stay open: closing the dialog would hide this message.
         setMessage({
           kind: "info",
           text: `${target} was already connected to this server. Pick it from the host list.`,
         });
+        return;
       }
       onConnected?.(res.identity?.hostId ?? null);
     } finally {

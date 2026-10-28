@@ -98,10 +98,27 @@ describe("createSshConnectFlow", () => {
     connect.finish({ ok: true, identity: { serverUrl: SERVER, hostId: "h" } });
     assert.deepEqual(await result, {
       ok: true,
+      alreadyRunning: false,
       identity: { serverUrl: SERVER, hostId: "h" },
       shownInConsole: true,
     });
     assert.deepEqual(world.sent(win, "ssh-connect:done"), [{ ok: true, error: null }]);
+  });
+
+  it("shows remote error text in its own window and never returns it to the page", async () => {
+    const { world, flow } = harness();
+    const result = flow.run(null, SERVER, "my-ec2");
+    const [win] = world.windows;
+    world.sendFrom(win.webContents.id, "ssh-connect:confirm");
+    const remote = "Signing in on my-ec2 failed: SENTINEL /home/me/.config/secret";
+
+    world.connects[0].finish({ ok: false, error: remote, stdout: "SENTINEL" });
+    const returned = await result;
+
+    assert.deepEqual(world.sent(win, "ssh-connect:done"), [{ ok: false, error: remote }]);
+    assert.equal(returned.ok, false);
+    assert.equal(returned.shownInConsole, true);
+    assert.doesNotMatch(JSON.stringify(returned), /SENTINEL/);
   });
 
   it("cancels the connect and any open prompt when the window closes mid-run", async () => {

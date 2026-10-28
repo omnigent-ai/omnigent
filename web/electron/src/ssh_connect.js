@@ -116,11 +116,13 @@ const REMOTE_PATH = 'PATH="$HOME/.local/bin:$PATH"; export PATH';
 function loginScript(serverUrl) {
   // The app holds stdin open; when the session ends it closes, and the
   // watchdog stops the login and its CLI instead of leaving them on the port.
+  // setsid puts both in one process group to kill; pkill covers hosts without it (macOS).
   return [
     REMOTE_PATH,
     "exec 3<&0",
-    `BROWSER=none omnigent login "${serverUrl}" </dev/null & login=$!`,
-    "(read -r _ <&3; command -v pkill >/dev/null 2>&1 && pkill -TERM -P $login; kill -TERM $login 2>/dev/null) & watch=$!",
+    "group=; command -v setsid >/dev/null 2>&1 && group=setsid",
+    `BROWSER=none $group omnigent login "${serverUrl}" </dev/null & login=$!`,
+    "(read -r _ <&3; kill -s TERM -- -$login 2>/dev/null || { command -v pkill >/dev/null 2>&1 && pkill -TERM -P $login; kill -TERM $login 2>/dev/null; }) & watch=$!",
     "wait $login; status=$?; kill $watch 2>/dev/null; exit $status",
   ].join("; ");
 }
@@ -236,13 +238,21 @@ function listSshHosts(deps = {}) {
 
 /**
  * @param {number} port
- * @returns {Promise<boolean>} Whether nothing on this computer holds 127.0.0.1:<port>.
+ * @returns {Promise<boolean>} Whether nothing on this computer holds <port> on
+ *   either loopback address; a browser may try `::1` first for localhost.
  */
-function isPortFree(port) {
+async function isPortFree(port) {
+  return (await canListen(port, "127.0.0.1")) && (await canListen(port, "::1"));
+}
+
+function canListen(port, host) {
   return new Promise((resolve) => {
     const server = net.createServer();
-    server.once("error", () => resolve(false));
-    server.listen({ port, host: "127.0.0.1", exclusive: true }, () => {
+    server.once("error", (error) => {
+      // A computer without IPv6 loopback has nothing listening there.
+      resolve(host === "::1" && ["EADDRNOTAVAIL", "EAFNOSUPPORT"].includes(error?.code));
+    });
+    server.listen({ port, host, exclusive: true }, () => {
       server.close(() => resolve(true));
     });
   });
@@ -499,9 +509,18 @@ function createSshSession(options) {
      * @param {{ stdin?: string | null, holdStdin?: boolean, timeoutMs?: number, onStdout?: (t: string) => void, onStderr?: (t: string) => void }} [opts]
      */
     exec(script, opts = {}) {
-      // A shared-connection client would otherwise re-request the config's forwards.
+      // A shared-connection client would otherwise re-request the config's forwards,
+      // and ssh refuses a command when the alias sets RemoteCommand (say, tmux).
       return client(
-        ["-o", "ClearAllForwardings=yes", "-T", destination, remoteCommand(script)],
+        [
+          "-o",
+          "ClearAllForwardings=yes",
+          "-o",
+          "RemoteCommand=none",
+          "-T",
+          destination,
+          remoteCommand(script),
+        ],
         opts,
       );
     },

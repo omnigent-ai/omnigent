@@ -195,6 +195,7 @@ function loadNavigationHarness({
     arcaLoginCancels: 0,
     arcaSetups: [],
     arcaSetupCancels: 0,
+    sshConnects: [],
   };
   const pickers = [];
   const findBars = [];
@@ -429,6 +430,14 @@ function loadNavigationHarness({
 
   const localRequires = {
     "./desktop_updater": { createDesktopUpdater },
+    "./ssh_connect_window": {
+      createSshConnectFlow: () => ({
+        run: async (_parentWin, sshServerUrl, destination) => {
+          calls.sshConnects.push({ serverUrl: sshServerUrl, destination });
+          return { ok: true, shownInConsole: true };
+        },
+      }),
+    },
     "./connection_loading": {
       createConnectionLoading: () => ({
         show: (_win, attempt, label) => calls.loading.push({ action: "show", attempt, label }),
@@ -5332,5 +5341,53 @@ describe("server names from the manifest", () => {
     h.api.windows.get(h.win).ephemeral = true;
     await h.api.loadServerUrl(h.win, server);
     assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
+  });
+});
+
+describe("SSH connect IPC", () => {
+  const server = "https://host.example/ml/omnigents";
+  const fromServer = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const fromElsewhere = (h) => ({
+    sender: h.webContents,
+    senderFrame: { url: "https://elsewhere.example/" },
+  });
+  function sshHarness(t, options = {}) {
+    const h = loadNavigationHarness({ serverUrl: server, ...options });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    return h;
+  }
+
+  it("connects only for the window's own server page and a valid destination", async (t) => {
+    const h = sshHarness(t);
+    const connect = h.ipc.get("omnigent:ssh-connect");
+
+    await assert.rejects(connect(fromElsewhere(h), "devbox"), /connected server page/);
+    const bad = await connect(fromServer(h), "-oProxyCommand=evil");
+    assert.equal(bad.ok, false);
+    assert.deepEqual(h.calls.sshConnects, []);
+
+    assert.equal((await connect(fromServer(h), "devbox")).ok, true);
+    assert.deepEqual(h.calls.sshConnects, [{ serverUrl: server, destination: "devbox" }]);
+  });
+
+  it("refuses on Windows before opening anything", async (t) => {
+    const h = sshHarness(t, { platform: "win32" });
+
+    const result = await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    // main.js runs in its own realm, so compare plain data.
+    assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+      ok: false,
+      error: "Connecting over SSH isn't available on Windows yet.",
+    });
+    assert.deepEqual(h.calls.sshConnects, []);
+  });
+
+  it("lists no SSH hosts to another page", async (t) => {
+    const h = sshHarness(t);
+
+    const hosts = await h.ipc.get("omnigent:ssh-hosts")(fromElsewhere(h));
+    assert.equal(JSON.stringify(hosts), "[]");
   });
 });
