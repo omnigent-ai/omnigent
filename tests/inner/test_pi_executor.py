@@ -941,15 +941,15 @@ class TestToolServer(unittest.TestCase):
         finally:
             probe.close()
 
-    async def _run_generated_bridge_tool(
+    async def _run_generated_bridge_tools(
         self,
         *,
         port: int,
         token: str,
-        args: dict | None = None,
+        args: list[dict] | None = None,
         timeout: float = 5.0,
-    ) -> dict:
-        """Run the generated JS extension under Node and execute one tool.
+    ) -> list[dict]:
+        """Run sequential tool calls in one generated Node extension.
 
         This is intentionally cross-runtime: Python starts the real loopback
         server, while Node loads the generated Pi extension, captures the
@@ -973,7 +973,7 @@ class TestToolServer(unittest.TestCase):
             extension_path = tmp_path / "omnigent_tools.js"
             runner_path = tmp_path / "run_bridge.js"
             args_path = tmp_path / "args.json"
-            args_path.write_text(json.dumps(args if args is not None else {"input": "hello"}))
+            args_path.write_text(json.dumps(args if args is not None else [{"input": "hello"}]))
             extension_path.write_text(_generate_extension_js(port, schema, token))
             runner_path.write_text(
                 textwrap.dedent(
@@ -990,14 +990,14 @@ class TestToolServer(unittest.TestCase):
                       if (!registered) {
                         throw new Error("tool was not registered");
                       }
-                      const result = await registered.execute(
-                        "call-1",
-                        JSON.parse(require("fs").readFileSync(process.argv[3], "utf8")),
-                        undefined,
-                        undefined,
-                        {}
-                      );
-                      process.stdout.write(JSON.stringify(result));
+                      const args = JSON.parse(require("fs").readFileSync(process.argv[3], "utf8"));
+                      const results = [];
+                      for (const [index, params] of args.entries()) {
+                        results.push(await registered.execute(
+                          `call-${index + 1}`, params, undefined, undefined, {}
+                        ));
+                      }
+                      process.stdout.write(JSON.stringify(results));
                     })().catch((err) => {
                       process.stderr.write(err && err.stack ? err.stack : String(err));
                       process.exit(1);
@@ -1033,52 +1033,70 @@ class TestToolServer(unittest.TestCase):
             server = _ToolServer()
             await server.start()
             payload = "large-tool-input:" + "x" * (128 * 1024)
+            calls = []
 
             async def executor(name, args, *, call_id=None):
-                self.assertEqual(name, "exotic")
-                self.assertEqual(args["input"], payload)
-                self.assertEqual(call_id, "call-1")
-                return {"accepted_bytes": len(payload.encode())}
+                calls.append((name, args, call_id))
+                return {"accepted_bytes": len(args["input"].encode())}
 
             server._tool_executor = executor
             try:
-                result = await self._run_generated_bridge_tool(
-                    port=server.port, token=server.token, args={"input": payload}
+                result, next_result = await self._run_generated_bridge_tools(
+                    port=server.port,
+                    token=server.token,
+                    args=[{"input": payload}, {"input": "hello"}],
                 )
             finally:
                 await server.stop()
 
             self.assertFalse(result["isError"])
             self.assertEqual(
+                calls,
+                [
+                    ("exotic", {"input": payload}, "call-1"),
+                    ("exotic", {"input": "hello"}, "call-2"),
+                ],
+            )
+            self.assertEqual(
                 json.loads(result["content"][0]["text"]),
                 {"accepted_bytes": len(payload.encode())},
             )
+            self.assertFalse(next_result["isError"])
+            self.assertEqual(json.loads(next_result["content"][0]["text"]), {"accepted_bytes": 5})
 
         _run(_test())
 
     def test_generated_bridge_rejects_oversized_request_without_dispatch_or_payload_logs(self):
         async def _test():
             server = _ToolServer()
-            executor = AsyncMock()
+            executor = AsyncMock(return_value={"ok": True})
             server._tool_executor = executor
-            with patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 1024):
+            with patch("omnigent.inner.pi_executor._TOOL_REQUEST_LIMIT", 64 * 1024):
                 await server.start()
                 try:
                     with self.assertLogs("omnigent.inner.pi_executor", level="WARNING") as logs:
-                        result = await self._run_generated_bridge_tool(
+                        result, next_result = await self._run_generated_bridge_tools(
                             port=server.port,
                             token=server.token,
-                            args={"input": "private-tool-value" * 128},
+                            args=[
+                                {"input": "private-tool-value" + "x" * (8 * 1024 * 1024)},
+                                {"input": "hello"},
+                            ],
                         )
                 finally:
                     await server.stop()
 
-            executor.assert_not_awaited()
+            executor.assert_awaited_once_with("exotic", {"input": "hello"}, call_id="call-2")
             self.assertTrue(result["isError"])
-            self.assertIn("1024-byte limit", json.loads(result["content"][0]["text"])["error"])
+            self.assertEqual(
+                json.loads(result["content"][0]["text"]),
+                {"error": "tool request exceeds 65536-byte limit"},
+            )
+            self.assertFalse(next_result["isError"])
+            self.assertEqual(json.loads(next_result["content"][0]["text"]), {"ok": True})
             row = record_to_row(logs.records[-1], source="runner")
             self.assertEqual(row["event_name"], "pi_tool_request_rejected")
-            self.assertEqual(row["attributes"]["request_limit_bytes"], "1024")
+            self.assertEqual(row["attributes"]["request_limit_bytes"], "65536")
             self.assertNotIn("private-tool-value", json.dumps(row))
             self.assertNotIn(server.token, json.dumps(row))
 
@@ -1326,7 +1344,7 @@ class TestToolServer(unittest.TestCase):
 
             server._tool_executor = executor
             try:
-                result = await self._run_generated_bridge_tool(
+                [result] = await self._run_generated_bridge_tools(
                     port=server.port,
                     token=server.token,
                 )
@@ -1357,7 +1375,7 @@ class TestToolServer(unittest.TestCase):
             server = await asyncio.start_server(close_without_response, "127.0.0.1", 0)
             port = server.sockets[0].getsockname()[1]
             try:
-                result = await self._run_generated_bridge_tool(
+                [result] = await self._run_generated_bridge_tools(
                     port=port,
                     token="close-token",
                 )
