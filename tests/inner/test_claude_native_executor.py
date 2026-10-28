@@ -2042,7 +2042,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivery", ["message", "steering", "model"])
+@pytest.mark.parametrize("delivery", ["message", "steering", "model", "hook-processing"])
 @pytest.mark.parametrize("watchdog", [False, True])
 async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch: pytest.MonkeyPatch,
@@ -2055,14 +2055,29 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     finished = threading.Event()
     commands: list[tuple[str, ...]] = []
     reaped: list[Path] = []
+    bridge_dir = tmp_path / "bridge"
+    processing = None
+    if delivery == "hook-processing":
+        from tests.harnesses.claude_native._submit_hook_support import install_submit
+
+        bridge_dir.mkdir()
+        processing = install_submit(bridge_dir, monkeypatch, outcome="never", content="hello")
+    capture_pane = claude_bridge._capture_pane
 
     def capture(socket_path: str, tmux_target: str) -> str:
+        if processing is not None and processing.elapsed < 5:
+            return capture_pane(socket_path, tmux_target)
         started.set()
         assert release.wait(5), "test did not release the in-flight capture"
+        if processing is not None:
+            return capture_pane(socket_path, tmux_target)
         return "────────────────\n❯ \n────────────────\n"
 
     def inject(*args: Any, **kwargs: Any) -> None:
         try:
+            if processing is not None:
+                claude_bridge.inject_user_message(*args, **kwargs)
+                return
             claude_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=30)
             claude_bridge._run_tmux("/tmp/sock", "send-keys", "late message", "Enter")
         finally:
@@ -2082,7 +2097,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
     monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", reap)
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(bridge_dir)
     monkeypatch.setattr(
         executor, "_model_command_arg", lambda model: "sonnet" if delivery == "model" else None
     )
@@ -2123,6 +2138,10 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
         assert not executor._inject_lock.locked()
         assert reaped == [tmp_path / "bridge"]
         assert commands == []
+        if processing is not None:
+            assert processing.enters == 1
+            assert processing.after_submit == []
+            assert "hello" in processing.pane
     finally:
         release.set()
         if not task.done():
@@ -2133,38 +2152,67 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["send-keys", "hook-processing"])
 async def test_run_turn_does_not_reap_unrelated_runtime_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    failure: str,
 ) -> None:
     """Only the readiness failure that terminalizes the turn triggers cleanup."""
+    from omnigent.runtime import pending_inputs
+
     killed: list[Path] = []
+    bridge_dir = tmp_path / "bridge"
+    processing = None
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise RuntimeError("tmux send-keys failed")
 
-    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    if failure == "hook-processing":
+        from tests.harnesses.claude_native._submit_hook_support import install_submit
+
+        bridge_dir.mkdir()
+        processing = install_submit(bridge_dir, monkeypatch, outcome="never", content="hi")
+    else:
+        monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",
         lambda *args, **kwargs: killed.append(args[0]),
     )
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
-    events = [
-        event
-        async for event in executor.run_turn(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[],
-            system_prompt="",
+    pending_inputs.reset_for_tests()
+    try:
+        pending_id = pending_inputs.record(
+            "web-original", [{"type": "input_text", "text": "hi"}], stable_id="a" * 32
         )
-    ]
+        executor = ClaudeNativeExecutor(bridge_dir)
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+        assert [item["pending_id"] for item in pending_inputs.snapshot_for("web-original")] == [
+            pending_id
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
 
     assert killed == []
+    assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert events[0].message == "tmux send-keys failed"
     assert events[0].undelivered is False
+    if processing is not None:
+        assert "could not be confirmed" in events[0].message
+        assert 120 <= processing.elapsed < 121
+        assert processing.enters == 1
+        assert processing.after_submit == []
+    else:
+        assert events[0].message == "tmux send-keys failed"
 
 
 @pytest.mark.asyncio
