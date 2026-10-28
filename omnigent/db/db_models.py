@@ -213,6 +213,9 @@ class SqlAgent(OmnigentBase):
     # user agent is admin-only).
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
+    # Owner/name fingerprint for original user agents; copies and server rows have none.
+    user_identity: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_agents_kind"),
         Index("ix_agents_created_at", "workspace_id", "created_at", "id"),
@@ -224,6 +227,7 @@ class SqlAgent(OmnigentBase):
         # do — kind is included so the seek skips same-named session copies
         # straight to the template row.
         Index("ix_agents_name", "workspace_id", "name", "kind", "id"),
+        Index("ix_agents_user_identity", "workspace_id", "user_identity", "created_at", "id"),
         # Keyset listing of one user's own agents, newest first: equality on
         # kind and created_by, order on created_at, primary-key tie-break.
         Index(
