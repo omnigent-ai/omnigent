@@ -25,7 +25,8 @@ def test_mod_observation_contract() -> None:
 
 
 @pytest.mark.parametrize(
-    "fault", [None, "duplicate", "late", "reload", "agent", "name", "sequence", "session"]
+    "fault",
+    [None, "duplicate", "late", "reload", "agent", "name", "sequence", "session", "gap", "end"],
 )
 def test_delayed_call_requires_unique_original_emission(fault: str | None) -> None:
     """A new turn never relabels an old call, and ambiguous observations stay unknown."""
@@ -56,6 +57,10 @@ def test_delayed_call_requires_unique_original_emission(fault: str | None) -> No
         events.append(dict(events[1]))
     elif fault == "session":
         call["session_id"] = "session-two"
+    elif fault == "gap":
+        events.pop(1)
+    elif fault == "end":
+        events[1] = {**emitted, "sequence": 2, "kind": "session.end", "reason": "resume"}
     result = summarize(events)
     assert result["calls"][0]["turn_id"] == ("old" if fault is None else None)
     assert result["calls"][0]["requester"] == "unverified"
@@ -68,10 +73,11 @@ def test_analyzer_refuses_missing_or_partial_capture(tmp_path: Path) -> None:
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=10)
     assert result.returncode == 2
     assert "no probe records" in result.stderr
-    (tmp_path / "event.json").write_text('{"version":')
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=10)
-    assert result.returncode == 2
-    assert "malformed" in result.stderr
+    for invalid in ('{"version":', "null", "[]", '{"version": 1, "sequence": false}'):
+        (tmp_path / "event.json").write_text(invalid)
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 2
+        assert "malformed" in result.stderr
     (tmp_path / "event.json").write_text(
         json.dumps({"version": 1, "incarnation": "one", "sequence": 1, "kind": "session.start"})
     )

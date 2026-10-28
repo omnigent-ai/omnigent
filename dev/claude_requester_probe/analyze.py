@@ -10,26 +10,38 @@ from pathlib import Path
 
 def summarize(events: list[dict]) -> dict:
     """Join calls only to unique preceding provider emissions in the same incarnation."""
+    for event in events:
+        if (
+            not isinstance(event, dict)
+            or not isinstance(event.get("incarnation"), str)
+            or not event["incarnation"]
+            or type(event.get("sequence")) is not int
+            or event["sequence"] < 1
+            or not isinstance(event.get("kind"), str)
+        ):
+            raise ValueError("invalid event identity or sequence")
     events = sorted(events, key=lambda event: (event["incarnation"], event["sequence"]))
     emissions: dict[tuple, list[dict]] = defaultdict(list)
-    seen_sequences: set[tuple] = set()
+    last_sequences: dict[str, int] = defaultdict(int)
     invalid_incarnations: set[str] = set()
+    epochs: dict[tuple, int] = defaultdict(int)
+    event_keys: list[tuple] = []
     for event in events:
-        key = (event["incarnation"], event["sequence"])
-        if key in seen_sequences:
+        if event["sequence"] != last_sequences[event["incarnation"]] + 1:
             invalid_incarnations.add(event["incarnation"])
-        seen_sequences.add(key)
+        last_sequences[event["incarnation"]] = event["sequence"]
+        scope = (event["incarnation"], event.get("session_id"))
+        key = (*scope, epochs[scope], event.get("tool_use_id"))
+        event_keys.append(key)
         if event["kind"] == "tool.emitted":
-            emissions[
-                (event["incarnation"], event.get("session_id"), event.get("tool_use_id"))
-            ].append(event)
+            emissions[key].append(event)
+        if event["kind"] == "session.end":
+            epochs[scope] += 1
     calls = []
-    for event in events:
+    for event, key in zip(events, event_keys, strict=True):
         if event["kind"] != "tool.call":
             continue
-        candidates = emissions[
-            (event["incarnation"], event.get("session_id"), event.get("tool_use_id"))
-        ]
+        candidates = emissions[key]
         emitted = candidates[0] if len(candidates) == 1 else None
         matched = (
             event["incarnation"] not in invalid_incarnations
@@ -55,6 +67,7 @@ def summarize(events: list[dict]) -> dict:
         )
     return {
         "events": len(events),
+        "incomplete_incarnations": sorted(invalid_incarnations),
         "provider_versions": [
             event.get("provider_version") for event in events if event["kind"] == "session.start"
         ],
@@ -83,7 +96,7 @@ def main() -> None:
         parser.error("no probe records; plugin loading has not been established")
     try:
         events = [json.loads(path.read_text()) for path in paths]
-        if any(event.get("version") != 1 for event in events):
+        if any(not isinstance(event, dict) or event.get("version") != 1 for event in events):
             raise ValueError("unsupported probe record version")
         result = summarize(events)
     except (OSError, ValueError, KeyError, TypeError) as error:

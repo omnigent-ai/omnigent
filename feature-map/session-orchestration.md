@@ -160,7 +160,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   environment; `tests/dev/test_claude_requester_probe.py` covers handler/analyzer
   contracts without Claude. This is diagnostic evidence, not owner delegation
   support. No production entry point installs the plugin, and the blocked row
-  above remains unchanged.
+  above remains unchanged. The probe also observes transcript row IDs and tests
+  `/clear` followed by fresh work. Its [remaining contract](../dev/claude_requester_probe/REQUESTER_CONTRACT.md)
+  separates supported row/tool identity from the missing input-consumption proof.
 
 - Component compatibility checks: `tests/runtime/harnesses/test_executor_adapter_requester.py`
   exercises retained callbacks with the real SDK parser/dispatcher. The Claude

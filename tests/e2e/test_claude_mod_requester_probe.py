@@ -191,6 +191,65 @@ def test_native_mod_captures_typed_input_and_tool_binding(
             timeout=30,
             what="queued input reaching the provider",
         )
+        screen.wait_for(
+            lambda _: (
+                {e["turn_id"] for e in events() if e["kind"] == "turn.start"}
+                <= {e["turn_id"] for e in events() if e["kind"] == "turn.complete"}
+            ),
+            timeout=30,
+            what="all submitted turns ending before clear",
+        )
+        prior_sessions = {e["session_id"] for e in events()}
+        child.send("/clear")
+        child.send("\r")
+        screen.wait_for(
+            lambda _: any(e["kind"] == "session.end" and e["reason"] == "clear" for e in events()),
+            timeout=15,
+            what="native clear boundary",
+        )
+        configure_mock_llm(
+            mock,
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "call_id": "toolu_probe_after_clear",
+                            "name": "mcp__probe__echo",
+                            "arguments": "{}",
+                        }
+                    ]
+                }
+            ],
+            required_tools=["mcp__probe__echo"],
+        )
+        child.send("PROBE_FRESH: run the harmless tool after clearing.")
+        child.send("\r")
+        screen.wait_for(
+            lambda _: any(
+                e["kind"] == "tool.call" and e.get("tool_use_id") == "toolu_probe_after_clear"
+                for e in events()
+            ),
+            timeout=30,
+            what="fresh native session tool call",
+        )
+        records = events()
+        prompt_rows = [
+            e for e in records if e["kind"] == "session.append" and e["door"] == "prompt"
+        ]
+        assert prompt_rows and all(e["row_uuid"] for e in prompt_rows)
+        assert any(e["kind"] == "append.result" and e["row_uuid"] for e in records)
+        fresh = next(
+            e
+            for e in records
+            if e["kind"] == "tool.call" and e.get("tool_use_id") == "toolu_probe_after_clear"
+        )
+        assert fresh["session_id"] not in prior_sessions
+        assert len([e for e in records if e["kind"] == "session.start"]) == 1
+        report = summarize(records)
+        assert all(c["correlation"] == "observed" for c in report["calls"]), report
+        assert not report["incomplete_incarnations"], report
+        assert report["authorization"] == "not_established"
+        (tmp_path / "report.json").write_text(json.dumps(report, indent=2))
     finally:
         (tmp_path / "terminal.txt").write_text(screen.text())
         child.close(force=True)

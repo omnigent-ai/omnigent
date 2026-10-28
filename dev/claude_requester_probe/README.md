@@ -25,12 +25,14 @@ categories, and CLI version. It forwards prompts, tool calls, and response
 chunks unchanged. It stores no prompt text, tool arguments or results.
 The analyzer reports unique preceding emissions as `observed`, never as
 authorization. Missing, duplicate, late, cross-session or cross-incarnation
-observations remain unresolved. These writable diagnostic files are not
+observations remain unresolved, including calls across an observed session end
+and captures with missing sequence numbers. These writable diagnostic files are not
 credentials and must never feed the server's authorization gate.
 
 | Boundary | What the public contract provides | What it does not establish |
 | --- | --- | --- |
 | Prompt submission | Origin category; turn active when submitted; queue preference | Bryan/Pat identity; unique accepted-input receipt; actual consuming turn |
+| Transcript append | Row UUID and append outcome; a direct call can retain its returned ID | Which authenticated native submission caused the row; actual consuming turn |
 | Model step → call | Turn/agent IDs and streamed tool-use ID | Original human requester |
 | MCP call | `claudecode/toolUseId`, already decoded by Omnigent | An authorization grant |
 
@@ -69,6 +71,8 @@ Handler tests execute the actual JavaScript module under Node with simulated
 mod APIs. They cover retained stream IDs, interruption cleanup, dropped/error
 inputs, absent opt-in and omission of prompt text. Analyzer cases check
 ambiguous IDs, changed sessions/agents/incarnations and incomplete captures.
+Retained stream/prompt callbacks keep the session identity captured at hook
+entry, even if the engine switches sessions while they are awaiting work.
 
 The separate real-process probe needs a non-root Linux container with
 `--network none --cap-drop ALL --security-opt no-new-privileges`, no host
@@ -84,12 +88,17 @@ It reuses the repository's scripted Anthropic provider and terminal-screen
 driver, types into the real Claude TUI, holds a model request while another
 input arrives, and correlates a built-in and an MCP call. The MCP fixture
 captures actual wire metadata for the existing Omnigent locator decoder.
+It observes actual transcript row IDs, then types `/clear` and repeats a tool call in the new session, checking
+that the mod remains loaded and the session identities remain distinct.
 This distinct mod/interpreter/stdio boundary needs its own scenario; it
 does not prove Omnigent startup, authenticated multi-user delegation, cloud
 provisioning, or live-provider behavior. The isolation guard is reused from
 the existing orchestration process scenario.
 
 ## Before authorization integration
+
+See [the remaining contract and acceptance journeys](REQUESTER_CONTRACT.md).
+That proposal does not describe an already available provider API.
 
 Establish a trusted accepted-input receipt and actual consumption binding,
 then test owner → collaborator steering → fresh owner → delayed old call.

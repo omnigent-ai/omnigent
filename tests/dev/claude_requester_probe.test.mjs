@@ -68,3 +68,46 @@ test('closing an interrupted observation closes the provider stream', async () =
   await stream.return();
   assert.equal(closed, true);
 });
+
+test('retained helper streams and prompt results keep their entry session after reset', async () => {
+  const { hooks, records, api } = harness();
+  let session = 'before-clear';
+  api.session.id = async () => session;
+  async function* provider() {
+    yield { kind: 'engine', ref: 1 };
+    yield { kind: 'tool', id: 'helper-call', name: 'Read' };
+  }
+  const stream = hooks.get('turn.step')(api, { turnId: 'helper-turn', agentId: 'helper', index: 0 }, provider);
+  await stream.next();
+  const prompt = { text: 'private', wait: false, origin: { kind: 'composer' } };
+  const rewritten = { text: 'also private', origin: { kind: 'composer' } };
+  assert.equal(await hooks.get('prompt.submit')(api, prompt, async () => {
+    session = 'after-clear';
+    return rewritten;
+  }), rewritten);
+  await stream.next();
+  await stream.next();
+  assert.equal(records.find(e => e.kind === 'prompt.result').session_id, 'before-clear');
+  const emitted = records.find(e => e.kind === 'tool.emitted');
+  assert.equal(emitted.session_id, 'before-clear');
+  assert.equal(emitted.agent_id, 'helper');
+  await hooks.get('tool.call')(api, { tool_use_id: 'helper-call', tool: 'Read', agentId: 'helper' }, async () => ({}));
+  assert.equal(records.at(-1).session_id, 'after-clear');
+  assert.ok(!JSON.stringify(records).includes('private'));
+});
+
+test('append observes row identity without saving message contents or claiming consumption', async () => {
+  const { hooks, records, api } = harness();
+  const row = { uuid: 'row-id', door: 'prompt', origin: { kind: 'composer' }, message: { content: 'private' } };
+  const result = { uuid: 'row-id', message: { content: 'rewritten private' } };
+  assert.equal(await hooks.get('session.append')(api, row, async () => result), result);
+  assert.equal(records[0].row_uuid, 'row-id');
+  assert.equal(records[1].row_uuid, 'row-id');
+  assert.equal(records[1].appended, records[0].sequence);
+  assert.ok(!JSON.stringify(records).includes('private'));
+  const refusal = { deny: 'private refusal' };
+  assert.equal(await hooks.get('session.append')(api, row, async () => refusal), refusal);
+  assert.equal(records.at(-1).refused, true);
+  assert.equal(records.at(-1).row_uuid, null);
+  assert.ok(!JSON.stringify(records).includes('private'));
+});
