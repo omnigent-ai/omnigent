@@ -226,6 +226,7 @@ def test_gitlab_panel_summary_and_diff(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
+    panel.get_by_role("button", name="team/sub/project !7 — Add the widget", exact=True).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
     expect(panel.get_by_title("GitLab", exact=True)).to_be_visible()
     expect(panel.get_by_text("!7", exact=True)).to_be_visible()
@@ -264,16 +265,15 @@ def test_gitlab_link_select_unlink(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(SECOND)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
-    expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="team/sub/project !7").click()
+    panel.get_by_role("button", name="team/sub/project !7 — Add the widget", exact=True).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="team/sub/other !12").click()
+    panel.get_by_role("button", name="All pull requests (2)").click()
+    panel.get_by_role(
+        "button", name="team/sub/other !12 — Fix another project", exact=True
+    ).click()
+    expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("!7")
     page.screenshot(path=str(tmp_path / "gitlab-selection.png"), animations="disabled")
 
@@ -299,6 +299,7 @@ def test_gitlab_unlink_last_mr_clears_selection(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
+    panel.get_by_role("button", name="team/sub/project !7 — Add the widget", exact=True).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_visible()
@@ -322,6 +323,7 @@ def test_gitlab_partial_data_is_visible(
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("button", name="team/sub/project !7 — Add the widget", exact=True).click()
     expect(
         panel.get_by_text(
             "GitLab comments and checks are incomplete. Refresh to retry.", exact=True

@@ -25,6 +25,10 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 - `canvas`: enable Canvas, open it, and follow an MR link on a session card.
 - `native-hook`: create or update an MR through a Claude or Codex native session.
 
+Select a row in the PR list to open its details; **All pull requests** returns
+to the list. Stored metadata and row actions remain available while the host
+is offline; checks and merge controls resume after reconnection.
+
 ## Driving it with the repro environment
 
 Preconditions: use the [Verify Omnigent skill](skills/verify-omnigent/SKILL.md)

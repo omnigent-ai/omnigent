@@ -16,7 +16,7 @@
 // Data comes from the runner's read-only PR resource API (see
 // hooks/usePullRequests.ts), which shells out to the provider CLI + `git`.
 // While the runner and host are offline, the server's stored PRs
-// (hooks/useSessionPullRequests.ts) keep the picker and the selected PR's last
+// (hooks/useSessionPullRequests.ts) keep the list and the selected PR's last
 // summary.
 // `derivePullRequestPanelState` is the single switch that turns the info query
 // into what the panel shows: an outdated host, a non-git workspace, an
@@ -1085,17 +1085,23 @@ function PullRequestListRow({
   onSelect,
   onUnlink,
   unlinkPending,
+  hostOffline,
+  sandboxAsleep,
 }: {
   conversationId: string;
   association: PullRequestAssociation;
   onSelect: () => void;
   onUnlink?: () => void;
   unlinkPending: boolean;
+  hostOffline: boolean;
+  sandboxAsleep: boolean;
 }) {
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: association.url });
   const canEdit = useCanEdit(conversationId);
   const data = info.data ? normalizePullRequestInfo(info.data) : undefined;
-  const pr = data?.pr?.url === association.url ? data.pr : undefined;
+  const offline = hostOffline || info.error instanceof RunnerOfflineError;
+  const pr = !offline && data?.pr?.url === association.url ? data.pr : undefined;
+  const summary = pr ?? association;
   const checks = pr?.checks;
   const mergeState = pr ? mergeButtonState(pr) : undefined;
   const ready =
@@ -1120,7 +1126,9 @@ function PullRequestListRow({
     undefined,
     association.provider_display,
   );
-  const href = parseHttpUrl(association.url)?.href;
+  const href = /^https:\/\//.test(association.url)
+    ? parseHttpUrl(association.url)?.href
+    : undefined;
   return (
     <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
       <button
@@ -1134,11 +1142,11 @@ function PullRequestListRow({
           aria-hidden
           className={cn(
             "size-4 shrink-0",
-            !pr || pr.is_draft
+            !summary.state || summary.is_draft
               ? "text-muted-foreground"
-              : pr.state === "OPEN"
+              : summary.state === "OPEN"
                 ? "text-green-600"
-                : pr.state === "MERGED"
+                : summary.state === "MERGED"
                   ? "text-purple-500"
                   : "text-red-500",
           )}
@@ -1154,7 +1162,29 @@ function PullRequestListRow({
         </span>
       </button>
       <div className="flex max-w-[45%] shrink-0 flex-wrap items-center justify-end gap-1 text-xs text-muted-foreground">
-        {ready && pr ? (
+        {offline ? (
+          <>
+            {association.state && (
+              <PullRequestStatus
+                state={association.state}
+                isDraft={association.is_draft === true}
+              />
+            )}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span tabIndex={0} role="status" className="inline-flex items-center gap-1">
+                    <ServerOffIcon aria-hidden className="size-3" />
+                    {sandboxAsleep ? "Sandbox asleep" : "Host offline"}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-xs">
+                  {storedPullRequestHint(association, sandboxAsleep)}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </>
+        ) : ready && pr ? (
           <>
             {(checksUnavailable || !!checks?.failing || !!checks?.pending) && checkStatus}
             <PullRequestMerge
@@ -1327,14 +1357,27 @@ export function PullRequestPanel({
   const update = useUpdateSessionPr(conversationId);
   const unlink = useUnlinkSessionPr(conversationId);
   useEffect(() => {
-    if (!selected && associations?.selected_pr_url) {
+    if (linked !== undefined && selected && !linked.some((pr) => pr.url === selected)) {
+      setSelection({ sessionId: conversationId, url: associations?.selected_pr_url });
+    } else if (!selected && associations?.selected_pr_url) {
       setSelection({ sessionId: conversationId, url: associations.selected_pr_url });
     }
-  }, [conversationId, selected, associations?.selected_pr_url]);
+  }, [conversationId, selected, associations?.selected_pr_url, linked]);
   const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
-  const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
+  const detailsInfo =
+    linked?.length === 0 && info.data
+      ? { ...info, data: { ...info.data, pr: null, selected_pr_url: undefined } }
+      : info;
+  const linkInEmptyState =
+    prs.length === 0 && derivePullRequestPanelState(detailsInfo).kind === "no-pr";
+  const unlinkPr = (prUrl: string) =>
+    unlink.mutate(prUrl, {
+      onSuccess: (remaining) => {
+        if (prUrl === selected) changeSelection(remaining.prs[0]?.url);
+      },
+    });
   const linkControls = (
     <>
       {linking && (
@@ -1349,6 +1392,7 @@ export function PullRequestPanel({
           }}
           onSubmit={(event) => {
             event.preventDefault();
+            if (linkNeedsHost) return;
             update.mutate(
               { url, action: "attach" },
               {
@@ -1366,12 +1410,13 @@ export function PullRequestPanel({
             autoFocus
             type="url"
             required
+            disabled={linkNeedsHost}
             value={url}
             onChange={(event) => setUrl(event.target.value)}
             placeholder={copy.prUrlPlaceholder}
             className="flex-1 focus-visible:ring-0"
           />
-          <Button type="submit" disabled={update.isPending}>
+          <Button type="submit" disabled={update.isPending || linkNeedsHost}>
             Link
           </Button>
           <Button type="button" variant="outline" onClick={() => setLinking(false)}>
@@ -1433,11 +1478,7 @@ export function PullRequestPanel({
                   <IconButton
                     label="Unlink PR"
                     disabled={unlink.isPending}
-                    onClick={() =>
-                      unlink.mutate(selectedPr.url, {
-                        onSuccess: (remaining) => changeSelection(remaining.prs[0]?.url),
-                      })
-                    }
+                    onClick={() => unlinkPr(selectedPr.url)}
                   >
                     <Trash2Icon className="size-3.5" aria-hidden="true" />
                   </IconButton>
@@ -1483,20 +1524,10 @@ export function PullRequestPanel({
                   provider_display:
                     pr.provider_display ?? associations?.provider_display ?? undefined,
                 }}
-                unlinkPending={update.isPending}
-                onUnlink={
-                  associations?.tracking_available
-                    ? () =>
-                        update.mutate(
-                          { url: pr.url, action: "remove" },
-                          {
-                            onSuccess: (data) => {
-                              if (pr.url === selected) changeSelection(data.selected_pr_url);
-                            },
-                          },
-                        )
-                    : undefined
-                }
+                hostOffline={hostOffline}
+                sandboxAsleep={sandboxAsleep}
+                unlinkPending={unlink.isPending}
+                onUnlink={associations?.tracking_available ? () => unlinkPr(pr.url) : undefined}
                 onSelect={() => {
                   changeSelection(pr.url);
                   setDetailsSession(conversationId);
@@ -1505,35 +1536,35 @@ export function PullRequestPanel({
             ))}
           </ul>
         ) : (
-        <PullRequestPanelDetails
-          key={`${conversationId}:${selected ?? ""}`}
-          conversationId={conversationId}
-          info={info}
-          storedPr={storesPrs && hostOffline ? selectedPr : undefined}
-          notSynced={notSynced && !selectedPr}
-          showHeading={!showTrackingControls}
-          refreshButton={!showTrackingControls ? refreshButton : undefined}
-          emptyStateAction={
-            associations?.tracking_available && linkInEmptyState ? (
-              <div className="mt-2 w-full max-w-sm">
-                {linkNeedsHost ? (
-                  <p role="status" className="text-ui text-muted-foreground">
-                    {sandboxAsleep
-                      ? "To link a PR, send a message to start the session’s sandbox."
-                      : "To link a PR, please reconnect the session’s host."}
-                  </p>
-                ) : (
-                  <>
-                    {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
-                    {linkControls}
-                  </>
-                )}
-              </div>
-            ) : (
-              openPrFallback
-            )
-          }
-        />
+          <PullRequestPanelDetails
+            key={`${conversationId}:${selected ?? ""}`}
+            conversationId={conversationId}
+            info={detailsInfo}
+            storedPr={storesPrs && hostOffline ? selectedPr : undefined}
+            notSynced={notSynced && !selectedPr}
+            showHeading={!showTrackingControls}
+            refreshButton={!showTrackingControls ? refreshButton : undefined}
+            emptyStateAction={
+              associations?.tracking_available && linkInEmptyState ? (
+                <div className="mt-2 w-full max-w-sm">
+                  {linkNeedsHost ? (
+                    <p role="status" className="text-ui text-muted-foreground">
+                      {sandboxAsleep
+                        ? "To link a PR, send a message to start the session’s sandbox."
+                        : "To link a PR, please reconnect the session’s host."}
+                    </p>
+                  ) : (
+                    <>
+                      {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
+                      {linkControls}
+                    </>
+                  )}
+                </div>
+              ) : (
+                openPrFallback
+              )
+            }
+          />
         )}
       </div>
     </div>
@@ -1552,6 +1583,18 @@ function useHostOffline(
   const serveable = useWorkspaceServeable(conversationId);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   return serveable === false || sandboxAsleep || info.error instanceof RunnerOfflineError;
+}
+
+function storedPullRequestHint(pr: PullRequestAssociation, sandboxAsleep: boolean): string {
+  const lastSync = pr.state_checked_at
+    ? `Last sync time: ${absoluteTime(pr.state_checked_at * 1000)}. `
+    : "";
+  return (
+    lastSync +
+    (sandboxAsleep
+      ? "To load the PR details, send a message to start the session’s sandbox."
+      : "To load the PR details, please reconnect the session’s host.")
+  );
 }
 
 /**
@@ -1573,7 +1616,6 @@ function StoredPullRequestDetails({
   refreshButton?: React.ReactNode;
 }) {
   const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
-  const lastSync = pr.state_checked_at ? absoluteTime(pr.state_checked_at * 1000) : "";
   const href = /^https:\/\//.test(pr.url) ? pr.url : undefined;
   const label = (
     <>
@@ -1596,6 +1638,7 @@ function StoredPullRequestDetails({
             <div className="ml-auto shrink-0">{refreshButton}</div>
           </div>
           <div className="mt-1 flex flex-nowrap items-center gap-2">
+            <PullRequestProviderIcon copy={copy} />
             {href ? (
               <a
                 href={href}
@@ -1613,10 +1656,7 @@ function StoredPullRequestDetails({
           </div>
         </div>
         <p role="status" className="p-3 text-ui text-muted-foreground">
-          {lastSync && `Last sync time: ${lastSync}. `}
-          {sandboxAsleep
-            ? "To load the PR details, send a message to start the session’s sandbox."
-            : "To load the PR details, please reconnect the session’s host."}
+          {storedPullRequestHint(pr, sandboxAsleep)}
         </p>
       </div>
     </TooltipProvider>

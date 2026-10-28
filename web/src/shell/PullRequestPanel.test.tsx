@@ -219,11 +219,14 @@ function file(
 
 function renderPanel(active?: boolean) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<PullRequestPanel conversationId="conv_1" active={active} />, {
-    wrapper: ({ children }) => (
-      <QueryClientProvider client={client}>{children}</QueryClientProvider>
-    ),
-  });
+  return {
+    client,
+    ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    }),
+  };
 }
 
 /** Render, then switch to the Changes tab — Summary is the default, so the
@@ -2314,10 +2317,7 @@ describe("session PR selection", () => {
     expect(await navigator.clipboard.readText()).toBe(two);
     await user.click(screen.getByRole("button", { name: "Actions for example/two #42" }));
     await user.click(screen.getByRole("menuitem", { name: "Unlink PR" }));
-    expect(state.updateSessionPr).toHaveBeenCalledWith(
-      { url: two, action: "remove" },
-      expect.any(Object),
-    );
+    expect(state.unlink.mutate).toHaveBeenCalledWith(two, expect.any(Object));
 
     expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
@@ -2374,10 +2374,17 @@ describe("session PR selection", () => {
         relationship: "inferred",
       },
     ];
-    renderPanel();
+    const { client } = renderPanel();
 
-    const picker = await screen.findByRole("combobox", { name: "Session pull request" });
-    expect(picker).toHaveTextContent("example/one #42 — Ship it");
+    const list = await screen.findByRole("list", { name: "Pull requests" });
+    expect(within(list).getByLabelText("Pull request status: Merged")).toBeVisible();
+    expect(within(list).getAllByText("Host offline")).toHaveLength(2);
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Actions for example/one #42" }));
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute("href", one);
+    await user.click(screen.getByRole("menuitem", { name: "Copy PR link" }));
+    expect(await navigator.clipboard.readText()).toBe(one);
+    await user.click(screen.getByRole("button", { name: "example/one #42 — Ship it" }));
     const stored = screen.getByTestId("github-stored-pr");
     expect(within(stored).getByRole("link", { name: /Ship it/ })).toHaveAttribute("href", one);
     expect(within(stored).getByLabelText("Pull request status: Merged")).toBeInTheDocument();
@@ -2392,75 +2399,165 @@ describe("session PR selection", () => {
     await user.click(screen.getByRole("button", { name: "Unlink PR" }));
     expect(state.unlink.mutate).toHaveBeenCalledWith(one, expect.anything());
     const [, { onSuccess }] = state.unlink.mutate.mock.calls[0];
-    act(() => onSuccess({ prs: state.stored.conv_1.slice(1), synced: true, complete: true }));
-    expect(picker).toHaveTextContent("example/two #7 (from branch)");
+    act(() => {
+      const remaining = { prs: state.stored.conv_1.slice(1), synced: true };
+      client.setQueryData(["session-pull-requests", "conv_1"], remaining);
+      onSuccess(remaining);
+    });
     // A PR the host never fetched has no sync time to show.
     expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
       /^To load the PR details, please reconnect the session’s host\.$/,
     );
+    await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
+    expect(screen.queryByRole("button", { name: "example/one #42 — Ship it" })).toBeNull();
+    await user.click(
+      screen.getByRole("button", { name: "Actions for example/two #7 (from branch)" }),
+    );
+    await user.click(screen.getByRole("menuitem", { name: "Unlink PR" }));
+    expect(state.unlink.mutate).toHaveBeenLastCalledWith(two, expect.any(Object));
+    const [, callbacks] = state.unlink.mutate.mock.calls[1];
+    act(() => {
+      client.setQueryData(["session-pull-requests", "conv_1"], { prs: [], synced: true });
+      callbacks.onSuccess({ prs: [] });
+    });
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
   });
 
-  it("switches cached live info to the stored PR once the host goes offline", async () => {
-    const url = "https://github.com/acme/app/pull/6000";
-    const attached: PullRequestAssociation = {
-      url,
-      host: "github.com",
-      repository: "acme/app",
-      number: 6000,
-      title: "Attached while online",
-      relationship: "attached",
-      state: "OPEN",
-      is_draft: false,
-      state_checked_at: Date.now() / 1000 - 60,
-    };
+  it.each(["error", "health", "sandbox"])(
+    "replaces cached checks/merge with stored metadata and recovers: %s",
+    async (reason) => {
+      const user = userEvent.setup();
+      const url = "https://github.com/acme/app/pull/6000";
+      const attached: PullRequestAssociation = {
+        url,
+        host: "github.com",
+        repository: "acme/app",
+        number: 6000,
+        title: "Attached while online",
+        relationship: "attached",
+        state: "OPEN",
+        is_draft: false,
+        state_checked_at: Date.now() / 1000 - 60,
+      };
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [attached],
+        capabilities: { merging: true },
+        pr: {
+          ...state.info!.data!.pr!,
+          url,
+          title: "Live title",
+          merge_state_status: "UNSTABLE",
+          head_sha: "head",
+        },
+      });
+      state.stored.conv_1 = [attached];
+      const { rerender } = renderPanel();
+      await screen.findByRole("list", { name: "Pull requests" });
+      expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "66 passed" })).toBeVisible();
+      const online = state.info!;
+      expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+
+      // React Query keeps the last payload when the refetch fails.
+      state.info = { ...state.info!, error: reason === "error" ? new RunnerOfflineError() : null };
+      state.serveable = reason === "health" ? false : undefined;
+      state.sandboxAsleep = reason === "sandbox";
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+
+      expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "66 passed" })).toBeNull();
+      const status = screen.getByText(reason === "sandbox" ? "Sandbox asleep" : "Host offline");
+      await user.hover(status);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent("Last sync time:");
+      await user.unhover(status);
+      await user.click(
+        screen.getByRole("button", { name: "acme/app #6000 — Attached while online" }),
+      );
+      const stored = screen.getByTestId("github-stored-pr");
+      expect(within(stored).getByRole("link", { name: /Attached while online/ })).toHaveAttribute(
+        "href",
+        url,
+      );
+      expect(within(stored).getByLabelText("Pull request status: Open")).toBeInTheDocument();
+      expect(screen.queryByText(/The agent is asleep/)).toBeNull();
+      expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+      state.info = online;
+      state.serveable = true;
+      state.sandboxAsleep = false;
+      rerender(<PullRequestPanel conversationId="conv_1" />);
+      expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
+      await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
+      expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+      expect(screen.queryByText("Host offline")).toBeNull();
+    },
+  );
+
+  it.each([true, false])(
+    "treats an empty server list as authoritative (offline: %s)",
+    async (offline) => {
+      const url = "https://github.com/acme/app/pull/6000";
+      const cached: PullRequestAssociation = {
+        url,
+        host: "github.com",
+        repository: "acme/app",
+        number: 6000,
+        title: "Unlinked in another tab",
+        relationship: "attached",
+      };
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [cached],
+      });
+      state.info = { ...state.info!, error: offline ? new RunnerOfflineError() : null };
+      state.stored.conv_1 = [cached];
+      const { client } = renderPanel();
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole("button", { name: /^(acme\/app #6000)/ }));
+      expect(screen.getByRole("button", { name: "All pull requests (1)" })).toBeVisible();
+      act(() => {
+        client.setQueryData(["session-pull-requests", "conv_1"], { prs: [], synced: true });
+      });
+
+      await waitFor(() => expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull());
+      expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+      expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    },
+  );
+
+  it("disables an open link form when the host disconnects", async () => {
+    const user = userEvent.setup();
     Object.assign(state.info!.data!, {
       tracking_available: true,
-      selected_pr_url: url,
-      prs: [attached],
+      prs: [
+        {
+          url: "https://github.com/acme/app/pull/6000",
+          host: "github.com",
+          repository: "acme/app",
+          number: 6000,
+          relationship: "attached",
+        },
+      ],
     });
-    state.stored.conv_1 = [attached];
     const { rerender } = renderPanel();
-    expect(
-      await screen.findByRole("combobox", { name: "Session pull request" }),
-    ).toBeInTheDocument();
-    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
-
-    // React Query keeps the last payload when the refetch fails.
-    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    await user.click(await screen.findByRole("button", { name: "Link a PR" }));
+    await user.type(
+      screen.getByRole("textbox", { name: "Pull request URL" }),
+      "https://github.com/acme/app/pull/7",
+    );
+    state.serveable = false;
     rerender(<PullRequestPanel conversationId="conv_1" />);
-
-    const stored = screen.getByTestId("github-stored-pr");
-    expect(within(stored).getByRole("link", { name: /Attached while online/ })).toHaveAttribute(
-      "href",
-      url,
+    expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Link" })).toBeDisabled();
+    state.serveable = true;
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByRole("button", { name: "Link" })).toBeEnabled();
+    expect(screen.getByRole("textbox", { name: "Pull request URL" })).toHaveValue(
+      "https://github.com/acme/app/pull/7",
     );
-    expect(within(stored).getByLabelText("Pull request status: Open")).toBeInTheDocument();
-    expect(screen.queryByText(/The agent is asleep/)).toBeNull();
-  });
-
-  it("treats an empty server list as authoritative while the host is offline", async () => {
-    const url = "https://github.com/acme/app/pull/6000";
-    const cached: PullRequestAssociation = {
-      url,
-      host: "github.com",
-      repository: "acme/app",
-      number: 6000,
-      title: "Unlinked in another tab",
-      relationship: "attached",
-    };
-    Object.assign(state.info!.data!, {
-      tracking_available: true,
-      selected_pr_url: url,
-      prs: [cached],
-    });
-    state.info = { ...state.info!, error: new RunnerOfflineError() };
-    state.stored.conv_1 = [];
-    renderPanel();
-
-    await waitFor(() =>
-      expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull(),
-    );
-    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
   });
 
   it.each([
@@ -2565,6 +2662,7 @@ describe("session PR selection", () => {
       ];
       renderPanel();
 
+      fireEvent.click(await screen.findByRole("button", { name: "acme/app #1 — Not a link" }));
       // The details remount once the selection settles on the stored PR.
       await waitFor(() =>
         expect(
@@ -2579,7 +2677,7 @@ describe("session PR selection", () => {
     },
   );
 
-  it("asks to start a sleeping sandbox rather than reconnect a host", () => {
+  it("asks to start a sleeping sandbox rather than reconnect a host", async () => {
     const url = "https://github.com/acme/app/pull/6000";
     state.sandboxAsleep = true;
     state.info = { isLoading: false, error: null, isFetching: false };
@@ -2598,6 +2696,7 @@ describe("session PR selection", () => {
     ];
     renderPanel();
 
+    fireEvent.click(await screen.findByRole("button", { name: "acme/app #6000 — Sandbox PR" }));
     return waitFor(() =>
       expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
         /^To load the PR details, send a message to start the session’s sandbox\.$/,
