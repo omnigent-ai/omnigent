@@ -357,7 +357,7 @@ def _monotonic() -> float:
 
 def _native_input_ready_probe(
     resource_role: str | None,
-) -> Callable[[str, TerminalInstance], bool] | None:
+) -> Callable[[str, TerminalInstance], bool | str | None] | None:
     """Resolve the provider's ``input_ready_probe`` for a native terminal role.
 
     Native terminal roles are the harness names (``"pi-native"``), so the role
@@ -1570,8 +1570,11 @@ class SessionResourceRegistry:
             if input_ready_probe is not None and not native_input_ready:
                 # Readiness logging must not stop the lifecycle watcher on failure.
                 with contextlib.suppress(Exception):
-                    if input_ready_probe(session_id, instance):
+                    ready = input_ready_probe(session_id, instance)
+                    if ready:
                         native_input_ready = True
+                        # A probe may name the signal that matched.
+                        signal = {"readiness_signal": ready} if isinstance(ready, str) else {}
                         _logger.info(
                             "Native input ready",
                             extra=debug_event(
@@ -1580,6 +1583,7 @@ class SessionResourceRegistry:
                                 harness=resource_role,
                                 terminal_instance_id=instance.diagnostic_id,
                                 stage="native_input",
+                                **signal,
                             ),
                         )
 

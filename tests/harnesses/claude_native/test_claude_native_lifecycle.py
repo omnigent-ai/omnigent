@@ -541,3 +541,34 @@ def test_invalid_record_is_preserved_instead_of_treated_as_a_missing_file(
     assert path.read_text() == content
     assert _read(launch)["session_end_reason"] == "unknown"
     assert _read(launch)["session_end_reason"] == "unknown"
+
+
+def test_input_ready_probe_accepts_a_recorded_prompt_submit_for_this_launch(
+    launch: tuple[Path, TerminalLifecycleTrace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real UserPromptSubmit hook proves input readiness when the pane check misses."""
+    directory, trace = launch
+    pane = {"text": "  custom startup footer\n"}
+    instance = SimpleNamespace(
+        args=["--settings", str(directory / bridge._INVOCATION_SETTINGS_FILE)],
+        diagnostic_id=_INSTANCE_ID,
+        lifecycle_trace=trace,
+        last_pane_text=lambda: pane["text"],
+    )
+
+    assert bridge.native_input_ready("session-a", instance) is None  # type: ignore[arg-type]
+    # Booting alone does not prove the composer accepts input; a dialog may be up.
+    _hook(monkeypatch, directory, "SessionStart", 10.0, source="startup")
+    assert bridge.native_input_ready("session-a", instance) is None  # type: ignore[arg-type]
+
+    _hook(monkeypatch, directory, "UserPromptSubmit", 11.0, prompt="hello")
+    assert (
+        bridge.native_input_ready("session-a", instance)  # type: ignore[arg-type]
+        == bridge.CLAUDE_PROMPT_SUBMIT_READINESS_SIGNAL
+    )
+
+    pane["text"] = "────────────────────\n❯ \n────────────────────"
+    assert (
+        bridge.native_input_ready("session-a", instance)  # type: ignore[arg-type]
+        == bridge.CLAUDE_COMPOSER_READINESS_SIGNAL
+    )

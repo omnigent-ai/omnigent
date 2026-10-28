@@ -99,6 +99,7 @@ class NativeHarnessProvider:
     auto_create_terminal: str  # runner terminal builder
     # ``(session_id, instance) -> bool`` polled by the runner's terminal watcher
     # until the native TUI accepts input, which then logs ``native_input_ready``.
+    # A probe may return the matched signal's name instead of ``True``.
     # Required so no native harness can ship without input-readiness logging.
     input_ready_probe: str
     spawn_env_builder: str | None = None

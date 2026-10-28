@@ -71,6 +71,7 @@ from filelock import Timeout as FileLockTimeout
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+from omnigent.harnesses.claude_native.lifecycle import read_lifecycle_snapshot
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
@@ -5898,16 +5899,46 @@ def claude_pane_text_ready(pane: str) -> bool:
     return _claude_prompt_rendered(pane)
 
 
-def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
-    """Provider ``input_ready_probe``: Claude's composer is on screen.
+CLAUDE_COMPOSER_READINESS_SIGNAL = "claude_composer"
+CLAUDE_PROMPT_SUBMIT_READINESS_SIGNAL = "claude_prompt_submit_hook"
+
+
+def claude_prompt_submitted(instance: TerminalInstance) -> bool:
+    """
+    Return whether this Claude launch has accepted a user prompt.
+
+    A ``UserPromptSubmit`` hook recorded for the terminal's own launch proves
+    the composer took input even when the pane never matched the composer
+    check. Observation only: delivery still waits for :func:`claude_pane_ready`.
+
+    :param instance: The live Claude terminal.
+    :returns: ``True`` once the launch's lifecycle evidence holds a submit.
+    """
+    snapshot = read_lifecycle_snapshot(
+        bridge_dir_from_launch_args(instance.args),
+        instance.diagnostic_id,
+        instance.lifecycle_trace.launch_id,
+    )
+    hooks = snapshot.get("recent_hooks")
+    return isinstance(hooks, list) and any(
+        isinstance(hook, dict) and hook.get("event_name") == "UserPromptSubmit" for hook in hooks
+    )
+
+
+def native_input_ready(session_id: str, instance: TerminalInstance) -> str | None:
+    """Provider ``input_ready_probe``: Claude's composer is on screen or took a prompt.
 
     :param session_id: Omnigent conversation id (unused; the pane is enough).
     :param instance: The live Claude terminal.
-    :returns: Whether the watcher's last captured pane shows the prompt.
+    :returns: The readiness signal that matched, or ``None`` when not ready yet.
     """
     del session_id
     # The watcher already captured this live pane; no extra tmux query.
-    return claude_pane_text_ready(instance.last_pane_text() or "")
+    if claude_pane_text_ready(instance.last_pane_text() or ""):
+        return CLAUDE_COMPOSER_READINESS_SIGNAL
+    if claude_prompt_submitted(instance):
+        return CLAUDE_PROMPT_SUBMIT_READINESS_SIGNAL
+    return None
 
 
 def _user_prompt_visible(pane: str) -> bool:
