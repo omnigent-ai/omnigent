@@ -888,14 +888,28 @@ function WorkspacePanelImpl({
   onMobileSideChatsOpenChange,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
-  const [warmRailTerminals, setWarmRailTerminals] = useState<string[]>([]);
+  const [warmRailTerminals, setWarmRailTerminals] = useState({
+    conversationId,
+    keys: [] as string[],
+  });
+  // Terminal ids can repeat across sessions, so another session's or a closed tab's key
+  // must neither attach here nor hold an LRU slot.
+  const liveWarmRailTerminals = (
+    warmRailTerminals.conversationId === conversationId ? warmRailTerminals.keys : []
+  ).filter((key) => openTerminals.includes(key));
   // Include the selected shell in the same render so its first mount isn't a frame late.
   const nextWarmRailTerminals = terminalShown
-    ? updateWarmRailTerminals(warmRailTerminals, selectedTerminalKey)
-    : warmRailTerminals;
+    ? updateWarmRailTerminals(liveWarmRailTerminals, selectedTerminalKey)
+    : liveWarmRailTerminals;
   useEffect(() => {
-    setWarmRailTerminals(nextWarmRailTerminals);
-  }, [nextWarmRailTerminals]);
+    setWarmRailTerminals((prev) =>
+      prev.conversationId === conversationId &&
+      prev.keys.length === nextWarmRailTerminals.length &&
+      prev.keys.every((key, index) => key === nextWarmRailTerminals[index])
+        ? prev
+        : { conversationId, keys: nextWarmRailTerminals },
+    );
+  }, [conversationId, nextWarmRailTerminals]);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const browsers = useBrowserTabs(conversationId);

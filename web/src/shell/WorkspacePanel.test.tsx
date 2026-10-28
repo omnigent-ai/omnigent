@@ -776,6 +776,50 @@ describe("WorkspacePanel shell tabs", () => {
     expect(MAX_WARM_RAIL_TERMINALS).toBe(keys.length);
   });
 
+  it("keeps a switched-away shell mounted but hidden, and reveals the same node on return", async () => {
+    const other = { ...term, id: "terminal_zsh_s2", session: "u-second" };
+    const otherKey = "terminal:terminal_zsh_s2";
+    useTerminalsMock.mockReturnValue({ terminals: [term, other], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      openTerminals: [termKey, otherKey],
+      selectedTerminalKey: termKey,
+    });
+    const first = await screen.findByText("terminal_zsh_s1");
+
+    rerender({ selectedTerminalKey: otherKey });
+    await screen.findByText("terminal_zsh_s2");
+    // Same DOM node means the xterm and its attach were not torn down.
+    expect(screen.getByText("terminal_zsh_s1")).toBe(first);
+    expect(first.parentElement).toHaveAttribute("aria-hidden", "true");
+
+    rerender({ selectedTerminalKey: termKey });
+    expect(screen.getByText("terminal_zsh_s1")).toBe(first);
+    expect(first.parentElement).toHaveAttribute("aria-hidden", "false");
+    expect(screen.getByText("terminal_zsh_s2").parentElement).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
+  });
+
+  it("does not carry warm shells into another session", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      openTerminals: [termKey],
+      selectedTerminalKey: termKey,
+    });
+    await screen.findByTestId("terminal-view-stub");
+
+    // The new session reuses the terminal id but never showed that shell.
+    rerender({ conversationId: "conv_other", selectedTerminalKey: null });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+  });
+
+  it("drops closed shells and evicts the least recently shown past the cap", () => {
+    expect(updateWarmRailTerminals(["a", "b"], "a")).toEqual(["b", "a"]);
+    const full = Array.from({ length: MAX_WARM_RAIL_TERMINALS }, (_, index) => `t${index}`);
+    expect(updateWarmRailTerminals(full, "new")).toEqual([...full.slice(1), "new"]);
+  });
+
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { openTerminalTab } = renderWorkspace({
