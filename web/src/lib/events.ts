@@ -1,3 +1,4 @@
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
@@ -333,6 +334,8 @@ export interface MessageDone {
   responseId: string;
   /** Native live-preview stream finalized by this item. */
   messageId?: string;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
 }
 
 /**
@@ -985,6 +988,11 @@ export interface BrowserActionRequestEvent {
   args: Record<string, unknown>;
 }
 
+export interface UiOpenFileEvent {
+  type: "ui_open_file";
+  path: string;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -1043,4 +1051,5 @@ export type StreamEvent =
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent
-  | BrowserActionRequestEvent;
+  | BrowserActionRequestEvent
+  | UiOpenFileEvent;

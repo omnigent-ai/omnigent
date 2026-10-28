@@ -28,7 +28,9 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
+import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { Link, useParams } from "@/lib/routing";
 import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
 import { Button } from "@/components/ui/button";
@@ -190,10 +192,7 @@ export function RearrangeableGrid({
 }) {
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
-  const [selectedSessionId, setSelectedSessionId] = useState(sessionIds[0]);
-  const activeSessionId = sessionIds.includes(selectedSessionId)
-    ? selectedSessionId
-    : sessionIds[0];
+  const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
   const workspaceKey = `grid:${grid.id}`;
   const [workspace, setWorkspace] = useState(() => {
     const saved = readSessionWorkspaceState(workspaceKey);
@@ -202,10 +201,29 @@ export function RearrangeableGrid({
   useEffect(() => writeSessionWorkspaceState(workspaceKey, workspace), [workspaceKey, workspace]);
   const [maximized, setMaximized] = useState(false);
   const [workspaceTarget, setWorkspaceTarget] = useState<HTMLDivElement | null>(null);
-  const openWorkspace = useCallback((sessionId: string) => {
-    setSelectedSessionId(sessionId);
-    setWorkspace((previous) => ({ ...previous, open: true }));
-  }, []);
+  const openWorkspace = useCallback(
+    (sessionId: string) => {
+      selectSession(sessionId);
+      setWorkspace((previous) => ({ ...previous, open: true }));
+    },
+    [selectSession],
+  );
+  const toggleWorkspace = () => {
+    setMaximized(false);
+    setWorkspace((previous) => ({ ...previous, open: !previous.open }));
+  };
+  useSidebarToggleHotkeys({ onToggleRight: toggleWorkspace });
+  // The cell a pane-cycle chord moved to; that cell then claims keyboard focus.
+  const [focusRequest, setFocusRequest] = useState<{ sessionId: string } | null>(null);
+  usePaneCycleHotkey({
+    enabled: !maximized,
+    paneKeys: sessionIds,
+    focusedKey: activeSessionId,
+    onFocusPane: (sessionId) => {
+      selectSession(sessionId);
+      setFocusRequest({ sessionId });
+    },
+  });
   const container = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
@@ -326,10 +344,7 @@ export function RearrangeableGrid({
               size="icon-xs"
               aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
               // aria-expanded={workspace.open}
-              onClick={() => {
-                setMaximized(false);
-                setWorkspace((previous) => ({ ...previous, open: !previous.open }));
-              }}
+              onClick={toggleWorkspace}
               className="text-muted-foreground hover:text-foreground border-none"
             >
               {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
@@ -345,7 +360,8 @@ export function RearrangeableGrid({
                 sessionId={sessionId}
                 area={area}
                 selected={sessionId === activeSessionId}
-                onActivate={() => setSelectedSessionId(sessionId)}
+                focusRequest={focusRequest?.sessionId === sessionId ? focusRequest : null}
+                onActivate={() => selectSession(sessionId)}
                 workspaceTarget={workspaceTarget}
                 workspacePanel={workspacePanel}
                 onOpenWorkspace={() => openWorkspace(sessionId)}
@@ -407,7 +423,6 @@ export function GridWorkspace({
         className="relative flex min-h-0 min-w-0 flex-1"
         onDragOver={preventLinkDrop}
         onDropCapture={preventLinkDrop}
-        data-grid-session={grids.enabled ? grids.conversationId : undefined}
       >
         {content}
       </div>

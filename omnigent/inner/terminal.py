@@ -330,6 +330,9 @@ _EXIT_STATUS_POLL_SECONDS = 0.01
 _PANE_EXIT_STATUS_FORMAT = "#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}"
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+# A watcher whose last capture is older than this has stalled or stopped, so its
+# view of the screen no longer says whether the pane is producing output.
+_SCREEN_WATCH_STALE_SECONDS = 10.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -1153,6 +1156,11 @@ class TerminalInstance:
     _last_pane_snapshot: str | None = field(default=None, repr=False)
     _last_exit_snapshot: str | None = field(default=None, repr=False)
     _last_capture_at: float | None = field(default=None, repr=False)
+    # Monotonic stamps from the threaded idle watcher: when it started, its
+    # latest capture, and the latest capture that agent output changed.
+    _screen_watch_started_at: float | None = field(default=None, repr=False)
+    _screen_watched_at: float | None = field(default=None, repr=False)
+    _screen_changed_at: float | None = field(default=None, repr=False)
     _probe_failures: deque[dict[str, object]] = field(
         default_factory=lambda: deque(maxlen=2 * _IDLE_EXIT_FAILURE_THRESHOLD),
         init=False,
@@ -1214,6 +1222,33 @@ class TerminalInstance:
             ``False`` when none was ever observed.
         """
         return time.monotonic() - self._last_client_interaction_at < window_s
+
+    def screen_changed_within(self, window_s: float) -> bool | None:
+        """
+        Whether agent output changed the screen in the last *window_s* seconds.
+
+        tmux's ``window_activity`` advances on any output, including title
+        updates and repaints that leave the screen as it was, so an idle TUI
+        with a title spinner reads as busy forever. The native pane reaper
+        reads the idle watcher's own screen diff instead when it can.
+
+        :param window_s: Recency window in seconds, e.g. ``120.0``.
+        :returns: ``None`` when the watcher has not watched for the whole window
+            or its last capture is stale, so the caller must fall back to tmux's
+            clock; otherwise whether the screen changed within the window.
+        """
+        now = time.monotonic()
+        started_at = self._screen_watch_started_at
+        watched_at = self._screen_watched_at
+        if (
+            started_at is None
+            or watched_at is None
+            or now - started_at < window_s
+            or now - watched_at > _SCREEN_WATCH_STALE_SECONDS
+        ):
+            return None
+        changed_at = self._screen_changed_at
+        return changed_at is not None and now - changed_at < window_s
 
     def last_pane_text(self) -> str | None:
         """Return the last visible pane text captured for diagnostics.
@@ -2280,6 +2315,7 @@ class TerminalInstance:
         interval = poll_interval_s if poll_interval_s is not None else _IDLE_POLL_INTERVAL_SECONDS
         consecutive_capture_failures = 0
         self._probe_failures.clear()
+        self._screen_watch_started_at = time.monotonic()
         while True:
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
@@ -2358,6 +2394,12 @@ class TerminalInstance:
                 time.monotonic() - self._last_client_interaction_at
             ) < _CLIENT_INTERACTION_WINDOW_SECONDS
             idle_fired = detector.tick(snapshot, suppress_activity=suppress)
+            # The change stamp lands first, so a reader never pairs a fresh capture
+            # with the previous change time.
+            watched_at = time.monotonic()
+            if detector.changed_this_tick:
+                self._screen_changed_at = watched_at
+            self._screen_watched_at = watched_at
             # Activity edge first: a tick can both change the pane and
             # (much later) cross the idle threshold, but never both in
             # the same tick — a change resets the idle timer.

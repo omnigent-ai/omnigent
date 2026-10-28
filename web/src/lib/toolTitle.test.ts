@@ -1,11 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { formatToolRunLabel, formatToolTitle } from "./toolTitle";
+import {
+  formatToolRunLabel,
+  formatToolTitle,
+  humanizeToolName,
+  shellCommandPreview,
+  shellToolCall,
+  splitEnvPrefix,
+  splitToolName,
+  summarizeArgs,
+} from "./toolTitle";
 
 describe("formatToolTitle", () => {
   it("strips sys_os_shell down to the command string with no bold verb", () => {
     expect(formatToolTitle("sys_os_shell", { command: "ls -la" })).toEqual({
       verb: null,
       body: "ls -la",
+      isShellCommand: true,
+    });
+  });
+
+  it("gives a prefixed omnigent tool the same title as the bare tool", () => {
+    // WHY: Claude-native sessions call Omnigent's tools through its MCP server.
+    expect(formatToolTitle("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toEqual({
+      verb: null,
+      body: "ls -la",
+      isShellCommand: true,
+    });
+    expect(formatToolTitle("mcp__omnigent__sys_os_read", { path: "a.py" })).toEqual({
+      verb: "Read",
+      body: "a.py",
+      filePath: "a.py",
     });
   });
 
@@ -35,6 +59,14 @@ describe("formatToolTitle", () => {
     });
     expect(formatToolTitle("sys_session_close", args)).toEqual({
       verb: "Close child session:",
+      body: "'researcher - auth'",
+    });
+  });
+
+  it("formats sys_session_send in the named spawn schema's agent/title form", () => {
+    const args = { agent: "researcher", title: "auth", args: { input: "Audit login" } };
+    expect(formatToolTitle("sys_session_send", args)).toEqual({
+      verb: "Start child session:",
       body: "'researcher - auth'",
     });
   });
@@ -119,22 +151,56 @@ describe("formatToolTitle", () => {
     });
   });
 
-  it("falls back to `name(argsSummary)` (no bold verb) for unknown tools", () => {
-    expect(formatToolTitle("my_custom_tool", { x: 1 }, '{"x":1}')).toEqual({
-      verb: null,
-      body: 'my_custom_tool({"x":1})',
+  it("humanizes an unknown tool's name and lists its key argument values", () => {
+    // WHY: a tool without a formatter still reads as an action, not as `name({json})`.
+    const todoList = [
+      { id: 1, title: "Find review workflow", status: "completed" },
+      { id: 2, title: "Fetch open PRs", status: "in-progress" },
+    ];
+    expect(formatToolTitle("manage_todo_list", { operation: "write", todoList })).toEqual({
+      verb: "Manage todo list",
+      body: "write · 2 items",
+      toolName: "manage_todo_list",
+    });
+    expect(formatToolTitle("my_custom_tool", {})).toEqual({
+      verb: "My custom tool",
+      body: "",
+      toolName: "my_custom_tool",
     });
   });
 
-  it("falls back to bare name when argsSummary is missing or empty", () => {
-    expect(formatToolTitle("my_custom_tool", {})).toEqual({
-      verb: null,
-      body: "my_custom_tool",
+  it("names the MCP server separately from the tool", () => {
+    expect(
+      formatToolTitle("mcp__linear__get_issue", { id: "OMNI-12243", includeComments: false }),
+    ).toEqual({
+      verb: "Get issue",
+      body: "OMNI-12243",
+      server: "linear",
+      toolName: "mcp__linear__get_issue",
     });
-    expect(formatToolTitle("my_custom_tool", {}, "")).toEqual({
-      verb: null,
-      body: "my_custom_tool",
+    expect(formatToolTitle("github__create_pull_request", { owner: "omnigent-ai" })).toEqual({
+      verb: "Create pull request",
+      body: "omnigent-ai",
+      server: "github",
+      toolName: "github__create_pull_request",
     });
+    // A list of fields to return shapes the result, so it is not counted as "5 items".
+    expect(
+      formatToolTitle("mcp__linear__get_issue", {
+        id: "OMNI-13632",
+        fields: ["id", "title", "description", "status", "labels"],
+      }).body,
+    ).toBe("OMNI-13632");
+    expect(formatToolTitle("search_records", { query: "x", selectColumns: ["a", "b"] }).body).toBe(
+      "x",
+    );
+    expect(formatToolTitle("get_issue", { issue: "OMNI-1", fields: "summary,status" }).body).toBe(
+      "OMNI-1",
+    );
+    // `include` names what the call is about (a path glob), not which fields come back.
+    expect(formatToolTitle("search_code", { include: ["src/**/*.ts"] }).body).toBe("src/**/*.ts");
+    // A formatter for a built-in name does not apply to another server's tool.
+    expect(formatToolTitle("mcp__search__web_search", { query: "x" }).verb).toBe("Web search");
   });
 
   it("formats Claude Code native tools like the CLI's step lines", () => {
@@ -146,6 +212,7 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("Bash", { command: "ls docs" })).toEqual({
       verb: null,
       body: "ls docs",
+      isShellCommand: true,
     });
     expect(formatToolTitle("Read", { file_path: "/repo/README.md" })).toEqual({
       verb: "Read",
@@ -175,6 +242,7 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("shell", { command: "/bin/bash -lc 'cat notes.txt'" })).toEqual({
       verb: null,
       body: "cat notes.txt",
+      isShellCommand: true,
     });
     expect(
       formatToolTitle("apply_patch", {
@@ -201,6 +269,7 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("bash", { command: "cat notes.txt" })).toEqual({
       verb: null,
       body: "cat notes.txt",
+      isShellCommand: true,
     });
     expect(formatToolTitle("read", { filePath: "/repo/notes.txt" })).toEqual({
       verb: "Read",
@@ -220,18 +289,17 @@ describe("formatToolTitle", () => {
   });
 
   it("falls back when a known tool's required arg is missing or wrong-typed", () => {
-    expect(formatToolTitle("sys_os_shell", {}, "fallback")).toEqual({
-      verb: null,
-      body: "sys_os_shell(fallback)",
+    expect(formatToolTitle("sys_os_shell", {})).toEqual({
+      verb: "OS shell",
+      body: "",
+      toolName: "sys_os_shell",
     });
-    expect(formatToolTitle("sys_session_send", { tool: "r" }, "{tool:r}")).toEqual({
-      verb: null,
-      body: "sys_session_send({tool:r})",
+    expect(formatToolTitle("sys_session_send", { tool: "r" })).toEqual({
+      verb: "Send session",
+      body: "r",
+      toolName: "sys_session_send",
     });
-    expect(formatToolTitle("sys_os_shell", { command: 42 }, "{command:42}")).toEqual({
-      verb: null,
-      body: "sys_os_shell({command:42})",
-    });
+    expect(formatToolTitle("sys_os_shell", { command: 42 }).body).toBe("");
   });
 });
 
@@ -309,5 +377,186 @@ describe("formatToolRunLabel", () => {
     expect(formatToolRunLabel([call("turn_diff")])).toBe("Called 1 tool");
     expect(formatToolRunLabel([call("TodoWrite")])).toBe("Called 1 tool");
     expect(formatToolRunLabel([call("alpha_tool"), call("beta_tool")])).toBe("Called 2 tools");
+  });
+});
+
+describe("shellToolCall", () => {
+  const commandOf = (name: string, args: Record<string, unknown>) =>
+    shellToolCall(name, args)?.command ?? null;
+
+  it("returns the command for shell tools only", () => {
+    expect(commandOf("shell", { command: "/bin/zsh -lc 'pnpm install'" })).toBe("pnpm install");
+    expect(commandOf("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toBe("ls -la");
+    expect(commandOf("Bash", { command: "git status", description: "Check" })).toBe("git status");
+    expect(commandOf("Read", { command: "ls" })).toBeNull();
+    expect(commandOf("Bash", { command: 42 })).toBeNull();
+    // OpenAI's local_shell passes an argv array, which has no single command line.
+    expect(commandOf("local_shell", { command: ["ls", "-la"] })).toBeNull();
+  });
+
+  it("only unwraps Codex's shell, and keeps commands that are not one quoted word", () => {
+    // Claude ran this wrapper itself, so it is shown and copied as run.
+    expect(commandOf("Bash", { command: "bash -c 'make test'" })).toBe("bash -c 'make test'");
+    // Only `a` runs inside sh; stripping the outer quotes would mangle the rest.
+    expect(commandOf("shell", { command: "sh -c 'a' && echo 'b'" })).toBe("sh -c 'a' && echo 'b'");
+    expect(commandOf("shell", { command: String.raw`/bin/bash -lc 'echo '\''hi'\'''` })).toBe(
+      "echo 'hi'",
+    );
+    expect(commandOf("shell", { command: String.raw`/bin/zsh -lc "echo \"a b\""` })).toBe(
+      'echo "a b"',
+    );
+    // An empty wrapped command shows the wrapper rather than nothing.
+    expect(commandOf("shell", { command: "/bin/bash -lc ''" })).toBe("/bin/bash -lc ''");
+  });
+
+  it.each([
+    ["sys_os_shell", "sys-os-json"],
+    ["mcp__omnigent__sys_os_shell", "sys-os-json"],
+    ["shell", "codex-suffix"],
+    ["Bash", "plain"],
+    ["bash", "plain"],
+  ])("reads %s output as %s", (name, format) => {
+    expect(shellToolCall(name, { command: "ls" })?.outputFormat).toBe(format);
+  });
+});
+
+describe("splitEnvPrefix", () => {
+  it.each([
+    [
+      'PATH="$HOME/bin:$PATH" pnpm install',
+      { env: 'PATH="$HOME/bin:$PATH" ', rest: "pnpm install" },
+    ],
+    ["FOO=1 BAR='a b' make test", { env: "FOO=1 BAR='a b' ", rest: "make test" }],
+    ["git status", { env: "", rest: "git status" }],
+    // Assignments with no program after them are not a prefix.
+    ["FOO=1", { env: "", rest: "FOO=1" }],
+    ["FOO=1 BAR=2", { env: "", rest: "FOO=1 BAR=2" }],
+    // Never split inside a value.
+    ['FOO="a b"c make', { env: "", rest: 'FOO="a b"c make' }],
+    ["FOO=$(a b) cmd", { env: "", rest: "FOO=$(a b) cmd" }],
+    ["FOO=a;b cmd", { env: "", rest: "FOO=a;b cmd" }],
+    ["FOO=a&&b cmd", { env: "", rest: "FOO=a&&b cmd" }],
+    ["FOO=a|b cmd", { env: "", rest: "FOO=a|b cmd" }],
+  ])("splits %s", (command, expected) => {
+    expect(splitEnvPrefix(command)).toEqual(expected);
+  });
+});
+
+describe("shellCommandPreview", () => {
+  it("shows a one-line command as it is", () => {
+    expect(shellCommandPreview("ls -la")).toEqual({ firstLine: "ls -la", moreLines: 0 });
+  });
+
+  it("counts the non-blank lines after the first", () => {
+    expect(shellCommandPreview("git diff --check\n\ngit status --short\nls\n")).toEqual({
+      firstLine: "git diff --check",
+      moreLines: 2,
+    });
+  });
+
+  it("drops a trailing backslash from the first line", () => {
+    expect(shellCommandPreview("pnpm test \\\n  --filter web")).toEqual({
+      firstLine: "pnpm test",
+      moreLines: 1,
+    });
+  });
+
+  it("skips leading comment lines", () => {
+    expect(shellCommandPreview("# Inspect the tree\ngit status")).toEqual({
+      firstLine: "git status",
+      moreLines: 1,
+    });
+  });
+
+  it("keeps a comment-only script", () => {
+    expect(shellCommandPreview("# nothing to run\n")).toEqual({
+      firstLine: "# nothing to run",
+      moreLines: 0,
+    });
+  });
+});
+
+describe("splitToolName", () => {
+  it.each([
+    ["mcp__linear__get_issue", { server: "linear", tool: "get_issue" }],
+    ["mcp__databricks-v2__list_files", { server: "databricks-v2", tool: "list_files" }],
+    ["mcp__omnigent__sys_os_read", { tool: "sys_os_read" }],
+    // SDK harnesses name a spec-declared MCP server's tools `server__tool`; the
+    // model sees them proxied through Omnigent's MCP server.
+    ["linear__get_issue", { server: "linear", tool: "get_issue" }],
+    ["mcp__omnigent__linear__get_issue", { server: "linear", tool: "get_issue" }],
+    // Goose names its tools by MCP extension, so its shell gets the extension's tag.
+    ["developer__shell", { server: "developer", tool: "shell" }],
+    // Underscores around the separator are not a server name.
+    ["a___b", { tool: "a___b" }],
+    ["__init__", { tool: "__init__" }],
+    ["manage_todo_list", { tool: "manage_todo_list" }],
+  ])("splits %s", (name, expected) => {
+    expect(splitToolName(name)).toEqual(expected);
+  });
+});
+
+describe("humanizeToolName", () => {
+  it.each([
+    ["manage_todo_list", undefined, "Manage todo list"],
+    ["getPullRequest", undefined, "Get pull request"],
+    // A trailing verb moves to the front so the label reads as an action.
+    ["sys_scheduled_task_create", undefined, "Create scheduled task"],
+    ["session_rename", undefined, "Rename session"],
+    // A repeat of the server name is dropped; acronyms keep their case.
+    ["slack_read_api_call", "slack", "Read API call"],
+    ["databricks_jobs", "databricks-v2", "Jobs"],
+    ["turn_diff", undefined, "Turn diff"],
+  ])("%s on %s reads as %s", (tool, server, expected) => {
+    expect(humanizeToolName(tool, server)).toBe(expected);
+  });
+
+  it("keeps a name that is only the server's name", () => {
+    expect(humanizeToolName("slack", "slack")).toBe("Slack");
+  });
+});
+
+describe("summarizeArgs", () => {
+  it("lists short strings, id-like numbers and list sizes in argument order", () => {
+    expect(
+      summarizeArgs({
+        owner: "omnigent-ai",
+        pull_number: 11532,
+        labels: ["bug", "web"],
+        reviewers: ["a", "b", "c", "d"],
+      }),
+    ).toBe("omnigent-ai · 11532 · bug, web");
+    expect(summarizeArgs({ files: [{ path: "a" }] })).toBe("1 item");
+  });
+
+  it("leaves bodies, bare counts, flags, objects and secrets for the expanded view", () => {
+    expect(
+      summarizeArgs({
+        api_key: "sk-123",
+        content: "line one\nline two",
+        limit: 20,
+        draft: true,
+        params: { channel: "C1" },
+        empty: [],
+        query: "is:open",
+      }),
+    ).toBe("is:open");
+  });
+
+  it("leaves credential-like arguments out, matching whole words", () => {
+    expect(
+      summarizeArgs({
+        session_token: "t1",
+        cookie: "c1",
+        access_key: "k1",
+        passphrase: "p1",
+        clientSecret: "s1",
+        author: "pat",
+      }),
+    ).toBe("pat");
+  });
+
+  it("caps the summary at three values", () => {
+    expect(summarizeArgs({ a: "1", b: "2", c: "3", d: "4" })).toBe("1 · 2 · 3");
   });
 });

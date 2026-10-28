@@ -604,5 +604,33 @@ class GitLabPullRequests:
         del root, reference, add, remove
         raise ValueError("Editing GitLab merge request reviewers is not supported yet.")
 
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Reject comment posting for this provider."""
+        del root, reference, body
+        raise ValueError("Posting comments for this provider is not supported yet.")
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        del root, reference, title, body
+        raise ValueError("Editing GitLab merge request descriptions is not supported yet.")
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        del root, reference, name, content_type, content
+        raise ValueError("Attaching files to GitLab merge requests is not supported yet.")
+
 
 PULL_REQUESTS: PullRequestFacet = GitLabPullRequests()
