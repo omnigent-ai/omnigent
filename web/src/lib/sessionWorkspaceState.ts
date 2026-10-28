@@ -45,6 +45,8 @@ export interface SessionWorkspaceState {
   /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
    *  by design: side chats are ephemeral and vanish when the app is closed. */
   openSideChats?: string[];
+  /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
+  openSubagentTabs?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
   /** Split panes of the main terminal view; absent while unsplit. */
@@ -137,6 +139,15 @@ function sanitize(entry: unknown): SessionWorkspaceState {
       ),
     ];
   }
+  if (Array.isArray(record.openSubagentTabs)) {
+    state.openSubagentTabs = [
+      ...new Set(
+        record.openSubagentTabs.filter(
+          (value): value is string => typeof value === "string" && value.length > 0,
+        ),
+      ),
+    ];
+  }
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
@@ -165,12 +176,15 @@ function readStore(): Store {
   }
 }
 
-function writeStore(store: Store): void {
-  if (typeof window === "undefined") return;
+/** Persist the store; false when storage refused the write. */
+function writeStore(store: Store): boolean {
+  if (typeof window === "undefined") return false;
   try {
     window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
+    return true;
   } catch {
     // Storage quota/access errors must not break panel interactions.
+    return false;
   }
 }
 
@@ -180,11 +194,11 @@ export function readSessionWorkspaceState(conversationId: string): SessionWorksp
   return entry ? entry.state : {};
 }
 
-/** Merge a partial update into one session's persisted workspace state. */
-export function writeSessionWorkspaceState(
+/** Like {@link writeSessionWorkspaceState}, but returns false when storage refused the write. */
+export function saveSessionWorkspaceState(
   conversationId: string,
   patch: SessionWorkspaceState,
-): void {
+): boolean {
   const store = readStore();
   const existingIdx = store.findIndex((e) => e.id === conversationId);
   const prev = existingIdx >= 0 ? store[existingIdx].state : {};
@@ -206,6 +220,9 @@ export function writeSessionWorkspaceState(
   if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {
     next.openSideChats = next.openSideChats.slice(-MAX_OPEN_FILES);
   }
+  if (next.openSubagentTabs && next.openSubagentTabs.length > MAX_OPEN_FILES) {
+    next.openSubagentTabs = next.openSubagentTabs.slice(-MAX_OPEN_FILES);
+  }
   // Drop any existing entry and re-append so the most-recently-touched session
   // moves to the end; pruning then evicts from the front (oldest-touched).
   if (existingIdx >= 0) store.splice(existingIdx, 1);
@@ -213,7 +230,15 @@ export function writeSessionWorkspaceState(
   if (store.length > MAX_SESSIONS) {
     store.splice(0, store.length - MAX_SESSIONS);
   }
-  writeStore(store);
+  return writeStore(store);
+}
+
+/** Merge a partial update into one session's persisted workspace state. */
+export function writeSessionWorkspaceState(
+  conversationId: string,
+  patch: SessionWorkspaceState,
+): void {
+  saveSessionWorkspaceState(conversationId, patch);
 }
 
 /** Let existing chats follow a changed default while keeping their open tabs and layout. */

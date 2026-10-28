@@ -394,6 +394,13 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+With Settings → General → **Open sub-agents in the Workspace panel** on, a
+plain click on a sub-agent (transcript link, composer indicator, Agents row or
+graph node) opens it as a tab in the same strip, marked with a bot icon, and
+reveals the panel; ancestors still open full screen. The tab's **Open full
+screen** link opens the sub-agent's own page. Claude Code and closed sub-agents
+are read-only there too. Closing a sub-agent tab only hides it; the sub-agent
+keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.

@@ -1,20 +1,28 @@
-import { useCallback, useEffect, useState } from "react";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { readSessionWorkspaceState, saveSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { newPendingSideChatId } from "@/lib/sideChat";
+import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 
 interface SideChatTabsState {
   /** Open side-chat child conversation ids, in open order. */
   tabs: string[];
-  /** The selected side-chat tab, or null when another rail view is active. */
+  /** Open sub-agent tabs (`subagentTabId` values), in open order. */
+  subagentTabs: string[];
+  /** The selected tab of either kind, or null when another rail view is active. */
   selected: string | null;
 }
 
 function readSideChatTabsState(conversationId: string): SideChatTabsState {
   const saved = readSessionWorkspaceState(conversationId);
   const tabs = saved.openSideChats ?? [];
+  const subagentTabs = (saved.openSubagentTabs ?? []).filter(
+    (id) => subagentSessionIdFromTab(id) !== null,
+  );
+  const selected = saved.selectedSideChatId ?? "";
   return {
     tabs,
-    selected: tabs.includes(saved.selectedSideChatId ?? "") ? saved.selectedSideChatId! : null,
+    subagentTabs,
+    selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
   };
 }
 
@@ -28,26 +36,38 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
  * Opening (`open`) just records an already-created child id as a tab — the
  * child itself is created by the server (Codex's native ephemeral fork, or the
  * generic `POST /v1/sessions/{id}/side-chat`) and surfaced here once its
- * `session_created` event arrives.
+ * `session_created` event arrives. Sub-agent tabs (`subagentTabId` ids) are
+ * kept in their own list and listed after the side chats.
  *
  * @param conversationId The parent (main) conversation whose rail owns these tabs.
  */
 export function useSideChats(conversationId: string) {
   const [state, setState] = useState(() => readSideChatTabsState(conversationId));
+  // Tabs a failed storage write couldn't save. Changes build on these until a
+  // write succeeds, then on storage again so other windows' changes are kept.
+  const unsaved = useRef<{ conversationId: string; state: SideChatTabsState } | null>(null);
   // WorkspacePanel isn't remounted when the user navigates to another
   // conversation (conversationId is a prop, not a key), so reload this
   // conversation's own tabs on change — otherwise the previous conversation's
   // side-chat tabs would linger in the new one's rail.
   useEffect(() => {
+    unsaved.current = null;
     setState(readSideChatTabsState(conversationId));
   }, [conversationId]);
   const update = useCallback(
     (mutate: (current: SideChatTabsState) => SideChatTabsState) => {
-      const next = mutate(readSideChatTabsState(conversationId));
-      writeSessionWorkspaceState(conversationId, {
+      const base =
+        unsaved.current?.conversationId === conversationId
+          ? unsaved.current.state
+          : readSideChatTabsState(conversationId);
+      const next = mutate(base);
+      const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
+        // Omitted when empty, so a session without sub-agent tabs is stored as before.
+        openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
       });
+      unsaved.current = saved ? null : { conversationId, state: next };
       setState(next);
     },
     [conversationId],
@@ -65,7 +85,7 @@ export function useSideChats(conversationId: string) {
    *  closed and the real child's tab takes over. */
   const openPending = useCallback((): string => {
     const id = newPendingSideChatId();
-    update((current) => ({ tabs: [...current.tabs, id], selected: id }));
+    update((current) => ({ ...current, tabs: [...current.tabs, id], selected: id }));
     return id;
   }, [update]);
 
@@ -74,10 +94,15 @@ export function useSideChats(conversationId: string) {
    *  `session_created`, so `open` can be reached twice for one child). */
   const open = useCallback(
     (childId: string) =>
-      update((current) => ({
-        tabs: current.tabs.includes(childId) ? current.tabs : [...current.tabs, childId],
-        selected: childId,
-      })),
+      update((current) => {
+        const key = subagentSessionIdFromTab(childId) === null ? "tabs" : "subagentTabs";
+        const list = current[key];
+        return {
+          ...current,
+          [key]: list.includes(childId) ? list : [...list, childId],
+          selected: childId,
+        };
+      }),
     [update],
   );
 
@@ -92,29 +117,47 @@ export function useSideChats(conversationId: string) {
         if (index === -1) return current;
         const selected = current.selected === oldId ? newId : current.selected;
         if (current.tabs.includes(newId)) {
-          return { tabs: current.tabs.filter((id) => id !== oldId), selected };
+          return { ...current, tabs: current.tabs.filter((id) => id !== oldId), selected };
         }
         const tabs = [...current.tabs];
         tabs[index] = newId;
-        return { tabs, selected };
+        return { ...current, tabs, selected };
       }),
     [update],
   );
 
   /** Close a tab. Drops only the client-side reference — an ephemeral Codex
-   *  fork dies with its process, and a generic child stays hidden server-side. */
+   *  fork dies with its process, and a generic child stays hidden server-side.
+   *  A closed selected tab hands the selection to its left neighbour in the strip. */
   const close = useCallback(
     (childId: string) =>
       update((current) => {
-        const index = current.tabs.indexOf(childId);
+        const strip = [...current.tabs, ...current.subagentTabs];
+        const index = strip.indexOf(childId);
         if (index === -1) return current;
-        const tabs = current.tabs.filter((id) => id !== childId);
+        const remaining = strip.filter((id) => id !== childId);
         const selected =
-          current.selected === childId ? (tabs[Math.max(0, index - 1)] ?? null) : current.selected;
-        return { tabs, selected };
+          current.selected === childId
+            ? (remaining[Math.max(0, index - 1)] ?? null)
+            : current.selected;
+        return {
+          tabs: current.tabs.filter((id) => id !== childId),
+          subagentTabs: current.subagentTabs.filter((id) => id !== childId),
+          selected,
+        };
       }),
     [update],
   );
 
-  return { tabs: state.tabs, selected: state.selected, open, openPending, rekey, close, select };
+  // Side chats, then sub-agent tabs: the order the strip shows them in.
+  const tabs = useMemo(() => [...state.tabs, ...state.subagentTabs], [state]);
+  return {
+    tabs,
+    selected: state.selected,
+    open,
+    openPending,
+    rekey,
+    close,
+    select,
+  };
 }
