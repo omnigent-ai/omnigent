@@ -1681,16 +1681,31 @@ def _inline_family_pi_provider(
         )
     if unpinned_gateway is None:
         return None
-    enumerated = _databricks_gateway_pi_provider(
-        gateway_base_url=unpinned_gateway.base_url,
-        model=None,
-        auth_command=unpinned_gateway.auth_command,
-        static_api_key=unpinned_gateway.api_key,
-    )
+    try:
+        enumerated = _databricks_gateway_pi_provider(
+            gateway_base_url=unpinned_gateway.base_url,
+            model=None,
+            auth_command=unpinned_gateway.auth_command,
+            static_api_key=unpinned_gateway.api_key,
+        )
+    except ModelResolutionError:
+        # Neither the catalog nor the listing names a Claude default.
+        return None
+    listed_ids = [
+        model_id
+        for entries in (
+            enumerated.extra_models,
+            *(provider["models"] for provider in enumerated.additional_providers.values()),
+        )
+        for listed in entries
+        if isinstance((model_id := listed.get("id")), str)
+    ]
     # Without a listing there is no model the workspace is known to serve.
-    if enumerated.extra_models or enumerated.additional_providers:
-        return enumerated
-    return None
+    if not listed_ids:
+        return None
+    if enumerated.model not in listed_ids:
+        return replace(enumerated, model=listed_ids[0])
+    return enumerated
 
 
 def resolve_pi_native_provider(
