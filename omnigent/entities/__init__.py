@@ -42,6 +42,7 @@ from omnigent.entities.session_resources import (
     get_resource_by_id,
     resolve_terminal_entry_by_resource_id,
 )
+from omnigent.entities.skill import InstalledSkill, SkillSource
 
 __all__ = [
     "DEFAULT_ENVIRONMENT_ID",
@@ -62,6 +63,7 @@ __all__ = [
     "FunctionCallData",
     "FunctionCallOutputData",
     "GithubConnection",
+    "InstalledSkill",
     "ItemData",
     "LoadedAgent",
     "MessageData",
@@ -79,6 +81,7 @@ __all__ = [
     "ScheduledTaskRun",
     "SessionPermission",
     "SessionResourceView",
+    "SkillSource",
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
