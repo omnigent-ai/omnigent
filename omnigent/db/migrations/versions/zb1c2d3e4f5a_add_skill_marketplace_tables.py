@@ -1,7 +1,7 @@
 """Add the skills marketplace tables.
 
 Revision ID: zb1c2d3e4f5a
-Revises: b2e4f6a8c013
+Revises: d0a1f879a01d
 Create Date: 2026-10-28 00:00:00.000000
 
 Creates ``skill_sources`` (repositories the marketplace browses) and
@@ -26,7 +26,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "zb1c2d3e4f5a"
-down_revision: str | None = "b2e4f6a8c013"
+down_revision: str | None = "d0a1f879a01d"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

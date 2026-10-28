@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.db_models import SqlInstalledSkill, SqlSkillSource
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
 
-PREVIOUS = "b2e4f6a8c013"
+PREVIOUS = "d0a1f879a01d"
 TABLES = {"skill_sources", "installed_skills"}
 INDEXES = {
     "skill_sources": {"ix_skill_sources_order", "ix_skill_sources_identity"},
