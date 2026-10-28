@@ -31,8 +31,10 @@ import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
+import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
@@ -1950,7 +1952,7 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
-  it("reflects the docked sidebar's open state on the app shell for CSS to key off", () => {
+  it("reflects the docked sidebar state and width on the app shell", () => {
     // The maximized rail's traffic-light clearance (index.css) must drop when
     // the sidebar is reopened over it — the sidebar then covers the window
     // corner, so there are no lights to clear. That CSS keys off
@@ -1965,11 +1967,14 @@ describe("Workspace rail maximize", () => {
     // `:not([data-sidebar-open])` matches and the clearance still applies.
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(shell?.hasAttribute("data-sidebar-open")).toBe(false);
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("0px");
 
-    // Reopen the sidebar: the attribute appears, dropping the clearance.
+    // Reopen the sidebar: the attribute appears, dropping the clearance, and
+    // the background reservation expands to the live sidebar width.
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("320px");
   });
 
   it.each([
@@ -2154,6 +2159,121 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" }).className).not.toContain(
       "md:absolute",
     );
+  });
+});
+
+describe("Sidebar across the md breakpoint", () => {
+  // Resizable viewport: matchMedia answers the md queries from `width` and
+  // fires change listeners for the queries a resize flips.
+  function mockViewportWidth(initialWidth: number) {
+    let width = initialWidth;
+    const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
+    const matches = (query: string) => {
+      if (query === "(min-width: 768px)") return width >= 768;
+      if (query === "(max-width: 767.98px)") return width < 768;
+      return false;
+    };
+    const baseMatchMedia = window.matchMedia;
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
+      ...baseMatchMedia(query),
+      matches: matches(query),
+      addEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+        if (!listeners.has(query)) listeners.set(query, new Set());
+        listeners.get(query)?.add(listener);
+      },
+      removeEventListener: (_type: string, listener: EventListenerOrEventListenerObject) => {
+        listeners.get(query)?.delete(listener);
+      },
+    }));
+    onTestFinished(() => matchMedia.mockRestore());
+    return (nextWidth: number) =>
+      act(() => {
+        const before = new Map([...listeners.keys()].map((query) => [query, matches(query)]));
+        width = nextWidth;
+        for (const [query, queryListeners] of listeners) {
+          const event = { matches: matches(query), media: query } as MediaQueryListEvent;
+          if (before.get(query) === event.matches) continue;
+          for (const listener of queryListeners) {
+            if (typeof listener === "function") listener(event);
+            else listener.handleEvent(event);
+          }
+        }
+      });
+  }
+
+  it("closes an open sidebar when the window narrows and reopens it on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+
+    resize(740);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps a sidebar the user closed closed across the breakpoint", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(740);
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("keeps a drawer the user closed while narrow closed on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores the open sidebar after leaving settings entered while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    resize(1280);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("does not open a drawer when leaving settings while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByTestId("nav-settings"));
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("keeps the settings menu open when the window narrows on /settings", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([]);
+    renderShell("/settings");
+
+    resize(740);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 });
 
@@ -2922,6 +3042,57 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("persists a link's new browser tab when its session changes before navigation accepts", async () => {
+    const accepted = deferredRequest<{ ok: boolean }>();
+    const browserOpenOrNavigate = vi.fn().mockReturnValue(accepted.promise);
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate,
+      setBadgeCount: vi.fn(),
+    });
+    writeOpenLinksInApp(true);
+    writeSessionWorkspaceState("conv_from", {
+      rightRailTab: "browser",
+      openBrowsers: [AGENT_BROWSER_TAB_ID],
+      selectedBrowserId: AGENT_BROWSER_TAB_ID,
+    });
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    try {
+      render(sessionShellTree(queryClient, "/c/conv_from", <SessionNavButton to="/c/conv_to" />));
+      expect(maybeOpenLinkInApp("conv_from", "https://example.com/page")).toBe(true);
+      fireEvent.click(screen.getByTestId("nav-session"));
+      await act(async () => accepted.resolve({ ok: true }));
+
+      const saved = readSessionWorkspaceState("conv_from");
+      expect(saved.selectedBrowserId).toEqual(expect.any(String));
+      expect(saved.selectedBrowserId).not.toBe(AGENT_BROWSER_TAB_ID);
+      expect(saved.openBrowsers).toEqual([AGENT_BROWSER_TAB_ID, saved.selectedBrowserId]);
+      expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+        browserViewId("conv_from", saved.selectedBrowserId!),
+        "https://example.com/page",
+        undefined,
+        { agent: true },
+      );
+      expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+      expect(readSessionWorkspaceState("conv_to").openBrowsers ?? []).toEqual([]);
+
+      cleanup();
+      renderShell("/c/conv_from");
+      expect(screen.getByRole("tab", { name: "Browser 2" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     } finally {
       cleanup();
       vi.unstubAllGlobals();
@@ -4311,6 +4482,56 @@ describe("AppShell clone/fork action", () => {
       expect(forkSessionMock).not.toHaveBeenCalled();
     },
   );
+
+  it("disables directory recovery for an Arclet session that forks only onto a new Arclet", async () => {
+    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_arclet",
+        workspace: "/missing/repo",
+        hostId: "host_arclet",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_arclet",
+          name: "Arclet",
+          owner: "owner",
+          status: "online",
+          sandbox_provider: "arclet",
+        },
+      ],
+    } as ReturnType<typeof useHosts>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider
+        info={serverInfo({ managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] })}
+      >
+        {sessionShellTree(
+          client,
+          "/c/conv_arclet",
+          <ConversationScopeContext.Provider value="conv_arclet">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>,
+        )}
+      </CapabilitiesProvider>,
+    );
+
+    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(recover).toBeDisabled();
+    fireEvent.focus(screen.getByRole("group", { name: "Continue in another directory…" }));
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "This sandbox session can only be cloned onto a new sandbox.",
+      ),
+    );
+    fireEvent.click(recover);
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
 
   it("opens workspace recovery and resets it before a later normal fork", async () => {
     const source = sessionSnapshot({

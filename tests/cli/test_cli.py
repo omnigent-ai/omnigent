@@ -85,6 +85,7 @@ from omnigent.runner.identity import (
     RUNNER_WORKSPACE_ENV_VAR,
     token_bound_runner_id,
 )
+from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.util.tunnel_limits import (
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
@@ -2410,6 +2411,115 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     assert captured["create_app_kwargs"]["server_config"] == {
         "session_title_instructions": "Prefix titles with the current date."
     }
+
+
+def test_server_preserves_explicit_builtin_agent_through_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Built-in refresh must not replace a bundle supplied with ``--agent``."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    from omnigent.runtime import get_agent_cache
+
+    agent_dir = tmp_path / "polly"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "polly",
+            "description": "Explicitly registered bundle.",
+            "executor": {
+                "type": "omnigent",
+                "model": "test-codex-model",
+                "config": {"harness": "codex"},
+            },
+        },
+    )
+    observed: dict[str, Any] = {}
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app):
+            agent_store = self.config.app.state.agent_store
+            agent = agent_store.get_by_name("polly")
+            assert agent is not None
+            observed["spec"] = get_agent_cache().load(agent.id, agent.bundle_location).spec
+            assert agent_store.get_by_name("debby") is not None
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+            "--agent",
+            str(agent_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["spec"].executor.config["harness"] == "codex"
+    assert observed["spec"].executor.model == "test-codex-model"
+    assert observed["spec"].description == "Explicitly registered bundle."
+
+
+def test_server_with_agent_flag_hides_trimmed_builtins(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``--agent`` startup still hides trimmed built-ins, but never the explicit bundle."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    agent_dir = tmp_path / "polly"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "polly",
+            "executor": {
+                "type": "omnigent",
+                "model": "test-codex-model",
+                "config": {"harness": "codex"},
+            },
+        },
+    )
+    observed: dict[str, frozenset[str]] = {}
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app):
+            observed["suppressed"] = self.config.app.state.suppressed_agent_names
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+            "--agent",
+            str(agent_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert "debby" in observed["suppressed"]
+    assert "polly" not in observed["suppressed"]
 
 
 def test_server_explicit_config_overrides_omnigent_config_env(

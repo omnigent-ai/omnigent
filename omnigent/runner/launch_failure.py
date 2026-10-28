@@ -185,6 +185,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+    # The gateway launcher checks the installed Claude Code before it starts it.
+    _TerminalMatcher(
+        "gateway_claude_too_old",
+        lambda s: s.output_contains_any(("ug requires claude code",)),
+        FailureDiagnosis(
+            title="Claude Code is too old for the Databricks gateway",
+            cause=(
+                "The gateway launcher needs a newer Claude Code than the one installed, "
+                "and it does not update a copy that a package manager manages."
+            ),
+            remediation=(
+                "Update Claude Code on the host using the same installer or package manager "
+                "you used to install it, then send your message again."
+            ),
+        ),
+    ),
 )
 
 
@@ -236,6 +252,10 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "currently experiencing high demand, which may cause temporary errors",
+)
+_CLAUDE_RESPONSE_STOPPED_MESSAGE = (
+    "api error: the response stopped arriving. the response above may be incomplete."
 )
 # 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
 _TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
@@ -288,6 +308,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         status in _TRANSIENT_UPSTREAM_STATUSES
         or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
         or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
+        or lowered.strip().removesuffix(".") == "request timed out"
+        or lowered.strip() == _CLAUDE_RESPONSE_STOPPED_MESSAGE
     ):
         return "transient_upstream_error"
     return code
@@ -339,6 +361,9 @@ _MODEL_UNAVAILABLE_MARKER = "issue with the selected model"
 # `404 {"type":"error","error":{"type":"not_found_error","message":"model: <id>"}}`.
 _ANTHROPIC_MODEL_NOT_FOUND = re.compile(r'"message"\s*:\s*"model:\s*[^"\s]+"', re.IGNORECASE)
 _NOT_FOUND_STATUS = re.compile(r"\b404\b|not_found_error", re.IGNORECASE)
+# Claude Code's stop category when its hook carries no error text, e.g.
+# "Claude Code ended the turn with an API error (model_not_found)."
+_CLAUDE_STOP_MODEL_NOT_FOUND = re.compile(r"API error \(model_not_found\)", re.IGNORECASE)
 # OpenAI's rejection of an unknown or inaccessible model id; the prose form must
 # name the model so other "does not exist" resource errors stay unlabeled.
 _OPENAI_MODEL_NOT_FOUND = re.compile(
@@ -350,6 +375,8 @@ _OPENAI_MODEL_NOT_FOUND = re.compile(
 
 def _is_model_unavailable(message: str) -> bool:
     if _MODEL_UNAVAILABLE_MARKER in message.lower():
+        return True
+    if _CLAUDE_STOP_MODEL_NOT_FOUND.search(message):
         return True
     if _OPENAI_MODEL_NOT_FOUND.search(message):
         return True
