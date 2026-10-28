@@ -1089,7 +1089,7 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("intervening_event", ["none", "hook", "new-turn"])
+@pytest.mark.parametrize("intervening_event", ["none", "failed-hook", "idle-hook", "new-turn"])
 async def test_queued_fallback_failure_preserves_newer_turn_state(
     tmp_path: Path, intervening_event: str
 ) -> None:
@@ -1101,7 +1101,9 @@ async def test_queued_fallback_failure_preserves_newer_turn_state(
     await asyncio.sleep(0)
     poller.emit("failed")
     if intervening_event != "none":
-        registry.note_external_session_status(session_id, "failed")
+        registry.note_external_session_status(
+            session_id, "idle" if intervening_event == "idle-hook" else "failed"
+        )
     if intervening_event == "new-turn":
         registry.note_session_turn_started(session_id)
     await asyncio.sleep(0)
