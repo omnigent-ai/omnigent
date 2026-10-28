@@ -36,7 +36,6 @@ import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
-import { isPathologicalText } from "@/lib/markdownLimits";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import {
@@ -510,9 +509,53 @@ const FILE_PATH_AWARE_COMPONENTS = {
 // final text still appears within this window of the last token.
 const STREAM_MARKDOWN_THROTTLE_MS = 100;
 
-// Hard cap on what the plain-text fallback paints, so a multi-MB payload
-// can't blow up the DOM; the rest is elided.
+// Defense-in-depth against a pathological text block locking the tab.
+// A user message whose text is a ~50KB unbroken base64 data URL
+// — e.g. an image block accidentally serialized into the text stream — both
+// jams the full markdown pipeline (Shiki/KaTeX/mermaid + rehype) on the main
+// thread AND forces the browser to lay out one ~50K-char line with no break
+// opportunities. Either heuristic below routes such a block to plain,
+// break-anywhere rendering that bypasses markdown entirely.
+//
+// `MAX_MARKDOWN_TEXT_LENGTH`: total size above which we never run markdown.
+// `MAX_UNBROKEN_TOKEN_LENGTH`: longest run of non-whitespace chars above which
+//   layout becomes pathological regardless of total size (base64, long URLs).
+// `MAX_PLAINTEXT_DISPLAY_LENGTH`: hard cap on what we paint even as plain text,
+//   so a multi-MB payload can't blow up the DOM; the rest is elided.
+const MAX_MARKDOWN_TEXT_LENGTH = 50_000;
+const MAX_UNBROKEN_TOKEN_LENGTH = 5_000;
 const MAX_PLAINTEXT_DISPLAY_LENGTH = 200_000;
+
+/**
+ * Longest run of consecutive non-whitespace characters in `text`. ASCII
+ * whitespace (space, tab, CR, LF, FF, VT) resets the run — those are the
+ * break opportunities the layout engine can use. O(n), single pass.
+ */
+function longestUnbrokenRun(text: string): number {
+  let max = 0;
+  let current = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    // 32 = space; 9..13 = tab, LF, VT, FF, CR.
+    if (code === 32 || (code >= 9 && code <= 13)) {
+      current = 0;
+    } else {
+      current += 1;
+      if (current > max) max = current;
+    }
+  }
+  return max;
+}
+
+/**
+ * Whether `text` should bypass the markdown pipeline because rendering it
+ * there would risk locking the tab. See the constants above for the why.
+ */
+function isPathologicalText(text: string): boolean {
+  return (
+    text.length > MAX_MARKDOWN_TEXT_LENGTH || longestUnbrokenRun(text) > MAX_UNBROKEN_TOKEN_LENGTH
+  );
+}
 
 /**
  * Plain, break-anywhere fallback for a pathological text block — no markdown.
@@ -535,6 +578,20 @@ function PlainTextFallback({ text }: { text: string }) {
   );
 }
 
+interface MarkdownNode {
+  type: string;
+  children?: MarkdownNode[];
+}
+
+/** Turns raw HTML nodes into text nodes holding the same source. */
+function remarkHtmlAsText() {
+  const visit = (node: MarkdownNode) => {
+    if (node.type === "html") node.type = "text";
+    node.children?.forEach(visit);
+  };
+  return visit;
+}
+
 /**
  * Wraps `MessageResponse` with {@link WorkspacePathInlineCode} via Streamdown's
  * `inlineCode` slot — NOT `code` — so fenced code blocks keep their default
@@ -548,20 +605,30 @@ function PlainTextFallback({ text }: { text: string }) {
  * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
  * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
  * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
+ *
+ * When `literalHtml` is set, raw HTML shows as written instead of rendering,
+ * so markup or comments in a tool's text can't hide part of it.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
+  literalHtml = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean }) {
+}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
 
-  // Extend (don't replace) Streamdown's defaults so remark-gfm survives;
-  // append remark-breaks only when `breaks` is requested. When `breaks` is
-  // false we pass `undefined` so Streamdown uses its own defaults unchanged.
+  // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
+  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
-    () => (breaks ? [...Object.values(defaultRemarkPlugins), remarkBreaks] : undefined),
-    [breaks],
+    () =>
+      breaks || literalHtml
+        ? [
+            ...Object.values(defaultRemarkPlugins),
+            ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(breaks ? [remarkBreaks] : []),
+          ]
+        : undefined,
+    [breaks, literalHtml],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few

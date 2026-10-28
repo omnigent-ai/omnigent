@@ -107,42 +107,26 @@ describe("ToolValueView", () => {
     expect(prose.querySelector("strong")).toBeNull();
   });
 
-  it("renders untrusted links and markup in tool text inertly", async () => {
+  it("shows raw HTML in prose as written, so it can't hide text or run", async () => {
+    // WHY: markup, comments or an unclosed tag in a tool's text must not hide part of it.
     renderValue({
-      description: "See [docs](https://x/docs) or [this](javascript:alert(1))\nfor more",
-      notes: 'Look <img src="x" onerror="alert(1)">\nhere',
+      description:
+        "<!-- Describe your change -->\n## Summary\n\nSee [docs](https://x/docs) or " +
+        '[this](javascript:alert(1))\nLook <img src="x" onerror="alert(1)"> here\n\n' +
+        "<details><summary>Logs</summary>\n\nAll green\n</details>",
     });
+    const prose = await screen.findByTestId("tool-prose-value");
     await screen.findByRole("link", { name: "docs" });
-    const hrefs = [...document.querySelectorAll("a[href]")].map((link) =>
-      link.getAttribute("href"),
-    );
+    const hrefs = [...prose.querySelectorAll("a[href]")].map((link) => link.getAttribute("href"));
     expect(hrefs).toEqual(["https://x/docs"]);
-    expect(document.querySelector("img")).toBeNull();
-    expect(document.querySelector("pre")?.textContent).toContain("onerror");
+    expect(prose.querySelector("img, details, [onerror]")).toBeNull();
+    expect(prose.textContent).toContain("<!-- Describe your change -->");
+    expect(prose.textContent).toContain('<img src="x" onerror="alert(1)">');
     cleanup();
-    // `<img/src=...>` is not read as a markup tag, so it reaches the markdown sanitizer.
-    renderValue({
-      description: "# Plan\n\n- first <img/src=x onerror=alert(1)>\n- second",
-    });
-    const prose = await screen.findByTestId("tool-prose-value");
-    expect(prose.querySelector("img, [onerror]")).toBeNull();
-  });
-
-  it("keeps a description literal when markdown would hide part of it", () => {
-    // An unfinished HTML block opener would swallow the rest of the text.
-    const description = "Summary\n<pre\nHidden rest\n\nmore text";
-    const container = renderValue({ description });
-    expect(screen.queryByTestId("tool-prose-value")).toBeNull();
-    expect(container.querySelector("pre")?.textContent).toBe(description);
-  });
-
-  it("renders a templated GitHub body as prose, hiding its comments", async () => {
-    renderValue({
-      body: "<!-- Describe your change -->\n## Summary\n\n- Fix it\n\n<details><summary>Logs</summary>\n\nAll green\n</details>\n",
-    });
-    const prose = await screen.findByTestId("tool-prose-value");
-    expect(prose.querySelector("details summary")?.textContent).toBe("Logs");
-    expect(prose.textContent).not.toContain("Describe your change");
+    renderValue({ description: "Summary\n<pre\nStill visible\n\nmore text" });
+    const unclosed = await screen.findByTestId("tool-prose-value");
+    expect(unclosed.textContent).toContain("Still visible");
+    expect(unclosed.textContent).toContain("more text");
   });
 
   it("keeps file-edit text literal, alone or in a batch of edits", () => {

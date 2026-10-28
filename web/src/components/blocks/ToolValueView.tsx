@@ -2,7 +2,7 @@
 // key/value list, lists of records as rows with a title, detail and status
 // badge, multi-line strings with their real line breaks, and prose as markdown.
 
-import { type ReactNode, useMemo } from "react";
+import type { ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { absoluteTime } from "@/lib/relativeTime";
 import {
@@ -155,12 +155,9 @@ function FieldRow({
 }
 
 function StringValue({ text, fieldKey }: { text: string; fieldKey?: string }) {
-  const block = text.includes("\n") || text.length > INLINE_STRING_MAX_CHARS;
-  // Classifying scans the whole text, so a card re-rendering while a turn streams reuses it.
-  const prose = useMemo(() => block && isProseText(text, fieldKey), [block, text, fieldKey]);
   if (text.length === 0) return <EmptyValue />;
-  if (block) {
-    if (prose) return <ProseValue text={text} />;
+  if (text.includes("\n") || text.length > INLINE_STRING_MAX_CHARS) {
+    if (isProseText(text, fieldKey)) return <ProseValue text={text} />;
     return (
       <pre className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/30 px-2.5 py-1.5 font-mono text-sm">
         {text}
@@ -199,11 +196,13 @@ const PROSE_MARKDOWN_CLASS =
 /** Long text written for people, as markdown in the interface font. */
 function ProseValue({ text }: { text: string }) {
   return (
-    <div
-      className="max-h-60 overflow-auto rounded-md border bg-muted/30 px-2.5 py-1.5"
-      data-testid="tool-prose-value"
-    >
-      <FilePathAwareMessageResponse mode="static" breaks className={PROSE_MARKDOWN_CLASS}>
+    <div className="max-h-60 overflow-auto" data-testid="tool-prose-value">
+      <FilePathAwareMessageResponse
+        mode="static"
+        breaks
+        literalHtml
+        className={PROSE_MARKDOWN_CLASS}
+      >
         {text}
       </FilePathAwareMessageResponse>
     </div>
