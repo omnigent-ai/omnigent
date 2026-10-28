@@ -149,6 +149,14 @@ async def test_real_codex_usage_and_model_override_cross_boundary(
         # output), a snapshot distinct from the billed total_tokens.
         "context_tokens": 18,
         "model": "mock-model-override",
+        "pricing_requests": [
+            {
+                "input_tokens": 8,
+                "cache_read_input_tokens": 3,
+                "output_tokens": 7,
+                "request_input_tokens": 11,
+            }
+        ],
     }
     assert sidecar.requests(min_count=1)[0]["body"]["model"] == "mock-model-override"
 
