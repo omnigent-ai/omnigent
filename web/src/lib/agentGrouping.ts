@@ -109,7 +109,9 @@ export const NEW_SESSION_HIDDEN_AGENTS = new Set(["nessie", "kimi", "kimi-code"]
  * @param agents - Raw catalog + discovery output (e.g. useAvailableAgents).
  */
 export function selectableSessionAgents<T extends AvailableAgent>(agents: readonly T[]): T[] {
-  return sortAgentsForDisplay(agents.filter((a) => !NEW_SESSION_HIDDEN_AGENTS.has(a.name)));
+  return sortAgentsForDisplay(
+    agents.filter((a) => a.mine || !NEW_SESSION_HIDDEN_AGENTS.has(a.name)),
+  );
 }
 
 /**

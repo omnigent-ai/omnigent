@@ -6,12 +6,12 @@ and deletes owned agents.
 
 ## Sub-features
 
-- `list`: server cards, owned rows with IDs/versions, search of loaded results, and pagination.
+- `list`: server cards, one owned row per exact name, search, and pagination.
 - `create`: name, description, harness, model, instructions, and MCP servers.
 - `review`: configuration preview, including version, dates, MCP servers, and skills.
 - `edit`: partial configuration updates, explicit credential replacement/removal,
   dirty-draft confirmation, error retention, and stale-revision reload.
-- `bundle-update`: CLI replacement by ID, retaining existing session bindings.
+- `identity`: one owner/name across Settings, imports, CLI runs/adds, and bundled children.
 - `delete`: confirmation, in-use warning, explicit forced removal, and errors.
 - `gating`: hidden navigation without the feature/install gates; an update notice
   and disabled management when single-agent retrieval is unsupported.
@@ -25,9 +25,6 @@ and deletes owned agents.
   and a server card opens its read-only summary.
 - Direct links: `/settings/custom-agents`, `/settings/custom-agents/new`, and
   `/settings/custom-agents/<agent-id>` open those same pages.
-- CLI: `omnigent agent list`, then `omnigent agent update <id> <local-source>`.
-  The source is a directory, YAML file, or `.tar.gz`; the server must advertise
-  `agent_bundle_update: true`.
 - Creation and review pages: Custom agents returns to the list; Cancel also
   returns from creation and configuration review. Owned agents open directly in
   an editable form with Save changes and Delete when the server supports them.
@@ -71,16 +68,18 @@ requires `user_owned: true` and `agent_config_edit: true`.
   list and API omit it. For an agent used by a session, verify the initial
   deletion reports the count and waits for Remove anyway. Only that action
   should force removal.
-- Bundle update: upload an agent through a session and install a same-named agent.
-  Confirm Settings on desktop/mobile shows two IDs and versions. Start two sessions
-  using the upload's ID. Run `omnigent agent update <uploaded-id> ./agent --server <url>`
-  after changing its instructions and supporting files (keep the name). Confirm the
-  ID stays unchanged, its version increments, both old sessions use the revision on
-  their next turn, and the installed ID is unchanged. Native TUI launch configuration
-  requires relaunch. Repeat with identical files: the version must stay unchanged.
-  Route/CLI checks live in `tests/server/routes/test_agent_install.py` and
-  `tests/cli/test_agent_commands.py`; existing runner revision checks live in
-  `tests/runner/test_runner_dispatch.py`.
+- Identity: create a bundled child using `sys_session_create(config_path)`, then run
+  `omnigent agent add ./agent` on those same files. Confirm one row in desktop/mobile
+  Settings and the agent picker, with the same ID and v1. Change instructions and run
+  `agent add` again: one ID at v2. Send another turn to the original child and a second
+  existing session; both use v2. Repeat the install unchanged: still v2. Reversing the
+  order (install, then upload or child create) must give the same result. A different
+  owner can use the same name independently.
+- Copy: fork another user's shared session twice. Identical copies reuse your one
+  owner/name ID. If you already own different files under that name, the copy fails
+  with a conflict and leaves your existing sessions unchanged. Scheduling and JSON
+  session creation follow the same rule. Choose your existing agent or rename the
+  source to resolve the conflict.
 - Gating: remove the feature flag, restart the isolated server, and reload.
   Customize must disappear, Harnesses must return to General, and Custom agents
   URLs must show General.
@@ -91,7 +90,7 @@ requires `user_owned: true` and `agent_config_edit: true`.
   explain that a server update is required. With `agent_config_edit` absent/false,
   retain create/review/delete but show a read-only summary and an editing update
   notice.
-- Component checks for duplicate names, failed save/delete, direct lookup,
+- Component checks for one identity per name, failed save/delete, direct lookup,
   request errors, and capability gating:
   `pnpm --filter web test src/pages/settings/SettingsCustomAgentsSection.test.tsx src/shell/settingsNav.test.tsx src/lib/capabilities.test.ts`.
 - The shared new-session creation dialog regression is covered by
@@ -103,10 +102,8 @@ requires `user_owned: true` and `agent_config_edit: true`.
 - On mobile, Custom agents links open the content directly. The header Back
   button opens the settings navigation; the form's Custom agents button returns
   to the agent list and confirms unsaved changes.
-- Creation/import replaces the installed identity for that owner/name; it does not
-  update a same-named session upload. Use `agent update <id>` for an explicit complete
-  replacement, or Settings edits for partial changes. Sessions using that ID receive
-  the update; other IDs remain independent.
+- Saving an existing owned name replaces its entire configuration and affects
+  sessions using it. Use a unique name when creating a separate agent.
 - Owned previews load the configuration endpoint and ETag; summaries never prefill it.
   Missing revision headers allow saving without a stale-draft check; the last
   successful save of a field wins. Unchanged fields are omitted from PATCH.
@@ -115,6 +112,7 @@ requires `user_owned: true` and `agent_config_edit: true`.
   Model/harness incompatibilities are reported on save.
 - Search covers loaded results. Load more to include older agents.
 - A detail bookmark uses the single-agent endpoint, independently of list
-  pagination. Duplicate names are separate rows identified by ID.
+  pagination. Historical duplicates remain accessible by ID but only the newest original
+  appears in the catalog. Their existing session bindings are not migrated.
 - Built-in harness wrappers belong in Harnesses settings. The older Create
   custom agent dialog in new-session composition still starts a session.

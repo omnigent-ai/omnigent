@@ -5910,11 +5910,6 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
-          "agent_bundle_update": {
-            "default": false,
-            "title": "Agent Bundle Update",
-            "type": "boolean"
-          },
           "agent_config_edit": {
             "default": false,
             "title": "Agent Config Edit",
@@ -11194,65 +11189,6 @@
           }
         },
         "summary": "Patch Agent Config",
-        "tags": [
-          "agents"
-        ]
-      }
-    },
-    "/v1/agents/{agent_id}/bundle": {
-      "put": {
-        "description": "Replace an owned agent's complete bundle while preserving its ID and sessions.\n\nAccepts the same multipart `bundle` as installation. The bundle name\nmust match the target; separate same-named agents remain independent.\nSessions resolve the new revision on their next turn; native terminals\nadopt launch configuration when relaunched. Optional `If-Match` uses\nthe configuration ETag. A concurrent edit or deletion returns 412.",
-        "operationId": "replace_agent_bundle_v1_agents__agent_id__bundle_put",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "agent_id",
-            "required": true,
-            "schema": {
-              "title": "Agent Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "if-match",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "If-Match"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentObject"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Replace Agent Bundle",
         "tags": [
           "agents"
         ]

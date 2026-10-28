@@ -1,3 +1,4 @@
+import { currentUserAgents } from "@/lib/userAgents";
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { BotIcon, PlusIcon, SearchIcon, TrashIcon } from "lucide-react";
@@ -57,7 +58,7 @@ export function SettingsCustomAgentsSection() {
     [servers.data],
   );
   const userAgents = useMemo(
-    () => yours.data?.pages.flatMap((page) => page.data) ?? [],
+    () => currentUserAgents(yours.data?.pages.flatMap((page) => page.data) ?? []),
     [yours.data],
   );
   const detailId = agentId === "new" ? undefined : agentId;
@@ -95,7 +96,7 @@ export function SettingsCustomAgentsSection() {
         <h1 className="mb-6 text-2xl font-semibold">Create custom agent</h1>
         <CreateAgentForm
           submitLabel="Save agent"
-          notice="Saving an existing installed agent's name replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
+          notice="Saving a name you already own updates that agent and replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
             const agent = await save.mutateAsync(input);
@@ -210,9 +211,6 @@ export function SettingsCustomAgentsSection() {
         <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
           Yours
         </h2>
-        <p className="mb-3 text-ui text-muted-foreground">
-          Each ID is a separate agent. Editing it updates sessions using that ID.
-        </p>
         {filtered.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[36rem] text-left text-ui">
@@ -252,9 +250,6 @@ export function SettingsCustomAgentsSection() {
                           <span className="block truncate font-medium">{agent.name}</span>
                           <span className="block truncate text-xs text-muted-foreground">
                             {agent.description}
-                          </span>
-                          <span className="block break-all font-mono text-xs text-muted-foreground">
-                            {agent.id} · v{agent.version}
                           </span>
                         </span>
                       </Link>

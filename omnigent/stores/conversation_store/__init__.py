@@ -528,6 +528,7 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        check_duplicate_title: bool = True,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -543,6 +544,8 @@ class ConversationStore(ABC):
         :param kind: Conversation type. ``"default"`` for
             user-initiated, ``"sub_agent"`` for sub-agent
             execution conversations.
+        :param check_duplicate_title: Preserve named-child uniqueness; bundle uploads
+            set False because their titles are display labels, not lookup keys.
         :param title: Optional title. Phase 4 named sub-agents
             store ``"<type>:<name>"`` so the partial unique index
             can enforce ``(parent_conversation_id, title)``

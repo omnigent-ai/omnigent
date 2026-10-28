@@ -29,7 +29,7 @@ interface AgentPage {
   last_id: string | null;
 }
 
-/** Management keeps every ID, including same-name agents omitted by the picker. */
+/** Settings and the picker read the same owner-scoped catalog. */
 export function useCustomAgents(scope: "server" | "user", enabled: boolean) {
   return useInfiniteQuery({
     queryKey: ["settings-agents", scope],

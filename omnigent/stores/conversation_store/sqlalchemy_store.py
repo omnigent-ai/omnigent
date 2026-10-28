@@ -1027,6 +1027,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        check_duplicate_title: bool = True,
     ) -> Conversation:
         """
         Create a new conversation in the database.
@@ -1034,6 +1035,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param kind: Conversation type. ``"default"`` for
             user-initiated, ``"sub_agent"`` for sub-agent
             execution conversations.
+        :param check_duplicate_title: Preserve named-child uniqueness; bundle uploads
+            set False because their titles are display labels, not lookup keys.
         :param title: Optional title. Phase 4 named sub-agents
             store ``"<type>:<name>"`` so the partial unique
             index enforces ``(parent_conversation_id, title)``
@@ -1143,7 +1146,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # rather than an error (the common repeat-send path is served by
                 # the runner's find-or-create pre-check, so this fires only on a
                 # genuine collision).
-                if parent_conversation_id is not None:
+                if parent_conversation_id is not None and check_duplicate_title:
                     with query_name_scope(
                         "omnigent.conversation_store.select_duplicate_child_title"
                     ):

@@ -704,12 +704,14 @@ def test_list_user_agents_skips_copies_and_keeps_legacy_originals(
     )
 
     assert {a.id for a in agent_store.list_user_agents(_OWNER).data} == {orion.id, legacy.id}
+    assert agent_store.get_user_agent_by_name(_OWNER, "atlas").id == legacy.id
+    assert agent_store.get_user_agent_by_name("someone-else", "atlas") is None
 
 
-def test_list_user_agents_lists_every_original_by_id_even_when_names_repeat(
+def test_list_user_agents_selects_one_stable_original_per_name(
     agent_store: SqlAlchemyAgentStore, clock: None
 ) -> None:
-    """Nothing is hidden by name, so every agent stays manageable by its id."""
+    """Legacy rows remain addressable; paging and new writes agree on one identity."""
     agent_store.create(uuid.uuid4().hex, "polly", "x/y")
     uploaded = _user_agent(agent_store, "orion")
     installed = _user_agent(agent_store, "orion")
@@ -720,8 +722,21 @@ def test_list_user_agents_lists_every_original_by_id_even_when_names_repeat(
         polly.id,
         edited_fork.id,
         installed.id,
-        uploaded.id,
     ]
+    assert agent_store.get(uploaded.id) is not None
+    assert agent_store.get_user_agent_by_name(_OWNER, "orion").id == installed.id
+    # Editing a historical row does not change the current identity.
+    agent_store.update(uploaded.id, f"{uploaded.id}/new")
+    assert agent_store.get_user_agent_by_name(_OWNER, "orion").id == installed.id
+    after = None
+    seen = []
+    while True:
+        page = agent_store.list_user_agents(_OWNER, limit=1, after=after)
+        seen.extend(a.id for a in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert seen == [polly.id, edited_fork.id, installed.id]
 
 
 def test_list_user_agents_reads_a_bounded_window(

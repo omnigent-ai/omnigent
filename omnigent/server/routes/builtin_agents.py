@@ -9,7 +9,6 @@ the new-session picker, which then creates a session with
 
 User agents belong to one user (``designs/REUSABLE_USER_AGENTS.md``):
 ``POST /v1/agents`` installs one (``omnigent agent add``),
-``PUT /v1/agents/{id}/bundle`` updates one by ID (``omnigent agent update``),
 ``GET /v1/agents?scope=user`` lists the caller's own, and
 ``DELETE /v1/agents/{id}`` removes one. Uploading a bundle with a new
 session (multipart ``POST /v1/sessions``) also creates one.
@@ -28,17 +27,16 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 from starlette.types import Message
 
-from omnigent.db.utils import builtin_agent_id, installed_agent_id
+from omnigent.db.utils import builtin_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider
-from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
+from omnigent.server.bundles import content_bundle_location, save_user_agent, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -186,7 +184,7 @@ class _AgentRoute(APIRoute):
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
         patch = "PATCH" in self.methods
-        if not patch and not self.path.endswith(("/{agent_id}/config", "/{agent_id}/bundle")):
+        if not patch and not self.path.endswith("/{agent_id}/config"):
             return handler
 
         async def patch_handler(request: Request) -> Response:
@@ -235,45 +233,6 @@ def _config_headers(response: Response, agent: Agent) -> None:
     response.headers["Access-Control-Expose-Headers"] = "ETag"
 
 
-async def _read_agent_bundle(request: Request) -> tuple[bytes, AgentSpec]:
-    """Read a size-bounded multipart bundle and validate it as tenant input."""
-    length = request.headers.get("content-length", "")
-    if length.isdigit() and int(length) > MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES:
-        raise _too_large()
-    async with _body_capped(request).form() as form:
-        bundle = form.get("bundle")
-        if not isinstance(bundle, UploadFile):
-            raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
-        if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
-            raise _too_large()
-        bundle_bytes = await bundle.read()
-    spec = await asyncio.to_thread(
-        validate_agent_bundle, bundle_bytes, enforce_handler_allowlist=True
-    )
-    return bundle_bytes, spec
-
-
-def _check_config_revision(request: Request, agent: Agent, if_match: str | None) -> None:
-    """Reject malformed or stale revision preconditions before changing a bundle."""
-    if if_match is None:
-        return
-    if len(request.headers.getlist("if-match")) != 1 or not (
-        len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "invalid_input", "message": "Supply one strong configuration ETag"},
-        )
-    if if_match != _config_etag(agent):
-        raise HTTPException(
-            status_code=412,
-            detail={
-                "code": "precondition_failed",
-                "message": "Agent changed; reload before saving",
-            },
-        )
-
-
 def install_user_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -282,13 +241,13 @@ def install_user_agent(
     owner: str | None,
     name: str,
     bundle_bytes: bytes,
+    description: str | None = None,
 ) -> Agent:
     """
     Create or update *owner*'s user agent named *name* from a validated bundle.
 
-    The id comes from owner and name (:func:`installed_agent_id`), so a
-    reinstall updates the same row in place (stable id, bumped version) and
-    the primary key keeps that identity atomic under concurrent installs.
+    All creation paths share owner/name identity. Reinstall updates the same
+    row, including an earlier session or child upload (stable id, bumped version).
     Sessions using the agent pick up the new bundle on their next turn.
 
     :param owner: Installing user, or ``None`` on an auth-less server.
@@ -296,44 +255,17 @@ def install_user_agent(
     :param bundle_bytes: Gzipped tarball already checked by
         :func:`validate_agent_bundle`.
     :returns: The created or updated agent.
-    :raises OmnigentError: ``CONFLICT`` when a server agent uses the name.
     """
-    if agent_store.get_by_name(name) is not None:
-        # A same-named user agent would be hidden behind the server agent.
-        raise OmnigentError(
-            f"{name!r} is a server agent; rename your agent to install it.",
-            code=ErrorCode.CONFLICT,
-        )
-    agent_id = installed_agent_id(owner, name)
-    # Named by content, so reinstalling the same files is a no-op however the
-    # client tarred them.
-    location = content_bundle_location(agent_id, bundle_bytes)
-    existing = agent_store.get(agent_id)
-    if existing is None:
-        artifact_store.put(location, bundle_bytes)
-        try:
-            # No stored description: the listing reads it from the current
-            # bundle's spec, so a reinstall never shows a stale one.
-            return agent_store.create_user_agent(agent_id, name, location, owner=owner)
-        except IntegrityError:
-            # A concurrent install of the same agent won; update that row instead.
-            existing = agent_store.get(agent_id)
-            if existing is None:
-                raise
-    if existing.bundle_location == location:
-        # Same files: restore the blob if it vanished while the row survived.
-        if not artifact_store.exists(location):
-            artifact_store.put(location, bundle_bytes)
-        return existing
-    artifact_store.put(location, bundle_bytes)
-    if agent_store.supports_config_edit:
-        updated = agent_store.update(agent_id, location, description=None)
-    else:
-        updated = agent_store.update(agent_id, location)
-    agent_cache.evict(agent_id)
-    if updated is None:  # removed concurrently
-        raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
-    return updated
+    agent = save_user_agent(
+        agent_store,
+        artifact_store,
+        owner=owner,
+        name=name,
+        bundle_bytes=bundle_bytes,
+        description=description,
+    )
+    agent_cache.evict(agent.id)
+    return agent
 
 
 def create_builtin_agents_router(
@@ -445,7 +377,15 @@ def create_builtin_agents_router(
     ) -> AgentConfigObject | JSONResponse:
         """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
-        _check_config_revision(request, agent, if_match)
+        if if_match is not None:
+            if len(request.headers.getlist("if-match")) != 1 or not (
+                len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
+            ):
+                return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
+            if if_match != _config_etag(agent):
+                return _config_error(
+                    412, "precondition_failed", "Agent changed; reload before saving"
+                )
         bundle, spec, location = await asyncio.to_thread(configuration, agent, body)
         if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
             raise _too_large()
@@ -579,7 +519,20 @@ def create_builtin_agents_router(
         require_user_agents()
         if artifact_store is None:
             raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
-        bundle_bytes, spec = await _read_agent_bundle(request)
+        length = request.headers.get("content-length", "")
+        if length.isdigit() and int(length) > MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES:
+            raise _too_large()
+        bundle = (await _body_capped(request).form()).get("bundle")
+        if not isinstance(bundle, UploadFile):
+            raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
+        if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
+            raise _too_large()
+        bundle_bytes = await bundle.read()
+        spec = await asyncio.to_thread(
+            validate_agent_bundle,
+            bundle_bytes,
+            enforce_handler_allowlist=True,
+        )
         if spec.name is None:  # validate_agent_bundle rejects this; narrows the type
             raise OmnigentError("agent spec has no name", code=ErrorCode.INVALID_INPUT)
         agent = await asyncio.to_thread(
@@ -590,59 +543,10 @@ def create_builtin_agents_router(
             owner=user_id,
             name=spec.name,
             bundle_bytes=bundle_bytes,
+            description=spec.description,
         )
         # Loads (extracts) the just-written bundle; keep it off the event loop.
         return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
-
-    @router.put(
-        "/agents/{agent_id}/bundle",
-        response_model=AgentObject,
-        dependencies=[Depends(require_trusted_origin)],
-    )
-    async def replace_agent_bundle(
-        request: Request,
-        agent_id: str,
-        response: Response,
-        if_match: str | None = Header(default=None),
-    ) -> AgentObject | JSONResponse:
-        """Replace an owned agent's complete bundle while preserving its ID and sessions.
-
-        Accepts the same multipart ``bundle`` as installation. The bundle name
-        must match the target; separate same-named agents remain independent.
-        Sessions resolve the new revision on their next turn; native terminals
-        adopt launch configuration when relaunched. Optional ``If-Match`` uses
-        the configuration ETag. A concurrent edit or deletion returns 412.
-        """
-        agent = await editable_agent(request, agent_id)
-        _check_config_revision(request, agent, if_match)
-        bundle_bytes, spec = await _read_agent_bundle(request)
-        if spec.name != agent.name:
-            raise OmnigentError(
-                "Bundle name must match the agent being updated; renaming is not supported",
-                code=ErrorCode.CONFLICT,
-            )
-        assert artifact_store is not None
-
-        def replace() -> Agent | None:
-            location = content_bundle_location(agent.id, bundle_bytes)
-            # Older uploads use an archive hash; identical files still keep their revision.
-            if location != agent.bundle_location and artifact_store.exists(agent.bundle_location):
-                current = artifact_store.get(agent.bundle_location)
-                if content_bundle_location(agent.id, current) == location:
-                    location = agent.bundle_location
-            artifact_store.put(location, bundle_bytes)
-            return agent_store.update_configuration(
-                agent,
-                location,
-                description=agent.description if agent.description == spec.description else None,
-            )
-
-        updated = await asyncio.to_thread(replace)
-        if updated is None:
-            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
-        agent_cache.evict(agent.id)
-        _config_headers(response, updated)
-        return await asyncio.to_thread(_to_agent_object, updated, agent_cache)
 
     @router.delete("/agents/{agent_id}")
     async def remove_agent(

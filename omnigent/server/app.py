@@ -261,8 +261,6 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
-    # PUT /v1/agents/{id}/bundle preserves identity across full-bundle updates.
-    agent_bundle_update: bool = False
     # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
     session_event_types: list[str] = []
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
@@ -3506,9 +3504,6 @@ def create_app(
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
-                and artifact_store is not None,
-                "agent_bundle_update": agent_store.supports_user_agents
-                and agent_store.supports_config_edit
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)

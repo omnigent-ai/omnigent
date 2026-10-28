@@ -1,7 +1,8 @@
 # Reusable user agents: install once, keep in the picker
 
-> **PROPOSED.** Implemented by a stack of PRs: this schema change, then switch-agent retirement,
-> shared agent rows on fork, user-agent install/list/remove, and the UI import.
+> **Updated identity contract:** one user agent per workspace, owner, and exact name,
+> across every creation path. This revision supersedes the separate upload/install
+> identities in the original design. Existing historical rows are retained.
 
 ## 1. Summary
 
@@ -14,8 +15,8 @@ This work makes user agents first-class and reusable:
 
 - `omnigent agent add <dir | yaml | tar.gz>` and a UI "Import bundle" button install an agent owned
   by the caller. `omnigent agent list` and `omnigent agent remove` manage them.
-- The picker gains one new source: the caller's own user agents, appended after everything it shows
-  today, so existing ordering does not change.
+- The picker and Settings read the same server and owner-scoped agent catalogs.
+  Recent sessions are a compatibility fallback only on servers without user-agent support.
 - One agent row is shared by every session that uses it. Forking your own session reuses your row;
   forking someone else's session gives you your own copy. The unused in-place "switch agent" API is
   removed (it also deletes agents other sessions still use). Deleting a session never deletes an
@@ -68,9 +69,9 @@ the user's 30 most recent sessions.
 - Install a complete agent bundle once (directory, single YAML, or `.tar.gz`), via CLI or UI, owned
   by the caller, visible only to the caller, on every host they use, with no server restart.
 - Preserve workers, skills, guardrails, and supporting files exactly as bundled.
-- Keep the picker's current ordering and grouping; only add the caller's agents.
+- Keep server and user agents in their respective groups; use the same current identities in Settings and the picker.
 - Remove an installed agent explicitly, with a warning when sessions still use it.
-- One agent row per agent: no new duplicate rows from fork or from rerunning the same files, and no
+- One agent row per owner and exact name: uploads, imports, child agents and installs update it, with no
   deletion of agents that other sessions use.
 - Every new or changed query is bounded and index-backed; changes to existing behavior are additive
   unless a decision below explicitly says otherwise.
@@ -106,17 +107,17 @@ the user's 30 most recent sessions.
 |---|---|---|
 | 1 | Installs are kind-2 rows with `created_by` = installer. No new kind, no constraint change. | Kind 2 already means user-provided; sessions already bind to it directly. |
 | 2 | Rename the Python codec names `template` to `server` and `session` to `user`. Stored integers unchanged. | Names match meaning; no migration. |
-| 3 | Install id is derived: `sha256("installed:" + (owner or "") + "\0" + name)[:32]`. Reinstall of the same owner and name updates that row in place (stable id, version + 1). | Primary key makes owner+name identity atomic under concurrent installs. |
-| 4 | Install rejects a name that matches any server agent (409). | A same-named user agent would sit behind the server agent in the picker. |
+| 3 | All user-agent creation paths reuse the current original for the same workspace, owner and exact name. New IDs use `sha256("installed:" + (owner or "") + "\0" + name)[:32]`; existing IDs stay unchanged. | One primary key prevents concurrent first-time uploads, installs and copies from creating duplicate identities. |
+| 4 | A user may own an agent with the same name as a server agent; their owners and IDs differ. Both catalogs remain visible in their respective groups. | Server agents never get overwritten or hide a user agent. |
 | 5 | Install bundles over 100 MiB are rejected before being read (413). Bundles are validated like any tenant upload and never executed at install. | Trust boundary. |
 | 6 | Sessions bind directly to the installed row. Reinstall therefore updates running sessions from their next turn, through any server process (6.18). A native terminal session keeps its launch configuration until it relaunches. | One agent, many sessions. |
-| 7 | Fork of **your own** session reuses your row. Fork of **someone else's** session (or of a row with no owner) creates a new row owned by you with the bundle **copied under the new id**, so it appears in your picker and is isolated from later changes to the original. | Prevents another user from changing code that runs in your sessions ("dependency injection"). |
+| 7 | Forking your own session reuses its row. Copying another user's agent creates or reuses your owner/name identity with its own blob. If your existing same-named agent has different files, return 409 and ask you to select it or rename the source. | Repeated forks do not create duplicates, and a foreign source cannot overwrite code in your existing sessions. |
 | 8 | Remove the switch-agent implementation (store method, request schema, web dialog, tests, docs). Keep the path reserved as an empty endpoint that returns 410 Gone, with a code comment that in-place switching will return with a new shape in a future release (section 16). Intentional API break. | No UI entry point, no other callers, and it deletes agents other sessions use. Fork covers the use case today; the path is kept for the planned rework. |
 | 9 | Deleting a session never deletes agent rows. Only `DELETE /v1/agents/{id}` deletes an agent. | Agents outlive the sessions using them. |
 | 10 | Removal warns: 409 with `sessions_in_use` while sessions use the agent; `force=true` removes anyway. The count reads at most 101 rows, unordered (N3). The CLI asks before forcing (`--yes` skips). | User chose "break with a warning" over blocking or copying. |
 | 11 | After removal, sessions keep running for as long as the runner can (cached spec). The error appears only when the agent cannot be loaded at all. No per-message server check. | Verified live: SDK sessions keep working from the runner cache (Appendix A). |
-| 12 | Picker: the caller's user agents join the existing newest-wins merge by root name, ranked by last change (`max(updated_at, created_at)`), so a fresh install or import is the entry shown for its name. Built-in names keep the built-in. Sorting unchanged. | The shown entry is always a selectable id. |
-| 13 | "My agents" listing returns every original the caller owns, each by its own id: names may repeat and nothing is hidden by name. Legacy copies are skipped. | Management addresses ids, so no agent is hidden from its owner. |
+| 12 | With `agent_install`, the picker reads the same catalogs as Settings and does not rediscover agents from recent sessions or restore historical IDs through pins. | Both surfaces expose the same current identities, including owned agents named like server agents. |
+| 13 | The owner-scoped catalog returns one current original per exact name: newest `created_at`, then greatest ID. Older duplicates remain addressable by ID and retain their session bindings. | A stable compatibility choice avoids consolidation and prevents an edit or recent session from changing which ID normal creation targets. |
 | 14 | "My agents" reads at most 50 rows per request. | Bounded work per picker open. |
 | 15 | New index `ix_agents_kind_owner_created (workspace_id, kind, created_by, created_at, id)`, non-unique, built concurrently on PostgreSQL, in its own schema-only PR. | Bounded keyset listing per owner. |
 | 16 | The server-agent listing also filters `created_by IS NULL` (server agents never have an owner, and `update()` never stamps one on them), so it walks the shared `ix_agents_kind_owner_created` in order (D1). `ix_agents_created_at` stays until no older server uses it, then drops (D5). | One index serves both listings; the server listing no longer walks every agent. |
@@ -125,9 +126,8 @@ the user's 30 most recent sessions.
 | 19 | No reviewers requested on the stack except the schema PR (code owners of migrations). | Requested. |
 | 20 | Starting a new session (not a fork) from another user's kind-2 agent, when allowed by the existing READ rule, copies the agent for the caller exactly as a fork does. A child session stays on its tree's agent only when it names its parent's agent; a scheduled task takes its copy when created or switched to the agent (a task saved earlier moves to its owner's copy at its next run). | Another user can never change code that runs in your sessions, on any creation path. |
 | 21 | The runner's existing missing-agent text is unified to the new guidance ("This agent no longer exists. Fork this session into another agent to continue."). Text-only change; tests updated. | One message for one condition. |
-| 22 | The picker follows the "my agents" cursor until it has 50 agent names, at most 5 pages, so neither a page of skipped copies nor many rows of one name (one per run, from servers before decision 23) hides an older agent; `omnigent agent list` pages through all of them. | Bounded picker load. |
-| 23 | A top-level session upload binds the uploader's row that holds the same files under the same name, creating it on first use. Its id is derived: `sha256("uploaded:" + (owner or "") + "\0" + name + "\0" + files + "\0" + attempt)[:32]`, where `files` hashes each entry's path, type, executable bit, and bytes, not archive timestamps, owners, or order. A row an MCP edit has changed is passed over for the next `attempt` (at most 3, then a fresh row), so a session always starts on the uploaded files. A sub-agent child upload keeps a row of its own: binding an existing row would add the per-parent title check that child creates never had. Installs name their blob by the same hash. | Agents outlive sessions (decision 9), so a row per `omnigent run` would pile up in "my agents" and the picker; rerunning the same files is one agent. |
-| 24 | Explicit whole-bundle updates target an owned agent ID, including uploads and child agents, preserving its ID and session bindings. Same-named installs and uploads remain independent. | Name alone cannot identify which sessions should receive a change. Updating the existing ID fulfills decision 6 without merging unrelated agents or rebinding sessions. |
+| 22 | The picker follows the owner-scoped cursor to completion, as Settings can through Load more. | Neither a 50-name cap nor a five-page cap should hide an agent available in Settings. Each request remains bounded. |
+| 23 | Top-level and child uploads use the same save operation as installation. Changed files replace the current bundle; identical extracted files are a no-op. Bundled child sessions keep their parent, kind, metadata and permissive display titles. | Old sessions use the new revision without rebinding, regardless of how the agent was created. Bundle content determines revisions, never identity. |
 
 ## 6. Design
 
@@ -140,7 +140,7 @@ No schema change except the index (6.2). `agents` columns used:
 | `workspace_id`, `id` | primary key |
 | `kind` | 1 server, 2 user |
 | `created_by` | owner of a user agent; NULL for server agents and legacy rows |
-| `name` | display and dedupe key (root name) |
+| `name` | exact user-agent identity within its workspace and owner |
 | `bundle_location` | `"<agent id that first stored the blob>/<sha256>"`; drives the original/copy rule |
 | `created_at` | listing order and cursor |
 | `version`, `updated_at`, `description` | unchanged semantics |
@@ -186,13 +186,13 @@ Invariant enforced in code: server agents (kind 1) never have `created_by` set.
 | Q6 | `update(id)` | PK | PK | 1 | unchanged; also used by reinstall |
 | Q7 | `delete(id)` | PK | PK | 1 | unchanged; used by removal |
 | Q8 | `_session_id_for_agent` | `conversations: ws, agent_id LIMIT 1` | `ix_conversations_agent_id` | 1 | unchanged |
-| Q9 | session create with uploaded bundle | top level: `get(derived id)`, `INSERT` kind 2 on the first upload (decision 23); child: `INSERT` | PK | at most 3 gets and 1 insert | **changed** |
-| Q10 | fork | `INSERT` copy row | | 1 | **changed**: only for cross-user or ownerless sources (decision 7) |
+| Q9 | session create with uploaded bundle | same owner/name save as install, then session insert | name index + PK | one name lookup; at most 3 write attempts | **changed** |
+| Q10 | fork | resolve or insert recipient's owner/name identity | name index + PK | one name lookup; insert on first use | **changed** (decision 7) |
 | Q11 | switch | delete old + insert copy | | 2 | **removed** (decision 8) |
 | Q12 | session delete cleanup | 2 `conversations` lookups + `DELETE agents WHERE kind=2` | `ix_conversations_agent_id` | subtree | **removed** (decision 9) |
 | Q13 | `list_conversations(agent_name=)` | `ws, name` then `IN` | `ix_agents_name` | all rows with that name | unchanged (stops growing for new forks of your own sessions) |
-| N1 | `list_user_agents(owner)` | `ws, kind=2, created_by=:owner` + cursor (`created_at <= :ts` plus the tie-break, so the seek starts at the cursor), `ORDER BY created_at DESC, id DESC LIMIT 51` | new index | at most 51 + timestamp ties | **new** |
-| N2 | install upsert | `get(derived id)`, then `INSERT` or `update` | PK | 1 to 2 | **new** |
+| N1 | `list_user_agents(owner)` | `ws, kind=2, created_by=:owner` + cursor (`created_at <= :ts` plus the tie-break, so the seek starts at the cursor), `ORDER BY created_at DESC, id DESC LIMIT 51` | new index | at most 51 candidates plus indexed same-name existence checks | **changed** |
+| N2 | shared save | resolve current original by `ws, name, kind, owner`, then insert or revision-checked update | `ix_agents_name`, PK | one name lookup; at most 3 write attempts | **changed** |
 | N3 | removal | `get`; `conversations: ws, agent_id LIMIT 101`; `DELETE` | PK, `ix_conversations_agent_id` | at most 103 | **new** |
 | N4 | cross-user fork source check | `get(source agent)` (already loaded by the fork route) | PK | 0 extra | **new logic, no new query** |
 | N5 | other sessions using a shared agent (non-owner binding, only after the Q8 root denies) | `conversations: ws, agent_id` in `id` pages of 200, deduped to 50 roots | `ix_conversations_agent_id` | at most 1,000 | **new** |
@@ -211,14 +211,16 @@ clients treat its absence on older servers as unsupported.
   a multipart post skips the CORS preflight.
 - Steps: reject over 100 MiB (413), counted while the body streams in so an oversized or chunked
   upload is cut off before it is spooled; `validate_agent_bundle` (same checks as session uploads; 400 on
-  failure); reject a name equal to any server agent (409); upsert by derived id (decision 3).
-- Concurrency: a primary-key conflict on insert falls back to update of the winner's row.
+  failure); save the owner/name identity (decision 3), regardless of its creation path.
+- Concurrency: a primary-key conflict on insert rereads the winner. Updates use the existing
+  revision comparison, retry a concurrent change up to three times, and return 409 if contention
+  continues. A concurrent deletion returns 404; the upload does not recreate it.
 - Response 200: the agent object (`id`, `name`, `version`, `description`, `harness`, `skills`, ...).
 
 **`GET /v1/agents?scope=user`** ("my agents")
 - Params: `limit` (at most 50; larger values are capped), `after` (cursor: id of the last row read).
   The listing pages forward only: `before` or `order=asc` returns 400.
-- Server reads up to 50 rows (N1), applies 6.7, returns `data` (at most `limit`, names may repeat), `has_more`, and
+- Server reads up to 50 rows (N1), applies 6.7, returns `data` (at most `limit`, one current original per exact name), `has_more`, and
   `last_id` = id of the **last row read** (may not appear in `data`) to continue.
 - A cursor row that no longer exists returns `stale_cursor` (existing error code).
 - Default `GET /v1/agents` (no `scope`) is byte-for-byte unchanged.
@@ -256,6 +258,8 @@ working and report `agent_install: false`:
 - `create_user_agent(agent_id, name, bundle_location, owner, description=None) -> Agent`: inserts
   kind 2 with `created_by = owner`. Raises the store's integrity error on primary-key conflict.
   Default raises "unsupported".
+- `get_user_agent_by_name(owner, name) -> Agent | None`: current original by creation time
+  and ID, scoped to the current workspace. Default returns None.
 - `list_user_agents(owner, limit, after) -> PagedList[Agent]`: N1 plus 6.7. Default returns empty.
 
 Existing methods (`create`, `get`, `get_by_name`, `list`, `get_names`, `update`, `delete`) keep their
@@ -269,9 +273,9 @@ whose sessions were all deleted stays a user agent.
    caller's shell (same as `omnigent run`); a single YAML is materialized into a bundle; a `.tar.gz`
    is uploaded as is (`${VAR}` left literal).
 2. Server validation (6.4) never imports or runs bundle code.
-3. Id = derived id (decision 3); the blob key is `"<id>/<files hash>"` (decision 23). Existing row
-   with that id: store the new blob, `update` (version + 1), evict cache (other processes follow,
-   6.18). No row: store blob, `create_user_agent`.
+3. Resolve the current original by owner and exact name; keep its ID. If absent, derive the
+   shared ID (decision 3). Store the blob at `"<id>/<files hash>"`; create on first use, otherwise
+   compare and update the existing revision. Other processes follow the revision (6.18).
 4. Reinstalling the same files is a no-op, however the client tarred them.
 5. Single-user local servers stamp owner `"local"` (the auth layer's local identity).
 
@@ -283,8 +287,10 @@ For each row read by N1, in order:
    `ag_`-prefixed form of the id). Skip derived copies.
 2. Stop when `limit` rows are kept or 50 rows are read.
 
-Nothing else is filtered: two of the caller's agents may share a name (an install and an upload, or
-one named like a server agent), and each is listed by its own id so it can be selected and removed.
+For each candidate, an indexed same-name existence check identifies whether a newer original
+exists for this workspace and owner. Only the current original is returned, using the same
+`created_at, id` ordering as creation. The check occurs before pagination output, so a duplicate
+on another page cannot reappear. Older rows are retained; no sessions or schedules are rebound.
 
 Ceiling (documented in code): a user with more than 50 derived copies newer than an original sees that
 original only on a later page. Upgrade path if it matters: a column marking derived copies.
@@ -315,13 +321,14 @@ Applies to session create (JSON), fork targets, schedules, skills discovery, and
 Let the source session use agent A; the caller is C; optional target agent T (fork into another agent).
 
 - No target, A is kind 1, or A is owned by C: the fork uses A (no new row).
-- No target, A owned by another user or ownerless: copy A for C. The bundle bytes are written under a
-  new id (`"<new id>/<sha>"`), and a new kind-2 row is inserted inside the fork transaction (existing
-  atomic clone path) with `name` = A's name, `description` = A's description, `created_by` = C.
+- No target, A owned by another user or ownerless: create C's owner/name identity or reuse
+  it if the files match. Different existing files return 409 before forking. The copy has
+  its own blob, so later changes by A's owner cannot affect C's sessions.
 - With target T: T must pass 6.8. T is kind 1 or owned by C: use T. T owned by someone else: copy as
   above.
-- The bundle is copied after every fork validation, right before the fork transaction, and deleted
-  if the fork fails.
+- Resolve the copy after fork validation. A reusable copy survives a failed fork because
+  another request may already have bound it. Stores without user-agent support retain the
+  previous transactional clone and cleanup behavior.
 
 ### 6.10 Switch-agent removal
 
@@ -375,27 +382,21 @@ agents stay read-only. Tests lock this in.
 
 ### 6.15 Picker (web)
 
-- `useAvailableAgents` keeps its two sources (server catalog, recent-session scan) and merge.
-- New third source, only when `/v1/info` reports `agent_install`: `GET /v1/agents?scope=user&limit=50`
-  (the picker follows the cursor until it has 50 agent names, at most 5 pages, decision 22).
-- Merged by root name with the same newest-wins rule as recent-session uploads, ranked by last change
-  (`max(updated_at, created_at)`), so the entry shown for a name is the agent the user installed,
-  imported, or edited last, and its id is always selectable. Built-in names keep the built-in. Other
-  same-named agents stay reachable from their sessions and through `omnigent agent list`.
-  A user agent the session scan also finds is ranked only by these agent timestamps, so starting or
-  forking a session never changes which same-named agent is shown.
-- Sorting and grouping (`sortAgentsForDisplay`, `partitionAgentsByKind`) unchanged; user agents land
-  under Agents, "Other..." as custom agents do today, whatever their harness: one on a native CLI
-  harness is still the user's agent, so it never joins the Harnesses rows (nor stands in for the
-  Claude Code wrapper that Smart Routing binds).
-- The earlier draft's merge changes (an "installed" flag beating session copies, native-dedupe
-  exemption) are reverted.
+With `agent_install`, both Settings and the picker read `GET /v1/agents` and
+`GET /v1/agents?scope=user`. The picker follows every page. Session history and
+configured pins cannot add a second identity or resurrect a removed one. On older
+servers without this capability, the existing session-discovery merge remains.
+For older catalog responses containing duplicates, both clients select the same
+newest original by creation time and ID; they compare exact names, not fork-name roots.
+
+User agents stay in Agents regardless of harness. Server agents stay in their
+server/harness groups. A user-owned name never hides behind a same-named server agent.
+A catalog failure is reported rather than silently replacing it with session history.
 
 ### 6.16 CLI
 
 ```
 omnigent agent add <dir | file.yaml | bundle.tar.gz> [--server URL]
-omnigent agent update <id> <dir | file.yaml | bundle.tar.gz> [--server URL]
 omnigent agent list [--server URL]
 omnigent agent remove <name | id> [--yes] [--server URL]
 ```
@@ -403,10 +404,6 @@ omnigent agent remove <name | id> [--yes] [--server URL]
 - Every command first checks `/v1/info`; a server without `agent_install` gets
   "<server> does not support installing agents; upgrade the server to use `omnigent agent`."
 - `list` pages `scope=user` to completion and prints a table of name, version, harness, and id.
-- `update` replaces the complete bundle of the specified ID, requiring the same name.
-  It also checks `/v1/info.agent_bundle_update`; older servers get an upgrade message,
-  never a fallback install. Sources are local directories, YAML files, or tarballs,
-  bundled the same way as `add`.
 - `remove` resolves an id or a name in `scope=user`; a name several agents share is refused with
   their ids, so the user removes one by id. It sends `DELETE`; on 409 shows the session count and
   asks "Remove anyway?"; `--yes` sends `force=true` directly.
@@ -424,7 +421,7 @@ omnigent agent remove <name | id> [--yes] [--server URL]
 
 ### 6.18 Revision changes reach running sessions
 
-A reinstall, explicit bundle update, or MCP edit keeps the agent id and changes `bundle_location`. Every cache keyed by id
+A reinstall or MCP edit keeps the agent id and changes `bundle_location`. Every cache keyed by id
 must notice:
 
 - **Server `AgentCache`**: entries remember the bundle location they were built from, in memory and
@@ -443,28 +440,6 @@ must notice:
 
 A native terminal session (a TUI) keeps the configuration it launched with until it relaunches. `omnigent agent add` says so when it
 updates an agent.
-
-### 6.19 Update an existing upload or child agent
-
-`PUT /v1/agents/{id}/bundle` accepts the same size-bounded, validated multipart
-bundle as installation. Only the owner can update a user agent; server agents and
-another user's copies cannot be changed. The name must match the target (409 on
-rename). This replaces all bundle files and settings, including credentials;
-omitted content is removed. Use the configuration PATCH for partial edits.
-
-The route reuses the configuration store's atomic revision check. It accepts an
-optional configuration `If-Match` ETag, returns the updated agent and ETag, and
-returns 412 for a stale tag or a concurrent edit/deletion. Identical files keep the
-revision, including older uploads whose archive metadata produced a different
-hash. Changed configuration increments the version and follows section 6.18.
-Active turns finish with their current configuration; session overrides still apply.
-
-Settings shows each owned ID and version so same-named records can be distinguished.
-To update old sessions, choose the ID those sessions already use. Updating another
-same-named ID does not move them. Both records stay manageable; the picker keeps
-its existing most-recently-changed rule. Child uploads remain independent records,
-and cross-user copies stay isolated. There is no schema migration, automatic
-deduplication, deletion, or session rebinding.
 
 ## 7. Security considerations
 
@@ -485,11 +460,11 @@ deduplication, deletion, or session rebinding.
 
 | Combination | Behavior |
 |---|---|
-| New server, old web client | Picker as today (no `scope=user` fetch). Installed agents reachable once used in a recent session. |
+| New server, old web client | Uploads and installs still share identity on the server. Older picker merging may hide an owned name shared with a server agent. |
 | Old server, new web client | `agent_install` false: no Import button, no third picker source. |
 | Old server, new CLI | Clear upgrade message. |
 | Clients calling switch-agent | 410 Gone with fork guidance (intentional API break, labelled as such). |
-| Legacy rows | Ownerless kind-2 rows are not listed by "my agents" (still via the session scan) and not removable via CLI. Legacy fork and switch copies are hidden by the original rule. Rows older servers created per run stay and are listed; the picker shows one entry per name (decision 22) and new uploads never bind them. Nothing is deleted. |
+| Legacy rows | Ownerless rows on authenticated servers and derived copies stay out of the catalog. One newest original per owner/name is current; new uploads and installs reuse it. Other IDs and their existing sessions remain untouched and accessible directly. Deleting the current row can expose the next retained original. There is no consolidation or migration of historical sessions. |
 | Deployments applying schema outside alembic | Must add the index before enabling the feature; until the store supports user agents the feature reports off. |
 | Old and new servers sharing one database (rolling deploy across replicas, or a rollback) | Old servers treat an agent no session uses as unowned. Accepted risk; see section 11. |
 
@@ -507,12 +482,12 @@ For each of: kind-1 row; kind-2 row used by a session; kind-2 row with NULL owne
 ### 9.2 New behavior
 
 - Store: `create_user_agent`, `list_user_agents` (50-row read cap, originals only, legacy prefix,
-  repeated names listed by id, cursor = last read row, stale cursor), defaults on a store without
+  one stable original per exact name across pages, cursor = last read row, stale cursor), defaults on a store without
   support; capped session count.
 - Migration: index columns, non-unique, downgrade, concurrent path on PostgreSQL (SQL emitted).
-- Routes: install (new, reinstall in place, identical no-op, concurrent race, server-name 409, 413,
+- Routes: install (new, reinstall in place, identical no-op, concurrent child/install race, isolated server-name collision, 413,
   invalid bundle 400, foreign `Origin` 403), `scope=user` (owner isolation, paging, a same-named upload
-  and install both listed and removable by id), removal (owner-only, 409 count capped, force),
+  and install sharing one stable ID), removal (owner-only, 409 count capped, force),
   `/v1/info`.
 - Copies: a child under the caller's own root and a schedule both copy another user's agent; a child
   naming its parent's agent does not; a task saved on another user's agent moves to a copy at its run.
@@ -521,8 +496,8 @@ For each of: kind-1 row; kind-2 row used by a session; kind-2 row with NULL owne
   process replaced; the runner bundle cache keeps an agent added again off the old directory.
 - Fork: own session reuses row; other user's session copies with new blob and owner; ownerless source
   copies; target owned by other user copies; copy unaffected by later reinstall of the original.
-- Uploads: re-tarred uploads of the same files bind one row; changed files, another owner, and a
-  sub-agent child each get their own; runs after an MCP edit share one new row holding their files;
+- Uploads: re-tarred uploads of the same files bind one row; changed files and child uploads
+  update that row; another owner is isolated. Runs after an MCP edit replace the same row;
   reinstalling re-tarred files is a no-op; the files hash ignores archive metadata and follows
   extraction for a repeated path.
 - Switch removal: the reserved route returns 410 with the fork guidance, the store method is gone,
@@ -531,8 +506,8 @@ For each of: kind-1 row; kind-2 row used by a session; kind-2 row with NULL owne
 - Removed agent: agent reads 404 with message; fork 410; web error card text.
 - CLI: add (directory contents uploaded), list (with ids), remove by name or id with prompt and
   `--yes`, an ambiguous name refused, older-server message, entry point dispatch through `main()`.
-- Web: picker merge rule (one entry per name, the last-changed user agent shown, built-in names
-  kept), paging past a page of one name's rows, import gating, selection, error states.
+- Web: picker merge rule (the same current ID per exact name in Settings and the picker, server and user owners
+  kept separate), paging past a page of one name's rows, import gating, selection, error states.
 
 ### 9.3 Live verification (isolated local server)
 
@@ -545,8 +520,9 @@ For each of: kind-1 row; kind-2 row used by a session; kind-2 row with NULL owne
 5. Older-server path for CLI and UI.
 6. Two running sessions on one agent; reinstall with a changed instruction; both use it next turn.
 7. Remove and add again with a changed bundle; a new session on the same runner uses the new one.
-8. Upload an agent through a session, then import a bundle with the same name: the composer selects
-   the import; `agent list` shows both by id and `agent remove <id>` removes the intended one.
+8. Create a bundled child, then import or CLI-install the same bundle: the picker, Settings and
+   `agent list` show one ID at v1. Change the files and reinstall: same ID at v2, and the original
+   child and another existing session use v2 on their next turn.
 9. Second user schedules a run from the first user's agent: the task binds the second user's copy.
 
 ### 9.4 CI
@@ -559,8 +535,8 @@ Watch each PR; before attributing a failure, check whether it also fails on `mai
 |---|---|---|---|
 | 1 | Schema: `ix_agents_kind_owner_created` (existing #8777) | model index, migration (concurrent on PostgreSQL), migration tests, deployment note | `main` |
 | 2 | Retire the switch-agent API to a reserved 410 stub (new) | 6.10, docs, OpenAPI, feature map; intentional API break label | 1 |
-| 3 | Fork reuses your agent; cross-user copy (new) | 6.9, shared-row binding in 6.8 | 2 |
-| 4 | User agents: install, list, remove; session delete keeps agents (existing #8677, rebuilt) | 6.4 to 6.8, 6.11 to 6.13, 6.15, 6.16, 6.18, codec rename, `Agent.kind` | 3 |
+| 3 | All user-agent creation paths reuse the current original for the same workspace, owner and exact name. New IDs use `sha256("installed:" + (owner or "") + "\0" + name)[:32]`; existing IDs stay unchanged. | One primary key prevents concurrent first-time uploads, installs and copies from creating duplicate identities. |
+| 4 | A user may own an agent with the same name as a server agent; their owners and IDs differ. Both catalogs remain visible in their respective groups. | Server agents never get overwritten or hide a user agent. |
 | 5 | UI import (existing #8680, rebuilt) | 6.17 | 4 |
 
 - Reviewers: only PR 1 (migration code owners). Push top-down to avoid CODEOWNERS churn on children.
@@ -577,8 +553,7 @@ across several replicas, or a rollback past this release), old servers misread a
 uses: anyone who knows such an agent's id can bind it, and deleting a session through an old server
 deletes the agents its tree uses even when other sessions still use them (installs, forks sharing a
 row). A binding made this way outlives the window. Accepted for this release because a single server
-process never mixes versions, only derived ids can be computed (an install's from owner and name,
-an upload's also from its files, decision 23; copies have random ids), and the window lasts only as
+process never mixes versions, new identities derive from owner and name, and the window lasts only as
 long as the deploy.
 
 - Upgrade all replicas together, and prefer rolling forward over rolling back.
@@ -592,14 +567,13 @@ long as the deploy.
 - Install from a git URL (follow-up).
 - UI removal of agents (follow-up).
 - Dropping `ix_agents_created_at` (D5) once no older server uses it.
-- The 50-row read ceiling in 6.7. The picker reads up to 5 pages (decision 22), so an agent behind
-  more than 250 newer rows, or older than your 50 newest agents, is missing from it until it is used
-  in a recent session; `omnigent agent list` shows all. Ordering the listing by last change would
-  lift that.
-- Uploads whose files differ on every run (a generated timestamp, say) still get a row each, as do
-  sub-agent uploads. Rows older servers created per run stay until removed. If users pile up many,
-  a dedupe command could merge identical ones: move their sessions and scheduled tasks onto the row
-  new runs bind (runners re-read a session's agent each turn), then delete the rows nothing uses.
+- Legacy duplicate rows and their session bindings are retained. Only the current original is
+  listed and targeted by new uploads. Updating it does not update sessions still bound to a
+  historical duplicate. Direct ID links still work. Deleting the current original can reveal
+  the next retained one; removing historical duplicates is a separate cleanup operation.
+- Mixed deployments can still create duplicates through old replicas. Upgrade every writer
+  before relying on owner/name uniqueness. No bulk migration or database constraint rewrite.
+- The 50-row read cap in 6.7 still applies per request; callers follow all pages.
 - MCP edits apply to every session using the agent; per-session MCP overrides are not supported.
 
 ## 13. Open items

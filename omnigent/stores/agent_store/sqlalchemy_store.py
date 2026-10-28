@@ -5,9 +5,10 @@ from __future__ import annotations
 import builtins
 from typing import cast
 
-from sqlalchemy import CursorResult, and_, asc, case, desc, or_, select, update
+from sqlalchemy import CursorResult, and_, asc, case, desc, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
+from sqlalchemy.sql.elements import ColumnElement
 
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
@@ -520,6 +521,35 @@ class SqlAlchemyAgentStore(AgentStore):
 
         return run_write_transaction(self._session_immediate, "create_user_agent", write)
 
+    def _original_agent(self, row: type[SqlAgent]) -> ColumnElement[bool]:
+        # IDs are binary in SQL; bundle prefixes use their lowercase hex form.
+        hex_id = (
+            func.encode(row.id, "hex")
+            if self._engine.dialect.name == "postgresql"
+            else func.lower(func.hex(row.id))
+        )
+        return or_(
+            func.substr(row.bundle_location, 1, 33) == hex_id + "/",
+            func.substr(row.bundle_location, 1, 36) == "ag_" + hex_id + "/",
+        )
+
+    def get_user_agent_by_name(self, owner: str | None, name: str) -> Agent | None:
+        """Resolve an owner/name using the same stable winner as the listing."""
+        with self._session("resolve_user_agent_name") as session:
+            row = session.execute(
+                select(SqlAgent)
+                .where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.kind == encode_agent_kind("user"),
+                    SqlAgent.created_by == owner,
+                    SqlAgent.name == name,
+                    self._original_agent(SqlAgent),
+                )
+                .order_by(desc(SqlAgent.created_at), desc(SqlAgent.id))
+                .limit(1)
+            ).scalar_one_or_none()
+            return sql_agent_to_entity(row) if row is not None else None
+
     def list_user_agents(
         self,
         owner: str | None,
@@ -544,7 +574,23 @@ class SqlAlchemyAgentStore(AgentStore):
             SqlAgent.created_by == owner,
         )
         with self._session("list_user_agents") as session:
-            stmt = select(SqlAgent).where(*mine)
+            newer = aliased(SqlAgent)
+            has_newer = (
+                select(newer.id)
+                .where(
+                    newer.workspace_id == current_workspace_id(),
+                    newer.kind == encode_agent_kind("user"),
+                    newer.created_by == owner,
+                    newer.name == SqlAgent.name,
+                    self._original_agent(newer),
+                    or_(
+                        newer.created_at > SqlAgent.created_at,
+                        and_(newer.created_at == SqlAgent.created_at, newer.id > SqlAgent.id),
+                    ),
+                )
+                .exists()
+            )
+            stmt = select(SqlAgent, ~has_newer).where(*mine)
             if after:
                 cursor_at = session.execute(
                     select(SqlAgent.created_at).where(*mine, SqlAgent.id == after)
@@ -560,17 +606,17 @@ class SqlAlchemyAgentStore(AgentStore):
                     ),
                 )
             stmt = stmt.order_by(desc(SqlAgent.created_at), desc(SqlAgent.id))
-            rows = list(session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).scalars())
+            rows = list(session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).all())
             read = rows[:_USER_AGENT_READ_CAP]
             kept: builtins.list[Agent] = []
             consumed = 0
-            for row in read:
+            for row, is_current in read:
                 if len(kept) >= limit:
                     break
                 consumed += 1
-                if _is_original(row):
+                if is_current and _is_original(row):
                     kept.append(sql_agent_to_entity(row))
-            last_read = read[consumed - 1].id if consumed else None
+            last_read = read[consumed - 1][0].id if consumed else None
         return PagedList(
             data=kept,
             first_id=kept[0].id if kept else None,

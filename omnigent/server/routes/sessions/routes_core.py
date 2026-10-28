@@ -80,7 +80,12 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     BackgroundTitleRequest,
 )
-from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
+from omnigent.server.bundles import (
+    agent_for_user,
+    agent_needs_own_copy,
+    copy_agent_bundle,
+    validate_agent_bundle,
+)
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
@@ -4174,11 +4179,16 @@ def register_core_routes(
         if body.host_id is not None:
             await _check_requested_host_id(request, body.host_id, user_id)
 
-        # Copied last, after every validation above; the copy row itself is
-        # inserted inside fork_conversation's transaction.
+        # Reusable copies survive a failed fork: another request may bind them.
+        # Stores without user agents retain the transactional clone path.
         fork_agent_id = base_agent.id
         clone_location: str | None = None
-        if needs_own_copy:
+        if needs_own_copy and agent_store.supports_user_agents:
+            copied = await asyncio.to_thread(
+                agent_for_user, agent_store, artifact_store, base_agent, user_id
+            )
+            fork_agent_id = copied.id
+        elif needs_own_copy:
             assert artifact_store is not None
             fork_agent_id = generate_agent_id()
             clone_location = await asyncio.to_thread(

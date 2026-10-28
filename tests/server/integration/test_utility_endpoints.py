@@ -115,7 +115,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_session_modes"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
-    assert data["agent_bundle_update"] is True
     # Gates the web's /clear for native sessions; older servers reject it.
     assert data["session_event_types"] == sorted(CLIENT_SESSION_EVENT_TYPES)
     assert "clear" in data["session_event_types"]
@@ -136,8 +135,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).agent_detail is False
     del data["agent_config_edit"]
     assert ServerInfoResponse.model_validate(data).agent_config_edit is False
-    del data["agent_bundle_update"]
-    assert ServerInfoResponse.model_validate(data).agent_bundle_update is False
     del data["session_event_types"]
     assert ServerInfoResponse.model_validate(data).session_event_types == []
     del data["automations_enabled"]
@@ -158,7 +155,6 @@ async def test_info_disables_config_edit_for_unsupported_store(
 
     assert response.status_code == 200, response.text
     assert response.json()["agent_config_edit"] is False
-    assert response.json()["agent_bundle_update"] is False
 
 
 async def test_info_single_user_false_without_marker(

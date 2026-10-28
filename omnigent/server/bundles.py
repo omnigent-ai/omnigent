@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.utils import generate_agent_id, uploaded_agent_id
+from omnigent.db.utils import installed_agent_id
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.spec import AgentSpec, ExtractionError, ToolRuntime, load
@@ -218,10 +218,20 @@ def agent_for_user(
         or not agent_needs_own_copy(agent, user_id)
     ):
         return agent
-    copy_id = generate_agent_id()
-    location = copy_agent_bundle(artifact_store, agent.bundle_location, copy_id)
-    return agent_store.create_user_agent(
-        copy_id, agent.name, location, owner=user_id, description=agent.description
+    try:
+        data = artifact_store.get(agent.bundle_location)
+    except KeyError as exc:
+        raise OmnigentError(
+            SESSION_AGENT_BUNDLE_MISSING_MESSAGE, code=ErrorCode.SESSION_AGENT_MISSING
+        ) from exc
+    return save_user_agent(
+        agent_store,
+        artifact_store,
+        owner=user_id,
+        name=agent.name,
+        bundle_bytes=data,
+        description=agent.description,
+        replace_existing=False,
     )
 
 
@@ -295,9 +305,76 @@ def content_bundle_location(agent_id: str, bundle_bytes: bytes) -> str:
     return f"{agent_id}/{digest}"
 
 
-# An MCP edit moves a row off its upload's content, so later uploads of that
-# content take the next id; past this many edited rows they get fresh rows.
-_UPLOADED_AGENT_ATTEMPTS = 3
+def save_user_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    *,
+    owner: str | None,
+    name: str,
+    bundle_bytes: bytes,
+    description: str | None = None,
+    replace_existing: bool = True,
+) -> Agent:
+    """Save one owner/name identity across installs, session uploads and copies.
+
+    New identities share a deterministic primary key, including concurrent
+    requests from different creation paths. Existing originals keep their ID.
+    Copying another user's agent may reuse identical files, but never replace
+    the recipient's configuration. Explicit uploads replace the whole bundle.
+    """
+    existing = agent_store.get_user_agent_by_name(owner, name)
+    agent_id = existing.id if existing is not None else installed_agent_id(owner, name)
+    location = content_bundle_location(agent_id, bundle_bytes)
+    for _ in range(3):
+        if existing is None:
+            artifact_store.put(location, bundle_bytes)
+            try:
+                return agent_store.create_user_agent(
+                    agent_id, name, location, owner=owner, description=description
+                )
+            except IntegrityError:
+                existing = agent_store.get(agent_id)
+                if existing is None:
+                    raise
+        if existing.kind != "user" or existing.created_by != owner or existing.name != name:
+            raise OmnigentError("Agent identity conflict", code=ErrorCode.CONFLICT)
+        current_location = location
+        if current_location != existing.bundle_location and artifact_store.exists(
+            existing.bundle_location
+        ):
+            current = artifact_store.get(existing.bundle_location)
+            if content_bundle_location(agent_id, current) == location:
+                current_location = existing.bundle_location
+        if not replace_existing and current_location != existing.bundle_location:
+            raise OmnigentError(
+                f"You already have an agent named {name!r}. Select your agent or rename "
+                "the source before copying it.",
+                code=ErrorCode.CONFLICT,
+            )
+        artifact_store.put(current_location, bundle_bytes)
+        if not replace_existing:
+            return existing
+        if agent_store.supports_config_edit:
+            updated = agent_store.update_configuration(
+                existing,
+                current_location,
+                description=(
+                    None
+                    if current_location == existing.bundle_location
+                    and existing.description is None
+                    else description
+                ),
+            )
+        elif current_location == existing.bundle_location:
+            return existing
+        else:
+            updated = agent_store.update(agent_id, current_location)
+        if updated is not None:
+            return updated
+        existing = agent_store.get(agent_id)
+        if existing is None:
+            raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
+    raise OmnigentError("Agent changed concurrently; retry the upload", code=ErrorCode.CONFLICT)
 
 
 def uploaded_agent_for(
@@ -308,49 +385,14 @@ def uploaded_agent_for(
     spec: AgentSpec,
     bundle_bytes: bytes,
 ) -> Agent | None:
-    """
-    Return *owner*'s agent holding exactly this upload, creating it on first use.
-
-    The id comes from owner, name, and content (:func:`uploaded_agent_id`), so
-    every identical upload binds one row and concurrent ones collide on its
-    primary key. A row whose bundle an MCP edit has changed no longer matches
-    and is passed over for the next id, so a session always starts on the
-    uploaded files.
-
-    :param owner: Uploading user, or ``None`` on an auth-less server.
-    :param spec: The upload's validated spec (its name and description).
-    :param bundle_bytes: Tarball already checked by :func:`validate_agent_bundle`.
-    :returns: The agent to bind, or ``None`` when the store has no user agents
-        or the bundle can't be digested; the caller then creates a fresh row.
-    """
-    name = spec.name
-    if name is None or not agent_store.supports_user_agents:
+    """Create or update the uploader's named agent, including child uploads."""
+    if spec.name is None or not agent_store.supports_user_agents:
         return None
-    digest = bundle_content_digest(bundle_bytes)
-    if digest is None:
-        return None
-    for attempt in range(_UPLOADED_AGENT_ATTEMPTS):
-        agent_id = uploaded_agent_id(owner, name, digest, attempt)
-        location = f"{agent_id}/{digest}"
-        agent = agent_store.get(agent_id)
-        if agent is None:
-            artifact_store.put(location, bundle_bytes)
-            try:
-                return agent_store.create_user_agent(
-                    agent_id, name, location, owner=owner, description=spec.description
-                )
-            except IntegrityError:
-                agent = agent_store.get(agent_id)  # a concurrent identical upload won
-        if (
-            agent is not None
-            and agent.kind == "user"
-            and agent.created_by == owner
-            and agent.name == name
-            and agent.bundle_location == location
-        ):
-            # The blob can vanish while the row survives (pruned artifacts, a DB
-            # restored without its store); this upload holds the same files.
-            if not artifact_store.exists(location):
-                artifact_store.put(location, bundle_bytes)
-            return agent
-    return None
+    return save_user_agent(
+        agent_store,
+        artifact_store,
+        owner=owner,
+        name=spec.name,
+        bundle_bytes=bundle_bytes,
+        description=spec.description,
+    )

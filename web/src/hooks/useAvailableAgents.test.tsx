@@ -1457,7 +1457,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     has_more: false,
   });
 
-  it("merges the caller's agents in, one per name, keeping built-in names", async () => {
+  it("uses the same owned catalog as Settings, including names shared with server agents", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       [MINE_URL]: MINE,
@@ -1466,8 +1466,8 @@ describe("useAvailableAgents user agents (scope=user)", () => {
           { id: "ag_vega", name: "vega", harness: "claude-sdk", builtin: false, created_at: 9 },
           // Also used by a recent session: listed once.
           { id: "ag_orion", name: "orion", builtin: false, created_at: 5 },
-          // A built-in's name: the built-in wins.
-          { id: "ag_polly_copy", name: "polly (fork 1a2b)", builtin: false, created_at: 8 },
+          // Server agents have a different owner and do not hide your agent.
+          { id: "ag_polly_copy", name: "polly", builtin: false, created_at: 8 },
           { id: "ag_atlas", name: "atlas", builtin: false, created_at: 1 },
         ],
         has_more: false,
@@ -1483,6 +1483,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
         "ag_polly",
         "ag_vega",
         "ag_orion",
+        "ag_polly_copy",
         "ag_atlas",
       ]);
     });
@@ -1508,6 +1509,28 @@ describe("useAvailableAgents user agents (scope=user)", () => {
       expect(result.current.isPlaceholderData).toBe(false);
       expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     });
+  });
+
+  it("loads the entire catalog without resurrecting session-only agents", async () => {
+    const pages = Object.fromEntries(
+      Array.from({ length: 6 }, (_, index) => [
+        USER_AGENTS_URL + (index ? `&after=page${index}` : ""),
+        mockResponse({
+          data: [{ id: `agent${index}`, name: `agent${index}`, builtin: false }],
+          has_more: index < 5,
+          last_id: `page${index + 1}`,
+        }),
+      ]),
+    );
+    routeFetch({ [BUILTINS_URL]: CATALOG, [MINE_URL]: MINE, ...pages });
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+      wrapper: wrapperWithInfo(true),
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.map((a) => a.id)).toEqual([
+      "ag_polly",
+      ...Array.from({ length: 6 }, (_, index) => `agent${index}`),
+    ]);
   });
 
   it("names your agents by their own name, whatever their harness", async () => {
@@ -1576,7 +1599,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
   });
 
-  it("shows the most recently changed of same-named agents, so an install is selectable", async () => {
+  it("uses one stable identity for legacy names, even when an older row was edited", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       // A recent session uses an older upload named orion.
@@ -1602,11 +1625,11 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     });
     await waitFor(() => {
       expect(result.current.isPlaceholderData).toBe(false);
-      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion_installed"]);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     });
   });
 
-  it("ranks the caller's agents by their own changes, not by session activity", async () => {
+  it("does not revive legacy IDs from session activity or configured pins", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       // A fork just started on the older upload named orion.
@@ -1630,12 +1653,15 @@ describe("useAvailableAgents user agents (scope=user)", () => {
       }),
     });
 
-    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
-      wrapper: wrapperWithInfo(true),
-    });
+    const { result } = renderHook(
+      () => ({ ...useAvailableAgents({ pinnedAgentIds: ["ag_orion_installed"] }) }),
+      {
+        wrapper: wrapperWithInfo(true),
+      },
+    );
     await waitFor(() => {
       expect(result.current.isPlaceholderData).toBe(false);
-      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion_installed"]);
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
     });
   });
 
@@ -1654,7 +1680,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("scope=user"))).toBe(false);
   });
 
-  it("keeps the existing list when the caller's agents fail to load", async () => {
+  it("reports a catalog failure without reviving agents from session history", async () => {
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       [MINE_URL]: MINE,
@@ -1665,11 +1691,10 @@ describe("useAvailableAgents user agents (scope=user)", () => {
       wrapper: wrapperWithInfo(true),
     });
     await waitFor(() => {
-      expect(result.current.isSuccess).toBe(true);
-      expect(result.current.isPlaceholderData).toBe(false);
+      expect(result.current.isError).toBe(true);
     });
 
-    expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]);
+    expect(result.current.data?.some((a) => a.id === "ag_orion")).not.toBe(true);
     expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
   });
 });

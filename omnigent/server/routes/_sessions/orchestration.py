@@ -12276,9 +12276,8 @@ def _create_session_from_bundle(
     """
     Validate, store, and persist a bundled session request.
 
-    Top-level uploads reuse the uploader's row with the same name and bundle
-    contents (:func:`~omnigent.server.bundles.uploaded_agent_for`), never a row
-    matched by name alone. Child uploads receive separate rows.
+    All uploads update the uploader's owner/name identity, including children.
+    Sessions already using that agent receive the revision on their next turn.
 
     :param conversation_store: Store that owns the atomic
         conversation-plus-agent transaction.
@@ -12354,7 +12353,7 @@ def _create_session_from_bundle(
         if terminal_launch_args is not None:
             metadata = metadata.model_copy(update={"terminal_launch_args": terminal_launch_args})
 
-    if agent_store is not None and metadata.parent_session_id is None:
+    if agent_store is not None:
         agent = uploaded_agent_for(
             agent_store,
             artifact_store,
