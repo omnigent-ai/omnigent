@@ -29,7 +29,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.mysql import BINARY as MySQLBinary
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, validates
 
 from omnigent.db.compression import CompressedText
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
@@ -1723,20 +1723,39 @@ class SqlSkillSource(OmnigentBase):
 
     __tablename__ = "skill_sources"
     __table_args__ = (
-        # Keyset pagination over (created_at, id); ends in the primary key.
+        # Keyset pagination over (created_at, id), and the add-source dedup
+        # lookup by (url, ref); both end in the primary key.
         Index("ix_skill_sources_order", "workspace_id", "created_at", "id"),
+        Index("ix_skill_sources_identity", "workspace_id", "url", "ref", "id"),
     )
 
     workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
         primary_key=True,
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
-    url: Mapped[str] = mapped_column(String(512), nullable=False)
+    url: Mapped[str] = mapped_column(String(255), nullable=False)
     ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    @validates("url", "ref", "name", "created_by")
+    def _within_declared_length(self, key: str, value: str | None) -> str | None:
+        return _within_declared_length(self, key, value)
+
+
+def _within_declared_length(row: OmnigentBase, key: str, value: str | None) -> str | None:
+    """Enforce a ``String(n)`` column's length on every ORM write; SQLite would not.
+
+    Lengths are characters; at four bytes a character the widest column here
+    (1024) stores at most 4,096 bytes, under the 16 KiB stored-value limit.
+    """
+    limit = row.__table__.c[key].type.length
+    if value is not None and len(value) > limit:
+        raise ValueError(f"{key} is longer than {limit} characters")
+    return value
 
 
 class SqlInstalledSkill(OmnigentBase):
@@ -1758,7 +1777,9 @@ class SqlInstalledSkill(OmnigentBase):
     :param scope: ``"user"`` (one user's install) or ``"org"`` (everyone).
         Stored as a stable int code (see omnigent.db.enum_codecs
         INSTALLED_SKILL_SCOPE); the store converts at the row↔entity boundary.
-    :param owner_user_id: The installing user for a user-scoped row, else ``None``.
+    :param owner_user_id: The installing user for a user-scoped row; ``""`` for
+        an org-scoped row (and for the single local user), never NULL, so the
+        identity index is unique on every engine.
     :param bundle_location: Artifact-store key of the skill tarball.
     :param enabled: Whether sessions receive the skill.
     :param installed_by: User who installed it, or ``None`` in single-user mode.
@@ -1768,8 +1789,17 @@ class SqlInstalledSkill(OmnigentBase):
 
     __tablename__ = "installed_skills"
     __table_args__ = (
-        # Owner-scoped keyset pagination over (installed_at, id) and the
-        # replace-on-reinstall lookup by name; both end in the primary key.
+        # One row per (owner, name, scope): concurrent installs collide here
+        # instead of leaving a duplicate; its prefix also serves the lookups by name.
+        Index(
+            "ux_installed_skills_identity",
+            "workspace_id",
+            "owner_user_id",
+            "name",
+            "scope",
+            unique=True,
+        ),
+        # Owner-scoped keyset pagination over (installed_at, id); ends in the primary key.
         Index(
             "ix_installed_skills_owner_order",
             "workspace_id",
@@ -1777,11 +1807,11 @@ class SqlInstalledSkill(OmnigentBase):
             "installed_at",
             "id",
         ),
-        Index("ix_installed_skills_owner_name", "workspace_id", "owner_user_id", "name", "id"),
         CheckConstraint("scope IN (1, 2)", name="ck_installed_skills_scope"),
     )
 
     workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
         primary_key=True,
         default=current_workspace_id,
     )
@@ -1789,14 +1819,29 @@ class SqlInstalledSkill(OmnigentBase):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
     description: Mapped[str] = mapped_column(String(1024), nullable=False)
-    source_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    source_url: Mapped[str] = mapped_column(String(255), nullable=False)
     ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
     commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     path: Mapped[str] = mapped_column(String(1024), nullable=False)
     scope: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     bundle_location: Mapped[str] = mapped_column(String(512), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
     installed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     installed_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    @validates(
+        "name",
+        "display_name",
+        "description",
+        "source_url",
+        "ref",
+        "commit",
+        "path",
+        "owner_user_id",
+        "bundle_location",
+        "installed_by",
+    )
+    def _within_declared_length(self, key: str, value: str | None) -> str | None:
+        return _within_declared_length(self, key, value)
