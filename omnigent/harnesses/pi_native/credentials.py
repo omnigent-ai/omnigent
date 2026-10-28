@@ -1273,11 +1273,27 @@ def _databricks_gateway_pi_provider(
         surfaces[DatabricksPiSurface.COMPLETIONS] = workspace_completions_url
     if workspace_mlflow_url:
         surfaces[DatabricksPiSurface.MLFLOW] = workspace_mlflow_url
+    try:
+        launch_model = _select_databricks_claude_model(model, claude_models)
+    except ModelResolutionError:
+        # No Claude default: launch another model the workspace lists, if any.
+        listed_model = next(
+            (
+                model_id
+                for payload in additional.values()
+                for listed in payload["models"]
+                if isinstance((model_id := listed.get("id")), str)
+            ),
+            None,
+        )
+        if listed_model is None:
+            raise
+        launch_model = listed_model
     config = PiProviderConfig(
         provider_id=_PI_PROVIDER_ID,
         base_url=f"{gateway_origin}{_DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX}",
         api="anthropic-messages",
-        model=_select_databricks_claude_model(model, claude_models),
+        model=launch_model,
         api_key=api_key,
         auth_header=True,
         extra_models=claude_models,
@@ -1689,7 +1705,7 @@ def _inline_family_pi_provider(
             static_api_key=unpinned_gateway.api_key,
         )
     except ModelResolutionError:
-        # Neither the catalog nor the listing names a Claude default.
+        # Neither the catalog nor the listing names a model to launch.
         return None
     listed_ids = [
         model_id

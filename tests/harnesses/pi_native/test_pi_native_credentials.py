@@ -601,14 +601,14 @@ def test_inline_databricks_gateway_without_default_defers_to_a_pinned_family(
     assert listings == ["https://wkspc.cloud.databricks.com"]
 
 
+def _unavailable_catalog(provider_name: str, *, family: str, **kwargs: object) -> None:
+    raise ModelResolutionError("catalog discovery is unavailable")
+
+
 def test_inline_databricks_gateway_without_default_or_catalog_launches_a_listed_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unreachable model catalog still launches a Claude model the workspace lists."""
-
-    def _unavailable_catalog(provider_name: str, *, family: str, **kwargs: object) -> None:
-        raise ModelResolutionError("catalog discovery is unavailable")
-
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model", _unavailable_catalog
     )
@@ -635,10 +635,15 @@ def test_inline_databricks_gateway_without_default_or_catalog_launches_a_listed_
     assert provider.model == "system.ai.claude-sonnet-4-6"
 
 
+@pytest.mark.parametrize("catalog_reachable", [True, False])
 def test_inline_databricks_gateway_without_default_or_listed_claude_launches_a_listed_model(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, catalog_reachable: bool
 ) -> None:
-    """A workspace that lists no Claude launches a listed model, not the catalog's Claude."""
+    """A workspace that lists no Claude launches a listed model, whatever the catalog says."""
+    if not catalog_reachable:
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.resolve_catalog_model", _unavailable_catalog
+        )
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
@@ -661,22 +666,14 @@ def test_inline_databricks_gateway_without_default_or_listed_claude_launches_a_l
     assert defaults == ["omnigent-openai/system.ai.gpt-5"], options
 
 
-def test_inline_databricks_gateway_without_default_catalog_or_listed_claude_tries_databricks(
+def test_inline_databricks_gateway_without_default_catalog_or_listing_tries_databricks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no Claude default anywhere, resolution still reaches the databricks-kind fallback."""
-
-    def _unavailable_catalog(provider_name: str, *, family: str, **kwargs: object) -> None:
-        raise ModelResolutionError("catalog discovery is unavailable")
-
+    """Without a catalog or a listing, resolution still reaches the databricks-kind fallback."""
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model", _unavailable_catalog
     )
-    monkeypatch.setattr(
-        creds,
-        "_fetch_pi_model_lists",
-        lambda host, token: ([], [{"id": "system.ai.gpt-5"}], [], []),
-    )
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", lambda host, token: ([], [], [], []))
     fallback = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://wkspc.cloud.databricks.com/ai-gateway/anthropic",
