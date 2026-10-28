@@ -18,6 +18,7 @@ from omnigent.repl._repl import (
     _cmd_help,
     _model_validation_warning,
     _resolve_provider_default_model,
+    _resolved_elsewhere_label,
 )
 
 # ── approval state ───────────────────────────────────────────
@@ -98,6 +99,65 @@ async def test_cancel_refuses_pending_approval_but_keeps_always_cache() -> None:
     assert state.is_pre_approved("policy_a", "tool_call") is True
     # Cancelling with nothing pending is harmless.
     state.cancel()
+
+
+async def test_resolve_elsewhere_ignores_other_elicitations() -> None:
+    state = _ApprovalState()
+    future = state.begin("policy_a", "request", elicitation_id="elicit_current")
+
+    # An earlier card answered on the approval page or an abandoned prompt
+    # expiring is not an answer to the card in front of the user.
+    assert state.resolve_elsewhere("elicit_earlier", "decline") is False
+    assert state.resolve_elsewhere("elicit_earlier", "accept") is False
+    assert state.resolve_elsewhere("elicit_earlier", None) is False
+    assert state.resolve_elsewhere("", "accept") is False
+
+    assert state.pending is True
+    assert not future.done()
+
+
+@pytest.mark.parametrize(
+    ("action", "approved"),
+    [("accept", True), ("decline", False), ("cancel", False), (None, False)],
+)
+async def test_resolve_elsewhere_applies_the_carried_verdict(
+    action: str | None, approved: bool
+) -> None:
+    state = _ApprovalState()
+    future = state.begin("policy_a", "request", elicitation_id="elicit_current")
+
+    assert state.resolve_elsewhere("elicit_current", action) is True
+
+    assert future.result() is approved
+    assert state.pending is False
+    assert state.is_pre_approved("policy_a", "request") is False
+
+
+async def test_resolve_elsewhere_needs_a_known_elicitation_id() -> None:
+    state = _ApprovalState()
+    future = state.begin("policy_a", "request")
+
+    assert state.resolve_elsewhere("elicit_any", "accept") is False
+    assert not future.done()
+
+
+async def test_resolve_elsewhere_is_idle_without_a_pending_approval() -> None:
+    state = _ApprovalState()
+    assert state.resolve_elsewhere("elicit_any", "accept") is False
+
+
+@pytest.mark.parametrize(
+    ("action", "reason", "label"),
+    [
+        ("accept", None, "approved elsewhere"),
+        ("decline", None, "declined elsewhere"),
+        ("cancel", None, "cancelled elsewhere"),
+        (None, "unanswered", "expired unanswered · refused"),
+        (None, None, "resolved elsewhere · no verdict recorded · refused"),
+    ],
+)
+def test_resolved_elsewhere_label(action: str | None, reason: str | None, label: str) -> None:
+    assert _resolved_elsewhere_label(action, reason) == label
 
 
 # ── /help ────────────────────────────────────────────────────

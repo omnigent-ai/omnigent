@@ -211,8 +211,9 @@ export function filterConversations(
   });
 }
 
-// Newest first. Freeze update timestamps for the active chat and hovered list;
-// creation timestamps stay immutable, including when the selected order changes.
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
@@ -225,10 +226,7 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort(
-    (a, b) =>
-      effective(b) - effective(a) || (sortBy === "created_at" ? b.id.localeCompare(a.id) : 0),
-  );
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */
@@ -244,30 +242,30 @@ export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean
   return "Done";
 }
 
-export const UPDATED_BUCKETS = [
-  "Today",
-  "Yesterday",
-  "Previous 7 days",
-  "Previous 30 days",
-  "Older",
+export const DATE_BUCKETS = [
+  "today",
+  "yesterday",
+  "in the last 7 days",
+  "in the last 30 days",
+  "earlier",
 ] as const;
-export type UpdatedBucket = (typeof UPDATED_BUCKETS)[number];
+export type DateBucket = (typeof DATE_BUCKETS)[number];
 
-/** Bucket an `updated_at` (unix seconds) by local calendar day relative to `now`. */
-export function updatedBucket(updatedAt: number, now: Date): UpdatedBucket {
+/** Bucket a timestamp (unix seconds) by local calendar day relative to `now`. */
+export function dateBucket(timestamp: number, now: Date): DateBucket {
   // Local midnights via the Date constructor, so DST days aren't an hour off.
   const midnight = (daysAgo: number) =>
     new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
-  const at = updatedAt * 1000;
-  if (at >= midnight(0)) return "Today";
-  if (at >= midnight(1)) return "Yesterday";
-  if (at >= midnight(7)) return "Previous 7 days";
-  if (at >= midnight(30)) return "Previous 30 days";
-  return "Older";
+  const at = timestamp * 1000;
+  if (at >= midnight(0)) return "today";
+  if (at >= midnight(1)) return "yesterday";
+  if (at >= midnight(7)) return "in the last 7 days";
+  if (at >= midnight(30)) return "in the last 30 days";
+  return "earlier";
 }
 
 /**
- * Split `rows` into non-empty groups in `order`, keeping input order within each
+ * Split `rows` into groups in `order`, keeping input order within each
  * group. A row with no key (or one outside `order`) lands in the last group
  * rather than vanishing.
  */
@@ -275,6 +273,7 @@ export function groupConversations<K extends string>(
   rows: readonly Conversation[],
   keyOf: (c: Conversation) => K | undefined,
   order: readonly K[],
+  keepEmpty?: K,
 ): { title: K; conversations: Conversation[] }[] {
   const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
   const fallback = byKey.get(order[order.length - 1]);
@@ -285,7 +284,7 @@ export function groupConversations<K extends string>(
   }
   return order.flatMap((title) => {
     const conversations = byKey.get(title) ?? [];
-    return conversations.length > 0 ? [{ title, conversations }] : [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
   });
 }
 

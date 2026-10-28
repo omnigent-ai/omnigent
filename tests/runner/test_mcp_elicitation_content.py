@@ -288,7 +288,20 @@ async def test_a_declined_elicitation_sends_no_content() -> None:
     assert result.content is None
 
 
-async def test_the_runner_events_endpoint_carries_the_content() -> None:
+@pytest.mark.parametrize(
+    "runner_owned, elicitation_id",
+    [
+        (True, ELICIT_ID),
+        (False, "elicit_claude_" + "a" * 32),
+        (False, "elicit_codex_" + "a" * 32),
+        (False, "elicit_eval_" + "a" * 32),
+        (False, "elicit_pi_" + "a" * 32),
+    ],
+)
+@pytest.mark.parametrize("action", ["accept", "decline", "cancel"])
+async def test_runner_approval_content_and_decline_interrupt_ownership(
+    runner_owned: bool, elicitation_id: str, action: str
+) -> None:
     """The regression boundary, exercised through the real HTTP handler.
 
     Every other test here calls ``resolve`` directly, which is precisely the
@@ -301,11 +314,12 @@ async def test_the_runner_events_endpoint_carries_the_content() -> None:
     from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
     from tests.runner.helpers import NullServerClient
 
+    harness_client = _ScriptedHarnessClient([])
     app = create_runner_app(
-        process_manager=cast(Any, _FakeProcessManager(_ScriptedHarnessClient([]))),
+        process_manager=cast(Any, _FakeProcessManager(harness_client)),
         server_client=cast(Any, NullServerClient()),
     )
-    parked = pending_approvals.register(ELICIT_ID)
+    parked = pending_approvals.register(elicitation_id) if runner_owned else None
     try:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
@@ -314,19 +328,28 @@ async def test_the_runner_events_endpoint_carries_the_content() -> None:
                 json={
                     "type": "approval",
                     "data": {
-                        "elicitation_id": ELICIT_ID,
-                        "action": "accept",
+                        "elicitation_id": elicitation_id,
+                        "action": action,
                         "content": {"answer": "prod"},
                     },
                 },
             )
             assert resp.status_code in (200, 204)
-        assert parked.done(), "the approval event never reached the registry"
-        assert parked.result() == pending_approvals.Verdict(
-            approved=True, content={"answer": "prod"}
+        if parked is not None:
+            assert parked.done(), "the approval event never reached the registry"
+            assert parked.result() == pending_approvals.Verdict(
+                approved=action == "accept",
+                content={"answer": "prod"} if action == "accept" else None,
+            )
+        assert [body["type"] for body in harness_client.patched_events] == (
+            ["interrupt", "approval"]
+            if action == "decline"
+            and (runner_owned or not elicitation_id.startswith("elicit_pi_"))
+            else ["approval"]
         )
+        assert harness_client.patched_events[-1]["content"] == {"answer": "prod"}
     finally:
-        pending_approvals.cleanup(ELICIT_ID)
+        pending_approvals.cleanup(elicitation_id)
 
 
 async def _elicit_with_schema(schema: dict[str, Any], resolve: Any) -> Any:

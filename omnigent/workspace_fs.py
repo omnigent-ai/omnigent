@@ -626,3 +626,42 @@ class WorkspaceReader:
                 pr_url=pr_url,
             ),
         )
+
+    def github_labels(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The labels the selected PR's repository offers."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_labels(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )
+
+    def github_merge_options(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The merge methods the selected PR's repository allows."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_merge_options(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )
+
+    def github_reviewers(
+        self, session_id: str | None = None, pr_url: str | None = None
+    ) -> _WorkspacePayload:
+        """The users and teams a review of the selected PR can be requested from."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_review_candidates(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+            ),
+        )

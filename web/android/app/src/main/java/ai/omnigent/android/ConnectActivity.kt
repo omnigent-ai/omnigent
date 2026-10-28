@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -27,7 +28,27 @@ class ConnectActivity : ComponentActivity() {
         setContentView(R.layout.activity_connect)
 
         val field = findViewById<EditText>(R.id.server_url)
+        intent.getStringExtra(EXTRA_SERVER_URL)?.let(field::setText)
+        intent.getStringExtra(EXTRA_ERROR)?.let { message ->
+            findViewById<TextView>(R.id.error_text).apply {
+                text = message
+                visibility = View.VISIBLE
+            }
+        }
         findViewById<Button>(R.id.connect).setOnClickListener { connect(field.text.toString()) }
+        findViewById<Button>(R.id.about).setOnClickListener {
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.about_title)
+                .setMessage(
+                    getString(
+                        R.string.about_version,
+                        BuildConfig.VERSION_NAME,
+                        BuildConfig.VERSION_CODE,
+                    ),
+                ).setPositiveButton(android.R.string.ok, null)
+                .show()
+        }
         field.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO) {
                 connect(field.text.toString())
@@ -53,6 +74,7 @@ class ConnectActivity : ComponentActivity() {
         startActivity(
             Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(MainActivity.EXTRA_CONNECT_REQUEST, UserConnectRequests.issue())
             },
         )
         finish()
@@ -71,5 +93,10 @@ class ConnectActivity : ComponentActivity() {
             row.setOnClickListener { connect(url) }
             container.addView(row)
         }
+    }
+
+    companion object {
+        const val EXTRA_SERVER_URL = "ai.omnigent.android.SERVER_URL"
+        const val EXTRA_ERROR = "ai.omnigent.android.CONNECT_ERROR"
     }
 }

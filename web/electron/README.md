@@ -231,9 +231,20 @@ node --test --test-name-pattern='interactive OAuth cancellation' web/electron/te
 
 ### Databricks authentication diagnostics
 
-Run `just electron-dev` from a terminal and retain the `[omnigent] databricks`
-lines. For a packaged build, launch the app's executable from a terminal to see
-its stdout/stderr. No extra logging flag is required.
+For a customer report, reproduce the problem and choose **Server → Export
+Diagnostics…**. This works in packaged builds without Developer Mode or a
+terminal. It saves a bounded JSON Lines file (current log plus two rotated
+files, up to 3 MiB) from Electron's per-user logs directory, including desktop
+connection and authentication milestones. On macOS the directory is under
+`~/Library/Logs/Omnigent/` (or `Omnigent Dev` for development). This is an
+application log, **not** the macOS Unified Log or a collection of system-wide
+logs. The export excludes renderer console, CLI/server output, cookies and token
+stores; it does not include server-side diagnostics. The native Server menu is
+available even if the app is stuck on the connect screen.
+
+For development, `just electron-dev` still prints `[omnigent] databricks`
+lines in the terminal. Launching a packaged executable from a terminal also
+shows its stdout/stderr. No extra logging flag is required.
 
 The logs identify the selected mode, public OAuth client ID, requested scopes,
 whether a client secret is configured (not its value), token-exchange status,
@@ -243,7 +254,13 @@ Tokens, cookie values, client secrets, authorization codes, PKCE verifiers, full
 callback URLs, and raw response bodies are not logged. Token and account-API
 requests never follow redirects, so a 3xx from those endpoints is reported as a
 failure rather than carrying the grant or bearer to another destination. Workspace and client IDs
-are still deployment metadata; redact those before sharing logs publicly.
+are still deployment metadata; review and redact those before sharing logs
+publicly. The exported file records only approved fields (origin, phase,
+outcome, selected error codes, HTTP status and request ID), rather than copying
+all terminal output. OIDC diagnostics distinguish existing sessions, silent
+refresh, browser sign-in, token exchange and rejection/recovery. If an auth
+failure needs server-side context, correlate its request ID with the server's
+logs separately.
 
 - `bridge response` with `phase: 'session-create'` means the status came from
   `/auth/session/create` itself, before following a redirect.
@@ -366,6 +383,7 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
+  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -450,7 +468,8 @@ dismisses.
 ## Embedded browser pane
 
 The desktop shell hosts an **embedded browser pane**: a real Chromium page the
-user can drive (URL bar + toolbar) and point-and-prompt in design mode. This PR
+user can drive (URL bar + toolbar), point-and-prompt in design mode, and sign in
+with cookies imported from the local Chrome profile. This PR
 covers that user-facing pane plus the Electron/renderer plumbing; the
 agent-facing builtin `browser_*` tools (navigate / snapshot / click / type /
 screenshot) that can also drive the pane land in a separate PR. A
@@ -543,9 +562,10 @@ recovery; older shells keep the action visible.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).
-Other loopback addresses, private-network and metadata destinations, and
-non-web schemes remain restricted. Existing tool approvals are unchanged;
-whether a tool call asks for approval depends on the harness and its policy.
+Other loopback addresses, private-network and metadata destinations, hostnames
+that resolve to any of them, and non-web schemes remain restricted. Existing
+tool approvals are unchanged; whether a tool call asks for approval depends on
+the harness and its policy.
 
 ### Local network permission
 
@@ -604,6 +624,33 @@ against its local Chromium, and the result is posted back.
   http(s) target navigates the same view in place (still allowlist-checked on
   an agent-locked view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
+- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
+  no loopback, private, link-local, metadata, or other non-public address in
+  any literal form (including IPv4-mapped and other IPv6 spellings). A
+  hostname is resolved through the view's Chromium session and refused if it
+  does not resolve or any address is non-public. `main.js` also applies the
+  policy to every document request (frames, `<object>`/`<embed>`) of an
+  agent-locked view through `webRequest`, covering redirects and in-place
+  window opens. Scripts, images, fetch/XHR, and WebSockets are outside this
+  guard and can still reach internal addresses; Electron 42 does not enforce
+  Chromium's Local Network Access checks here.
+  Those requests skip HTTP-cache reads so every response reports
+  the address Chromium connected to, and a response whose address is missing
+  or non-public (a DNS answer that changed after the check) is cancelled,
+  unless that address belongs to a configured proxy. Limits: that response
+  check runs after the request was sent, so it keeps the response from the
+  page but does not stop the request reaching the server. Pages restored from
+  the back-forward cache and navigations answered by a service worker make no
+  request these hooks see. Electron reports the connected IP but not its port
+  or whether a proxy was used, so when an internal proxy with a `DIRECT`
+  fallback is down and the destination rebinds to that proxy's IP, a direct
+  connection to another port there is accepted; failing closed would block
+  agent browsing through such proxies. For a proxied request, the reported IP
+  belongs to the proxy, not the destination it fetched; destination enforcement
+  therefore also depends on the proxy's own policy. Preflight still requires
+  successful local destination DNS, so proxy-only DNS configurations are not
+  supported. Classification conservatively excludes all of `2001::/23`,
+  including the global exceptions recognized by the Python policy.
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it
@@ -611,7 +658,7 @@ against its local Chromium, and the result is posted back.
 - `src/browserIpc.js` — the whole `ipcMain.handle('omnigent:browser-*')` surface,
   extracted out of `main.js` so that file stays bounded:
   `open-or-navigate`, `set-active`, `resize`, `screenshot`
-  (`capturePage().toPNG()` → base64), `execute`, `has-view`, `close`, plus the
+  (`capturePage().toPNG()` → base64), `perform-action`, `has-view`, `close`, plus the
   toolbar handlers `go-back`, `go-forward`, `reload`, and `open-devtools`
   (toggle, docked bottom), plus the design-mode handlers
   `enable-design-mode` / `disable-design-mode` / `signal-design-result`
@@ -623,10 +670,15 @@ against its local Chromium, and the result is posted back.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
+- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
+  Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
+  Electron-free, so it is unit-tested with a stub session and a synthetic
+  `Cookies` DB.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
   `Execute/Close` + `browserHasView`, the toolbar methods
   `browserGoBack/GoForward/Reload` + `openBrowserDevTools`, the design-mode
-  methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, and the
+  methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, the
+  Chrome cookie methods `browserChromeCookiePreview/Import`, and the
   subscriptions `onBrowserViewCreated` / `onBrowserHostActiveChanged` /
   `onBrowserViewClosed` / `onBrowserUrlChanged` / `onBrowserNavState` +
   `onBrowserElementSelected` / `onBrowserElementPromptSubmit` /
@@ -685,16 +737,103 @@ console listener is stored on the registry entry
 `close()` detaches it on teardown. Electron-only (needs `executeJavaScript` +
 the native view); no server flag.
 
-**JS trust boundary (important):** `omnigent:browser-execute` runs
-arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed
-to the SPA **only for the relay's own fixed templates** (the DOM-snapshot walk,
-and the click / type element resolvers) — there is deliberately **no
-agent-facing generic `evaluate`**. This keeps the _agent_ boundary: the agent
-picks elements by `ref`/`selector` and supplies text, but never ships a raw JS
-string that main will run. (It does not, and is not intended to, defend against
-XSS _within_ the visited page — that page runs its own scripts in its own
-sandboxed view regardless.) Preserve this when extending the bridge: add typed,
-argument-shaped actions, not a passthrough JS channel.
+All renderer IPC navigation uses the same URL policy, including the URL bar.
+A renderer's `agent: false` flag does not exempt a tab from address checks.
+Main-owned Arca preview eligibility still applies. Other internal sites must be
+opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
+
+**Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
+(Google sign-in is the common one) can't be signed in from this pane, so the
+toolbar's cookie button copies the **current site's** cookies out of a local
+Chrome profile into this conversation's in-memory session and reloads the page.
+Scope is deliberately narrow:
+
+- Only cookies inside the page's own domain tree: its host, its subdomains, and
+  the leading-dot parent domains that reach it (`.google.com` for
+  `mail.google.com`). Nothing else in the jar is read into the app.
+- When the host has parent domains the dialog offers them as _Site scope_, each
+  labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
+  wider scope being a superset because it covers every subdomain's cookies).
+  Cookies for other subdomains stay bound to their own host in the cookie store,
+  so they only apply once the tab visits them — which is what makes a sign-in
+  flow that bounces across subdomains work. The choice is validated main-side
+  against the ancestors of the view's current host, so the renderer can never
+  name an unrelated site.
+- A scope is only offered when that Chrome profile holds a `.<scope>` domain
+  cookie for it. Chrome refuses domain cookies on public suffixes, so `co.uk` and
+  `github.io` never appear in the picker; the page's own host is always offered.
+  The cost is that a host-only cookie on an ancestor domain (`example.com` set
+  for `example.com` exactly) can't widen the offer to `example.com` from
+  `mail.example.com` — such a cookie would not have reached the page anyway.
+- The page's own host always includes its subdomains, which is the point of a
+  site tree. On a public suffix people can host under (`github.io`,
+  `blogspot.com`) that reads every tenant's cookies for the suffix; the dialog
+  names the scope before anything is read, and the user has to confirm.
+- `browser-chrome-cookie-preview` reports only counts and profile names, and
+  touches no Keychain, so the confirmation dialog opens without a system prompt.
+  The import re-derives the host from the view's own URL main-side and refuses if
+  the tab navigated away while the dialog was open — including after the Keychain
+  prompt, before anything is written (navigation after the write starts is not
+  re-checked; the cookies are already domain-scoped). The renderer's scope string
+  is normalized main-side and must be one the profile offers, so a mixed-case or
+  trailing-dot value can't dodge the count the dialog shows.
+- The secret-copying step itself needs consent from the main process, not just
+  the pane's dialog: the connected page holds the bridge and could call it
+  directly, so `browser-chrome-cookie-import` runs a native
+  `dialog.showMessageBox` naming the scope, the tab's host (when an ancestor
+  scope was picked), the Chrome profile and the count (that count comes from
+  main's own preview, never from the renderer). Like the shell's other consent
+  dialogs it is parented to the sender's window, so it can't be approved while
+  the tab it describes is hidden behind another app, and Chrome's profile name —
+  a plain file on disk — is flattened to one short line so it can't add its own
+  text. Cancel is the default and a declined prompt returns
+  `{ ok: false, cancelled: true }`.
+- Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
+  Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
+  App-bound `v20` values and non-macOS platforms are refused with a message, not
+  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
+  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
+  the item's ACL, and any local process can then read Chrome's key without a
+  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  unpartitioned, which would widen the site they were scoped to.
+- Reading never touches Chrome's live database: `Cookies` (plus any
+  `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
+  `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
+  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
+  macOS system copies) instead of being resolved through `PATH`, so nothing on
+  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
+  message, never the command line.
+- Cookies land in the conversation's existing in-memory partition, so they
+  disappear when the app quits; nothing is written back to Chrome, and there is
+  no background sync.
+- Cookies alone don't always reproduce a sign-in (localStorage, device checks,
+  `HttpOnly` site state), and an agent-controlled tab means the agent can act as
+  you on that site while they're loaded — the dialog says so. For real SSO use
+  system-browser sign-in above.
+
+**JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,
+click and type requests. Main validates their arguments and builds fixed scripts,
+without granting a synthetic user gesture. Clipboard, popup and other
+gesture-gated page APIs still require native user interaction.
+
+**Desktop/UI transition (through v0.20).** Desktop and the served UI can upgrade
+in either order. An updated UI prefers `browserPerformAction`; on a pre-typed
+v0.18 desktop it sends only the fixed v0.18 action templates through the existing
+`browserExecute` bridge. Older desktops retain their existing execution behavior
+until upgraded. An updated desktop also accepts a v0.18 UI: its legacy adapter
+recognizes the complete snapshot/click/type templates, extracts only JSON data,
+validates the same argument limits, and reconstructs the action in main. It never
+evaluates the submitted script. Other scripts are rejected with an update message.
+
+Both adapters are deprecated for removal in v0.21. Update desktop and server UI
+before that release. The supported combinations during this transition are:
+
+| Desktop | Served UI | Action transport                                         |
+| ------- | --------- | -------------------------------------------------------- |
+| Updated | Updated   | Typed actions                                            |
+| Updated | v0.18     | Validated legacy templates → typed actions in main       |
+| v0.18   | Updated   | Fixed v0.18 templates through the older desktop's bridge |
 
 **Availability.** The pane is always on in this build — this shell machinery
 activates the moment a `browser.action_request` arrives (the agent-side

@@ -16,6 +16,8 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { cn } from "@/lib/utils";
 import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
@@ -45,7 +47,7 @@ export function ComposerWorkspaceBar({
     <div
       ref={barRef}
       className={cn(
-        "composer-workspace-surface group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
+        "composer-context-bar group/composer-workspace relative z-0 -mb-px flex h-7 min-w-0 items-center gap-0.5 rounded-t-2xl border border-b-0 border-border py-0.5 md:h-[37px] md:gap-2 md:py-1.5",
         COMPOSER_CONTENT_INSET_CLASS,
         COMPOSER_TRAY_INSET_CLASS,
         className,
@@ -102,7 +104,7 @@ export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status: "online" | "offline" | "unknown";
+    status?: "online" | "offline" | "unknown";
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -116,7 +118,6 @@ export const ComposerHostTrigger = forwardRef<
       ref={ref}
       type="button"
       aria-label={label}
-      title={label}
       className={cn(
         "flex h-8 w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
         className,
@@ -124,16 +125,18 @@ export const ComposerHostTrigger = forwardRef<
       {...props}
     >
       <span className="flex items-center">
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          <span
-            aria-hidden
-            className={cn(
-              "size-2 rounded-full",
-              status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-            )}
-            data-testid={`${testIdPrefix}-host-status`}
-          />
-        </span>
+        {status && (
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 rounded-full",
+                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
+              )}
+              data-testid={`${testIdPrefix}-host-status`}
+            />
+          </span>
+        )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
       </span>
     </button>
@@ -147,6 +150,7 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  disabledReason,
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
@@ -159,6 +163,8 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hover text explaining why the picker is disabled. */
+  disabledReason?: string;
   /** Hide the visible value; it stays in the accessible name. */
   iconOnly?: boolean;
   loading?: boolean;
@@ -178,7 +184,7 @@ export function ComposerPermissionPicker({
             loading && "disabled:opacity-100",
           )}
           aria-label={`${label}: ${value}`}
-          title={`${label}: ${value}`}
+          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >
@@ -240,6 +246,55 @@ export function ComposerConfigTooltipRows({
         </span>
       ))}
     </>
+  );
+}
+
+/**
+ * Hover tooltip for a composer control that opens a menu. It stays hidden
+ * while the menu is open and doesn't reopen as focus returns on close.
+ */
+export function ComposerMenuTooltip({
+  menuOpen,
+  content,
+  variant = "default",
+  testId,
+  className,
+  contentClassName,
+  children,
+}: {
+  menuOpen: boolean;
+  content: ReactNode;
+  variant?: "default" | "session-info";
+  testId?: string;
+  /** Classes for the wrapper that receives the hover. */
+  className?: string;
+  /** Classes for the tooltip surface. */
+  contentClassName?: string;
+  children: ReactNode;
+}) {
+  const guardedTooltip = useMenuGuardedTooltip(menuOpen);
+  return (
+    <TooltipProvider>
+      <Tooltip open={guardedTooltip.open} onOpenChange={guardedTooltip.onOpenChange}>
+        <TooltipTrigger asChild>
+          <span className={cn("flex min-w-0", className)} {...guardedTooltip.triggerProps}>
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className={cn(
+            "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
+            variant === "session-info" &&
+              "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
+            contentClassName,
+          )}
+          data-testid={testId}
+        >
+          {content}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 

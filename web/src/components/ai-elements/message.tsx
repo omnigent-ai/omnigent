@@ -39,6 +39,7 @@ import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } fro
 import {
   CHAT_LINK_SAFETY,
   FILE_LINK_STREAMDOWN_REHYPE_PLUGINS,
+  GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS,
   SECURE_STREAMDOWN_REHYPE_PLUGINS,
   STREAMDOWN_PLUGINS,
 } from "./streamdown-security";
@@ -316,6 +317,8 @@ export type MessageResponseProps = Omit<StreamdownProps, "rehypePlugins" | "merm
    * Opt-in: only callers that supply that override may set it.
    */
   markFileLinks?: boolean;
+  /** Show images hosted as GitHub attachments, e.g. in a PR description; others stay blocked. */
+  allowGitHubAttachmentImages?: boolean;
 };
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
@@ -619,7 +622,14 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
 }
 
 export const MessageResponse = memo(
-  ({ className, components, controls, markFileLinks = false, ...props }: MessageResponseProps) => {
+  ({
+    className,
+    components,
+    controls,
+    markFileLinks = false,
+    allowGitHubAttachmentImages = false,
+    ...props
+  }: MessageResponseProps) => {
     const themeMode = useResolvedThemeMode();
     const messageComponents = useMemo(
       () => ({ ...components, pre: ChatCodeBlockPre, table: ChatTable }),
@@ -650,7 +660,11 @@ export const MessageResponse = memo(
           mermaid={mermaidOptions}
           // Block remote image fetches that can exfiltrate data through URLs.
           rehypePlugins={
-            markFileLinks ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS : SECURE_STREAMDOWN_REHYPE_PLUGINS
+            markFileLinks
+              ? FILE_LINK_STREAMDOWN_REHYPE_PLUGINS
+              : allowGitHubAttachmentImages
+                ? GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS
+                : SECURE_STREAMDOWN_REHYPE_PLUGINS
           }
         />
       </MarkdownErrorBoundary>

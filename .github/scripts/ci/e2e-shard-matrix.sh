@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 # Emits the e2e shard matrix as `matrix=<json>` on $GITHUB_OUTPUT, or an EMPTY
-# matrix ({"include":[]}) to skip. Empty yields zero jobs and thus NO check-runs
-# -- the point of the indirection: a job-level `if:` skip would instead leave a
-# check-run with an unexpanded `E2E Tests (shard ${{ matrix.shard_id }}/...)` name.
+# matrix ({"include":[]}) to skip. The consuming job must guard this value
+# with a job-level `if:` before GitHub expands the matrix.
 #
-# Skips only draft PRs. These suites are mock-LLM (no secrets), so fork PRs run
-# directly, like CI.
+# Skips draft PRs and scopes without consumers in this suite.
 #
-# Env in:  EVENT_NAME, IS_DRAFT, NUM_SHARDS.
+# Env in:  EVENT_NAME, IS_DRAFT, NUM_SHARDS, RUN_TESTS (defaults to true).
 # Shared by e2e.yml and e2e-ui.yml (differ in NUM_SHARDS).
 
 set -euo pipefail
 
 skip=false
-if [[ "${IS_DRAFT:-false}" == "true" ]]; then
+if [[ "${IS_DRAFT:-false}" == "true" || "${RUN_TESTS:-true}" == "false" ]]; then
   skip=true
 fi
 
 if [[ "$skip" == "true" ]]; then
   echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-})"
+  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-} run=${RUN_TESTS:-true})"
   exit 0
 fi
 

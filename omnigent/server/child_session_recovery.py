@@ -292,6 +292,7 @@ async def restore_active_children(
                         resume_interrupted_turn=_interrupted(child),
                         generation=generation,
                         store_slots=store_slots,
+                        trigger="child_recovery",
                     )
                     if is_session_agent_removed(response):
                         return False  # nothing to restore; already logged as expected

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -99,25 +100,74 @@ async def test_legacy_failure_keeps_current_reply_and_ignores_meta_messages(stat
 
 
 @pytest.mark.asyncio
-async def test_wire_failure_reason_wins_over_stored_text() -> None:
-    data = {"status": "failed", "response_id": "resp_new", "output": "Actual failure"}
+@pytest.mark.parametrize("source", ["output", "failure_detail", "both"])
+@pytest.mark.parametrize("structured", [False, True])
+async def test_wire_failure_reason_wins_over_stored_text(source: str, structured: bool) -> None:
+    reason = "Actual failure"
+    if structured:
+        reason = json.dumps(
+            {
+                "error_code": "BAD_REQUEST",
+                "message": json.dumps(
+                    {
+                        "error": {
+                            "type": "invalid_request_error",
+                            "code": "array_above_max_length",
+                            "param": "input[3].content",
+                            "message": "Invalid input content count.",
+                        }
+                    }
+                ),
+            }
+        )
+    detail_source = "failure_detail" if source == "both" else source
+    data = {"status": "failed", "response_id": "resp_new", detail_source: reason}
+    if source == "both":
+        data["output"] = json.dumps({"error": {"code": "prose-code", "param": "prose-param"}})
     result = await _enrich(data, [_message("assistant", "Old reply", "resp_old")])
-    assert result.pop("failure_context")["detail_source"] == "external_status_output"
-    assert result == data
+    context = result.pop("failure_context")
+    assert context["detail_source"] == f"external_status_{detail_source}"
+    if structured:
+        assert context["provider_error_type"] == "invalid_request_error"
+        assert context["provider_error_code"] == "array_above_max_length"
+        assert context["provider_error_param"] == "input[3].content"
+    else:
+        assert "provider_error_code" not in context
+    assert result == {**data, "output": reason}
 
 
 @pytest.mark.asyncio
-async def test_harness_failure_detail_wins_over_stored_prose() -> None:
+@pytest.mark.parametrize("partial_output", [None, "Now add the block on the new branch:"])
+async def test_harness_failure_detail_wins_over_stored_prose(
+    partial_output: str | None,
+) -> None:
+    data = {
+        "status": "failed",
+        "response_id": "resp_failed",
+        "failure_detail": " API Error: 500 Overloaded ",
+    }
+    if partial_output is not None:
+        data["output"] = partial_output
     result = await _enrich(
-        {
-            "status": "failed",
-            "response_id": "resp_failed",
-            "failure_detail": " API Error: 500 Overloaded ",
-        },
+        data,
         [_message("assistant", "Now add the block on the new branch:", "resp_failed")],
     )
     assert result["output"] == "API Error: 500 Overloaded"
     assert result["failure_context"]["detail_source"] == "external_status_failure_detail"
+
+
+@pytest.mark.asyncio
+async def test_structured_source_evidence_wins_over_parsed_wire_text() -> None:
+    result = await _enrich(
+        {
+            "status": "failed",
+            "output": json.dumps({"error": {"code": "weaker-text-code", "param": "input"}}),
+            "failure_context": {"provider_error_code": "source-code"},
+        },
+        [],
+    )
+    assert result["failure_context"]["provider_error_code"] == "source-code"
+    assert result["failure_context"]["provider_error_param"] == "input"
 
 
 @pytest.mark.asyncio
@@ -141,7 +191,11 @@ async def test_failure_without_output_marks_missing_detail_and_keeps_category() 
 
 
 @pytest.mark.asyncio
-async def test_store_fallback_overrides_stale_claimed_provenance() -> None:
+@pytest.mark.parametrize("structured_prose", [False, True])
+async def test_store_fallback_overrides_stale_claimed_provenance(structured_prose: bool) -> None:
+    text = "I am waiting for a background task."
+    if structured_prose:
+        text = json.dumps({"error": {"code": "example-from-assistant-prose"}})
     result = await _enrich(
         {
             "status": "failed",
@@ -151,10 +205,11 @@ async def test_store_fallback_overrides_stale_claimed_provenance() -> None:
                 "detail_source": "missing",
             },
         },
-        [_message("assistant", "I am waiting for a background task.", "resp_failed")],
+        [_message("assistant", text, "resp_failed")],
     )
     assert result["failure_context"]["native_error_category"] == "server_error"
     assert result["failure_context"]["detail_source"] == "assistant_output_fallback"
+    assert "provider_error_code" not in result["failure_context"]
 
 
 @pytest.mark.asyncio
@@ -167,3 +222,11 @@ async def test_idle_enrichment_retains_its_existing_behavior() -> None:
         ],
     )
     assert result["output"] == "Completed output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["This turn's result", ""])
+async def test_confirmed_turn_output_is_not_replaced_by_other_turns(output: str) -> None:
+    data = {"status": "idle", "turn_completed": True, "output": output}
+    result = await _enrich(data, [_message("assistant", "Another turn's result", "resp_other")])
+    assert result == data

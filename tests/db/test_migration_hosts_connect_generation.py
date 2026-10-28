@@ -18,7 +18,7 @@ from omnigent.db.utils import (
     now_epoch,
 )
 
-_PARENT_REVISION = "mm1a2b3c4d5e"
+_PARENT_REVISION = "d0a1f879a01d"
 
 
 @pytest.fixture
@@ -86,7 +86,9 @@ def test_legacy_rows_keep_null_tokens_and_migration_is_retry_safe(db_engine: Eng
 
     # A retried upgrade (version table behind, column already present) must not fail.
     with db_engine.begin() as conn:
-        conn.execute(sa.text(f"UPDATE alembic_version SET version_num = '{_PARENT_REVISION}'"))
+        conn.execute(
+            sa.text("UPDATE alembic_version SET version_num = :rev"), {"rev": _PARENT_REVISION}
+        )
     _migrate(db_engine, "head")
     assert _connect_generation_column(db_engine) is not None
 

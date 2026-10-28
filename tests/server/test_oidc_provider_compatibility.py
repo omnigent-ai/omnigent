@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from omnigent.server.admin_list import AdminList
 from omnigent.server.auth import UnifiedAuthProvider
-from omnigent.server.oidc import OIDCConfig, derive_code_challenge
+from omnigent.server.oidc import OIDCConfig, derive_code_challenge, generate_code_verifier
 from omnigent.server.routes.auth import create_auth_router
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
@@ -101,6 +101,7 @@ def test_confidential_client_still_requires_secret(monkeypatch, auth_method):
         ("TOKEN_ENDPOINT", "", "Set all three"),
         ("AUTHORIZATION_ENDPOINT", "", "Set all three"),
         ("JWKS_URI", "", "Set all three"),
+        ("REQUIRE_REAUTH", "of", "OMNIGENT_OIDC_REQUIRE_REAUTH must be"),
     ],
 )
 def test_invalid_provider_configuration_fails_at_startup(monkeypatch, setting, value, error):
@@ -108,6 +109,37 @@ def test_invalid_provider_configuration_fails_at_startup(monkeypatch, setting, v
     monkeypatch.setenv(f"OMNIGENT_OIDC_{setting}", value)
     with pytest.raises(RuntimeError, match=error):
         OIDCConfig.from_env()
+
+
+@pytest.mark.usefixtures("oidc_env")
+@pytest.mark.parametrize(
+    ("value", "required", "github"),
+    [
+        (None, True, False),
+        ("", True, False),
+        ("1", True, False),
+        (" TRUE ", True, False),
+        ("yes", True, False),
+        ("0", False, False),
+        ("False", False, False),
+        ("no", False, False),
+        ("0", False, True),
+    ],
+)
+def test_reauth_verification_setting(monkeypatch, caplog, value, required, github):
+    """Re-authentication stays verified unless the operator explicitly opts out."""
+    if github:
+        monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://github.com")
+        monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_SECRET", "secret")
+        for name in ("TOKEN_ENDPOINT_AUTH_METHOD", *(name.upper() for name in _ENDPOINTS)):
+            monkeypatch.delenv(f"OMNIGENT_OIDC_{name}")
+    if value is not None:
+        monkeypatch.setenv("OMNIGENT_OIDC_REQUIRE_REAUTH", value)
+    with caplog.at_level("WARNING", logger="omnigent.server.oidc"):
+        assert OIDCConfig.from_env().require_reauth is required
+    # GitHub never forces re-authentication, so the opt-out changes nothing there.
+    warned = "OMNIGENT_OIDC_REQUIRE_REAUTH is disabled" in caplog.text
+    assert warned is (not required and not github)
 
 
 @pytest.mark.usefixtures("oidc_env")
@@ -305,12 +337,38 @@ def test_public_login_rejects_invalid_proofs(provider_client, failure):
 
 
 def test_public_pkce_login_fulfills_cli_ticket(provider_client):
-    """CLI login uses the same public-client exchange and validated identity token."""
+    """CLI login uses the same public-client exchange and validated identity token.
+
+    The ticket is PKCE-bound and released only after the signed-in browser
+    approves it on the consent page the callback redirects to.
+    """
     client, codes, _, _, _ = provider_client
-    ticket = client.post("/auth/cli-login").json()
-    params = begin_login(client, codes, {"ticket": ticket["ticket"]})
+    verifier = generate_code_verifier()
+    ticket = client.post(
+        "/auth/cli-login",
+        json={"code_challenge": derive_code_challenge(verifier), "code_challenge_method": "S256"},
+    ).json()
+    login_params = {
+        name: values[0] for name, values in parse_qs(urlsplit(ticket["login_url"]).query).items()
+    }
+    params = begin_login(client, codes, login_params)
     response = client.get("/auth/callback", params=params, follow_redirects=False)
-    assert response.status_code == 200, response.text
-    poll = client.get("/auth/cli-poll", params={"ticket": ticket["ticket"]})
+    assert response.status_code == 302, response.text
+    assert response.headers["location"] == f"/auth/cli-consent?ticket={ticket['ticket']}"
+    consent = client.get(response.headers["location"])
+    assert consent.status_code == 200, consent.text
+    assert ticket["user_code"] in consent.text
+    poll_headers = {"X-Omnigent-Code-Verifier": verifier}
+    pending = client.get(
+        "/auth/cli-poll", params={"ticket": ticket["ticket"]}, headers=poll_headers
+    )
+    assert pending.status_code == 202, pending.text
+    approve = client.post(
+        "/auth/cli-approve",
+        data={"ticket": ticket["ticket"]},
+        headers={"Origin": "http://testserver"},
+    )
+    assert approve.status_code == 200, approve.text
+    poll = client.get("/auth/cli-poll", params={"ticket": ticket["ticket"]}, headers=poll_headers)
     assert poll.status_code == 200, poll.text
     assert poll.json()["token"]

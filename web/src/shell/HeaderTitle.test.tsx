@@ -34,6 +34,31 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderTitle", () => {
+  it("opens from the rename shortcut with the title selected and saves on Enter", () => {
+    renderTitle(<HeaderTitle conversationId="conv-1" title="Planning" />);
+    expect(screen.getByTestId("header-title")).toHaveAttribute(
+      "aria-keyshortcuts",
+      "Control+Alt+R",
+    );
+    fireEvent.keyDown(window, { code: "KeyR", ctrlKey: true, altKey: true });
+
+    const input = screen.getByRole("textbox", { name: "Session name" }) as HTMLInputElement;
+    expect(input).toHaveFocus();
+    expect([input.selectionStart, input.selectionEnd]).toEqual([0, "Planning".length]);
+    fireEvent.change(input, { target: { value: "Roadmap" } });
+    fireEvent.keyDown(input, { code: "KeyR", ctrlKey: true, altKey: true, repeat: true });
+    expect(input).toHaveValue("Roadmap");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(mocks.rename).toHaveBeenCalledExactlyOnceWith({ id: "conv-1", title: "Roadmap" });
+  });
+
+  it("does not open from the shortcut while a rename is saving", () => {
+    mocks.pending = true;
+    renderTitle(<HeaderTitle conversationId="conv-1" title="Planning" />);
+    fireEvent.keyDown(window, { code: "KeyR", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("textbox", { name: "Session name" })).toBeNull();
+  });
+
   it("shows the title as a button that opens an inline input on click", () => {
     renderTitle(<HeaderTitle conversationId="conv-1" title="Planning" />);
     const trigger = screen.getByTestId("header-title");

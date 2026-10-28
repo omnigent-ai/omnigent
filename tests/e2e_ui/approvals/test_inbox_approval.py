@@ -30,6 +30,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.polling import poll_until
+
 _COMPOSER = "Send a message…"
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _INBOX_ITEM = '[data-testid="inbox-item"]'
@@ -56,16 +58,6 @@ def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
     return resp.json().get("pending_elicitations") or []
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 def _permission_hook_payload(elicitation_id: str, command: str) -> dict:
@@ -161,7 +153,7 @@ def _settle_after_drain(
     :param rng: Test RNG for the randomized settle delay.
     """
     expect(page.locator(_APPROVAL_CARD)).to_have_count(0, timeout=_REPARK_TIMEOUT_MS)
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id), timeout_s=30.0)
+    poll_until(lambda: not _pending_elicitations(base_url, session_id), timeout_s=30.0)
     # > one full rescan window past the drain, with margin for a loaded CI box
     # lagging the rescan loop, so the drain is always registered before the bump.
     time.sleep(rng.uniform(_WS_RESCAN_S + 2.0, _WS_RESCAN_S + 5.0))
@@ -197,7 +189,7 @@ def _park_in_thread(
     workers.append(worker)
     worker.start()
     if expect_pending:
-        _wait_for(partial(_is_parked, base_url, session_id, elicitation_id), timeout_s=30.0)
+        poll_until(partial(_is_parked, base_url, session_id, elicitation_id), timeout_s=30.0)
     return sink
 
 
@@ -234,7 +226,7 @@ def test_pending_approval_surfaces_and_resolves_in_inbox(
         timeout=_AGENT_TURN_TIMEOUT_MS
     )
     # Confirm the server is parked before we navigate away.
-    _wait_for(lambda: bool(_pending_elicitations(base_url, session_id)))
+    poll_until(lambda: bool(_pending_elicitations(base_url, session_id)))
 
     # The inbox gathers the prompt from the session's snapshot.
     page.goto(f"{base_url}/inbox")
@@ -248,7 +240,7 @@ def test_pending_approval_surfaces_and_resolves_in_inbox(
     # server drains the prompt, and the row's pending count drops to zero so
     # the item falls out of the inbox.
     card.get_by_role("button", name="Approve").click()
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
     expect(page.locator(_INBOX_ITEM)).to_have_count(0, timeout=30_000)
 
 

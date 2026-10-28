@@ -1,57 +1,14 @@
 import { useCallback } from "react";
 
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
-import type { HostWorktree } from "@/hooks/useHostWorktrees";
+import {
+  storedListToShow,
+  type StoredPullRequests,
+  useSessionPullRequests,
+} from "@/hooks/useSessionPullRequests";
+import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { gitProviderCopy } from "@/lib/gitProviders";
-
-/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
-const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
-
-/**
- * Canonicalize a path for comparison, mirroring the backend boundary check in
- * `_workspace_validation._is_subpath_of`: when either side is a Windows
- * absolute path, treat ``\`` as a separator and drive-letter case as
- * insignificant; on POSIX keep case and treat ``\`` as a legal filename char.
- * Trailing separators are dropped so they never affect identity.
- */
-function canonicalizePath(path: string, windows: boolean): string {
-  const canon = windows ? path.replace(/\\/g, "/").toLowerCase() : path;
-  return canon.replace(/\/+$/, "");
-}
-
-type MatchKind = { kind: "exact" | "contains"; length: number } | { kind: "none" };
-
-/** How ``workspace`` relates to a worktree ``root``, platform-aware. */
-function matchKind(root: string, workspace: string): MatchKind {
-  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(workspace);
-  const r = canonicalizePath(root, windows);
-  const w = canonicalizePath(workspace, windows);
-  if (w === r) return { kind: "exact", length: r.length };
-  // Boundary-aware containment: `/a/foo` is not under `/a/fo` (prefix collision).
-  if (w.startsWith(`${r}/`)) return { kind: "contains", length: r.length };
-  return { kind: "none" };
-}
-
-/**
- * The worktree whose root contains ``workspace`` — exact match, else the
- * deepest root ``workspace`` sits under (a workspace bound to a subdir of a
- * worktree). ``null`` when nothing contains it. Path comparison is
- * platform-aware (see {@link matchKind}).
- */
-function matchWorktree(worktrees: HostWorktree[], workspace: string): HostWorktree | null {
-  let best: HostWorktree | null = null;
-  let bestLength = -1;
-  for (const wt of worktrees) {
-    const match = matchKind(wt.path, workspace);
-    if (match.kind === "exact") return wt;
-    if (match.kind === "contains" && match.length > bestLength) {
-      best = wt;
-      bestLength = match.length;
-    }
-  }
-  return best;
-}
 
 /** How much we actually know about the session's checked-out branch. */
 export type ComposerBranchState =
@@ -104,6 +61,16 @@ export interface ComposerGitStatus {
  * @param workspace - Absolute workspace path.
  * @param creationBranch - Static `session.gitBranch`, surfaced as history only.
  */
+/** Ready once live info or the server's list can answer; the server's list doesn't wait on the host. */
+function githubStateOf(
+  github: { data?: unknown; isError: boolean; isLoading: boolean },
+  stored: StoredPullRequests | undefined,
+): ComposerGitStatus["githubState"] {
+  if (github.data && !github.isError) return "ready";
+  if (stored && (stored.prs.length > 0 || stored.synced)) return "ready";
+  return github.isLoading ? "loading" : "unknown";
+}
+
 export function useComposerGitStatus({
   sessionId,
   hostId,
@@ -117,6 +84,7 @@ export function useComposerGitStatus({
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
   const github = usePullRequestInfo(sessionId ?? undefined);
+  const stored = useSessionPullRequests(sessionId ?? undefined, github.data);
   const info = github.data;
   const result = worktrees.data;
 
@@ -152,7 +120,10 @@ export function useComposerGitStatus({
     }
   }
 
-  const prs = info?.prs;
+  // Servers that store PRs decide which PRs the session links once they have
+  // imported them, unless the host doesn't track PRs; older servers only have live info.
+  const fromStored = storedListToShow(stored.data, !!info);
+  const prs = fromStored && (!info || info.tracking_available === true) ? fromStored : info?.prs;
   const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
   const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
   // The primary PR's own provider first, then the session's.
@@ -176,7 +147,7 @@ export function useComposerGitStatus({
     worktreePath,
     creationBranch: creationBranch?.trim() || null,
     repoNameWithOwner: info?.repo?.name_with_owner ?? null,
-    githubState: github.isLoading ? "loading" : github.isError || !info ? "unknown" : "ready",
+    githubState: githubStateOf(github, stored.data),
     prCount,
     prNumber,
     prNumberPrefix,

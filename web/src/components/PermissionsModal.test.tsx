@@ -445,6 +445,50 @@ describe("PermissionsModal", () => {
     });
   });
 
+  it.each([
+    [
+      "denies clipboard write",
+      {
+        writeText: vi
+          .fn()
+          .mockRejectedValue(new DOMException("Write permission denied.", "NotAllowedError")),
+      },
+    ],
+    ["is unavailable on an insecure origin", undefined],
+  ])("copies the link and confirms when the async clipboard %s", async (_case, clipboard) => {
+    listMock.mockResolvedValue([]);
+    const copiedText = vi.fn();
+    Object.assign(navigator, { clipboard });
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn((command: string) => {
+        if (command !== "copy") return false;
+        const event = new Event("copy", { bubbles: true, cancelable: true }) as ClipboardEvent;
+        Object.defineProperty(event, "clipboardData", {
+          value: { setData: (_type: string, text: string) => copiedText(text) },
+        });
+        document.dispatchEvent(event);
+        if (!event.defaultPrevented && document.activeElement instanceof HTMLTextAreaElement) {
+          copiedText(document.activeElement.value);
+        }
+        return true;
+      }),
+    });
+
+    try {
+      render(<PermissionsModal sessionId="conv_xyz" open={true} onOpenChange={() => {}} />, {
+        wrapper: createWrapper(),
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /copy link/i }));
+
+      expect(await screen.findByRole("button", { name: /copied!/i })).toBeInTheDocument();
+      expect(copiedText).toHaveBeenCalledWith(`${window.location.origin}/c/conv_xyz`);
+    } finally {
+      delete (document as { execCommand?: unknown }).execCommand;
+    }
+  });
+
   it("surfaces a server error from a failed revoke", async () => {
     // WHY: revoke failures (e.g. insufficient permission) must render the
     // server message via the onError path, mirroring the grant error path.
@@ -547,6 +591,52 @@ describe("PermissionsModal", () => {
             : [],
         ),
       );
+    });
+
+    it("disables the combobox for a workspace that cannot be shared", async () => {
+      listMock.mockResolvedValue([]);
+      render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+
+      const input = screen.getByPlaceholderText("alice@example.com");
+      expect(input).toHaveAttribute("role", "combobox");
+      expect(input).toBeDisabled();
+    });
+
+    it("closes open suggestions when the workspace becomes unshareable", async () => {
+      listMock.mockResolvedValue([]);
+      const { rerender } = render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice/project"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      const input = screen.getByPlaceholderText("alice@example.com");
+      fireEvent.focus(input);
+      fireEvent.change(input, { target: { value: "al" } });
+      await waitFor(() => expect(screen.getByRole("listbox")).toBeInTheDocument());
+
+      rerender(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+      );
+      expect(input).toBeDisabled();
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     });
 
     it("renders the field as a combobox and shows suggestions while typing", async () => {
@@ -712,7 +802,7 @@ describe("PermissionsModal", () => {
     });
 
     it.each(["/home/alice", "/Users/bob", "/var/home/carol", "/root", "/"])(
-      "explains the restriction for %s before any submission",
+      "disables new grants and explains the restriction for %s",
       async (workspace) => {
         listMock.mockResolvedValue([]);
         render(
@@ -729,13 +819,51 @@ describe("PermissionsModal", () => {
 
         const warning = screen.getByText(/This session's working directory/);
         expect(warning).toHaveClass("text-destructive");
+        const grantButton = screen.getByRole("button", { name: /grant/i });
+        expect(screen.getByLabelText("User ID")).toBeDisabled();
+        expect(screen.getByRole("combobox", { name: "New user permission" })).toBeDisabled();
+        expect(grantButton).toHaveAccessibleDescription(warning.textContent ?? "");
+        // A user id in the field must not re-enable Grant: submitting would be
+        // a silent no-op because handleGrant bails out for blocked workspaces.
         fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
-        fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+        expect(grantButton).toBeDisabled();
+        fireEvent.click(grantButton);
         expect(screen.getByRole("combobox", { name: "General access" })).toBeDisabled();
         await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
         expect(grantMock).not.toHaveBeenCalled();
       },
     );
+
+    it("rejects a form submission once the workspace becomes unshareable", async () => {
+      listMock.mockResolvedValue([]);
+      const { rerender } = render(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice/project"
+          open
+          onOpenChange={() => {}}
+        />,
+        { wrapper: createSharingWrapper("restricted_read_only") },
+      );
+      fireEvent.change(screen.getByLabelText("User ID"), { target: { value: "bob" } });
+      expect(screen.getByRole("button", { name: /grant/i })).toBeEnabled();
+
+      rerender(
+        <PermissionsModal
+          sessionId="conv_abc"
+          workspace="/home/alice"
+          open
+          onOpenChange={() => {}}
+        />,
+      );
+      const grantButton = screen.getByRole("button", { name: /grant/i });
+      expect(grantButton).toBeDisabled();
+      // Submit the form directly: a disabled button never reaches handleGrant,
+      // so this is what exercises its own guard.
+      fireEvent.submit(grantButton.closest("form")!);
+      await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
+      expect(grantMock).not.toHaveBeenCalled();
+    });
 
     it.each(["on", "read_only"] as const)(
       "does not block home directories in %s mode",

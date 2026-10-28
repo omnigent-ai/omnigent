@@ -1718,6 +1718,7 @@ class _LaunchReturningRegistry:
         parent_os_env: Any | None = None,
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
+        program_status_app: str | None = None,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
@@ -1728,6 +1729,7 @@ class _LaunchReturningRegistry:
         :param parent_os_env: Agent os_env (unused).
         :param cwd_override: cwd override (unused).
         :param sandbox_override: sandbox override (unused).
+        :param program_status_app: Runtime status application identity.
         :returns: The prepared terminal instance.
         """
         del (
@@ -1739,6 +1741,7 @@ class _LaunchReturningRegistry:
             cwd_override,
             sandbox_override,
         )
+        self._instance.program_status_app = program_status_app
         return self._instance
 
 

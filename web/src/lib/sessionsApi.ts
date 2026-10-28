@@ -11,11 +11,12 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
+import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
-import { setSessionHost, setSessionParent } from "./sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
@@ -249,6 +250,7 @@ interface SessionResponseWire {
   }[];
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
+  side_chat_settings_supported?: boolean;
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -317,7 +319,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -366,6 +368,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     codexModelOptions: wire.model_options ?? [],
+    sideChatSettingsSupported: wire.side_chat_settings_supported === true,
     ...(wire.inference_configured !== undefined
       ? {
           inferenceConfigured: wire.inference_configured,
@@ -809,7 +812,8 @@ export async function createBundledSession(
  *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
  *   repository the server clones into the sandbox; `null` gives the fork an
  *   empty sandbox, and leaving the key off inherits the repository the
- *   source session recorded.
+ *   source session recorded. `hostId` names the new sandbox host, as on a
+ *   managed create; omitted, the server mints one.
  */
 export async function forkSession(
   sourceId: string,
@@ -819,11 +823,11 @@ export async function forkSession(
     upToResponseId?: string;
     config?: {
       modelOverride?: string;
-      reasoningEffort?: string;
+      reasoningEffort?: string | null;
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null };
+    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -834,11 +838,12 @@ export async function forkSession(
     agent_id?: string;
     up_to_response_id?: string;
     model_override?: string;
-    reasoning_effort?: string;
+    reasoning_effort?: string | null;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    host_id?: string;
     workspace?: string | null;
     side_chat?: boolean;
   } = {};
@@ -879,6 +884,9 @@ export async function forkSession(
     if (sandbox.workspace !== undefined) {
       body.workspace = sandbox.workspace;
     }
+    if (sandbox.hostId !== undefined) {
+      body.host_id = sandbox.hostId;
+    }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
@@ -901,7 +909,10 @@ export async function forkSession(
  * @returns The new side-chat session id.
  * @throws Error when the source is disconnected or the fork / runner launch fails.
  */
-export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
+export async function createSideChat(
+  sourceId: string,
+  settings?: SideChatModelSettings,
+): Promise<{ childSessionId: string }> {
   let source = await getSession(sourceId);
   if (
     source.runnerOnline === false &&
@@ -917,7 +928,11 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
   if (!canUseRunner) {
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
-  const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
+  const fork = await forkSession(sourceId, {
+    title: "Side chat",
+    sideChat: true,
+    config: settings,
+  });
   if (runnerId) {
     await updateSession(fork.id, { runnerId });
   }
@@ -1374,6 +1389,12 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
   return "data" in item && typeof (item as NestedSessionItem).data === "object";
 }
 
+/** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
+export const HOST_OFFLINE_CODE = "host_offline";
+
+/** Tells the server this client resends a message once its offline host reconnects. */
+const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
+
 /**
  * Submit a single event to a session. Validated server-side per the
  * `type` discriminator (`message`, `function_call_output`,
@@ -1384,12 +1405,14 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 export async function postEvent(
   sessionId: string,
   event: SessionEventInput,
+  opts?: { holdWhenHostOffline?: boolean },
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...backgroundSessionTitlesRequestHeaders(),
+      ...(opts?.holdWhenHostOffline ? { [HOST_OFFLINE_HOLD_HEADER]: "on" } : {}),
     },
     body: JSON.stringify(event),
   });

@@ -203,6 +203,26 @@ def test_add_github_repo_refuses_symlinks(fake_repo: _FakeRepo, server: _FakeSer
     assert not [r for r in server.seen if r.method == "POST"]
 
 
+@pytest.mark.parametrize(
+    ("source", "hinted"), [("acme/agents", True), ("https://github.com/acme/agents", False)]
+)
+def test_add_github_clone_failure_hints_a_missing_local_path(
+    source: str, hinted: bool, server: _FakeServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    def fail_clone(url: str, ref: str | None, dest: Path) -> None:
+        raise cli_mod._agent_cli_error(f"Could not clone {url}.")
+
+    monkeypatch.setattr(cli_mod, "_clone_github_source", fail_clone)
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "add", source], standalone_mode=False)
+    assert isinstance(result.exception, click.ClickException), result.output
+    message = result.exception.message
+    assert message.startswith("Could not clone https://github.com/acme/agents.git.")
+    assert (f"(If {source!r} is a local path, it doesn't exist.)" in message) is hinted
+    assert suppresses_recovery_hint(result.exception)
+
+
 def test_add_github_repo_with_symlinked_tmpdir(
     fake_repo: _FakeRepo, server: _FakeServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

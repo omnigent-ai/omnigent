@@ -373,7 +373,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
     tmp_path: Path,
 ) -> None:
     """A different parent harness preserves the child's prompt and native answer."""
-    client, workspace, runner_id, mock_url = cross_harness_rig
+    client, _workspace, runner_id, mock_url = cross_harness_rig
     name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
     parent = {
         "spec_version": 1,
@@ -388,7 +388,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         "async": True,
         "os_env": {
             "type": "caller_process",
-            "cwd": str(workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
         "tools": {"agents": ["claude_code"]},

@@ -47,6 +47,7 @@ import { usePublicSharingMaxLevel } from "@/hooks/useSharing";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
+import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
@@ -103,6 +104,7 @@ export function PermissionsModal({
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
+  const blockedNoticeId = useId();
 
   // Whether the owner shared the workspace files with view-level collaborators.
   // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
@@ -316,13 +318,22 @@ export function PermissionsModal({
           )}
         </div>
 
+        {/* Shown above the disabled add-grant form so it reads as the reason the
+            controls are inert, before the user tries them. */}
+        {workspaceBlocked && (
+          <p id={blockedNoticeId} className="text-sm text-destructive">
+            This session&apos;s working directory (a home or root directory) cannot be shared on
+            this Omnigent server.
+          </p>
+        )}
+
         {/* Add grant form */}
         <form onSubmit={handleGrant} className="flex items-end gap-2">
           <div className="flex-1">
             <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
               User ID
             </label>
-            <AddUserField value={newUserId} onChange={setNewUserId} />
+            <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
           </div>
           <div>
             <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
@@ -331,6 +342,7 @@ export function PermissionsModal({
             <Select
               value={newLevel}
               onValueChange={setNewLevel}
+              disabled={workspaceBlocked}
               componentId="diagnostics.permissions.grant_level"
               valueHasNoPii
             >
@@ -348,20 +360,14 @@ export function PermissionsModal({
             type="submit"
             size="sm"
             loading={grant.isPending}
-            disabled={!newUserId.trim()}
+            disabled={workspaceBlocked || !newUserId.trim()}
+            aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
             componentId="diagnostics.permissions.grant"
           >
             <UserPlusIcon className="mr-1 size-3.5" />
             Grant
           </Button>
         </form>
-
-        {workspaceBlocked && (
-          <p className="text-sm text-destructive">
-            This session&apos;s working directory (a home or root directory) cannot be shared on
-            this Omnigent server.
-          </p>
-        )}
 
         {error && <p className="text-sm text-destructive">{error}</p>}
 
@@ -394,6 +400,7 @@ export function PermissionsModal({
 interface AddUserFieldProps {
   value: string;
   onChange: (value: string) => void;
+  disabled?: boolean;
 }
 
 /**
@@ -402,7 +409,7 @@ interface AddUserFieldProps {
  * a free-text suggestion combobox. Free typing is always allowed; suggestions
  * are an aid, not a constraint.
  */
-function AddUserField({ value, onChange }: AddUserFieldProps) {
+function AddUserField({ value, onChange, disabled }: AddUserFieldProps) {
   // Read once: the host installs config eagerly before first render, so the
   // branch is stable for the lifetime of the modal.
   const searchUsers = getOmnigentUserSearch();
@@ -414,10 +421,11 @@ function AddUserField({ value, onChange }: AddUserFieldProps) {
         onChange={(e) => onChange(e.target.value)}
         placeholder="alice@example.com"
         className="mt-1 h-8"
+        disabled={disabled}
       />
     );
   }
-  return <AddUserCombobox value={value} onChange={onChange} />;
+  return <AddUserCombobox value={value} onChange={onChange} disabled={disabled} />;
 }
 
 // Hand-rolled accessible combobox/listbox rendered INLINE (no Radix Popover).
@@ -433,12 +441,14 @@ function AddUserField({ value, onChange }: AddUserFieldProps) {
 // Rendering the list as an absolutely-positioned descendant of the dialog keeps
 // it inside the scroll-lock's allow-list (wheel works) and lets us own the
 // combobox a11y roles + keyboard handling directly.
-function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
+function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const { suggestions, isLoading } = useUserSearch(value);
   const hasQuery = value.trim().length > 0;
-  const isOpen = open && hasQuery;
+  // `disabled` can flip on while the list is open (the sharing policy resolves
+  // after the dialog mounts), so close it rather than leave it clickable.
+  const isOpen = open && hasQuery && !disabled;
 
   const listId = useId();
   const listRef = useRef<HTMLDivElement>(null);
@@ -518,6 +528,7 @@ function AddUserCombobox({ value, onChange }: AddUserFieldProps) {
         placeholder="alice@example.com"
         className="mt-1 h-8"
         autoComplete="off"
+        disabled={disabled}
       />
       {isOpen && (
         // Wider than the (narrow) field so suggested emails aren't truncated.
@@ -609,7 +620,7 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
 
   const handleCopy = useCallback(() => {
     const url = getShareableLink(sessionId, rebasePath);
-    navigator.clipboard.writeText(url).then(
+    copyText(url).then(
       () => setCopied(true),
       (err) => {
         console.warn("Failed to copy link to clipboard", err);

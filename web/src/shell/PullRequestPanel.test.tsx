@@ -2,13 +2,15 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type * as UseSessionPullRequestsModule from "@/hooks/useSessionPullRequests";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type {
   PullRequest,
   PullRequestAssociation,
@@ -17,6 +19,8 @@ import type {
   PullRequestComment,
   PullRequestDiffResponse,
   PullRequestInfo,
+  PullRequestRepoLabels,
+  PullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
@@ -48,30 +52,106 @@ const state = vi.hoisted(() => ({
   // The whole-PR diff response; the panel parses its patch into per-file diffs.
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
+  canEdit: true,
+  repoLabels: {
+    data: undefined as PullRequestRepoLabels | undefined,
+    isPending: true,
+    isError: false,
+    error: null as Error | null,
+  },
+  updateLabels: { mutate: vi.fn(), isError: false, error: null as Error | null },
+  reviewCandidates: {
+    data: undefined as PullRequestReviewCandidates | undefined,
+    isPending: true,
+    isError: false,
+    error: null as Error | null,
+  },
+  updateReviewers: { mutate: vi.fn(), isError: false, error: null as Error | null },
+  // The server's stored PRs per session; absent sessions keep what the panel seeded.
+  stored: {} as Record<string, PullRequestAssociation[]>,
+  // Sessions the server hasn't imported yet; others are synced.
+  unsynced: new Set<string>(),
+  storedFetches: 0,
+  storesPrs: true,
+  unlink: { mutate: vi.fn(), isPending: false, isError: false, error: null as Error | null },
+  sandboxAsleep: false,
+  // False once the session's host disconnects, which leaves cached live info without an error.
+  serveable: undefined as boolean | undefined,
 }));
 
-vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
-  // The panel reads every info payload through the real normalizer.
-  normalizePullRequestInfo: (await importOriginal<typeof UsePullRequestsModule>())
-    .normalizePullRequestInfo,
-  usePullRequestInfo: vi.fn(() => state.info),
-  usePullRequestChangedFiles: vi.fn(() => state.changes),
-  usePullRequestDiff: () => ({
-    data: state.diff,
-    isLoading: false,
-    error: state.diffError,
-    isFetching: false,
-  }),
-  fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
-  // The account selector (shown in the repo-unresolved empty state) calls this;
-  // stub the mutation shape it reads.
-  useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useSetPullRequestPreference: () => ({
-    mutate: () => {},
-    isPending: false,
-    isError: false,
-    error: null,
-  }),
+vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
+  const original = await importOriginal<typeof UsePullRequestsModule>();
+  return {
+    // The panel reads every info payload through the real normalizer.
+    normalizePullRequestInfo: original.normalizePullRequestInfo,
+    usePullRequestCommentComposer: original.usePullRequestCommentComposer,
+    pullRequestCommentTooLong: original.pullRequestCommentTooLong,
+    MAX_PULL_REQUEST_COMMENT_CHARACTERS: original.MAX_PULL_REQUEST_COMMENT_CHARACTERS,
+    applyPullRequestLabelChange: original.applyPullRequestLabelChange,
+    pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
+    usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
+    useUpdatePullRequestLabels: () => state.updateLabels,
+    usePullRequestMergeOptions: () => ({ data: undefined, isPending: true, isError: false }),
+    useMergePullRequest: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useDisablePullRequestAutoMerge: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    applyPullRequestReviewerChange: original.applyPullRequestReviewerChange,
+    pullRequestReviewerKey: original.pullRequestReviewerKey,
+    pullRequestReviewersMutationKey: original.pullRequestReviewersMutationKey,
+    usePullRequestReviewCandidates: vi.fn(() => state.reviewCandidates),
+    useUpdatePullRequestReviewers: () => state.updateReviewers,
+    useUpdatePullRequestDetails: () => ({
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      isPending: false,
+      isError: false,
+    }),
+    uploadPullRequestAttachment: vi.fn(),
+    usePullRequestInfo: vi.fn(() => state.info),
+    usePullRequestChangedFiles: vi.fn(() => state.changes),
+    usePullRequestDiff: () => ({
+      data: state.diff,
+      isLoading: false,
+      error: state.diffError,
+      isFetching: false,
+    }),
+    fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
+    // The account selector (shown in the repo-unresolved empty state) calls this;
+    // stub the mutation shape it reads.
+    useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useSetPullRequestPreference: () => ({
+      mutate: () => {},
+      isPending: false,
+      isError: false,
+      error: null,
+    }),
+  };
+});
+vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
+  const original = await importOriginal<typeof UseSessionPullRequestsModule>();
+  const { useQuery } = await import("@tanstack/react-query");
+  return {
+    sessionPullRequestsKey: original.sessionPullRequestsKey,
+    storedListToShow: original.storedListToShow,
+    storesSessionPullRequests: () => state.storesPrs,
+    useSessionPullRequests: (id: string | undefined) => {
+      return useQuery({
+        queryKey: original.sessionPullRequestsKey(id),
+        queryFn: async () => {
+          state.storedFetches += 1;
+          return { prs: state.stored[id ?? ""] ?? [], synced: !state.unsynced.has(id ?? "") };
+        },
+        // Sessions without a server list here read live info only.
+        enabled: !!id && id in state.stored && state.storesPrs,
+      });
+    },
+    useUnlinkSessionPr: () => state.unlink,
+  };
+});
+vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
+  useWorkspaceAsleep: () => state.sandboxAsleep,
+  useWorkspaceServeable: () => state.serveable,
 }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
@@ -98,7 +178,12 @@ vi.mock("@/components/ai-elements/message", () => ({
   ),
 }));
 
-import { usePullRequestInfo, usePullRequestChangedFiles } from "@/hooks/usePullRequests";
+import {
+  usePullRequestInfo,
+  usePullRequestChangedFiles,
+  usePullRequestRepoLabels,
+  usePullRequestReviewCandidates,
+} from "@/hooks/usePullRequests";
 
 import {
   PullRequestPanel,
@@ -149,6 +234,13 @@ function renderChanges() {
   return r;
 }
 
+/** Render, then switch to the Comments tab (see renderChanges). */
+function renderComments() {
+  const r = renderPanel();
+  fireEvent.mouseDown(screen.getByRole("tab", { name: /^Comments/ }));
+  return r;
+}
+
 /** Silences console.error for the current test and returns a reader for the React
  *  duplicate- and missing-key warnings logged so far. */
 function watchKeyWarnings(): () => string[] {
@@ -160,8 +252,8 @@ function watchKeyWarnings(): () => string[] {
       .filter((message) => /same key|unique "key"/.test(message));
 }
 
-/** The markdown body of each comment card, in rendered order. The fixtures used
- *  with it have no PR description, so every markdown block is a comment. */
+/** The markdown body of each comment card, in rendered order. Only the active
+ *  tab mounts, so on the Comments tab every markdown block is a comment. */
 function commentBodies(): (string | null)[] {
   return screen.getAllByTestId("markdown").map((el) => el.textContent);
 }
@@ -171,6 +263,13 @@ let scrollIntoView: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   // The diff-layout toggle seeds from persisted prefs; start each test clean.
   window.localStorage.clear();
+  state.stored = {};
+  state.unsynced = new Set();
+  state.storedFetches = 0;
+  state.storesPrs = true;
+  state.unlink = { mutate: vi.fn(), isPending: false, isError: false, error: null };
+  state.sandboxAsleep = false;
+  state.serveable = undefined;
   // Fire the observer callback immediately on observe so lazy sections mount.
   class IO {
     private cb: IntersectionObserverCallback;
@@ -240,6 +339,9 @@ beforeEach(() => {
   state.parsedFiles = [{ name: "hello.py" }, { name: "src/app.ts" }];
   state.diff = { object: "session.github.pr_diff", patch: "PATCH" };
   state.diffError = null;
+  state.canEdit = true;
+  state.repoLabels = { data: undefined, isPending: true, isError: false, error: null };
+  state.updateLabels = { mutate: vi.fn(), isError: false, error: null };
 });
 
 afterEach(() => {
@@ -262,6 +364,416 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
+    const user = userEvent.setup();
+    state.info!.data!.pr!.checks = {
+      passing: 0,
+      failing: 0,
+      pending: 0,
+      cancelled: 1,
+      skipped: 2,
+      total: 3,
+      runs: [
+        { name: "cancelled job", bucket: "cancelled", url: null },
+        { name: "skipped job", bucket: "skipped", url: null },
+        { name: "another skipped job", bucket: "skipped", url: null },
+      ],
+    };
+    renderPanel();
+
+    for (const label of ["1 cancelled", "2 skipped"]) {
+      expect(screen.getByRole("button", { name: label })).toHaveClass(
+        "bg-muted",
+        "text-muted-foreground",
+        "rounded-full",
+      );
+    }
+    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+
+    await user.hover(screen.getByRole("button", { name: "2 skipped" }));
+    const rows = await screen.findAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual(["skipped job", "another skipped job"]);
+  });
+
+  it("shows each assigned reviewer with its current state and team kind", () => {
+    state.info!.data!.pr!.reviewers = [
+      { login: "alice", kind: "user", state: "PENDING" },
+      { login: "bob", kind: "user", state: "APPROVED" },
+      { login: "carol", kind: "user", state: "COMMENTED" },
+      { login: "platform-team", kind: "team", state: "CHANGES_REQUESTED" },
+      { login: "former-reviewer", kind: "user", state: "DISMISSED" },
+    ];
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toBeInTheDocument();
+    for (const [subject, status] of [
+      ["alice", "Pending"],
+      ["bob", "Approved"],
+      ["carol", "Commented"],
+      ["Team platform-team", "Changes requested"],
+      ["former-reviewer", "Dismissed"],
+    ]) {
+      expect(screen.getByRole("listitem", { name: `${subject}: ${status}` })).toBeInTheDocument();
+    }
+    expect(screen.getByText("(team)")).toBeInTheDocument();
+
+    const reviewersSection = screen.getByRole("heading", { name: "Reviewers" }).closest("section");
+    const checksSection = screen.getByRole("heading", { name: "Checks" }).closest("section");
+    expect(reviewersSection).not.toBeNull();
+    expect(checksSection).not.toBeNull();
+    expect(
+      reviewersSection!.compareDocumentPosition(checksSection!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("shows an empty reviewer section when the host reports no reviewers", () => {
+    state.info!.data!.pr!.reviewers = [];
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Reviewers" })).toBeInTheDocument();
+    expect(screen.getByText("No reviewers assigned.")).toBeInTheDocument();
+  });
+
+  it("omits reviewers for a host that does not include the optional field", () => {
+    renderPanel();
+
+    expect(screen.queryByRole("heading", { name: "Reviewers" })).toBeNull();
+  });
+
+  it("updates reviewers when the active PR changes", () => {
+    state.info!.data!.pr!.reviewers = [{ login: "alice", kind: "user", state: "PENDING" }];
+    const { rerender } = renderPanel();
+    expect(screen.getByRole("listitem", { name: "alice: Pending" })).toBeInTheDocument();
+
+    state.info!.data!.pr = {
+      ...state.info!.data!.pr!,
+      number: 6001,
+      title: "chore: another PR",
+      reviewers: [{ login: "platform-team", kind: "team", state: "APPROVED" }],
+    };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+
+    expect(screen.queryByRole("listitem", { name: "alice: Pending" })).toBeNull();
+    expect(
+      screen.getByRole("listitem", { name: "Team platform-team: Approved" }),
+    ).toBeInTheDocument();
+  });
+
+  describe("title and description editing", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        details_editing: true,
+        attachment_uploads: true,
+      };
+    });
+
+    it("opens the title and description editors on the selected PR", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit title" }));
+      expect(screen.getByRole("textbox", { name: "Pull request title" })).toHaveValue(
+        state.info!.data!.pr!.title,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      expect(screen.getByRole("textbox", { name: "Pull request description" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Attach images or videos" })).toBeInTheDocument();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without details editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a host that names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("offers no title or description editing to %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("button", { name: "Edit title" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit description" })).not.toBeInTheDocument();
+    });
+  });
+
+  describe("reviewer editing", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.pr!.reviewers = [
+        { login: "alice", kind: "user", state: "PENDING" },
+        { login: "bob", kind: "user", state: "APPROVED" },
+      ];
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        reviewer_editing: true,
+      };
+    });
+
+    it("wires the rows and the picker to the selected PR", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Withdraw review request from alice" }));
+      expect(state.updateReviewers.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [],
+        remove: [{ login: "alice", kind: "user", state: "PENDING" }],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Re-request review from bob" }));
+      expect(state.updateReviewers.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [{ login: "bob", kind: "user", state: "APPROVED" }],
+        remove: [],
+      });
+      expect(usePullRequestReviewCandidates).toHaveBeenLastCalledWith("conv_1", prUrl, false);
+      fireEvent.click(screen.getByRole("button", { name: "Request reviewers" }));
+      expect(usePullRequestReviewCandidates).toHaveBeenLastCalledWith("conv_1", prUrl, true);
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without reviewer editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a host that names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("shows reviewers read-only for %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.getByRole("listitem", { name: "alice: Pending" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Request reviewers" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /review request from|review from/ })).toBeNull();
+    });
+  });
+
+  describe("labels", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+    const bug = { name: "bug", color: "d73a4a", description: "Something isn't working" };
+    const docs = { name: "Docs", color: "0075ca", description: null };
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.pr!.labels = [docs, bug];
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        label_editing: true,
+      };
+    });
+
+    it("lists the PR's labels by name between reviewers and checks", () => {
+      state.info!.data!.pr!.reviewers = [];
+      renderPanel();
+
+      const list = screen.getByRole("list", { name: "Labels" });
+      expect(
+        within(list)
+          .getAllByRole("listitem")
+          .map((item) => item.textContent),
+      ).toEqual(["bug", "Docs"]);
+      expect(within(list).getAllByRole("listitem")[0]).toHaveAttribute(
+        "title",
+        "Something isn't working",
+      );
+      const labels = list.closest("section")!;
+      const reviewers = screen.getByRole("heading", { name: "Reviewers" }).closest("section")!;
+      const checks = screen.getByText("Checks").closest("section")!;
+      expect(
+        reviewers.compareDocumentPosition(labels) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      const row = reviewers.parentElement!.parentElement!;
+      expect(row).toContainElement(labels);
+      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
+        "data-orientation",
+        "vertical",
+      );
+      expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
+    });
+
+    it("wires editing to the selected PR: chips remove, and the picker loads on open", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Remove label bug" }));
+      expect(state.updateLabels.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [],
+        remove: [bug],
+      });
+      expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, false);
+      fireEvent.click(screen.getByRole("button", { name: "Edit labels" }));
+      expect(usePullRequestRepoLabels).toHaveBeenLastCalledWith("conv_1", prUrl, true);
+      expect(screen.getByRole("combobox", { name: "Filter labels" })).toBeInTheDocument();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without label editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+    ])("shows labels read-only for %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.getByRole("list", { name: "Labels" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit labels" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /^Remove label/ })).toBeNull();
+    });
+
+    it.each([
+      [
+        "does not report labels",
+        () => {
+          delete state.info!.data!.pr!.labels;
+        },
+      ],
+      [
+        "names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("omits labels when the host %s", (_case, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("heading", { name: "Labels" })).toBeNull();
+    });
+  });
+
+  describe("merge button", () => {
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = "https://github.com/acme/app/pull/6000";
+      state.info!.data!.pr!.head_sha = "a".repeat(40);
+      state.info!.data!.pr!.merge_state_status = "CLEAN";
+      state.info!.data!.pr!.auto_merge = null;
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+      };
+    });
+
+    it("sits below the checks and opens the merge dialog", () => {
+      renderPanel();
+
+      const merge = screen.getByRole("region", { name: "Merge" });
+      const checks = screen.getByText("Checks").closest("section")!;
+      expect(checks.compareDocumentPosition(merge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+      expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
+    });
+
+    it("divides the metadata from the description", () => {
+      renderPanel();
+
+      const divider = [...document.querySelectorAll('[data-slot="separator"]')].at(-1)!;
+      const merge = screen.getByRole("region", { name: "Merge" });
+      const description = screen.getByText("Description").closest("section")!;
+      expect(
+        merge.compareDocumentPosition(divider) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        divider.compareDocumentPosition(description) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without merging",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a provider that can't merge",
+        () => {
+          state.info!.data!.capabilities!.merging = false;
+        },
+      ],
+      [
+        "a host that doesn't report the merge state",
+        () => {
+          delete state.info!.data!.pr!.merge_state_status;
+        },
+      ],
+      [
+        "a closed PR",
+        () => {
+          state.info!.data!.pr!.state = "CLOSED";
+        },
+      ],
+      [
+        "a merged PR",
+        () => {
+          state.info!.data!.pr!.state = "MERGED";
+        },
+      ],
+    ])("is hidden for %s", (_case, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("region", { name: "Merge" })).toBeNull();
+    });
   });
 
   it.each([
@@ -279,7 +791,7 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("link", { name: /chore: dummy PR/ })).not.toHaveClass("flex-1");
   });
 
-  it("lands on the Summary tab, showing the PR description and comments", async () => {
+  it("lands on Summary with the description and counts comments on their own tab", async () => {
     state.info!.data!.pr!.body = "## Overview\nThis PR does the thing.";
     state.info!.data!.pr!.comments = [
       {
@@ -293,9 +805,19 @@ describe("PullRequestPanel", () => {
     // Summary is the default — the diff sections aren't mounted yet.
     expect(screen.queryByTestId("diff")).toBeNull();
     expect(await screen.findByText(/This PR does the thing\./)).toBeInTheDocument();
-    expect(screen.getByText("Comments (1)")).toBeInTheDocument();
+    // Comments have their own tab, which shows how many there are.
+    expect(screen.queryByText("Looks good to me!")).toBeNull();
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Summary",
+      "Comments 1",
+      "Changes",
+    ]);
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Comments 1" }));
     expect(screen.getByText("octocat")).toBeInTheDocument();
     expect(screen.getByText("Looks good to me!")).toBeInTheDocument();
+    expect(screen.queryByText(/This PR does the thing\./)).toBeNull();
+    expect(screen.queryByText("Checks")).toBeNull();
   });
 
   it("renders GitHub comments in order, including ones without a URL or time", () => {
@@ -316,19 +838,60 @@ describe("PullRequestPanel", () => {
       { author: null, body: "Third", created_at: null, url: null },
       { author: null, body: "Fourth", created_at: null, url: null },
     ];
-    renderPanel();
+    renderComments();
 
-    expect(screen.getByText("Comments (4)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Comments 4" })).toBeInTheDocument();
     expect(commentBodies()).toEqual(["First", "Second", "Third", "Fourth"]);
     expect(keyWarnings()).toEqual([]);
   });
 
-  it("shows Summary empty states when the PR has no body or comments", () => {
+  it.each([
+    ["shared suffixes", ["zoe_data", "amy_data", "a-bot", "z-bot"]],
+    ["other suffixes", ["build[bot]", "lint[bot]", "zoe_acme", "amy_acme"]],
+    ["ordinary usernames", ["ci[bot]", "bob", "alice"]],
+  ])("spaces comment colors consistently for %s", (_, orderedAuthors) => {
+    const comments = [...orderedAuthors].reverse().map((author) => ({
+      author,
+      body: `Comment by ${author}`,
+      created_at: null,
+      url: null,
+    }));
+    const repeatedAuthor = orderedAuthors[0]!.toUpperCase();
+    state.info!.data!.pr!.comments = [
+      ...comments,
+      { author: repeatedAuthor, body: "Another comment", created_at: null, url: null },
+      { author: null, body: "Deleted author", created_at: null, url: null },
+    ];
+    const assertColors = () => {
+      orderedAuthors.forEach((author, index) => {
+        expect(screen.getByText(author).previousElementSibling).toHaveStyle({
+          backgroundColor: `oklch(0.48 0.13 ${(index * 360) / orderedAuthors.length})`,
+          color: "#fff",
+        });
+      });
+      expect(screen.getByText(repeatedAuthor).previousElementSibling).toHaveStyle({
+        backgroundColor: "oklch(0.48 0.13 0)",
+      });
+      expect(screen.getByText("unknown").previousElementSibling).not.toHaveAttribute("style");
+    };
+    const view = renderComments();
+    assertColors();
+    view.unmount();
+    state.info!.data!.pr!.comments.reverse();
+    renderComments();
+    assertColors();
+  });
+
+  it("shows empty states when the PR has no body or comments", () => {
     // The default fixture carries neither a body nor comments.
     renderPanel();
     expect(screen.getByText("No description provided.")).toBeInTheDocument();
-    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+
+    const commentsTab = screen.getByRole("tab", { name: "Comments" });
+    expect(commentsTab).toHaveTextContent(/^Comments\s*$/);
+    fireEvent.mouseDown(commentsTab);
+    expect(screen.getByText("No comments yet.")).toBeInTheDocument();
   });
 
   it("marks incomplete checks and comments without claiming they are empty", () => {
@@ -345,6 +908,7 @@ describe("PullRequestPanel", () => {
 
     expect(screen.getByText("Checks")).toBeInTheDocument();
     expect(screen.getByText(/Some checks are unavailable/)).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Comments" }));
     expect(screen.getByText("Some comments are unavailable.")).toBeInTheDocument();
     expect(screen.queryByText("No comments yet.")).not.toBeInTheDocument();
   });
@@ -360,7 +924,9 @@ describe("PullRequestPanel", () => {
       "Checks can’t be read with this GitHub token. Fine-grained personal access tokens can’t read check runs; use a classic token or a GitHub App.",
     );
     expect(screen.queryByText(/Some checks are unavailable/)).toBeNull();
-    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /passed|failed|pending|cancelled|skipped/ }),
+    ).toBeNull();
     expect(screen.getByText("No description provided.")).toBeInTheDocument();
   });
 
@@ -369,9 +935,9 @@ describe("PullRequestPanel", () => {
     state.info!.data!.pr!.comments = [
       { author: "reviewer", body: "Loaded comment", created_at: null, url: null },
     ];
-    renderPanel();
+    renderComments();
 
-    expect(screen.getByText("Comments (1+)")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Comments 1+" })).toBeInTheDocument();
     expect(screen.getByText("Loaded comment")).toBeInTheDocument();
     expect(screen.getByText("Some comments are unavailable.")).toBeInTheDocument();
   });
@@ -394,6 +960,12 @@ describe("PullRequestPanel", () => {
     renderPanel();
 
     expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+    // The empty state shows the panel title; the provider stays in the tooltip.
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
+      "title",
+      "GitHub",
+    );
+    expect(screen.getByText("Pull Requests")).not.toHaveClass("sr-only");
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("GitLab discovery failed.");
     expect(screen.queryByText("Pull requests aren’t available.")).not.toBeInTheDocument();
@@ -418,14 +990,20 @@ describe("PullRequestPanel", () => {
     for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
 
-  it("jumps to a file's section when its sidebar row is clicked", async () => {
+  it("jumps to and expands a file's section when its sidebar row is clicked", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(screen.getAllByTestId("diff").map((d) => d.getAttribute("data-path"))).toEqual([
+      "hello.py",
+    ]);
     // Both the sidebar row and the section header are buttons matching the
     // name; the sidebar row (which scrolls) is first in the DOM.
     const row = screen.getAllByRole("button", { name: /app\.ts/ })[0];
     fireEvent.click(row);
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: true })).toBeInTheDocument();
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
   it("collapses a file's diff when its section header is clicked", async () => {
@@ -920,7 +1498,10 @@ describe("PullRequestPanel", () => {
     it("uses the generic label and names the missing CLI", () => {
       state.info!.data = gitlab({ authenticated: false, cli: { name: "glab", available: false } });
       renderPanel();
-      expect(screen.getByRole("heading", { name: "gitlab" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
+        "title",
+        "gitlab",
+      );
       expect(screen.getByText("gitlab CLI not found")).toBeInTheDocument();
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
@@ -1109,9 +1690,9 @@ describe("PullRequestPanel", () => {
             comment({ body: "Fair, resolving this.", created_at: "2026-09-05T08:15:09.000Z" }),
           ],
         });
-        renderPanel();
+        renderComments();
 
-        expect(screen.getByText("Comments (3)")).toBeInTheDocument();
+        expect(screen.getByRole("tab", { name: "Comments 3" })).toBeInTheDocument();
         expect(commentBodies()).toEqual([
           "Why not reuse the helper?",
           "It predates the helper.",
@@ -1131,7 +1712,7 @@ describe("PullRequestPanel", () => {
         state.info!.data = withPr({
           comments: [comment({ body: "First of two" }), comment({ body: "Second of two" })],
         });
-        renderPanel();
+        renderComments();
 
         expect(commentBodies()).toEqual(["First of two", "Second of two"]);
         expect(keyWarnings()).toEqual([]);
@@ -1157,7 +1738,7 @@ describe("PullRequestPanel", () => {
           url: first.url,
         });
         state.info!.data = withPr({ comments: [first, second] });
-        const { rerender } = renderPanel();
+        const { rerender } = renderComments();
         const card = screen.getByText("Thread two").closest("li");
 
         // The next poll returns a reply to the first thread, ahead of the second.
@@ -1169,29 +1750,41 @@ describe("PullRequestPanel", () => {
         expect(keyWarnings()).toEqual([]);
       });
 
-      it("lists every check in the hover card when checks share a build URL or a name", async () => {
+      it("lists every check in the hover card and links only http(s) run URLs, even when checks share a URL or a name", async () => {
         const user = userEvent.setup();
         const keyWarnings = watchKeyWarnings();
         const buildUrl = "https://forge.example.test/contoso/web/_build/results?buildId=41";
         state.info!.data = withPr({
           checks: {
-            passing: 4,
+            passing: 5,
             failing: 0,
             pending: 0,
-            total: 4,
+            total: 5,
             runs: [
               { name: "Build", bucket: "passing", url: buildUrl },
               { name: "Lint", bucket: "passing", url: buildUrl },
               { name: "Deploy", bucket: "passing", url: null },
               { name: "Deploy", bucket: "passing", url: null },
+              // A status poster controls its target URL, so a script URL must not render.
+              { name: "Status", bucket: "passing", url: "javascript:alert(1)" },
             ],
           },
         });
         renderPanel();
 
-        await user.hover(screen.getByRole("button", { name: /4\s*passed/ }));
+        await user.hover(screen.getByRole("button", { name: /5\s*passed/ }));
         const rows = await screen.findAllByRole("listitem");
-        expect(rows.map((row) => row.textContent)).toEqual(["Build", "Lint", "Deploy", "Deploy"]);
+        expect(rows.map((row) => row.textContent)).toEqual([
+          "Build",
+          "Lint",
+          "Deploy",
+          "Deploy",
+          "Status",
+        ]);
+        expect(
+          rows.map((row) => within(row).queryByRole("link")?.getAttribute("href") ?? null),
+        ).toEqual([buildUrl, buildUrl, null, null, null]);
+        expect(within(rows[0]).getByRole("link")).toHaveAttribute("target", "_blank");
         expect(keyWarnings()).toEqual([]);
       });
     });
@@ -1234,6 +1827,37 @@ describe("PullRequestPanel", () => {
 
     expect(await screen.findByText("Diff request timed out.")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
+  });
+
+  it("reports a failed file list without claiming there are no changes", async () => {
+    state.changes!.data = undefined;
+    state.changes!.error = new Error("Could not load changed files.");
+    renderChanges();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load changed files.");
+    expect(screen.queryByText("No changes vs base.")).toBeNull();
+  });
+
+  it("reports a malformed patch", async () => {
+    vi.mocked(parsePatchFiles).mockImplementationOnce(() => {
+      throw new Error("bad patch");
+    });
+    renderChanges();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t read the PR diff.");
+    expect(screen.queryByText("No text diff available for this file.")).toBeNull();
+  });
+
+  it("refreshes info, files, diff and the stored PRs even from an error state", async () => {
+    state.info!.error = new Error("Request timed out.");
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries").mockResolvedValue();
+    onTestFinished(() => invalidate.mockRestore());
+    renderPanel();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
+      "github-info",
+      "github-changed-files",
+      "github-pr-diff",
+      "session-pull-requests",
+    ]);
   });
 
   it("marks an incomplete changed-file list while retaining loaded file diffs", async () => {
@@ -1309,16 +1933,18 @@ describe("PullRequestPanel", () => {
     expect(description.parentElement).toContainElement(link);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
     fireEvent.click(link);
-    expect(description.parentElement).toContainElement(
-      screen.getByRole("textbox", { name: "Pull request URL" }),
-    );
+    const input = screen.getByRole("textbox", { name: "Pull request URL" });
+    expect(description.parentElement).toContainElement(input);
+    expect(input).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
-    fireEvent.click(link);
+    fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "Pull request URL" }), {
       key: "Escape",
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
   it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
@@ -1402,6 +2028,13 @@ describe("derivePullRequestPanelState", () => {
       "runner-offline",
     );
     expect(derivePullRequestPanelState(q({ error: new Error("boom") })).kind).toBe("error");
+  });
+
+  it("reads an offline sandbox as sandbox-offline unless info was cached before it stopped", () => {
+    const asleep = (over: Parameters<typeof q>[0]) => ({ ...q(over), sandboxAsleep: true });
+    expect(derivePullRequestPanelState(asleep({ isLoading: true })).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({})).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({ data: ready })).kind).toBe("ready");
   });
 
   it("maps each unavailable reason to its own state", () => {
@@ -1579,6 +2212,7 @@ describe("session PR selection", () => {
     expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveTextContent(/^$/);
     expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
@@ -1596,6 +2230,264 @@ describe("session PR selection", () => {
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
+  });
+
+  it("shows the server's stored PRs and lets them be unlinked while the host is offline", async () => {
+    const user = userEvent.setup();
+    const one = "https://github.com/example/one/pull/42";
+    const two = "https://github.com/example/two/pull/7";
+    const checkedAt = Date.UTC(2026, 9, 22, 17, 30) / 1000;
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [
+      {
+        url: one,
+        host: "github.com",
+        repository: "example/one",
+        number: 42,
+        title: "Ship it",
+        relationship: "created",
+        state: "MERGED",
+        is_draft: false,
+        state_checked_at: checkedAt,
+      },
+      {
+        url: two,
+        host: "github.com",
+        repository: "example/two",
+        number: 7,
+        title: null,
+        relationship: "inferred",
+      },
+    ];
+    renderPanel();
+
+    const picker = await screen.findByRole("combobox", { name: "Session pull request" });
+    expect(picker).toHaveTextContent("example/one #42 — Ship it");
+    const stored = screen.getByTestId("github-stored-pr");
+    expect(within(stored).getByRole("link", { name: /Ship it/ })).toHaveAttribute("href", one);
+    expect(within(stored).getByLabelText("Pull request status: Merged")).toBeInTheDocument();
+    expect(within(stored).getByRole("status")).toHaveTextContent(
+      `Last sync time: ${new Date(checkedAt * 1000).toLocaleString()}. To load the PR details, please reconnect the session’s host.`,
+    );
+    // Linking verifies the PR with the host's account; unlinking is the server's.
+    expect(
+      screen.getByRole("button", { name: "Link a PR (needs the host online)" }),
+    ).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Unlink PR" }));
+    expect(state.unlink.mutate).toHaveBeenCalledWith(one, expect.anything());
+    const [, { onSuccess }] = state.unlink.mutate.mock.calls[0];
+    act(() => onSuccess({ prs: state.stored.conv_1.slice(1), synced: true, complete: true }));
+    expect(picker).toHaveTextContent("example/two #7 (from branch)");
+    // A PR the host never fetched has no sync time to show.
+    expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
+      /^To load the PR details, please reconnect the session’s host\.$/,
+    );
+  });
+
+  it("switches cached live info to the stored PR once the host goes offline", async () => {
+    const url = "https://github.com/acme/app/pull/6000";
+    const attached: PullRequestAssociation = {
+      url,
+      host: "github.com",
+      repository: "acme/app",
+      number: 6000,
+      title: "Attached while online",
+      relationship: "attached",
+      state: "OPEN",
+      is_draft: false,
+      state_checked_at: Date.now() / 1000 - 60,
+    };
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [attached],
+    });
+    state.stored.conv_1 = [attached];
+    const { rerender } = renderPanel();
+    expect(
+      await screen.findByRole("combobox", { name: "Session pull request" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+
+    // React Query keeps the last payload when the refetch fails.
+    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+
+    const stored = screen.getByTestId("github-stored-pr");
+    expect(within(stored).getByRole("link", { name: /Attached while online/ })).toHaveAttribute(
+      "href",
+      url,
+    );
+    expect(within(stored).getByLabelText("Pull request status: Open")).toBeInTheDocument();
+    expect(screen.queryByText(/The agent is asleep/)).toBeNull();
+  });
+
+  it("treats an empty server list as authoritative while the host is offline", async () => {
+    const url = "https://github.com/acme/app/pull/6000";
+    const cached: PullRequestAssociation = {
+      url,
+      host: "github.com",
+      repository: "acme/app",
+      number: 6000,
+      title: "Unlinked in another tab",
+      relationship: "attached",
+    };
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [cached],
+    });
+    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    state.stored.conv_1 = [];
+    renderPanel();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull(),
+    );
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+  });
+
+  it.each([
+    {
+      offline: "the host is disconnected",
+      serveable: false,
+      sandboxAsleep: false,
+      message: "To link a PR, please reconnect the session’s host.",
+    },
+    {
+      offline: "the sandbox is asleep",
+      serveable: undefined,
+      sandboxAsleep: true,
+      message: "To link a PR, send a message to start the session’s sandbox.",
+    },
+  ])(
+    "asks for the host instead of offering to link a PR while $offline",
+    async ({ serveable, sandboxAsleep, message }) => {
+      state.serveable = serveable;
+      state.sandboxAsleep = sandboxAsleep;
+      // Cached from before the host went away, as after unlinking the last PR offline.
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        prs: [],
+        pr: null,
+        selected_pr_url: undefined,
+      });
+      state.stored.conv_1 = [];
+      renderPanel();
+
+      expect(await screen.findByText(message)).toBeInTheDocument();
+      expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    },
+  );
+
+  it("still offers to link a PR on an older server while the host is disconnected", () => {
+    state.storesPrs = false;
+    state.serveable = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      prs: [],
+      pr: null,
+      selected_pr_url: undefined,
+    });
+    renderPanel();
+
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
+  });
+
+  it("says when the server hasn't imported the session's PRs yet", async () => {
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [];
+    state.unsynced.add("conv_1");
+    renderPanel();
+
+    expect(
+      await screen.findByText(
+        "This session’s PRs haven’t synced to the server yet. To load them, please reconnect the session’s host.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps an older server's offline panel as it was", () => {
+    state.storesPrs = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: "https://github.com/acme/app/pull/6000",
+      prs: [
+        {
+          url: "https://github.com/acme/app/pull/6000",
+          host: "github.com",
+          repository: "acme/app",
+          number: 6000,
+          title: "Live only",
+          relationship: "attached",
+        },
+      ],
+    });
+    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    renderPanel();
+
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
+  });
+
+  it.each(["javascript:alert(1)", "http://github.com/acme/app/pull/1"])(
+    "links a stored PR only over https and marks a draft: %s",
+    async (url) => {
+      state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 1,
+          title: "Not a link",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: true,
+        },
+      ];
+      renderPanel();
+
+      // The details remount once the selection settles on the stored PR.
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByLabelText(
+            "Pull request status: Draft",
+          ),
+        ).toBeInTheDocument(),
+      );
+      const stored = screen.getByTestId("github-stored-pr");
+      expect(within(stored).queryByRole("link")).toBeNull();
+      expect(within(stored).getByText("Not a link")).toBeInTheDocument();
+    },
+  );
+
+  it("asks to start a sleeping sandbox rather than reconnect a host", () => {
+    const url = "https://github.com/acme/app/pull/6000";
+    state.sandboxAsleep = true;
+    state.info = { isLoading: false, error: null, isFetching: false };
+    state.stored.conv_1 = [
+      {
+        url,
+        host: "github.com",
+        repository: "acme/app",
+        number: 6000,
+        title: "Sandbox PR",
+        relationship: "created",
+        state: "OPEN",
+        is_draft: false,
+        state_checked_at: null,
+      },
+    ];
+    renderPanel();
+
+    return waitFor(() =>
+      expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
+        /^To load the PR details, send a message to start the session’s sandbox\.$/,
+      ),
+    );
   });
 
   it.each([undefined, null, "", "   "])(
@@ -1681,3 +2573,44 @@ describe("session PR selection", () => {
     expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
   });
 });
+
+it.each([
+  [true, true, true],
+  [false, true, false],
+  [true, false, false],
+  [true, undefined, false],
+])(
+  "gates comment posting on edit access %s and host capability %s",
+  (canEdit, capability, visible) => {
+    state.canEdit = canEdit;
+    state.info!.data!.selected_pr_url = state.info!.data!.pr!.url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      comment_posting: capability,
+    };
+    renderComments();
+    expect(screen.queryByRole("textbox", { name: "New PR comment" }) !== null).toBe(visible);
+  },
+);
+
+it.each(["capabilities", "selected_pr_url"] as const)(
+  "hides comment posting without %s",
+  (missing) => {
+    state.info!.data!.selected_pr_url = state.info!.data!.pr!.url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      comment_posting: true,
+    };
+    if (missing === "capabilities") delete state.info!.data!.capabilities;
+    else delete state.info!.data!.selected_pr_url;
+    renderComments();
+    expect(screen.queryByRole("textbox", { name: "New PR comment" })).toBeNull();
+    expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
+  },
+);
