@@ -97,16 +97,22 @@ class _ContextLimitProxy:
                 }
             ).encode()
         else:
-            upstream = httpx.post(
-                f"{self._upstream}{handler.path}",
-                content=raw,
-                headers={"content-type": "application/json"},
-                timeout=120.0,
-                trust_env=False,
-            )
-            status = upstream.status_code
-            content_type = upstream.headers.get("content-type", "application/json")
-            payload = upstream.content
+            try:
+                upstream = httpx.post(
+                    f"{self._upstream}{handler.path}",
+                    content=raw,
+                    headers={"content-type": "application/json"},
+                    timeout=120.0,
+                    trust_env=False,
+                )
+                status = upstream.status_code
+                content_type = upstream.headers.get("content-type", "application/json")
+                payload = upstream.content
+            except httpx.HTTPError as exc:
+                status, content_type = 502, "application/json"
+                payload = json.dumps(
+                    {"error": {"message": f"proxy upstream error: {exc!r}"}}
+                ).encode()
         with self._lock:
             entry = {
                 "seq": len(self.requests),

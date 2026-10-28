@@ -6360,11 +6360,6 @@ def _overflow_compaction_frames(
     ]
 
 
-def _sent_command_types(rpc: _PiRpcSession) -> list[str]:
-    written = b"".join(rpc.process.stdin.data).decode()
-    return [json.loads(line)["type"] for line in written.splitlines()]
-
-
 def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
     """A context-overflow error that pi repairs by compacting and re-running
     the prompt completes with the recovered answer, after reporting pi's
@@ -6414,7 +6409,8 @@ def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
 
         assert [e.message for e in events if isinstance(e, ExecutorError)] == []
         assert [type(e) for e in events[-2:]] == [CompactionComplete, TurnComplete]
-        compaction, turn_complete = events[-2:]
+        (compaction,) = [e for e in events if isinstance(e, CompactionComplete)]
+        (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
         assert turn_complete.response == "RECOVERED"
         assert compaction.summary == "Earlier: SUMMARY"
         assert compaction.token_count == 1200
@@ -6453,7 +6449,7 @@ def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
                 "content": [{"type": "output_text", "text": "Reading notes."}],
             },
         ]
-        assert _sent_command_types(rpc) == ["prompt", "get_messages"]
+        assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt", "get_messages"]
         assert rpc._line_queue.empty()
         assert _SESSION_KEY in executor._session_states
 
@@ -6543,7 +6539,7 @@ def test_settled_compaction_then_failed_retry_reports_compaction_before_error() 
         assert compaction.summary == "SUMMARY"
         assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == ["hello"]
         assert not any(isinstance(e, TurnComplete) for e in events)
-        assert _sent_command_types(rpc) == ["prompt", "get_messages"]
+        assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt", "get_messages"]
         assert rpc._line_queue.empty()
         assert _SESSION_KEY in executor._session_states
 
@@ -6580,7 +6576,7 @@ def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -
         assert not any(isinstance(e, CompactionComplete) for e in events)
         (turn_complete,) = [e for e in events if isinstance(e, TurnComplete)]
         assert turn_complete.response == "ANSWER"
-        assert _sent_command_types(rpc) == ["prompt"]
+        assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt"]
         assert rpc._line_queue.empty()
 
     _run(_test())

@@ -3014,12 +3014,20 @@ def _text_message(role: str, text: str) -> dict[str, Any]:
     return {"type": "message", "role": role, "content": [{"type": part_type, "text": text}]}
 
 
+_COMPACTED_SNAPSHOT = [
+    _text_message("user", "SUMMARY"),
+    _text_message("user", "hi"),
+    _text_message("assistant", "Reading notes."),
+]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("stored_items", "expected_history"),
+    ("stored_items", "compacted_messages", "expected_history"),
     [
         pytest.param(
             [{"id": "item_latest"}],
+            _COMPACTED_SNAPSHOT,
             [
                 ("user", "SUMMARY"),
                 ("user", "hi"),
@@ -3030,7 +3038,23 @@ def _text_message(role: str, text: str) -> dict[str, Any]:
             id="compacted",
         ),
         pytest.param(
+            [{"id": "item_latest"}],
+            None,
+            [
+                (
+                    "user",
+                    "[Automatically generated summary of prior conversation context.]\n\n"
+                    "Please provide a summary of our conversation so far.",
+                ),
+                ("assistant", "SUMMARY"),
+                ("assistant", "RECOVERED"),
+                ("user", "next"),
+            ],
+            id="summary-only",
+        ),
+        pytest.param(
             [],
+            _COMPACTED_SNAPSHOT,
             [
                 ("user", "hi"),
                 ("function_call", "call_1"),
@@ -3043,12 +3067,15 @@ def _text_message(role: str, text: str) -> dict[str, Any]:
     ],
 )
 async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
-    stored_items: list[dict[str, Any]], expected_history: list[tuple[str, str]]
+    stored_items: list[dict[str, Any]],
+    compacted_messages: list[dict[str, Any]] | None,
+    expected_history: list[tuple[str, str]],
 ) -> None:
-    """The next harness request has the turn's pre-tool text once after a compaction.
+    """The next harness request matches the stored replay after a compaction.
 
-    The compaction snapshot already holds the text before the tool call, so only the text
-    after it follows. When the compaction is not persisted, the history is unchanged.
+    The server stores the turn's pre-tool text before the compaction item, so only the
+    text after the tool call follows the compacted history. When the compaction is not
+    persisted, the history is unchanged.
     """
     spec = AgentSpec(
         spec_version=1,
@@ -3089,11 +3116,7 @@ async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
                     "type": "response.compaction.completed",
                     "summary": "SUMMARY",
                     "total_tokens": 5,
-                    "compacted_messages": [
-                        _text_message("user", "SUMMARY"),
-                        _text_message("user", "hi"),
-                        _text_message("assistant", "Reading notes."),
-                    ],
+                    "compacted_messages": compacted_messages,
                 }
             ),
             _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
