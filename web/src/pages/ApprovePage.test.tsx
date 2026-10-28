@@ -241,10 +241,28 @@ describe("ApprovePage submission", () => {
     // WHY: a failed resolve POST routes to the `error` branch with the status.
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }));
+      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 500 }));
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
-    expect(await screen.findByText("Resolve failed: 409")).toBeInTheDocument();
+    expect(await screen.findByText("Resolve failed: 500")).toBeInTheDocument();
+  });
+
+  it("reloads into the terminal card when the server refuses a prompt that moved there", async () => {
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
+      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }))
+      .mockResolvedValue(
+        jsonResponse({
+          status: "pending",
+          message: "Run the migration?",
+          terminal_fallback: { answer_undelivered: false },
+        }),
+      );
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
+    expect(await screen.findByText("Answer in the terminal")).toBeInTheDocument();
+    expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
   });
 
   it("shows a network error when the resolve POST throws", async () => {

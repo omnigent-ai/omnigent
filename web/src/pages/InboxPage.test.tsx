@@ -498,6 +498,75 @@ describe("InboxPage approval items", () => {
     expect(within(card).queryByRole("button", { name: /approve|reject/i })).toBeNull();
     expect(within(card).queryByTestId("approval-card-open-terminal")).toBeNull();
   });
+
+  describe("a prompt moving between chat and the agent's terminal", () => {
+    const chatPrompt = rawElicitation("eli_terminal", "Claude wants to call **Bash**");
+    const terminalPrompt = rawElicitation("eli_terminal", "Claude wants to call **Bash**", {
+      terminal_fallback: { answer_undelivered: false },
+    });
+    let pendingElicitations: unknown[] = [];
+    let queryClient: QueryClient;
+
+    beforeEach(() => {
+      vi.mocked(conversationsHook.useConversations).mockReturnValue(
+        conversationsStub([conversation({ id: "sess_terminal" })]),
+      );
+      vi.mocked(sessionsApi.getSession).mockImplementation(
+        async () =>
+          ({ pendingElicitations }) as unknown as Awaited<
+            ReturnType<typeof sessionsApi.getSession>
+          >,
+      );
+      // The row's count and updated_at stay the same, so only polling or invalidation refetches.
+      queryClient = new QueryClient({
+        defaultOptions: {
+          queries: { retry: false, staleTime: 30_000, refetchOnWindowFocus: false },
+        },
+      });
+    });
+
+    afterEach(() => {
+      queryClient.clear();
+    });
+
+    it("shows the terminal card when a chat answer is refused", async () => {
+      pendingElicitations = [chatPrompt];
+      vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("409 Conflict"));
+      renderPage(queryClient);
+
+      const accept = await screen.findByRole("button", { name: "Stub Accept" });
+      pendingElicitations = [terminalPrompt];
+      fireEvent.click(accept);
+
+      await waitFor(() =>
+        expect(screen.getByTestId("approval-card")).toHaveAttribute("data-state", "terminal"),
+      );
+      expect(screen.queryByRole("button", { name: "Stub Accept" })).toBeNull();
+    });
+
+    it("restores chat answers when a hook retry takes the prompt back", async () => {
+      vi.useFakeTimers();
+      pendingElicitations = [terminalPrompt];
+      const poll = () =>
+        act(async () => {
+          await vi.advanceTimersByTimeAsync(1001);
+        });
+      try {
+        await act(async () => {
+          renderPage(queryClient);
+        });
+        await poll();
+        expect(screen.getByTestId("approval-card")).toHaveAttribute("data-state", "terminal");
+
+        pendingElicitations = [chatPrompt];
+        await poll();
+        expect(screen.getByRole("button", { name: "Stub Accept" })).toBeInTheDocument();
+      } finally {
+        cleanup();
+        vi.useRealTimers();
+      }
+    });
+  });
 });
 
 describe("InboxPage comments and errors", () => {

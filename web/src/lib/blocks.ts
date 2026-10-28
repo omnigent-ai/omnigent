@@ -758,17 +758,32 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
+function isPendingOwnElicitation(
+  block: AnyBlock,
+  sessionId: string | null,
+): block is ElicitationBlock {
+  return (
+    block.type === "elicitation" &&
+    block.status === "pending" &&
+    (block.targetSessionId == null || block.targetSessionId === sessionId)
+  );
+}
+
 /** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
 export function hasPendingOwnElicitation(
   blocks: readonly AnyBlock[],
   sessionId: string | null,
 ): boolean {
-  return blocks.some(
-    (b) =>
-      b.type === "elicitation" &&
-      b.status === "pending" &&
-      (b.targetSessionId == null || b.targetSessionId === sessionId),
-  );
+  return blocks.some((b) => isPendingOwnElicitation(b, sessionId));
+}
+
+/** Whether every pending own card waits for its answer in the agent's terminal. */
+export function pendingOwnElicitationsInTerminal(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): boolean {
+  const pending = blocks.filter((b) => isPendingOwnElicitation(b, sessionId));
+  return pending.length > 0 && pending.every((b) => b.terminalFallback !== undefined);
 }
 
 /**

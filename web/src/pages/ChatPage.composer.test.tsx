@@ -4785,6 +4785,27 @@ describe("Composer pending elicitation", () => {
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
   });
 
+  it.each([
+    {
+      label: "every pending card waits in the agent's terminal",
+      blocks: [elicitationBlock({ terminalFallback: { answerUndelivered: false } })],
+      placeholder: "Answer the pending request in the agent's terminal to continue",
+    },
+    {
+      label: "another pending card can still be answered here",
+      blocks: [
+        elicitationBlock({ terminalFallback: { answerUndelivered: false } }),
+        elicitationBlock({ elicitationId: "elic_2" }),
+      ],
+      placeholder: "Respond to the pending request above to continue",
+    },
+  ])("points the locked composer to the right place when $label", ({ blocks, placeholder }) => {
+    useChatStore.setState({ conversationId: "conv_terminal", blocks });
+    render(<Composer {...composerProps()} />);
+    expect(textarea().placeholder).toBe(placeholder);
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  });
+
   it("keeps the interrupt button live while an elicitation is pending", () => {
     // Cancelling the turn is the other legitimate way out of a parked
     // elicitation — the lock must not take the stop control with it.

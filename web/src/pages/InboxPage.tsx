@@ -178,12 +178,13 @@ export function InboxPage() {
       queryKey: ["inbox-elicitations", row.id, row.pending_elicitations_count, row.updated_at],
       queryFn: () => getSession(row.id),
       retry: 1,
-      // The count and snapshot can disagree briefly while a native request re-parks.
+      // The count doesn't change while a native request re-parks or a prompt
+      // waits in the agent's terminal, so poll until the snapshot settles.
       refetchInterval: (query: Query<Session>) =>
         query.state.data?.pendingElicitations?.length === 0 ||
         query.state.data?.pendingElicitations?.some((event) => {
           const params = event.params as Record<string, unknown> | undefined;
-          return params?.native_delivery !== undefined;
+          return params?.native_delivery !== undefined || params?.terminal_fallback !== undefined;
         })
           ? 1000
           : false,
@@ -306,6 +307,12 @@ export function InboxPage() {
   // rollback on error. Success invalidates the session list so the row's
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
+    const refreshSnapshot = () => {
+      const queryKey = ["inbox-elicitations", item.row.id];
+      void queryClient
+        .cancelQueries({ queryKey })
+        .then(() => queryClient.invalidateQueries({ queryKey }));
+    };
     return (elicitationId, action, content, meta) => {
       const attempt = item.elicitation.nativeDelivery?.attempt;
       const previous = pendingSubmissions.current.get(elicitationId);
@@ -327,12 +334,7 @@ export function InboxPage() {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-          if (item.elicitation.nativeDelivery) {
-            const queryKey = ["inbox-elicitations", item.row.id];
-            void queryClient
-              .cancelQueries({ queryKey })
-              .then(() => queryClient.invalidateQueries({ queryKey }));
-          }
+          if (item.elicitation.nativeDelivery) refreshSnapshot();
         },
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
@@ -344,6 +346,8 @@ export function InboxPage() {
             const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
             return pendingVerdicts;
           });
+          // A refused answer can mean the prompt moved to the agent's terminal.
+          refreshSnapshot();
         },
       );
     };

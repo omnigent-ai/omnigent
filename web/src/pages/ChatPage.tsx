@@ -53,7 +53,7 @@ import {
 } from "@/components/composer/ComposerControls";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { useAppName } from "@/lib/branding";
-import { hasPendingOwnElicitation } from "@/lib/blocks";
+import { hasPendingOwnElicitation, pendingOwnElicitationsInTerminal } from "@/lib/blocks";
 import { cn } from "@/lib/utils";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import {
@@ -2460,6 +2460,9 @@ function ComposerImpl(
   const hasPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
   );
+  const pendingElicitationsInTerminal = useChatStore((s) =>
+    pendingOwnElicitationsInTerminal(s.blocks, s.conversationId),
+  );
   const readyPlaceholder = sendReconnectsArca
     ? "Send a message to reconnect Arca…"
     : "Send a message…";
@@ -3979,7 +3982,9 @@ function ComposerImpl(
                 : unreachable && !sendReconnectsArca && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
-                    ? "Respond to the pending request above to continue"
+                    ? pendingElicitationsInTerminal
+                      ? "Answer the pending request in the agent's terminal to continue"
+                      : "Respond to the pending request above to continue"
                     : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : isStreaming

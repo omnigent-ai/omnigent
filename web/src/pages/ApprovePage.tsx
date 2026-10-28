@@ -58,6 +58,7 @@ export function ApprovePage() {
     elicitationId: string;
   }>();
   const [state, setState] = useState<PageState>({ kind: "loading" });
+  const [reloadCount, setReloadCount] = useState(0);
   const submission = useRef<{ revision: number; pending: boolean; attempt?: string }>({
     revision: 0,
     pending: false,
@@ -120,7 +121,7 @@ export function ApprovePage() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [sessionId, elicitationId]);
+  }, [sessionId, elicitationId, reloadCount]);
 
   const submit = useCallback(
     async (
@@ -160,7 +161,13 @@ export function ApprovePage() {
           },
         );
         if (!res.ok && submission.current === submitted) {
-          setState({ kind: "error", message: `Resolve failed: ${res.status}` });
+          if (res.status === 409) {
+            // The prompt moved to the agent's terminal; reload to show where to answer.
+            setState({ kind: "loading" });
+            setReloadCount((count) => count + 1);
+          } else {
+            setState({ kind: "error", message: `Resolve failed: ${res.status}` });
+          }
         }
       } catch (err) {
         if (submission.current === submitted) {
