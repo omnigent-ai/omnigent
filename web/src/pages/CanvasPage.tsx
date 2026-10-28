@@ -12,8 +12,8 @@
  * - Projects come from `useProjects`; the **+** tab reuses the sidebar's
  *   `NewProjectButton`, so creating a project here is the same
  *   `POST /v1/projects` the sidebar performs.
- * - Pull requests come through the GitHub panel's query cache
- *   (`fetchPullRequestInfo`), throttled per session by `usePullRequests`.
+ * - Each card's pull request is the session's first linked PR as the server
+ *   stores it (`Conversation.pull_request`), mapped by `usePullRequests`.
  * - Card positions live in localStorage (`canvasStorage.ts`), keyed by server
  *   identity and viewer; the server never learns the layout. Every card's spot
  *   is saved once the full list is known — grid slots included — so nothing

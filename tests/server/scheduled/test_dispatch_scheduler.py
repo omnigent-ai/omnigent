@@ -242,7 +242,11 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
             loop.call_soon_threadsafe(renewing.set)
             assert clock_advanced.wait(10)
         result = original_renew(run_id, now=renewal_time, lease_seconds=lease_seconds)
-        if result is not None and result.lease_expires_at == task.next_run_at + 150:
+        if (
+            result is not None
+            and result.lease_expires_at == task.next_run_at + 150
+            and (failed_once or not transient_failure)
+        ):
             loop.call_soon_threadsafe(renewed.set)
         return result
 

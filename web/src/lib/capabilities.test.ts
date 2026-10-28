@@ -318,6 +318,14 @@ describe("custom agents settings capability", () => {
   });
 
   it.each([undefined, false, "true", true])(
+    "parses session_pull_requests strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_pull_requests: stored });
+      expect(parsed.session_pull_requests).toBe(stored === true);
+    },
+  );
+
+  it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",
     async (install) => {
       const parsed = await probe({
