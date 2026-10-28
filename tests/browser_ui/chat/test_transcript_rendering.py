@@ -621,6 +621,8 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         "tag => parseFloat(getComputedStyle(el.querySelector(tag)).fontSize))"
     )
     assert sizes[0] <= sizes[1] * 1.1, sizes
+    font_size = "el => getComputedStyle(el).fontSize"
+    label_size = fields.last.locator("dt").first.evaluate(font_size)
     raw = page.get_by_role("tab", name="Raw")
     expect(page.get_by_role("tab", name="Fields")).to_have_attribute("aria-selected", "true")
     raw.click()
@@ -630,6 +632,11 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     expect(card.get_by_text("Input", exact=True)).to_be_visible()
     expect(card.get_by_text("Result", exact=True)).to_be_visible()
     expect(card).not_to_contain_text("Parameters")
+    # Labels and code share one Interface font step, so the card reads as one size.
+    code_sizes = card.locator("pre code").evaluate_all(
+        "codes => codes.map(code => getComputedStyle(code).fontSize)"
+    )
+    assert set(code_sizes) == {label_size}, (label_size, code_sizes)
 
 
 _PATCH_CHANGES = [

@@ -168,7 +168,8 @@ export function ToolCard({
         lineCounts={lineCounts}
         onBodyClick={onBodyClick}
       />
-      <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
+      {/* The whole body, code panels included, sits on the Interface font's caption step. */}
+      <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 text-sm [&_code]:text-sm [&_pre]:text-sm data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         <DefaultToolBody call={call} duration={displayDuration} view={view} />
       </CollapsibleContent>
     </Collapsible>
@@ -596,7 +597,7 @@ function ShellCommandLine({ command }: { command: string }) {
   const { env, rest } = splitEnvPrefix(firstLine);
   return (
     // Only the command truncates, so the line count stays visible.
-    <span className="inline-flex max-w-full items-baseline font-mono text-[0.92em]">
+    <span className="inline-flex max-w-full items-baseline font-mono text-sm">
       <span className="min-w-0 truncate">
         {env.length > 0 && <span className="opacity-60">{env}</span>}
         <span>{rest}</span>
@@ -682,7 +683,7 @@ function ShellTerminalPanel({
           // it, left-aligned with the text.
           <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-3 pt-1.5">
             <span
-              className="min-w-0 truncate font-mono text-muted-foreground text-xs @max-[480px]/shell:basis-full"
+              className="min-w-0 truncate font-mono text-muted-foreground text-sm @max-[480px]/shell:basis-full"
               title={cwd}
             >
               {cwd}
@@ -731,7 +732,7 @@ function ShellTerminalPanel({
           />
         )}
         {parsed !== null && !hasOutput && (
-          <div className="px-3 pb-2 font-mono text-muted-foreground text-xs">(no output)</div>
+          <div className="px-3 pb-2 font-mono text-muted-foreground text-sm">(no output)</div>
         )}
         <ShellStatus
           state={state}
@@ -804,7 +805,7 @@ function ShellStatus({
   } else {
     return null;
   }
-  return <div className="px-3 pb-2 font-mono text-xs tabular-nums">{status}</div>;
+  return <div className="px-3 pb-2 font-mono text-sm tabular-nums">{status}</div>;
 }
 
 /**
