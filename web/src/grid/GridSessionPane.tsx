@@ -60,6 +60,7 @@ export function GridSessionPane({
   sessionId,
   area,
   selected,
+  focusRequest = null,
   onActivate,
   workspaceTarget,
   workspacePanel,
@@ -68,6 +69,8 @@ export function GridSessionPane({
   sessionId: string;
   area?: string;
   selected: boolean;
+  /** A new object asks this cell to take keyboard focus. */
+  focusRequest?: object | null;
   onActivate: () => void;
   workspaceTarget: HTMLDivElement | null;
   workspacePanel: GridWorkspacePanelProps;
@@ -91,8 +94,11 @@ export function GridSessionPane({
     active,
     isOver,
   } = useDroppable({ id: sessionId, data: { title } });
+  const paneRef = useRef<HTMLElement | null>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
   const setPaneRef = useCallback(
     (node: HTMLElement | null) => {
+      paneRef.current = node;
       setDragNodeRef(node);
       setDropNodeRef(node);
     },
@@ -150,6 +156,21 @@ export function GridSessionPane({
     [sessionId],
   );
   const showTerminal = terminalFirst && view === "terminal";
+  // A connected terminal focuses itself as the cell activates; otherwise focus
+  // the chat composer, or the cell itself when there is nothing to type into.
+  const handledFocusRequest = useRef<object | null>(null);
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!focusRequest || focusRequest === handledFocusRequest.current || !pane) return;
+    handledFocusRequest.current = focusRequest;
+    if (pane.contains(document.activeElement)) return;
+    const composer = showTerminal
+      ? undefined
+      : Array.from(
+          chatRef.current?.querySelectorAll<HTMLTextAreaElement>("textarea:not(:disabled)") ?? [],
+        ).at(-1);
+    (composer ?? pane).focus({ preventScroll: true });
+  }, [focusRequest, showTerminal]);
   const hadTerminal = useRef(false);
   useEffect(() => {
     if (agentTerminal) hadTerminal.current = true;
@@ -316,10 +337,11 @@ export function GridSessionPane({
           data-grid-session={sessionId}
           data-active={selected}
           aria-label={`${title}${selected ? " (active)" : ""}`}
+          tabIndex={-1}
           onClickCapture={onActivate}
           onFocusCapture={onActivate}
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background",
+            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background outline-none",
             selected && "border-brand-accent/50 shadow-lg",
             isDragging && "opacity-50",
           )}
@@ -364,7 +386,11 @@ export function GridSessionPane({
             </Button>
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-            <div className={cn("h-full", showTerminal && "hidden")} inert={showTerminal}>
+            <div
+              ref={chatRef}
+              className={cn("h-full", showTerminal && "hidden")}
+              inert={showTerminal}
+            >
               <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal) && (

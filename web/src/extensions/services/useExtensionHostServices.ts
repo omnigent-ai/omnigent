@@ -3,7 +3,15 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
 import { resolveIdentity } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
-import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+import { fetchPullRequestInfo, type PullRequest } from "@/hooks/usePullRequests";
+import {
+  fetchSessionPullRequests,
+  sessionPullRequestsKey,
+  storesSessionPullRequests,
+  type StoredPullRequests,
+} from "@/hooks/useSessionPullRequests";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
 import { useNavigate } from "@/lib/routing";
 import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
 import { ExtensionHostServiceError } from "./errors";
@@ -76,6 +84,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
   const navigate = useNavigate();
   const { resolvedTheme } = useTheme();
   const queryClient = useQueryClient();
+  const storedPullRequests = storesSessionPullRequests(useServerInfo());
   const theme = resolvedTheme === "dark" ? "dark" : "light";
   const writeLimiter = useMemo(() => new ExtensionStorageWriteLimiter(), []);
   const sessionListLimiter = useMemo(() => new SessionReadLimiter(), []);
@@ -178,13 +187,41 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           if (typeof sessionId !== "string" || !sessionId || sessionId.length > 256) {
             throw new ExtensionHostServiceError("InvalidParams", "sessionId is invalid");
           }
-          // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
-          const info = await queryClient.fetchQuery({
-            queryKey: ["github-info", sessionId],
-            queryFn: () => fetchPullRequestInfo(sessionId),
-            staleTime: 30_000,
-          });
-          const pr = info.available ? info.pr : null;
+          let pr: Pick<PullRequest, "number" | "title" | "state" | "url"> | null | undefined;
+          try {
+            // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
+            const info = await queryClient.fetchQuery({
+              queryKey: ["github-info", sessionId],
+              queryFn: () => fetchPullRequestInfo(sessionId),
+              staleTime: 30_000,
+            });
+            pr = info.available ? info.pr : null;
+          } catch (error) {
+            // The host is offline; answer with the state the server last stored, if it does.
+            if (!(error instanceof RunnerOfflineError) || !storedPullRequests) throw error;
+            let stored: StoredPullRequests;
+            try {
+              stored = await queryClient.fetchQuery({
+                queryKey: sessionPullRequestsKey(sessionId),
+                queryFn: () => fetchSessionPullRequests(sessionId),
+                staleTime: 30_000,
+              });
+            } catch (fallbackError) {
+              throw Object.assign(error, { cause: fallbackError });
+            }
+            const [first] = stored.prs;
+            // A linked PR answers once it has a state, imported or not; an empty list
+            // means "no PR" only once the server has imported the session's PRs.
+            if (first ? !first.state : !stored.synced) throw error;
+            pr = first?.state
+              ? {
+                  number: first.number,
+                  title: first.title ?? "",
+                  state: first.state,
+                  url: first.url,
+                }
+              : null;
+          }
           if (!pr || !/^https:\/\//.test(pr.url)) return null;
           externalUrlsRef.current.add(pr.url);
           return { number: pr.number, title: pr.title.slice(0, 256), state: pr.state, url: pr.url };
@@ -209,6 +246,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
     pullRequestLimiter,
     queryClient,
     sessionListLimiter,
+    storedPullRequests,
     theme,
     writeLimiter,
   ]);

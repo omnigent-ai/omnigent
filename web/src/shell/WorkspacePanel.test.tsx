@@ -11,6 +11,7 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { browserViewId } from "@/lib/browserTabs";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -631,16 +632,24 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-media-active", "false");
   });
 
-  it("renders the FileViewer for the active path (not the scope panel)", () => {
-    renderWorkspace({
+  it("keeps the FilesPanel mounted but hidden behind the active file", () => {
+    const { rerender } = renderWorkspace({
       openFiles: ["src/App.tsx"],
-      selectedFilePath: "src/App.tsx",
+      selectedFilePath: null,
     });
+    const panel = screen.getByTestId("files-panel-stub");
+    expect(panel.parentElement).not.toHaveClass("invisible");
 
-    // A selected file shows its viewer in the content slot; the scope panel
-    // must not also mount. The stub echoes the path it received.
+    rerender({ selectedFilePath: "src/App.tsx" });
+    // The viewer owns the slot; the scope panel stays mounted (same node, so
+    // tree state survives) inside an invisible wrapper.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
-    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel.parentElement).toHaveClass("invisible");
+
+    rerender({ selectedFilePath: null });
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel.parentElement).not.toHaveClass("invisible");
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
@@ -719,6 +728,17 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ openTerminals: [termKey] });
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
+  });
+
+  it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({ rightRailTab: "files", openTerminals: [termKey] });
+    const panel = screen.getByTestId("files-panel-stub");
+
+    rerender({ selectedTerminalKey: termKey });
+    expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel.parentElement).toHaveClass("invisible");
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
@@ -1150,6 +1170,42 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
+  it("uses page labels in tabs, close controls, and the panel picker", async () => {
+    const title = "Documentation: a complete guide to configuring your workspace and browser";
+    const firstView = browserViewId("conv_ws", "docs");
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserClose,
+        browserHasView: vi.fn(async (viewId: string) => ({
+          exists: true,
+          url:
+            viewId === firstView ? "https://docs.example.com/guide" : "https://status.example.com/",
+          title: viewId === firstView ? title : "",
+        })),
+      },
+    });
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["docs", "status"],
+      selectedBrowserId: "docs",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    const tab = await screen.findByRole("tab", { name: title });
+    expect(tab).toHaveAttribute("title", title);
+    expect(tab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "status.example.com" })).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: title }));
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: `Close ${title}` }));
+    await waitFor(() => expect(screen.queryByRole("tab", { name: title })).not.toBeInTheDocument());
+    expect(browserClose).toHaveBeenCalledWith(firstView);
+    expect(screen.getByRole("tab", { name: "status.example.com" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
   it("opens a browser tab with Ctrl+Alt+B", () => {
     const { onRightRailTabChange, onReveal } = renderWorkspace({
       showBrowserTab: true,
@@ -1248,12 +1304,27 @@ describe("WorkspacePanel mobile side chats", () => {
     });
 
   it.each([false, true])(
-    "keeps a side chat and draft when close fails (mobile=%s)",
+    "keeps a side chat, draft, and queue when close fails (mobile=%s)",
     async (mobile) => {
       isMobileMock.mockReturnValue(mobile);
       openTabs();
-      const stop = vi.spyOn(sessionsApi, "stopSession").mockRejectedValueOnce(new Error("offline"));
-      useChatStore.setState({ sideChatDrafts: { conv_side_b: "Keep this question" } });
+      const followUp = {
+        queueId: "q_side",
+        text: "Queued follow-up",
+        conversationId: "conv_side_b",
+      };
+      const otherChat = { queueId: "q_other", text: "Other chat", conversationId: "conv_side_a" };
+      const sideQueue = () =>
+        useChatStore.getState().queuedMessages.filter((m) => m.conversationId === "conv_side_b");
+      const queuedAtStop: unknown[] = [];
+      const stop = vi.spyOn(sessionsApi, "stopSession").mockImplementationOnce(async () => {
+        queuedAtStop.push(sideQueue());
+        throw new Error("offline");
+      });
+      useChatStore.setState({
+        sideChatDrafts: { conv_side_b: "Keep this question" },
+        queuedMessages: [followUp, otherChat],
+      });
       renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
       const surface = mobile
         ? screen.getByTestId("side-chats-panel-drawer")
@@ -1265,14 +1336,23 @@ describe("WorkspacePanel mobile side chats", () => {
       );
       expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBe("Keep this question");
+      expect(sideQueue()).toEqual([followUp]);
 
-      stop.mockResolvedValueOnce({ queued: false });
+      const queuedDuringStop = { ...followUp, queueId: "q_late", text: "Queued while closing" };
+      stop.mockImplementationOnce(async () => {
+        queuedAtStop.push(sideQueue());
+        useChatStore.setState((s) => ({ queuedMessages: [...s.queuedMessages, queuedDuringStop] }));
+        return { queued: false };
+      });
       fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
       await waitFor(() =>
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
       expect(stop.mock.calls).toEqual([["conv_side_b"], ["conv_side_b"]]);
+      expect(queuedAtStop).toEqual([[], []]);
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBeUndefined();
+      expect(useChatStore.getState().queuedMessages).toEqual([otherChat]);
+      useChatStore.setState({ queuedMessages: [] });
       stop.mockRestore();
     },
   );
