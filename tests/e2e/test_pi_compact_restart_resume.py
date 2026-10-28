@@ -10,7 +10,6 @@ import contextlib
 import http.server
 import json
 import math
-import shutil
 import threading
 import time
 import uuid
@@ -21,23 +20,22 @@ from typing import Any
 import httpx
 import pytest
 import yaml
-from playwright.sync_api import Browser, Page, expect
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.live_server import terminate_process
 from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
-from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
-from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm
-from tests.e2e_ui.messages.test_message_render_parity import (
-    _ASSISTANT,
-    _WORKING,
-    _ensure_chat_view,
+from tests.e2e._harness_probes import skip_if_harness_cli_missing
+from tests.e2e.conftest import (
+    configure_mock_llm,
+    poll_session_until_terminal,
+    reset_mock_llm,
+    send_user_message_to_session,
 )
+from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
 
 _MODEL = "local-vllm-32k"
 _CONTEXT_LIMIT = 32_768
-_TURN_TIMEOUT_MS = 180_000
 _BIND_TIMEOUT_S = 180.0
 # Pi keeps ~20k recent tokens on overflow; small parts let the retry fit the window.
 _PART_CHARS = 4_000
@@ -214,42 +212,18 @@ def _items(client: httpx.Client, base_url: str, session_id: str) -> list[dict[st
     return list(response.json()["data"])
 
 
-def _send(page: Page, text: str) -> None:
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_be_enabled(timeout=60_000)
-    composer.fill(text)
-    page.get_by_role("button", name="Send", exact=True).click()
-
-
-def _send_turn(page: Page, text: str, reply: str) -> None:
-    _send(page, text)
-    expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible(timeout=_TURN_TIMEOUT_MS)
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=_TURN_TIMEOUT_MS)
+def _send_turn(client: httpx.Client, session_id: str, text: str, reply: str) -> None:
+    response_id = send_user_message_to_session(client, session_id=session_id, content=text)
+    result = poll_session_until_terminal(
+        client, session_id=session_id, response_id=response_id, timeout=180
+    )
+    assert result["status"] == "completed", result
+    assert reply in json.dumps(result["output"]), result
 
 
 def _is_summarization(entry: dict[str, Any]) -> bool:
     text = _user_text(entry["body"])
     return any(prompt in text for prompt in _SUMMARY_PROMPTS)
-
-
-def _wait_for_turn_outcome(page: Page, replies_before: int, errors_before: int) -> str:
-    replies = page.locator(_ASSISTANT)
-    error_pill = page.get_by_test_id("error-pill")
-    deadline = time.monotonic() + _TURN_TIMEOUT_MS / 1000
-    while time.monotonic() < deadline:
-        if replies.count() > replies_before and page.locator(_WORKING).count() == 0:
-            replies.last.scroll_into_view_if_needed()
-            return f"reply: {replies.last.inner_text()[:300]}"
-        if error_pill.count() > errors_before:
-            pill = error_pill.last
-            pill.scroll_into_view_if_needed()
-            pill.get_by_role("button", expanded=False).first.click()
-            message = pill.get_by_test_id("error-message-content")
-            expect(message).to_be_visible(timeout=10_000)
-            message.scroll_into_view_if_needed()
-            return f"error: {message.inner_text()[:300]}"
-        page.wait_for_timeout(500)
-    return "no outcome"
 
 
 def _restart_stack(stack: ServerRunner, runner_env: dict[str, str | None]) -> None:
@@ -263,16 +237,15 @@ def _restart_stack(stack: ServerRunner, runner_env: dict[str, str | None]) -> No
 @pytest.mark.nightly
 @pytest.mark.timeout(900)
 def test_pi_compacted_session_resumes_compacted_after_restart(
-    browser: Browser,
-    built_spa: None,
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """The first post-restart request carries Pi's summary and fits the window."""
-    if shutil.which("pi") is None:
-        pytest.skip("requires the real pi executable")
+    """Restart and fork preserve Pi's summary and the recent context it kept."""
+    skip_if_harness_cli_missing("pi")
     nonce = uuid.uuid4().hex[:8]
-    post_marker, resume_marker = f"POST-01-{nonce}", f"RESUME-01-{nonce}"
+    post_marker, resume_marker, fork_marker = (
+        f"{stage}-01-{nonce}" for stage in ("POST", "NEXT", "FORK")
+    )
     summary = f"SUMMARY-{nonce} the user shared build log parts; nothing failed yet."
     reset_mock_llm(mock_llm_server_url)
 
@@ -288,131 +261,94 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
         configure_mock_llm(mock_llm_server_url, [{"text": summary}] * 60, match=prompt)
 
     proxy = _ContextLimitProxy(mock_llm_server_url, tmp_path / "proxy-requests.jsonl")
-    diagnostics: dict[str, Any] = {"nonce": nonce, "timeline": []}
-    started = time.monotonic()
-
-    def mark(label: str) -> None:
-        diagnostics["timeline"].append((label, round(time.monotonic() - started, 2)))
-
+    pre_markers: list[str] = []
+    compacting_markers: list[str] = []
     with (
         proxy.running(),
-        httpx.Client(trust_env=False) as client,
         server_runner(tmp_path / "stack") as stack,
+        httpx.Client(base_url=stack.base_url, timeout=30, trust_env=False) as client,
     ):
-        runner_env = _runner_env(stack, f"{proxy.url}")
+        runner_env = _runner_env(stack, proxy.url)
         stack.start_runner(env=runner_env)
         session_id = _create_pi_session(client, stack)
-        diagnostics["session_id"] = session_id
-        context = browser.new_context()
-        outcome = "not reached"
-        restart_seq = 0
-        pre_markers: list[str] = []
-        compacting_markers: list[str] = []
-        try:
-            page = context.new_page()
-            page.goto(f"{stack.base_url}/c/{session_id}")
-            _ensure_chat_view(page)
-            mark("session open")
-            first_compaction_turn: int | None = None
-            for index in range(1, _MAX_FILL_TURNS + 1):
-                marker = f"PRE-{index:02d}-{nonce}"
-                pre_markers.append(marker)
-                script_reply(marker)
-                sent_at = len(proxy.requests)
-                _send_turn(
-                    page,
-                    f"Turn {marker}: here is part {index} of the build log I am debugging. "
-                    f"Keep it in mind.\n{_log_part(index)}",
-                    f"ack-{marker}",
-                )
-                mark(f"turn {marker} answered")
-                if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
-                    compacting_markers.append(marker)
-                if first_compaction_turn is None and any(
-                    _is_summarization(entry) for entry in proxy.requests
-                ):
-                    first_compaction_turn = index
-                if (
-                    first_compaction_turn is not None
-                    and index >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
-                ):
-                    break
-            diagnostics["fill_turns"] = len(pre_markers)
-            diagnostics["first_compaction_turn"] = first_compaction_turn
-            assert first_compaction_turn is not None and (
-                len(pre_markers) >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
-            ), f"the fill loop stopped before enough post-compaction history: {diagnostics}"
-            script_reply(post_marker)
+        first_compaction_turn: int | None = None
+        for index in range(1, _MAX_FILL_TURNS + 1):
+            marker = f"PRE-{index:02d}-{nonce}"
+            pre_markers.append(marker)
+            script_reply(marker)
             sent_at = len(proxy.requests)
             _send_turn(
-                page, f"Turn {post_marker}: does anything stand out so far?", f"ack-{post_marker}"
+                client,
+                session_id,
+                f"Turn {marker}: here is part {index} of the build log I am debugging. "
+                f"Keep it in mind.\n{_log_part(index)}",
+                f"ack-{marker}",
             )
-            mark("post-compaction turn answered")
             if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
-                compacting_markers.append(post_marker)
-            diagnostics["compacting_turns"] = compacting_markers
-            deadline = time.monotonic() + 30.0
-            compactions: list[dict[str, Any]] = []
-            while time.monotonic() < deadline and not compactions:
-                compactions = [
-                    item
-                    for item in _items(client, stack.base_url, session_id)
-                    if item.get("type") == "compaction"
-                ]
-                time.sleep(1.0)
-            diagnostics["compaction_items_before_restart"] = len(compactions)
-            restart_seq = len(proxy.requests)
-            _restart_stack(stack, runner_env)
-            mark("server and runner restarted")
-            page.goto(f"{stack.base_url}/c/{session_id}")
-            _ensure_chat_view(page)
-            expect(page.locator(_ASSISTANT, has_text=f"ack-{post_marker}").first).to_be_visible(
-                timeout=60_000
-            )
-            mark("session reopened")
-            script_reply(resume_marker)
-            replies_before = page.locator(_ASSISTANT).count()
-            errors_before = page.get_by_test_id("error-pill").count()
-            _send(page, f"Turn {resume_marker}: which worker was slowest?")
-            outcome = _wait_for_turn_outcome(page, replies_before, errors_before)
-            mark(f"resume turn outcome: {outcome}")
-            page.wait_for_timeout(4_000)
-        finally:
-            context.close()
-            diagnostics["outcome"] = outcome
-            (tmp_path / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2))
+                compacting_markers.append(marker)
+                if first_compaction_turn is None:
+                    first_compaction_turn = index
+            if (
+                first_compaction_turn is not None
+                and index >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
+            ):
+                break
+        assert first_compaction_turn is not None
+        assert len(pre_markers) >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
+        script_reply(post_marker)
+        sent_at = len(proxy.requests)
+        _send_turn(
+            client,
+            session_id,
+            f"Turn {post_marker}: does anything stand out so far?",
+            f"ack-{post_marker}",
+        )
+        if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
+            compacting_markers.append(post_marker)
+        restart_seq = len(proxy.requests)
+        _restart_stack(stack, runner_env)
+        # Read from the restarted server, rather than an in-memory session cache.
+        assert f"ack-{post_marker}" in json.dumps(_items(client, stack.base_url, session_id))
+        script_reply(resume_marker)
+        _send_turn(
+            client,
+            session_id,
+            f"Turn {resume_marker}: which worker was slowest?",
+            f"ack-{resume_marker}",
+        )
+        response = client.post(f"/v1/sessions/{session_id}/fork", json={})
+        response.raise_for_status()
+        fork_id = response.json()["id"]
+        assert fork_id != session_id
+        bind_session_runner(client.patch, stack.base_url, fork_id, stack.runner_id)
+        script_reply(fork_marker)
+        _send_turn(
+            client,
+            fork_id,
+            f"Turn {fork_marker}: continue investigating the build.",
+            f"ack-{fork_marker}",
+        )
+        assert fork_marker not in json.dumps(_items(client, stack.base_url, session_id))
 
     summarization = [entry for entry in proxy.requests[:restart_seq] if _is_summarization(entry)]
-    assert summarization, (
-        "Pi never compacted before the restart; the setup did not fill the window"
-    )
-    resumed = [
-        entry
-        for entry in proxy.requests[restart_seq:]
-        if resume_marker in _user_text(entry["body"])
-    ]
-    assert resumed, "no model request carried the post-restart message"
-    first = resumed[0]
-    (tmp_path / "first-resumed-request.json").write_text(json.dumps(first, indent=2))
-    resumed_text = _user_text(first["body"])
     summarized_text = "\n".join(_user_text(entry["body"]) for entry in summarization)
-    summarized_markers = [
-        marker for marker in pre_markers if marker in summarized_text and marker in resumed_text
-    ]
-    assert first["status"] == 200 and f"ack-{resume_marker}" in outcome, (
-        f"the resumed Pi session overflowed the model window: first request estimated "
-        f"{first['estimated_tokens']} tokens (limit {_CONTEXT_LIMIT}), HTTP {first['status']}; "
-        f"chat outcome {outcome!r}; Omnigent persisted "
-        f"{diagnostics['compaction_items_before_restart']} compaction items; summarized turns "
-        f"replayed: {summarized_markers}; summary present: {summary.split()[0] in resumed_text}"
-    )
-    assert not summarized_markers, (
-        f"turns Pi had already summarized were replayed after restart: {summarized_markers}"
-    )
-    assert summary.split()[0] in resumed_text, "the resumed context lost Pi's compaction summary"
-    assert compacting_markers, "no observed turn sent Pi's summarization request"
-    # The last compacting turn's prompt is stored before its compaction item, so only
-    # the kept context can replay it.
-    assert f"Turn {compacting_markers[-1]}:" in resumed_text, (
-        "the resumed context lost the prompt Pi kept when it last compacted"
-    )
+    assert compacting_markers, "Pi never compacted before the restart"
+    for marker in (resume_marker, fork_marker):
+        resumed = [
+            entry
+            for entry in proxy.requests[restart_seq:]
+            if f"Turn {marker}:" in _user_text(entry["body"])
+        ]
+        assert resumed, "no model request carried the continuation"
+        first = resumed[0]
+        (tmp_path / f"{marker}-request.json").write_text(json.dumps(first, indent=2))
+        resumed_text = _user_text(first["body"])
+        assert first["status"] == 200, first
+        assert summary.split()[0] in resumed_text, "lost Pi's compaction summary"
+        assert not [
+            previous
+            for previous in pre_markers
+            if previous in summarized_text and previous in resumed_text
+        ], "replayed turns Pi already summarized"
+        # This prompt predates the stored boundary; only kept context can replay it.
+        assert f"Turn {compacting_markers[-1]}:" in resumed_text, "lost Pi's kept context"

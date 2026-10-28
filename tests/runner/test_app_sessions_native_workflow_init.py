@@ -37,6 +37,7 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _build_app_for_spec,
     _build_app_with_mcp_tool,
@@ -2309,7 +2310,9 @@ async def test_create_session_threads_resolved_bundle_dir_to_codex_spawn_env(
 
 
 @pytest.mark.asyncio
-async def test_create_session_spawns_the_snapshot_harness_override() -> None:
+async def test_create_session_spawns_the_snapshot_harness_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """Session init must spawn the session's overridden harness, not the spec's.
 
     ``get_client`` entries are keyed by conversation, so resolving the spawn
@@ -2320,6 +2323,7 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
     spec's harness is a native one, init also launches its terminal on top of
     that spawn, leaving two live processes for the one session.
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
@@ -2364,7 +2368,9 @@ async def test_create_session_spawns_the_snapshot_harness_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_message_turn_resolves_the_recorded_harness_override() -> None:
+async def test_message_turn_resolves_the_recorded_harness_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """A turn whose body has no ``harness_override`` still runs the override.
 
     The native terminal forward carries the override as session state, not
@@ -2374,6 +2380,7 @@ async def test_message_turn_resolves_the_recorded_harness_override() -> None:
     evicted the override harness mid-session (the split-brain on the turn
     after the kickoff).
     """
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     spec = AgentSpec(
         spec_version=1,
         name="override-agent",
