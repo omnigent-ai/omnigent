@@ -7,7 +7,6 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { PullRequestInfo } from "./usePullRequests";
 import {
   fetchSessionPullRequests,
-  sessionPullRequestsKey,
   stateAsOf,
   useSessionPullRequests,
   useUnlinkSessionPr,
@@ -52,20 +51,31 @@ const serverInfo = (stored: boolean): ServerInfo => ({
 });
 
 it.each([
-  { server: "current", stored: true },
-  { server: "older", stored: false },
-])("unlinks on the $server server and stores what remains", async ({ stored }) => {
+  {
+    server: "current",
+    stored: true,
+    request: "DELETE /v1/sessions/conv_1/pull-requests",
+    listed: { prs: [two], synced: true },
+  },
+  {
+    server: "older",
+    stored: false,
+    request: "POST /v1/sessions/conv_1/resources/github/prs",
+    listed: undefined,
+  },
+])("unlinks on the $server server and lists only what it stores", async (scenario) => {
   const requests: string[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new URL(String(input), "http://localhost");
-      requests.push(`${init?.method ?? "GET"} ${request.pathname}`);
-      if (init?.method === "DELETE") {
+      if (!init?.method) return page([{ ...two, url: one, number: 42 }, two]);
+      requests.push(`${init.method} ${request.pathname}`);
+      if (init.method === "DELETE") {
         expect(request.searchParams.get("url")).toBe(one);
         return page([two]);
       }
-      expect(JSON.parse(String(init?.body))).toEqual({ url: one, action: "remove" });
+      expect(JSON.parse(String(init.body))).toEqual({ url: one, action: "remove" });
       return new Response(
         JSON.stringify({ object: "session.github.info", available: true, prs: [two] }),
         { status: 200 },
@@ -73,23 +83,46 @@ it.each([
     }),
   );
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const { result } = renderHook(() => useUnlinkSessionPr("conv_1"), {
-    wrapper: wrapper(client, serverInfo(stored)),
-  });
-
-  result.current.mutate(one);
-
-  await waitFor(() => expect(result.current.isSuccess).toBe(true));
-  expect(result.current.data?.prs).toEqual([two]);
-  expect(client.getQueryData(sessionPullRequestsKey("conv_1"))).toEqual({
-    prs: [two],
-    synced: true,
-  });
-  expect(requests).toEqual(
-    stored
-      ? ["DELETE /v1/sessions/conv_1/pull-requests"]
-      : ["POST /v1/sessions/conv_1/resources/github/prs"],
+  const { result } = renderHook(
+    () => ({ list: useSessionPullRequests("conv_1"), unlink: useUnlinkSessionPr("conv_1") }),
+    { wrapper: wrapper(client, serverInfo(scenario.stored)) },
   );
+
+  result.current.unlink.mutate(one);
+
+  await waitFor(() => expect(result.current.unlink.isSuccess).toBe(true));
+  expect(result.current.unlink.data?.prs).toEqual([two]);
+  // An older server stores no list, so its consumers keep following live info.
+  expect(result.current.list.data).toEqual(scenario.listed);
+  expect(requests).toEqual([scenario.request]);
+});
+
+it("reads the whole list again when an unlink answers with only its first page", async () => {
+  const first = { ...two, url: one, number: 42 };
+  const third = { ...two, url: "https://github.com/example/two/pull/8", number: 8 };
+  let unlinked = false;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "DELETE") {
+        unlinked = true;
+        return page([two], { last_id: two.url, has_more: true });
+      }
+      if (!unlinked) return page([first, two, third]);
+      const after = new URL(String(input), "http://localhost").searchParams.get("after");
+      return after ? page([third]) : page([two], { last_id: two.url, has_more: true });
+    }),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(
+    () => ({ list: useSessionPullRequests("conv_1"), unlink: useUnlinkSessionPr("conv_1") }),
+    { wrapper: wrapper(client, serverInfo(true)) },
+  );
+  await waitFor(() => expect(result.current.list.data?.prs).toEqual([first, two, third]));
+
+  result.current.unlink.mutate(one);
+
+  await waitFor(() => expect(result.current.list.data?.prs).toEqual([two, third]));
 });
 
 it("keeps an unlink when a read that started before it answers afterwards", async () => {
@@ -128,11 +161,17 @@ it("refetches when a live read lists different PRs, and only then", async () => 
   const fetchMock = vi.fn(async () => page([two]));
   vi.stubGlobal("fetch", fetchMock);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const { rerender } = renderHook(({ live }) => useSessionPullRequests("conv_1", live), {
+  const { result, rerender } = renderHook(({ live }) => useSessionPullRequests("conv_1", live), {
     wrapper: wrapper(client, serverInfo(true)),
     initialProps: { live: livePayload([two]) },
   });
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+  rerender({ live: livePayload([{ ...two }]) });
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 10);
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
 
   rerender({ live: livePayload([{ ...two, url: one }, two]) });
   await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));

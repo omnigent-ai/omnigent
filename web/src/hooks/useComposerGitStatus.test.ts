@@ -220,42 +220,19 @@ describe("useComposerGitStatus", () => {
     expect(result.current.prNumber).toBe(7);
   });
 
-  it("names the server's stored PRs while the host is offline", () => {
+  it.each([
+    { live: "the host is offline", query: { isError: true, isFetching: false } },
+    { live: "live info still loads", query: { isError: false, isLoading: true, isFetching: true } },
+  ])("names the server's stored PRs while $live", ({ query }) => {
     setWorktrees(undefined);
-    usePullRequestInfoMock.mockReturnValue({
-      data: undefined,
-      isError: true,
-      isFetching: false,
-      refetch: vi.fn(),
-    });
+    usePullRequestInfoMock.mockReturnValue({ data: undefined, refetch: vi.fn(), ...query });
     useSessionPullRequestsMock.mockReturnValue({
       data: {
         prs: [{ url: "https://github.com/o/r/pull/42", number: 42, provider: "github" }],
         synced: true,
       },
     });
-    const { result } = run();
-    expect(result.current.githubState).toBe("ready");
-    expect(result.current.prCount).toBe(1);
-    expect(result.current.prNumber).toBe(42);
-  });
-
-  it("is ready from the server's list while live info still loads", () => {
-    setWorktrees(undefined);
-    usePullRequestInfoMock.mockReturnValue({
-      data: undefined,
-      isError: false,
-      isLoading: true,
-      isFetching: true,
-      refetch: vi.fn(),
-    });
-    useSessionPullRequestsMock.mockReturnValue({
-      data: {
-        prs: [{ url: "https://github.com/o/r/pull/42", number: 42, provider: "github" }],
-        synced: true,
-      },
-    });
-    expect(run().result.current).toMatchObject({ githubState: "ready", prNumber: 42 });
+    expect(run().result.current).toMatchObject({ githubState: "ready", prCount: 1, prNumber: 42 });
   });
 
   it("keeps a live PR from a host without tracking over the empty stored list", () => {

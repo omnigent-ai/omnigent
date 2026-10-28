@@ -2380,32 +2380,37 @@ describe("session PR selection", () => {
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
   });
 
-  it("links a stored PR only over https and marks a draft", async () => {
-    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
-    state.stored.conv_1 = [
-      {
-        url: "javascript:alert(1)",
-        host: "github.com",
-        repository: "acme/app",
-        number: 1,
-        title: "Not a link",
-        relationship: "created",
-        state: "OPEN",
-        is_draft: true,
-      },
-    ];
-    renderPanel();
+  it.each(["javascript:alert(1)", "http://github.com/acme/app/pull/1"])(
+    "links a stored PR only over https and marks a draft: %s",
+    async (url) => {
+      state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 1,
+          title: "Not a link",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: true,
+        },
+      ];
+      renderPanel();
 
-    // The details remount once the selection settles on the stored PR.
-    await waitFor(() =>
-      expect(
-        within(screen.getByTestId("github-stored-pr")).getByLabelText("Pull request status: Draft"),
-      ).toBeInTheDocument(),
-    );
-    const stored = screen.getByTestId("github-stored-pr");
-    expect(within(stored).queryByRole("link")).toBeNull();
-    expect(within(stored).getByText("Not a link")).toBeInTheDocument();
-  });
+      // The details remount once the selection settles on the stored PR.
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByLabelText(
+            "Pull request status: Draft",
+          ),
+        ).toBeInTheDocument(),
+      );
+      const stored = screen.getByTestId("github-stored-pr");
+      expect(within(stored).queryByRole("link")).toBeNull();
+      expect(within(stored).getByText("Not a link")).toBeInTheDocument();
+    },
+  );
 
   it("asks to start a sleeping sandbox rather than reconnect a host", () => {
     const url = "https://github.com/acme/app/pull/6000";

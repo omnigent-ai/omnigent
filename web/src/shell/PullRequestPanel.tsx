@@ -1392,7 +1392,7 @@ function StoredPullRequestDetails({
 }) {
   const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
   const lastSync = pr.state_checked_at ? absoluteTime(pr.state_checked_at * 1000) : "";
-  const href = parseHttpUrl(pr.url)?.href;
+  const href = /^https:\/\//.test(pr.url) ? pr.url : undefined;
   const label = (
     <>
       <span className="truncate">{title}</span>

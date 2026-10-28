@@ -158,13 +158,15 @@ export function useUnlinkSessionPr(conversationId: string) {
   const infoKey = ["github-info", conversationId];
   const storedKey = sessionPullRequestsKey(conversationId);
   return useMutation({
-    mutationFn: async (url: string): Promise<StoredPullRequests & { complete: boolean }> => {
+    mutationFn: async (
+      url: string,
+    ): Promise<{ prs: PullRequestAssociation[]; page?: SessionPullRequestList }> => {
       if (serverInfo === "loading") throw new Error("Still connecting to the server; try again.");
       // @deprecated server-pr-tracking compat, remove in 0.24.0 (~2026-11-24): servers
       // before 0.20.0 lack this route, so unlink through the runner or host instead.
       if (!storesSessionPullRequests(serverInfo)) {
         const info = await updateSessionPr(conversationId, { url, action: "remove" });
-        return { prs: info.prs ?? [], synced: true, complete: true };
+        return { prs: info.prs ?? [] };
       }
       const response = await authenticatedFetch(
         pullRequestsPath(conversationId, new URLSearchParams({ url })),
@@ -172,18 +174,22 @@ export function useUnlinkSessionPr(conversationId: string) {
       );
       if (!response.ok) throw await errorFromResponse(response);
       const page = (await response.json()) as SessionPullRequestList;
-      return { prs: page.data, synced: page.synced === true, complete: !page.has_more };
+      return { prs: page.data, page };
     },
-    onSuccess: async ({ prs, synced, complete }, url) => {
+    onSuccess: async ({ page }, url) => {
       // A read that started before the unlink would bring the PR back.
       await Promise.all([
         queryClient.cancelQueries({ queryKey: storedKey }),
         queryClient.cancelQueries({ queryKey: infoKey }),
       ]);
-      if (complete) {
-        queryClient.setQueryData<StoredPullRequests>(storedKey, { prs, synced });
-      } else {
+      // Only a server that stores PRs answers with its list; an older one has none to cache.
+      if (page?.has_more) {
         void queryClient.invalidateQueries({ queryKey: storedKey });
+      } else if (page) {
+        queryClient.setQueryData<StoredPullRequests>(storedKey, {
+          prs: page.data,
+          synced: page.synced === true,
+        });
       }
       queryClient.setQueriesData<PullRequestInfo>({ queryKey: infoKey }, (info) =>
         info?.prs
