@@ -139,8 +139,12 @@ test("does not inherit another editor's IPC connection and reports CLI errors", 
   assert.equal(receivedEnv.CURSOR_CLI_BLOCK_CURSOR_AGENT, "true");
 });
 
-for (const change of ["unchanged lookup", "alias change", "alias restoration", "server change"]) {
-  test(`remote opening during foregrounding handles ${change}`, async (t) => {
+for (const [source, change] of ["verified", "discovered"].flatMap((mappingSource) =>
+  ["unchanged lookup", "alias change", "alias restoration", "server change"].map(
+    (mappingChange) => [mappingSource, mappingChange],
+  ),
+)) {
+  test(`remote opening with ${source} SSH mapping during foregrounding handles ${change}`, async (t) => {
     const calls = [];
     let alias = "arca.ssh";
     let context = {};
@@ -148,7 +152,8 @@ for (const change of ["unchanged lookup", "alias change", "alias restoration", "
     const foregroundComplete = Promise.withResolvers();
     t.after(() => foregroundComplete.resolve({ stdout: "" }));
     const { directory, openRemote, resolve } = setup(t, "darwin", {
-      resolveSshHost: () => alias,
+      resolveSshHost: () => (source === "verified" ? alias : null),
+      discoverSshHost: () => alias,
       getServerContext: () => context,
       run: async (command) => {
         calls.push(command);
@@ -160,17 +165,17 @@ for (const change of ["unchanged lookup", "alias change", "alias restoration", "
       },
     });
     fs.mkdirSync(path.join(directory, "Cursor.app"));
-    await resolve();
+    await resolve([alias]);
     const opening = openRemote("/remote/workspace");
     await foregroundStarted.promise;
     assert.deepEqual(calls, ["/usr/bin/open"]);
 
     if (change === "server change") context = {};
     if (change === "alias change" || change === "alias restoration") alias = "other.ssh";
-    assert.equal(await resolve(), alias);
+    assert.equal(await resolve([alias]), alias);
     if (change === "alias restoration") {
       alias = "arca.ssh";
-      assert.equal(await resolve(), alias);
+      assert.equal(await resolve([alias]), alias);
     }
 
     foregroundComplete.resolve({ stdout: "" });
@@ -278,7 +283,7 @@ test("requires fresh host fingerprints after discovered SSH mappings expire", as
   const discoveries = [];
   const oldKeys = ["SHA256:old-host-key"];
   const newKeys = ["SHA256:new-host-key"];
-  const { resolve, openRemote, directory } = setup(t, "darwin", {
+  const { resolve, openRemote, directory, calls } = setup(t, "darwin", {
     now: () => time,
     resolveSshHost: () => null,
     discoverSshHost: async (keys) => {
@@ -293,6 +298,9 @@ test("requires fresh host fingerprints after discovered SSH mappings expire", as
   assert.equal(await openRemote("/repo"), true);
 
   time = 30_000;
+  const launched = calls.length;
+  assert.equal(await openRemote("/repo"), false);
+  assert.equal(calls.length, launched);
   assert.equal(await resolve(), null);
   assert.equal(await resolve(), null);
   assert.deepEqual(discoveries, [oldKeys]);

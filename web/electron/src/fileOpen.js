@@ -217,6 +217,7 @@ function registerFileOpen({
         const state = sshContext(event);
         const entry = state?.hosts.get(hostId);
         if (!entry?.alias || entry.alias !== sshHost) return false;
+        if (!entry.verified && now() >= entry.expiresAt) return false;
         if (entry.verified && (await resolveSshHost(event, hostId)) !== entry.alias) return false;
         const stillAuthorized = () =>
           isPinnedOriginSender(event) &&

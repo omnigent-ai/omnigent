@@ -125,10 +125,12 @@ it.each([
       ]);
       expect(openRemoteFileInApp).not.toHaveBeenCalled();
     } else {
-      expect(openRemoteFileInApp.mock.calls).toEqual([
-        [hostId, "/workspace", "vscode", "arca.ssh", true],
-        [hostId, "/workspace/src/main.ts", "vscode", "arca.ssh", false],
-      ]);
+      await waitFor(() =>
+        expect(openRemoteFileInApp.mock.calls).toEqual([
+          [hostId, "/workspace", "vscode", "arca.ssh", true],
+          [hostId, "/workspace/src/main.ts", "vscode", "arca.ssh", false],
+        ]),
+      );
       expect(openFileInApp).not.toHaveBeenCalled();
     }
   },
@@ -156,12 +158,14 @@ it("keeps remote and local defaults separate and ignores unavailable choices", a
   getFileOpenSshHost.mockResolvedValue("arca.ssh");
   await renderMenu("src/main.ts", "remote");
   fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-  expect(openRemoteFileInApp).toHaveBeenCalledWith(
-    "remote",
-    "/workspace/src/main.ts",
-    "vscode",
-    "arca.ssh",
-    false,
+  await waitFor(() =>
+    expect(openRemoteFileInApp).toHaveBeenCalledWith(
+      "remote",
+      "/workspace/src/main.ts",
+      "vscode",
+      "arca.ssh",
+      false,
+    ),
   );
   expect(localStorage.getItem("omnigent:open-in-app:local")).toBe("terminal");
 });
@@ -269,6 +273,62 @@ it("discovers an existing Arca connection from host fingerprints without prompti
   expect(screen.queryByRole("dialog")).toBeNull();
 });
 
+it.each(["primary", "menu"])(
+  "refreshes expired SSH discovery for the %s action",
+  async (action) => {
+    getFileOpenSshHost.mockResolvedValue("arca.ssh");
+    await renderMenu("src/main.ts", "remote");
+    const select = async () => {
+      if (action === "menu") {
+        await openMenu();
+        fireEvent.click(await screen.findByRole("menuitem", { name: "VS Code" }));
+      } else {
+        fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+      }
+    };
+
+    const fingerprints = ["SHA256:new-host-key"];
+    getFileOpenSshHost.mockImplementation((_host, keys) =>
+      Promise.resolve(keys ? "arca_new.ssh" : null),
+    );
+    let provideMetadata!: (response: unknown) => void;
+    fetchHost.mockReturnValueOnce(
+      new Promise((resolve) => {
+        provideMetadata = resolve;
+      }),
+    );
+    await select();
+    await waitFor(() => expect(fetchHost).toHaveBeenCalledTimes(1));
+    expect(openRemoteFileInApp).not.toHaveBeenCalled();
+    await act(() =>
+      provideMetadata({
+        ok: true,
+        json: async () => ({ ssh_host_key_fingerprints: fingerprints }),
+      }),
+    );
+    await waitFor(() =>
+      expect(openRemoteFileInApp).toHaveBeenCalledWith(
+        "remote",
+        "/workspace/src/main.ts",
+        "vscode",
+        "arca_new.ssh",
+        false,
+      ),
+    );
+    expect(getFileOpenSshHost).toHaveBeenLastCalledWith("remote", fingerprints);
+
+    getFileOpenSshHost.mockResolvedValue(null);
+    fetchHost.mockRejectedValue(new Error("Host unavailable"));
+    await select();
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't open this remote file in VS Code"),
+    );
+    expect(openRemoteFileInApp).toHaveBeenCalledTimes(1);
+    expect(openFileInApp).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
+  },
+);
+
 it.each(["old server", "unreachable", "unmatched", "no discovery bridge"])(
   "hides remote opening when discovery is %s",
   async (mode) => {
@@ -305,15 +365,18 @@ it("waits for SSH discovery before showing the remote picker", async () => {
   await renderMenu("src/main.ts", "remote");
   expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
   await act(() => complete("arca.ssh"));
+  getFileOpenSshHost.mockResolvedValue("arca.ssh");
   await openMenu();
   expect(screen.queryByRole("menuitem", { name: "SSH connection…" })).toBeNull();
   fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
-  expect(openRemoteFileInApp).toHaveBeenCalledWith(
-    "remote",
-    "/workspace/src/main.ts",
-    "cursor",
-    "arca.ssh",
-    false,
+  await waitFor(() =>
+    expect(openRemoteFileInApp).toHaveBeenCalledWith(
+      "remote",
+      "/workspace/src/main.ts",
+      "cursor",
+      "arca.ssh",
+      false,
+    ),
   );
 });
 

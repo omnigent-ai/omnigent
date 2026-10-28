@@ -64,6 +64,28 @@ function subscribeToAppPreference(listener: () => void) {
   };
 }
 
+async function discoverSshHost(hostId: string): Promise<string | null> {
+  const cached = await getFileOpenSshHost(hostId);
+  if (cached) return cached;
+  try {
+    const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (response.ok) {
+      const detail = await response.json();
+      if (
+        Array.isArray(detail.ssh_host_key_fingerprints) &&
+        detail.ssh_host_key_fingerprints.length
+      ) {
+        return getFileOpenSshHost(hostId, detail.ssh_host_key_fingerprints);
+      }
+    }
+  } catch {
+    // Unavailable metadata leaves remote opening hidden.
+  }
+  return null;
+}
+
 interface OpenInAction {
   key: string;
   label: string;
@@ -92,29 +114,9 @@ export function useOpenInActions(path: string | null, directory = false): OpenIn
   useEffect(() => {
     if (!available || !remote || !hostId) return;
     let cancelled = false;
-    const discover = async () => {
-      let alias = await getFileOpenSshHost(hostId);
-      if (!alias) {
-        try {
-          const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}`, {
-            signal: AbortSignal.timeout(3000),
-          });
-          if (response.ok) {
-            const detail = await response.json();
-            if (
-              Array.isArray(detail.ssh_host_key_fingerprints) &&
-              detail.ssh_host_key_fingerprints.length
-            ) {
-              alias = await getFileOpenSshHost(hostId, detail.ssh_host_key_fingerprints);
-            }
-          }
-        } catch {
-          // Unavailable metadata leaves remote opening hidden.
-        }
-      }
+    void discoverSshHost(hostId).then((alias) => {
       if (!cancelled) setConnection(alias ? { hostId, alias } : null);
-    };
-    void discover();
+    });
     return () => {
       cancelled = true;
     };
@@ -152,14 +154,22 @@ export function useOpenInActions(path: string | null, directory = false): OpenIn
           onSelect: () => {
             rememberApp(remote, app.id);
             if (remote && sshHost) {
-              void openRemoteFileInApp(target.hostId, target.path, app.id, sshHost, directory).then(
-                (ok) => {
-                  if (!ok)
-                    toast.error(
-                      `Couldn't open this remote ${directory ? "folder" : "file"} in ${app.label}`,
-                    );
-                },
-              );
+              void discoverSshHost(target.hostId).then(async (alias) => {
+                setConnection((current) =>
+                  current?.hostId === target.hostId
+                    ? alias
+                      ? { hostId: target.hostId, alias }
+                      : null
+                    : current,
+                );
+                const ok =
+                  alias &&
+                  (await openRemoteFileInApp(target.hostId, target.path, app.id, alias, directory));
+                if (!ok)
+                  toast.error(
+                    `Couldn't open this remote ${directory ? "folder" : "file"} in ${app.label}`,
+                  );
+              });
               return;
             }
             void openFileInApp(target.hostId, target.path, app.id).then((ok) => {
