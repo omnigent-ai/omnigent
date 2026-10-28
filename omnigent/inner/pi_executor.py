@@ -2769,25 +2769,26 @@ class PiExecutor(Executor):
 
     async def _compaction_complete(
         self,
-        rpc: _PiRpcSession,
+        rpc: _PiRpcSession | None,
         result: dict[str, JsonValue],
         model: str | None,
     ) -> CompactionComplete:
         """Report a settled turn's compaction with Pi's compacted context.
 
-        :param rpc: The settled Pi RPC session; idle, so ``get_messages`` is safe.
+        :param rpc: A settled Pi session, or ``None`` for a summary-only fallback.
         :param result: The ``compaction_end`` result carrying Pi's summary.
         :param model: The turn's model.
         :returns: The compaction event; summary-only if Pi did not export its context.
         """
-        try:
-            response = await rpc.request(
-                {"type": "get_messages", "id": "compacted_messages"},
-                "get_messages",
-            )
-        except Exception:  # a failed export still persists the summary
-            logger.debug("PiExecutor: get_messages failed after compaction", exc_info=True)
-            response = None
+        response = None
+        if rpc is not None:
+            try:
+                response = await rpc.request(
+                    {"type": "get_messages", "id": "compacted_messages"},
+                    "get_messages",
+                )
+            except Exception:  # a failed export still persists the summary
+                logger.debug("PiExecutor: get_messages failed after compaction", exc_info=True)
         data = response.get("data") if response else None
         pi_messages = data.get("messages") if isinstance(data, dict) else None
         tokens_after = result.get("estimatedTokensAfter")
@@ -2801,6 +2802,56 @@ class PiExecutor(Executor):
                 else None
             ),
         )
+
+    async def _evict_with_compaction(
+        self,
+        session_key: str,
+        rpc: _PiRpcSession,
+        result: dict[str, JsonValue],
+        model: str | None,
+    ) -> CompactionComplete:
+        """Stop a failed turn and preserve its checkpoint before eviction.
+
+        Discard retry output while abort settles. If settlement fails, retain
+        only the summary rather than exporting context from an active turn.
+
+        :param session_key: Session to evict.
+        :param rpc: The failed turn's Pi process.
+        :param result: Latest successful compaction result.
+        :param model: The turn's model.
+        :returns: A full checkpoint when settled, otherwise its summary only.
+        """
+        settled = False
+        try:
+            try:
+                async with asyncio.timeout(_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S):
+                    await rpc.send_command({"type": "abort", "id": "compaction_abort"})
+                    while (line := await rpc.read_line()) is not None:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") == "agent_settled":
+                            settled = True
+                            break
+                        if event.get("type") == "compaction_end":
+                            latest = event.get("result")
+                            if isinstance(latest, dict) and isinstance(latest.get("summary"), str):
+                                result = latest
+            except Exception:  # preserve the summary even if abort or settlement fails
+                logger.debug(
+                    "PiExecutor: compaction settlement failed before eviction", exc_info=True
+                )
+            if not settled:
+                logger.warning(
+                    "PiExecutor: preserving only the compaction summary before eviction; "
+                    "recent kept context is unavailable"
+                )
+            return await self._compaction_complete(rpc if settled else None, result, model)
+        finally:
+            await self._evict_rpc(session_key, rpc)
 
     async def _apply_thinking_level(
         self,
@@ -3311,21 +3362,21 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop == "aborted":
-                        # pi still emits agent_end/agent_settled after an abort;
-                        # drop the session so the next turn cannot read them.
+                    if stop == "aborted" or (
+                        stop == "error" and settled_boundary and message_streamed_text
+                    ):
+                        # Never append regenerated text after a failed streamed reply.
                         if settled_boundary:
-                            await self._evict_rpc(session_key, rpc)
+                            if compaction_result is not None:
+                                yield await self._evict_with_compaction(
+                                    session_key, rpc, compaction_result, model
+                                )
+                            else:
+                                await self._evict_rpc(session_key, rpc)
                         yield ExecutorError(message=str(msg.get("errorMessage", stop)))
                         return
                     if stop == "error":
                         error = str(msg.get("errorMessage", stop))
-                        if settled_boundary and message_streamed_text:
-                            # pi regenerates this message on retry; its partial
-                            # text is already on screen, so stop here.
-                            await self._evict_rpc(session_key, rpc)
-                            yield ExecutorError(message=error)
-                            return
                         # pi emits the run's ``agent_end`` right after an errored
                         # call; consume it (and on pi >= 0.80.4 the retry or
                         # settlement that follows) rather than leave it queued.
@@ -3337,10 +3388,18 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "compaction_end" and settled_boundary:
+                result = event.get("result")
+                if isinstance(result, dict) and isinstance(result.get("summary"), str):
+                    compaction_result = result
                 if event.get("willRetry") and message_streamed_text:
                     # Overflow recovery re-runs the prompt, replacing a
                     # truncated message whose text already streamed.
-                    await self._evict_rpc(session_key, rpc)
+                    if compaction_result is not None:
+                        yield await self._evict_with_compaction(
+                            session_key, rpc, compaction_result, model
+                        )
+                    else:
+                        await self._evict_rpc(session_key, rpc)
                     yield ExecutorError(
                         message=(
                             "Pi's response was truncated and it compacted the context to "
@@ -3348,9 +3407,6 @@ class PiExecutor(Executor):
                         )
                     )
                     return
-                result = event.get("result")
-                if isinstance(result, dict) and isinstance(result.get("summary"), str):
-                    compaction_result = result
                 continue
 
             if event_type == "extension_ui_request":

@@ -176,8 +176,10 @@ window; the fork must leave its parent unchanged.
 
 This is an API/process check, not browser reload or live-provider acceptance.
 Existing sessions without a saved compaction checkpoint are not repaired by
-this recipe. If Pi cannot export its kept context, the fallback retains only
-the summary; component tests cover that degraded path separately.
+this recipe. After compaction, a failed streamed retry is aborted and drained
+to settlement before exporting context and evicting Pi; retry text is suppressed.
+If settlement or context export fails, the fallback retains only the summary
+and loses recent kept context. Component tests cover these failure paths separately.
 
 ### Pi SDK bundled resources (own environment)
 

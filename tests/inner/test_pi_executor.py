@@ -6500,12 +6500,33 @@ def test_settled_compaction_without_exported_context_reports_summary_only() -> N
     _run(_test())
 
 
-def test_settled_compaction_then_failed_retry_reports_compaction_before_error() -> None:
+@pytest.mark.parametrize(
+    ("stop_reason", "partial_text", "settlement"),
+    [
+        pytest.param("error", "", "settled", id="before-text"),
+        pytest.param("error", "partial", "settled", id="partial-error"),
+        pytest.param("aborted", "partial", "settled", id="partial-abort"),
+        pytest.param("aborted", "", "settled", id="abort-before-text"),
+        pytest.param("error", "partial", "eof", id="exit-before-settlement"),
+        pytest.param("aborted", "partial", "timeout", id="settlement-timeout"),
+        pytest.param("error", "partial", "abort-error", id="abort-write-failure"),
+    ],
+)
+def test_settled_compaction_then_failed_retry_reports_compaction_before_error(
+    stop_reason: str, partial_text: str, settlement: str
+) -> None:
     """pi keeps its compacted context when the retry fails, so the compaction
     is still reported before the turn's error."""
 
     async def _test() -> None:
-        failed_retry = _assistant_message(stop_reason="error", error_message="upstream 500")
+        failed_retry = _assistant_message(
+            partial_text, stop_reason=stop_reason, error_message="upstream interrupted"
+        )
+        settled_frames = []
+        if settlement == "settled":
+            if partial_text:
+                settled_frames.append(_text_delta_frame("DO NOT REPLAY"))
+            settled_frames.append(_rpc_frame(type="agent_settled"))
         executor, rpc = _session_executor(
             _overflow_compaction_frames(
                 {"result": {"summary": "SUMMARY"}, "aborted": False, "willRetry": True},
@@ -6524,24 +6545,67 @@ def test_settled_compaction_then_failed_retry_reports_compaction_before_error() 
                 retry=[
                     _rpc_frame(type="agent_start"),
                     _rpc_frame(type="message_start", message={"role": "assistant"}),
+                    *([_text_delta_frame(partial_text)] if partial_text else []),
                     _rpc_frame(type="message_end", message=failed_retry),
                     _rpc_frame(type="agent_end", messages=[failed_retry], willRetry=False),
-                    _rpc_frame(type="agent_settled"),
+                    *settled_frames,
                 ],
             )
         )
+        stdin = rpc.process.stdin
+        settled = False
+        read_line, send_command = rpc.read_line, rpc.send_command
 
-        events = await _run_session_turn(executor, "hello")
+        async def read_frame(*args, **kwargs):
+            nonlocal settled
+            if settlement in {"eof", "timeout"} and rpc._line_queue.qsize() == 1:
+                if settlement == "timeout":
+                    await asyncio.sleep(1)
+                return None
+            line = await read_line(*args, **kwargs)
+            if line is not None and json.loads(line).get("type") == "agent_settled":
+                settled = True
+            return line
+
+        async def send_checked(command):
+            if command["type"] == "get_messages":
+                assert settled, "context export must wait for agent_settled"
+            if command["type"] == "abort" and settlement == "abort-error":
+                raise BrokenPipeError("Pi exited before abort")
+            await send_command(command)
+
+        with (
+            patch.object(rpc, "read_line", side_effect=read_frame),
+            patch.object(rpc, "send_command", side_effect=send_checked),
+            patch("omnigent.inner.pi_executor._TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S", 0.05),
+        ):
+            events = await asyncio.wait_for(_run_session_turn(executor, "hello"), timeout=1)
 
         assert [type(e) for e in events[-2:]] == [CompactionComplete, ExecutorError]
         compaction, error = events[-2:]
-        assert error.message == "upstream 500"
+        assert error.message == "upstream interrupted"
         assert compaction.summary == "SUMMARY"
-        assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == ["hello"]
+        assert [e.text for e in events if isinstance(e, TextChunk)] == (
+            [partial_text] if partial_text else []
+        )
+        commands = [json.loads(line)["type"] for line in stdin.data]
+        if settlement == "settled":
+            assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == [
+                "hello"
+            ]
+            assert commands[-1] == "get_messages"
+            assert rpc._line_queue.empty()
+        else:
+            assert compaction.compacted_messages is None
+            assert "get_messages" not in commands
         assert not any(isinstance(e, TurnComplete) for e in events)
-        assert [cmd["type"] for cmd in _sent_commands(rpc)] == ["prompt", "get_messages"]
-        assert rpc._line_queue.empty()
-        assert _SESSION_KEY in executor._session_states
+        if partial_text or stop_reason == "aborted":
+            _assert_session_evicted(executor, rpc)
+            if settlement != "abort-error":
+                assert commands[:2] == ["prompt", "abort"]
+        else:
+            assert commands == ["prompt", "get_messages"]
+            assert _SESSION_KEY in executor._session_states
 
     _run(_test())
 
@@ -6582,7 +6646,10 @@ def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -
     _run(_test())
 
 
-def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -> None:
+@pytest.mark.parametrize("settled", [True, False], ids=["settled", "exited"])
+def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts(
+    settled: bool,
+) -> None:
     """A truncated answer that already streamed is not followed by the
     regenerated one pi produces after overflow compaction."""
 
@@ -6603,15 +6670,40 @@ def test_settled_compaction_retry_after_streamed_truncation_stops_and_evicts() -
                     aborted=False,
                     willRetry=True,
                 ),
-                *_plain_answer_frames("REGENERATED")[1:],
+                *(
+                    [
+                        *_plain_answer_frames("REGENERATED")[1:],
+                        _rpc_frame(
+                            type="response",
+                            command="get_messages",
+                            success=True,
+                            data={
+                                "messages": [
+                                    {"role": "compactionSummary", "summary": "..."},
+                                    {"role": "user", "content": "hello"},
+                                    _assistant_message("REGENERATED"),
+                                ]
+                            },
+                        ),
+                    ]
+                    if settled
+                    else []
+                ),
             ]
         )
+        if not settled:
+            rpc._line_queue.put_nowait(None)
 
         events = await _run_session_turn(executor, "hello")
 
         assert [e.text for e in events if isinstance(e, TextChunk)] == ["partial"]
         assert not any(isinstance(e, TurnComplete) for e in events)
         assert len([e for e in events if isinstance(e, ExecutorError)]) == 1
+        compaction, error = events[-2:]
+        assert isinstance(compaction, CompactionComplete)
+        assert compaction.summary == "..."
+        assert bool(compaction.compacted_messages) is settled
+        assert "partial response was already streamed" in error.message
         _assert_session_evicted(executor, rpc)
 
     _run(_test())
