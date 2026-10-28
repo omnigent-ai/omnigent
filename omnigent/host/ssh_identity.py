@@ -25,7 +25,7 @@ def ssh_host_key_fingerprints() -> list[str] | None:
             timeout=3,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return None
     else:
         fingerprints: set[str] = set()

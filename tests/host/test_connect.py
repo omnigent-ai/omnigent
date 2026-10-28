@@ -2699,8 +2699,9 @@ async def test_capability_probe_timeout_preserves_unknown_registration_fallback(
     assert "capability discovery timed out" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("ssh_fingerprints", [None, ["SHA256:public-key"]])
 async def test_fast_capability_discovery_is_included_in_hello(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, ssh_fingerprints: list[str] | None
 ) -> None:
     """The first hello carries both readiness and gateway backing."""
     host = _make_host_process()
@@ -2712,7 +2713,7 @@ async def test_fast_capability_discovery_is_included_in_hello(
         host, "_probe_gateway_inference", AsyncMock(return_value={"codex-native": True})
     )
     monkeypatch.setattr(
-        "omnigent.host.ssh_identity.ssh_host_key_fingerprints", lambda: ["SHA256:public-key"]
+        "omnigent.host.ssh_identity.ssh_host_key_fingerprints", lambda: ssh_fingerprints
     )
     tunnel = _BlockingTunnel()
     serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
@@ -2727,7 +2728,7 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference == {"codex-native": True}
 
-    assert hello.ssh_host_key_fingerprints == ["SHA256:public-key"]
+    assert hello.ssh_host_key_fingerprints == ssh_fingerprints
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(

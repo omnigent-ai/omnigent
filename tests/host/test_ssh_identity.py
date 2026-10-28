@@ -11,7 +11,13 @@ from omnigent.host.ssh_identity import ssh_host_key_fingerprints
 
 
 @pytest.mark.parametrize(
-    "failure", [None, FileNotFoundError(), subprocess.TimeoutExpired("ssh-keyscan", 3)]
+    "failure",
+    [
+        None,
+        FileNotFoundError(),
+        subprocess.TimeoutExpired("ssh-keyscan", 3),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+    ],
 )
 def test_ssh_identity_probe(monkeypatch: pytest.MonkeyPatch, failure: Exception | None) -> None:
     monkeypatch.setattr("omnigent.host.ssh_identity.sys.platform", "linux")
