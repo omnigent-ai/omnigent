@@ -227,6 +227,7 @@ def test_unavailable_plugin_inventory_keeps_standalone_and_enabled_plugin_skills
     tmp_path: Path,
     codex_cli: Mock,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     failure: Exception | None,
     loaded_skills: Mock,
 ) -> None:
@@ -258,15 +259,25 @@ def test_unavailable_plugin_inventory_keeps_standalone_and_enabled_plugin_skills
     expected = {"review": standalone}
     if failure is not None:
         expected["toolkit:review"] = enabled
-    assert _discover(tmp_path, warnings=warnings) == expected
+    with caplog.at_level(logging.INFO, logger="omnigent.spec.codex_plugin_skills"):
+        assert _discover(tmp_path, warnings=warnings) == expected
+    logged = [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.name == "omnigent.spec.codex_plugin_skills"
+    ]
     if failure is None:
         codex_cli.assert_not_called()
         loaded_skills.assert_not_called()
-        assert warnings == ["Codex plugin skills unavailable: `codex` was not found on the host."]
+        message = "Codex plugin skills unavailable: `codex` was not found on the host"
+        assert warnings == [f"{message}."]
+        assert logged == [(logging.WARNING, message)]
     else:
         loaded_skills.assert_called_once_with("/test/codex", codex_home, codex_home)
         # Codex's loaded catalog stands in for the inventory, so nothing is missing.
         assert warnings == []
+        assert [level for level, _ in logged] == [logging.INFO]
+        assert logged[0][1].startswith("Codex plugin inventory unavailable: ")
 
 
 @pytest.mark.parametrize("skills_filter", ["all", ["selected"], ["toolkit:selected"]])
@@ -355,19 +366,15 @@ def test_failed_loaded_skill_query_keeps_standalone_skills(
     ]
 
 
-def test_plugin_cache_without_a_codex_binary_warns(
+def test_missing_codex_without_a_plugin_cache_does_not_warn(
     tmp_path: Path, codex_cli: Mock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: None)
-    codex_home = tmp_path / ".codex"
-    standalone = _skill(codex_home / "skills")
+    standalone = _skill(tmp_path / ".codex" / "skills")
     warnings: list[str] = []
     # Without a plugin cache there are no plugin skills to miss.
     assert _discover(tmp_path, warnings=warnings) == {"review": standalone}
     assert warnings == []
-    _skill(_plugin(codex_home) / "skills")
-    assert _discover(tmp_path, warnings=warnings) == {"review": standalone}
-    assert warnings == ["Codex plugin skills unavailable: `codex` was not found on the host."]
     codex_cli.assert_not_called()
 
 
