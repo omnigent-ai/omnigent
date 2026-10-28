@@ -89,6 +89,7 @@ from omnigent.server.schemas import (
     SkillSummary,
 )
 from omnigent.server.skill_injection import _bundle_spec, with_installed_skills
+from omnigent.skills.policy import DEFAULT_POLICY
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
@@ -271,6 +272,7 @@ def register_agent_routes(
                 skill_store=skill_store,
                 artifact_store=artifact_store,
                 spec=_bundle_spec(agent_cache, agent),
+                policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
             )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":

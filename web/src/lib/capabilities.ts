@@ -265,6 +265,8 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
+  /** The operator's skills marketplace policy; null on older servers (URL installs allowed). */
+  skills_marketplace?: SkillsMarketplaceInfo | null;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -322,6 +324,17 @@ function parsePicker(raw: unknown): PickerCuration {
       ? null
       : fallbackDefault;
   return { restrictToAgentNames: new Set(names), defaultAgentName };
+}
+
+/** What Settings → Skills needs from the ``skills_marketplace:`` server config. */
+export interface SkillsMarketplaceInfo {
+  /** Whether Add from URL is offered, or only the listed sources. */
+  url_install: boolean;
+}
+
+function parseSkillsMarketplace(raw: unknown): SkillsMarketplaceInfo | null {
+  if (raw === null || typeof raw !== "object") return null;
+  return { url_install: (raw as Record<string, unknown>).url_install !== false };
 }
 
 /** The server's filesystem attachment policy, as reported by ``/v1/info``. */
@@ -453,6 +466,11 @@ export function skillsMarketplaceEnabled(info: ServerInfo | "loading"): boolean 
   return isFeatureEnabled(info, "skills_marketplace");
 }
 
+/** Whether Settings → Skills offers Add from URL; the server config can limit it to listed sources. */
+export function skillUrlInstallEnabled(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.skills_marketplace?.url_install !== false;
+}
+
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
   return (
     isFeatureEnabled(info, "custom_agents_settings_ui") &&
@@ -541,6 +559,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
+          skills_marketplace: parseSkillsMarketplace(data.skills_marketplace),
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
         };

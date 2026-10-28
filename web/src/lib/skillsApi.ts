@@ -9,6 +9,8 @@ export interface SkillSource {
   name: string;
   created_by: string | null;
   created_at: number;
+  /** Listed in the server config: seeded at startup and not removable here. */
+  managed: boolean;
 }
 
 /** One skill a repository offers, with the caller's install of it if any. */

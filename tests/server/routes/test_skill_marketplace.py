@@ -57,14 +57,19 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _fetcher(repo: Path) -> SkillFetcher:
-    def clone(url: str, ref: str | None, dest: Path) -> None:
+    def clone(url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
         shutil.copytree(repo, dest)
 
     return SkillFetcher(clone=clone)
 
 
 def _build(
-    db_uri: str, tmp_path: Path, *, enabled: bool = True, auth: bool = False
+    db_uri: str,
+    tmp_path: Path,
+    *,
+    enabled: bool = True,
+    auth: bool = False,
+    server_config: dict[str, object] | None = None,
 ) -> tuple[FastAPI, LocalArtifactStore]:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     flags = FeatureFlags(frozenset({Feature.SKILLS_MARKETPLACE}) if enabled else frozenset())
@@ -78,6 +83,7 @@ def _build(
         feature_flags=flags,
         permission_store=SqlAlchemyPermissionStore(db_uri) if auth else None,
         auth_provider=UnifiedAuthProvider(source="header") if auth else None,
+        server_config=server_config,
     )
     return app, artifact_store
 
@@ -492,3 +498,67 @@ def test_a_users_install_wins_over_the_orgs_whatever_the_order(
     ]
     # Someone without their own copy gets the org's.
     assert [s.scope for s in effective_installed_skills(store, "bob")] == ["org"]
+
+
+@pytest.mark.asyncio
+async def test_server_policy_binds_sources_url_installs_and_delivery(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
+) -> None:
+    # Single-user mode is all-admin, so every refusal below is one an admin gets.
+    config = {
+        "skills_marketplace": {
+            "sources": [{"url": "https://github.com/acme/skills", "name": "Acme"}],
+            "allowed_sources": ["github.com/acme/*"],
+            "allow_url_install": False,
+        }
+    }
+    app, artifact_store = _build(db_uri, tmp_path, server_config=config)
+    app.state.skill_fetcher = _fetcher(repo)
+    session_id = _bind_session(db_uri, artifact_store, _tar({"config.yaml": b"name: bundled\n"}))
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=transport, base_url="http://test") as client,
+    ):
+        assert (await client.get("/v1/info")).json()["skills_marketplace"] == {
+            "url_install": False
+        }
+
+        # The config's source is seeded at startup, labelled, and not removable here.
+        listed = (await client.get("/v1/skill-sources")).json()["data"]
+        assert [(s["url"], s["name"], s["managed"]) for s in listed] == [(REPO_URL, "Acme", True)]
+        source_id = listed[0]["id"]
+        assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 403
+        assert (await client.get(f"/v1/skill-sources/{source_id}/catalog")).status_code == 200
+
+        # allowed_sources binds the admin too.
+        refused = await client.post("/v1/skill-sources", json={"source": "other/skills"})
+        assert refused.status_code == 403 and "not an allowed skill source" in refused.text
+
+        # URL installs off: previewing or installing needs a listed source.
+        preview = await client.post("/v1/skill-catalog", json={"source": "acme/more"})
+        assert preview.status_code == 403 and "disabled on this server" in preview.text
+        unlisted = {"source": "acme/more", "names": ["review"]}
+        assert (await client.post("/v1/installed-skills", json=unlisted)).status_code == 403
+        installed = await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+        assert installed.status_code == 201, installed.text
+        skill_id = installed.json()["data"][0]["id"]
+        assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 200
+        contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+        assert "skills/review/SKILL.md" in _names(contents.content)
+
+    # Tighten the policy: the row stays, but the skill is neither served nor updatable,
+    # and the source, no longer in the config, is an ordinary one an admin may remove.
+    tighter = {"skills_marketplace": {"allowed_sources": ["github.com/trusted/*"]}}
+    app, _ = _build(db_uri, tmp_path, server_config=tighter)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 403
+        assert (await client.get(f"/v1/skill-sources/{source_id}/catalog")).status_code == 403
+        contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+        assert "skills/review/SKILL.md" not in _names(contents.content)
+        assert (await client.get("/v1/installed-skills")).json()["data"][0]["id"] == skill_id
+        assert (await client.delete(f"/v1/skill-sources/{source_id}")).status_code == 204

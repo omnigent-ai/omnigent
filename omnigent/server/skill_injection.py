@@ -12,6 +12,7 @@ import logging
 from omnigent.entities import Agent, InstalledSkill
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.skills.overlay import SkillTarballError, overlay_skills, validate_skill_tarball
+from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import ArtifactStore
 from omnigent.stores.skill_store import SkillStore
@@ -49,15 +50,17 @@ def with_installed_skills(
     skill_store: SkillStore,
     artifact_store: ArtifactStore,
     spec: AgentSpec | None = None,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
 ) -> bytes:
     """Return the bundle with the owner's enabled installed skills added under ``skills/``.
 
     The bundle's own skills, by their canonical parsed names, always win a
     collision; a user-scoped install wins over an org-scoped one of the same
-    name. A tarball that fails validation drops only itself.
+    name. A tarball that fails validation drops only itself, and so does a
+    skill whose repository the server's policy no longer allows.
     """
     try:
-        installed = effective_installed_skills(skill_store, owner_id)
+        installed = effective_installed_skills(skill_store, owner_id, policy=policy)
     except Exception:
         _logger.warning("could not list installed skills for %s", owner_id, exc_info=True)
         return bundle_bytes
@@ -88,18 +91,23 @@ def with_installed_skills(
 
 
 def effective_installed_skills(
-    skill_store: SkillStore, owner_id: str | None
+    skill_store: SkillStore,
+    owner_id: str | None,
+    *,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
 ) -> list[InstalledSkill]:
     """The owner's enabled installed skills, one per name, user scope winning over org.
 
-    Pages through the store so the read stays bounded per call.
+    A skill from a repository outside the policy's ``allowed_sources`` is left
+    out, so tightening the policy stops serving it. Pages through the store so
+    the read stays bounded per call.
     """
     by_name: dict[str, InstalledSkill] = {}
     after: str | None = None
     while True:
         page = skill_store.list_for_user(owner_id, after=after)
         for skill in page.data:
-            if not skill.enabled:
+            if not skill.enabled or not policy.allows(skill.source_url):
                 continue
             current = by_name.get(skill.name)
             if current is None or (current.scope == "org" and skill.scope == "user"):

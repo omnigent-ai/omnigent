@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, TrashIcon } from "lucide-react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { skillsMarketplaceEnabled } from "@/lib/capabilities";
+import { skillUrlInstallEnabled, skillsMarketplaceEnabled } from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,7 +63,7 @@ export function SettingsSkillsSection() {
           <InstalledSkillsTab isAdmin={isAdmin} />
         </TabsContent>
         <TabsContent value="browse">
-          <BrowseTab isAdmin={isAdmin} />
+          <BrowseTab isAdmin={isAdmin} urlInstall={skillUrlInstallEnabled(info)} />
         </TabsContent>
       </Tabs>
     </div>
@@ -246,7 +246,7 @@ function SkillContentDialog({
 
 // ── Browse ────────────────────────────────────────────────────────────────
 
-function BrowseTab({ isAdmin }: { isAdmin: boolean }) {
+function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: boolean }) {
   const sources = useSkillSources(true);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
   const [preview, setPreview] = useState<SkillCatalog | null>(null);
@@ -284,7 +284,18 @@ function BrowseTab({ isAdmin }: { isAdmin: boolean }) {
                 {source.name}
                 {source.ref && <span className="text-muted-foreground"> @{source.ref}</span>}
               </button>
-              {isAdmin && <DeleteSourceButton id={source.id} name={source.name} />}
+              {source.managed && (
+                <Badge
+                  variant="outline"
+                  title="Set in the server config"
+                  data-testid={`skill-source-managed-${source.id}`}
+                >
+                  Config
+                </Badge>
+              )}
+              {isAdmin && !source.managed && (
+                <DeleteSourceButton id={source.id} name={source.name} />
+              )}
             </li>
           ))}
         </ul>
@@ -308,7 +319,7 @@ function BrowseTab({ isAdmin }: { isAdmin: boolean }) {
           </p>
         )}
         {isAdmin && <AddSourceForm />}
-        <AddFromUrlForm onPreview={setPreview} />
+        {urlInstall && <AddFromUrlForm onPreview={setPreview} />}
       </aside>
       <section>
         {preview && (

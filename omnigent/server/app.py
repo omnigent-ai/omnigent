@@ -166,6 +166,8 @@ from omnigent.server.server_config import (
     PickerCuration,
 )
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
+from omnigent.skills.policy import CONFIG_KEY as SKILLS_MARKETPLACE_CONFIG_KEY
+from omnigent.skills.policy import SkillsMarketplacePolicy
 from omnigent.skills.service import SkillFetcher
 from omnigent.stores import (
     AgentStore,
@@ -239,6 +241,13 @@ class FilesystemAttachmentsInfo(BaseModel):
     all_types: bool
 
 
+class SkillsMarketplaceInfo(BaseModel):
+    """The parts of the operator's skills marketplace policy the Settings page shows."""
+
+    # Whether Add from URL is offered; off when the config lists sources only.
+    url_install: bool
+
+
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     single_user: bool
@@ -294,6 +303,8 @@ class ServerInfoResponse(BaseModel):
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
+    # Absent on older servers, which clients treat as URL installs allowed.
+    skills_marketplace: SkillsMarketplaceInfo | None = None
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -1828,6 +1839,11 @@ def create_app(
     active_skill_store: SkillStore | None = (
         skill_store if resolved_feature_flags.enabled(Feature.SKILLS_MARKETPLACE) else None
     )
+    # The operator's constraint on the marketplace, from the server config; it
+    # binds admins and the single local user alike, on every fetch and at delivery.
+    skills_policy = SkillsMarketplacePolicy.from_config(
+        resolved_server_config.get(SKILLS_MARKETPLACE_CONFIG_KEY)
+    )
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -2022,6 +2038,10 @@ def create_app(
         _warn_on_empty_picker_restriction(
             agent_store, picker_curation, app_inst.state.suppressed_agent_names
         )
+        if active_skill_store is not None and skills_policy.sources:
+            from omnigent.server.routes.skill_marketplace import seed_configured_sources
+
+            await asyncio.to_thread(seed_configured_sources, active_skill_store, skills_policy)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -2275,8 +2295,9 @@ def create_app(
     app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
     app.state.skill_store = active_skill_store
+    app.state.skills_policy = skills_policy
     # Tests swap in a fetcher whose clone copies a fixture repository.
-    app.state.skill_fetcher = SkillFetcher()
+    app.state.skill_fetcher = SkillFetcher(policy=skills_policy)
     if active_skill_store is not None:
         from omnigent.server.routes.skill_marketplace import create_skill_marketplace_router
 
@@ -2286,6 +2307,7 @@ def create_app(
                 artifact_store=artifact_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+                policy=skills_policy,
             ),
             prefix="/v1",
             tags=["skills"],
@@ -3665,6 +3687,7 @@ def create_app(
                 "scheduled_task_projects": project_store is not None,
                 "automations_enabled": scheduled_task_store is not None
                 and deployment_gate_enabled(app.state.automations, "automations"),
+                "skills_marketplace": {"url_install": skills_policy.allow_url_install},
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
             }

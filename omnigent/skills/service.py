@@ -10,9 +10,10 @@ from __future__ import annotations
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from omnigent.skills.catalog import CatalogEntry, index_checkout, skill_markdown
 from omnigent.skills.git_source import (
@@ -22,6 +23,7 @@ from omnigent.skills.git_source import (
     parse_github_source,
     tar_untrusted_dir,
 )
+from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
 
 CATALOG_TTL_S = 600.0
 # Per skill and per install request; checked while packing, before reading more.
@@ -29,12 +31,18 @@ MAX_SKILL_BYTES = 20 * 1024 * 1024
 MAX_SKILL_ENTRIES = 2_000
 MAX_INSTALL_BYTES = 100 * 1024 * 1024
 
-Cloner = Callable[[str, str | None, Path], None]
+
+class Cloner(Protocol):
+    """Clone *clone_url* at *ref* into *dest*; *token* is the operator's, if the policy has one."""
+
+    def __call__(
+        self, clone_url: str, ref: str | None, dest: Path, *, token: str | None = None
+    ) -> None: ...
 
 
-def server_clone(clone_url: str, ref: str | None, dest: Path) -> None:
+def server_clone(clone_url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
     """The marketplace's clone: isolated from the server's own git credentials."""
-    clone_github_source(clone_url, ref, dest, isolated=True)
+    clone_github_source(clone_url, ref, dest, isolated=True, token=token)
 
 
 @dataclass(frozen=True)
@@ -59,32 +67,52 @@ class PackagedSkill:
 
 
 def resolve_source(source: str, ref: str | None = None) -> tuple[str, str | None]:
-    """Normalize ``owner/repo`` or a github.com URL into ``(clone_url, ref)``.
+    """Normalize ``owner/repo`` or a GitHub URL into ``(clone_url, ref)``.
 
     :raises GitSourceError: When the source is not a GitHub repository.
     """
     parsed = parse_github_source(source.strip())
     if parsed is None:
         raise GitSourceError(
-            "Only GitHub repositories are supported: use owner/repo or a github.com URL."
+            "Only GitHub repositories are supported: use owner/repo, a github.com URL, "
+            "or a URL on a GitHub Enterprise host this server knows."
         )
     return parsed.clone_url, ref or parsed.ref
 
 
 class SkillFetcher:
-    """Clone, index and package skills from GitHub repositories."""
+    """Clone, index and package skills from GitHub repositories, within the server's policy."""
 
-    def __init__(self, *, clone: Cloner = server_clone, ttl_s: float = CATALOG_TTL_S):
+    def __init__(
+        self,
+        *,
+        clone: Cloner = server_clone,
+        ttl_s: float = CATALOG_TTL_S,
+        policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
+    ):
         self._clone = clone
         self._ttl_s = ttl_s
+        self._policy = policy
         self._catalogs: dict[tuple[str, str | None], FetchedCatalog] = {}
         self._lock = threading.Lock()
+
+    def resolve(self, source: str, ref: str | None = None) -> tuple[str, str | None]:
+        """``(clone_url, ref)`` for a source the policy allows.
+
+        :raises GitSourceError: When the source is not GitHub or the policy refuses it.
+        """
+        url, ref = resolve_source(source, ref)
+        self._policy.require_allowed(url)
+        return url, ref
+
+    def _checkout(self, url: str, ref: str | None, dest: Path) -> None:
+        self._clone(url, ref, dest, token=self._policy.token_for(url))
 
     def catalog(
         self, source: str, ref: str | None = None, *, refresh: bool = False
     ) -> FetchedCatalog:
         """The repository's catalog, from cache unless stale or *refresh*."""
-        url, ref = resolve_source(source, ref)
+        url, ref = self.resolve(source, ref)
         key = (url, ref)
         with self._lock:
             cached = self._catalogs.get(key)
@@ -96,7 +124,7 @@ class SkillFetcher:
             return cached
         with tempfile.TemporaryDirectory(prefix="omnigent-skill-catalog-") as tmp:
             checkout = Path(tmp) / "repo"
-            self._clone(url, ref, checkout)
+            self._checkout(url, ref, checkout)
             skipped: list[str] = []
             entries = index_checkout(checkout, skipped=skipped)
             fetched = FetchedCatalog(
@@ -119,10 +147,10 @@ class SkillFetcher:
         :returns: The checkout's commit and the packaged skills in *names* order.
         :raises GitSourceError: On a clone failure, an unknown name, or an unsafe file.
         """
-        url, ref = resolve_source(source, ref)
+        url, ref = self.resolve(source, ref)
         with tempfile.TemporaryDirectory(prefix="omnigent-skill-install-") as tmp:
             checkout = Path(tmp) / "repo"
-            self._clone(url, ref, checkout)
+            self._checkout(url, ref, checkout)
             by_name = {entry.name: entry for entry in index_checkout(checkout)}
             missing = [name for name in names if name not in by_name]
             if missing:

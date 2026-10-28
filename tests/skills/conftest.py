@@ -59,10 +59,14 @@ def fake_clone(tmp_path: Path) -> Callable[[Path], Callable[[str, str | None, Pa
 
     def make(repo: Path):
         calls: list[tuple[str, str | None]] = []
+        tokens: list[str | None] = []
 
-        def clone(url: str, ref: str | None, dest: Path) -> None:
+        def clone(url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
             calls.append((url, ref))
+            tokens.append(token)
             shutil.copytree(repo, dest, symlinks=True)
+
+        clone.tokens = tokens  # type: ignore[attr-defined]
 
         clone.calls = calls  # type: ignore[attr-defined]
         return clone

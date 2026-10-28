@@ -2,8 +2,9 @@
 
 Mounted only when the ``skills_marketplace`` feature is on and a skill store
 is configured. Sources are admin-managed; installs are per user unless an
-admin installs for the whole org. Fetching runs off the event loop and uses
-the same hardened clone as ``omnigent agent add``.
+admin installs for the whole org. The operator's ``skills_marketplace:``
+policy is checked on every fetch path, admins included. Fetching runs off the
+event loop and uses the same hardened clone as ``omnigent agent add``.
 """
 
 from __future__ import annotations
@@ -22,8 +23,9 @@ from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
-from omnigent.skills.git_source import GitSourceError
+from omnigent.skills.git_source import GitSourceError, repository_label
 from omnigent.skills.overlay import SkillTarballError, validate_skill_tarball
+from omnigent.skills.policy import DEFAULT_POLICY, SkillPolicyError, SkillsMarketplacePolicy
 from omnigent.skills.service import FetchedCatalog, SkillFetcher, resolve_source
 from omnigent.stores import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
@@ -48,6 +50,8 @@ class SkillSourceObject(BaseModel):
     name: str
     created_by: str | None
     created_at: int
+    # Listed in the server config: seeded at startup and not removable here.
+    managed: bool = False
 
 
 class SkillSourceList(BaseModel):
@@ -136,16 +140,10 @@ class InstalledSkillContentResponse(BaseModel):
 # ── helpers ──────────────────────────────────────────────────────────────
 
 
-def source_label(url: str) -> str:
-    """``owner/repo`` for a GitHub clone URL, else the URL itself."""
-    prefix = "https://github.com/"
-    if url.startswith(prefix):
-        return url.removeprefix(prefix).removesuffix(".git")
-    return url
-
-
-def _source_object(source: SkillSource) -> SkillSourceObject:
-    return SkillSourceObject(**source.__dict__)
+def _source_object(source: SkillSource, policy: SkillsMarketplacePolicy) -> SkillSourceObject:
+    return SkillSourceObject(
+        **source.__dict__, managed=policy.is_configured(source.url, source.ref)
+    )
 
 
 def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
@@ -155,7 +153,7 @@ def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
         display_name=skill.display_name,
         description=skill.description,
         source_url=skill.source_url,
-        source=source_label(skill.source_url),
+        source=repository_label(skill.source_url),
         ref=skill.ref,
         commit=skill.commit,
         path=skill.path,
@@ -221,7 +219,36 @@ def _catalog_response(
 
 
 def _invalid(exc: Exception) -> OmnigentError:
-    return OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT)
+    """A policy refusal is forbidden; anything else about the request is invalid input."""
+    code = ErrorCode.FORBIDDEN if isinstance(exc, SkillPolicyError) else ErrorCode.INVALID_INPUT
+    return OmnigentError(str(exc), code=code)
+
+
+async def _listed_source(skill_store: SkillStore, url: str, ref: str | None) -> SkillSource | None:
+    """The browsable source for this exact repository and ref, if there is one."""
+    after: str | None = None
+    while True:
+        page = await asyncio.to_thread(skill_store.list_sources, after=after)
+        for source in page.data:
+            if source.url == url and source.ref == ref:
+                return source
+        if not page.has_more or page.last_id is None:
+            return None
+        after = page.last_id
+
+
+def seed_configured_sources(skill_store: SkillStore, policy: SkillsMarketplacePolicy) -> None:
+    """Add the config's ``sources`` to the browse list; an existing row is left as is."""
+    for source in policy.sources:
+        try:
+            skill_store.add_source(
+                url=source.url,
+                ref=source.ref,
+                name=source.name or repository_label(source.url),
+                created_by=None,
+            )
+        except Exception:
+            _logger.warning("could not seed skill source %s", source.url, exc_info=True)
 
 
 async def _all_installed(skill_store: SkillStore, user_id: str | None) -> list[InstalledSkill]:
@@ -245,6 +272,7 @@ def create_skill_marketplace_router(
     artifact_store: ArtifactStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
 ) -> APIRouter:
     """Build the marketplace routes; the fetcher is read from ``app.state.skill_fetcher``."""
     router = APIRouter()
@@ -257,6 +285,23 @@ def create_skill_marketplace_router(
     async def fetch(fn, *args, **kwargs):  # type: ignore[no-untyped-def]  # thin thread hop
         async with fetch_slots:
             return await asyncio.to_thread(fn, *args, **kwargs)
+
+    def resolve_allowed(source: str, ref: str | None) -> tuple[str, str | None]:
+        """``(clone_url, ref)`` for a source within ``allowed_sources``, before any fetch."""
+        url, ref = resolve_source(source, ref)
+        policy.require_allowed(url)
+        return url, ref
+
+    async def require_browsable(url: str, ref: str | None) -> None:
+        """With URL installs off, a repository must be a listed source to fetch from."""
+        if policy.allow_url_install:
+            return
+        if await _listed_source(skill_store, url, ref) is None:
+            raise OmnigentError(
+                "Installing from a URL is disabled on this server; "
+                "choose a repository from the sources list.",
+                code=ErrorCode.FORBIDDEN,
+            )
 
     # ── sources ──
 
@@ -273,18 +318,18 @@ def create_skill_marketplace_router(
         except SkillValueError as exc:
             raise _invalid(exc) from None
         return SkillSourceList(
-            data=[_source_object(s) for s in page.data],
+            data=[_source_object(s, policy) for s in page.data],
             has_more=page.has_more,
             last_id=page.last_id,
         )
 
     @router.post("/skill-sources", status_code=201, dependencies=mutating)
     async def add_skill_source(request: Request, body: SkillSourceCreate) -> SkillSourceObject:
-        """Add a repository to browse (administrators only)."""
+        """Add a repository to browse (administrators only, within ``allowed_sources``)."""
         user_id = require_user(request, auth_provider)
         _require_admin(user_id, permission_store)
         try:
-            url, ref = resolve_source(body.source, body.ref)
+            url, ref = resolve_allowed(body.source, body.ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
         try:
@@ -292,18 +337,26 @@ def create_skill_marketplace_router(
                 skill_store.add_source,
                 url=url,
                 ref=ref,
-                name=body.name or source_label(url),
+                name=body.name or repository_label(url),
                 created_by=user_id,
             )
         except SkillValueError as exc:
             raise _invalid(exc) from None
-        return _source_object(source)
+        return _source_object(source, policy)
 
     @router.delete("/skill-sources/{source_id}", status_code=204, dependencies=mutating[:1])
     async def delete_skill_source(request: Request, source_id: str) -> Response:
         """Remove a repository from the browse list; installed skills stay."""
         user_id = require_user(request, auth_provider)
         _require_admin(user_id, permission_store)
+        source = await asyncio.to_thread(skill_store.get_source, source_id)
+        if source is None:
+            raise OmnigentError("Skill source not found", code=ErrorCode.NOT_FOUND)
+        if policy.is_configured(source.url, source.ref):
+            raise OmnigentError(
+                "This source is set in the server config and cannot be removed here.",
+                code=ErrorCode.FORBIDDEN,
+            )
         if not await asyncio.to_thread(skill_store.delete_source, source_id):
             raise OmnigentError("Skill source not found", code=ErrorCode.NOT_FOUND)
         return Response(status_code=204)
@@ -318,6 +371,8 @@ def create_skill_marketplace_router(
         if source is None:
             raise OmnigentError("Skill source not found", code=ErrorCode.NOT_FOUND)
         try:
+            # A source added under a looser policy is refused once it is outside it.
+            policy.require_allowed(source.url)
             fetched = await fetch(
                 fetcher(request).catalog, source.url, source.ref, refresh=refresh
             )
@@ -332,7 +387,9 @@ def create_skill_marketplace_router(
         """The skills an arbitrary GitHub repository offers (the Add from URL path)."""
         user_id = require_user(request, auth_provider)
         try:
-            fetched = await fetch(fetcher(request).catalog, body.source, body.ref)
+            url, ref = resolve_allowed(body.source, body.ref)
+            await require_browsable(url, ref)
+            fetched = await fetch(fetcher(request).catalog, url, ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
         return _catalog_response(fetched, await _all_installed(skill_store, user_id))
@@ -367,8 +424,9 @@ def create_skill_marketplace_router(
             _require_admin(user_id, permission_store)
         names = list(dict.fromkeys(body.names))
         try:
-            commit, packaged = await fetch(fetcher(request).package, body.source, body.ref, names)
-            url, ref = resolve_source(body.source, body.ref)
+            url, ref = resolve_allowed(body.source, body.ref)
+            await require_browsable(url, ref)
+            commit, packaged = await fetch(fetcher(request).package, url, ref, names)
         except GitSourceError as exc:
             raise _invalid(exc) from None
         # Validate every tarball and every stored value before the first write,
@@ -434,6 +492,8 @@ def create_skill_marketplace_router(
         skill = await _load(skill_id, user_id)
         _require_can_mutate(skill, user_id, permission_store)
         try:
+            policy.require_allowed(skill.source_url)
+            await require_browsable(skill.source_url, skill.ref)
             commit, packaged = await fetch(
                 fetcher(request).package, skill.source_url, skill.ref, [skill.name]
             )

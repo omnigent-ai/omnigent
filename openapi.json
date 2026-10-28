@@ -6518,6 +6518,16 @@
             "title": "Single User",
             "type": "boolean"
           },
+          "skills_marketplace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SkillsMarketplaceInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "smart_routing_enabled": {
             "title": "Smart Routing Enabled",
             "type": "boolean"
@@ -10221,6 +10231,11 @@
             "title": "Id",
             "type": "string"
           },
+          "managed": {
+            "default": false,
+            "title": "Managed",
+            "type": "boolean"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -10294,6 +10309,20 @@
           "description"
         ],
         "title": "SkillSummary",
+        "type": "object"
+      },
+      "SkillsMarketplaceInfo": {
+        "description": "The parts of the operator's skills marketplace policy the Settings page shows.",
+        "properties": {
+          "url_install": {
+            "title": "Url Install",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url_install"
+        ],
+        "title": "SkillsMarketplaceInfo",
         "type": "object"
       },
       "SkillsResponse": {
@@ -20356,7 +20385,7 @@
         ]
       },
       "post": {
-        "description": "Add a repository to browse (administrators only).",
+        "description": "Add a repository to browse (administrators only, within `allowed_sources`).",
         "operationId": "add_skill_source_v1_skill_sources_post",
         "requestBody": {
           "content": {

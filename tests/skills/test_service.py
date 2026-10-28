@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.skills.git_source import GitSourceError
+from omnigent.skills.policy import SkillPolicyError, SkillsMarketplacePolicy, SourceCredential
 from omnigent.skills.service import SkillFetcher, resolve_source
 
 
@@ -74,11 +75,50 @@ def test_fetcher_clones_isolated_from_server_credentials(monkeypatch: pytest.Mon
 
     seen: dict[str, object] = {}
 
-    def clone(url: str, ref: str | None, dest: Path, *, isolated: bool = False) -> None:
-        seen["isolated"] = isolated
+    def clone(
+        url: str,
+        ref: str | None,
+        dest: Path,
+        *,
+        isolated: bool = False,
+        token: str | None = None,
+    ) -> None:
+        seen["isolated"], seen["token"] = isolated, token
         raise GitSourceError("stop")
 
     monkeypatch.setattr(service, "clone_github_source", clone)
     with pytest.raises(GitSourceError):
-        service.server_clone("https://github.com/a/b.git", None, Path("/nonexistent"))
-    assert seen["isolated"] is True
+        service.server_clone("https://github.com/a/b.git", None, Path("/nonexistent"), token="t")
+    assert seen == {"isolated": True, "token": "t"}
+
+
+def test_fetcher_refuses_a_source_outside_the_policy_before_cloning(
+    plain_repo: Path, fake_clone
+) -> None:
+    clone = fake_clone(plain_repo)
+    policy = SkillsMarketplacePolicy(allowed_sources=("github.com/acme/*",))
+    fetcher = SkillFetcher(clone=clone, policy=policy)
+
+    with pytest.raises(SkillPolicyError, match="not an allowed skill source"):
+        fetcher.catalog("other/skills")
+    with pytest.raises(SkillPolicyError):
+        fetcher.package("https://github.com/other/skills", None, ["review"])
+    assert clone.calls == []
+
+    fetcher.catalog("acme/skills")
+    assert clone.calls == [("https://github.com/acme/skills.git", None)]
+
+
+def test_fetcher_hands_the_policys_token_to_the_clone(
+    plain_repo: Path, fake_clone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SKILLS_TOKEN", "ghs_secret")
+    clone = fake_clone(plain_repo)
+    policy = SkillsMarketplacePolicy(
+        credentials=(SourceCredential(match="github.com/acme/*", token_env="SKILLS_TOKEN"),)
+    )
+    fetcher = SkillFetcher(clone=clone, policy=policy)
+
+    fetcher.catalog("acme/skills")
+    fetcher.package("other/skills", None, ["review"])
+    assert clone.tokens == ["ghs_secret", None]

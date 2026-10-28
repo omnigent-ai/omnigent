@@ -17,9 +17,10 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
-from omnigent.server.routes.skill_marketplace import source_label
 from omnigent.server.schemas import SkillSummary
 from omnigent.server.skill_injection import effective_installed_skills, skill_allowed
+from omnigent.skills.git_source import repository_label
+from omnigent.skills.policy import DEFAULT_POLICY
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
@@ -176,7 +177,12 @@ def create_skills_router(
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
         if skill_store is not None:
-            installed = await asyncio.to_thread(effective_installed_skills, skill_store, user_id)
+            installed = await asyncio.to_thread(
+                effective_installed_skills,
+                skill_store,
+                user_id,
+                policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
+            )
             skills += installed_skill_summaries(installed, spec, {s.name for s in skills})
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
@@ -251,7 +257,7 @@ def installed_skill_summaries(
                 name=skill.name,
                 description=skill.description,
                 display_name=skill.display_name,
-                source=source_label(skill.source_url),
+                source=repository_label(skill.source_url),
             )
         )
     return out

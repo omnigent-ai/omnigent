@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 import os
 import subprocess
@@ -118,3 +119,59 @@ def test_tar_untrusted_dir_stops_at_the_limits_before_reading_more(tmp_path: Pat
         git_source.tar_untrusted_dir(src, what="a skill", max_entries=1)
     # Within the limits the archive is produced.
     assert git_source.tar_untrusted_dir(src, what="a skill", max_bytes=8192, max_entries=5)
+
+
+def test_enterprise_hosts_the_server_knows_keep_their_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "github.acme.internal")
+    parsed = git_source.parse_github_source("https://github.acme.internal/team/skills/tree/v2")
+    assert parsed is not None
+    assert (parsed.host, parsed.clone_url, parsed.ref) == (
+        "github.acme.internal",
+        "https://github.acme.internal/team/skills.git",
+        "v2",
+    )
+    # An unknown host is refused, never normalised onto github.com.
+    assert git_source.parse_github_source("https://github.other.internal/team/skills") is None
+    monkeypatch.setenv("GH_HOST", "github.other.internal")
+    assert git_source.parse_github_source("https://github.other.internal/team/skills") is not None
+
+    assert git_source.repository_label("https://github.com/acme/skills.git") == "acme/skills"
+    assert (
+        git_source.repository_label("https://github.acme.internal/team/skills.git")
+        == "github.acme.internal/team/skills"
+    )
+
+
+def test_token_travels_in_the_environment_not_the_command_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: list[tuple[list[str], dict[str, str]]] = []
+
+    def run(cmd: list[str], **kwargs: object) -> object:
+        seen.append((cmd, kwargs["env"]))  # type: ignore[arg-type]
+        return type("P", (), {"returncode": 0, "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", run)
+    git_source.clone_github_source(
+        "https://github.acme.internal/team/skills.git",
+        None,
+        tmp_path / "r",
+        isolated=True,
+        token="ghs_secret",
+    )
+    cmd, env = seen[0]
+    assert not any("ghs_secret" in part for part in cmd)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.acme.internal/.extraheader"
+    basic = base64.b64encode(b"x-access-token:ghs_secret").decode()
+    assert env["GIT_CONFIG_VALUE_0"] == f"AUTHORIZATION: basic {basic}"
+    # The isolation still holds around the header.
+    assert env["GIT_CONFIG_GLOBAL"] == os.devnull and "credential.helper=" in cmd
+
+    git_source.clone_github_source(
+        "https://github.com/a/b.git", None, tmp_path / "r2", isolated=True
+    )
+    assert "GIT_CONFIG_COUNT" not in seen[1][1]

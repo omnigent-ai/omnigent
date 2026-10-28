@@ -10,9 +10,12 @@ import { SettingsSkillsSection } from "./SettingsSkillsSection";
 import { authenticatedFetch } from "@/lib/identity";
 import type { InstalledSkill, SkillCatalog, SkillSource } from "@/lib/skillsApi";
 
-const flags = { feature: true, admin: true };
+const flags = { feature: true, admin: true, urlInstall: true };
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ features: { skills_marketplace: flags.feature } }),
+  useServerInfo: () => ({
+    features: { skills_marketplace: flags.feature },
+    skills_marketplace: { url_install: flags.urlInstall },
+  }),
 }));
 vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => flags.admin }));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
@@ -26,6 +29,7 @@ const source: SkillSource = {
   name: "acme/skills",
   created_by: null,
   created_at: 0,
+  managed: false,
 };
 const review: InstalledSkill = {
   id: "sk1",
@@ -79,6 +83,7 @@ function json(body: unknown, status = 200) {
 const calls: { method: string; url: string; body?: unknown }[] = [];
 const state = {
   installed: [review] as InstalledSkill[],
+  sources: [source] as SkillSource[],
   failPatch: false,
   secondPage: null as InstalledSkill[] | null,
 };
@@ -99,7 +104,7 @@ function script() {
         page(state.installed, state.secondPage !== null, state.secondPage ? "cursor" : null),
       );
     }
-    if (url.startsWith("/v1/skill-sources?") && method === "GET") return json(page([source]));
+    if (url.startsWith("/v1/skill-sources?") && method === "GET") return json(page(state.sources));
     if (url === "/v1/skill-sources" && method === "POST") return json(source, 201);
     if (url === "/v1/skill-sources/src1" && method === "DELETE")
       return new Response(null, { status: 204 });
@@ -141,7 +146,9 @@ function renderSection() {
 beforeEach(() => {
   flags.feature = true;
   flags.admin = true;
+  flags.urlInstall = true;
   state.installed = [review];
+  state.sources = [source];
   state.failPatch = false;
   state.secondPage = null;
   calls.length = 0;
@@ -335,5 +342,18 @@ describe("SettingsSkillsSection", () => {
     expect(screen.queryByTestId("skill-source-input")).toBeNull();
     expect(screen.queryByRole("button", { name: /Remove source/ })).toBeNull();
     expect(screen.getByTestId("skill-url-input")).toBeInTheDocument();
+  });
+
+  it("keeps a config source in place and drops Add from URL when the server says so", async () => {
+    flags.urlInstall = false;
+    state.sources = [{ ...source, managed: true }];
+    renderSection();
+    openBrowse();
+    await screen.findByTestId("skill-source-src1");
+    expect(screen.getByTestId("skill-source-managed-src1")).toHaveTextContent("Config");
+    // Even an admin cannot remove it here; they can still add sources of their own.
+    expect(screen.queryByRole("button", { name: /Remove source/ })).toBeNull();
+    expect(screen.getByTestId("skill-source-input")).toBeInTheDocument();
+    expect(screen.queryByTestId("skill-url-input")).toBeNull();
   });
 });
