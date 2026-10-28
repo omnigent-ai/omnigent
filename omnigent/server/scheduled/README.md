@@ -481,6 +481,17 @@ scheduled_task_scheduler:
 - With the flag on, an invalid setting stops the server from starting. With the
   flag off, only `startup_retry_seconds` is read and checked.
 
+## Turning automations off for some callers
+
+A deployment can pass `create_app(automations=...)`: a bool, or a zero-arg
+callable checked on each request, for example a per-workspace flag. When it is
+off for a request, every `/v1/scheduled-tasks` route returns 404, including the
+agent tools that call them, and `GET /v1/info` reports `automations_enabled`
+false so clients hide the feature. A callable that raises counts as off. The
+gate does not stop the scheduler: tasks created while it was on keep running,
+and can be paused or deleted only once it is on again. Omitting it enables
+automations.
+
 ## Switching schedulers
 
 **Turning it on.** Set `OMNIGENT_FEATURES=automations_v2` and restart all

@@ -5878,6 +5878,11 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automations_enabled": {
+            "default": false,
+            "title": "Automations Enabled",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },

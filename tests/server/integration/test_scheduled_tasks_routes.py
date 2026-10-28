@@ -7,7 +7,7 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -68,6 +68,7 @@ def _build_app(
     persistent: bool = False,
     local_single_user: bool = False,
     projects: bool = True,
+    automations: bool | Callable[[], bool] | None = None,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
@@ -86,6 +87,7 @@ def _build_app(
         # ``app.state.host_store`` is None and the route skips the check.
         host_store=HostStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri) if projects else None,
+        automations=automations,
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=local_single_user),
         feature_flags=resolve_feature_flags(
             {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
@@ -246,6 +248,56 @@ async def test_create_lists_and_gets(auth_client: httpx.AsyncClient, db_uri: str
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["id"] == task_id
+
+
+async def test_automations_gate_is_checked_per_request(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    mock_llm: ControllableMockClient,
+) -> None:
+    gate = {"state": "on"}
+
+    def automations() -> bool:
+        if gate["state"] == "broken":
+            raise RuntimeError("gate unavailable")
+        return gate["state"] == "on"
+
+    app = _build_app(db_uri, tmp_path, automations=automations)
+    _make_user(db_uri)
+    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
+
+    async with _serve(app, mock_llm, tmp_path) as client:
+
+        async def enabled_in_info() -> bool:
+            return (await client.get("/v1/info", headers=_headers())).json()["automations_enabled"]
+
+        created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        assert created.status_code == 200, created.text
+        task_url = f"/v1/scheduled-tasks/{created.json()['id']}"
+        assert await enabled_in_info() is True
+
+        # A failing gate is off too, so a broken deployment flag hides automations.
+        for state in ("off", "broken"):
+            gate["state"] = state
+            for method, url in (
+                ("GET", "/v1/scheduled-tasks"),
+                ("POST", "/v1/scheduled-tasks"),
+                ("GET", task_url),
+                ("PATCH", task_url),
+                ("POST", f"{task_url}/run"),
+                ("GET", f"{task_url}/runs"),
+                ("DELETE", task_url),
+            ):
+                body = _create_body() if method == "POST" else {} if method == "PATCH" else None
+                response = await client.request(method, url, json=body, headers=_headers())
+                assert response.status_code == 404, (state, method, url, response.text)
+            assert await enabled_in_info() is False
+
+        gate["state"] = "on"
+        got = await client.get(task_url, headers=_headers())
+        assert got.status_code == 200, got.text
+        assert await enabled_in_info() is True
 
 
 async def test_create_no_workspace_task_persists_null_host_and_workspace(

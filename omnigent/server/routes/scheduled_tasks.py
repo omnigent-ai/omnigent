@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
@@ -28,6 +28,7 @@ from omnigent.entities import Agent, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.bundles import agent_for_user
+from omnigent.server.feature_flags import DeploymentGate, deployment_gate_enabled
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._session_create_validation import (
@@ -246,6 +247,7 @@ def create_scheduled_tasks_router(
     auth_provider: AuthProvider | None = None,
     artifact_store: ArtifactStore | None = None,
     project_store: ProjectStore | None = None,
+    automations: DeploymentGate = True,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -255,11 +257,17 @@ def create_scheduled_tasks_router(
     :param artifact_store: Holds the copy a task gets of another user's agent.
     :param project_store: Checks the project fired sessions are filed into.
         ``None`` rejects tasks that set a project.
+    :param automations: Per-request gate; every route returns 404 while it is off.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
     :returns: A configured :class:`APIRouter`.
     """
-    router = APIRouter()
+
+    def require_automations() -> None:
+        if not deployment_gate_enabled(automations, "automations"):
+            raise HTTPException(status_code=404, detail="not found")
+
+    router = APIRouter(dependencies=[Depends(require_automations)])
 
     def _owner(request: Request) -> str:
         """Resolve the calling user, mapping the auth-disabled case to
