@@ -648,6 +648,30 @@ async def test_fire_keeps_a_project_the_task_moved_to_mid_fire() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fire_runs_unfiled_when_clearing_a_deleted_project_fails() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})
+
+    def _fail_clear(scheduled_task_id: str, project_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    store.clear_project_id = _fail_clear
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, project_store=FakeProjectStore(set())),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
 async def test_fire_without_a_project_store_files_nothing() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})

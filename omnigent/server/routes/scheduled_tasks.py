@@ -84,7 +84,7 @@ class CreateScheduledTaskRequest(BaseModel):
     # (no host_id/workspace); default keeps the connected-host behavior.
     execution_target: str = "connected_host"
     # One of the caller's projects to file fired sessions into.
-    project_id: str | None = Field(default=None, min_length=1)
+    project_id: str | None = None
 
     @model_validator(mode="after")
     def _validate_create(self) -> CreateScheduledTaskRequest:
@@ -118,7 +118,7 @@ class UpdateScheduledTaskRequest(BaseModel):
     host_id: str | None = Field(default=None, min_length=1)
     execution_target: str | None = Field(default=None, min_length=1)
     state: str | None = None
-    project_id: str | None = Field(default=None, min_length=1)  # null unfiles future runs
+    project_id: str | None = None  # null unfiles future runs
 
     @model_validator(mode="after")
     def _validate_patch(self) -> UpdateScheduledTaskRequest:

@@ -50,7 +50,7 @@ const projectsQuery = vi.hoisted(() => ({
 const resolveOrCreateProjectId = vi.hoisted(() => vi.fn());
 vi.mock("@/hooks/useConversations", () => ({
   useProjects: () => projectsQuery.current,
-  resolveOrCreateProjectId,
+  useResolveOrCreateProjectId: () => resolveOrCreateProjectId,
 }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
@@ -1006,6 +1006,29 @@ describe("CreateScheduledTaskDialog project", () => {
     fireEvent.click(await screen.findByRole("menuitem", { name: "Triage" }));
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
     expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+  });
+
+  it("blocks a second save while a typed project is being created", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    let finishCreate: (id: string) => void = () => undefined;
+    resolveOrCreateProjectId.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    await waitFor(() => expect(submit).toBeDisabled());
+    fireEvent.click(submit);
+    finishCreate("proj_new");
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(resolveOrCreateProjectId).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the picked project when it is renamed before saving", async () => {

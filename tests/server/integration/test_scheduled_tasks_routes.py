@@ -640,7 +640,7 @@ async def test_create_files_runs_into_an_owned_project(
     mine = await _make_project(auth_client, "mine")
     bobs = await _make_project(auth_client, "bob's", owner="bob@example.com")
 
-    for project_id in (bobs, "not-a-project-id"):
+    for project_id in (bobs, "not-a-project-id", ""):
         resp = await auth_client.post(
             "/v1/scheduled-tasks", json=_create_body(project_id=project_id), headers=_headers()
         )
@@ -686,8 +686,11 @@ async def test_update_moves_and_clears_the_task_project(
     renamed = await auth_client.patch(task_url, json={"name": "renamed"}, headers=_headers())
     assert renamed.json()["project_id"] == second
 
-    foreign = await auth_client.patch(task_url, json={"project_id": bobs}, headers=_headers())
-    assert foreign.status_code == 404, foreign.text
+    for rejected_id in (bobs, ""):
+        rejected = await auth_client.patch(
+            task_url, json={"project_id": rejected_id}, headers=_headers()
+        )
+        assert rejected.status_code == 404, rejected.text
     assert (await auth_client.get(task_url, headers=_headers())).json()["project_id"] == second
 
     cleared = await auth_client.patch(task_url, json={"project_id": None}, headers=_headers())

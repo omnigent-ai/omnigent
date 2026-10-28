@@ -33,7 +33,7 @@ import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
-import { resolveOrCreateProjectId, useProjects } from "@/hooks/useConversations";
+import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -77,7 +77,6 @@ export function CreateScheduledTaskDialog({
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts } = useHosts({ enabled: open });
-  const { data: projects = [], isSuccess: projectsLoaded, isError: projectsFailed } = useProjects();
   const info = useServerInfo();
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
@@ -85,6 +84,12 @@ export function CreateScheduledTaskDialog({
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   // Older servers reject a task's project fields, so the picker needs the flag.
   const projectsSupported = info !== "loading" && info.scheduled_task_projects === true;
+  const {
+    data: projects = [],
+    isSuccess: projectsLoaded,
+    isError: projectsFailed,
+  } = useProjects({ enabled: open && projectsSupported });
+  const resolveProjectId = useResolveOrCreateProjectId();
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
@@ -284,13 +289,11 @@ export function CreateScheduledTaskDialog({
   // or once the project is deleted. Only a loaded list proves it is deleted.
   const savedProjectUnresolved = projectChoice === null && savedProjectName === undefined;
   const savedProjectDeleted = savedProjectUnresolved && projectsLoaded;
-  const unresolvedProjectLabel = savedProjectUnresolved
-    ? savedProjectDeleted
-      ? "Deleted project"
-      : projectsFailed
-        ? "Project unavailable"
-        : "Loading…"
-    : null;
+  const unresolvedProjectLabel = unresolvedProjectText(
+    savedProjectUnresolved,
+    savedProjectDeleted,
+    projectsFailed,
+  );
 
   const hostOptions = hosts ?? [];
   const preservePinnedHost = isEdit && editingTask?.hostId != null;
@@ -314,7 +317,9 @@ export function CreateScheduledTaskDialog({
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
-  const mutationPending = createMutation.isPending || updateMutation.isPending;
+  // Set across the whole submit, which may first find or create a project.
+  const [submitting, setSubmitting] = useState(false);
+  const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
     name.trim() !== "" &&
     prompt.trim() !== "" &&
@@ -347,7 +352,9 @@ export function CreateScheduledTaskDialog({
   }
 
   async function handleSubmit() {
+    if (!editingTask && effectiveAgentId === null) return;
     setError(null);
+    setSubmitting(true);
     try {
       // A sandbox task runs hostless (fresh sandbox per fire), so host/workspace
       // are omitted. Only send executionTarget when it's meaningful: on create
@@ -370,7 +377,12 @@ export function CreateScheduledTaskDialog({
           ? { workspace: workspace.trim() }
           : {}),
       };
-      const projectInput = await projectChangeInput(projectChoice, pickedProjectId, savedProjectId);
+      const projectInput = await projectChangeInput(
+        projectChoice,
+        pickedProjectId,
+        savedProjectId,
+        resolveProjectId,
+      );
       if (editingTask) {
         // Thread model/effort ONLY when the agent supports them. Each control's
         // "" (Default) maps to `null` so an update CLEARS a previously-set
@@ -421,6 +433,8 @@ export function CreateScheduledTaskDialog({
               ? "Couldn't update the automation."
               : "Couldn't create the automation.",
       );
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -750,6 +764,18 @@ export function CreateScheduledTaskDialog({
   );
 }
 
+/** Label for a saved project the list can't name yet, or `null` once it can. */
+function unresolvedProjectText(
+  unresolved: boolean,
+  deleted: boolean,
+  failed: boolean,
+): string | null {
+  if (!unresolved) return null;
+  if (deleted) return "Deleted project";
+  if (failed) return "Project unavailable";
+  return "Loading…";
+}
+
 /**
  * The project field to send for a pick, and nothing when it is unchanged. An
  * existing project is sent by the id captured when it was picked; a typed name
@@ -759,11 +785,12 @@ async function projectChangeInput(
   choice: string | null,
   pickedId: string | null,
   savedProjectId: string | null,
+  resolveProjectId: (name: string) => Promise<string>,
 ): Promise<{ projectId?: string | null }> {
   if (choice === null) return {};
   if (choice === "") return savedProjectId !== null ? { projectId: null } : {};
   if (pickedId !== null) return pickedId === savedProjectId ? {} : { projectId: pickedId };
-  return { projectId: await resolveOrCreateProjectId(choice) };
+  return { projectId: await resolveProjectId(choice) };
 }
 
 /** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
