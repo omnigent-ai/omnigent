@@ -1,4 +1,4 @@
-// Tests for /tasks: lists, filters, gallery tabs, and row actions.
+// Tests for /tasks: lists, filters, project filter, gallery tabs, and row actions.
 // Scheduled-task hooks are mocked; the creation dialog exposes its seed props and close action.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -11,6 +11,7 @@ import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import * as conversationHooks from "@/hooks/useConversations";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
 
@@ -24,6 +25,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
 }));
+vi.mock("@/hooks/useConversations", () => ({ useProjects: vi.fn() }));
 
 // Stub the create dialog — its internals are covered separately; here we only
 // need to know it opened and WHICH prefill (initialName/initialPrompt) TasksPage
@@ -37,6 +39,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialTrigger,
     initialTemplateId,
     sessionLink,
+    initialProject,
     editingTask,
     onCreated,
   }: {
@@ -48,6 +51,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialTrigger?: string | null;
     initialTemplateId?: string;
     sessionLink?: string;
+    initialProject?: { id: string; name: string };
     editingTask?: ScheduledTask | null;
   }) =>
     open ? (
@@ -58,6 +62,7 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-initial-trigger={initialTrigger ?? ""}
         data-initial-template={initialTemplateId ?? ""}
         data-session-link={sessionLink ?? ""}
+        data-initial-project-id={initialProject?.id ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
       >
@@ -128,6 +133,7 @@ beforeEach(() => {
   setOmnigentHostConfig({ analytics });
   localStorage.clear();
   vi.mocked(useViewerId).mockReturnValue(null);
+  setProjects([]);
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -160,12 +166,15 @@ const TRIGGER_INFO = {
   features: { session_orchestration: true },
 };
 
-function renderPage(
+const PROJECTS_INFO = { ...TRIGGER_INFO, scheduled_task_projects: true };
+
+// Exposed so tests can rerender the same tree with new mock data (state is kept).
+function pageTree(
   path = "/tasks",
   basename = "",
   info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
 ) {
-  return render(
+  return (
     <CapabilitiesProvider info={info}>
       <MemoryRouter initialEntries={[`${basename}${path}`]}>
         <RoutingProvider value={basenamedRouting(basename)}>
@@ -178,12 +187,37 @@ function renderPage(
           </Routes>
         </RoutingProvider>
       </MemoryRouter>
-    </CapabilitiesProvider>,
+    </CapabilitiesProvider>
   );
+}
+
+function renderPage(
+  path = "/tasks",
+  basename = "",
+  info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO,
+) {
+  return render(pageTree(path, basename, info));
 }
 
 function selectView(name: "Your automations" | "Templates") {
   fireEvent.mouseDown(screen.getByRole("tab", { name }), { button: 0, ctrlKey: false });
+}
+
+function setProjects(
+  data: conversationHooks.ProjectSummary[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean; refetch?: () => void } = {},
+) {
+  vi.mocked(conversationHooks.useProjects).mockReturnValue({
+    data,
+    isLoading: state.isLoading ?? false,
+    isError: state.isError ?? false,
+    refetch: state.refetch ?? vi.fn(),
+  } as unknown as ReturnType<typeof conversationHooks.useProjects>);
+}
+
+async function chooseProjectFilter(name: string) {
+  fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
+  fireEvent.click(await screen.findByRole("option", { name }));
 }
 
 describe("TasksPage list", () => {
@@ -436,6 +470,139 @@ describe("filtering + search", () => {
     const rows = screen.getAllByTestId("scheduled-task-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("PR sweep")).toBeInTheDocument();
+  });
+});
+
+describe("Project filtering", () => {
+  const inA = task({ id: "a", name: "In A", projectId: "p_a" });
+  const inB = task({ id: "b", name: "In B", projectId: "p_b" });
+  const unfiled = task({ id: "u", name: "Unfiled one", projectId: null });
+  const dangling = task({ id: "d", name: "Dangling", projectId: "deleted" });
+
+  beforeEach(() => {
+    setProjects([
+      { id: "p_a", name: "Project A", icon: "📊" },
+      { id: "p_b", name: "Project B" },
+      { id: null, name: "Legacy only" },
+    ]);
+  });
+
+  it("hides the filter and chips when the server does not file runs into projects", () => {
+    setTasks([inA]);
+    renderPage("/tasks", "", { ...PROJECTS_INFO, scheduled_task_projects: false });
+    expect(screen.queryByTestId("tasks-project-filter")).toBeNull();
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
+    expect(vi.mocked(conversationHooks.useProjects)).toHaveBeenCalledWith({ enabled: false });
+  });
+
+  it("names the current selection in the filter's accessible name", async () => {
+    setTasks([inA, inB]);
+    renderPage("/tasks", "", PROJECTS_INFO);
+    expect(screen.getByRole("combobox", { name: "Filter by project: All projects" })).toBeTruthy();
+    await chooseProjectFilter("Project A");
+    expect(screen.getByRole("combobox", { name: "Filter by project: Project A" })).toBeTruthy();
+    await chooseProjectFilter("All projects");
+    expect(screen.getByText("In B")).toBeInTheDocument();
+  });
+
+  it("disables Unfiled while the project list is unavailable", async () => {
+    setTasks([inA, dangling]);
+    setProjects(undefined, { isError: true });
+    renderPage("/tasks", "", PROJECTS_INFO);
+    fireEvent.keyDown(screen.getByTestId("tasks-project-filter"), { key: "Enter" });
+    expect(await screen.findByRole("option", { name: "Unfiled" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("stops filtering once the last automation is gone", async () => {
+    setTasks([inA]);
+    const view = renderPage("/tasks", "", PROJECTS_INFO);
+    await chooseProjectFilter("Project A");
+    setTasks([]);
+    view.rerender(pageTree("/tasks", "", PROJECTS_INFO));
+    expect(screen.getByTestId("tasks-suggestions")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-project-id", "");
+  });
+
+  it("filters to the selected project, or to unfiled and deleted-project tasks", async () => {
+    setTasks([inA, inB, unfiled, dangling]);
+    renderPage("/tasks", "", PROJECTS_INFO);
+
+    await chooseProjectFilter("Project A");
+    expect(screen.getByText("In A")).toBeInTheDocument();
+    expect(screen.queryByText("In B")).toBeNull();
+    expect(screen.queryByTestId("task-project-chip")).toBeNull();
+
+    await chooseProjectFilter("Unfiled");
+    expect(screen.getByText("Unfiled one")).toBeInTheDocument();
+    expect(screen.getByText("Dangling")).toBeInTheDocument();
+    expect(screen.queryByText("In A")).toBeNull();
+  });
+
+  it("shows a chip only for tasks whose project resolves", () => {
+    setTasks([inA, unfiled, dangling]);
+    renderPage("/tasks", "", PROJECTS_INFO);
+    const chips = screen.getAllByTestId("task-project-chip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]).toHaveTextContent("Project A");
+    expect(within(chips[0]).getByTestId("project-icon")).toHaveTextContent("📊");
+  });
+
+  it("starts a new automation in the selected project", async () => {
+    setTasks([inA]);
+    renderPage("/tasks", "", PROJECTS_INFO);
+    await chooseProjectFilter("Project A");
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-project-id",
+      "p_a",
+    );
+  });
+
+  it("keeps the template gallery out of project-filtered lists", async () => {
+    setTasks([inA, unfiled]);
+    renderPage("/tasks", "", PROJECTS_INFO);
+    await chooseProjectFilter("Project A");
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+    selectView("Templates");
+    expect(screen.getByRole("region", { name: "Automation templates" })).toBeVisible();
+    expect(screen.queryByTestId("tasks-project-filter")).toBeNull();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
+    expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
+      "data-initial-project-id",
+      "p_a",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
+    selectView("Your automations");
+    expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("Project A");
+    expect(screen.getByText("In A")).toBeVisible();
+    expect(screen.queryByText("Unfiled one")).toBeNull();
+    await chooseProjectFilter("Unfiled");
+    expect(screen.queryByTestId("tasks-suggestions")).toBeNull();
+  });
+
+  it("offers a retry when projects fail to load", () => {
+    setTasks([inA]);
+    const refetch = vi.fn();
+    setProjects(undefined, { isError: true, refetch });
+    renderPage("/tasks", "", PROJECTS_INFO);
+    expect(screen.getByTestId("tasks-projects-error")).toHaveTextContent("Couldn’t load projects.");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to All projects when the selected project is deleted", async () => {
+    setTasks([inA]);
+    const view = renderPage("/tasks", "", PROJECTS_INFO);
+    await chooseProjectFilter("Project A");
+    setProjects([{ id: "p_b", name: "Project B" }]);
+    view.rerender(pageTree("/tasks", "", PROJECTS_INFO));
+    await waitFor(() =>
+      expect(screen.getByTestId("tasks-project-filter")).toHaveTextContent("All projects"),
+    );
   });
 });
 
