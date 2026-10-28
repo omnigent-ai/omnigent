@@ -254,6 +254,9 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "overloaded",
     "currently experiencing high demand, which may cause temporary errors",
 )
+_CLAUDE_RESPONSE_STOPPED_MESSAGE = (
+    "api error: the response stopped arriving. the response above may be incomplete."
+)
 # 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
 _TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
 # The gateway's CANCELLED error envelope, which can arrive without a parseable status.
@@ -306,6 +309,7 @@ def classify_native_turn_error(code: str, message: str) -> str:
         or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
         or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
         or lowered.strip().removesuffix(".") == "request timed out"
+        or lowered.strip() == _CLAUDE_RESPONSE_STOPPED_MESSAGE
     ):
         return "transient_upstream_error"
     return code
