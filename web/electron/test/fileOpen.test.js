@@ -139,34 +139,51 @@ test("does not inherit another editor's IPC connection and reports CLI errors", 
   assert.equal(receivedEnv.CURSOR_CLI_BLOCK_CURSOR_AGENT, "true");
 });
 
-test("foregrounds the editor while its remote CLI is still starting", async (t) => {
-  const calls = [];
-  let finishCli;
-  let cliStarted;
-  const started = new Promise((resolve) => {
-    cliStarted = resolve;
+for (const change of ["unchanged lookup", "alias change", "alias restoration", "server change"]) {
+  test(`remote opening during foregrounding handles ${change}`, async (t) => {
+    const calls = [];
+    let alias = "arca.ssh";
+    let context = {};
+    const foregroundStarted = Promise.withResolvers();
+    const foregroundComplete = Promise.withResolvers();
+    t.after(() => foregroundComplete.resolve({ stdout: "" }));
+    const { directory, openRemote, resolve } = setup(t, "darwin", {
+      resolveSshHost: () => alias,
+      getServerContext: () => context,
+      run: async (command) => {
+        calls.push(command);
+        if (command === "/usr/bin/open") {
+          foregroundStarted.resolve();
+          return foregroundComplete.promise;
+        }
+        return { stdout: "" };
+      },
+    });
+    fs.mkdirSync(path.join(directory, "Cursor.app"));
+    await resolve();
+    const opening = openRemote("/remote/workspace");
+    await foregroundStarted.promise;
+    assert.deepEqual(calls, ["/usr/bin/open"]);
+
+    if (change === "server change") context = {};
+    if (change === "alias change" || change === "alias restoration") alias = "other.ssh";
+    assert.equal(await resolve(), alias);
+    if (change === "alias restoration") {
+      alias = "arca.ssh";
+      assert.equal(await resolve(), alias);
+    }
+
+    foregroundComplete.resolve({ stdout: "" });
+    const unchanged = change === "unchanged lookup";
+    assert.equal(await opening, unchanged);
+    assert.deepEqual(
+      calls,
+      unchanged
+        ? ["/usr/bin/open", path.join(directory, "Cursor.app/Contents/Resources/app/bin/cursor")]
+        : ["/usr/bin/open"],
+    );
   });
-  const { directory, openRemote, resolve } = setup(t, "darwin", {
-    run: async (command) => {
-      calls.push(command);
-      if (command === "/usr/bin/open") return { stdout: "" };
-      cliStarted();
-      return new Promise((complete) => {
-        finishCli = complete;
-      });
-    },
-  });
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
-  await resolve();
-  const opening = openRemote("/remote/workspace");
-  await started;
-  assert.deepEqual(calls, [
-    "/usr/bin/open",
-    path.join(directory, "Cursor.app/Contents/Resources/app/bin/cursor"),
-  ]);
-  finishCli({ stdout: "" });
-  assert.equal(await opening, true);
-});
+}
 
 test("still hands off the remote path if foregrounding fails", async (t) => {
   let cliLaunched = false;

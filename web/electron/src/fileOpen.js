@@ -156,11 +156,13 @@ function registerFileOpen({
     try {
       const verifiedAlias = await resolveSshHost(event, hostId);
       if (!isPinnedOriginSender(event) || sshContext(event) !== state) return null;
+      const previous = state.hosts.get(hostId);
       if (verifiedAlias) {
-        state.hosts.set(hostId, { alias: verifiedAlias, verified: true });
+        if (!previous?.verified || previous.alias !== verifiedAlias) {
+          state.hosts.set(hostId, { alias: verifiedAlias, verified: true });
+        }
         return verifiedAlias;
       }
-      const previous = state.hosts.get(hostId);
       const keys = fingerprints ?? previous?.fingerprints;
       const fingerprintKey = JSON.stringify(keys);
       if (
