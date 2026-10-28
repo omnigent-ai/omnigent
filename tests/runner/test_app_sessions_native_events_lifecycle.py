@@ -5472,6 +5472,9 @@ async def test_events_codex_side_chat_preserves_indentation(
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
 
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_cache", {})
+    monkeypatch.setattr(codex_native_app_server, "_effort_catalog_misses", {})
+
     monkeypatch.setattr(
         "omnigent.runner.native.orchestration._auto_create_codex_terminal",
         AsyncMock(return_value=None),
@@ -5491,6 +5494,19 @@ async def test_events_codex_side_chat_preserves_indentation(
     fake_client = _RecordingCodexAppServerClient(
         transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
     )
+    fake_client.model_list_responses = [
+        {
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-6-sol",
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [{"reasoningEffort": "max"}],
+                    }
+                ]
+            }
+        }
+    ]
     monkeypatch.setattr(
         codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
     )
@@ -5513,6 +5529,9 @@ async def test_events_codex_side_chat_preserves_indentation(
         )
         assert created.status_code == 201, created.text
         response = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+        if not command:
+            repeated = await client.post(f"/v1/sessions/{conv_id}/events", json=payload)
+            assert repeated.status_code == 202, repeated.text
     assert response.status_code == 202, response.text
     if command:
         assert [request.question for request in side_chat.peek_side_chat_requests(bridge_dir)] == [
@@ -5530,9 +5549,10 @@ async def test_events_codex_side_chat_preserves_indentation(
                     **({"effort": "max"} if not inherited else {}),
                 },
             )
-        ]
-        if inherited:
-            assert not any(method == "model/list" for method, _ in fake_client.requests)
+        ] * 2
+        assert sum(method == "model/list" for method, _ in fake_client.requests) == (
+            0 if inherited else 1
+        )
         assert fake_client.closed
 
 

@@ -200,6 +200,25 @@ async def test_parent_side_chat_settings_reuse_the_parent_turns_catalog(
     assert settings == {"model": "gpt-6-sol", "effort": "max"}
     assert side_client.calls == []
 
+    await side_chat.submit_side_turn(
+        side_client,
+        "thread_side",
+        "follow up",
+        model="gpt-6-sol",
+        effort="max",
+        transport=socket_path,
+    )
+    await side_chat.submit_side_turn(
+        side_client,
+        "thread_side",
+        "reset effort",
+        model="gpt-6-sol",
+        reset_effort=True,
+        transport=socket_path,
+    )
+    assert [method for method, _ in side_client.calls] == ["turn/start", "turn/start"]
+    assert [params["effort"] for _, params in side_client.calls] == ["max", "medium"]
+
 
 @pytest.mark.asyncio
 async def test_fork_returns_none_when_response_has_no_thread_id() -> None:

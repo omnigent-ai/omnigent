@@ -37,9 +37,11 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
-- `side-chat-settings`: before or after the first message, choose a supported model or effort
-  in the side-chat composer; selections apply to that chat's next turn independently
-  of its parent, in the desktop panel and mobile drawer.
+- `side-chat-settings`: choose a supported model or effort in the side-chat composer;
+  selections apply to that chat's next turn independently of its parent, in the
+  desktop panel and mobile drawer. Generic side chats allow selection before or
+  after the first message. Native Codex controls appear after child creation and
+  require a runner that supports side-chat settings.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.

@@ -6503,6 +6503,7 @@ def create_runner_app(
                         _side_client,
                         str(_side_thread_id),
                         _side_text,
+                        transport=_side_state.socket_path,
                         model=body.get("model_override"),
                         effort=body.get("reasoning_effort"),
                         reset_effort="reasoning_effort" in body
