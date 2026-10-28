@@ -11,7 +11,9 @@ reattach when the session moves to another host.
 
 - `agent-terminal-view`: the Chat/Terminal switcher shows the harness terminal
   and returns to chat with the terminal's content kept. States: starting up
-  (no Resume action), stopped (Resume offered), connected.
+  (no Resume action), stopped (Resume offered), failed (stopped plus the
+  session's failure cause), sandbox offline ("The sandbox is offline." with
+  Resume sandbox), connected.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
@@ -91,6 +93,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   using `--browser-ui-skip-build --reruns 0 --video=on`.
   `tests/e2e_ui/shells/test_new_shell.py::test_starting_terminal_view_shows_loading_without_resume`,
   `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`.
+  A failed session's cause on the stopped state:
+  `tests/e2e_ui/shells/test_new_shell.py::test_failed_terminal_view_surfaces_runner_failure_cause`.
   The stopped state with a selectable empty terminal (own environment):
   `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
   kills the session's runner, so it fails under `verify-env run`; run it with

@@ -971,6 +971,11 @@ plain `uv run pytest`, which starts a private server for the test.
   chosen repository's main checkout, never from the missing worktree's branch.
   Existing worktree recreation and sandbox creation belong to the ordinary fork
   dialog, not this recovery action.
+- A host recreates a deleted workspace directory as an empty one on the next
+  launch and posts an info notice instead of the recovery card. To reproduce the
+  missing-workspace error, remove its parent directory or make it uncreatable.
+  Host coverage (own environment):
+  `tests/e2e/test_host_e2e.py::test_host_relaunch_recreates_deleted_workspace`.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.

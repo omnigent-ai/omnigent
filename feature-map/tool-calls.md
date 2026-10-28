@@ -13,6 +13,7 @@ Every tool call an agent makes renders in the chat transcript as a muted row: an
 - `tool-states`: running (spinner and waiting indicator), cancelled, failed turn, and no output recorded.
 - `tool-file-link`: a single-file row shows its path workspace-relative and opens it in the file viewer.
 - `tool-run-fold`: runs fold into one summary line; the live run keeps its last three rows visible, and durable routing or dispatch cards never fold.
+- `final-answer-fold`: with Settings > Appearance > "Show only the final answer" on (per device, off by default), a finished turn also folds its progress messages into the Worked row. Codex's marked answers stay visible; for other agents, the last message does.
 
 ## How to get to it (user POV)
 
@@ -29,6 +30,7 @@ Preconditions: build this checkout's web UI and install its Playwright Chromium.
 
 - Titles, server tag, result lines and their error color, fields, Raw, at desktop and phone width from stored history (Claude-shaped MCP content blocks, a Pi plan call, a failing call): `tests/browser_ui/chat/test_transcript_rendering.py::test_tool_rows_read_as_actions_with_their_outcome`.
 - Live run folding and semantic labels through the server and runner: `tests/e2e_ui/messages/test_message_render_parity.py::test_tool_run_fold_semantic_label`.
+- Final-answer folding with and without tool work: `tests/e2e_ui/chat/test_working_indicator_reload.py::test_final_answer_setting_folds_narration_with_tool_work`, `tests/e2e_ui/chat/test_working_indicator_reload.py::test_final_answer_setting_folds_progress_messages_without_tools`.
 - Long result preview and Expand: `tests/e2e_ui/agents/test_subagent_long_handoff_retrieval.py::test_long_subagent_handoff_tail_reachable_in_parent_chat`.
 - Shell terminal panel and wrapping: `tests/e2e_ui/chat/test_tool_output_long_line_wrap.py::test_tool_output_long_line_wraps_instead_of_clipping`.
 - Sub-agent dispatch row title: `tests/e2e_ui/chat/test_two_agent_chat.py::test_two_agents_discuss_hitchhikers_guide`.
