@@ -10431,6 +10431,8 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/labels", "github_labels"),
         ("/merge-options", "github_merge_options"),
         ("/reviewers", "github_reviewers"),
+        ("/review-threads", "github_review_threads"),
+        ("/review-threads/thread-1/comments", "github_review_thread_comments"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -10449,13 +10451,27 @@ async def test_selected_pr_reaches_offline_host(
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
     url = "https://github.com/example/second/pull/42"
+    params = {"pr_url": url}
+    if resource == "":
+        params["include_review_threads"] = "true"
+    elif resource.startswith("/review-threads"):
+        params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
     response = await offline_env_client.get(
-        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params={"pr_url": url}
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
     assert response.status_code == 200
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"]["pr_url"] == url
+    if resource == "":
+        assert captured["params"]["include_review_threads"] is True
+    elif resource.startswith("/review-threads"):
+        assert captured["params"]["after"] == "cursor"
+        if resource.endswith("/comments"):
+            assert captured["params"]["thread_id"] == "thread-1"
+        else:
+            assert captured["params"]["head_sha"] == "a" * 40
+            assert captured["params"]["base_sha"] == "b" * 40
 
 
 async def test_pr_attachment_uses_bound_session_when_runner_offline(
@@ -10485,6 +10501,12 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     "resource,body,op,params",
     [
         ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
+        (
+            "/review-threads/thread-1/replies",
+            {"body": "Hello"},
+            "github_review_thread_reply",
+            {"body": "Hello", "thread_id": "thread-1"},
+        ),
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
         (
             "/reviewers",
@@ -11085,8 +11107,11 @@ async def test_environment_id_is_one_runner_url_segment(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["comments", "review-threads/thread-1/replies"])
 async def test_comment_transport_timeout_does_not_retry_on_host(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
 ) -> None:
     from omnigent.server.routes import _host_filesystem
 
@@ -11103,7 +11128,7 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 
     monkeypatch.setattr(runner, "post", timeout)
     monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", unexpected_fallback)
-    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/comments"
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
     response = await client.post(
         path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"}
     )
@@ -11112,7 +11137,10 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource,expected", [("comments", 502), ("details", 503)])
+@pytest.mark.parametrize(
+    "resource,expected",
+    [("comments", 502), ("review-threads/thread-1/replies", 502), ("details", 503)],
+)
 async def test_host_write_timeout_preserves_comment_uncertainty(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -11146,7 +11174,7 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
     assert response.status_code == expected, response.text
     assert len(sent) == 1
     assert connection.pending_fs_requests == {}
-    if resource == "comments":
+    if resource != "details":
         assert (
             response.json()["detail"]
             == "Could not confirm comment posting. Check GitHub before retrying."

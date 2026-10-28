@@ -1403,10 +1403,12 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        include_review_threads: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_info",
+            include_review_threads=include_review_threads,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1433,10 +1435,14 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_diff",
+            head_sha=head_sha,
+            base_sha=base_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1572,6 +1578,62 @@ def register_resource_routes(
             **_server_tracking_fields(body),
             add=body.get("add", []),
             remove=body.get("remove", []),
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/review-threads")
+    async def read_review_threads_route(
+        session_id: str,
+        pr_url: str,
+        after: str,
+        head_sha: str,
+        base_sha: str,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_review_threads",
+            pr_url=pr_url,
+            after=after,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.get("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments")
+    async def read_review_thread_comments_route(
+        session_id: str,
+        thread_id: str,
+        pr_url: str,
+        after: str,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_review_thread_comments",
+            pr_url=pr_url,
+            thread_id=thread_id,
+            after=after,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies")
+    async def reply_to_review_thread_route(
+        session_id: str, thread_id: str, request: Request
+    ) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "reply_to_pr_review_thread",
+            thread_id=thread_id,
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            **_server_tracking_fields(body),
         )
 
     @app.post("/v1/sessions/{session_id}/resources/github/comments")

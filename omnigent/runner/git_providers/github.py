@@ -33,6 +33,8 @@ _CAPABILITIES = ProviderCapabilities(
     merging=True,
     reviewer_editing=True,
     comment_posting=True,
+    review_threads=True,
+    review_thread_replies=True,
     details_editing=True,
     attachment_uploads=True,
 )
@@ -84,6 +86,52 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._gh_installed()
+
+    def reference_info_with_threads(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Read metadata and published review conversations in the same request."""
+        from omnigent.runner import github_resource
+
+        return _with_provider_fields(
+            github_resource._reference_info(root, reference, include_review_threads=True)
+        )
+
+    def review_diff(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Fetch a patch whose revisions match the displayed review conversations."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_patch_at_revision(
+            root, reference, head_sha=head_sha, base_sha=base_sha
+        )
+
+    def review_threads(
+        self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
+    ) -> dict[str, Any]:
+        """Load another review-thread page on demand."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.read_threads(
+            root, reference, after=after, head_sha=head_sha, base_sha=base_sha
+        )
+
+    def review_thread_comments(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, after: str
+    ) -> dict[str, Any]:
+        """Load another page in a published thread."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.read_comments(
+            root, reference, thread_id=thread_id, after=after
+        )
+
+    def reply_to_review_thread(
+        self, root: str, reference: PullRequestRef, *, thread_id: str, body: str
+    ) -> dict[str, Any]:
+        """Publish a reply immediately to its original review conversation."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.reply(root, reference, thread_id=thread_id, body=body)
 
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float

@@ -651,7 +651,8 @@ def register_resources_routes(
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
             ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
-            ``"github_labels"`` / ``"github_merge_options"`` / ``"github_reviewers"``.
+            ``"github_labels"`` / ``"github_merge_options"`` / ``"github_reviewers"`` /
+        ``"github_review_threads"`` / ``"github_review_thread_comments"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -2895,6 +2896,8 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> Any:
         """
         Return the whole PR as one unified diff patch.
@@ -2909,6 +2912,10 @@ def register_resources_routes(
         """
         conv = await _authorize_browse_read(session_id, request)
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha:
+            params["head_sha"] = head_sha
+        if base_sha:
+            params["base_sha"] = base_sha
         return await _fs_get_with_host_fallback(
             session_id,
             conv,
@@ -3322,10 +3329,16 @@ def register_resources_routes(
             )
 
     async def _github_info(
-        session_id: str, conv: Conversation, pr_url: str | None = None
+        session_id: str,
+        conv: Conversation,
+        pr_url: str | None = None,
+        *,
+        include_review_threads: bool = False,
     ) -> dict[str, Any]:
         """Read PR context through the runner or host and store what it reports."""
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if include_review_threads:
+            params["include_review_threads"] = True
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -3576,6 +3589,7 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        include_review_threads: bool = False,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -3589,7 +3603,9 @@ def register_resources_routes(
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(session_id, conv, pr_url)
+        return await _github_info(
+            session_id, conv, pr_url, include_review_threads=include_review_threads
+        )
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",
@@ -3918,6 +3934,89 @@ def register_resources_routes(
                 "remove": body.get("remove", []),
             },
             failure_detail="Cannot update reviewers",
+        )
+
+    @router.get("/sessions/{session_id}/resources/github/review-threads", response_model=None)
+    async def get_session_review_threads(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+        after: str,
+        head_sha: str,
+        base_sha: str,
+    ) -> dict[str, Any]:
+        """Load more review conversations for the displayed PR revision."""
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        params = await _github_params(
+            session_id,
+            {
+                "pr_url": pr_url,
+                "after": after,
+                "head_sha": head_sha,
+                "base_sha": base_sha,
+            },
+        )
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_review_threads",
+            host_params=params,
+            runner_params=params,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments",
+        response_model=None,
+    )
+    async def get_session_review_thread_comments(
+        request: Request,
+        session_id: str,
+        thread_id: str,
+        pr_url: str,
+        after: str,
+    ) -> dict[str, Any]:
+        """Load additional replies in a published PR review conversation."""
+        conv = await _validate_session(session_id, request, LEVEL_READ)
+        params = await _github_params(session_id, {"pr_url": pr_url, "after": after})
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_review_thread_comments",
+            host_params={**params, "thread_id": thread_id},
+            runner_params=params,
+            runner_path=(
+                f"/v1/sessions/{session_id}/resources/github/review-threads/"
+                f"{urllib.parse.quote(thread_id, safe='')}/comments"
+            ),
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def reply_to_session_review_thread(
+        request: Request,
+        session_id: str,
+        thread_id: str,
+    ) -> dict[str, Any]:
+        """Publish one reply with the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=(
+                f"/v1/sessions/{session_id}/resources/github/review-threads/"
+                f"{urllib.parse.quote(thread_id, safe='')}/replies"
+            ),
+            host_op="github_review_thread_reply",
+            non_idempotent=True,
+            params={"pr_url": body["pr_url"], "thread_id": thread_id, "body": body.get("body")},
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
         )
 
     @router.post(

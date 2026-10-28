@@ -41,6 +41,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestFacet,
     ReviewerRef,
+    ReviewThreadsFacet,
     local_git,
     unsupported_remote_info,
 )
@@ -296,12 +297,20 @@ def _workspace_info(root: str, resolution: ProviderResolution | None = None) -> 
     return info
 
 
-def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
+def _reference_info(
+    root: str, reference: PullRequestRef, *, include_review_threads: bool = False
+) -> dict[str, Any]:
     """Info for one tracked PR, or the unsupported payload when its provider has no facet."""
     try:
         facet = _facet(reference.provider)
         if facet is None:
             return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
+        if (
+            include_review_threads
+            and facet.capabilities.review_threads
+            and isinstance(facet, ReviewThreadsFacet)
+        ):
+            return facet.reference_info_with_threads(root, reference)
         return facet.reference_info(root, reference)
     except Exception:  # retain the selector and healthy providers on failure
         _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
@@ -479,7 +488,11 @@ def _background_discovery(
 
 
 def pr_info(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    include_review_threads: bool = False,
 ) -> dict[str, Any]:
     """Read the selected session PR and discover untracked providers from all remotes.
 
@@ -518,12 +531,12 @@ def pr_info(
     discovered: list[dict[str, Any]] = []
     if not resolutions:
         assert reference is not None
-        info = _reference_info(root, reference)
+        info = _reference_info(root, reference, include_review_threads=include_review_threads)
     elif reference is not None:
         pending = [
             (value, _background_discovery(root, session_id, value)) for value in resolutions
         ]
-        info = _reference_info(root, reference)
+        info = _reference_info(root, reference, include_review_threads=include_review_threads)
         # Collect quick results; slow forges will appear on a subsequent poll.
         deadline = time.monotonic() + 0.1
         for resolution, future in pending:
@@ -853,6 +866,89 @@ def update_pr_reviewers(
     return facet.edit_reviewers(root, reference, add=add_refs, remove=remove_refs)
 
 
+def _comment_body(body: object) -> str:
+    """Validate Markdown consistently for conversation comments and review replies."""
+    if not isinstance(body, str):
+        raise ValueError("Expected body to be a string")
+    if not body.strip():
+        raise ValueError("A comment cannot be empty")
+    if len(body) > _MAX_BODY_CHARS:
+        raise ValueError(f"A comment can be at most {_MAX_BODY_CHARS} characters")
+    return body
+
+
+def _review_target(
+    session_id: str | None, pr_url: str | None, *, replying: bool = False
+) -> tuple[ReviewThreadsFacet, SessionPullRequest]:
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: (
+            capabilities.review_thread_replies if replying else capabilities.review_threads
+        ),
+        unselected="Select a pull request to read or reply to a conversation",
+        unsupported="Review conversations on {kind} are not supported",
+    )
+    if not isinstance(facet, ReviewThreadsFacet):
+        raise ValueError("This provider does not support review conversations")
+    return facet, reference
+
+
+def _review_identifier(value: str) -> str:
+    if not value or len(value) > 1024 or any(character.isspace() for character in value):
+        raise ValueError("Invalid review conversation identifier or cursor")
+    return value
+
+
+def pr_review_threads(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    after: str,
+    head_sha: str,
+    base_sha: str,
+) -> dict[str, Any]:
+    """Read an additional page of conversations at the displayed revision."""
+    facet, reference = _review_target(session_id, pr_url)
+    if not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha):
+        raise ValueError("Expected full head and base commit SHAs")
+    return facet.review_threads(
+        root, reference, after=_review_identifier(after), head_sha=head_sha, base_sha=base_sha
+    )
+
+
+def pr_review_thread_comments(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    thread_id: str,
+    after: str,
+) -> dict[str, Any]:
+    """Read additional replies from a conversation on the selected PR."""
+    facet, reference = _review_target(session_id, pr_url)
+    return facet.review_thread_comments(
+        root, reference, thread_id=_review_identifier(thread_id), after=_review_identifier(after)
+    )
+
+
+def reply_to_pr_review_thread(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    thread_id: str,
+    body: object = None,
+) -> dict[str, Any]:
+    """Post a validated reply through the selected PR's provider."""
+    comment_body = _comment_body(body)
+    facet, reference = _review_target(session_id, pr_url, replying=True)
+    return facet.reply_to_review_thread(
+        root, reference, thread_id=_review_identifier(thread_id), body=comment_body
+    )
+
+
 def create_pr_comment(
     root: str,
     *,
@@ -861,12 +957,7 @@ def create_pr_comment(
     body: object = None,
 ) -> dict[str, Any]:
     """Post a non-empty Markdown comment to the selected tracked PR."""
-    if not isinstance(body, str):
-        raise ValueError("Expected body to be a string")
-    if not body.strip():
-        raise ValueError("A comment cannot be empty")
-    if len(body) > _MAX_BODY_CHARS:
-        raise ValueError(f"A comment can be at most {_MAX_BODY_CHARS} characters")
+    body = _comment_body(body)
     facet, reference = _capable_target(
         session_id,
         pr_url,
@@ -1007,13 +1098,27 @@ def pr_changed_files(
 
 
 def pr_diff(
-    root: str, *, session_id: str | None = None, pr_url: str | None = None
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    head_sha: str | None = None,
+    base_sha: str | None = None,
 ) -> dict[str, Any]:
     """Return the selected PR as one unified diff; empty when no provider serves it."""
     reference = _default_pr(session_id, pr_url)
     facet = _serving_facet(root, reference)
     if facet is None:
         return {"object": PR_DIFF_OBJECT, "patch": ""}
+    if reference and (head_sha or base_sha) and isinstance(facet, ReviewThreadsFacet):
+        if (
+            not head_sha
+            or not base_sha
+            or not _COMMIT_SHA.fullmatch(head_sha)
+            or not _COMMIT_SHA.fullmatch(base_sha)
+        ):
+            raise ValueError("Expected full head and base commit SHAs")
+        return facet.review_diff(root, reference, head_sha=head_sha, base_sha=base_sha)
     return facet.pr_diff(root, reference)
 
 

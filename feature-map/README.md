@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Pull request conversations](./pull-request-conversations.md) covers inline
+  GitHub threads and replies through Workspace, composer, mobile and Canvas.
+
 - [Session orchestration](./session-orchestration.md) covers private-owner
   messaging, top-level worker creation, polling results and sharing restrictions.
 

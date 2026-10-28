@@ -11,6 +11,7 @@ import pytest
 
 from omnigent.runner import create_runner_app, pr_resource
 from omnigent.runner import github_resource as github
+from omnigent.runner import github_review_threads as reviews
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.runner.helpers import NullServerClient
 
@@ -37,13 +38,15 @@ class GhCall:
         )
 
 
-def _fake_gh(calls: list[GhCall], responses: list[GhResponse]) -> Callable[..., GhResponse]:
+def _fake_gh(
+    calls: list[GhCall], responses: list[GhResponse], *, workspace: str = "/workspace"
+) -> Callable[..., GhResponse]:
     """A ``_gh`` stand-in that records each call and answers in order."""
 
     def gh(
         argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
     ) -> GhResponse:
-        assert cwd == "/workspace"
+        assert cwd == workspace
         calls.append(GhCall(argv, token, timeout))
         return responses.pop(0)
 
@@ -492,16 +495,26 @@ def test_create_comment_does_not_retry_unknown_outcomes(
         ({"pr_url": GITLAB_MR_URL}, "not supported"),
     ],
 )
+@pytest.mark.parametrize("inline", [False, True])
 def test_invalid_comments_never_reach_github(
     tracked: str,
     monkeypatch: pytest.MonkeyPatch,
     kwargs: dict[str, object],
     message: str,
+    inline: bool,
 ) -> None:
     monkeypatch.setattr(github, "_gh", _fake_gh([], []))
     request: dict[str, object] = {"pr_url": PR_URL, "body": "Hello", **kwargs}
     with pytest.raises(ValueError, match=message):
-        pr_resource.create_pr_comment(tracked, session_id="session", **request)  # type: ignore[arg-type]
+        if inline:
+            pr_resource.reply_to_pr_review_thread(
+                tracked,
+                session_id="session",
+                thread_id="thread-1",
+                **request,  # type: ignore[arg-type]
+            )
+        else:
+            pr_resource.create_pr_comment(tracked, session_id="session", **request)  # type: ignore[arg-type]
 
 
 async def test_runner_posts_comment_once(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -552,3 +565,324 @@ def test_comment_deadline_distinguishes_unsent_from_uncertain(
     with pytest.raises(ValueError, match=message):
         github._create_comment("/workspace", reference, body="Hello")
     assert len(calls) == (0 if stage == "authentication" else 1)
+
+
+@pytest.fixture
+def review_thread() -> dict:
+    return {
+        "id": "thread-1",
+        "path": "src/app.py",
+        "diffSide": "LEFT",
+        "line": 12,
+        "startLine": 10,
+        "isResolved": False,
+        "isOutdated": False,
+        "subjectType": "LINE",
+        "viewerCanReply": True,
+        "pullRequest": {"url": PR_URL},
+        "root": {"nodes": [{"fullDatabaseId": "9007199254740999", "state": "SUBMITTED"}]},
+        "comments": {
+            "nodes": [
+                {
+                    "id": "comment-1",
+                    "body": "Explain this?",
+                    "state": "SUBMITTED",
+                    "author": {"login": "reviewer"},
+                    "diffHunk": "@@ -10,3 +10,2 @@",
+                }
+            ],
+            "pageInfo": {"hasNextPage": True, "endCursor": "comments-next"},
+        },
+    }
+
+
+@pytest.mark.parametrize("transport", ["runner", "host"])
+async def test_review_pages_use_selected_pr_and_cursor(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, review_thread: dict, transport: str
+) -> None:
+    calls: list[GhCall] = []
+    page = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "headRefOid": "a" * 40,
+                    "baseRefOid": "b" * 40,
+                    "reviewThreads": {
+                        "nodes": [review_thread],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(
+        github,
+        "_gh",
+        _fake_gh(
+            calls,
+            [
+                (0, json.dumps(page), ""),
+                (0, json.dumps({"data": {"node": review_thread}}), ""),
+            ],
+            workspace=str(Path(tracked) / "session") if transport == "runner" else tracked,
+        ),
+    )
+    params = {"pr_url": PR_URL, "after": "cursor", "head_sha": "a" * 40, "base_sha": "b" * 40}
+    if transport == "runner":
+        app = create_runner_app(runner_workspace=Path(tracked), server_client=NullServerClient())  # type: ignore[arg-type]
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            base = "/v1/sessions/session/resources/github/review-threads"
+            threads = await client.get(base, params=params)
+            comments = await client.get(base + "/thread-1/comments", params=params)
+        assert threads.status_code == comments.status_code == 200
+        thread_data, comment_data = threads.json(), comments.json()
+    else:
+        from omnigent.host.connect import HostProcess
+        from omnigent.workspace_fs import WorkspaceReader
+
+        reader = WorkspaceReader(Path(tracked))
+        thread_data = HostProcess._dispatch_fs_op(
+            reader, "github_review_threads", "session", params
+        )
+        comment_data = HostProcess._dispatch_fs_op(
+            reader, "github_review_thread_comments", "session", {**params, "thread_id": "thread-1"}
+        )
+    assert thread_data["data"][0]["id"] == "thread-1"
+    assert comment_data["data"][0]["id"] == "comment-1"
+    assert [json.loads(call.input)["variables"]["after"] for call in calls] == ["cursor", "cursor"]
+
+
+@pytest.mark.parametrize("include_threads", [False, True])
+def test_known_pr_combines_metadata_and_optional_threads_in_one_read(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    review_thread: dict,
+    include_threads: bool,
+) -> None:
+    calls: list[GhCall] = []
+    pr = {
+        "title": "Combined PR",
+        "headRefOid": "a" * 40,
+        "baseRefOid": "b" * 40,
+        "comments": {"nodes": [{"body": "Top-level"}]},
+        "reviews": {"nodes": [{"body": "Review body", "submittedAt": "2026-10-28"}]},
+        "reviewRequests": {
+            "nodes": [{"requestedReviewer": {"__typename": "Team", "slug": "team"}}]
+        },
+        "latestReviews": {"nodes": [{"author": {"login": "reviewer"}, "state": "APPROVED"}]},
+        "commits": {
+            "nodes": [
+                {
+                    "commit": {
+                        "statusCheckRollup": {
+                            "contexts": {
+                                "nodes": [
+                                    {
+                                        "name": "unit",
+                                        "status": "COMPLETED",
+                                        "conclusion": "SUCCESS",
+                                    }
+                                ],
+                                "pageInfo": {"hasNextPage": True},
+                            }
+                        }
+                    }
+                }
+            ]
+        },
+        "reviewThreads": {
+            "nodes": [review_thread],
+            "pageInfo": {"hasNextPage": True, "endCursor": "next"},
+        },
+    }
+    monkeypatch.setattr(
+        github,
+        "_gh",
+        _fake_gh(calls, [(0, json.dumps({"data": {"repository": {"pullRequest": pr}}}), "")]),
+    )
+    result = reviews.read_pr("/workspace", reference, include_threads=include_threads)
+    [call] = calls
+    assert call.token == "selected-token"
+    payload = json.loads(call.input)
+    assert payload["variables"] == {"owner": "acme", "name": "widgets", "number": 17}
+    assert ("reviewThreads(first: 25)" in payload["query"]) == include_threads
+    assert "comments(last: 100)" in payload["query"]
+    assert result["comments"][0]["body"] == "Top-level"
+    assert result["reviewRequests"][0]["slug"] == "team"
+    assert result["statusCheckRollup"][0]["name"] == "unit"
+    assert result["checks_partial"] is True
+    if include_threads:
+        page = result["review_threads"]
+        assert (page["head_sha"], page["base_sha"], page["next_cursor"]) == (
+            "a" * 40,
+            "b" * 40,
+            "next",
+        )
+        [thread] = page["data"]
+        assert (thread["side"], thread["line"], thread["start_line"]) == ("LEFT", 12, 10)
+        assert thread["comments"]["next_cursor"] == "comments-next"
+    else:
+        assert "review_threads" not in result
+
+
+@pytest.mark.parametrize("partial_data", [False, True])
+@pytest.mark.parametrize("field_error", [False, True])
+def test_thread_field_failure_preserves_metadata_and_reports_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    partial_data: bool,
+    field_error: bool,
+) -> None:
+    calls: list[GhCall] = []
+    pr = {"title": "Still visible", "comments": {"nodes": []}}
+    response = {
+        "data": {"repository": {"pullRequest": pr if partial_data else None}},
+        "errors": [
+            {"extensions": {"fieldName": "viewerCanReply"}}
+            if field_error
+            else {"path": ["repository", "pullRequest", "reviewThreads"]}
+        ],
+    }
+    answers = [(1, json.dumps(response), "GraphQL error")]
+    if not partial_data:
+        answers.append((0, json.dumps({"data": {"repository": {"pullRequest": pr}}}), ""))
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, answers))
+    result = reviews.read_pr("/workspace", reference, include_threads=True)
+    assert result["title"] == "Still visible"
+    assert result["review_threads"]["warning"]
+    assert len(calls) == (1 if partial_data else 2)
+    if not partial_data:
+        assert "reviewThreads" not in json.loads(calls[1].input)["query"]
+
+
+def test_thread_shaping_keeps_minimized_placeholder_and_excludes_pending(
+    review_thread: dict,
+) -> None:
+    review_thread["comments"]["nodes"] += [
+        {"id": "pending", "state": "PENDING", "body": "Unpublished"},
+        {"id": "hidden", "state": "SUBMITTED", "isMinimized": True, "body": "Hidden body"},
+    ]
+    shaped = reviews._thread(review_thread)
+    assert shaped is not None
+    assert [comment["id"] for comment in shaped["comments"]["data"]] == ["comment-1", "hidden"]
+    assert shaped["comments"]["data"][-1]["body"] == ""
+    assert shaped["comments"]["data"][-1]["minimized"] is True
+
+
+@pytest.mark.parametrize("head,expected", [("a" * 40, None), ("c" * 40, "pull request changed")])
+def test_thread_pagination_rejects_changed_revisions(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    review_thread: dict,
+    head: str,
+    expected: str | None,
+) -> None:
+    pr = {
+        "headRefOid": head,
+        "baseRefOid": "b" * 40,
+        "reviewThreads": {
+            "nodes": [review_thread],
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+        },
+    }
+    calls: list[GhCall] = []
+    monkeypatch.setattr(
+        github,
+        "_gh",
+        _fake_gh(calls, [(0, json.dumps({"data": {"repository": {"pullRequest": pr}}}), "")]),
+    )
+    if expected:
+        with pytest.raises(ValueError, match=expected):
+            reviews.read_threads(
+                "/workspace", reference, after="next", head_sha="a" * 40, base_sha="b" * 40
+            )
+    else:
+        assert (
+            reviews.read_threads(
+                "/workspace", reference, after="next", head_sha="a" * 40, base_sha="b" * 40
+            )["data"][0]["id"]
+            == "thread-1"
+        )
+    assert json.loads(calls[0].input)["variables"]["after"] == "next"
+
+
+@pytest.mark.parametrize("failure", [None, "wrong_pr", "forbidden", "pending", "timeout"])
+def test_inline_reply_checks_membership_and_posts_once_to_original_comment(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    review_thread: dict,
+    failure: str | None,
+) -> None:
+    calls: list[GhCall] = []
+    if failure == "wrong_pr":
+        review_thread["pullRequest"]["url"] = PR_URL + "0"
+    if failure == "forbidden":
+        review_thread["viewerCanReply"] = False
+    if failure == "pending":
+        review_thread["root"]["nodes"][0]["state"] = "PENDING"
+    posted = {
+        "id": 99,
+        "node_id": "comment-99",
+        "html_url": PR_URL + "#discussion_r99",
+        "body": "**Reply**",
+        "user": {"login": "selected-user"},
+    }
+    answers: list[GhResponse] = [(0, json.dumps({"data": {"node": review_thread}}), "")]
+    answers.append((None, "", "timeout") if failure == "timeout" else (0, json.dumps(posted), ""))
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, answers))
+    if failure:
+        with pytest.raises(
+            ValueError,
+            match="Check GitHub before retrying" if failure == "timeout" else "conversation",
+        ):
+            reviews.reply("/workspace", reference, thread_id="thread-1", body="**Reply**")
+    else:
+        result = reviews.reply("/workspace", reference, thread_id="thread-1", body="**Reply**")
+        assert result["thread_id"] == "thread-1"
+        assert result["comment"]["id"] == "comment-99"
+        assert result["comment"]["author"] == "selected-user"
+    assert len(calls) == (2 if failure in (None, "timeout") else 1)
+    if len(calls) == 2:
+        assert calls[1].argv[5] == "repos/acme/widgets/pulls/17/comments/9007199254740999/replies"
+        assert json.loads(calls[1].input) == {"body": "**Reply**"}
+        assert calls[1].token == "selected-token"
+
+
+@pytest.mark.parametrize("move_during_fetch", [False, True])
+def test_review_patch_checks_revision_before_and_after_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    move_during_fetch: bool,
+) -> None:
+    original = {"head": {"sha": "a" * 40}, "base": {"sha": "b" * 40}}
+    final = {**original, "head": {"sha": "c" * 40}} if move_during_fetch else original
+    calls: list[GhCall] = []
+    monkeypatch.setattr(
+        github,
+        "_gh",
+        _fake_gh(
+            calls,
+            [
+                (0, json.dumps(original), ""),
+                (0, "patch", ""),
+                (0, json.dumps(final), ""),
+            ],
+        ),
+    )
+    if move_during_fetch:
+        with pytest.raises(ValueError, match="pull request changed"):
+            github._pr_patch_at_revision(
+                "/workspace", reference, head_sha="a" * 40, base_sha="b" * 40
+            )
+    else:
+        assert github._pr_patch_at_revision(
+            "/workspace", reference, head_sha="a" * 40, base_sha="b" * 40
+        ) == {
+            "object": "session.github.pr_diff",
+            "patch": "patch",
+            "head_sha": "a" * 40,
+            "base_sha": "b" * 40,
+        }
+    assert len(calls) == 3

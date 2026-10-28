@@ -7,6 +7,7 @@ import {
   MAX_PULL_REQUEST_COMMENT_CHARACTERS,
   pullRequestCommentTooLong,
   usePullRequestCommentComposer,
+  type PullRequestCommentDraft,
 } from "@/hooks/usePullRequests";
 import { PULL_REQUEST_MARKDOWN_COMPONENTS } from "./PullRequestDetails";
 
@@ -20,11 +21,31 @@ export function PullRequestCommentComposer({
   account: string | null;
 }) {
   const { draft, setBody, post } = usePullRequestCommentComposer(conversationId, prUrl);
+  return <PullRequestCommentForm draft={draft} setBody={setBody} post={post} account={account} />;
+}
+
+export function PullRequestCommentForm({
+  draft,
+  setBody,
+  post,
+  account,
+  inline = false,
+}: {
+  draft: PullRequestCommentDraft;
+  setBody: (body: string) => void;
+  post: () => void;
+  account: string | null;
+  inline?: boolean;
+}) {
   const [tab, setTab] = useState("write");
   const tooLong = pullRequestCommentTooLong(draft.body);
   return (
     <form
-      className="flex max-h-[60%] shrink-0 flex-col gap-2 border-t bg-background p-3"
+      className={
+        inline
+          ? "flex max-h-96 min-w-0 flex-col gap-2 border-t bg-background p-3"
+          : "flex max-h-[60%] shrink-0 flex-col gap-2 border-t bg-background p-3"
+      }
       onSubmit={(event) => {
         event.preventDefault();
         post();
@@ -37,9 +58,9 @@ export function PullRequestCommentComposer({
         </TabsList>
         <TabsContent value="write" className="min-h-0 overflow-y-auto">
           <Textarea
-            aria-label="New PR comment"
+            aria-label={inline ? "Reply to review conversation" : "New PR comment"}
             className="max-h-40 bg-transparent focus-visible:ring-0 dark:bg-transparent"
-            placeholder="Leave a comment..."
+            placeholder={inline ? "Write a reply…" : "Leave a comment..."}
             value={draft.body}
             disabled={draft.pending}
             onChange={(event) => setBody(event.target.value)}
@@ -76,7 +97,7 @@ export function PullRequestCommentComposer({
           className="shrink-0"
           disabled={draft.pending || !draft.body.trim() || tooLong}
         >
-          {draft.pending ? "Posting…" : "Post comment"}
+          {draft.pending ? "Posting…" : inline ? "Reply" : "Post comment"}
         </Button>
         <p className="min-w-0 truncate text-ui text-muted-foreground" title={account ?? undefined}>
           {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}

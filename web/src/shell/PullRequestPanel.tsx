@@ -27,6 +27,9 @@
 import { createPortal } from "react-dom";
 import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
+import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
+import { reviewThreadAnnotations, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -34,6 +37,7 @@ import {
   CopyIcon,
   EllipsisIcon,
   ChevronDownIcon,
+  ChevronUpIcon,
   ChevronRightIcon,
   ChevronsDownUpIcon,
   ChevronsUpDownIcon,
@@ -55,6 +59,7 @@ import {
   GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
+  MessageSquareIcon,
   type LucideIcon,
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
@@ -93,6 +98,7 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import {
@@ -442,7 +448,7 @@ function splitPath(path: string): { dir: string; name: string } {
 }
 
 /** How @pierre/diffs' FileDiff is configured for this read-only stacked view. */
-type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
+type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewThread[]>>["options"];
 
 /**
  * Files with more unified diff lines than this wait for "Show diff": FileDiff
@@ -463,6 +469,9 @@ function PullRequestFileSection({
   registerRef,
   collapsed,
   onToggleCollapsed,
+  threads,
+  threadContext,
+  matchingRevision,
 }: {
   file: PullRequestChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
@@ -472,6 +481,9 @@ function PullRequestFileSection({
   /** Whether this file's diff is hidden. Lifted so the toolbar can drive all. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  threads: ReviewThread[];
+  threadContext: ReviewThreadContext;
+  matchingRevision: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [seen, setSeen] = useState(false);
@@ -504,6 +516,16 @@ function PullRequestFileSection({
   const renamedFrom =
     fileDiff?.prevName && fileDiff.prevName !== file.path ? fileDiff.prevName : null;
   const pureRename = fileDiff?.type === "rename-pure";
+  const renderingDiff =
+    !!fileDiff &&
+    !pureRename &&
+    seen &&
+    (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
+  const { annotations, unplaced } = reviewThreadAnnotations(
+    threads,
+    renderingDiff ? fileDiff : undefined,
+    matchingRevision,
+  );
 
   return (
     <div ref={ref} data-github-file={file.path}>
@@ -534,7 +556,28 @@ function PullRequestFileSection({
           )}
         </span>
         <DiffStat file={file} />
+        {threads.length > 0 && (
+          <span
+            className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
+            title={`${threads.length} conversation${threads.length === 1 ? "" : "s"}`}
+          >
+            <MessageSquareIcon className="size-3" />
+            {threads.length}
+          </span>
+        )}
       </button>
+      {!collapsed && unplaced.length > 0 && (
+        <div className="px-3">
+          {unplaced.map((thread) => (
+            <PullRequestReviewThread
+              key={thread.id}
+              thread={thread}
+              context={threadContext}
+              showContext
+            />
+          ))}
+        </div>
+      )}
       {collapsed ? null : pureRename ? (
         <div className="p-4 text-ui text-muted-foreground">File renamed without changes.</div>
       ) : !seen ? (
@@ -554,7 +597,31 @@ function PullRequestFileSection({
           </button>
         </div>
       ) : fileDiff ? (
-        <FileDiff fileDiff={fileDiff} options={options} disableWorkerPool />
+        <div className="overflow-x-auto">
+          <div
+            style={{
+              minWidth: annotations.length && options?.diffStyle === "split" ? 720 : undefined,
+            }}
+          >
+            <FileDiff
+              fileDiff={fileDiff}
+              options={options}
+              disableWorkerPool
+              lineAnnotations={annotations}
+              renderAnnotation={(annotation) => (
+                <div className="min-w-0 px-3">
+                  {annotation.metadata.map((thread) => (
+                    <PullRequestReviewThread
+                      key={thread.id}
+                      thread={thread}
+                      context={threadContext}
+                    />
+                  ))}
+                </div>
+              )}
+            />
+          </div>
+        </div>
       ) : (
         <div className="p-4 text-ui text-muted-foreground">
           No text diff available for this file.
@@ -1082,6 +1149,7 @@ type Associations = Pick<
   PullRequestInfo,
   "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
 >;
+type PullRequestSubtab = "summary" | "comments" | "changes";
 
 function PullRequestListRow({
   conversationId,
@@ -1283,10 +1351,24 @@ export function PullRequestPanel({
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
+  const [subtab, setSubtab] = useState<{
+    sessionId: string;
+    prUrl?: string;
+    value: PullRequestSubtab;
+  }>();
+  const activeTab =
+    subtab?.sessionId === conversationId && subtab.prUrl === selected ? subtab.value : "summary";
+  const setActiveTab = (value: PullRequestSubtab) =>
+    setSubtab({ sessionId: conversationId, prUrl: selected, value });
   const info = usePullRequestInfo(conversationId, {
     poll: active ? (selected && !showingDetails ? "list" : true) : false,
     prUrl: selected,
+    includeReviewThreads: active && activeTab === "changes",
   });
+  const showPullRequestList = () => {
+    setDetailsSession(undefined);
+    setActiveTab("summary");
+  };
   const queryClient = useQueryClient();
   // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
   const wasActive = useRef(active);
@@ -1516,7 +1598,7 @@ export function PullRequestPanel({
               size="sm"
               className="-ml-2"
               aria-label={`All pull requests (${prs.length})`}
-              onClick={() => setDetailsSession(undefined)}
+              onClick={showPullRequestList}
             >
               <ArrowLeftIcon className="size-3.5" /> All pull requests
             </Button>
@@ -1529,7 +1611,7 @@ export function PullRequestPanel({
             {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
             <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
               {prs.length > 0 && showingDetails && (
-                <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
+                <Button variant="ghost" size="sm" onClick={showPullRequestList}>
                   <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
                 </Button>
               )}
@@ -1593,6 +1675,8 @@ export function PullRequestPanel({
             key={`${conversationId}:${selected ?? ""}`}
             conversationId={conversationId}
             info={detailsInfo}
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
             storedPr={storesPrs && hostOffline ? selectedPr : undefined}
             notSynced={notSynced && !selectedPr}
             showHeading={!inMobileDrawer && !showTrackingControls}
@@ -1724,6 +1808,8 @@ function PullRequestPanelDetails({
   showHeading,
   refreshButton,
   emptyStateAction,
+  activeTab,
+  setActiveTab,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
@@ -1734,6 +1820,8 @@ function PullRequestPanelDetails({
   showHeading: boolean;
   refreshButton?: React.ReactNode;
   emptyStateAction?: React.ReactNode;
+  activeTab: PullRequestSubtab;
+  setActiveTab: (value: PullRequestSubtab) => void;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
@@ -1745,17 +1833,24 @@ function PullRequestPanelDetails({
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   const canEdit = useCanEdit(conversationId);
+  const mobile = useIsMobileViewport();
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
   // Conversation view.
-  const [activeTab, setActiveTab] = useState<"summary" | "comments" | "changes">("summary");
+  const reviews = usePullRequestReviewThreads(
+    conversationId,
+    prUrl,
+    info.data?.auth?.selected_account ?? info.data?.selected_account,
+    revision,
+    info.data?.pr?.review_threads,
+  );
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
   // from the persisted value and write toggles back so the choice carries over.
   const [diffStyle, setDiffStyle] = useState<"unified" | "split">(() =>
-    readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
+    !mobile && readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
   );
   const toggleDiffStyle = useCallback(() => {
     setDiffStyle((prev) => {
@@ -1773,7 +1868,7 @@ function PullRequestPanelDetails({
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed.
   const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(mobile);
   // Collapsed folders in the sidebar tree (empty = all expanded).
   const [collapsedDirs, setCollapsedDirs] = useState<ReadonlySet<string>>(() => new Set());
   const toggleDir = useCallback((path: string) => {
@@ -1911,6 +2006,25 @@ function PullRequestPanelDetails({
     });
     sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
   }, []);
+
+  const [focusedThread, setFocusedThread] = useState<{ id: string } | null>(null);
+  useEffect(() => {
+    const container = scrollRef.current;
+    if (!container || !focusedThread || activeTab !== "changes") return;
+    const focusThread = () => {
+      const element = container.querySelector<HTMLElement>(
+        `[data-review-thread="${CSS.escape(focusedThread.id)}"]`,
+      );
+      if (!element || !element.getClientRects().length) return;
+      element.scrollIntoView({ block: "center" });
+      element.focus({ preventScroll: true });
+      observer.disconnect();
+    };
+    const observer = new MutationObserver(focusThread);
+    observer.observe(container, { childList: true, subtree: true });
+    focusThread();
+    return () => observer.disconnect();
+  }, [focusedThread, activeTab]);
 
   // Mutation responses seed the query cache raw, so normalize before reading.
   const normalized = info.data && normalizePullRequestInfo(info.data);
@@ -2093,6 +2207,50 @@ function PullRequestPanelDetails({
   const checks = pr.checks;
   const comments = pr.comments ?? [];
   const canPostComment = !!(canEdit && data.capabilities.comment_posting && data.selected_pr_url);
+  const threadContext: ReviewThreadContext = {
+    conversationId,
+    prUrl: data.selected_pr_url ?? pr.url,
+    account: data.auth.selected_account,
+    canReply: !!(canEdit && data.capabilities.review_thread_replies),
+    loadComments: reviews.loadComments,
+    loadingComments: reviews.loadingComments,
+  };
+  const threads = reviews.page?.data ?? [];
+  const matchingRevision =
+    !!reviews.page &&
+    reviews.page.head_sha === prDiff.data?.head_sha &&
+    reviews.page.base_sha === prDiff.data?.base_sha;
+  const canShowFiles =
+    !changes.error &&
+    !prDiff.error &&
+    !parseError &&
+    !prDiff.data?.unavailable_reason &&
+    files.length > 0 &&
+    !prDiff.isLoading;
+  const threadsByFile = new Map<string, ReviewThread[]>();
+  const earlierThreads: ReviewThread[] = [];
+  for (const thread of threads) {
+    const file =
+      canShowFiles &&
+      files.find(
+        (entry) =>
+          entry.path === thread.path || filesByPath.get(entry.path)?.prevName === thread.path,
+      );
+    if (file) threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
+    else earlierThreads.push(thread);
+  }
+  const unresolved = threads.filter((thread) => !thread.resolved);
+  const navigateThread = (direction: number) => {
+    const index = unresolved.findIndex((thread) => thread.id === focusedThread?.id);
+    const start = index < 0 ? (direction > 0 ? -1 : 0) : index;
+    const next = unresolved[(start + direction + unresolved.length) % unresolved.length];
+    if (!next) return;
+    const file = files.find(
+      (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
+    );
+    if (file) jumpTo(file.path);
+    setFocusedThread({ id: next.id });
+  };
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -2245,6 +2403,56 @@ function PullRequestPanelDetails({
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
             of all files' diffs. */}
         <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
+          {data.capabilities.review_threads && (
+            <div className="flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1 text-ui">
+              <span className="text-muted-foreground">
+                {reviews.page
+                  ? `${threads.length}${reviews.page.has_more ? "+" : ""} review conversation${threads.length === 1 && !reviews.page.has_more ? "" : "s"}`
+                  : info.isFetching
+                    ? "Loading conversations…"
+                    : "Review conversations unavailable. Refresh to retry."}
+              </span>
+              {unresolved.length > 0 && (
+                <>
+                  <IconButton
+                    label="Previous unresolved conversation"
+                    onClick={() => navigateThread(-1)}
+                  >
+                    <ChevronUpIcon className="size-4" />
+                  </IconButton>
+                  <IconButton
+                    label="Next unresolved conversation"
+                    onClick={() => navigateThread(1)}
+                  >
+                    <ChevronDownIcon className="size-4" />
+                  </IconButton>
+                </>
+              )}
+              {reviews.page?.has_more && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={reviews.loadingMore}
+                  onClick={reviews.loadMore}
+                >
+                  {reviews.loadingMore ? "Loading…" : "Load more conversations"}
+                </Button>
+              )}
+              {reviews.historyStale && (
+                <span className="text-muted-foreground">
+                  Older pages may have changed.{" "}
+                  <button type="button" className="underline" onClick={reviews.refreshHistory}>
+                    Reload conversations
+                  </button>
+                </span>
+              )}
+              {(reviews.page?.warning || reviews.error) && (
+                <span role="status" className="text-destructive">
+                  {reviews.error ?? reviews.page?.warning}
+                </span>
+              )}
+            </div>
+          )}
           {(changes.data?.has_more || changes.data?.warning) && (
             <p
               role="status"
@@ -2380,8 +2588,26 @@ function PullRequestPanelDetails({
                     registerRef={registerRef}
                     collapsed={collapsedPaths.has(file.path)}
                     onToggleCollapsed={() => toggleOne(file.path)}
+                    threads={threadsByFile.get(file.path) ?? []}
+                    threadContext={threadContext}
+                    matchingRevision={matchingRevision}
                   />
                 ))
+              )}
+              {earlierThreads.length > 0 && (
+                <div className="p-3">
+                  <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
+                  {earlierThreads.map((thread) => (
+                    <div key={thread.id}>
+                      <p className="mt-3 break-all text-xs text-muted-foreground">{thread.path}</p>
+                      <PullRequestReviewThread
+                        thread={thread}
+                        context={threadContext}
+                        showContext
+                      />
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
           </div>

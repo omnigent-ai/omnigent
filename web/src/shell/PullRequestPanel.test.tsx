@@ -625,9 +625,43 @@ describe("PullRequestPanel", () => {
       stale: true,
     });
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: url });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+      includeReviewThreads: false,
+    });
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+      includeReviewThreads: true,
+    });
     rerender(<PullRequestPanel conversationId="conv_1" active={false} />);
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false, prUrl: url });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: false,
+      prUrl: url,
+      includeReviewThreads: false,
+    });
+    rerender(<PullRequestPanel conversationId="conv_1" active />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+      includeReviewThreads: true,
+    });
+    await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", {
+      poll: "list",
+      prUrl: url,
+      includeReviewThreads: false,
+    });
+    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
+    expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: url,
+      includeReviewThreads: false,
+    });
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
@@ -2554,7 +2588,11 @@ describe("session PR selection", () => {
 
     expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: two,
+      includeReviewThreads: false,
+    });
     expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
     expect(screen.getByRole("button", { name: "All pull requests (2)" })).toBeVisible();
 
@@ -2573,7 +2611,11 @@ describe("session PR selection", () => {
     await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "example/one #42 — First repository" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
+      poll: true,
+      prUrl: one,
+      includeReviewThreads: false,
+    });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);

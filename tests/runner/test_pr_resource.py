@@ -37,6 +37,8 @@ GITHUB_CAPABILITIES = {
     "merging": True,
     "reviewer_editing": True,
     "comment_posting": True,
+    "review_threads": True,
+    "review_thread_replies": True,
     "details_editing": True,
     "attachment_uploads": True,
 }

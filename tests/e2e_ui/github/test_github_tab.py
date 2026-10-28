@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.sync_api import Page, Route, expect
@@ -552,6 +553,7 @@ def test_post_top_level_pr_comment(
     ]
     info = {
         **_INFO,
+        "tracking_available": True,
         "selected_pr_url": pr_url,
         "capabilities": {"comment_posting": True},
         "selected_account": "octocat",
@@ -585,6 +587,9 @@ def test_post_top_level_pr_comment(
         panel.get_by_role("tab", name="Pull Requests").click()
     else:
         page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
     tabs.get_by_role("tab", name="Comments 30", exact=True).click()
     textbox = panel.get_by_role("textbox", name="New PR comment")
@@ -631,3 +636,200 @@ def test_post_top_level_pr_comment(
     expect(post_button).to_be_in_viewport()
     assert posts == [{"pr_url": pr_url, "body": "**Thanks for reviewing!**"}]
     page.screenshot(path=str(tmp_path / f"comment-{entry}-posted.png"))
+
+
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile", "canvas"])
+def test_reply_to_inline_review_conversation(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Reply inside the real diff renderer through each shared-panel surface."""
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    pr_url = _INFO["pr"]["url"]
+    thread = {
+        "id": "thread-1",
+        "path": "src/app/main.py",
+        "side": "RIGHT",
+        "line": 2,
+        "start_line": None,
+        "subject_type": "LINE",
+        "resolved": False,
+        "outdated": False,
+        "can_reply": True,
+        "diff_hunk": "@@ -1,2 +1,3 @@\n line1\n+added line\n line2",
+        "comments": {
+            "data": [
+                {
+                    "id": "root",
+                    "author": "alice",
+                    "body": "Why add this line?",
+                    "created_at": "2026-10-26T12:00:00Z",
+                    "url": pr_url + "#discussion_r1",
+                }
+            ],
+            "has_more": False,
+            "next_cursor": None,
+        },
+    }
+    threads = {
+        "data": [
+            thread,
+            {
+                **thread,
+                "id": "old-side",
+                "side": "LEFT",
+                "line": 1,
+                "comments": {
+                    **thread["comments"],
+                    "data": [
+                        {
+                            **thread["comments"]["data"][0],
+                            "id": "old-root",
+                            "body": "Old-side context",
+                        }
+                    ],
+                },
+            },
+            {
+                **thread,
+                "id": "outdated",
+                "path": "removed.py",
+                "resolved": True,
+                "outdated": True,
+                "original_line": 2,
+                "comments": {
+                    **thread["comments"],
+                    "data": [{**thread["comments"]["data"][0], "id": "outdated-root"}],
+                },
+            },
+        ],
+        "has_more": False,
+        "next_cursor": None,
+        "head_sha": "head",
+        "base_sha": "base",
+    }
+    info = {
+        **_INFO,
+        "tracking_available": True,
+        "selected_pr_url": pr_url,
+        "selected_account": "octocat",
+        "capabilities": {"review_threads": True, "review_thread_replies": True},
+        "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
+    }
+    included_reads = []
+
+    def read_info(route: Route) -> None:
+        include = parse_qs(urlsplit(route.request.url).query).get("include_review_threads") == [
+            "true"
+        ]
+        included_reads.append(include)
+        route.fulfill(
+            json={**info, "pr": {**info["pr"], **({"review_threads": threads} if include else {})}}
+        )
+
+    posts = []
+
+    def reply(route: Route) -> None:
+        posts.append(route.request.post_data_json)
+        comment = {
+            "id": "reply",
+            "author": "octocat",
+            "body": posts[-1]["body"],
+            "created_at": "2026-10-28T12:00:00Z",
+            "url": pr_url + "#discussion_r2",
+        }
+        thread["comments"]["data"].append(comment)
+        route.fulfill(json={"thread_id": thread["id"], "comment": comment})
+
+    page.route(re.compile(r"/resources/github(?:\?|$)"), read_info)
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+    )
+    page.route(re.compile(r"/resources/github/review-threads/thread-1/replies$"), reply)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1440, "height": 900})
+    if entry == "canvas":
+        from tests.e2e_ui.sessions.test_canvas_page import _stub_server_info
+
+        _stub_server_info(page, canvas=True, session_pull_requests=True)
+    page.goto(f"{base_url}/{'canvas/' if entry == 'canvas' else ''}c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    conversation = panel.locator('[data-review-thread="thread-1"]')
+    expect(conversation).to_be_visible()
+    assert conversation.evaluate("element => !!element.closest('diffs-container')")
+    assert (
+        conversation.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-additions-2"
+    )
+    old_side = panel.locator('[data-review-thread="old-side"]')
+    expect(old_side).to_be_visible()
+    assert (
+        old_side.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-deletions-1"
+    )
+    panel.get_by_role("button", name="Next unresolved conversation", exact=True).click()
+    expect(conversation).to_be_focused()
+    expect(conversation.get_by_text("Why add this line?", exact=True)).to_be_visible()
+    conversation.get_by_role("button", name="Reply…", exact=True).click()
+    textbox = conversation.get_by_role("textbox", name="Reply to review conversation")
+    textbox.fill("**This handles empty input.**")
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    panel.get_by_role("button", name=re.compile(r"^All pull requests")).click()
+    panel.get_by_role(
+        "button", name="example.com/acme/app #4242 — Add the GitHub tab", exact=True
+    ).click()
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    layout = panel.get_by_role("button", name=re.compile(r"Switch to (split|unified) view"))
+    layout.click()
+    expect(textbox).to_have_value("**This handles empty input.**")
+    page.wait_for_function("""() => {
+        const threads = document.querySelectorAll('[data-review-thread="thread-1"]');
+        return [...threads].some(element => element.getBoundingClientRect().width >= 240);
+    }""")
+    layout.click()
+    if mobile:
+        textbox.fill("Long Markdown preview.\n\n" * 80)
+        conversation.get_by_role("tab", name="Preview", exact=True).click()
+        post = conversation.get_by_role("button", name="Reply", exact=True)
+        post.scroll_into_view_if_needed()
+        expect(post).to_be_in_viewport()
+        page.set_viewport_size({"width": 390, "height": 540})
+        post.scroll_into_view_if_needed()
+        expect(post).to_be_in_viewport()
+        page.set_viewport_size({"width": 390, "height": 900})
+        conversation.get_by_role("tab", name="Write", exact=True).click()
+        textbox.fill("**This handles empty input.**")
+    conversation.get_by_role("tab", name="Preview", exact=True).click()
+    expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-preview.png"))
+    conversation.get_by_role("button", name="Reply", exact=True).click()
+    expect(conversation.locator("li")).to_have_count(2)
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(conversation.locator("li")).to_have_count(2)
+    expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
+    assert posts == [{"pr_url": pr_url, "body": "**This handles empty input.**"}]
+    assert any(included_reads)
+    fallback = panel.locator('[data-review-thread="outdated"]')
+    expect(fallback.get_by_role("button", expanded=False)).to_be_visible()
+    fallback.get_by_role("button", expanded=False).click()
+    expect(fallback.get_by_text("Original code context", exact=True)).to_be_visible()
+    conversation.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))

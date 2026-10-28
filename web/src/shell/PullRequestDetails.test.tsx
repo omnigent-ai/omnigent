@@ -3,6 +3,8 @@
 // a draft outlives the Summary tab unmounting, and pasted media upload into the draft.
 
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { PullRequestReviewThread } from "./PullRequestReviewThread";
+import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
@@ -43,7 +45,11 @@ function stubFetch() {
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const { pathname } = new URL(String(input), "http://localhost");
       return new Promise<Response>((respond, reject) => {
-        if (pathname === DETAILS_PATH || pathname.endsWith("/github/comments"))
+        if (
+          pathname === DETAILS_PATH ||
+          pathname.endsWith("/github/comments") ||
+          pathname.endsWith("/replies")
+        )
           edits.push({ body: JSON.parse(String(init?.body)), respond, reject });
         else if (pathname === ATTACHMENTS_PATH)
           uploads.push({ body: init?.body as FormData, respond, reject });
@@ -546,6 +552,99 @@ function mountCommentComposer(client: QueryClient, prUrl = PR_URL) {
     </QueryClientProvider>,
   );
 }
+
+it.each(["unmount", "rerender"])(
+  "keeps an inline reply with its thread across %s",
+  async (switchMode) => {
+    const { edits } = stubFetch();
+    const client = new QueryClient();
+    const thread: ReviewThread = {
+      id: "thread-1",
+      path: "app.py",
+      side: "RIGHT",
+      line: 2,
+      start_line: null,
+      subject_type: "LINE",
+      resolved: false,
+      outdated: false,
+      can_reply: true,
+      diff_hunk: "",
+      comments: {
+        data: [{ id: "root", author: "reviewer", body: "Why?", created_at: null, url: null }],
+        has_more: false,
+        next_cursor: null,
+      },
+    };
+    const page = {
+      data: [thread, { ...thread, id: "untouched" }],
+      has_more: false,
+      next_cursor: null,
+      head_sha: "head",
+      base_sha: "base",
+    };
+    client.setQueryData(INFO_KEY, {
+      selected_pr_url: PR_URL,
+      pr: { comments: [], review_threads: page },
+    });
+    const tree = (prUrl: string, current: ReviewThread) => (
+      <QueryClientProvider client={client}>
+        <PullRequestReviewThread
+          thread={current}
+          context={{
+            conversationId: "conv_1",
+            prUrl,
+            account: "octocat",
+            canReply: true,
+            loadComments: vi.fn(),
+            loadingComments: null,
+          }}
+        />
+      </QueryClientProvider>
+    );
+    const mount = (prUrl: string, current: ReviewThread) => render(tree(prUrl, current));
+    const first = mount(PR_URL, thread);
+    fireEvent.click(screen.getByRole("button", { name: "Reply…" }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "**Because**" } });
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("**Because**"));
+    fireEvent.click(screen.getByRole("button", { expanded: true }));
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { expanded: false }));
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    first.unmount();
+    const restored = mount(PR_URL, thread);
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    fireEvent.submit(screen.getByRole("textbox").closest("form")!);
+    fireEvent.submit(screen.getByRole("textbox").closest("form")!);
+    await waitFor(() => expect(edits).toHaveLength(1));
+    expect(edits[0].body).toEqual({ pr_url: PR_URL, body: "**Because**" });
+    if (switchMode === "unmount") {
+      restored.unmount();
+      mount("other-pr", { ...thread, id: "thread-2" });
+    } else {
+      restored.rerender(tree("other-pr", { ...thread, id: "thread-2" }));
+    }
+    const replyButton = screen.queryByRole("button", { name: "Reply…" });
+    if (replyButton) fireEvent.click(replyButton);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Other draft" } });
+    await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Other draft"));
+    const comment = {
+      id: "reply",
+      author: "octocat",
+      body: "**Because**",
+      created_at: "2026-10-28",
+      url: PR_URL + "#discussion_r99",
+    };
+    await act(async () => edits[0].respond(json({ thread_id: thread.id, comment })));
+    expect(screen.getByRole("textbox")).toHaveValue("Other draft");
+    const info = client.getQueryData<PullRequestInfo>(INFO_KEY)!;
+    expect(info.pr!.review_threads!.data[0].comments.data.map(({ id }) => id)).toEqual([
+      "root",
+      "reply",
+    ]);
+    expect(info.pr!.comments).toEqual([]);
+    expect(info.pr!.review_threads!.data[1].comments.data.map(({ id }) => id)).toEqual(["root"]);
+  },
+);
 
 it("posts a comment once, keeps the draft through unmount, and updates only its PR", async () => {
   const { edits } = stubFetch();

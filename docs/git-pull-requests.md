@@ -142,6 +142,38 @@ servers the web reads only the live host.
 
 ## Verification
 
+### Inline GitHub conversations
+
+GitHub advertises `review_threads` and `review_thread_replies`. Both default to
+false for other providers and older hosts. They use the optional `ReviewThreadsFacet`
+without changing the required methods of `PullRequestFacet`.
+
+While **Changes** is visible, the existing PR-info poll sends
+`include_review_threads=true`. Known PRs use one `gh api graphql` query for
+metadata, checks, top-level comments and the first 25 review threads, with up to
+20 published comments per thread. There is no separate thread timer. Additional
+pages use `GET review-threads` and `GET review-threads/{id}/comments` on demand.
+Loaded history is retained across ordinary polls and marked for manual reload.
+
+The optional `pr.review_threads` envelope carries `data`, `has_more`,
+`next_cursor`, `head_sha`, `base_sha` and an optional `warning`. Omission does not
+mean an empty collection. Patch reads verify the expected revisions before and
+after fetching; mismatches withhold inline placement. Outdated, hidden-context,
+file-level and unavailable-diff threads remain accessible with their original
+code context. Resolved threads start collapsed.
+
+`POST review-threads/{id}/replies` publishes immediately with the selected host
+account. The host validates thread membership and replies to its published root
+comment. Reads require session read permission; replies require edit permission.
+Runner and host fallback use the same provider implementation. An uncertain
+write is never retried automatically. Drafts and pending/error state stay in
+memory per session, PR and thread, including through tab and layout switches.
+
+New gutter comments and resolving/reopening threads are follow-up work.
+See the [browser verification recipe](../feature-map/pull-request-conversations.md).
+
+### Provider regression checks
+
 Run the existing GitHub resource and tracking suites together with provider
 dispatcher tests, then the shared panel, composer, and canvas frontend tests.
 For a manual check, open a GitHub session's Pull Requests tab, select a linked
