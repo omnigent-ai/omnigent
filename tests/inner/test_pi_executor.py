@@ -4395,6 +4395,15 @@ def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_arg
     probed: list[tuple[str, int]] = []
     captured: dict[str, tuple[str, ...]] = {}
     loop_threads: list[int] = []
+    system_prompt = 'line one\nline two & "%PATH%"\n\nline four'
+    tool_args = [
+        "--no-tools",
+        "--no-skills",
+        "--extension",
+        "C:/omnigent/omnigent_tools.js",
+        "--tools",
+        "sys_os_read,sys_os_shell",
+    ]
 
     def _node_cmd_shim_argv(path: str) -> list[str] | None:
         probed.append((path, threading.get_ident()))
@@ -4413,8 +4422,8 @@ def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_arg
         await rpc.start(
             "C:/pnpm/pi.CMD",
             env={},
-            system_prompt="line one\nline two",
-            extra_args=["--no-tools"],
+            system_prompt=system_prompt,
+            extra_args=tool_args,
         )
         await rpc.close()
 
@@ -4424,8 +4433,11 @@ def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_arg
     ((probed_path, probe_thread),) = probed
     assert probed_path == "C:/pnpm/pi.CMD"
     assert probe_thread not in loop_threads
-    assert captured["args"][: len(launcher) + 2] == (*launcher, "--mode", "rpc")
-    assert captured["args"][-1] == "--no-tools"
+    args = captured["args"]
+    assert args[: len(launcher) + 2] == (*launcher, "--mode", "rpc")
+    prompt_index = args.index("--append-system-prompt") + 1
+    assert args[prompt_index] == system_prompt
+    assert args[prompt_index + 1 :] == tuple(tool_args)
 
 
 def test_redact_argv_for_log_hides_system_prompt() -> None:
