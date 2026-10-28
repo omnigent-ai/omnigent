@@ -3069,6 +3069,19 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
+    user_record = (
+        item.type == "message" and isinstance(item.data, MessageData) and item.data.role == "user"
+    )
+    record_identity = {"native_source_id": body.data.get("source_id"), "item_id": item.stable_id}
+    if user_record:
+        log_input_event(
+            _logger,
+            "native_user_record_received",
+            session_id=session_id,
+            attributes=record_identity,
+            response_id=item.response_id,
+            is_meta=isinstance(item.data, MessageData) and item.data.is_meta is True,
+        )
     if item.stable_id is not None and _drains_pending_inputs(item):
         # A forwarder retry of a mirror already persisted under its source-derived
         # id: nothing to drain, persist or publish. Draining again could match a
@@ -3077,6 +3090,15 @@ async def _persist_external_conversation_item_unlocked(
         # retries are absorbed by the idempotent append below.
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
         if existing is not None:
+            if user_record:
+                log_input_event(
+                    _logger,
+                    "native_user_record_persisted",
+                    session_id=session_id,
+                    attributes=record_identity,
+                    response_id=existing.response_id,
+                    deduplicated=True,
+                )
             return existing.id
     if _drains_pending_inputs(item) and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
@@ -3214,6 +3236,18 @@ async def _persist_external_conversation_item_unlocked(
         )
         raise
     persisted = persisted_items[len(skipped_new_items)]
+    if user_record:
+        log_input_event(
+            _logger,
+            "native_user_record_persisted",
+            session_id=session_id,
+            attributes={**record_identity, "item_id": persisted.id},
+            response_id=persisted.response_id,
+            deduplicated=persisted.deduplicated,
+            match_method=match_method,
+            skipped_input_count=len(skipped_pending),
+            matched_pending_id=cleared_pending_id,
+        )
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user
@@ -3484,7 +3518,7 @@ async def _settle_undelivered_native_input(
     conversation_store: ConversationStore | None,
     session_id: str,
     response_id: str | None,
-    input_stable_id: str | None,
+    input_identity: Mapping[str, Any],
     reason_code: str | None = None,
 ) -> None:
     """
@@ -3492,10 +3526,10 @@ async def _settle_undelivered_native_input(
 
     Only native-terminal sessions queue web messages: the transcript forwarder
     normally mirrors each one back and drains its entry. When the runner
-    reports the turn failed and names the message it carried
-    (``input_stable_id``), an entry still queued under that id is a message the
-    harness never received. Left in the queue it lingers for the TTL and the
-    next mirrored message drains it instead of its own, so the transcript shows
+    reports the turn failed and names the message it carried by client id or
+    exact server delivery attempt, an entry still queued under that id is a
+    message the harness never received. Left in the queue it lingers for the
+    TTL and the next mirrored message drains it instead of its own, so the transcript shows
     the reply above a still-queued bubble and the failed message vanishes on
     reload. Settlement is by identity, never by queue order: a turn that fails
     after its message was mirrored (entry already drained) settles nothing, so
@@ -3505,31 +3539,57 @@ async def _settle_undelivered_native_input(
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param response_id: The failed turn's response id, so the message groups
         with the error item persisted right after it; ``None`` mints one.
-    :param input_stable_id: The web stable id the runner stamped on the failed
-        turn, passed only when the harness reported the failure as undelivered;
-        ``None`` settles nothing.
+    :param input_identity: Identity from a failure the harness explicitly marked
+        undelivered. Without a client id, both pending and attempt ids are required.
     """
-    if input_stable_id is None:
+    raw_input_stable_id = input_identity.get("input_stable_id")
+    input_stable_id = raw_input_stable_id if isinstance(raw_input_stable_id, str) else None
+    delivery_attempt_id: str | None = None
+    if input_stable_id is not None:
+        pending_inputs.mark_lifecycle(
+            session_id,
+            input_stable_id,
+            stage="rejected_before_handoff",
+            cause_class="rejected_before_handoff",
+            reason_code=reason_code or "reported_undelivered",
+            lifecycle_response_id=response_id,
+        )
+        if conversation_store is None:
+            return
+        matched_pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+        if matched_pending_id is None:
+            # Restored startup inputs keep their stable id, but not the old
+            # process's delivery attempt. Preserve stable-id receipt matching.
+            await restore_pending_inputs(conversation_store, session_id)
+            matched_pending_id = pending_inputs.pending_id_for_stable_id(
+                session_id, input_stable_id
+            )
+    else:
+        identity = input_attributes(input_identity)
+        if any(
+            key in input_identity and key not in identity
+            for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+        ):
+            return
+        pending_id = identity.get("pending_id")
+        attempt = identity.get("delivery_attempt_id")
+        if not isinstance(pending_id, str) or not isinstance(attempt, str):
+            return
+        delivery_attempt_id = attempt
+        matched_pending_id = pending_inputs.mark_lifecycle(
+            session_id,
+            pending_id=pending_id,
+            delivery_attempt_id=delivery_attempt_id,
+            stage="rejected_before_handoff",
+            cause_class="rejected_before_handoff",
+            reason_code=reason_code or "reported_undelivered",
+            lifecycle_response_id=response_id,
+        )
+    if conversation_store is None or matched_pending_id is None:
         return
-    pending_inputs.mark_lifecycle(
-        session_id,
-        input_stable_id,
-        stage="rejected_before_handoff",
-        cause_class="rejected_before_handoff",
-        reason_code=reason_code or "reported_undelivered",
-        lifecycle_response_id=response_id,
+    drained = pending_inputs.resolve(
+        session_id, matched_pending_id, delivery_attempt_id=delivery_attempt_id
     )
-    if conversation_store is None:
-        return
-    pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-    if pending_id is None:
-        # A saved startup input submitted before a server restart is matched
-        # only once restored.
-        await restore_pending_inputs(conversation_store, session_id)
-        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-    if pending_id is None:
-        return
-    drained = pending_inputs.resolve(session_id, pending_id)
     if drained is None:
         return
     item = NewConversationItem(
@@ -3537,7 +3597,11 @@ async def _settle_undelivered_native_input(
         response_id=response_id or generate_task_id(),
         data=MessageData(role="user", content=drained.content, user_authored=True),
         created_by=drained.created_by,
-        stable_id=drained.stable_id,
+        stable_id=drained.stable_id
+        or uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"omnigent-undelivered-native-user:{session_id}:{drained.pending_id}",
+        ).hex,
         replaces_pending_id=drained.stable_id,
     )
     try:
@@ -3559,7 +3623,7 @@ async def _settle_undelivered_native_input(
             outcome="reported_undelivered",
             item_id=persisted[0].id,
             response_id=persisted[0].response_id,
-            match_method="input_stable_id",
+            match_method="input_stable_id" if input_stable_id is not None else "delivery_attempt",
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
 
@@ -9454,21 +9518,15 @@ async def _relay_runner_stream_once(
                             "response.cancelled": "cancelled",
                         }.get(evt_type, "completed")
 
-                    if evt_type == "response.failed":
+                    if evt_type == "response.failed" and _failed_event_undelivered(event):
                         # The runner could not hand this turn to a native
                         # harness, so the web message it carried was never
                         # mirrored back: commit it ahead of the error item.
-                        raw_input_stable_id = event.get("input_stable_id")
                         await _settle_undelivered_native_input(
                             conversation_store,
                             session_id,
                             current_response_id,
-                            (
-                                raw_input_stable_id
-                                if isinstance(raw_input_stable_id, str)
-                                and _failed_event_undelivered(event)
-                                else None
-                            ),
+                            event,
                             reason_code=_native_input_reason_code(event),
                         )
                     error_item = _error_item_from_sse(

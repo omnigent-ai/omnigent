@@ -64,10 +64,36 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
         assert not [
             r for r in caplog.records if getattr(r, "event_name", None) == "native_input_settled"
         ]
+        assert not [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "native_user_record_persisted"
+        ]
         assert [p["pending_id"] for p in pending_inputs.snapshot_for(conv.id)] == [first, second]
         monkeypatch.setattr(store, "append", original_append)
 
     matched_id = await _persist_external_conversation_item(conv.id, conv, body, store)
+    received = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_user_record_received"
+    ]
+    assert len(received) == 1 + int(failed_append)
+    assert all(r["native_source_id"] == "native:later-record:0" for r in received)
+    [persisted] = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_user_record_persisted"
+    ]
+    assert persisted == {
+        "native_source_id": "native:later-record:0",
+        "item_id": matched_id,
+        "response_id": "resp_native",
+        "deduplicated": False,
+        "match_method": "normalized_text",
+        "skipped_input_count": 1,
+        "matched_pending_id": second,
+    }
     rows = [
         record_to_row(r, "server")
         for r in caplog.records
@@ -112,6 +138,19 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
 
     newer = pending_inputs.record(conv.id, [{"type": "input_text", "text": "later message"}])
     assert await _persist_external_conversation_item(conv.id, conv, body, store) == matched_id
+    [first_persist, retry_persist] = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_user_record_persisted"
+    ]
+    assert first_persist == persisted
+    assert retry_persist == {
+        "native_source_id": "native:later-record:0",
+        "item_id": matched_id,
+        "response_id": "resp_native",
+        "deduplicated": True,
+    }
+    assert private not in json.dumps([received, first_persist, retry_persist])
     assert (
         len(
             [r for r in caplog.records if getattr(r, "event_name", None) == "native_input_settled"]

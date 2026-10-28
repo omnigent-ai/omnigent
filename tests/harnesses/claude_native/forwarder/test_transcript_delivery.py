@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,9 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
-async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
+async def test_forwarder_posts_visible_transcript_items(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """
     The background forwarder reads Claude JSONL and posts Omnigent items.
 
@@ -31,6 +34,7 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
     but no process tailed that transcript into the Omnigent session
     stream.
     """
+    caplog.set_level(logging.INFO, logger="omnigent.harnesses.claude_native.forwarder")
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -198,6 +202,32 @@ async def test_forwarder_posts_visible_transcript_items(tmp_path: Path) -> None:
     assert posted[5]["response_id"] == posted[6]["response_id"]
     assert posted[5]["response_id"] != posted[4]["response_id"]
     assert posted[1]["response_id"].startswith("resp_claude_")
+    observed = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_user_record_observed"
+    ]
+    accepted = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_user_record_forward_finished"
+    ]
+    assert [record["native_source_id"] for record in observed] == [
+        posted[0]["source_id"],
+        posted[3]["source_id"],
+    ]
+    assert [record["native_source_id"] for record in accepted] == [
+        record["native_source_id"] for record in observed
+    ]
+    for record in observed:
+        assert record["transcript_cursor_lines"] == 0
+        assert record["transcript_read_end_bytes"] == transcript_path.stat().st_size
+        assert record["skip_user_messages"] is False
+        assert record["is_compact_summary"] is False
+    assert all(record["outcome"] == "forward_accepted" for record in accepted)
+    evidence = json.dumps([observed, accepted])
+    assert "read TODO" not in evidence
+    assert str(transcript_path) not in evidence
 
 
 @pytest.mark.asyncio

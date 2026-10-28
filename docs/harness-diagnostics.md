@@ -309,6 +309,37 @@ row is the only record of the original silent process.
 
 ## Native turn failure evidence
 
+Codex executor failures add transport evidence to the existing
+`codex_app_server_unreachable` and `codex_turn_injection_failed` records.
+`rpc_connection_phase` distinguishes the WebSocket handshake, `initialize`,
+and a ready connection. Reader state, up to four exception classes, observed
+close codes, HTTP handshake status and OS errno contain no addresses or payloads.
+RPC tracebacks retain the receiver's original exception and the method/request ID.
+
+On Linux and macOS, `executor_fd_count` counts at most 4,096 descriptors;
+`executor_fd_count_capped` indicates a lower bound. The directory probe itself
+can contribute one descriptor. Soft/hard limits and probe errors are recorded
+even when descriptor exhaustion prevents enumeration. These fields describe
+the Omnigent executor process, not the separate Codex app-server; they do not
+establish the cause of an app-server-reported file-limit error. No descriptor
+names, additional stderr, or request content are collected. Delivery and retry
+decisions are unchanged.
+
+Codex failed-turn evidence also retains typed app-server error categories, HTTP
+status, fixed reason labels, and known model identities across live and resumed
+turns. Failure context contains no copied provider command output. Diagnostic
+fields do not change failure classification, retries, or delivery decisions.
+
+Native user-record events distinguish transcript observation, accepted
+forwarding, server receipt, and committed persistence:
+`native_user_record_observed`, `native_user_record_forward_finished`,
+`native_user_record_received`, and `native_user_record_persisted`.
+`native_user_record_recovery` reports a resume response missing a user record.
+The allowlist retains only bounded identities, cursor counters, and flags.
+Persistence events mark retries already committed as `deduplicated`; failed
+writes emit no persistence confirmation. Accepted forwarding and persistence
+are separate stages, and neither establishes that a client rendered the record.
+
 Failed `external_session_status` events accept optional `failure_context`
 metadata. The server adds it to the existing `session_turn_failed` log without
 changing status, error codes, displayed text, or failure classification. Unknown

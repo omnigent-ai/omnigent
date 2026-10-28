@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 
+import omnigent.native.input_diagnostics as input_diagnostics
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
@@ -66,6 +67,11 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.harnesses.codex_native.failure_telemetry import (
+    codex_error_context,
+    codex_error_reason,
+)
+from omnigent.inner.native_attachments import restore_spilled_text
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -79,6 +85,12 @@ from omnigent.native._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    native_failure_id,
+    normalize_failure_context,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -469,6 +481,9 @@ class _CodexForwarderState:
     :param codex_client: Connected Codex app-server client. Set by
         ``supervise_forwarder`` so child backfill can issue
         ``thread/resume`` requests.
+    :param bridge_dir: The session's bridge directory. Set by
+        ``supervise_forwarder`` so a recovered user message can restore a
+        spilled paste from the session's attachment cache.
     :param subagents_by_thread: Maps Codex child thread ids to Omnigent child
         session ids, e.g. ``{"thread_child": "conv_child"}``.
     :param pending_child_threads: Codex child thread ids announced by
@@ -555,6 +570,7 @@ class _CodexForwarderState:
     posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
+    bridge_dir: Path | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
@@ -1169,10 +1185,12 @@ class _CodexTerminalError:
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
     :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param failure_context: Typed cause fields retained independently of display text.
     """
 
     message: str
     kind: str
+    failure_context: FailureContext = field(default_factory=dict)
 
     @property
     def is_auth(self) -> bool:
@@ -1329,7 +1347,11 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
     if payload is None:
         return None
     message = _error_payload_message(payload)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+    return _CodexTerminalError(
+        message=message,
+        kind=_classify_codex_error(payload, message),
+        failure_context=codex_error_context(payload, thread_id=_thread_id_from_params(params)),
+    )
 
 
 def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
@@ -1338,7 +1360,11 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
     if not isinstance(payload, dict):
         return None
     message = _error_payload_message(payload)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+    return _CodexTerminalError(
+        message=message,
+        kind=_classify_codex_error(payload, message),
+        failure_context=codex_error_context(payload, thread_id=_thread_id_from_params(params)),
+    )
 
 
 @dataclass(frozen=True)
@@ -2371,6 +2397,7 @@ async def supervise_forwarder(
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
+            bridge_dir=bridge_dir,
             child_usage_baseline_dir=bridge_dir,
         )
         # Released when the live event stream shows the thread became
@@ -3154,7 +3181,7 @@ def _resume_turn_status_edge_for_latest_turn(
         update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
-        error = _terminal_error_from_turn({"turn": turn})
+        error = _terminal_error_from_turn({"threadId": thread_id, "turn": turn})
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
@@ -4011,6 +4038,7 @@ async def _maybe_handle_turn_event(
                     compaction_model=compaction_model,
                     selected_model=selected_model if compaction_model else None,
                 ),
+                native_model=selected_model,
             )
             await usage_coalescer.flush()
         return True
@@ -4324,7 +4352,12 @@ async def _handle_terminal_turn_boundary_inner(
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
     if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            terminal.edge,
+            native_model=forwarder_state.model if forwarder_state is not None else None,
+        )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -5561,7 +5594,9 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        posted = await _post_user_message(
+            client, session_id, params, item, source_id=source_id, bridge_dir=bridge_dir
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
@@ -6479,6 +6514,14 @@ async def _ensure_user_message_posted(
         return
     user_item = _find_turn_user_message(response, turn_id)
     if user_item is None:
+        input_diagnostics.log_input_event(
+            _logger,
+            "native_user_record_recovery",
+            session_id=session_id,
+            attributes={"native_turn_id": turn_id, "thread_id": thread_id},
+            harness="codex-native",
+            outcome="resume_returned_no_user_record",
+        )
         return
     recovered_params: _JsonObject = {
         "threadId": thread_id,
@@ -6494,6 +6537,7 @@ async def _ensure_user_message_posted(
         recovered_params,
         user_item,
         source_id=source_id,
+        bridge_dir=forwarder_state.bridge_dir,
     ):
         forwarder_state.note_user_message_posted(turn_id)
 
@@ -6536,6 +6580,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -6545,9 +6590,13 @@ async def _post_user_message(
     :param params: Codex notification params.
     :param item: Codex ``userMessage`` item.
     :param source_id: Stable native item id used for server-side deduplication.
+    :param bridge_dir: The session's bridge directory, whose attachment cache
+        holds any paste the executor moved out of the message.
     :returns: Whether the item was accepted by the server.
     """
     text = _user_message_text(item)
+    if bridge_dir is not None:
+        text = await asyncio.to_thread(_with_spilled_pastes_restored, text, bridge_dir)
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
     # image in by file_id (``_merge_pending_file_blocks``). Bailing here would
@@ -6556,6 +6605,23 @@ async def _post_user_message(
     # this stale entry, folding the prior image into it. Only a truly empty
     # message (no text, no file block) is skipped.
     has_file_block = _user_message_has_file_content(item)
+    source_id = source_id or _source_id(params, item)
+    observation = {
+        "native_source_id": _bounded_source_id(source_id),
+        "native_turn_id": _turn_id_from_payload(params),
+        "response_id": _response_id(params),
+    }
+    input_diagnostics.log_input_event(
+        _logger,
+        "native_user_record_observed",
+        session_id=session_id,
+        attributes=observation,
+        harness="codex-native",
+        has_text=bool(text),
+        has_file=has_file_block,
+        is_meta=_is_codex_skill_wrapper(text),
+        outcome="forwarding" if text or has_file_block else "empty_record_skipped",
+    )
     if not text and not has_file_block:
         return False
     # Text-only / text+image post the text; image-only posts empty content and
@@ -6572,14 +6638,24 @@ async def _post_user_message(
             session_id,
             _source_id(params, item),
         )
-    return await _post_external_item(
+    posted = await _post_external_item(
         client,
         session_id,
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
-        source_id=source_id or _source_id(params, item),
+        source_id=source_id,
     )
+    input_diagnostics.log_input_event(
+        _logger,
+        "native_user_record_forward_finished",
+        session_id=session_id,
+        attributes=observation,
+        harness="codex-native",
+        outcome="forward_accepted" if posted else "forward_not_accepted",
+        is_meta=item_data.get("is_meta") is True,
+    )
+    return posted
 
 
 async def _post_agent_message(
@@ -7170,6 +7246,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    failure_context: FailureContext | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -7188,6 +7265,7 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param failure_context: Bounded native evidence attached only to failed edges.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
@@ -7197,6 +7275,8 @@ async def _post_status(
         data["output"] = output
     if reauth_required:
         data["reauth_required"] = True
+    if status == "failed" and failure_context:
+        data["failure_context"] = dict(normalize_failure_context(failure_context))
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
@@ -7213,6 +7293,8 @@ async def _post_turn_status_edge(
     client: httpx.AsyncClient,
     session_id: str,
     edge: _CodexTurnStatusEdge | None,
+    *,
+    native_model: str | None = None,
 ) -> None:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
@@ -7226,10 +7308,29 @@ async def _post_turn_status_edge(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param edge: Derived lifecycle edge, or ``None`` when no status should
         be published.
+    :param native_model: Known selected model; absent when the source lacks it.
     :returns: None.
     """
     if edge is None:
         return
+    context: FailureContext = {}
+    if edge.status == "failed":
+        context = normalize_failure_context(
+            {
+                **(edge.error.failure_context if edge.error is not None else {}),
+                "failure_source": "codex_app_server",
+                "detail_source": edge.source,
+                "failure_decision": "session_failed",
+                "native_harness": "codex-native",
+                "native_model": native_model or edge.selected_model,
+                "native_compaction_model": edge.compaction_model,
+                "native_error_reason": codex_error_reason(edge.error.message)
+                if edge.error is not None
+                else "missing_error_payload",
+            }
+        )
+        if edge.turn_id is not None:
+            context["failure_id"] = native_failure_id("codex_turn", session_id, edge.turn_id)
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -7244,14 +7345,7 @@ async def _post_turn_status_edge(
             has_turn_id=edge.turn_id is not None,
             has_error=edge.error is not None,
             native_error_kind=edge.error.kind if edge.error is not None else None,
-            native_error_reason=(
-                "thread_persistence_shutdown"
-                if edge.error is not None
-                and "failed to shutdown thread persistence" in edge.error.message[:4096].casefold()
-                else "unclassified"
-                if edge.error is not None
-                else None
-            ),
+            **failure_log_attributes(context),
         ),
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
@@ -7271,6 +7365,7 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        failure_context=context,
     )
 
 
@@ -8778,6 +8873,25 @@ def _delta_recovery_status_edge(
         turn_id=turn_id,
         source="delta:recovered",
     )
+
+
+def _with_spilled_pastes_restored(text: str, bridge_dir: Path) -> str:
+    """
+    Mirror the paste the person sent in place of the file reference Codex saw.
+
+    The server then records and matches the message as sent, whatever its
+    version. The executor refuses a paste whose restored message could not fit
+    one event, so the reference survives only if that check was bypassed.
+
+    :param text: User message text as Codex echoed it.
+    :param bridge_dir: The session's bridge directory.
+    :returns: The text to mirror.
+    """
+    restored = restore_spilled_text(text, bridge_dir)
+    if restored is None:
+        _logger.warning("Codex user message too large to mirror with its paste restored")
+        return text
+    return restored
 
 
 def _user_message_text(item: _JsonObject) -> str:

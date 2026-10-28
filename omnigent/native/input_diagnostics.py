@@ -29,6 +29,7 @@ _DETAIL_IDS = frozenset(
         "initial_thread_id",
         "initial_native_turn_id",
         "lifecycle_response_id",
+        "native_source_id",
     }
 )
 _DETAIL_LABELS = frozenset(
@@ -82,11 +83,28 @@ def _diagnostic_attributes(source: Mapping[str, object]) -> dict[str, object]:
             value = source[key]
             if value is None or (isinstance(value, str) and pattern.fullmatch(value)):
                 attrs[key] = value
-    for key in ("pending_age_ms", "rpc_error_code"):
+    for key in (
+        "pending_age_ms",
+        "rpc_error_code",
+        "transcript_cursor_bytes",
+        "transcript_read_end_bytes",
+        "transcript_cursor_lines",
+        "skipped_input_count",
+    ):
         value = source.get(key)
-        minimum = 0 if key == "pending_age_ms" else -(2**31)
+        minimum = -(2**31) if key == "rpc_error_code" else 0
         if isinstance(value, int) and not isinstance(value, bool) and minimum <= value < 10**15:
             attrs[key] = value
+    for key in (
+        "is_meta",
+        "is_compact_summary",
+        "skip_user_messages",
+        "deduplicated",
+        "has_text",
+        "has_file",
+    ):
+        if type(source.get(key)) is bool:
+            attrs[key] = source[key]
     return attrs
 
 

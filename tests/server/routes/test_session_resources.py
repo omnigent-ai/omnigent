@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
 import re
+import shutil
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -5876,6 +5878,176 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("earlier_pending", "paste_size"),
+    [
+        ("none", "small"),
+        ("source_id", "small"),
+        ("source_less", "small"),
+        # The size boundary doesn't depend on queue order, so one near-limit case is enough.
+        ("none", "near_event_limit"),
+    ],
+)
+async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input(
+    earlier_pending: str, paste_size: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paste Codex got as a file is recorded as sent, on any server, and survives the cache."""
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.native_attachments import pasted_text_cache_dir
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 350)
+    # The large paste's submission and its full mirror both fit one event.
+    paste = "r\u00e9sum\u00e9 line\n" * 120 if paste_size == "small" else "x" * 10_450_000
+    original = [
+        {"type": "input_text", "text": paste},
+        {"type": "input_text", "text": "keep this tail inline"},
+    ]
+    first = None
+    if earlier_pending != "none":
+        first = pending_inputs.record(
+            sid,
+            [{"type": "input_text", "text": "summarize the readme"}],
+            created_by="earlier@example.test",
+            stable_id="a" * 32,
+        )
+        pending_inputs.mark_delivery_stage(sid, first, "forward_accepted")
+    second = pending_inputs.record(
+        sid, original, created_by="paste@example.test", stable_id="b" * 32
+    )
+    items = codex_native_executor._content_to_input_items(original, bridge)
+    assert "pasted_text_" in str(items[0]["text"])
+    echoed = {"type": "userMessage", "content": [dict(item) for item in items]}
+    client = _RecordingClient()
+    source_id = "codex:spilled-paste:0" if earlier_pending != "source_less" else None
+    await forwarder._post_user_message(
+        client, sid, {"turnId": "t1"}, echoed, source_id=source_id, bridge_dir=bridge
+    )
+    [(_url, posted)] = client.posts
+    if source_id is None:
+        posted["data"].pop("source_id", None)
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput.model_validate(posted),
+            store,  # type: ignore[arg-type]
+        )
+        committed = store.get_item(sid, item_id)
+        assert committed.created_by == "paste@example.test"
+        assert committed.data.content == [
+            {"type": "input_text", "text": f"{paste}\n\nkeep this tail inline"}
+        ]
+        assert second not in pending_inputs.pending_ids(sid)
+        if earlier_pending == "source_less":
+            assert pending_inputs.pending_ids(sid) == [first]
+        elif earlier_pending == "source_id":
+            assert store.appended_items[0].data.content[0]["text"] == "summarize the readme"
+            assert store.appended_items[0].created_by == "earlier@example.test"
+            assert store.appended_items[1].type == "error"
+
+        # The committed message, not the runner's cache, is the durable copy.
+        shutil.rmtree(pasted_text_cache_dir(bridge))
+        durable = ConversationItem.model_validate_json(committed.model_dump_json())
+        assert paste in durable.data.content[0]["text"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upload_name", ["ordinary", "pasted_text"])
+async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_message(
+    upload_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A text upload beside a large paste must not consume an earlier pending input."""
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.native_attachments import attachment_cache_dir, attachment_content_digest
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 1_000)
+    csv = "id,value\n" + "1,2\n" * 100
+    paste = "pasted log line\n" * 60
+    filename = (
+        "data.csv"
+        if upload_name == "ordinary"
+        else f"pasted_text_{attachment_content_digest(csv.encode())}.txt"
+    )
+    upload = {"type": "input_file", "file_id": "file_csv", "filename": filename}
+    pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "an earlier ambiguous send"}],
+        created_by="earlier@example.test",
+    )
+    queued = pending_inputs.record(
+        sid, [upload, {"type": "input_text", "text": paste}], created_by="paste@example.test"
+    )
+    resolved_upload = {
+        **upload,
+        "file_data": "data:text/csv;base64," + base64.b64encode(csv.encode()).decode(),
+    }
+    items = codex_native_executor._content_to_input_items(
+        [{"type": "input_text", "text": paste}, resolved_upload], bridge
+    )
+    csv_path = attachment_cache_dir(bridge) / filename
+    assert items[0] == {"type": "text", "text": f"[Attached file: {csv_path}]"}
+    assert csv_path.read_text(encoding="utf-8") == csv
+    assert "pasted_text_" in str(items[1]["text"])
+    client = _RecordingClient()
+    await forwarder._post_user_message(
+        client,
+        sid,
+        {"turnId": "t1"},
+        {"type": "userMessage", "content": [dict(item) for item in items]},
+        bridge_dir=bridge,
+    )
+    [(_url, posted)] = client.posts
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput.model_validate(posted),
+            store,  # type: ignore[arg-type]
+        )
+        committed = store.get_item(sid, item_id)
+        assert committed.created_by == "paste@example.test"
+        assert committed.data.content == [
+            upload,
+            {"type": "input_text", "text": f"[Attached file: {csv_path}]\n\n{paste}"},
+        ]
+        assert queued not in pending_inputs.pending_ids(sid)
+        assert pending_inputs.pending_ids(sid) == []
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[0].created_by == "earlier@example.test"
+        assert store.appended_items[0].data.content == [
+            {"type": "input_text", "text": "an earlier ambiguous send"}
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() -> None:
     """A failed Kiro prompt must not make the next prompt clear the wrong pending input."""
     from omnigent.runtime import pending_inputs
@@ -8394,10 +8566,12 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_append", [False, True])
+@pytest.mark.parametrize("with_client_id", [False, True])
 async def test_relay_settles_queued_native_message_on_failed_turn(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fail_first_append: bool,
+    with_client_id: bool,
 ) -> None:
     """A failed native turn commits the queued web message ahead of its error item.
 
@@ -8418,13 +8592,19 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
     sid = "64a784c3aa907d1774f44313546947c6"
     store = _FailOnceStore() if fail_first_append else _ConversationStore()
     content = [{"type": "input_text", "text": "set up the worktree"}]
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if with_client_id else None
     pending_id = pending_inputs.record(
         sid,
         content,
         created_by="alice@example.com",
-        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        stable_id=stable_id,
     )
     original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    identity = {
+        key: value
+        for key, value in original.items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
     caplog.set_level(logging.INFO)
     # A second message the runner is still holding for the next turn.
     queued_next = pending_inputs.record(
@@ -8450,7 +8630,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 {
                     "type": "response.failed",
                     # The runner names the message this turn carried.
-                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    **identity,
                     "response": {
                         "id": "resp_fail",
                         "model": "codex",
@@ -8484,7 +8664,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 store,  # type: ignore[arg-type]
                 sid,
                 "resp_fail",
-                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                identity,
             )
             assert store.appended_items == []
             assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
@@ -8534,12 +8714,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         attrs = record.attributes
         assert attrs["outcome"] == "reported_undelivered"
         assert attrs["pending_id"] == pending_id
-        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs.get("input_stable_id") == stable_id
         assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
         assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
-        assert attrs["match_method"] == "input_stable_id"
+        assert attrs["match_method"] == (
+            "input_stable_id" if with_client_id else "delivery_attempt"
+        )
         assert attrs["cause_class"] == "rejected_before_handoff"
         assert attrs["reason_code"] == "databricks_sign_in_pending"
         assert attrs["lifecycle_response_id"] == "resp_fail"
@@ -8629,8 +8811,21 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("undelivered", [True, False])
+@pytest.mark.parametrize(
+    "identity_case",
+    [
+        "legacy_stable_id",
+        "server_attempt",
+        "pending_only",
+        "attempt_only",
+        "mismatched_pending",
+        "mismatched_attempt",
+        "malformed_attempt",
+    ],
+)
 async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     undelivered: bool,
+    identity_case: str,
 ) -> None:
     """Preserve one real error without a second missing-transcript error on the next turn."""
     from omnigent.inner.executor import ExecutorError, MockExecutor
@@ -8648,13 +8843,32 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     store = _ConversationStore()
     conv = store.get_conversation(sid)
     assert conv is not None
-    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_stable_id = (
+        "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if identity_case == "legacy_stable_id" else None
+    )
     first_content = [{"type": "input_text", "text": "set up the worktree"}]
     next_content = [{"type": "input_text", "text": "then run the tests"}]
     first_pending = pending_inputs.record(
         sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
     )
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(sid, first_pending).items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
+    if identity_case == "legacy_stable_id":
+        identity = {"input_stable_id": first_stable_id}
+    elif identity_case == "pending_only":
+        identity.pop("delivery_attempt_id")
+    elif identity_case == "attempt_only":
+        identity.pop("pending_id")
+    elif identity_case == "mismatched_attempt":
+        identity["delivery_attempt_id"] = "f" * 32
+    elif identity_case == "malformed_attempt":
+        identity["delivery_attempt_id"] = "not-an-attempt-id"
     next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    if identity_case == "mismatched_pending":
+        identity["pending_id"] = next_pending
     # Script only the executor boundary; the real adapter must transport its evidence.
     executor = MockExecutor()
     executor.enqueue_events(
@@ -8681,7 +8895,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
                 _sse_frame(
                     {
                         "type": "response.failed",
-                        "input_stable_id": first_stable_id,
+                        **identity,
                         "response": {
                             "id": "resp_not_ready",
                             "model": "claude",
@@ -8693,7 +8907,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
             ]
         )
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
-        if not undelivered:
+        if not undelivered or identity_case not in {"legacy_stable_id", "server_attempt"}:
             assert [item.type for item in store.appended_items] == ["error"]
             assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
                 first_pending,
@@ -8735,17 +8949,21 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
-async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+@pytest.mark.parametrize("with_client_id", [False, True])
+@pytest.mark.parametrize(
+    "refusal_case",
+    ["claude_auth", "claude_inactive", "claude_empty", "codex_goal_too_long", "codex_empty"],
+)
+async def test_native_pre_delivery_refusal_is_not_reclassified_as_missing_by_later_mirror(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal_case: str,
+    with_client_id: bool,
 ) -> None:
-    """A pre-delivery refusal must not be reported again as a missing message.
-
-    Claude refuses web ``/login`` before touching the terminal. If that failure
-    is not marked undelivered, the input stays pending. The next successful
-    message's transcript mirror skips it and persists a second error with code
-    ``native_prompt_not_recorded``.
-    """
+    """A refused input must not become a second error when the next echo arrives."""
+    from omnigent.harnesses.claude_native.bridge import REQUEST_SESSION_ID_ENV_VAR
     from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
     from omnigent.runtime import pending_inputs
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
@@ -8760,26 +8978,50 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
     store = _ConversationStore()
     conversation = store.get_conversation(session_id)
     assert conversation is not None
-    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a" if with_client_id else None
     later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
-    auth_content = [{"type": "input_text", "text": "/login"}]
+    harness = "codex" if refusal_case.startswith("codex") else "claude"
+    if harness == "codex":
+        conversation.labels["omnigent.wrapper"] = "codex-native-ui"
+    if refusal_case == "claude_inactive":
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    text = {
+        "claude_auth": "/login",
+        "claude_inactive": "message from an old tab",
+        "claude_empty": "",
+        "codex_goal_too_long": "/goal " + "x" * 4001,
+        "codex_empty": "",
+    }[refusal_case]
+    refused_content = [{"type": "input_text", "text": text}]
     later_content = [{"type": "input_text", "text": "continue after login"}]
     first_pending = pending_inputs.record(
         session_id,
-        auth_content,
+        refused_content,
         created_by="alice@example.com",
         stable_id=first_stable_id,
     )
-    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(session_id, first_pending).items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: (
+            CodexNativeExecutor(bridge_dir=tmp_path)
+            if harness == "codex"
+            else ClaudeNativeExecutor(tmp_path)
+        )
+    )
     context = TurnContext(
-        response_id="resp_login_refused",
+        response_id="resp_input_refused",
         event_queue=asyncio.Queue(),
         cancelled=asyncio.Event(),
     )
     try:
         with pytest.raises(RuntimeError) as raised:
             await adapter.run_turn(
-                CreateResponseRequest(model="claude", input=auth_content),
+                CreateResponseRequest(model="claude", input=refused_content),
                 context,
             )
         refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
@@ -8788,16 +9030,16 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                 _sse_frame(
                     {
                         "type": "response.in_progress",
-                        "response": {"id": "resp_login_refused", "model": "claude"},
+                        "response": {"id": "resp_input_refused", "model": harness},
                     }
                 ),
                 _sse_frame(
                     {
                         "type": "response.failed",
-                        "input_stable_id": first_stable_id,
+                        **identity,
                         "response": {
-                            "id": "resp_login_refused",
-                            "model": "claude",
+                            "id": "resp_input_refused",
+                            "model": harness,
                             "error": refusal,
                         },
                     }
@@ -8822,7 +9064,7 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                     "item_type": "message",
                     "item_data": {"role": "user", "content": later_content},
                     "response_id": "native_later_turn",
-                    "source_id": "claude:later:0",
+                    "source_id": f"{harness}:later:0",
                 },
             ),
             store,  # type: ignore[arg-type]
@@ -8839,6 +9081,9 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
             f"settled {later_pending}; persisted={missing_errors}"
         )
         assert refusal.get("undelivered") is True
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[0].data.content == refused_content
+        assert store.appended_items[-1].data.content == later_content
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
         assert later_pending not in pending_inputs.pending_ids(session_id)
     finally:

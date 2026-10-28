@@ -8,12 +8,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _isolate_ucode_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_native_config_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Point ucode state at an empty per-test path.
+    Keep caller configuration and account state under test-owned paths.
 
-    A Databricks-profile launch reads ``~/.ucode/state.json`` for its gateway and
-    auth, so without this the tests would depend on the machine running them.
+    Ambient Codex config rewrites change catalog fingerprints mid-scenario.
+    Profile launches also read ucode gateway/auth state from the caller's home.
 
     :param tmp_path: Per-test directory that holds no ucode state.
     :param monkeypatch: Fixture used to redirect the state path.
@@ -21,3 +21,4 @@ def _isolate_ucode_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         "omnigent.onboarding.ucode_state._STATE_PATH", tmp_path / "no-ucode-state.json"
     )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "caller-codex-home"))

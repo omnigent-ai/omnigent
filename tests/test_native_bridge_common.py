@@ -11,7 +11,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnigent.inner.native_attachments import attachment_cache_dir, materialize_attachment
+from omnigent.inner.native_attachments import (
+    attachment_cache_dir,
+    materialize_attachment,
+    materialize_text,
+    pasted_text_cache_dir,
+)
 from omnigent.native import native_bridge_common
 
 
@@ -57,6 +62,7 @@ def test_prune_removes_dead_keeps_live_and_unmarked(tmp_path: Path) -> None:
     }
     for bridge_dir in (dead_dir, live_dir, unmarked_dir):
         assert materialize_attachment(attachment, bridge_dir) is not None
+        assert materialize_text("a cached paste", bridge_dir) is not None
 
     pruned = native_bridge_common.prune_orphaned_dirs(root)
 
@@ -64,9 +70,10 @@ def test_prune_removes_dead_keeps_live_and_unmarked(tmp_path: Path) -> None:
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
-    assert not attachment_cache_dir(dead_dir).exists()
-    assert attachment_cache_dir(live_dir).exists()
-    assert attachment_cache_dir(unmarked_dir).exists()
+    for cache_dir in (attachment_cache_dir, pasted_text_cache_dir):
+        assert not cache_dir(dead_dir).exists()
+        assert cache_dir(live_dir).exists()
+        assert cache_dir(unmarked_dir).exists()
 
 
 def test_prune_ignores_non_dir_entries_and_bad_markers(tmp_path: Path) -> None:

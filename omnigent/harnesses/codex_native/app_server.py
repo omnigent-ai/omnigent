@@ -1126,6 +1126,27 @@ class CodexAppServerClient:
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
         self._subscribed_thread_ids: set[str] = set()
+        self._connection_phase = "not_started"
+
+    def connection_diagnostics(self) -> dict[str, object]:
+        """Snapshot transport progress without addresses, messages or request content."""
+        result: dict[str, object] = {
+            "rpc_transport": "websocket" if self._ws_url is not None else "unix",
+            "rpc_connection_phase": self._connection_phase,
+            "rpc_reader_state": "not_started",
+        }
+        reader = self._reader_task
+        if reader is not None:
+            if reader.cancelled():
+                result["rpc_reader_state"] = "cancelled"
+            elif not reader.done():
+                result["rpc_reader_state"] = "running"
+            else:
+                error = reader.exception()
+                result["rpc_reader_state"] = "completed" if error is None else "failed"
+                if error is not None:
+                    result["rpc_reader_error_type"] = type(error).__name__
+        return result
 
     async def connect(self) -> None:
         """
@@ -1133,6 +1154,7 @@ class CodexAppServerClient:
 
         :returns: None.
         """
+        self._connection_phase = "websocket_handshake"
         if self._ws_url is not None:
             self._ws = await websockets.connect(
                 self._ws_url,
@@ -1154,6 +1176,7 @@ class CodexAppServerClient:
             self._reader_loop(),
             name="codex-native-app-server-reader",
         )
+        self._connection_phase = "initialize"
         await self.request(
             "initialize",
             {
@@ -1167,6 +1190,7 @@ class CodexAppServerClient:
             },
         )
         await self.notify("initialized")
+        self._connection_phase = "ready"
 
     async def close(self) -> None:
         """
@@ -1222,10 +1246,16 @@ class CodexAppServerClient:
                     (future, self._reader_task), return_when=asyncio.FIRST_COMPLETED
                 )
                 if not future.done():
+                    reader_error = (
+                        None if self._reader_task.cancelled() else self._reader_task.exception()
+                    )
                     raise ConnectionError(
                         f"Codex app-server disconnected before responding to {method}"
-                    )
+                    ) from reader_error
             response = await future
+        except BaseException as exc:
+            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            raise
         finally:
             self._pending_requests.pop(request_id, None)
             future.cancel()

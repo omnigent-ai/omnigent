@@ -4846,6 +4846,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
 
     session_id = "83acdbadf84d4149b2a7d7441b6966aa"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "caller-codex-home"))
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
