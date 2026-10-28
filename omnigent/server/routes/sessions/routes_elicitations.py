@@ -169,7 +169,8 @@ def register_elicitations_routes(
             e.g. ``"elicit_abc123"``.
         :returns: JSON with ``status`` (``"pending"`` or
             ``"resolved"``), and when pending: ``message``,
-            ``phase``, ``policy_name``, ``content_preview``. Native requests
+            ``phase``, ``policy_name``, ``content_preview``, plus any untruncated
+            ``ask_user_question`` or ``exit_plan_mode`` payload. Native requests
             may include ``resolution`` (``"unanswered"`` or ``"confirmed"``)
             after clearing; absence alone does not prove native confirmation.
         :raises OmnigentError: 404 if the session does not exist.
@@ -201,7 +202,13 @@ def register_elicitations_routes(
             "content_preview": params.get("content_preview", ""),
             **{
                 key: params[key]
-                for key in ("native_delivery", "permission_directories", "terminal_fallback")
+                for key in (
+                    "native_delivery",
+                    "permission_directories",
+                    "terminal_fallback",
+                    "ask_user_question",
+                    "exit_plan_mode",
+                )
                 if key in params
             },
         }

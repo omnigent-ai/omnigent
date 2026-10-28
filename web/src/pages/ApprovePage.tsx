@@ -42,6 +42,8 @@ interface ElicitationData {
   native_delivery?: NativePermissionDelivery;
   permission_directories?: string[];
   terminal_fallback?: ElicitationTerminalFallback;
+  ask_user_question?: Record<string, unknown> | null;
+  exit_plan_mode?: Record<string, unknown> | null;
 }
 
 type PageState =
@@ -249,6 +251,8 @@ export function ApprovePage() {
             nativeDelivery={state.data.native_delivery}
             permissionDirectories={state.data.permission_directories}
             terminalFallback={state.data.terminal_fallback}
+            askUserQuestion={state.data.ask_user_question}
+            exitPlanMode={state.data.exit_plan_mode}
             onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
           />
         )}

@@ -141,6 +141,55 @@ describe("ApprovePage states", () => {
   });
 
   it.each([
+    {
+      label: "a question's option previews",
+      params: {
+        message: "Claude wants to call **AskUserQuestion**",
+        content_preview: 'AskUserQuestion({"questions": [{"question": "Lay',
+        ask_user_question: {
+          questions: [
+            {
+              question: "Layout?",
+              header: "",
+              options: [
+                { label: "Two-pane", description: "Side-by-side", preview: "[editor] | [output]" },
+                { label: "Single", description: "One pane", preview: "[editor only]" },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      shown: ["[editor] | [output]", "[editor only]"],
+    },
+    {
+      label: "a plan longer than the preview",
+      params: {
+        message: "Claude wants to call **ExitPlanMode**",
+        content_preview: 'ExitPlanMode({"plan": "# Migration plan',
+        exit_plan_mode: {
+          plan: `# Migration plan\n\n${"- move a parser\n".repeat(80)}- ship the last step\n`,
+        },
+      },
+      shown: ["Migration plan", "ship the last step"],
+    },
+  ])("shows $label read-only while the prompt waits in the terminal", async ({ params, shown }) => {
+    vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+      jsonResponse({
+        status: "pending",
+        terminal_fallback: { answer_undelivered: false },
+        ...params,
+      }),
+    );
+    renderPage();
+    expect(await screen.findByText("Answer in the terminal")).toBeInTheDocument();
+    await waitFor(() => {
+      for (const text of shown) expect(screen.getByText(text)).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("button", { name: /Approve|Reject|Submit/ })).not.toBeInTheDocument();
+  });
+
+  it.each([
     { label: "the terminal answers", next: { status: "resolved" } },
     { label: "the hook asks in chat again", next: { status: "pending", message: "Approve pwd" } },
   ])("refreshes a prompt waiting in the terminal when $label", async ({ next }) => {

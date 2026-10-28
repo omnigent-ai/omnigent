@@ -1509,6 +1509,9 @@ async def test_permission_request_hook_surfaces_ask_user_question_structured(
     assert second["multiSelect"] is True
     # Options without descriptions ride through with just the label.
     assert second["options"][0] == {"label": "Claude Code"}
+    # The standalone approval page renders the same form from its GET.
+    detail = await client.get(f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}")
+    assert detail.json()["ask_user_question"] == aqu
 
     # Resolve through the supported session-scoped event route so the
     # hook task doesn't time out and stall pytest.
@@ -1748,6 +1751,8 @@ async def test_permission_request_hook_surfaces_exit_plan_mode_input(
     # unknown field — must ride through verbatim. A missing key or a
     # truncated plan means the endpoint filtered/capped the extra.
     assert params["exit_plan_mode"] == payload["tool_input"], params
+    detail = await client.get(f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}")
+    assert detail.json()["exit_plan_mode"] == payload["tool_input"]
     # Plan cards are eligible for the "auto-accept edits" affordance
     # (Claude's native "Yes, and auto-accept edits" dialog option), so
     # the UI-button hint must be stamped alongside the plan.
@@ -2491,6 +2496,7 @@ async def _sever_hook_mid_turn(
     elicitation_id: str = _REATTACH_ELICITATION_ID,
     executor: dict[str, Any] | None = None,
     grace_s: float = 0.2,
+    parent_session_id: str | None = None,
 ) -> tuple[str, dict[str, Any], Any]:
     """
     Park a native hook prompt in a running session, then sever its hook.
@@ -2502,6 +2508,8 @@ async def _sever_hook_mid_turn(
     :param elicitation_id: Hook-supplied id, e.g. ``"elicit_kimi_" + "0" * 32``.
     :param executor: Agent executor config, or ``None`` for the default agent.
     :param grace_s: Re-park grace in seconds.
+    :param parent_session_id: Session to create the prompting session under,
+        or ``None`` for a top-level session.
     :returns: The session id, the hook payload, and a collector that has
         already consumed the original elicitation request.
     """
@@ -2522,7 +2530,19 @@ async def _sever_hook_mid_turn(
     monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_POLL_S", 0.02)
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, agent_name, executor=executor)
-    session_id = await _create_session(client, agent["id"])
+    if parent_session_id is None:
+        session_id = await _create_session(client, agent["id"])
+    else:
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent_session_id,
+                "title": f"{agent_name}:child",
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
     monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
     payload = {
         **(await _claude_permission_payload()),
@@ -2776,25 +2796,45 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
         pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("waiting_in_terminal", [True, False])
 async def test_deleting_session_releases_prompt_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    waiting_in_terminal: bool,
 ) -> None:
-    """A deleted session's status can stay mid-turn, so delete ends its terminal hold."""
+    """
+    A deleted session's status can stay mid-turn, so delete ends its terminal hold.
+
+    Deleting during the re-park grace or the hold also clears the surviving parent's mirror.
+    """
     from omnigent.runtime import pending_elicitations
 
+    parent_agent = await create_test_agent(
+        client, f"test-terminal-fallback-deleted-parent-{waiting_in_terminal}"
+    )
+    parent_id = await _create_session(client, parent_agent["id"])
     session_id, _payload, collector = await _sever_hook_mid_turn(
-        client, monkeypatch, "test-terminal-fallback-deleted"
+        client,
+        monkeypatch,
+        f"test-terminal-fallback-deleted-{waiting_in_terminal}",
+        grace_s=0.2 if waiting_in_terminal else 2.0,
+        parent_session_id=parent_id,
     )
     try:
-        waiting = await _next_elicitation_event(collector)
-        assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
+        unparked = _harness_unparked_elicitations[_REATTACH_ELICITATION_ID]
+        if waiting_in_terminal:
+            waiting = await _next_elicitation_event(collector)
+            assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
+        assert pending_elicitations.count_for(parent_id) == 1
 
         deleted = await client.delete(f"/v1/sessions/{session_id}")
         assert deleted.status_code == 200, deleted.text
         assert sessions_route._session_status_cache.get(session_id) == "running"
         await _finish_deferred_clears()
+        assert unparked.in_terminal is waiting_in_terminal
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+        assert pending_elicitations.count_for(session_id) == 0
+        assert pending_elicitations.count_for(parent_id) == 0
     finally:
         await collector.stop()
         pending_elicitations.reset_for_tests()

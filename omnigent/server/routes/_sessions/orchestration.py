@@ -948,15 +948,36 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
             handle.task.cancel()
 
 
-def _release_unparked_elicitations(session_ids: list[str]) -> None:
-    """Stop holding deleted sessions' prompts for their terminals.
+async def _release_unparked_elicitations(
+    session_ids: list[str],
+    conversation_store: ConversationStore,
+) -> None:
+    """Expire the prompts that sessions about to be deleted hold for their terminals.
 
     A deleted session's status may never leave mid-turn, so its hold would poll forever.
+    Run it before the delete so the expiry still reaches surviving ancestors' mirrors.
     """
     deleted = set(session_ids)
     for elicitation_id, unparked in _harness_unparked_elicitations.items():
-        if unparked.session_id in deleted:
-            _harness_unparked_elicitations.pop(elicitation_id, None)
+        if unparked.session_id not in deleted:
+            continue
+        _harness_unparked_elicitations.pop(elicitation_id, None)
+        _publish_elicitation_resolved(unparked.session_id, elicitation_id, reason="unanswered")
+        try:
+            await asyncio.to_thread(
+                _publish_elicitation_resolved_to_ancestors,
+                conversation_store,
+                unparked.session_id,
+                elicitation_id,
+                reason="unanswered",
+            )
+        except Exception:  # noqa: BLE001 — the delete must still go through
+            _logger.warning(
+                "Could not clear prompt %s from ancestors of deleted session %s",
+                elicitation_id,
+                unparked.session_id,
+                exc_info=True,
+            )
 
 
 # Strong references to detached archive stops so the tasks can't be

@@ -2463,6 +2463,9 @@ function ComposerImpl(
   const pendingElicitationsInTerminal = useChatStore((s) =>
     pendingOwnElicitationsInTerminal(s.blocks, s.conversationId),
   );
+  const pendingElicitationPlaceholder = pendingElicitationsInTerminal
+    ? "Answer the pending request in the agent's terminal to continue"
+    : "Respond to the pending request above to continue";
   const readyPlaceholder = sendReconnectsArca
     ? "Send a message to reconnect Arca…"
     : "Send a message…";
@@ -3982,9 +3985,7 @@ function ComposerImpl(
                 : unreachable && !sendReconnectsArca && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
-                    ? pendingElicitationsInTerminal
-                      ? "Answer the pending request in the agent's terminal to continue"
-                      : "Respond to the pending request above to continue"
+                    ? pendingElicitationPlaceholder
                     : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : isStreaming

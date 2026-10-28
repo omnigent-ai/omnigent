@@ -3809,13 +3809,13 @@ def register_events_routes(
                 )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
+        await _release_unparked_elicitations([session_id, *descendant_ids], conversation_store)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
         _cancel_runner_relays([session_id, *descendant_ids])
-        _release_unparked_elicitations([session_id, *descendant_ids])
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted
