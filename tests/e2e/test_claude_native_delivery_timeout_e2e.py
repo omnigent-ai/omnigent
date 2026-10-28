@@ -128,7 +128,12 @@ def main():
                         return
                     if ch == "\r" and not pasted:
                         if box.draft.strip():
-                            box.key("Enter")
+                            box.submitted.append((box.mode, box.draft))
+                            box.draft, box.cursor = "", 0
+                    elif ch == "\x7f" and not pasted:
+                        if box.cursor:
+                            box.draft = box.draft[:box.cursor - 1] + box.draft[box.cursor:]
+                            box.cursor -= 1
                     elif ch >= " " or (pasted and ch in "\r\n"):
                         ch = "\n" if ch == "\r" else ch
                         box.draft = box.draft[:box.cursor] + ch + box.draft[box.cursor:]
@@ -225,7 +230,9 @@ def test_inject_user_message_delivers_despite_stalled_submit(
 
     # The message left the input box and landed in the transcript.
     pane = _capture_pane(socket_path, "claude")
-    assert "sent: " in pane and _MESSAGE[:20] in pane, pane
+    assert [line for line in pane.splitlines() if line.startswith("sent: ")] == [
+        f"sent: {_MESSAGE}"
+    ], pane
 
 
 async def test_run_turn_completes_despite_stalled_submit(
@@ -236,7 +243,7 @@ async def test_run_turn_completes_despite_stalled_submit(
     TUI catches up -- it must not log ``failed to deliver message to harness``
     or yield the ``ExecutorError`` the runner would surface to the web UI as a
     failed turn."""
-    bridge_dir, _socket_path = stalling_claude_pane
+    bridge_dir, socket_path = stalling_claude_pane
     executor = ClaudeNativeExecutor(bridge_dir=bridge_dir)
 
     events = []
@@ -255,6 +262,10 @@ async def test_run_turn_completes_despite_stalled_submit(
     assert not isinstance(events[0], ExecutorError), events[0]
     assert isinstance(events[0], TurnComplete), events[0]
     assert _TUI_STALL_S - 2.0 <= elapsed <= _DELIVERY_BOUND_S, elapsed
+    pane = _capture_pane(socket_path, "claude")
+    assert [line for line in pane.splitlines() if line.startswith("sent: ")] == [
+        f"sent: {_MESSAGE}"
+    ], pane
 
     assert not any(
         "failed to deliver message to harness" in record.getMessage() for record in caplog.records

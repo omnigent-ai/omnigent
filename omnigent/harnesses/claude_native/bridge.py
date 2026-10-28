@@ -6577,6 +6577,8 @@ def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool 
             and not any(row.strip() for row in box.rows[1:])
         )
         if preserve_draft and box is not None:
+            # A placeholder and an identical user draft look the same in a capture.
+            # Refuse both: probing here would modify an edit made after rejection.
             if box.rows[0].strip() != _CLAUDE_PROMPT_GLYPH or any(
                 row.strip() for row in box.rows[1:]
             ):

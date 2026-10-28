@@ -4848,10 +4848,23 @@ def test_unknown_command_watch_keeps_the_recovered_pane_height(
 
 @pytest.mark.parametrize("clipped", [False, True], ids=["normal", "clipped-after-rejection"])
 @pytest.mark.parametrize(
-    "terminal_draft", ["", "a new terminal draft"], ids=["empty", "new-draft"]
+    ("terminal_draft", "hint"),
+    [
+        ("", ""),
+        ("a new terminal draft", ""),
+        ("", 'Try "fix the failing test"'),
+        ('Try "fix the failing test"', ""),
+        ("", "Press up to edit queued messages"),
+        ("Press up to edit queued messages", ""),
+    ],
+    ids=["empty", "new-draft", "try-hint", "try-draft", "queued-hint", "queued-draft"],
 )
 def test_unknown_command_fallback_preserves_a_new_terminal_draft(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clipped: bool, terminal_draft: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clipped: bool,
+    terminal_draft: str,
+    hint: str,
 ) -> None:
     """The fallback must not clear a terminal edit made after the rejected submit."""
     content = "/not-a-real-skill hello world"
@@ -4876,7 +4889,10 @@ def test_unknown_command_fallback_preserves_a_new_terminal_draft(
 
     def capture_pane(*args: str) -> str:
         rejection = "● Unknown command: /not-a-real-skill\n" if composer.submitted else ""
-        return rejection + composer._capture_pane(*args)
+        pane = composer._capture_pane(*args)
+        if rejection and not composer.text:
+            pane = pane.replace("❯ \n", f"❯ {hint}\n")
+        return rejection + pane
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture_pane)
@@ -4885,7 +4901,7 @@ def test_unknown_command_fallback_preserves_a_new_terminal_draft(
         "run",
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 7 latest\n", stderr=""),
     )
-    if terminal_draft:
+    if terminal_draft or hint:
         with pytest.raises(claude_native_bridge.ClaudeMessageNotAccepted, match="input changed"):
             inject_user_message(_picker_bridge_dir(tmp_path), content=content)
         assert composer.text == draft
@@ -4895,7 +4911,7 @@ def test_unknown_command_fallback_preserves_a_new_terminal_draft(
         inject_user_message(_picker_bridge_dir(tmp_path), content=content)
         assert composer.submitted == [content + "\n", " " + content + "\n"]
         assert fallback_keys == ["Enter"]
-    assert sizes == (["24", "7"] if clipped else [])
+    assert sizes == (["24", "7"] if clipped and not hint else [])
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(
