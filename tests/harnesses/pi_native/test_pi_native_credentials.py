@@ -21,6 +21,7 @@ import pytest
 from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
 from omnigent.inner._proc import process_alive
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.onboarding.providers import ModelInfo
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 
@@ -534,6 +535,122 @@ def test_inline_databricks_gateway_picking_omitted_default_keeps_its_surface(
     rendered = provider.to_models_config()["providers"]
     assert "omnigent-mlflow" not in rendered
     assert [m["id"] for m in rendered["omnigent-openai"]["models"]] == ["system.ai.gpt-5"]
+
+
+def test_inline_databricks_gateway_without_default_lists_workspace_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An AI Gateway entry without ``models.default`` still offers the workspace's models."""
+    qwen = "system.ai.qwen3-next-80b-a3b-instruct"
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-sonnet-4-6"}], [{"id": qwen}], [], []),
+    )
+    gateway = "https://wkspc.cloud.databricks.com/ai-gateway"
+    config = {
+        "providers": {
+            "isaac-databricks-ai-gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {"base_url": f"{gateway}/anthropic", "api_key": "gw-token"},
+                "openai": {"base_url": f"{gateway}/codex/v1", "api_key": "gw-token"},
+            }
+        }
+    }
+
+    options = creds.pi_native_model_options(config_loader=lambda: config)
+
+    assert any(str(option["model"]).endswith(f"/{qwen}") for option in options), options
+    # Pi opens a model the workspace lists, not the bundled catalog default.
+    defaults = [option["model"] for option in options if option["isDefault"]]
+    assert defaults == ["omnigent/system.ai.claude-sonnet-4-6"]
+
+
+def test_inline_databricks_gateway_without_default_defers_to_a_pinned_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A family that pins a default still launches it over an unpinned gateway family."""
+    listings: list[str] = []
+
+    def _listing(host: str, token: str):
+        listings.append(host)
+        return ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [])
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    gateway = "https://wkspc.cloud.databricks.com/ai-gateway"
+    config = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {"base_url": f"{gateway}/anthropic", "api_key": "gw-token"},
+                "openai": {
+                    "base_url": f"{gateway}/codex/v1",
+                    "api_key": "gw-token",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.gpt-5"
+    assert listings == ["https://wkspc.cloud.databricks.com"]
+
+
+def test_inline_databricks_gateway_without_default_or_catalog_launches_a_listed_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable model catalog still launches a Claude model the workspace lists."""
+
+    def _unavailable_catalog(provider_name: str, *, family: str, **kwargs: object) -> None:
+        raise ModelResolutionError("catalog discovery is unavailable")
+
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.resolve_catalog_model", _unavailable_catalog
+    )
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: ([{"id": "system.ai.claude-sonnet-4-6"}], [{"id": "gpt-5"}], [], []),
+    )
+    gateway = "https://wkspc.cloud.databricks.com/ai-gateway"
+    config = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {"base_url": f"{gateway}/anthropic", "api_key": "gw-token"},
+                "openai": {"base_url": f"{gateway}/codex/v1", "api_key": "gw-token"},
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert provider is not None
+    assert provider.model == "system.ai.claude-sonnet-4-6"
+
+
+def test_inline_databricks_gateway_without_default_or_listing_uses_pi_login() -> None:
+    """With neither a default nor a workspace listing there is no model to launch."""
+    config = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "anthropic": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/anthropic",
+                    "auth_command": "exit 1",
+                },
+            }
+        }
+    }
+
+    assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
 
 
 def test_run_auth_command_uses_the_shell() -> None:

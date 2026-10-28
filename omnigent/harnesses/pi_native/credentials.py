@@ -51,6 +51,7 @@ from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.model_override import normalize_model_for_provider
+from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
@@ -663,10 +664,19 @@ def _default_claude_model_from(entries: list[_PiModelEntry]) -> str | None:
 
 def _select_databricks_claude_model(model: str | None, claude_models: list[_PiModelEntry]) -> str:
     """Resolve an implicit Databricks default to an equivalent served Claude id."""
-    selected_model = (
-        model or model_catalog.resolve_catalog_model("databricks", family="claude").model_id
-    )
-    if model is not None or not claude_models:
+    if model is not None:
+        return model
+    try:
+        selected_model = model_catalog.resolve_catalog_model(
+            "databricks", family="claude"
+        ).model_id
+    except ModelResolutionError:
+        # The workspace listing still names servable ids when the catalog is unreachable.
+        listed_model = _default_claude_model_from(claude_models)
+        if listed_model is None:
+            raise
+        return listed_model
+    if not claude_models:
         return selected_model
     served_model = preferred_served_claude_model(
         (model_id for item in claude_models if isinstance((model_id := item.get("id")), str)),
@@ -1536,13 +1546,15 @@ def _inline_family_pi_provider(
     the selected family's ``base_url`` is a workspace-hosted Databricks AI
     Gateway, the whole workspace is enumerated instead (Claude, GPT and Gemini
     surfaces) with the configured default kept as the launch model; see
-    :func:`_databricks_gateway_pi_provider`.
+    :func:`_databricks_gateway_pi_provider`. When no family pins a default,
+    such a gateway is still enumerated and launches a model the workspace lists.
 
     :param entry: The resolved default provider entry.
     :param model: Session model override, or ``None`` to use the family default.
     :returns: The Pi provider config, or ``None`` when no usable family with a
-        base URL and credential is configured.
+        base URL, credential and model is configured.
     """
+    unpinned_gateway: FamilyConfig | None = None
     for family_name in _inline_family_order(model):
         family = entry.family(family_name)
         if family is None or not family.base_url:
@@ -1573,6 +1585,13 @@ def _inline_family_pi_provider(
             default_tier = entry.family_default_model(family_name)
             resolved_model = family.resolve_model_tier(default_tier) if default_tier else None
         if not resolved_model:
+            if (
+                unpinned_gateway is None
+                and not preserve_model_ids
+                and len(_family_tier_ids(family)) <= 1
+                and _databricks_workspace_gateway_surface(family.base_url) is not None
+            ):
+                unpinned_gateway = family
             continue
         # A session override can arrive as a Databricks-gateway id, which only
         # the gateway routes; strip the mechanical prefix for a vendor-direct
@@ -1660,6 +1679,17 @@ def _inline_family_pi_provider(
                 detail=f"provider {entry.name!r}",
             ),
         )
+    if unpinned_gateway is None:
+        return None
+    enumerated = _databricks_gateway_pi_provider(
+        gateway_base_url=unpinned_gateway.base_url,
+        model=None,
+        auth_command=unpinned_gateway.auth_command,
+        static_api_key=unpinned_gateway.api_key,
+    )
+    # Without a listing there is no model the workspace is known to serve.
+    if enumerated.extra_models or enumerated.additional_providers:
+        return enumerated
     return None
 
 
