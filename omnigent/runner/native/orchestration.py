@@ -97,6 +97,7 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    redacted_terminal_output,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -425,10 +426,13 @@ async def _observe_terminal_interactive(
     """Emit one semantic event when a native TUI can accept a message."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
+    last_screen: str | None = None
     try:
         while True:
             result = await instance.read()
             screen = result.get("screen")
+            if isinstance(screen, str):
+                last_screen = screen
             if isinstance(screen, str) and is_interactive(screen):
                 _logger.info(
                     "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
@@ -468,6 +472,9 @@ async def _observe_terminal_interactive(
                 terminal_instance_id=instance.diagnostic_id,
                 readiness_signal=readiness_signal,
                 reason=type(exc).__name__,
+                # What held the TUI back (a dialog, an auth error) is otherwise
+                # only on the pane.
+                terminal_last_output=redacted_terminal_output(last_screen),
             ),
         )
 
