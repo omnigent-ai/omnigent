@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import json
 import logging
@@ -2875,9 +2876,10 @@ async def test_create_session() -> None:
 
 
 class _NativeSeedServerClient(NullServerClient):
-    """Server client with one stored item; records item listings and event posts."""
+    """Server client with stored items; records item listings and event posts."""
 
-    def __init__(self) -> None:
+    def __init__(self, stored_items: list[dict[str, Any]] | None = None) -> None:
+        self.stored_items = [{"id": "item_latest"}] if stored_items is None else stored_items
         self.items_params: list[Any] = []
         self.file_calls: list[str] = []
         self.posted_events: list[dict[str, Any]] = []
@@ -2885,10 +2887,11 @@ class _NativeSeedServerClient(NullServerClient):
     async def get(self, url: str, **kwargs: Any) -> Any:
         if url.endswith("/items"):
             self.items_params.append(kwargs.get("params"))
+            stored_items = self.stored_items
 
             class _ItemsResponse(NullServerClient._Response):
                 def json(self) -> dict[str, Any]:
-                    return {"data": [{"id": "item_latest"}], "has_more": False}
+                    return {"data": stored_items, "has_more": False}
 
             return _ItemsResponse()
         if "/resources/files/" in url:
@@ -2991,6 +2994,143 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
 
     assert compactions, "harness compaction was never persisted to the server"
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
+
+
+class _SnapshotHarnessClient(_ScriptedHarnessClient):
+    """Records each harness request body as it was when sent."""
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        return super().stream(method, url, json=copy.deepcopy(json), timeout=timeout)
+
+
+def _history_shape(item: dict[str, Any]) -> tuple[str, str]:
+    if item["type"] == "message":
+        return item["role"], "".join(part["text"] for part in item["content"])
+    return item["type"], item["call_id"]
+
+
+def _text_message(role: str, text: str) -> dict[str, Any]:
+    part_type = "output_text" if role == "assistant" else "input_text"
+    return {"type": "message", "role": role, "content": [{"type": part_type, "text": text}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_items", "expected_history"),
+    [
+        pytest.param(
+            [{"id": "item_latest"}],
+            [
+                ("user", "SUMMARY"),
+                ("user", "hi"),
+                ("assistant", "Reading notes."),
+                ("assistant", "RECOVERED"),
+                ("user", "next"),
+            ],
+            id="compacted",
+        ),
+        pytest.param(
+            [],
+            [
+                ("user", "hi"),
+                ("function_call", "call_1"),
+                ("function_call_output", "call_1"),
+                ("assistant", "Reading notes.RECOVERED"),
+                ("user", "next"),
+            ],
+            id="compaction-not-persisted",
+        ),
+    ],
+)
+async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
+    stored_items: list[dict[str, Any]], expected_history: list[tuple[str, str]]
+) -> None:
+    """The next harness request has the turn's pre-tool text once after a compaction.
+
+    The compaction snapshot already holds the text before the tool call, so only the text
+    after it follows. When the compaction is not persisted, the history is unchanged.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    stream_finished = asyncio.Event()
+    harness_client = _SnapshotHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.output_text.delta", "delta": "Reading notes."}),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read",
+                        "arguments": "{}",
+                        "status": "completed",
+                    },
+                }
+            ),
+            _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+                }
+            ),
+            _sse({"type": "response.output_text.delta", "delta": "RECOVERED"}),
+            _sse(
+                {
+                    "type": "response.compaction.completed",
+                    "summary": "SUMMARY",
+                    "total_tokens": 5,
+                    "compacted_messages": [
+                        _text_message("user", "SUMMARY"),
+                        _text_message("user", "hi"),
+                        _text_message("assistant", "Reading notes."),
+                    ],
+                }
+            ),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ],
+        stream_finished=stream_finished,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_NativeSeedServerClient(stored_items),  # type: ignore[arg-type]
+    )
+
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert resp.status_code == 201, resp.text
+        for text in ("hi", "next"):
+            turn = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                    "model": "test-agent",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            )
+            assert turn.status_code == 202, turn.text
+            await asyncio.wait_for(stream_finished.wait(), timeout=5.0)
+            stream_finished.clear()
+
+    assert len(harness_client.posted_bodies) == 2
+    next_request = harness_client.posted_bodies[1]["content"]
+    assert [_history_shape(item) for item in next_request] == expected_history
 
 
 def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:

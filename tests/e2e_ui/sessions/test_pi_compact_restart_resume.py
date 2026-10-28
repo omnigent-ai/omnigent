@@ -333,6 +333,9 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
                     break
             diagnostics["fill_turns"] = len(pre_markers)
             diagnostics["first_compaction_turn"] = first_compaction_turn
+            assert first_compaction_turn is not None and (
+                len(pre_markers) >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
+            ), f"the fill loop stopped before enough post-compaction history: {diagnostics}"
             script_reply(post_marker)
             sent_at = len(proxy.requests)
             _send_turn(
