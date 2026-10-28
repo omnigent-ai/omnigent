@@ -264,7 +264,7 @@ describe("FileViewer video and download toolbar", () => {
         >,
       async () => {
         renderViewer({ open: true, path: "clip.mov", initialSearch: "diff=1" });
-        expect(useFileContent).toHaveBeenCalledWith("conv_1", null);
+        expect(useFileContent).toHaveBeenCalledWith("conv_1", null, { visible: true });
         expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
         expect(screen.queryByRole("button", { name: "Exit diff view" })).toBeNull();
         expect(screen.queryByTestId("diff-viewer")).toBeNull();
