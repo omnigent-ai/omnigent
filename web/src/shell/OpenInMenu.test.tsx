@@ -43,7 +43,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-function contextFor(sessionHostId: string) {
+function contextFor(sessionHostId: string | null) {
   return {
     openFile: vi.fn(),
     registerNavigationGuard: () => () => {},
@@ -56,7 +56,11 @@ function contextFor(sessionHostId: string) {
   };
 }
 
-async function renderMenu(path = "src/main.ts", sessionHostId = "local", directory = false) {
+async function renderMenu(
+  path = "src/main.ts",
+  sessionHostId: string | null = "local",
+  directory = false,
+) {
   const { FileViewerContext } = await import("./FileViewerContext");
   const { OpenInMenu } = await import("./OpenInMenu");
   let context = contextFor(sessionHostId);
@@ -92,6 +96,43 @@ it("opens the default app directly and uses its artwork", async () => {
   expect(openFileInApp).toHaveBeenCalledWith("local", "/workspace/src/main.ts", "vscode");
   expect(screen.queryByRole("menu")).toBeNull();
 });
+
+it.each([
+  ["local", false],
+  ["local", true],
+  ["remote", false],
+  ["remote", true],
+])(
+  "opens both child-session controls on the inherited %s host (late: %s)",
+  async (hostId, late) => {
+    const { setSessionHost, setSessionParent } = await import("@/lib/sessionHost");
+    setSessionParent("conv_1", "parent");
+    getFileOpenSshHost.mockResolvedValue("arca.ssh");
+    if (!late) setSessionHost("parent", hostId);
+    await renderMenu("/workspace", null, true);
+    await renderMenu("src/main.ts", null);
+    if (late) {
+      expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
+      await act(() => setSessionHost("parent", hostId));
+    }
+    const buttons = await screen.findAllByRole("button", { name: "Open in VS Code" });
+    expect(buttons).toHaveLength(2);
+    buttons.forEach((button) => fireEvent.click(button));
+    if (hostId === "local") {
+      expect(openFileInApp.mock.calls).toEqual([
+        [hostId, "/workspace", "vscode"],
+        [hostId, "/workspace/src/main.ts", "vscode"],
+      ]);
+      expect(openRemoteFileInApp).not.toHaveBeenCalled();
+    } else {
+      expect(openRemoteFileInApp.mock.calls).toEqual([
+        [hostId, "/workspace", "vscode", "arca.ssh", true],
+        [hostId, "/workspace/src/main.ts", "vscode", "arca.ssh", false],
+      ]);
+      expect(openFileInApp).not.toHaveBeenCalled();
+    }
+  },
+);
 
 it("shares the selected default between folder and file buttons and remembers it", async () => {
   await renderMenu("/workspace", "local", true);

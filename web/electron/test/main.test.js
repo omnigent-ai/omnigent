@@ -166,6 +166,7 @@ function loadNavigationHarness({
   notificationsSupported = false,
   oidc = {},
   acceptedSessions = new Set(),
+  fileOpenOverrides = {},
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -428,6 +429,10 @@ function loadNavigationHarness({
   };
 
   const localRequires = {
+    "./fileOpen": {
+      registerFileOpen: (options) =>
+        require("../src/fileOpen").registerFileOpen({ ...options, ...fileOpenOverrides }),
+    },
     "./desktop_updater": { createDesktopUpdater },
     "./connection_loading": {
       createConnectionLoading: () => ({
@@ -4324,10 +4329,20 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const { arcaTarget } = require("../src/arcaIdentity");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
+    const launches = [];
     const h = loadNavigationHarness({
       serverUrl,
       internalFeatures: true,
       arcaResult: { ok: true, identity: { serverUrl: arcaTarget(serverUrl), hostId } },
+      fileOpenOverrides: {
+        platform: "darwin",
+        appDirectories: [],
+        discoverSshHost: async () => null,
+        run: async (command, args) => {
+          launches.push([command, args]);
+          return { stdout: command === "/usr/bin/mdfind" ? "/fixture/Cursor.app\0" : "" };
+        },
+      },
     });
     t.after(h.cleanup);
     h.api.registerIpc();
@@ -4337,6 +4352,9 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(await resolve(event, hostId), null);
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(await resolve(event, hostId), "arca.ssh");
+    const open = h.ipc.get("omnigent:open-remote-file-in-app");
+    assert.equal(await open(event, hostId, "/repo", "cursor", "arca.ssh", true), true);
+    launches.length = 0;
     assert.equal(await resolve(event, "b".repeat(32)), null);
     assert.equal(await resolve(event, ""), null);
     assert.equal(
@@ -4345,7 +4363,41 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     );
 
     h.api.setWindowServerUrl(h.win, serverUrl.replace("123", "456"));
+    assert.equal(await open(event, hostId, "/repo", "cursor", "arca.ssh", true), false);
     assert.equal(await resolve(event, hostId), null);
+    h.api.setWindowServerUrl(h.win, serverUrl);
+    assert.equal(await open(event, hostId, "/repo", "cursor", "arca.ssh", true), false);
+    assert.deepEqual(launches, []);
+  });
+
+  it("uses the native file-protocol consent for default-app opening", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    const file = path.join(path.dirname(h.settingsPath), "document.txt");
+    fs.writeFileSync(file, "document");
+    const prompts = [];
+    const opened = [];
+    let allow = false;
+    h.electron.dialog.showMessageBox = async (_win, options) => {
+      prompts.push(options);
+      return { response: allow ? 1 : 0, checkboxChecked: allow };
+    };
+    h.electron.shell.openPath = async (value) => {
+      opened.push(value);
+      return "";
+    };
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    const open = h.ipc.get("omnigent:open-file-in-app");
+    assert.equal(await open(event, "host_test", file, "default"), false);
+    assert.deepEqual(opened, []);
+    assert.equal(prompts[0].defaultId, 0);
+    assert.ok(prompts[0].detail.includes(require("node:url").pathToFileURL(file).href));
+    allow = true;
+    assert.equal(await open(event, "host_test", file, "default"), true);
+    assert.equal(await open(event, "host_test", file, "default"), true);
+    assert.equal(prompts.length, 2);
+    assert.deepEqual(opened, [file, file]);
   });
 
   it("uses consent to recapture a source host that differs from the remembered host", async (t) => {

@@ -30,6 +30,7 @@ const MAC_APPS = [
   { id: "idea", label: "IntelliJ IDEA", bundle: "com.jetbrains.intellij", name: "IntelliJ IDEA" },
 ];
 const DEFAULT_APP = { id: "default", label: "Default app" };
+const DISCOVERY_TTL_MS = 30_000;
 
 /** Open files with a fixed app choice; never accept a command from the renderer. */
 function registerFileOpen({
@@ -40,6 +41,9 @@ function registerFileOpen({
   platform = process.platform,
   run = promisify(execFile),
   getAppIcon = readMacAppIcon,
+  confirmDefaultOpen = async () => false,
+  getServerContext = () => null,
+  now = Date.now,
   resolveSshHost = () => null,
   discoverSshHost = discoverArcaSshHost,
   appDirectories = [
@@ -49,7 +53,28 @@ function registerFileOpen({
   ],
 }) {
   const iconCache = new Map();
-  async function findApp({ name, bundle }) {
+  const appCache = new Map();
+  const sshContexts = new WeakMap();
+  function sshContext(event) {
+    const context = getServerContext(event);
+    if (!context || !event.sender) return null;
+    let state = sshContexts.get(event.sender);
+    if (!state || state.context !== context) {
+      state = { context, hosts: new Map() };
+      sshContexts.set(event.sender, state);
+    }
+    return state;
+  }
+
+  function findApp(app) {
+    const cached = appCache.get(app.bundle);
+    if (cached && now() < cached.expiresAt) return cached.promise;
+    const promise = locateApp(app).catch(() => null);
+    appCache.set(app.bundle, { promise, expiresAt: now() + DISCOVERY_TTL_MS });
+    return promise;
+  }
+
+  async function locateApp({ name, bundle }) {
     const candidates = await Promise.all(
       appDirectories.map(async (directory) => {
         const candidate = path.join(directory, `${name}.app`);
@@ -109,7 +134,12 @@ function registerFileOpen({
     try {
       const filePath = path.normalize(rawPath);
       const stat = await fs.stat(filePath);
-      if (appId === "default") return (await shell.openPath(filePath)) === "";
+      if (appId === "default") {
+        const context = getServerContext(event);
+        if (!context || !(await confirmDefaultOpen(event, filePath))) return false;
+        if (!isPinnedOriginSender(event) || getServerContext(event) !== context) return false;
+        return (await shell.openPath(filePath)) === "";
+      }
       const target =
         selectedApp.directory && !stat.isDirectory() ? path.dirname(filePath) : filePath;
       await run("/usr/bin/open", ["-b", selectedApp.bundle, target], { timeout: 5000 });
@@ -121,10 +151,50 @@ function registerFileOpen({
 
   ipcMain.handle("omnigent:file-open-ssh-host", async (event, hostId, fingerprints) => {
     if (!isPinnedOriginSender(event) || typeof hostId !== "string" || !hostId) return null;
-    return (
-      (await resolveSshHost(event, hostId)) ||
-      (platform === "darwin" ? await discoverSshHost(fingerprints) : null)
-    );
+    const state = sshContext(event);
+    if (!state || platform !== "darwin" || hostId === localHostId()) return null;
+    try {
+      const verifiedAlias = await resolveSshHost(event, hostId);
+      if (!isPinnedOriginSender(event) || sshContext(event) !== state) return null;
+      if (verifiedAlias) {
+        state.hosts.set(hostId, { alias: verifiedAlias, verified: true });
+        return verifiedAlias;
+      }
+      const previous = state.hosts.get(hostId);
+      const keys = fingerprints ?? previous?.fingerprints;
+      const fingerprintKey = JSON.stringify(keys);
+      if (
+        previous &&
+        !previous.verified &&
+        previous.fingerprintKey === fingerprintKey &&
+        now() < previous.expiresAt
+      )
+        return previous.promise;
+      const entry = {
+        alias: null,
+        fingerprints: keys,
+        fingerprintKey,
+        expiresAt: now() + DISCOVERY_TTL_MS,
+      };
+      state.hosts.set(hostId, entry);
+      entry.promise = Promise.resolve()
+        .then(() => discoverSshHost(keys))
+        .catch(() => null)
+        .then((alias) => {
+          if (
+            !isPinnedOriginSender(event) ||
+            sshContext(event) !== state ||
+            state.hosts.get(hostId) !== entry
+          )
+            return null;
+          entry.alias = alias;
+          return alias;
+        });
+      return entry.promise;
+    } catch {
+      state.hosts.delete(hostId);
+      return null;
+    }
   });
 
   ipcMain.handle(
@@ -143,9 +213,17 @@ function registerFileOpen({
       }
       if (typeof directory !== "boolean" || !["cursor", "vscode"].includes(appId)) return false;
       try {
+        const state = sshContext(event);
+        const entry = state?.hosts.get(hostId);
+        if (!entry?.alias || entry.alias !== sshHost) return false;
+        if (entry.verified && (await resolveSshHost(event, hostId)) !== entry.alias) return false;
+        const stillAuthorized = () =>
+          isPinnedOriginSender(event) &&
+          sshContext(event) === state &&
+          state.hosts.get(hostId) === entry;
         const selectedApp = MAC_APPS.find((app) => app.id === appId);
         const appPath = await findApp(selectedApp);
-        if (!appPath) return false;
+        if (!appPath || !stillAuthorized()) return false;
         const executable = path.join(
           appPath,
           "Contents",
@@ -159,9 +237,16 @@ function registerFileOpen({
         delete env.VSCODE_IPC_HOOK_CLI;
         // Foreground the app before its CLI initializes and hands off the SSH workspace.
         await run("/usr/bin/open", ["-a", appPath], { timeout: 5000 }).catch(() => {});
+        if (!stillAuthorized()) return false;
         await run(
           executable,
-          ["--remote", `ssh-remote+${sshHost}`, ...(directory ? [] : ["--goto"]), "--", remotePath],
+          [
+            "--remote",
+            `ssh-remote+${entry.alias}`,
+            ...(directory ? [] : ["--goto"]),
+            "--",
+            directory ? remotePath : `${remotePath}:1:1`,
+          ],
           { timeout: 30000, env },
         );
         return true;

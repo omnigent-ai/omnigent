@@ -20,6 +20,7 @@ import {
   supportsFileReveal,
 } from "@/lib/nativeBridge";
 import { FileViewerContext } from "./FileViewerContext";
+import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 
 /** Folder the Files tree is browsing; its row paths are relative to it. */
 export const RevealBaseContext = createContext("");
@@ -74,7 +75,10 @@ function joinPath(base: string, path: string): string {
 export function useHostFileTarget(path: string | null): RevealTarget | null {
   const ctx = useContext(FileViewerContext);
   const base = useContext(RevealBaseContext);
-  const hostId = ctx?.sessionHostId;
+  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
+    ctx?.conversationId ? getSessionHost(ctx.conversationId) : null,
+  );
+  const hostId = ctx?.sessionHostId || inheritedHostId;
   const root = ctx?.workspaceRoot;
   if (path === null || !root || !hostId) return null;
   return { hostId, path: joinPath(joinPath(root, base), path) };

@@ -966,7 +966,6 @@ def create_hosts_router(
         if user_id is not None and host.user_id != user_id:
             raise HTTPException(status_code=403, detail="not your host")
 
-        connection = host_registry.get(host_id)
         # Status comes from the DB so the answer is consistent across
         # replicas, gated on the liveness freshness window — see
         # list_hosts above for the full rationale.
@@ -987,7 +986,7 @@ def create_hosts_router(
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
             "ssh_host_key_fingerprints": (
-                connection.hello.ssh_host_key_fingerprints if connection is not None else None
+                conn.hello.ssh_host_key_fingerprints if conn is not None else None
             ),
         }
         if (

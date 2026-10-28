@@ -66,10 +66,12 @@ test("missing or unreadable artwork falls back and cleans failed conversions", a
 
 for (const filename of ["", "..", "../secret", "/absolute/icon.icns"]) {
   test(`does not read invalid bundle icon filename ${JSON.stringify(filename)}`, async () => {
+    const commands = [];
     const run = async (command) => {
-      assert.equal(command, "/usr/bin/plutil");
+      commands.push(command);
       return { stdout: filename };
     };
     assert.equal(await readMacAppIcon("/Applications/Editor.app", { run }), null);
+    assert.deepEqual(commands, ["/usr/bin/plutil"]);
   });
 }

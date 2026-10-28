@@ -80,12 +80,21 @@ test("requires a unique match and ignores revoked keys and certificate authoriti
 test("falls back for missing keys, unsupported configs, subprocess failures, or invalid metadata", async (t) => {
   const home = setup(t);
   await Promise.all(
-    ["userknownhostsfile /dev/null", "userknownhostsfile none", ""].map(async (config) => {
+    [
+      "userknownhostsfile /dev/null",
+      "userknownhostsfile none",
+      "userknownhostsfile /keys/%h",
+      "userknownhostsfile relative/keys",
+      "userknownhostsfile /a /b /c /d /e",
+      "",
+    ].map(async (config) => {
+      const commands = [];
       const run = async (command) => {
-        assert.equal(command, "/usr/bin/ssh");
+        commands.push(command);
         return { stdout: `hostname arca.ssh\n${config}` };
       };
       assert.equal(await discoverArcaSshHost([FINGERPRINT], { home, run }), null);
+      assert.deepEqual(commands, ["/usr/bin/ssh"]);
     }),
   );
   const fail = async () => {
@@ -109,4 +118,42 @@ test("falls back for missing keys, unsupported configs, subprocess failures, or 
       },
     ),
   );
+});
+
+test("bounds discovery concurrency and supports arclet aliases", async (t) => {
+  const aliases = Array.from({ length: 9 }, (_, index) => `arclet_${index}.ssh`);
+  const home = setup(t, aliases);
+  let active = 0;
+  let maximum = 0;
+  const run = async (command, args) => {
+    active++;
+    maximum = Math.max(maximum, active);
+    await new Promise(setImmediate);
+    active--;
+    return {
+      stdout:
+        command === "/usr/bin/ssh"
+          ? `hostname ${args[1]}\nport 22\nunused\nuserknownhostsfile /keys/a /keys/b /keys/c /keys/d\n`
+          : args[1] === "arclet_8.ssh"
+            ? `arclet_8.ssh ${KEY}`
+            : "",
+    };
+  };
+  assert.equal(await discoverArcaSshHost([FINGERPRINT], { home, run }), "arclet_8.ssh");
+  assert.ok(maximum <= 4);
+  assert.equal(active, 0);
+});
+
+test("does not examine a partial set of more than 32 saved aliases", async (t) => {
+  const home = setup(
+    t,
+    Array.from({ length: 33 }, (_, index) => `arca_${index}.ssh`),
+  );
+  let calls = 0;
+  const run = async () => {
+    calls++;
+    return { stdout: "" };
+  };
+  assert.equal(await discoverArcaSshHost([FINGERPRINT], { home, run }), null);
+  assert.equal(calls, 0);
 });
