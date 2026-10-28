@@ -1482,9 +1482,26 @@ export function PullRequestPanel({
   );
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {mobileHeaderTarget && createPortal(headerActions, mobileHeaderTarget)}
+      {mobileHeaderTarget?.actions && createPortal(headerActions, mobileHeaderTarget.actions)}
+      {mobileHeaderTarget?.title &&
+        showingDetails &&
+        prs.length > 0 &&
+        createPortal(
+          <div data-mobile-panel-title>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-2"
+              aria-label={`All pull requests (${prs.length})`}
+              onClick={() => setDetailsSession(undefined)}
+            >
+              <ArrowLeftIcon className="size-3.5" /> All pull requests
+            </Button>
+          </div>,
+          mobileHeaderTarget.title,
+        )}
       {showTrackingControls ? (
-        (!inMobileDrawer || showingDetails) && (
+        !inMobileDrawer && (
           <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
             {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
             <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">

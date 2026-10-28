@@ -261,7 +261,8 @@ def test_session_pr_list_long_title(
     expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
     expect(panel.get_by_role("link", name=f"{title} #42")).to_be_visible()
     if viewport_width < 768:
-        expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_have_count(1)
+        expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_have_count(0)
+        expect(header.get_by_role("button", name="All pull requests (2)")).to_be_visible()
         expect(header.get_by_role("button", name="Unlink PR", exact=True)).to_be_visible()
 
 

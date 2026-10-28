@@ -385,7 +385,7 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Cancel" }));
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
-    expect(screen.getAllByRole("heading", { name: "Pull Requests" })).toHaveLength(1);
+    expect(within(header).getByRole("button", { name: "All pull requests (1)" })).toBeVisible();
     expect(within(header).getByRole("button", { name: "Unlink PR" })).toBeEnabled();
     await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
     expect(within(header).queryByRole("button", { name: "Unlink PR" })).toBeNull();
