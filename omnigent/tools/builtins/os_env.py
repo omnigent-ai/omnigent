@@ -44,11 +44,9 @@ _logger = logging.getLogger(__name__)
 
 
 # ── JSON Schemas ──────────────────────────────────────────────
-# Mirror the inner :mod:`omnigent.inner.session` schemas
-# verbatim so the LLM sees the same parameter shapes regardless
-# of which path serves the request. Duplicated literally rather
-# than imported because session.py won't ship with AP-only
-# deployments — copying these here is the cost of layering.
+# AP-side parameter shapes for the four tools. Only ``sys_os_shell`` closes its
+# schema and rejects undeclared names at runtime; the runner relay accepts
+# ``sys_os_edit`` aliases, so the other three stay open.
 
 
 _OS_READ_SCHEMA: dict[str, Any] = {
@@ -132,7 +130,28 @@ _OS_SHELL_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["command"],
+    "additionalProperties": False,
 }
+
+
+def unknown_shell_argument_error(args: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Return an error result when *args* names arguments ``sys_os_shell``
+    does not declare, else ``None``.
+
+    A misnamed optional argument such as ``timeout_seconds`` would
+    otherwise be dropped silently and the 120-second default applied.
+    """
+    accepted = _OS_SHELL_SCHEMA["properties"]
+    unknown = sorted(name for name in args if name not in accepted)
+    if not unknown:
+        return None
+    return {
+        "error": (
+            f"unknown argument(s) for sys_os_shell: {', '.join(unknown)}; "
+            f"accepted arguments: {', '.join(accepted)}"
+        )
+    }
 
 
 class _OSEnvBackedTool(Tool):
@@ -370,8 +389,12 @@ class SysOsShellTool(_OSEnvBackedTool):
         Forward to :meth:`OSEnvironment.shell`.
 
         :param kwargs: Parsed args; ``command`` is required.
-        :returns: OpResult from the OSEnvironment.
+        :returns: OpResult from the OSEnvironment, or the
+            unknown-argument error.
         """
+        rejected = unknown_shell_argument_error(kwargs)
+        if rejected is not None:
+            return rejected
         return dict(
             await self._os_env.shell(
                 command=kwargs["command"],

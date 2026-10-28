@@ -696,6 +696,12 @@ Follow these rules for each clip:
   never shows its sub-agent's return, a toast never appears), film the
   triggering action and the screen staying in that stale state, with whatever
   error the product does show, for longer than a healthy response takes.
+- Keep the last complete clip until its replacement is finalized. Re-record
+  into a new raw directory and swap the stable path only after the new take
+  checks out; never delete an earlier clip in the re-run command.
+- If a re-record fails or is cut short, attach the best complete clip you have
+  with a caption that states its limits. `recordings: []` is for a facet with
+  no usable clip at all.
 - If recording is blocked by missing tools or an environment that cannot run
   the journey, set `recordings: []` and name the specific blocker in
   `recording_unavailable_reason`. Do not block the verdict because footage is
@@ -703,9 +709,9 @@ Follow these rules for each clip:
 - A blocker is the observed result of a recorder run. When the preflight
   recorder check passed, point the recorder at the facet's lane before declaring
   it blocked, and name the command you ran and its observed error in
-  `recording_unavailable_reason`. "The recorder was not stood up", a
-  multi-process journey, a flaky native boot, or a bug that is an absence are
-  not blockers; a reason that names no attempted recorder run is insufficient.
+  `recording_unavailable_reason`, with the limit you requested, not an inferred
+  platform ceiling. "The recorder was not stood up", a multi-process journey, a
+  flaky native boot, or a bug that is an absence are not blockers; a reason that names no attempted recorder run is insufficient.
 
 ## Output — the reproduction artifacts
 

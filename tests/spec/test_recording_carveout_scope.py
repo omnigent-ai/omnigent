@@ -39,6 +39,17 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
+def test_lane_rules_keep_the_last_complete_clip_and_report_observed_blockers() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+
+    assert "Keep the last complete clip until its replacement is finalized" in lanes
+    assert "Never delete the earlier clip as part of the re-run command" in lanes
+    assert "a caption that states its limits" in lanes
+    assert "Reserve `recordings: []` for a facet with no usable clip at all" in lanes
+    assert "not an inferred platform ceiling" in lanes
+    assert "`sys_os_shell` takes `timeout` (seconds; default 120)" in lanes
+
+
 def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_REPRO_AGENT / "AGENTS.md")
     lanes = _normalized(_DEV / "recording-lanes.md")
@@ -103,3 +114,15 @@ def test_caption_rules_reach_the_agent_without_treating_hidden_labels_as_visible
     assert "Quote only text the viewer can see" in lanes
     assert "quote only visibly rendered text" in instructions
     assert "hidden accessibility labels and backend logs are not screen evidence" in instructions
+
+
+def test_repro_clip_retention_rules_match_the_shared_guide() -> None:
+    instructions = _normalized(_DEV / "repro-agent" / "AGENTS.md")
+
+    assert "Keep the last complete clip until its replacement is finalized" in instructions
+    assert "never delete an earlier clip in the re-run command" in instructions
+    assert (
+        "attach the best complete clip you have with a caption that states its limits"
+        in instructions
+    )
+    assert "not an inferred platform ceiling" in instructions
