@@ -203,6 +203,55 @@ class CodexAppServerSilentStartTimeout(RuntimeError):
         self.last_error_type = last_error_type
 
 
+# Codex's whole stderr line when the selected model_provider has no table.
+_MISSING_MODEL_PROVIDER_LINE = re.compile(r"Error: Model provider `([^`]+)` not found")
+
+
+class CodexModelProviderMissingError(OmnigentError, RuntimeError):
+    """Codex's config selects a model provider that it does not define.
+
+    Coded ``HARNESS_NOT_CONFIGURED``: the ``[model_providers.X]`` table lives
+    in the person's own Codex config, so only they can restore it, and a
+    terminal start failure shows this message verbatim. Subclasses
+    :class:`RuntimeError`, the error ``start()`` raises for an early exit.
+    """
+
+    def __init__(self, provider: str, config_path: Path) -> None:
+        """
+        :param provider: Missing provider id, e.g. ``"Databricks"``.
+        :param config_path: Codex config the provider is bridged from, e.g.
+            ``Path.home() / ".codex" / "config.toml"``.
+        """
+        try:
+            shown_path = f"~/{config_path.relative_to(Path.home())}"
+        except ValueError:
+            shown_path = str(config_path)
+        super().__init__(
+            f"Codex config {shown_path} has no [model_providers.{provider}] table "
+            "for the selected model provider. Restore it, or pick another provider "
+            "with `omnigent setup`.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+        self.provider = provider
+
+
+def _missing_model_provider(stderr_lines: Sequence[str]) -> str | None:
+    """
+    Return the provider id Codex reported missing at startup, if any.
+
+    Only the bare form counts: ``error loading default config after config
+    error: ...`` is a legacy-profile failure with a different remedy.
+
+    :param stderr_lines: Recent app-server stderr lines, oldest first.
+    :returns: The provider id, e.g. ``"Databricks"``, or ``None``.
+    """
+    for line in reversed(stderr_lines):
+        match = _MISSING_MODEL_PROVIDER_LINE.fullmatch(line.strip())
+        if match is not None:
+            return match.group(1)
+    return None
+
+
 @dataclass(frozen=True)
 class _CodexModelDiscoveryProcess:
     """Short-lived Codex process, its bounded stderr drain and crash-reap registration."""
@@ -2689,6 +2738,8 @@ class CodexNativeAppServer:
         :raises CodexAppServerSilentStartTimeout: If the budget expires while
             the process is still alive and never initialized; ``start()``
             respawns it once.
+        :raises CodexModelProviderMissingError: If the app-server exits because
+            its config selects an undefined model provider.
         :raises RuntimeError: If the app-server exits early.
         """
         loop = asyncio.get_running_loop()
@@ -2696,7 +2747,13 @@ class CodexNativeAppServer:
         last_error: Exception | None = None
         while loop.time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
-                detail = " | ".join((self.recent_stderr or [])[-5:])
+                recent_stderr = self.recent_stderr or []
+                provider = _missing_model_provider(recent_stderr)
+                if provider is not None:
+                    raise CodexModelProviderMissingError(
+                        provider, _codex_home_config_source_from_env() / "config.toml"
+                    )
+                detail = " | ".join(recent_stderr[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
             client: CodexAppServerClient | None = None
             try:
