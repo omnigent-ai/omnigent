@@ -1707,7 +1707,7 @@ function ComposerSendShortcutControl() {
  * Where a plain click on a web link in chat content opens — desktop shells
  * with the embedded browser only. Off keeps the current behavior (the
  * default external browser); on routes the link into the conversation's
- * in-app Browser tab. Modified clicks always stay external.
+ * in-app browser tabs. Shift-click always stays external.
  */
 function OpenLinksInAppControl() {
   const [enabled, setEnabled] = useState(readOpenLinksInApp);
@@ -1725,7 +1725,7 @@ function OpenLinksInAppControl() {
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
-        description={`Open web links from chat in this conversation's Browser tab instead of your default browser. ${MOD_KEY}+click always opens the external browser.`}
+        description={`Open web links from chat in in-app browser tabs, reusing a tab already showing the same URL. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
         descriptionClassName="text-ui"
       />
       <Switch

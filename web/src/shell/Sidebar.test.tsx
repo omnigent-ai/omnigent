@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
 // longer carries a filter funnel (agent-type filter + "Show archived"
@@ -132,14 +133,15 @@ vi.mock("@/hooks/useConversations", async () => {
       data:
         projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
     }),
-    useProjectSessions: (project: string, enabled: boolean) => {
+    useProjectSessions: (project: string, enabled: boolean, _sortBy: unknown, archived = false) => {
       const override = projectSessionsMock.current[project];
       const loading = enabled && projectSessionsLoadingRef.current;
       const rows = !enabled
         ? []
         : (override ??
           conversationsRef.current.filter(
-            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+            (c) =>
+              (c.labels?.omni_project ?? null) === project && (c.archived === true) === archived,
           ));
       return {
         data:
@@ -570,7 +572,8 @@ describe("Sidebar session list", () => {
     selectSessionFilter(view);
 
     expect(screen.getByText("pinned-session")).toBe(pinned);
-    expect(screen.getByText("filed-session")).toBe(filed);
+    if (view === "archived") expect(screen.queryByText("filed-session")).toBeNull();
+    else expect(screen.getByText("filed-session")).toBe(filed);
     expect(screen.getByTestId("session-filter")).toBe(filter);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(sessions).getByRole("status")).toHaveTextContent(
@@ -582,7 +585,8 @@ describe("Sidebar session list", () => {
     }
     selectSessionFilter("mine");
     expect(screen.getByText("pinned-session")).toBe(pinned);
-    expect(screen.getByText("filed-session")).toBe(filed);
+    if (view === "archived") expect(screen.getByText("filed-session")).toBeInTheDocument();
+    else expect(screen.getByText("filed-session")).toBe(filed);
   });
 
   it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
@@ -3763,6 +3767,61 @@ describe("Sidebar view options", () => {
     });
   });
 
+  it("shows the server's stored PR while the host is offline", async () => {
+    usePullRequestInfoMock.mockReturnValue({ data: undefined });
+    mockConversations([
+      conv("conv_offline", "Codex", {
+        workspace: "/Users/me/omnigent",
+        pull_request: {
+          url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+          provider: "github",
+          repository: "omnigent-ai/omnigent",
+          number: 7918,
+          title: "Ship it",
+          state: "MERGED",
+          is_draft: false,
+        },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_offline" }), {
+      pointerType: "mouse",
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("session-tooltip-repo")).toHaveTextContent("Repoomnigent");
+      expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent("PR#7918 · Merged");
+    });
+  });
+
+  it("says how old a stale stored PR state is", async () => {
+    usePullRequestInfoMock.mockReturnValue({ data: undefined });
+    mockConversations([
+      conv("conv_stale", "Codex", {
+        workspace: "/Users/me/omnigent",
+        pull_request: {
+          url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+          provider: "github",
+          repository: "omnigent-ai/omnigent",
+          number: 7918,
+          state: "OPEN",
+          is_draft: false,
+          state_checked_at: Date.now() / 1000 - 2 * 3600,
+        },
+      }),
+    ]);
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_stale" }), {
+      pointerType: "mouse",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent(
+        "PR#7918 · Open (as of 2h ago)",
+      ),
+    );
+  });
+
   it("skips the GitHub lookup for a session without a workspace", async () => {
     mockConversations([conv("conv_bare", "Codex", { owner: null })]);
     renderGroupingSidebar();
@@ -4064,6 +4123,74 @@ describe("sidebar_grouping_ui release flag", () => {
     fireEvent.click(screen.getByRole("button", { name: "Shared" }));
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
+
+  it.each(["first-class", "legacy"])(
+    "shows owned archived %s project members only, then restores live members",
+    (membership) => {
+      projectsMock.push("Alpha", "Empty");
+      const filed =
+        membership === "first-class"
+          ? { project_id: "p_Alpha" }
+          : { labels: { omni_project: "Alpha" } };
+      const live = conv("live_filed", "Claude Code", filed);
+      const archived = conv("archived_filed", "Claude Code", {
+        ...filed,
+        archived: true,
+        labels: { ...("labels" in filed ? filed.labels : {}), [PINNED_LABEL_KEY]: "1" },
+      });
+      seedPins(["archived_filed"]);
+      const unfiled = conv("archived_unfiled", "Claude Code", { archived: true });
+      const shared = conv("archived_shared", "Claude Code", {
+        ...filed,
+        archived: true,
+        owner: "other@example.com",
+      });
+      mockConversations([live, archived, unfiled, shared]);
+      // Folder pages can contain members outside the global archived window.
+      const older = conv("older_archived_filed", "Claude Code", { ...filed, archived: true });
+      const original = useConvMock.getMockImplementation()!;
+      useConvMock.mockImplementation((...args) =>
+        args[4] === "archived"
+          ? ({
+              ...original(...args),
+              data: {
+                pages: [{ data: [archived, unfiled, shared], has_more: false }],
+                pageParams: [undefined],
+              },
+            } as ReturnType<typeof useConversations>)
+          : original(...args),
+      );
+      projectSessionsMock.current.Alpha = [live];
+      const view = renderGroupingSidebar();
+      fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+      expect(screen.getByText("live_filed")).toBeInTheDocument();
+
+      projectSessionsMock.current.Alpha = [archived, older, shared];
+      selectSessionFilter("archived");
+      const folder = screen.getByRole("button", { name: "Alpha" }).closest("section")!;
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      expect(within(folder).getByText("archived_filed")).toBeInTheDocument();
+      expect(within(folder).getByText("older_archived_filed")).toBeInTheDocument();
+      expect(within(folder).queryByText("archived_shared")).toBeNull();
+      expect(screen.queryByText("live_filed")).toBeNull();
+      expect(within(sessions).getByText("archived_unfiled")).toBeInTheDocument();
+      expect(within(sessions).queryByText("archived_filed")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Empty" }));
+      expect(screen.getByText("No archived sessions")).toBeInTheDocument();
+      expect(
+        within(screen.getByRole("button", { name: "Empty" }).closest("section")!).queryByRole(
+          "link",
+          { name: "new session" },
+        ),
+      ).toBeNull();
+
+      projectSessionsMock.current.Alpha = [live];
+      selectSessionFilter("mine");
+      expect(within(folder).getByText("live_filed")).toBeInTheDocument();
+      expect(screen.queryByText("archived_filed")).toBeNull();
+      view.unmount();
+    },
+  );
 
   it("keeps a shared session with a colliding project label in the Shared list", () => {
     projectsMock.push("Alpha");

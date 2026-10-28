@@ -243,6 +243,9 @@ if TYPE_CHECKING:
 # Workspaces whose fs reader (and change registry) stay warm between requests.
 _FS_READER_CACHE_SIZE = 8
 
+# Older servers omit a create's timeout_s and wait 150 s for its reply; finish inside that.
+_LEGACY_SERVER_CREATE_BUDGET_S = 140.0
+
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -818,6 +821,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HOST_SANDBOX_BACKEND",
         # Executable selection must survive CLI -> daemon -> runner. The
         # passthrough list is only applied at the second boundary.
+        "OMNIGENT_CLAUDE_PATH",
         "OMNIGENT_CODEX_PATH",
         "OMNIGENT_PI_PATH",
         # Credential-env denylists must survive both daemon and runner hops.
@@ -4373,6 +4377,9 @@ class HostProcess:
         :returns: Result frame with the worktree path and branch on
             success, or ``status: "failed"`` with an error message.
         """
+        timeout_s = (
+            frame.timeout_s if frame.timeout_s is not None else _LEGACY_SERVER_CREATE_BUDGET_S
+        )
         try:
             # Pause the orphan reaper: create_worktree runs git via
             # subprocess.run, whose children are direct children of this host
@@ -4385,12 +4392,29 @@ class HostProcess:
                     branch_name=frame.branch_name,
                     base_branch=frame.base_branch,
                     existing_branch=frame.existing_branch,
+                    timeout_s=timeout_s,
                 )
         except WorktreeError as exc:
             return HostCreateWorktreeResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=exc.message,
+            )
+        except OSError as exc:
+            # Reply so the server does not wait out its whole create bound.
+            _logger.warning("Could not create worktree from %s", frame.repo_path, exc_info=True)
+            return HostCreateWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"host filesystem error: {exc}",
+            )
+        except Exception as exc:
+            # Any other crash must still answer, or the server waits out its whole bound.
+            _logger.exception("Worktree creation crashed for %s", frame.repo_path)
+            return HostCreateWorktreeResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"worktree creation crashed on the host ({type(exc).__name__})",
             )
         _logger.info(
             "Created worktree %s (branch %s) from %s",

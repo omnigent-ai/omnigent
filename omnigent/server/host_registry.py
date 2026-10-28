@@ -191,6 +191,16 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
 
 
+def _fail_pending_worktrees(conn: HostConnection) -> None:
+    """Fail worktree requests as soon as their host disappears."""
+    for pending in (
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+    ):
+        _fail_pending_inventory(pending, conn.host_id)
+
+
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
     """Wake account/login route waiters when their tunnel disappears."""
     for pending in (
@@ -691,6 +701,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_worktrees(old)
                 _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -741,6 +752,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_worktrees(removed)
         _fail_pending_harness_rpcs(removed)
         return True
 

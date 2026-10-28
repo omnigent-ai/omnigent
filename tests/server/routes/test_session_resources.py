@@ -4766,6 +4766,74 @@ async def test_shell_proxies_to_runner(
     assert published == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "response_body", "kind"),
+    [
+        (502, "", "empty"),
+        (503, "private-upstream-body", "invalid_json"),
+        (403, "private-upstream-body", "invalid_json"),
+        (200, "private-upstream-body", "invalid_json"),
+        (200, "[]", "non_object"),
+    ],
+    ids=["empty-gateway-error", "unavailable", "forbidden", "non-json-success", "array-success"],
+)
+@pytest.mark.parametrize(
+    ("method", "resource_path", "body"),
+    [
+        ("POST", "shell", {"command": "private-shell-command"}),
+        ("PUT", "filesystem/new.txt", {"content": "private-file-content"}),
+        ("PATCH", "filesystem/existing.txt", {"old_text": "old", "new_text": "new"}),
+        ("DELETE", "filesystem/old.txt", None),
+    ],
+)
+async def test_resource_mutation_invalid_response_preserves_status_without_replaying(
+    client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    response_body: str,
+    kind: str,
+    method: str,
+    resource_path: str,
+    body: dict[str, Any] | None,
+) -> None:
+    """Unreadable replies retain error status, safe evidence and mutation uncertainty."""
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/"
+        + resource_path
+    )
+    fake_runner = _FakeRunnerClient(
+        text_responses={
+            path: (
+                status,
+                response_body,
+                {"content-type": "private-content-type", "x-request-id": "private-request-id"},
+            )
+        }
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.ERROR):
+        response = await client.request(method, path, json=body)
+
+    assert response.status_code == (status if status >= 400 else 502)
+    assert "operation may have completed" in response.json()["detail"]
+    assert fake_runner.calls == [(method, path)]
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_resource_response_invalid"
+    ]
+    assert len(records) == 1
+    attributes = records[0].attributes
+    assert attributes["http_status"] == status
+    assert attributes["method"] == method
+    assert attributes["response_kind"] == kind
+    assert attributes["response_bytes"] == len(response_body)
+    assert attributes["content_type"] == "other"
+    assert "private-" not in response.text + records[0].getMessage() + json.dumps(attributes)
+
+
 # ── Conversation deletion cleanup test ───────────────────────────
 
 
@@ -6530,16 +6598,21 @@ async def test_kiro_prompt_with_literal_attachment_text_matches_its_entry() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expire_during_append", [False, True])
 @pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
 async def test_claude_native_failed_slash_command_append_restores_its_entry(
     prior_state: str,
+    expire_during_append: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A slash-command mirror whose append fails puts its queued entry back, in order."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
     pending_inputs.reset_for_tests()
-    store = _FailOnceStore()
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    store = _BlockingStore(fail_first_append=True)
     sid = "64a784c3aa907d1774f44313546947c6"
     conv = store.get_conversation(sid)
     assert conv is not None
@@ -6565,13 +6638,23 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
     )
 
     try:
-        with pytest.raises(RuntimeError, match="database unavailable"):
-            await _persist_external_conversation_item(
+        persist = asyncio.create_task(
+            _persist_external_conversation_item(
                 sid,
                 conv,
                 body,
                 store,  # type: ignore[arg-type]
             )
+        )
+        try:
+            assert await asyncio.to_thread(store.first_append_started.wait, 2)
+            if expire_during_append:
+                now[0] += pending_inputs._TTL_S + 1
+                assert pending_inputs.snapshot_for(sid) == []
+        finally:
+            store.release_first_append.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await persist
         assert store.appended_items == []
         assert pending_inputs.pending_ids(sid) == [older, command]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
@@ -6590,9 +6673,27 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
             [] if prior_state == "interrupted" else [older]
         )
-        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
-        assert delayed.matched is not None and delayed.matched.pending_id == older
-        assert delayed.matched.interrupted == (prior_state == "interrupted")
+        pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                    },
+                    "response_id": "resp_continue",
+                    "source_id": "claude:continue:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        errors = [item.data.code for item in store.appended_items if item.type == "error"]
+        assert errors == (["native_prompt_not_recorded"] if prior_state == "plain" else [])
+        assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()
 

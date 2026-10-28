@@ -5856,6 +5856,14 @@ _CODEX_LOGIN_EXPIRED_DETAIL = (
             {},
         ),
         (
+            "API Error: The response stopped arriving. The response above may be incomplete.",
+            "transient_upstream_error",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
             "We’re currently experiencing high demand, which may cause temporary errors.",
             "transient_upstream_error",
             {},
@@ -5961,6 +5969,24 @@ async def test_native_failures_are_coded_live_and_after_reload(
         expected_code = "codex_turn_error" if wire_output else "native_turn_error"
     session_id = session["id"]
     response_id = "resp_native_coded_failure"
+    partial_text = "The first part of the answer."
+    partial_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": response_id,
+                "source_id": "src_native_partial_answer",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": wrapper,
+                    "content": [{"type": "output_text", "text": partial_text}],
+                },
+            },
+        },
+    )
+    assert partial_resp.status_code == 202, partial_resp.text
     item_resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -6000,12 +6026,19 @@ async def test_native_failures_are_coded_live_and_after_reload(
 
     snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
     assert snapshot_resp.status_code == 200, snapshot_resp.text
+    assert snapshot_resp.json()["status"] == "failed"
     assert snapshot_resp.json()["last_task_error"] == {
         "code": expected_code,
         "message": detail,
         "agent_name": wrapper,
         **card,
     }
+    assert partial_text in [
+        block.get("text")
+        for item in snapshot_resp.json()["items"]
+        if item.get("type") == "message"
+        for block in item.get("data", {}).get("content", [])
+    ]
 
 
 async def test_post_external_session_status_propagates_runner_delivery_failure(

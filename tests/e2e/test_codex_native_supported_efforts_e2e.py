@@ -41,6 +41,105 @@ _EXTENDED_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_EXTENDED_MODEL", "gpt-6-so
 _SWITCH_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_SWITCH_MODEL", "gpt-5.6-sol")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("codex_effort_rig", [30], indirect=True)
+def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -> None:
+    """A real native turn pins a runner until it settles, without a web message."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium", terminal=True)
+        terminate_process(rig.stack.runner)
+        rig.stack.runner = None
+        rig.stack.start_runner(cwd=_REPO_ROOT, env=rig.runner_env)
+        session.ensure_terminal(rig)
+        runner_log = max((rig.stack.runner_home / ".omnigent/logs/runner").glob("*.log"))
+        assert "Runner session initialization started" not in runner_log.read_text()
+        marker = f"TERMINAL_ONLY_{uuid.uuid4().hex}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={"key": _STANDARD_MODEL, "responses": [{"text": marker, "block": True}] * 12},
+            )
+        )
+        before = len(_json(rig.model.get("/mock/requests"))["requests"])
+        session.tmux("send-keys", "-l", f"Reply with {marker}")
+        time.sleep(0.5)
+        session.tmux("send-keys", "Enter")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            state = read_bridge_state(session.bridge)
+            requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
+            own = [
+                request
+                for request in requests
+                if state is not None and request.get("prompt_cache_key") == state.thread_id
+            ]
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            if own and snapshot.get("status") == "running":
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                "Terminal input did not reach the mock provider.\n"
+                f"{session.tmux('capture-pane', '-p')}"
+            )
+        assert len(own) == 1
+        assert state is not None
+        assert rig.stack.runner is not None
+        held_at = time.monotonic()
+        try:
+            # Do not send runner requests or keep a terminal WebSocket attached here.
+            while time.monotonic() - held_at < 36:
+                assert rig.stack.runner.poll() is None, rig.stack.log_tail()
+                time.sleep(0.25)
+            held_seconds = time.monotonic() - held_at
+            (rig.stack.root / "held-terminal.txt").write_text(session.tmux("capture-pane", "-p"))
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                items = _json(
+                    rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100})
+                )["data"]
+                replies = [
+                    item
+                    for item in items
+                    if item.get("role") == "assistant"
+                    and marker in json.dumps(item.get("content"))
+                ]
+                state = read_bridge_state(session.bridge)
+                snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+                if replies and snapshot.get("status") == "idle":
+                    break
+                time.sleep(0.2)
+            else:
+                pytest.fail(f"Terminal turn did not settle.\n{rig.stack.log_tail()}")
+            assert len(replies) == 1
+            assert len([item for item in items if item.get("role") == "user"]) == 2
+            return_code = rig.stack.runner.wait(timeout=50)
+            assert return_code == 0, rig.stack.log_tail()
+            log = runner_log.read_text()
+            assert "idle timeout reached" in log, log[-4000:]
+            assert "Runner session initialization started" not in log
+            (rig.stack.root / "terminal-only-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "held_seconds": held_seconds,
+                        "idle_timeout_s": 30,
+                        "requests": own,
+                        "reply_count": len(replies),
+                        "runner_exit": return_code,
+                    },
+                    indent=2,
+                )
+            )
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.timeout(240),
@@ -85,7 +184,9 @@ class _Rig:
 
 @pytest.fixture(scope="module")
 def codex_effort_rig(
-    tmp_path_factory: pytest.TempPathFactory, mock_llm_server_url: str
+    tmp_path_factory: pytest.TempPathFactory,
+    mock_llm_server_url: str,
+    request: pytest.FixtureRequest,
 ) -> Iterator[_Rig]:
     """Own a real server, runner, and private Codex home without ambient credentials."""
     root = tmp_path_factory.mktemp("codex-supported-efforts")
@@ -96,7 +197,7 @@ def codex_effort_rig(
     (config / "config.yaml").write_text(
         json.dumps(
             {
-                "runner": {"idle_timeout_s": 0},
+                "runner": {"idle_timeout_s": getattr(request, "param", 0)},
                 "providers": {
                     "effort-test": {
                         "kind": "key",
@@ -595,3 +696,113 @@ def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
         assert resumed.socket_path != original.socket_path, "A new app-server must own the resume"
         assert resumed.thread_id == original.thread_id, "Resume must retain the existing thread"
         _assert_turn(rig, session, _STANDARD_MODEL, "low", terminal=True)
+
+
+def test_fresh_terminal_turn_reports_running_before_first_model_output(
+    codex_effort_rig: _Rig,
+) -> None:
+    """Fresh subscription recovers running status before any model output arrives."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        marker = f"FRESH_QUIET_{uuid.uuid4().hex}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={"key": _STANDARD_MODEL, "responses": [{"text": marker, "block": True}] * 12},
+            )
+        )
+        logs = rig.stack.runner_home / ".omnigent/logs/runner"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(
+                "not ready yet (no/empty rollout)" in path.read_text()
+                for path in logs.glob("*.log")
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("The fresh native thread never reached its no-rollout subscription wait")
+        session.tmux("send-keys", "-l", f"Reply with {marker}")
+        time.sleep(0.5)
+        session.tmux("send-keys", "Enter")
+        try:
+            deadline = time.monotonic() + 20
+            requests = []
+            while time.monotonic() < deadline:
+                state = read_bridge_state(session.bridge)
+                requests = [
+                    request
+                    for request in _json(rig.model.get("/mock/requests"))["requests"]
+                    if state is not None and request.get("prompt_cache_key") == state.thread_id
+                ]
+                if requests:
+                    break
+                time.sleep(0.1)
+            assert len(requests) == 1, session.tmux("capture-pane", "-p")
+            assert state is not None
+
+            async def native_snapshot() -> dict[str, Any]:
+                observer = client_for_transport(
+                    state.socket_path, client_name="fresh-turn-observer"
+                )
+                await observer.connect()
+                try:
+                    response = await observer.request(
+                        "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                    )
+                    return response["result"]["thread"]
+                finally:
+                    await observer.close()
+
+            native = asyncio.run(native_snapshot())
+            (rig.stack.root / "fresh-native-thread.json").write_text(json.dumps(native, indent=2))
+            assert len(native["turns"]) == 1
+            turn = native["turns"][0]
+            assert turn["status"] == "inProgress", native
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+                bridge = read_bridge_state(session.bridge)
+                if (
+                    snapshot.get("status") == "running"
+                    and bridge is not None
+                    and bridge.active_turn_id == turn["id"]
+                ):
+                    break
+                time.sleep(0.1)
+            (rig.stack.root / "fresh-quiet-terminal.txt").write_text(
+                session.tmux("capture-pane", "-p")
+            )
+            (rig.stack.root / "fresh-session-before-output.json").write_text(
+                json.dumps(snapshot, indent=2)
+            )
+            assert snapshot.get("status") == "running", snapshot.get("status")
+            assert bridge is not None and bridge.active_turn_id == turn["id"]
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            assert len([item for item in items if item.get("role") == "user"]) == 1
+            assert not any(item.get("role") == "assistant" for item in items)
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            replies = [
+                item
+                for item in items
+                if item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+            ]
+            if snapshot.get("status") == "idle" and replies:
+                break
+            time.sleep(0.1)
+        assert len(replies) == 1
+        assert len([item for item in items if item.get("role") == "user"]) == 1
+        assert snapshot.get("status") == "idle"
+        bridge = read_bridge_state(session.bridge)
+        assert bridge is not None and bridge.active_turn_id is None

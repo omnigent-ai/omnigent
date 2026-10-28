@@ -521,107 +521,111 @@ it("gates Created ordering and separates its pagination from Updated caches", as
   expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
 });
 
-it("clears destination sort snapshots while folders, pins and Archived reload", async () => {
-  groupingUi = true;
-  view = "all";
-  client.setQueryDefaults(["project-sessions"], { staleTime: 30_000 });
-  let updatedAt = 100;
-  let release!: () => void;
-  let pending = Promise.resolve();
-  fetchMock.mockImplementation(async (url: string) => {
-    await pending;
-    const p = params(url);
-    const next: Conversation = {
-      ...row(p.get("visibility") ?? "mine", p.get("visibility") === "shared"),
-      updated_at: updatedAt,
-      archived: p.get("visibility") === "archived",
-      labels: p.has("pinned") ? { [PINNED_LABEL_KEY]: "1" } : {},
+it.each([false, true])(
+  "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",
+  async (archivedFolder) => {
+    groupingUi = true;
+    view = "all";
+    client.setQueryDefaults(["project-sessions"], { staleTime: 30_000 });
+    let updatedAt = 100;
+    let release!: () => void;
+    let pending = Promise.resolve();
+    fetchMock.mockImplementation(async (url: string) => {
+      await pending;
+      const p = params(url);
+      const next: Conversation = {
+        ...row(p.get("visibility") ?? "mine", p.get("visibility") === "shared"),
+        updated_at: updatedAt,
+        archived: p.get("visibility") === "archived" || p.get("include_archived") === "true",
+        labels: p.has("pinned") ? { [PINNED_LABEL_KEY]: "1" } : {},
+      };
+      return response([next]);
+    });
+    const { result } = renderHook(
+      () => {
+        const sidebar = useSidebarData();
+        const folder = useProjectSessions("folder", true, sidebar.sortBy, archivedFolder);
+        const archived = useArchivedSessions(true, sidebar.sortBy);
+        return { ...sidebar, folder, archived };
+      },
+      { wrapper },
+    );
+    const timestamps = () => [
+      ...[
+        result.current.mine,
+        result.current.shared,
+        result.current.folder,
+        result.current.archived,
+      ].map((query) => query.data?.pages[0].data[0]?.updated_at),
+      result.current.pinned.data?.conversations[0]?.updated_at,
+    ];
+    await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
+    act(() => result.current.updateView({ ordering: "created" }));
+    await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
+    updatedAt = 200;
+    await act(async () => {
+      await result.current.all.refetch?.();
+    });
+    await waitFor(() => expect(result.current.mine.data?.pages[0].data[0].updated_at).toBe(200));
+    expect(
+      client.getQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"])?.pages[0]
+        .data[0].updated_at,
+    ).toBe(100);
+
+    const unrelatedKey = ["conversations", "search", false];
+    const unrelatedData = {
+      pages: [sessionRowsPage([row("search-result")])],
+      pageParams: [undefined],
     };
-    return response([next]);
-  });
-  const { result } = renderHook(
-    () => {
-      const sidebar = useSidebarData();
-      const folder = useProjectSessions("folder", true, sidebar.sortBy);
-      const archived = useArchivedSessions(true, sidebar.sortBy);
-      return { ...sidebar, folder, archived };
-    },
-    { wrapper },
-  );
-  const timestamps = () => [
-    ...[
-      result.current.mine,
-      result.current.shared,
-      result.current.folder,
-      result.current.archived,
-    ].map((query) => query.data?.pages[0].data[0]?.updated_at),
-    result.current.pinned.data?.conversations[0]?.updated_at,
-  ];
-  await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
-  act(() => result.current.updateView({ ordering: "created" }));
-  await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
-  updatedAt = 200;
-  await act(async () => {
-    await result.current.all.refetch?.();
-  });
-  await waitFor(() => expect(result.current.mine.data?.pages[0].data[0].updated_at).toBe(200));
-  expect(
-    client.getQueryData<ScopeCacheData>(["conversations", "", false, null, "mine"])?.pages[0]
-      .data[0].updated_at,
-  ).toBe(100);
+    client.setQueryData(unrelatedKey, unrelatedData);
+    pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "updated" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    expect(
+      [
+        result.current.mine,
+        result.current.shared,
+        result.current.folder,
+        result.current.archived,
+        result.current.pinned,
+      ].every((query) => query.isLoading),
+    ).toBe(true);
+    expect(client.getQueryData(unrelatedKey)).toBe(unrelatedData);
+    await act(async () => {
+      release();
+    });
+    await waitFor(() => expect(timestamps()).toEqual([200, 200, 200, 200, 200]));
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(fetchMock.mock.calls.every(([url]) => params(url).get("sort_by") === "updated_at")).toBe(
+      true,
+    );
+    expect(
+      client.getQueryState(["conversations", "", false, null, "mine", "created_at"])?.isInvalidated,
+    ).toBe(true);
+    expect(
+      client.getQueryState(["project-sessions", "folder", "created_at", archivedFolder])
+        ?.isInvalidated,
+    ).toBe(true);
 
-  const unrelatedKey = ["conversations", "search", false];
-  const unrelatedData = {
-    pages: [sessionRowsPage([row("search-result")])],
-    pageParams: [undefined],
-  };
-  client.setQueryData(unrelatedKey, unrelatedData);
-  pending = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  fetchMock.mockClear();
-  act(() => result.current.updateView({ ordering: "updated" }));
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-  expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
-  expect(
-    [
-      result.current.mine,
-      result.current.shared,
-      result.current.folder,
-      result.current.archived,
-      result.current.pinned,
-    ].every((query) => query.isLoading),
-  ).toBe(true);
-  expect(client.getQueryData(unrelatedKey)).toBe(unrelatedData);
-  await act(async () => {
-    release();
-  });
-  await waitFor(() => expect(timestamps()).toEqual([200, 200, 200, 200, 200]));
-  expect(fetchMock).toHaveBeenCalledTimes(5);
-  expect(fetchMock.mock.calls.every(([url]) => params(url).get("sort_by") === "updated_at")).toBe(
-    true,
-  );
-  expect(
-    client.getQueryState(["conversations", "", false, null, "mine", "created_at"])?.isInvalidated,
-  ).toBe(true);
-  expect(client.getQueryState(["project-sessions", "folder", "created_at"])?.isInvalidated).toBe(
-    true,
-  );
-
-  updatedAt = 300;
-  pending = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  fetchMock.mockClear();
-  act(() => result.current.updateView({ ordering: "created" }));
-  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-  expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
-  await act(async () => {
-    release();
-  });
-  await waitFor(() => expect(timestamps()).toEqual([300, 300, 300, 300, 300]));
-  expect(fetchMock).toHaveBeenCalledTimes(5);
-  fetchMock.mockClear();
-  act(() => result.current.updateView({ ordering: "created", grouping: "status" }));
-  expect(fetchMock).not.toHaveBeenCalled();
-});
+    updatedAt = 300;
+    pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "created" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
+    expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    await act(async () => {
+      release();
+    });
+    await waitFor(() => expect(timestamps()).toEqual([300, 300, 300, 300, 300]));
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "created", grouping: "status" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+  },
+);
