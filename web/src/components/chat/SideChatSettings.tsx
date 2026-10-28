@@ -16,7 +16,7 @@ import {
   nativeModelLabel,
   nativeModelTooltip,
 } from "@/lib/composerModelLabel";
-import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
+import { currentFusionCombo, fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -35,7 +35,7 @@ import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { updateSession } from "@/lib/sessionsApi";
 import { parentIdFromLabels } from "@/lib/sessionHost";
-import type { SideChatModelSettings } from "@/lib/sideChat";
+import { sideChatSettingsMutationKey, type SideChatModelSettings } from "@/lib/sideChat";
 import type { Session } from "@/lib/types";
 
 /** Model controls always address this pane's session, independent of the active main chat. */
@@ -63,7 +63,7 @@ export function SideChatSettings({
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
-  const mutationKey = ["side-chat-settings", session.id];
+  const mutationKey = sideChatSettingsMutationKey(session.id);
   const saving = useIsMutating({ mutationKey }) > 0;
   const [error, setError] = useState<string | null>(null);
   const mutation = useMutation({
@@ -164,7 +164,9 @@ export function SideChatSettings({
                   className: "whitespace-normal break-words",
                   disabled,
                   onSelect: () => {
-                    const nextModel = option === fusionModel && model ? model : option.id;
+                    const nextModel = option.fusion
+                      ? currentFusionCombo(option.fusion, model ?? "").modelUid
+                      : option.id;
                     const nextEfforts = supportsEffort
                       ? effortLevelsForConv(session, options, nextModel, family)
                       : [];

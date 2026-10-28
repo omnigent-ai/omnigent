@@ -86,9 +86,8 @@ export function effortLevelsForConv(
     case "claude-code-native-ui":
       return CLAUDE_NATIVE_EFFORT_LEVELS;
     case "devin-native-ui":
-      // Devin encodes effort as a model variant; each model declares its own ladder.
-      return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "codex-native-ui":
+      // Both catalogs declare effort per model; Devin encodes it as a model variant.
       return codexEffortLevelsForModel(codexModelOptions, currentModel);
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;

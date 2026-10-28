@@ -115,6 +115,8 @@ import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import {
   isSideChatCommand,
+  sideChatSettingsMutationKey,
+  SIDE_CHAT_SETTINGS_MUTATION,
   usesNativeSideChatFork,
   type SideChatModelSettings,
 } from "@/lib/sideChat";
@@ -1431,7 +1433,7 @@ let unsubscribeSettingsMutations: (() => void) | undefined;
 
 function sideChatSettingsPending(conversationId: string): boolean {
   return (
-    (queryClient?.isMutating({ mutationKey: ["side-chat-settings", conversationId] }) ?? 0) > 0
+    (queryClient?.isMutating({ mutationKey: sideChatSettingsMutationKey(conversationId) }) ?? 0) > 0
   );
 }
 
@@ -1950,7 +1952,7 @@ export function initChatStore(client: QueryClient): void {
   unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
     if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
     const [kind, conversationId] = event.mutation.options.mutationKey ?? [];
-    if (kind !== "side-chat-settings" || typeof conversationId !== "string") return;
+    if (kind !== SIDE_CHAT_SETTINGS_MUTATION || typeof conversationId !== "string") return;
     // A pane may be closed when the save settles; the store owns queue resumption.
     useChatStore.getState().maybeFlushQueuedHead(conversationId);
     useChatStore.getState().flushBackgroundQueues();

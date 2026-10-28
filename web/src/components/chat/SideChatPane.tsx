@@ -80,7 +80,7 @@ import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
-import { usesNativeSideChatFork } from "@/lib/sideChat";
+import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import {
   appendReplyQuote,
@@ -468,9 +468,9 @@ function SideChatComposer({
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
   const queryClient = useQueryClient();
-  const settingsSaving = useIsMutating({ mutationKey: ["side-chat-settings", childId] }) > 0;
+  const settingsSaving = useIsMutating({ mutationKey: sideChatSettingsMutationKey(childId) }) > 0;
   const settingsSavePending = () =>
-    queryClient.isMutating({ mutationKey: ["side-chat-settings", childId] }) > 0;
+    queryClient.isMutating({ mutationKey: sideChatSettingsMutationKey(childId) }) > 0;
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   // Unsent text + attachments live in the store, keyed by child id, NOT in
   // component state: this pane mounts in the desktop rail or the mobile

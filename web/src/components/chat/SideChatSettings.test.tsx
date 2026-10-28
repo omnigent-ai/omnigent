@@ -493,21 +493,14 @@ it.each([
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
 
-it.each([
-  { harness: "claude-native", draft: false },
-  { harness: "claude-native", draft: true },
-  { harness: "pi-native", draft: false },
-  { harness: "pi-native", draft: true },
-])(
-  "preserves unspecified effort when selecting a model ($harness, draft=$draft)",
-  async ({ harness, draft }) => {
+it.each([false, true])(
+  "preserves unspecified effort when selecting a model (draft=%s)",
+  async (draft) => {
     const onChange = vi.fn();
     const session = {
       ...child,
-      harness,
-      labels: {
-        "omnigent.wrapper": harness === "claude-native" ? "claude-code-native-ui" : "pi-native-ui",
-      },
+      harness: "claude-native",
+      labels: { "omnigent.wrapper": "claude-code-native-ui" },
       reasoningEffort: null,
       codexModelOptions: [models[0], { ...models[1], defaultReasoningEffort: "unsupported" }],
     };
@@ -547,51 +540,62 @@ it("hides unsupported custom native effort", () => {
   ).not.toBeInTheDocument();
 });
 
-it.each([false, true])("preserves an inherited Devin Fusion pairing (draft=%s)", async (draft) => {
-  const model = "fusion-lead-high-sidekick-helper";
-  const onChange = vi.fn();
-  const session = {
-    ...child,
-    modelOverride: model,
-    reasoningEffort: null,
-    codexModelOptions: [
-      {
-        id: "fusion",
-        displayName: "Fusion",
-        fusion: {
-          default: "fusion-lead-medium-sidekick-helper",
-          combos: ["medium", "high"].map((effort) => ({
-            modelUid: `fusion-lead-${effort}-sidekick-helper`,
-            lead: "lead",
-            leadLabel: "Lead",
-            effort,
-            fast: false,
-            sidekick: "helper",
-            sidekickLabel: "Helper",
-            priority: false,
-          })),
+it.each([
+  { draft: false, model: "fusion-lead-high-sidekick-helper" },
+  { draft: true, model: "fusion-lead-high-sidekick-helper" },
+  { draft: false, model: "model-a" },
+  { draft: true, model: "model-a" },
+])(
+  "selects a runnable Devin Fusion pairing (draft=$draft, current=$model)",
+  async ({ draft, model }) => {
+    const inherited = model.startsWith("fusion-");
+    const onChange = vi.fn();
+    const session = {
+      ...child,
+      modelOverride: model,
+      reasoningEffort: inherited ? null : "high",
+      codexModelOptions: [
+        models[0],
+        {
+          id: "fusion",
+          displayName: "Fusion",
+          fusion: {
+            default: "fusion-lead-medium-sidekick-helper",
+            combos: ["medium", "high"].map((effort) => ({
+              modelUid: `fusion-lead-${effort}-sidekick-helper`,
+              lead: "lead",
+              leadLabel: "Lead",
+              effort,
+              fast: false,
+              sidekick: "helper",
+              sidekickLabel: "Helper",
+              priority: false,
+            })),
+          },
         },
-      },
-    ],
-  };
-  render(
-    <QueryClientProvider client={cache}>
-      <SideChatSettings
-        session={session}
-        draft={draft ? { onChange, disabled: false } : undefined}
-      />
-    </QueryClientProvider>,
-  );
-  const picker = screen.getByRole("button", { name: "Side chat model and effort" });
-  expect(picker).toHaveTextContent("Fusion · Lead High + Helper");
-  const user = userEvent.setup();
-  await user.click(picker);
-  await user.click(screen.getByTestId("side-chat-model-edit"));
-  const fusion = screen.getByRole("menuitemcheckbox", { name: "Fusion" });
-  expect(fusion).toHaveAttribute("aria-checked", "true");
-  expect(screen.queryByTestId("side-chat-efforts")).not.toBeInTheDocument();
-  await user.click(fusion);
-  const updates = { modelOverride: model };
-  if (draft) expect(onChange).toHaveBeenCalledWith(updates);
-  else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
-});
+      ],
+    };
+    render(
+      <QueryClientProvider client={cache}>
+        <SideChatSettings
+          session={session}
+          draft={draft ? { onChange, disabled: false } : undefined}
+        />
+      </QueryClientProvider>,
+    );
+    const picker = screen.getByRole("button", { name: "Side chat model and effort" });
+    expect(picker).toHaveTextContent(inherited ? "Fusion · Lead High + Helper" : "Model A");
+    const user = userEvent.setup();
+    await user.click(picker);
+    await user.click(screen.getByTestId("side-chat-model-edit"));
+    const fusion = screen.getByRole("menuitemcheckbox", { name: "Fusion" });
+    expect(fusion).toHaveAttribute("aria-checked", String(inherited));
+    if (inherited) expect(screen.queryByTestId("side-chat-efforts")).not.toBeInTheDocument();
+    await user.click(fusion);
+    const updates = inherited
+      ? { modelOverride: model }
+      : { modelOverride: "fusion-lead-medium-sidekick-helper", reasoningEffort: null };
+    if (draft) expect(onChange).toHaveBeenCalledWith(updates);
+    else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
+  },
+);

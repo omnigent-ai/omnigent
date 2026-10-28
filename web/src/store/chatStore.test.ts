@@ -16,6 +16,7 @@
 // helpers so tests can model capped snapshots and full transcripts.
 
 import type * as IdentityModule from "@/lib/identity";
+import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
 import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -18236,7 +18237,7 @@ describe("chatStore — client-side message queue", () => {
           : client
               .getMutationCache()
               .build(client, {
-                mutationKey: ["side-chat-settings", "conv_side"],
+                mutationKey: sideChatSettingsMutationKey("conv_side"),
                 mutationFn: () =>
                   new Promise<void>((resolve, reject) => {
                     settle = () =>
