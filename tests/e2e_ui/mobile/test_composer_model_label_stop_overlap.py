@@ -235,6 +235,46 @@ def _assert_same_row(a: FloatRect, b: FloatRect) -> None:
     )
 
 
+# For each text leaf in the menu rows: the fraction left visible by clipping
+# ancestors, and whether its own text overflows (an ellipsis).
+_MENU_ROW_TEXT_JS = """(menu) => [...menu.querySelectorAll('[role="menuitem"] span')]
+  .filter((el) => el.childElementCount === 0 && el.textContent.trim())
+  .map((el) => {
+    const box = el.getBoundingClientRect();
+    let [left, top, right, bottom] = [box.left, box.top, box.right, box.bottom];
+    for (let node = el.parentElement; node !== menu.parentElement; node = node.parentElement) {
+      if (getComputedStyle(node).overflow === "visible") continue;
+      const clip = node.getBoundingClientRect();
+      left = Math.max(left, clip.left);
+      top = Math.max(top, clip.top);
+      right = Math.min(right, clip.right);
+      bottom = Math.min(bottom, clip.bottom);
+    }
+    const shown = Math.max(0, right - left) * Math.max(0, bottom - top);
+    return {
+      text: el.textContent,
+      shown: shown / (box.width * box.height),
+      overflow: el.scrollWidth - el.clientWidth,
+    };
+  })"""
+
+
+def _menu_row_texts_shown(menu: Locator) -> set[str]:
+    """Fail if any menu row text is cut off; return the texts shown in full.
+
+    :param menu: The open Add menu.
+    :returns: The row labels and descriptions that are fully visible.
+    """
+    texts = menu.evaluate(_MENU_ROW_TEXT_JS)
+    cut = [
+        text
+        for text in texts
+        if text["shown"] > 0 and (text["shown"] < 0.99 or text["overflow"] > 0)
+    ]
+    assert not cut, f"Add menu text is cut off: {cut}"
+    return {text["text"] for text in texts if text["shown"] > 0}
+
+
 def _screenshot(page: Page, name: str) -> None:
     """Save a demo screenshot when E2E_SCREENSHOT_DIR is set (local runs)."""
     shot_dir = os.environ.get("E2E_SCREENSHOT_DIR")
@@ -379,7 +419,8 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Keep Goal and Plan reachable in the shared Add menu at both widths."""
+    """Keep Goal and Plan reachable in the shared Add menu at both widths, with
+    no row text cut off; desktop still shows the side-chat description."""
     base_url, session_id = seeded_session
     page.set_viewport_size(_IPHONE_VIEWPORT)
     _patch_session_as_databricks_codex_native(page, session_id)
@@ -391,13 +432,21 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
             expect(trigger).to_be_visible()
             expect(page.get_by_test_id("composer-config-gear")).to_be_visible()
             trigger.click()
-            for action_id in ["composer-plan-action", "composer-goal-action"]:
+            for action_id in [
+                "composer-side-chat-action",
+                "composer-plan-action",
+                "composer-goal-action",
+            ]:
                 action = page.get_by_test_id(action_id)
                 expect(action).to_be_visible()
                 expect(action).to_be_enabled()
                 bounds = _box(action)
                 assert bounds["x"] >= 0
                 assert bounds["x"] + bounds["width"] <= viewport["width"]
+            shown = _menu_row_texts_shown(page.get_by_test_id("composer-add-menu"))
+            assert "Start a new side chat" in shown
+            if viewport["width"] >= 1200:
+                assert "Ask without affecting this conversation" in shown
             page.keyboard.press("Escape")
             expect(trigger).to_be_focused()
     finally:
