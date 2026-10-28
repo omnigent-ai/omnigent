@@ -54,7 +54,8 @@ implements them separately, so a fix for one harness does not reach the others.
   the answer reaches the harness. If Claude's permission hook exits mid-turn,
   the card stays, read-only, and says to answer in the terminal. It stays that
   way, with the composer locked, until the terminal answers, the hook retries,
-  or the turn ends. A hook retry still delivers an answer given in chat meanwhile.
+  or the turn ends. A hook retry still delivers an answer given in chat meanwhile
+  while the server keeps it (up to 5 minutes); after that the retry asks again.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names

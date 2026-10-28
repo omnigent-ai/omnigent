@@ -380,7 +380,7 @@ export function parseBackgroundTasks(raw: unknown): BackgroundTaskInfo[] | undef
   return tasks.length > 0 ? tasks : undefined;
 }
 
-/** Parse an elicitation's `terminal_fallback` param; `undefined` when absent or malformed. */
+/** Parse an elicitation's `terminal_fallback` param; any object marks the hold. */
 export function parseTerminalFallback(raw: unknown): ElicitationTerminalFallback | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
   return { answerUndelivered: (raw as Record<string, unknown>).answer_undelivered === true };

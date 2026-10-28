@@ -17862,6 +17862,53 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     },
   );
 
+  it("keeps a card that moved to the terminal while an older snapshot was in flight", async () => {
+    const sid = "conv_terminal_snapshot_race";
+    const eid = "elic_terminal_snapshot_race";
+    seedSession(sid, []);
+    const { sinks, controller, loop } = await openLoop(sid);
+    const raw = pendingElicitationRaw(eid, "Approve?");
+    sinks.at(-1)!.push(sse("response.elicitation_request", raw));
+    await drainAsync();
+    expect(elicitationCards()[0]!.status).toBe("pending");
+
+    // The snapshot is captured during the grace, while a gap answer has the prompt unparked.
+    seedPendingElicitations(sid, []);
+    const route = fetchMock.getMockImplementation()!;
+    let releaseSnapshot!: () => void;
+    const snapshotHeld = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith(`/v1/sessions/${sid}?`)) await snapshotHeld;
+      return route(input, init);
+    });
+    sinks.at(-1)!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const inTerminal = {
+      ...raw,
+      params: {
+        ...(raw.params as Record<string, unknown>),
+        terminal_fallback: { answer_undelivered: true },
+      },
+    };
+    sinks.at(-1)!.push(sse("response.elicitation_request", inTerminal));
+    await drainAsync();
+    expect(elicitationCards()[0]!.terminalFallback).toEqual({ answerUndelivered: true });
+
+    releaseSnapshot();
+    await drainAsync();
+    expect(elicitationCards()).toHaveLength(1);
+    expect(elicitationCards()[0]).toMatchObject({
+      status: "pending",
+      response: null,
+      terminalFallback: { answerUndelivered: true },
+    });
+    await abortLoop(sinks, controller, loop);
+  });
+
   it("keeps a pending mid-turn ApprovalCard across a transport drop", async () => {
     seedSession("conv_keep", []);
     // The server still has the prompt parked: its snapshot lists it.

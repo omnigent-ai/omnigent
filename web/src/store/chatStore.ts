@@ -5526,7 +5526,10 @@ function reconcileElicitationBlocks(
       (candidate): candidate is ElicitationBlock =>
         candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
     );
-    if (b.nativeDelivery && preGapCards.get(b.elicitationId) !== b) return b;
+    const preGapCard = preGapCards.get(b.elicitationId);
+    if (b.nativeDelivery && preGapCard !== b) return b;
+    // The live stream moved this card into or out of the terminal hold after the snapshot began.
+    if (preGapCard && terminalHoldChanged(b, preGapCard)) return b;
     if (
       currentDelivery?.nativeDelivery &&
       !b.nativeDeliveryResolved &&
@@ -5539,7 +5542,7 @@ function reconcileElicitationBlocks(
     if (
       currentDelivery &&
       terminalHoldChanged(currentDelivery, b) &&
-      preGapCards.get(b.elicitationId) === b &&
+      preGapCard === b &&
       !b.nativeDeliveryResolved
     ) {
       changed = true;

@@ -2690,24 +2690,28 @@ async def test_reattach_id_waiting_in_terminal_rejected_for_other_session(
         pending_elicitations.reset_for_tests()
 
 
-@pytest.mark.parametrize("answered_in_gap", [False, True])
+@pytest.mark.parametrize(
+    ("answered_in_gap", "answer_expired"), [(False, False), (True, False), (True, True)]
+)
 async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     answered_in_gap: bool,
+    answer_expired: bool,
 ) -> None:
     """
     A hook that retries after the grace still gets the prompt's answer.
 
     A chat answer given in the gap shows as undelivered until the retry
-    delivers it; without one, the retry restores the normal card.
+    delivers it. Without one, or once the saved answer expired, the retry
+    restores the normal card.
     """
     from omnigent.runtime import pending_elicitations
 
     session_id, payload, collector = await _sever_hook_mid_turn(
         client,
         monkeypatch,
-        f"test-terminal-fallback-late-retry-{answered_in_gap}",
+        f"test-terminal-fallback-late-retry-{answered_in_gap}-{answer_expired}",
         sever_every_poll=False,
     )
     hook_task: asyncio.Task[httpx.Response] | None = None
@@ -2726,10 +2730,12 @@ async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
         assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": answered_in_gap}
         assert pending_elicitations.count_for(session_id) == 1
 
+        if answer_expired:
+            monkeypatch.setattr(sessions_route, "_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S", 0.0)
         hook_task = asyncio.create_task(
             client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
         )
-        if answered_in_gap:
+        if answered_in_gap and not answer_expired:
             cleared = await _next_elicitation_event(collector)
             assert cleared["type"] == "response.elicitation_resolved"
             assert cleared["elicitation_id"] == _REATTACH_ELICITATION_ID
