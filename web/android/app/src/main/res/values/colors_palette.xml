@@ -5,6 +5,6 @@
     <color name="brand_foreground">#27272a</color>
     <color name="brand_muted_foreground">#71717a</color>
     <color name="brand_border">#e4e4e7</color>
-    <color name="brand_primary">#11171c</color>
+    <color name="brand_primary">#df3c85</color>
     <color name="brand_on_primary">#ffffff</color>
 </resources>
