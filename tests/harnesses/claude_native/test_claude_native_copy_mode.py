@@ -33,16 +33,24 @@ import tty
 from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
+panel_open = sys.argv[3] == "background"
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
 
 def render(draft=""):
-    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 80 + "\r\n❯ " + draft + "\r\n" + "─" * 80 + "\r\n")
+    rule = "─" * min(80, os.get_terminal_size().columns)
+    sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n❯ " + draft + "\r\n" + rule + "\r\n")
     sys.stdout.flush()
 
 
-render()
+if panel_open:
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 50 + "\r\n"
+        "  Background\r\n  1 active shell\r\n  ❯ ● make test   running\r\n"
+        "  ↑/↓ to select · Enter to view · x to stop · Esc to close\r\n")
+    sys.stdout.flush()
+else:
+    render()
 buffer = b""
 draft = None
 messages = []
@@ -51,6 +59,12 @@ while True:
     with received.open("ab") as log:
         log.write(chunk)
     buffer += chunk
+    if panel_open:
+        if buffer == b"\x1b":
+            panel_open = False
+            buffer = b""
+            render()
+        continue
     if b"\x1b[200~" in buffer and b"\x1b[201~" in buffer:
         pasted, buffer = buffer.split(b"\x1b[200~", 1)[1].split(b"\x1b[201~", 1)
         draft = pasted.decode().strip()
@@ -92,9 +106,17 @@ class _Pane:
         assert self.in_mode(), "Expected the pane to be in copy mode after scrolling back."
 
 
+@pytest.fixture
+def initial_surface() -> str:
+    return "composer"
+
+
 @pytest.fixture(params=["emacs", "vi"])
 def pane(
-    request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_surface: str,
 ) -> Iterator[_Pane]:
     """Start the stand-in composer in tmux with the parametrized copy-mode key table."""
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
@@ -107,7 +129,9 @@ def pane(
     with tempfile.TemporaryDirectory(prefix="claude-copy-", dir="/tmp") as socket_dir:
         socket_path = Path(socket_dir) / "tmux.sock"
         tmux = ["tmux", "-S", str(socket_path)]
-        command = shlex.join([sys.executable, str(terminal), str(received), str(delivered)])
+        command = shlex.join(
+            [sys.executable, str(terminal), str(received), str(delivered), initial_surface]
+        )
         try:
             subprocess.run(
                 [
@@ -119,7 +143,7 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "120",
+                    "50" if initial_surface == "background" else "120",
                     "-y",
                     "24",
                     command,
@@ -168,6 +192,23 @@ def test_message_from_web_ui_reaches_scrolled_back_pane(pane: _Pane) -> None:
 
     assert json.loads(pane.delivered.read_text()) == ["SENT_WHILE_SCROLLED_BACK"]
     assert not pane.in_mode(), "Delivery should return the pane to the live view."
+
+
+@pytest.mark.parametrize("pane", ["emacs"], indirect=True)
+@pytest.mark.parametrize("initial_surface", ["background"])
+def test_web_message_dismisses_wrapped_background_panel(
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real terminal wraps the close hint before delivery reclaims the composer."""
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 2.0)
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    assert "Esc to close" not in captured
+    assert "Esc\nto close" in captured
+
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_BACKGROUND_PANEL", timeout_s=2.0)
+
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_BACKGROUND_PANEL"]
+    assert pane.received.read_bytes().startswith(b"\x1b ")
 
 
 def test_interrupt_reaches_scrolled_back_pane(pane: _Pane) -> None:

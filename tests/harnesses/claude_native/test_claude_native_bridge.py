@@ -11352,6 +11352,16 @@ _TASK_DETAILS_PANE = """\
   ← to go back · Esc/Enter/Space to close · x to stop
 """
 
+_WRAPPED_BACKGROUND_PANEL = """\
+● Running the build
+──────────────────────────────
+  Background
+  1 active shell
+  ❯ ● make test   running
+  ↑/↓ to select · Enter to view · x to stop · Esc to
+  close
+"""
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -12603,6 +12613,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
         _TASK_DETAILS_PANE,
+        _WRAPPED_BACKGROUND_PANEL,
     ],
     ids=[
         "reverse-search",
@@ -12612,6 +12623,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "rewind",
         "settings-panel",
         "task-details-panel",
+        "wrapped-background-panel",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -12630,6 +12642,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     (its own documented dismissal), restoring the empty input box, then
     deliver the message normally.
     """
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
@@ -13163,9 +13176,15 @@ def test_occupied_input_retries_stay_outside_the_double_escape_window(
     assert min(gaps) >= 1.0, f"Escapes {gaps} apart can open Claude Code's rewind dialog"
 
 
+@pytest.mark.parametrize(
+    "occupied_pane",
+    [_REVERSE_SEARCH_PANE, _WRAPPED_BACKGROUND_PANEL],
+    ids=["reverse-search", "wrapped-background-panel"],
+)
 def test_inject_slash_command_restores_an_occupied_input_box_first(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    occupied_pane: str,
 ) -> None:
     """
     The same reclaim guards slash commands (e.g. a routed model switch).
@@ -13180,8 +13199,8 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         # re-confirmation, idle after the Escape, then the typed command
         # renders and the submit clears it.
         [
-            _REVERSE_SEARCH_PANE,
-            _REVERSE_SEARCH_PANE,
+            occupied_pane,
+            occupied_pane,
             _IDLE_PANE,
             _composer_pane("/effort high"),
             _IDLE_PANE,
@@ -13197,6 +13216,24 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
         "/effort high",
         "Enter",
     ]
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _WRAPPED_BACKGROUND_PANEL + _IDLE_PANE,
+        _WRAPPED_BACKGROUND_PANEL + "\n──────────────────────────────\nStarting Claude…",
+        _WRAPPED_BACKGROUND_PANEL.replace("Background", "Choose an action"),
+        _WRAPPED_BACKGROUND_PANEL.replace("Enter to view · x to stop", "Enter to select"),
+    ],
+    ids=["composer", "scrollback", "other-dialog", "decision-footer"],
+)
+def test_wrapped_background_footer_does_not_dismiss_other_screens(
+    monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    sends = _fake_tmux(monkeypatch, [pane])
+    claude_native_bridge._restore_occupied_input("/tmp/example.sock", "main")
+    assert sends == []
 
 
 class _BootingClaudePane:

@@ -6186,7 +6186,8 @@ def _restore_occupied_input(
         # Nothing an Escape can clear: launcher output before the input box
         # mounts, a dialog that offers no dismissal, or one Escape would quit.
         unclearable = surface == _OVERLAY_SURFACE and (
-            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
+            not (_ESCAPE_DISMISS_HINT.search(pane) or _background_panel_close_hint(pane))
+            or _escape_quits_claude(pane)
         )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
@@ -6220,6 +6221,18 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _background_panel_close_hint(pane: str) -> bool:
+    """Recognize the background panel's close footer across terminal line wraps."""
+    lines = [line.strip() for line in pane.splitlines() if line.strip()]
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=-1)
+    panel = lines[last_rule + 1 :]
+    if last_rule < 0 or not panel or panel[0] != "Background":
+        return False
+    # Only this panel's navigation footer is collapsed, never decision-dialog text.
+    footer = " ".join(" ".join(panel[-3:]).split())
+    return footer.endswith("↑/↓ to select · Enter to view · x to stop · Esc to close")
 
 
 def _escape_quits_claude(pane: str) -> bool:
