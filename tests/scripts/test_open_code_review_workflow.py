@@ -603,27 +603,34 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         result, summary, outputs = self.run_report(
             "partial",
             summary={"budget_exceeded": True},
-            failed=[{"path": "b.ts", "reason": budget}, {"path": "a.ts", "reason": budget}],
+            failed=[
+                {"path": "b`.ts\n::error::injected", "reason": budget},
+                {"path": "a.ts", "reason": budget},
+            ],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            "::warning::OCR token budget reached; 2 file(s) were not reviewed: a.ts, b.ts",
-            result.stdout,
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "::warning::OCR token budget reached; 2 file(s) were not reviewed. "
+                "See the job summary for the list."
+            ],
         )
-        self.assertIn("- `a.ts`", summary)
+        self.assertIn("- `a.ts`\n- `b'.ts ::error::injected`\n", summary)
         self.assertEqual(outputs, "")
-        for summary_value, failed in (
+        budget_only = [{"path": "a.ts", "reason": budget}]
+        for status, summary_value, failed in (
             (
+                "partial",
                 {"budget_exceeded": True},
                 [{"path": "a.ts", "reason": budget}, {"path": "b.ts", "reason": "LLM error"}],
             ),
-            ({"budget_exceeded": True}, []),
-            ({}, [{"path": "a.ts", "reason": budget}]),
+            ("partial", {"budget_exceeded": True}, []),
+            ("partial", {}, budget_only),
+            ("failed", {"budget_exceeded": True}, budget_only),
         ):
-            with self.subTest(summary=summary_value, failed=failed):
-                result, _, outputs = self.run_report(
-                    "partial", summary=summary_value, failed=failed
-                )
+            with self.subTest(status=status, summary=summary_value, failed=failed):
+                result, _, outputs = self.run_report(status, summary=summary_value, failed=failed)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("incomplete", result.stderr)
                 self.assertEqual(outputs, "")
