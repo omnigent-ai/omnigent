@@ -1249,7 +1249,12 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
     approval_policy = payload.get("approvalPolicy")
     if approval_policy is None:
         approval_policy = payload.get("approval_policy")
-    if approval_policy not in {"never", "on-failure", "on-request", "untrusted"}:
+    if not isinstance(approval_policy, str) or approval_policy not in {
+        "never",
+        "on-failure",
+        "on-request",
+        "untrusted",
+    }:
         return None
 
     args: list[str] = []
@@ -1269,12 +1274,16 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
         if not isinstance(sandbox_policy, dict):
             return None
         sandbox_mode = sandbox_policy.get("type")
-        if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        if not isinstance(sandbox_mode, str) or sandbox_mode not in {
+            "read-only",
+            "workspace-write",
+            "danger-full-access",
+        }:
             return None
         if approval_policy != "on-request" or sandbox_mode != "workspace-write":
             args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
 
-    if reviewer in {"user", "auto_review", "guardian_subagent"}:
+    if isinstance(reviewer, str) and reviewer in {"user", "auto_review", "guardian_subagent"}:
         args.extend(["-c", f"approvals_reviewer={json.dumps(reviewer)}"])
     return args
 
