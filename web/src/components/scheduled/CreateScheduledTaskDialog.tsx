@@ -283,8 +283,11 @@ export function CreateScheduledTaskDialog({
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
     savedProjectId !== null ? projects.find((p) => p.id === savedProjectId)?.name : "";
-  const projectName = projectChoice ?? savedProjectName ?? "";
-  const projectIcon = projects.find((p) => p.name === projectName)?.icon;
+  // A picked project is shown by its id, so a rename elsewhere shows the new name.
+  const pickedProject =
+    pickedProjectId !== null ? projects.find((p) => p.id === pickedProjectId) : undefined;
+  const projectName = pickedProject?.name ?? projectChoice ?? savedProjectName ?? "";
+  const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
   // The saved project has no name while the list loads, if it fails to load,
   // or once the project is deleted. Only a loaded list proves it is deleted.
   const savedProjectUnresolved = projectChoice === null && savedProjectName === undefined;
@@ -609,7 +612,8 @@ export function CreateScheduledTaskDialog({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-56">
-                  {savedProjectDeleted && (
+                  {/* The picker's "Remove from" row needs the name; this works without it. */}
+                  {savedProjectUnresolved && (
                     <DropdownMenuItem
                       className="px-2 py-1"
                       onSelect={() => {

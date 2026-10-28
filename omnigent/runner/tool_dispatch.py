@@ -4901,9 +4901,18 @@ async def _execute_scheduled_task_tool(
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
+                resp = None
                 if project_name is not None:
-                    payload["project_id"] = await _project_id_for_name(server_client, project_name)
-                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                    # Confirm the task first so a bad id doesn't leave a new project behind.
+                    existing = await server_client.get(task_url, timeout=30.0)
+                    if existing.status_code >= 400:
+                        resp = existing
+                    else:
+                        payload["project_id"] = await _project_id_for_name(
+                            server_client, project_name
+                        )
+                if resp is None:
+                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001

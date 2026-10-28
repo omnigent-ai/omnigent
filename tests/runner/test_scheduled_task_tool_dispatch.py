@@ -280,6 +280,26 @@ async def test_project_args_are_refused_on_a_server_without_task_projects(
 
 
 @pytest.mark.asyncio
+async def test_update_by_name_on_an_unknown_task_creates_no_project() -> None:
+    class _MissingTaskClient(_ProjectsClient):
+        async def get(self, url: str, *, timeout: object = None) -> _Resp:
+            if url.startswith("/v1/scheduled-tasks/"):
+                self.calls.append(("GET", url, None))
+                return _Resp(status_code=404, body={"detail": "Scheduled task not found"})
+            return await super().get(url, timeout=timeout)
+
+    client = _MissingTaskClient([])
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps({"scheduled_task_id": _TASK_ID, "project_name": "new"}),
+        server_client=client,
+    )
+    assert json.loads(out)["error"] == "server returned 404"
+    assert not [call for call in client.calls if call[1] == "/v1/projects"]
+    assert not [call for call in client.calls if call[0] == "PATCH"]
+
+
+@pytest.mark.asyncio
 async def test_calls_without_project_args_skip_the_capability_check() -> None:
     client = _RecordingClient(info=_Resp(body={}))
     await _execute_scheduled_task_tool(

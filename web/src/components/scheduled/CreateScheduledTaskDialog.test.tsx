@@ -1050,8 +1050,32 @@ describe("CreateScheduledTaskDialog project", () => {
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
       </CapabilitiesProvider>,
     );
+    // The trigger follows the picked project's new name.
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Bugs");
     expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("keeps the dialog open and retryable when creating its project fails", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    resolveOrCreateProjectId.mockRejectedValueOnce(new Error("500 Internal Server Error"));
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("create-error")).toHaveTextContent(
+      "500 Internal Server Error",
+    );
+    expect(mutateAsync).not.toHaveBeenCalled();
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ projectId: "proj_new" });
   });
 
   it("creates a project from a typed name", async () => {
@@ -1118,16 +1142,18 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Loading…");
     openProjectMenu();
     expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
   });
 
-  it("does not call a saved project deleted when the projects fail to load", async () => {
+  it("can unfile a task whose project list fails to load", async () => {
     projectsQuery.current = { data: undefined, isPending: false, isSuccess: false, isError: true };
     renderEditingFiledTask();
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Project unavailable");
     openProjectMenu();
-    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
   });
 
   it("unfiles an edited task's runs when its project is removed", async () => {
