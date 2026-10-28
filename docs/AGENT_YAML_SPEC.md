@@ -377,6 +377,25 @@ os_env:
     allow_network: true
 ```
 
+Runner-backed sessions can opt into backgrounding slow shell calls:
+
+```yaml
+os_env:
+  shell_yield_after: 30
+```
+
+Commands that finish within 30 seconds return normally. Longer commands keep
+running and return a handle; collect the final output with `sys_read_inbox`,
+or request cancellation with `sys_cancel_async`. The command runs once with
+the same sandbox and execution timeout. Its final output still passes through
+the shell's result policies and retains the normal shell output limits.
+This is off by default and requires `async: true`
+(the default). Both server and runner must support the option.
+
+Handles live in the runner; a runner restart does not restore their commands.
+As with explicit async calls, cancelling a blocking shell helper may leave its
+command running until its execution timeout.
+
 On Linux, the `openai-agents` harness supports disposable copy-on-write mounts:
 
 ```yaml

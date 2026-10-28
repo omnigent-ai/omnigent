@@ -331,7 +331,7 @@ def register_mcp_routes(
                 _agent_id_local = _session_agent_ids.get(session_id)
                 try:
                     dispatch_workspace = await _session_runtime_cwd(session_id)
-                    output = await execute_tool(
+                    execution = execute_tool(
                         tool_name=tool_name,
                         arguments=_json.dumps(arguments),
                         server_client=server_client,
@@ -352,6 +352,33 @@ def register_mcp_routes(
                         filesystem_registry=filesystem_registry,
                         effective_harness=_session_harness_name(session_id),
                     )
+                    yield_after = spec.os_env.shell_yield_after if spec and spec.os_env else None
+                    inbox = _session_inboxes.get(session_id)
+                    async_tasks = _session_async_tasks.get(session_id)
+                    if (
+                        tool_name == "sys_os_shell"
+                        and body.get("_omnigent_background_shell") is True
+                        and yield_after is not None
+                        and spec is not None
+                        and spec.async_enabled
+                        and inbox is not None
+                        and async_tasks is not None
+                    ):
+                        from omnigent.runner.shell_yield import execute_shell_with_yield
+
+                        output, deferred = await execute_shell_with_yield(
+                            execution,
+                            after=yield_after,
+                            arguments=arguments,
+                            inbox=inbox,
+                            tasks=async_tasks,
+                        )
+                        if deferred:
+                            return JSONResponse(
+                                content={"result": {"output": output, "deferred": True}}
+                            )
+                    else:
+                        output = await execution
                 except Exception as exc:
                     _logger.exception(
                         "MCP tool dispatch failed for %s",

@@ -754,6 +754,7 @@ def _parse_os_env_spec(data: YamlData | str | bool | None) -> OSEnvSpec | None:
         sandbox=sandbox,
         fork=fork,
         start_in_scratch=start_in_scratch,
+        shell_yield_after=data.get("shell_yield_after"),
     )
 
 

@@ -12517,6 +12517,9 @@ async def _handle_mcp_tools_call(
         step: str,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        if namespaced_name == "sys_os_shell":
+            # Older runners ignore this; older servers never request yielding.
+            body["_omnigent_background_shell"] = True
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body
@@ -12883,6 +12886,15 @@ async def _handle_mcp_tools_call(
             )
 
     output: str = exec_data.get("result", {}).get("output", "")
+    if (
+        namespaced_name == "sys_os_shell"
+        and execute_tool is None
+        and registry_config is None
+        and exec_data.get("result", {}).get("deferred") is True
+    ):
+        # The original shell's TOOL_RESULT policy runs when its output is read
+        # from the inbox, not against this temporary handle.
+        return _mcp_ok_response(rpc_id, {"content": [{"type": "text", "text": output}]})
     _logger.debug(
         "MCP tools/call execute: session=%r tool=%r output_len=%d",
         session_id,

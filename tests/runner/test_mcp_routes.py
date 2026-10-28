@@ -9,6 +9,7 @@ summarizer, harness forwarding — is driven through the real HTTP handler.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.runner import mcp_routes
 from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
 from omnigent.runner.mcp_manager import McpSchemasResult
@@ -119,6 +121,8 @@ class Harness:
         mcp_manager: _FakeMcpManager | None = None,
         process_manager: _FakeProcessManager | None = None,
         spec_resolver: object | None = None,
+        workspace: Path | None = None,
+        server_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.app = FastAPI()
         self.mcp_manager = mcp_manager
@@ -149,7 +153,7 @@ class Harness:
             return self.resolved_entry
 
         async def _runtime_cwd(session_id: str) -> Path | None:
-            return Path("/tmp/runtime-cwd")
+            return workspace or Path("/tmp/runtime-cwd")
 
         mcp_routes.register_mcp_routes(
             self.app,
@@ -170,7 +174,7 @@ class Harness:
             process_manager=process_manager,  # type: ignore[arg-type]
             resource_registry=SessionResourceRegistry(),
             runner_workspace=Path("/tmp/runner-workspace"),
-            server_client=httpx.AsyncClient(base_url="http://server"),
+            server_client=server_client or httpx.AsyncClient(base_url="http://server"),
             spec_resolver=spec_resolver,  # type: ignore[arg-type]
             terminal_registry=None,
         )
@@ -463,6 +467,70 @@ async def test_builtin_tool_failure_is_generic_to_the_client(
     assert status == 200
     assert body["error"]["code"] == -32000
     assert "/etc/shadow" not in body["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    ("yield_after", "server_support", "async_enabled", "tool", "with_inbox"),
+    [
+        (None, True, True, "sys_os_shell", True),
+        (0.001, False, True, "sys_os_shell", True),
+        (0.001, True, False, "sys_os_shell", True),
+        (0.001, True, True, "sys_os_read", True),
+        (0.001, True, True, "sys_os_shell", False),
+        (0.001, True, True, "sys_os_shell", True),
+    ],
+)
+async def test_shell_yield_is_opt_in_and_retained(
+    monkeypatch: pytest.MonkeyPatch,
+    yield_after: float | None,
+    server_support: bool,
+    async_enabled: bool,
+    tool: str,
+    with_inbox: bool,
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+    starts = 0
+
+    async def execute(**kwargs: Any) -> str:
+        nonlocal starts
+        starts += 1
+        started.set()
+        await release.wait()
+        return "finished"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.execute_tool", execute)
+    h = Harness()
+    h.spec_cache[SESSION] = AgentSpec(
+        spec_version=1,
+        async_enabled=async_enabled,
+        os_env=OSEnvSpec(shell_yield_after=yield_after),
+    )
+    if with_inbox:
+        h.inboxes[SESSION], h.async_tasks[SESSION] = asyncio.Queue(), {}
+    body = {
+        **_call(tool),
+        "_omnigent_background_shell": server_support,
+        "_omnigent_operation": {"id": "shell-once", "step": "initial"},
+    }
+    call = asyncio.create_task(h.execute(body))
+    should_yield = bool(
+        yield_after and server_support and async_enabled and with_inbox and tool == "sys_os_shell"
+    )
+    try:
+        await started.wait()
+        done, _ = await asyncio.wait({call}, timeout=0.05)
+        assert bool(done) is should_yield
+        if should_yield:
+            status, response = call.result()
+            assert response["result"]["deferred"] is True
+            assert await h.execute(body) == (status, response)
+    finally:
+        release.set()
+        await call
+        await asyncio.gather(*(task for task, _ in h.async_tasks.get(SESSION, {}).values()))
+    if not should_yield:
+        assert call.result() == (200, {"result": {"output": "finished"}})
+    assert starts == 1
 
 
 # ── tools/call: retained operations (``_omnigent_operation``) ──────────────

@@ -429,6 +429,7 @@ class TestLoadFromDict(unittest.TestCase):
                 "os_env": {
                     "type": "caller_process",
                     "cwd": "/tmp/work",
+                    "shell_yield_after": 30,
                     "sandbox": {
                         "type": "none",
                     },
@@ -440,6 +441,7 @@ class TestLoadFromDict(unittest.TestCase):
             OSEnvSpec(
                 type="caller_process",
                 cwd="/tmp/work",
+                shell_yield_after=30,
                 sandbox=OSEnvSandboxSpec(type="none"),
             ),
         )
