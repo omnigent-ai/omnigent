@@ -6340,8 +6340,10 @@ def test_settled_eof_before_settlement_is_an_error() -> None:
     _run(_test())
 
 
-def _overflow_compaction_frames(compaction_end: dict, *after_settled: str) -> list[str]:
-    """pi's frames for an overflow it compacts and retries into "RECOVERED"."""
+def _overflow_compaction_frames(
+    compaction_end: dict, *after_settled: str, retry: list[str] | None = None
+) -> list[str]:
+    """pi's frames for an overflow it compacts and retries, by default into "RECOVERED"."""
     overflow = _assistant_message(
         stop_reason="error", error_message="Context overflow: prompt is too long"
     )
@@ -6352,7 +6354,7 @@ def _overflow_compaction_frames(compaction_end: dict, *after_settled: str) -> li
         _rpc_frame(type="agent_end", messages=[overflow], willRetry=False),
         _rpc_frame(type="compaction_start", reason="overflow"),
         _rpc_frame(type="compaction_end", reason="overflow", **compaction_end),
-        *_plain_answer_frames("RECOVERED")[1:],
+        *(retry if retry is not None else _plain_answer_frames("RECOVERED")[1:]),
         *after_settled,
     ]
 
@@ -6381,6 +6383,14 @@ def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
             {"role": "toolResult", "toolCallId": "c1", "content": [{"type": "text", "text": "x"}]},
             _assistant_message("kept answer"),
             {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Reading notes."},
+                    {"type": "toolCall", "id": "c2", "name": "read", "arguments": {}},
+                ],
+            },
+            {"role": "toolResult", "toolCallId": "c2", "content": [{"type": "text", "text": "y"}]},
             _assistant_message("RECOVERED"),
         ]
         executor, rpc = _session_executor(
@@ -6436,6 +6446,11 @@ def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
                 "role": "user",
                 "content": [{"type": "input_text", "text": "hello"}],
             },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Reading notes."}],
+            },
         ]
         assert _sent_command_types(rpc) == ["prompt", "get_messages"]
         assert rpc._line_queue.empty()
@@ -6468,7 +6483,61 @@ def test_settled_compaction_without_exported_context_reports_summary_only() -> N
     _run(_test())
 
 
-def test_settled_failed_compaction_reports_no_compaction() -> None:
+def test_settled_compaction_then_failed_retry_reports_compaction_before_error() -> None:
+    """pi keeps its compacted context when the retry fails, so the compaction
+    is still reported before the turn's error."""
+
+    async def _test() -> None:
+        failed_retry = _assistant_message(stop_reason="error", error_message="upstream 500")
+        executor, rpc = _session_executor(
+            _overflow_compaction_frames(
+                {"result": {"summary": "SUMMARY"}, "aborted": False, "willRetry": True},
+                _rpc_frame(
+                    type="response",
+                    command="get_messages",
+                    success=True,
+                    data={
+                        "messages": [
+                            {"role": "compactionSummary", "summary": "SUMMARY"},
+                            {"role": "user", "content": "hello"},
+                            failed_retry,
+                        ]
+                    },
+                ),
+                retry=[
+                    _rpc_frame(type="agent_start"),
+                    _rpc_frame(type="message_start", message={"role": "assistant"}),
+                    _rpc_frame(type="message_end", message=failed_retry),
+                    _rpc_frame(type="agent_end", messages=[failed_retry], willRetry=False),
+                    _rpc_frame(type="agent_settled"),
+                ],
+            )
+        )
+
+        events = await _run_session_turn(executor, "hello")
+
+        assert [type(e) for e in events[-2:]] == [CompactionComplete, ExecutorError]
+        compaction, error = events[-2:]
+        assert error.message == "upstream 500"
+        assert compaction.summary == "SUMMARY"
+        assert [m["content"][0]["text"] for m in compaction.compacted_messages][1:] == ["hello"]
+        assert not any(isinstance(e, TurnComplete) for e in events)
+        assert _sent_command_types(rpc) == ["prompt", "get_messages"]
+        assert rpc._line_queue.empty()
+        assert _SESSION_KEY in executor._session_states
+
+    _run(_test())
+
+
+@pytest.mark.parametrize(
+    "compaction_end",
+    [
+        {"aborted": False, "errorMessage": "Auto-compaction failed: timeout"},
+        {"aborted": True},
+    ],
+    ids=["failed", "aborted"],
+)
+def test_settled_failed_compaction_reports_no_compaction(compaction_end: dict) -> None:
     """A compaction that pi aborts or fails leaves the history unchanged, so
     nothing is reported and pi is not asked for its context."""
 
@@ -6479,11 +6548,7 @@ def test_settled_failed_compaction_reports_no_compaction() -> None:
                 *answer_frames[:-1],
                 _rpc_frame(type="compaction_start", reason="threshold"),
                 _rpc_frame(
-                    type="compaction_end",
-                    reason="threshold",
-                    aborted=False,
-                    willRetry=False,
-                    errorMessage="Auto-compaction failed: timeout",
+                    type="compaction_end", reason="threshold", willRetry=False, **compaction_end
                 ),
                 answer_frames[-1],
             ]

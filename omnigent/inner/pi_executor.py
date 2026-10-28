@@ -1541,9 +1541,10 @@ def _pi_compacted_history(pi_messages: list[JsonValue]) -> CompactedMessages:
     """
     Convert Pi's post-compaction context into Omnigent replay messages.
 
-    Messages after the last user prompt are this turn's output, which the
-    runner persists after the compaction item, so they are left out. Tool
-    calls and results are dropped because Pi replay carries text only.
+    The current turn's text up to its last tool result is persisted before
+    the compaction item, so it is kept. The reply after that result is
+    persisted after the item, so it is left out. Tool calls and results are
+    dropped because Pi replay carries text only.
 
     :param pi_messages: ``get_messages`` data from Pi after compaction.
     :returns: Text messages for the runner's compaction item.
@@ -1553,8 +1554,16 @@ def _pi_compacted_history(pi_messages: list[JsonValue]) -> CompactedMessages:
         (index for index, m in enumerate(messages) if m.get("role") == "user"),
         default=-1,
     )
+    persisted_end = max(
+        (
+            index
+            for index, m in enumerate(messages)
+            if index > last_prompt and m.get("role") == "toolResult"
+        ),
+        default=last_prompt,
+    )
     history: CompactedMessages = []
-    for message in messages[: last_prompt + 1]:
+    for message in messages[: persisted_end + 1]:
         role = message.get("role")
         if role == "compactionSummary":
             summary = message.get("summary")
@@ -3277,11 +3286,12 @@ class PiExecutor(Executor):
             # ``agent_settled``: no retry, compaction or queued continuation is
             # left, so the stream is clean for the next turn on this session.
             if event_type == "agent_settled" and settled_boundary:
+                # A failed turn still reports it: the kept pi process stays compacted.
+                if compaction_result is not None:
+                    yield await self._compaction_complete(rpc, compaction_result, model)
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                if compaction_result is not None:
-                    yield await self._compaction_complete(rpc, compaction_result, model)
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 yield TurnComplete(

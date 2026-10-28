@@ -42,8 +42,7 @@ _BIND_TIMEOUT_S = 180.0
 # Pi keeps ~20k recent tokens on overflow; small parts let the retry fit the window.
 _PART_CHARS = 4_000
 _MAX_FILL_TURNS = 40
-# Keep working after Pi's first compaction (it compacts again on each later turn) until
-# the uncompacted history is about the reported 48k tokens.
+# Keep going after Pi's first compaction until raw history is ~48k tokens, well over the window.
 _TURNS_AFTER_FIRST_COMPACTION = 15
 _SUMMARY_PROMPTS = (
     "Create a structured context checkpoint summary",
@@ -302,6 +301,7 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
         outcome = "not reached"
         restart_seq = 0
         pre_markers: list[str] = []
+        compacting_markers: list[str] = []
         try:
             page = context.new_page()
             page.goto(f"{stack.base_url}/c/{session_id}")
@@ -312,6 +312,7 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
                 marker = f"PRE-{index:02d}-{nonce}"
                 pre_markers.append(marker)
                 script_reply(marker)
+                sent_at = len(proxy.requests)
                 _send_turn(
                     page,
                     f"Turn {marker}: here is part {index} of the build log I am debugging. "
@@ -319,6 +320,8 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
                     f"ack-{marker}",
                 )
                 mark(f"turn {marker} answered")
+                if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
+                    compacting_markers.append(marker)
                 if first_compaction_turn is None and any(
                     _is_summarization(entry) for entry in proxy.requests
                 ):
@@ -331,10 +334,14 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
             diagnostics["fill_turns"] = len(pre_markers)
             diagnostics["first_compaction_turn"] = first_compaction_turn
             script_reply(post_marker)
+            sent_at = len(proxy.requests)
             _send_turn(
                 page, f"Turn {post_marker}: does anything stand out so far?", f"ack-{post_marker}"
             )
             mark("post-compaction turn answered")
+            if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
+                compacting_markers.append(post_marker)
+            diagnostics["compacting_turns"] = compacting_markers
             deadline = time.monotonic() + 30.0
             compactions: list[dict[str, Any]] = []
             while time.monotonic() < deadline and not compactions:
@@ -393,3 +400,8 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
         f"turns Pi had already summarized were replayed after restart: {summarized_markers}"
     )
     assert summary.split()[0] in resumed_text, "the resumed context lost Pi's compaction summary"
+    # The last compacting turn's prompt is stored before its compaction item, so only
+    # the kept context can replay it.
+    assert f"Turn {compacting_markers[-1]}:" in resumed_text, (
+        "the resumed context lost the prompt Pi kept when it last compacted"
+    )
