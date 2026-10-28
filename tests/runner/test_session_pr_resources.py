@@ -614,6 +614,29 @@ async def test_pr_reads_report_lock_contention_and_allow_retry(
     assert reader.github_info(session_id="session", pr_url=pr_url)["pr"]["number"] == 42
 
 
+async def test_runner_serves_a_pr_the_server_vouches_for(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh host never recorded the session's PR; the server's vouching is enough."""
+    monkeypatch.setattr(github, "_gh", lambda *_a, **_kw: (0, '{"number": 42}', ""))
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    path = "/v1/sessions/fresh/resources/github"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        refused = await client.get(path, params={"pr_url": A})
+        served = await client.get(path, params={"pr_url": A, "server_tracked": "1"})
+        default = await client.get(path, params={"default_pr_url": A, "server_tracked": "1"})
+    assert refused.status_code == 400
+    assert served.status_code == 200, served.text
+    assert served.json()["pr"]["number"] == 42
+    assert default.json()["selected_pr_url"] == A
+    assert SessionPrRegistry("fresh").list() == []
+
+
 @pytest.mark.parametrize("operation", ["github_changes", "github_pr_diff", "github_file_diff"])
 def test_selected_pr_reads_report_lock_contention(tracked: str, operation: str) -> None:
     registry = SessionPrRegistry("session")

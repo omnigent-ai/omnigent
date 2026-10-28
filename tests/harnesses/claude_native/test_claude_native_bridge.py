@@ -54,6 +54,7 @@ from omnigent.harnesses.claude_native.bridge import (
     inject_user_message,
     is_auth_slash_command,
     kill_session,
+    pane_closed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -740,6 +741,39 @@ def test_record_hook_event_ignores_foreign_identity(tmp_path: Path) -> None:
     assert read_seen_claude_session_ids(bridge_dir) == {"pinned-session"}
     # The event itself is still recorded — only its identity is ignored.
     assert count_hook_events(bridge_dir) == 2
+
+
+@pytest.mark.parametrize("event_name", ["SessionStart", "Stop", "StopFailure"])
+@pytest.mark.parametrize("marker", ["agent_id", "subagent_path"])
+@pytest.mark.parametrize("parent_started", [False, True])
+def test_record_hook_event_keeps_child_identity_out_of_parent_state(
+    tmp_path: Path, event_name: str, marker: str, parent_started: bool
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    parent_transcript = tmp_path / "parent.jsonl"
+    if parent_started:
+        record_hook_event(
+            bridge_dir,
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "parent",
+                "transcript_path": str(parent_transcript),
+            },
+        )
+    child: dict[str, Any] = {
+        "hook_event_name": event_name,
+        "session_id": "parent" if marker == "agent_id" else "child",
+        "transcript_path": str(tmp_path / "subagents" / "agent-child.jsonl"),
+    }
+    if marker == "agent_id":
+        child["agent_id"] = "child"
+        child["transcript_path"] = str(tmp_path / "child.jsonl")
+    record_hook_event(bridge_dir, child)
+
+    assert read_transcript_path(bridge_dir) == (parent_transcript if parent_started else None)
+    assert read_claude_session_id(bridge_dir) == ("parent" if parent_started else None)
+    assert read_seen_claude_session_ids(bridge_dir) == ({"parent"} if parent_started else set())
+    assert count_hook_events(bridge_dir) == 1 + int(parent_started)
 
 
 def test_record_hook_event_session_start_rotates_identity(tmp_path: Path) -> None:
@@ -1861,6 +1895,31 @@ def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> N
     assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
+def test_read_transcript_login_guidance_in_managed_sandbox_points_at_a_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A managed sandbox (``IS_SANDBOX=1``) cannot run ``omni setup``.
+
+    Its credentials arrive at launch, so the appended remedy names the only
+    self-service step (a new session) and the fallback when that still fails
+    (the sandbox administrator). The CLI's own text is kept.
+    """
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    raw_text = "Login expired · Please run /login"
+
+    rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert rendered.startswith(f"{raw_text}\n\n")
+    assert "credentials at launch" in rendered
+    assert "new session" in rendered
+    assert "if sign-in still fails" in rendered
+    assert "sandbox administrator" in rendered
+    assert "refresh its credentials" in rendered
+    assert "omni setup" not in rendered
+
+
 def test_read_transcript_items_from_offset_skips_existing_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2184,6 +2243,87 @@ def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> N
     assert result.items[0].response_id == "resp_prev_turn"
     assert result.items[2].data["role"] == "assistant"
     assert result.items[2].response_id not in {"resp_prev_turn", None}
+
+
+@pytest.mark.parametrize(
+    ("record_fields", "message_fields", "hidden"),
+    [
+        pytest.param({}, {}, True, id="interrupted-turn-resumed"),
+        pytest.param(
+            {"isApiErrorMessage": True, "error": "rate_limit"}, {}, True, id="rate-limit"
+        ),
+        pytest.param({}, {"content": "No response requested."}, True, id="string-content"),
+        pytest.param({}, {"model": "claude-sonnet-4-5"}, False, id="model-reply"),
+        pytest.param(
+            {"isApiErrorMessage": True},
+            {"content": [{"type": "text", "text": "API Error: Connection refused"}]},
+            False,
+            id="api-error",
+        ),
+        pytest.param(
+            {},
+            {
+                "content": [
+                    {"type": "text", "text": "No response requested."},
+                    {"type": "text", "text": "Continuing."},
+                ]
+            },
+            False,
+            id="additional-text",
+        ),
+    ],
+)
+def test_read_transcript_hides_no_response_placeholder(
+    tmp_path: Path,
+    record_fields: dict[str, Any],
+    message_fields: dict[str, Any],
+    hidden: bool,
+) -> None:
+    """
+    Claude Code's synthetic no-reply placeholder never reaches the chat.
+
+    On resume the TUI writes it just before the next prompt; it must not render
+    or open a turn. Model prose and other CLI-authored messages are kept.
+    """
+    record = {
+        "type": "assistant",
+        "uuid": "placeholder",
+        "isApiErrorMessage": False,
+        "message": {
+            "role": "assistant",
+            "model": "<synthetic>",
+            "stop_reason": "stop_sequence",
+            "content": [{"type": "text", "text": "No response requested."}],
+            **message_fields,
+        },
+        **record_fields,
+    }
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(record)
+        + _transcript_line(
+            {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "continue"}}
+        )
+        + _transcript_line(_assistant_text_entry("reply", "Picking the task back up.")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+
+    texts = [block["text"] for item in result.items for block in item.data["content"]]
+    conversation = ["continue", "Picking the task back up."]
+    if hidden:
+        assert texts == conversation
+    else:
+        kept = [block["text"] for block in record["message"]["content"]]
+        assert texts == [claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT, *kept, *conversation]
 
 
 def test_read_transcript_line_cursor_migration_preserves_legacy_source_ids(
@@ -5856,6 +5996,86 @@ def test_kill_session_raises_on_unexpected_tmux_failure(
         kill_session(bridge_dir)
 
 
+def test_expected_close_marks_the_pane_before_the_kill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A kill Omnigent asks for marks the pane's private dir before tmux kills it.
+
+    The runner reads the pane's exit moments later. The marker must already
+    exist when the kill runs, or the exit reads as the terminal dying on its own.
+    """
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+    marked_at_kill: list[bool] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        marked_at_kill.append(pane_closed_by_omnigent(private_dir))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    kill_session(bridge_dir, expected_close=True)
+
+    assert marked_at_kill == [True]
+    assert pane_closed_by_omnigent(private_dir)
+
+
+def test_failed_expected_close_kill_leaves_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kill that fails did not close the pane, so a later exit is still a crash."""
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="permission denied"):
+        kill_session(bridge_dir, expected_close=True)
+
+    assert not pane_closed_by_omnigent(private_dir)
+
+
+def test_kill_session_without_expected_close_leaves_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    kill_session(bridge_dir)
+
+    assert not pane_closed_by_omnigent(private_dir)
+
+
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8632,6 +8852,30 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert "omni setup" in login.failure_message
 
 
+def test_hook_record_stop_failure_login_guidance_in_managed_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure card's remedy follows the host kind like the transcript's."""
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "error_details": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" not in login.failure_message
+    assert "credentials at launch" in login.failure_message
+    assert "new session" in login.failure_message
+    assert "if sign-in still fails" in login.failure_message
+    assert "sandbox administrator" in login.failure_message
+    assert "refresh its credentials" in login.failure_message
+
+
 def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:
     """``last_assistant_message`` alone does not populate ``failure_message``."""
     # Production bug: a session's previous turn prose appeared as the error
@@ -8655,8 +8899,10 @@ def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:
 # ── stop_hook_seen_since: subagent filtering ─────────────────────────
 
 
+@pytest.mark.parametrize("event_name", ["Stop", "StopFailure"])
+@pytest.mark.parametrize("transcript_kind", ["subagent", "ordinary", "omitted"])
 def test_stop_hook_seen_since_ignores_subagent_stop(
-    tmp_path: Path,
+    tmp_path: Path, event_name: str, transcript_kind: str
 ) -> None:
     """
     ``stop_hook_seen_since`` must skip subagent ``Stop`` events.
@@ -8684,14 +8930,15 @@ def test_stop_hook_seen_since_ignores_subagent_stop(
         },
     )
     cursor = 1
-    # Subagent Stop — must not be detected.
+    child: dict[str, Any] = {"hook_event_name": event_name, "session_id": "subagent"}
+    if transcript_kind != "omitted":
+        child["transcript_path"] = str(
+            subagent_transcript if transcript_kind == "subagent" else tmp_path / "child.jsonl"
+        )
+    # A foreign native session remains a child without a distinctive path.
     record_hook_event(
         bridge_dir,
-        {
-            "hook_event_name": "Stop",
-            "session_id": "subagent",
-            "transcript_path": str(subagent_transcript),
-        },
+        child,
     )
     assert not stop_hook_seen_since(bridge_dir, cursor)
 
@@ -11517,13 +11764,27 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("cursor", [0, 8, 18], ids=["start", "middle", "end"])
+@pytest.mark.parametrize("stale_frame", [False, True], ids=["plain", "previous-frame"])
 @pytest.mark.parametrize("draft", ["", "ONE\nTWO\nTHREE\nFOUR"], ids=["empty", "hidden-draft"])
 def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, cursor: int, draft: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    cursor: int,
+    draft: str,
+    stale_frame: bool,
 ) -> None:
     """A tiny pane can hide the closing rule even after every draft line was cleared."""
     composer = _EditableComposer(draft, cursor=min(cursor, len(draft)), visible_rows=1)
     composer.install(monkeypatch)
+    if stale_frame:
+        capture = composer._capture_pane
+
+        def capture_after_old_frame(socket_path: str, tmux_target: str) -> str:
+            pane = capture(socket_path, tmux_target).removeprefix("⏺ done\n")
+            return f"{composer._RULE}\n❯ previous message\n{pane}"
+
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture_after_old_frame)
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -11559,7 +11820,84 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
     assert sizes == ["24", "6"]
 
 
+_IDLE_COMPACT_NOTICE_PANE = """\
+──────────────────────────────
+❯ [idle-compact] 00000000-0000-0000-0000-000000000001: idle 60m with 900000 ctx tok
+ens (example-model) -> sent /compact. Use /rewind if you need to return to a spec
+ific earlier point.
+  ▸▸ auto mode on (shift+tab to cycle)
+"""
+
+
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("scenario", ["printed", "hidden-draft", "unresponsive", "scrollback"])
+def test_idle_compact_notice_redraw_preserves_delivery_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, scenario: str
+) -> None:
+    """Printed terminal output clears on redraw; real drafts still need clearing."""
+    draft = _TALL_DRAFT if scenario == "hidden-draft" else ""
+    composer = _EditableComposer(draft, cursor=0)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 40 latest\n", stderr=""),
+    )
+    overlay = _IDLE_COMPACT_NOTICE_PANE
+    if scenario == "hidden-draft":
+        overlay = overlay.replace("❯ [idle-compact]", "❯ STALE 0\n  [idle-compact]")
+    elif scenario == "scrollback":
+        overlay += _composer_pane("stale\n  still unreadable after clearing")
+    notice_visible = True
+    operations: list[tuple[str, ...]] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        nonlocal notice_visible, overlay
+        operations.append(args)
+        if args[0] == "send-keys" and args[-1] == "C-l":
+            if scenario == "hidden-draft":
+                assert "STALE" in composer.text, "Hidden draft lines must remain before redraw."
+            if scenario != "unresponsive":
+                notice_visible = False
+        else:
+            if args[-1] == "Space" and scenario in {"printed", "hidden-draft"}:
+                # An incremental repaint erases the marker but leaves the wrapped output.
+                overlay = "\n".join(
+                    row.partition("[idle-compact]")[0] for row in overlay.splitlines()
+                )
+            composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: overlay if notice_visible else composer._capture_pane(*args),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    def inject() -> None:
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+
+    if scenario in {"unresponsive", "scrollback"}:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject()
+        assert composer.submitted == []
+        assert not any(args[0] in {"load-buffer", "paste-buffer"} for args in operations)
+    else:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [
+            "/effort high" if slash else "hello from the web"
+        ]
+    assert sum(args[-1] == "C-l" for args in operations) == (scenario != "scrollback")
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("recovery", ["resize", "notice-redraw"])
 @pytest.mark.parametrize(
     ("pane", "error"),
     [
@@ -11573,27 +11911,33 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     slash: bool,
+    recovery: str,
     pane: str,
     error: type[Exception],
 ) -> None:
-    """A dialog exposed by resizing receives no clearing, paste or submit keystrokes."""
-    composer = _EditableComposer("", cursor=0, visible_rows=1)
+    """A dialog exposed by recovery receives no clearing, paste or submit keystrokes."""
+    composer = _EditableComposer("", cursor=0, visible_rows=1 if recovery == "resize" else None)
     composer.install(monkeypatch)
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="120 7 manual\nmanual\n", stderr=""
+            returncode=0,
+            stdout=f"120 {7 if recovery == 'resize' else 40} manual\nmanual\n",
+            stderr="",
         ),
     )
     resized = False
+    redrawn = False
     recovery_keys: list[str] = []
 
     def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
-        nonlocal resized
+        nonlocal resized, redrawn
         if args[0] == "resize-window":
             resized = args[args.index("-y") + 1] == "24"
-        elif resized:
+        elif args[0] == "send-keys" and args[-1] == "C-l":
+            redrawn = True
+        elif resized or redrawn:
             assert args[0] == "send-keys" and args[-1] == "Escape"
             recovery_keys.append(args[-1])
         else:
@@ -11603,7 +11947,13 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
-        lambda *args: pane if resized else composer._capture_pane(*args),
+        lambda *args: (
+            pane
+            if resized or redrawn
+            else _IDLE_COMPACT_NOTICE_PANE
+            if recovery == "notice-redraw"
+            else composer._capture_pane(*args)
+        ),
     )
     monkeypatch.setattr(
         claude_native_bridge,
@@ -11621,6 +11971,7 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
 
     assert composer.submitted == []
     assert not resized
+    assert redrawn == (recovery == "notice-redraw")
     if pane != _REVERSE_SEARCH_PANE:
         assert recovery_keys == []
 
@@ -12360,9 +12711,9 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
         inject_user_message(bridge_dir, content="hello from the web")
 
     tails = [args[-1] for args in sends]
-    assert tails and set(tails) == {claude_native_bridge._CLEAR_LINE_KEY}, (
-        f"Only the clearing keys may be sent; got {tails}."
-    )
+    assert tails and all(
+        not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
+    ), f"Only the clearing keys may be sent; got {tails}."
 
 
 _MCP_APPROVAL_DIALOG_PANE = """\

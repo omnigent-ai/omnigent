@@ -374,6 +374,8 @@ _SCHEDULED_TASK_SETTINGS = (
     "host_id",
     "workspace",
     "execution_target",
+    "project_name",
+    "project_id",
     "permission_mode",
     "max_cost_usd",
     "model_override",

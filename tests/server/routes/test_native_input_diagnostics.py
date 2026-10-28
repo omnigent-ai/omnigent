@@ -123,6 +123,7 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_client_id", [False, True])
 @pytest.mark.parametrize(
     ("outcome", "cause_class", "reason_code"),
     [
@@ -137,13 +138,14 @@ async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
     outcome: str,
     cause_class: str,
     reason_code: str,
+    with_client_id: bool,
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
     first = pending_inputs.record(
         conv.id,
         [{"type": "input_text", "text": "missing"}],
-        stable_id="a" * 32,
+        stable_id="a" * 32 if with_client_id else None,
         background_titles_enabled=False,
     )
     second = pending_inputs.record(
@@ -152,11 +154,16 @@ async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
         stable_id="b" * 32,
         background_titles_enabled=False,
     )
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(conv.id, first).items()
+        if key in {"pending_id", "delivery_attempt_id", "input_stable_id"}
+    }
     _record_native_input_lifecycle(
         conv.id,
         {
             "type": "response.in_progress",
-            "input_stable_id": "a" * 32,
+            **identity,
             "response": {"id": "resp_missing"},
         },
     )
@@ -164,7 +171,7 @@ async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
         conv.id,
         {
             "type": f"response.{outcome}",
-            "input_stable_id": "a" * 32,
+            **identity,
             "response": {"id": "resp_missing"},
         },
     )
@@ -206,6 +213,26 @@ async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
     saved = {item.id: item for item in store.list_items(conv.id).data}
     assert saved[record.attributes["item_id"]].data.content[0]["text"] == "missing"
     assert saved[record.attributes["error_item_id"]].data.code == "native_prompt_not_recorded"
+
+
+@pytest.mark.parametrize("invalid_key", ["input_stable_id", "pending_id", "delivery_attempt_id"])
+def test_malformed_lifecycle_identity_does_not_fall_back_to_another_identifier(
+    invalid_key: str,
+) -> None:
+    session_id = "conv_malformed_lifecycle_identity"
+    pending_id = pending_inputs.record(session_id, [], stable_id="a" * 32)
+    original = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    try:
+        _record_native_input_lifecycle(
+            session_id,
+            {**original, "type": "response.completed", invalid_key: "invalid identity"},
+        )
+        assert (
+            pending_inputs.delivery_attributes_for(session_id, pending_id)["last_delivery_stage"]
+            == "server_queued"
+        )
+    finally:
+        pending_inputs.resolve(session_id, pending_id)
 
 
 @pytest.mark.asyncio

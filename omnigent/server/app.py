@@ -77,8 +77,14 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    session_live_state,
+    session_pull_requests,
+    shutdown_state,
+)
 from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
     AuthProvider,
     SharingMode,
     auth_mode,
@@ -89,7 +95,12 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.feature_flags import (
+    Feature,
+    FeatureFlags,
+    harness_install_enabled,
+    resolve_feature_flags,
+)
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -120,6 +131,7 @@ from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
+    CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
@@ -237,8 +249,15 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
+    session_event_types: list[str] = []
+    # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
+    # absent on older servers, which clients treat as unsupported.
+    session_pull_requests: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
+    # Scheduled tasks accept ``project_id``; older servers reject it.
+    scheduled_task_projects: bool = False
     branding: BrandingInfo
 
 
@@ -1381,6 +1400,7 @@ def create_app(
     filesystem_attachment_allowed_extensions: (
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
+    harness_install: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1428,8 +1448,9 @@ def create_app(
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
     :param preference_store: Optional shared-preference API; no launcher adoption.
-    :param scheduled_task_dispatch: Claimed-run execution and recovery callbacks;
-        required only when automations_v2 is enabled.
+    :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
+        the owner identity fires act under, or a replacement executor. ``None``
+        uses the built-in executor with every host owned by this replica.
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
@@ -1573,18 +1594,18 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    if harness_install is None:
+        app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
+            Feature.HARNESS_INSTALL
+        )
+    else:
+        app_harness_install = harness_install
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     if automations_v2_enabled:
         if scheduled_task_store is None:
             raise ValueError(
                 "automations_v2 requires a scheduled task store. Pass scheduled_task_store "
                 "to create_app(), or leave automations_v2 disabled until scheduling is configured."
-            )
-        if scheduled_task_dispatch is None:
-            raise ValueError(
-                "automations_v2 requires callbacks to start runs and recover interrupted "
-                "startups. Pass scheduled_task_dispatch to create_app(), or disable "
-                "automations_v2 to use the existing scheduler."
             )
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
@@ -1682,6 +1703,7 @@ def create_app(
         RunnerBackgroundTitleGenerator(runner_router),
         additional_instructions=title_instructions,
     )
+    pull_request_refresher = session_pull_requests.PullRequestRefresher()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -1843,7 +1865,12 @@ def create_app(
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import (
+                ClaimedRunExecutor,
+                FireDeps,
+                build_on_fire,
+                build_run_now,
+            )
 
             fire_deps = FireDeps(
                 scheduled_task_store=scheduled_task_store,
@@ -1865,26 +1892,28 @@ def create_app(
                 managed_launches=app_inst.state.managed_launches,
                 startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
+                project_store=project_store,
+                single_user_owner=RESERVED_USER_LOCAL if auth_provider is not None else None,
             )
-            on_fire = build_on_fire(fire_deps)
-            # The manual "run now" trigger reuses the same fire path (dispatch /
-            # preflight / in-flight guard) as the scheduler; it only differs in
-            # allowing a paused task to fire. Exposed on app.state for the
-            # POST /v1/scheduled-tasks/{id}/run route.
-            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             if not automations_v2_enabled:
+                # Legacy Run now uses this fire path, including for paused tasks.
+                # The database scheduler handles Run now itself.
+                app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
                 scheduled_task_scheduler = ScheduledTaskScheduler(
                     store=scheduled_task_store,
-                    on_fire=on_fire,
+                    on_fire=build_on_fire(fire_deps),
                 )
             else:
-                assert scheduled_task_dispatch is not None
                 assert isinstance(scheduled_task_store, ScheduledTaskDispatchStore)
+                dispatch_hooks = scheduled_task_dispatch or ScheduledTaskDispatchHooks()
+                executor = ClaimedRunExecutor(
+                    fire_deps, fire_identity=dispatch_hooks.fire_identity
+                )
                 scheduled_task_scheduler = PersistentTaskScheduler(
                     store=scheduled_task_store,
-                    on_fire=scheduled_task_dispatch.on_fire,
-                    on_expired=scheduled_task_dispatch.on_expired,
-                    owns_host=scheduled_task_dispatch.owns_host,
+                    on_fire=dispatch_hooks.on_fire or executor.fire,
+                    on_expired=dispatch_hooks.on_expired or executor.recover,
+                    owned_hosts=dispatch_hooks.owned_hosts,
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
@@ -1962,10 +1991,13 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        session_pull_requests.install_refresher(pull_request_refresher)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            session_pull_requests.install_refresher(None)
+            await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -2082,6 +2114,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.harness_install = app_harness_install
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3308,10 +3341,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # The immutable feature snapshot is shared by capability
-        # advertisement and route enforcement, so frontend and backend cannot
-        # disagree during a process lifetime.
-        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
+        # Resolve the gate per request with the same resolver used by route enforcement.
+        current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
+        frontend_features = app.state.feature_flags.frontend_dict()
+        frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -3320,7 +3353,7 @@ def create_app(
         from omnigent.onboarding.harness_install import ui_installable_harnesses
 
         installable_harnesses = (
-            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+            sorted(ui_installable_harnesses()) if current_harness_install_enabled else []
         )
         # dictation_available gates the composer mic button's server
         # speech-to-text fallback (designs/server-dictation.md). Checks
@@ -3349,8 +3382,8 @@ def create_app(
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
-                "features": app.state.feature_flags.frontend_dict(),
-                "harness_install_enabled": harness_install_enabled,
+                "features": frontend_features,
+                "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
@@ -3360,10 +3393,14 @@ def create_app(
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
+                "session_pull_requests": session_pull_requests.open_store(conversation_store)
+                is not None,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
                 },
+                "scheduled_task_projects": project_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3484,6 +3521,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            pull_request_refresher=pull_request_refresher,
             register_startup_dispatch=lambda handler: (
                 setattr(startup_inputs, "dispatch", handler)
                 if startup_inputs is not None
@@ -3659,6 +3697,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                project_store=project_store,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
@@ -3934,7 +3973,7 @@ def create_app(
         loop = asyncio.get_running_loop()
         started = loop.time()
         deadline = started + HOST_OFFLINE_HOLD_S
-        host_back = False
+        host_back_deadline: float | None = None
         outcome = "cancelled"
         for conv in held:
             _logger.info(
@@ -3951,10 +3990,13 @@ def create_app(
             )
         try:
             while True:
-                remaining = deadline - loop.time()
+                now = loop.time()
+                remaining = deadline - now
                 if remaining <= 0:
-                    outcome = "host_back_without_runner" if host_back else "expired"
+                    outcome = "expired"
                     break
+                if host_back_deadline is not None:
+                    remaining = min(remaining, max(0.0, host_back_deadline - now))
                 if (
                     await tunnel_registry.wait_for_runner(
                         runner_id, timeout_s=min(HOST_OFFLINE_RECHECK_S, remaining)
@@ -3967,10 +4009,16 @@ def create_app(
                     outcome = "server_shutdown"
                     break
                 # An unreadable host row keeps holding; only a live one ends it early.
-                if not host_back and await _host_offline(host_id) is False:
-                    # The host is back; give its runner one more grace to follow.
-                    host_back = True
-                    deadline = min(deadline, loop.time() + RUNNER_DISCONNECT_GRACE_S)
+                if await _host_offline(host_id) is False:
+                    now = loop.time()
+                    if host_back_deadline is None:
+                        host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
+                    if now >= host_back_deadline:
+                        outcome = "host_back_without_runner"
+                        break
+                else:
+                    # A brief host return cannot end a sleeping host's absolute hold.
+                    host_back_deadline = None
         finally:
             for conv in held:
                 _logger.info(
@@ -4572,6 +4620,7 @@ def create_app(
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -4586,6 +4635,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],

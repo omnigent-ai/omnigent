@@ -57,9 +57,11 @@ from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
+    global_pi_agent_dir,
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
@@ -117,6 +119,9 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
+# Tool arguments can include files; match the other adapters' bounded stream limit.
+_TOOL_REQUEST_LIMIT = 16 * 1024 * 1024
+_TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
 
 
 class _GatewayAuthError(OSError):
@@ -299,6 +304,7 @@ class _ToolServer:
             self._handle_client,
             "127.0.0.1",
             0,
+            limit=_TOOL_REQUEST_LIMIT,
         )
         addr = self._server.sockets[0].getsockname()
         self.port = addr[1]
@@ -326,7 +332,31 @@ class _ToolServer:
         self._clients.add(task)
         try:
             while True:
-                raw = await reader.readline()
+                try:
+                    raw = await reader.readline()
+                except ValueError:
+                    logger.warning(
+                        "Pi tool request exceeded the frame limit",
+                        extra=debug_event(
+                            "pi_tool_request_rejected",
+                            request_limit_bytes=_TOOL_REQUEST_LIMIT,
+                        ),
+                    )
+                    writer.write(
+                        json.dumps(
+                            {"error": f"tool request exceeds {_TOOL_REQUEST_LIMIT}-byte limit"}
+                        ).encode()
+                        + b"\n"
+                    )
+                    await writer.drain()
+                    writer.write_eof()
+                    # Unread input can reset the socket and discard the error response.
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(_TOOL_REQUEST_DRAIN_TIMEOUT_S):
+                            while chunk := await reader.read(64 * 1024):
+                                if b"\n" in chunk:
+                                    break
+                    break
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -2579,6 +2609,9 @@ class PiExecutor(Executor):
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
+                global_agent_dir=global_pi_agent_dir(
+                    env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
+                ),
             )
             from omnigent.inner.pi_gateway import pi_gateway_extension_args
 

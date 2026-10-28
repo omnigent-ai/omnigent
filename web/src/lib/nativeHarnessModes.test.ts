@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { canonicalNativeHarness, permissionModeConcept } from "./nativeHarnessModes";
+import {
+  canonicalNativeHarness,
+  harnessAccountKey,
+  permissionModeConcept,
+} from "./nativeHarnessModes";
 
 describe("permissionModeConcept", () => {
   it("maps Claude and Codex vocabularies onto shared concepts", () => {
@@ -22,6 +26,13 @@ describe("permissionModeConcept", () => {
     expect(canonicalNativeHarness("native-codex")).toBe("codex-native");
     expect(canonicalNativeHarness("native-pi")).toBe("pi-native");
     expect(canonicalNativeHarness("opencode-native")).toBe("opencode-native");
+  });
+
+  it("maps native aliases to canonical host account keys", () => {
+    expect(harnessAccountKey("codex-native")).toBe("codex");
+    expect(harnessAccountKey("native-claude")).toBe("claude");
+    expect(harnessAccountKey("pi-native")).toBe("pi");
+    expect(harnessAccountKey("opencode-native")).toBe("opencode");
   });
 
   it("falls back safely for missing or future values", () => {

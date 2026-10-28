@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writePreferredShell } from "./preferredShell";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import {
   TerminalFirstContextProvider,
@@ -19,6 +20,7 @@ const BASH_KEY = "terminal:terminal_bash_u-1";
 
 const fixture = vi.hoisted(() => ({
   createTerminal: vi.fn(),
+  createPending: false,
   deleteTerminal: vi.fn(),
   declaredShells: ["zsh", "bash"],
   mobile: false,
@@ -32,13 +34,14 @@ vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => fixtu
 vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: () => ({ terminals: fixture.terminals }),
-  useCreateTerminal: () => ({ mutate: fixture.createTerminal, isPending: false }),
+  useCreateTerminal: () => ({ mutate: fixture.createTerminal, isPending: fixture.createPending }),
   useDeleteTerminal: () => ({ mutate: fixture.deleteTerminal, isPending: false }),
 }));
 
 beforeEach(() => {
   fixture.createTerminal.mockReset();
   fixture.deleteTerminal.mockReset();
+  fixture.createPending = false;
   fixture.declaredShells = ["zsh", "bash"];
   fixture.mobile = false;
   fixture.terminals = [AGENT];
@@ -97,9 +100,12 @@ it.each([
       return renderControls("conv_gate");
     },
   ],
-])("renders nothing when %s", (_case, renderCase) => {
+])("renders nothing and leaves the split chords unbound when %s", (_case, renderCase) => {
   renderCase();
   expect(screen.queryByRole("button", { name: "Split right" })).toBeNull();
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true, shiftKey: true });
+  fireEvent.keyDown(window, { code: "Minus", ctrlKey: true, altKey: true });
+  expect(fixture.createTerminal).not.toHaveBeenCalled();
 });
 
 it("splits the agent pane with the picked shell and focuses the new pane", async () => {
@@ -122,6 +128,32 @@ it("splits the agent pane with the picked shell and focuses the new pane", async
       focusedKey: BASH_KEY,
     }),
   );
+});
+
+it("splits right with the preferred shell from the keyboard, skipping the picker", async () => {
+  fixture.createTerminal.mockImplementation((_shell: string, { onSuccess }) => onSuccess(BASH));
+  writePreferredShell("bash");
+  renderControls("conv_controls_hotkey");
+
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true, shiftKey: true });
+
+  expect(fixture.createTerminal).toHaveBeenCalledExactlyOnceWith("bash", expect.anything());
+  expect(screen.queryByRole("menu")).toBeNull();
+  await waitFor(() =>
+    expect(readSessionWorkspaceState("conv_controls_hotkey").terminalSplit).toEqual({
+      layout: { axis: "columns", ratio: 0.5, children: [AGENT_KEY, BASH_KEY] },
+      focusedKey: BASH_KEY,
+    }),
+  );
+});
+
+it("claims the split chord without a second shell while one is being created", () => {
+  fixture.createPending = true;
+  renderControls("conv_controls_pending");
+
+  // false: the chord was claimed, so a focused terminal never receives it.
+  expect(fireEvent.keyDown(window, { code: "Minus", ctrlKey: true, altKey: true })).toBe(false);
+  expect(fixture.createTerminal).not.toHaveBeenCalled();
 });
 
 function saveSplit(conversationId: string, focusedKey: string) {

@@ -136,6 +136,39 @@ it("replaces the default selection and the removed PR's cached metadata", async 
   expect(client.getQueryData(["github-info", "conv", url])).toMatchObject(empty);
 });
 
+it("keeps a link to its own session when the panel switches sessions", async () => {
+  const url = "https://github.com/example/one/pull/42";
+  const linked = { object: "session.github.info", tracking_available: true, prs: [{ url }] };
+  const other = { object: "session.github.info", tracking_available: true, prs: [] };
+  let answer: (response: Response) => void = () => {};
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          answer = resolve;
+        }),
+    ),
+  );
+  const client = new QueryClient();
+  client.setQueryData(["github-info", "conv_2"], other);
+  const { result, rerender } = renderHook(({ id }) => useUpdateSessionPr(id), {
+    initialProps: { id: "conv_1" },
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  result.current.mutate({ url, action: "attach" });
+  await waitFor(() => expect(result.current.isPending).toBe(true));
+
+  rerender({ id: "conv_2" });
+  expect(result.current.isIdle).toBe(true);
+  answer(new Response(JSON.stringify(linked), { status: 200 }));
+
+  await waitFor(() => expect(client.getQueryData(["github-info", "conv_1"])).toMatchObject(linked));
+  expect(client.getQueryData(["github-info", "conv_2"])).toEqual(other);
+});
+
 it("does not restore an unlinked GitLab MR from an older host's stale selection", async () => {
   const url = "https://gitlab.com/team/project/-/merge_requests/7";
   const empty = {

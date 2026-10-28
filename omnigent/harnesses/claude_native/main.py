@@ -123,8 +123,10 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.inner import _proc
 from omnigent.inner._subprocess_lifecycle import (
     await_cleanup_task,
+    close_subprocess_transport,
     terminate_direct_subprocess,
 )
 from omnigent.models import model_catalog
@@ -153,6 +155,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
+from omnigent.native.native_terminal import post_initial_prompt
 from omnigent.native.native_terminal import (
     request_with_429_retry as _request_with_429_retry,
 )
@@ -229,14 +232,13 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 #: same rows page fine at smaller sizes.
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
-_CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+# Configured launchers may bootstrap credentials and settings before Claude starts.
+_CLAUDE_MODEL_PROBE_TIMEOUT_S = 60.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
-#: revalidation retries them later). Startup dominates each run and
-#: stretches with box load (measured 0.7s–17s for the same command), so the
-#: concurrency covers a whole alias set in one wave and the budget fits one
-#: slow wave.
-_CLAUDE_ALIAS_RESOLUTION_BUDGET_S = 30.0
+#: revalidation retries them later). Allow one full probe wave, including
+#: configured-launcher bootstrap, while concurrency bounds process fan-out.
+_CLAUDE_ALIAS_RESOLUTION_BUDGET_S = _CLAUDE_MODEL_PROBE_TIMEOUT_S
 _CLAUDE_ALIAS_RESOLUTION_CONCURRENCY = 12
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _CLAUDE_CODE_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
@@ -255,6 +257,9 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# Gateway catalogs can reject Claude's canonical refusal fallback.
+# Keep the original model and refusal instead of switching to an unservable id.
+_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -467,16 +472,23 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
-def _ambient_env_is_non_anthropic_gateway() -> bool:
+def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None) -> bool:
     """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
     fingerprint must treat the env as a non-canonical endpoint.
+
+    :param configured_base_url: Optional launch override for the ambient URL;
+        managed settings still take precedence.
     """
     managed_base_url, _ = managed_claude_gateway_signal()
-    base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    base_url = managed_base_url or (
+        configured_base_url
+        if configured_base_url is not None
+        else os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    )
     if not base_url:
         return False
     host = (urlparse(base_url).hostname or "").lower()
@@ -920,25 +932,23 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
     return resolved
 
 
-def _claude_model_probe_invocation(
+def _claude_model_probe_launch(
     claude_config: ClaudeNativeUcodeConfig | None,
     extra_args: Sequence[str] = (),
     *,
     stream_input: bool = False,
-) -> tuple[str, list[str], dict[str, str]]:
+) -> tuple[str, list[str]]:
     """
-    Assemble one headless ``/model`` probe invocation.
-
-    Shared by the alias-enumeration run and the per-alias resolution runs
-    so the two cannot drift: same launch resolution, session env, speed
-    env, and env-unset list.
+    Resolve probe command and arguments without constructing the launch environment.
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param extra_args: Appended CLI args (e.g. ``--model <alias>``).
     :param stream_input: Send control requests and /model over stdin.
-    :returns: ``(command, launch_args, env)`` ready to exec.
+    :returns: ``(command, launch_args)`` shared by discovery and its cache key.
     """
     from omnigent.claude_launcher import resolve_claude_launch
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
 
     args = ["-p"]
     if stream_input:
@@ -961,7 +971,22 @@ def _claude_model_probe_invocation(
     )
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
-    command, launch_args = resolve_claude_launch("claude", args)
+    cfg = load_effective_config()
+    command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
+    launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
+    return resolve_claude_launch(command, launch_args)
+
+
+def _claude_model_probe_invocation(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    extra_args: Sequence[str] = (),
+    *,
+    stream_input: bool = False,
+) -> tuple[str, list[str], dict[str, str]]:
+    """Assemble a headless probe with the terminal's launch and auth environment."""
+    command, launch_args = _claude_model_probe_launch(
+        claude_config, extra_args, stream_input=stream_input
+    )
     env = dict(os.environ)
     env.update(build_native_claude_terminal_env(claude_config))
     env.update(
@@ -976,8 +1001,8 @@ def _claude_model_probe_invocation(
     env.pop("DATABRICKS_CONFIG_PROFILE", None)
     env.pop(_CLAUDE_CODE_NESTED_SESSION_ENV, None)
     env.pop(_CLAUDE_NONESSENTIAL_TRAFFIC_ENV, None)
-    if claude_config is not None and claude_config.api_key_helper:
-        env.pop(_ANTHROPIC_API_KEY_ENV, None)
+    for name in native_claude_auth_env_unset(claude_config):
+        env.pop(name, None)
     return command, launch_args, env
 
 
@@ -1003,29 +1028,31 @@ async def _resolve_claude_model_alias(
     )
     try:
         process = await asyncio.create_subprocess_exec(
-            command,
-            *launch_args,
+            *_proc.pipe_supervised_command(command, *launch_args),
             cwd=str(Path.home()),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         _logger.debug("Claude alias resolution could not launch for %r", alias, exc_info=True)
         return {}
+    _proc.remember_process_group(process)
     try:
         async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
             stdout, _stderr = await process.communicate()
     except (TimeoutError, asyncio.CancelledError) as exc:
-        if process.returncode is None:
-            process.kill()
+        _proc.kill_tree(process)
         with contextlib.suppress(Exception):
-            await process.wait()
+            await asyncio.wait_for(process.wait(), timeout=1.0)
         if isinstance(exc, asyncio.CancelledError):
             raise
         _logger.debug("Claude alias resolution timed out for %r", alias)
         return {}
+    finally:
+        close_subprocess_transport(process)
     if process.returncode != 0:
         _logger.debug("Claude alias resolution exited %s for %r", process.returncode, alias)
         return {}
@@ -1174,29 +1201,31 @@ async def _run_claude_model_probe(
     )
     try:
         process = await asyncio.create_subprocess_exec(
-            command,
-            *launch_args,
+            *_proc.pipe_supervised_command(command, *launch_args),
             cwd=str(Path.home()),
             env=env,
             stdin=asyncio.subprocess.PIPE if stream_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         _logger.warning("Claude model probe could not launch the claude CLI", exc_info=True)
         return None
+    _proc.remember_process_group(process)
     try:
         async with asyncio.timeout(_CLAUDE_MODEL_PROBE_TIMEOUT_S):
             stdout, stderr = await process.communicate(probe_input)
     except (TimeoutError, asyncio.CancelledError) as exc:
-        if process.returncode is None:
-            process.kill()
+        _proc.kill_tree(process)
         with contextlib.suppress(Exception):
-            await process.wait()
+            await asyncio.wait_for(process.wait(), timeout=1.0)
         if isinstance(exc, asyncio.CancelledError):
             raise
         _logger.warning("Claude model probe timed out")
         return None
+    finally:
+        close_subprocess_transport(process)
     text = stdout.decode(errors="replace")
     if process.returncode != 0:
         _logger.warning(
@@ -1309,16 +1338,15 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     The Claude Code executable is part of the key. The catalog holds that
     binary's own answer, so an upgraded CLI must re-probe instead of
     serving model names the previous release printed. The binary is
-    resolved the same way the probe launches it.
+    resolved the same way the probe launches it, including wrapper arguments.
 
     :param claude_config: The resolved launch config, or ``None``.
     :returns: A stable fingerprint string.
     """
-    from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
-    command, _ = resolve_claude_launch("claude", [])
+    command, launch_args = _claude_model_probe_launch(claude_config, stream_input=True)
     ambient_gateway = None
     if claude_config is None:
         managed_base_url, _ = managed_claude_gateway_signal()
@@ -1330,7 +1358,10 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
         sorted(claude_config.routable_models) if claude_config is not None else None,
+        command,
+        launch_args,
         binary_identity(command),
+        binary_identity("claude"),
         ambient_gateway,
         claude_managed_model_picker() if claude_config is None else None,
     )
@@ -1523,6 +1554,15 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
     )
 
 
+def native_claude_auth_env_unset(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, ...]:
+    """Credentials that would override the explicitly configured auth helper."""
+    if claude_config is not None and claude_config.api_key_helper:
+        return (_ANTHROPIC_API_KEY_ENV, "ANTHROPIC_AUTH_TOKEN")
+    return ()
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
@@ -1534,7 +1574,9 @@ def build_native_claude_terminal_env(
     terminal stays pinned to the session the Omnigent UI is showing, and
     disables the in-TUI feedback surveys, which a web-driven session
     cannot see or answer (see
-    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
+    endpoints keep the selected model when it refuses, since their catalogs
+    may not serve Claude Code's canonical refusal-fallback target.
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1552,14 +1594,17 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
-    # On the apiKeyHelper path the credential reaches Claude Code via the
-    # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
-    # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
-    if claude_config is not None and claude_config.api_key_helper:
-        if _ANTHROPIC_API_KEY_ENV in terminal_env:
+    configured_base_url = (
+        claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
+    )
+    if _ambient_env_is_non_anthropic_gateway(configured_base_url):
+        terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
+    # A raw credential can override the helper or open Claude's API-key menu.
+    for name in native_claude_auth_env_unset(claude_config):
+        if name in terminal_env:
             raise RuntimeError(
                 "native-claude: apiKeyHelper is configured but the terminal env "
-                f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
+                f"carries a raw {name}; the credential must reach "
                 "Claude Code via the helper, not the environment."
             )
     return terminal_env
@@ -1618,13 +1663,11 @@ def run_claude_native(
     :param resume_picker: ``True`` runs the claude-native picker
         once the server is reachable; ``False`` keeps the existing
         ``session_id``-or-fresh-session behavior.
-    :param prompt: Optional first prompt for the TUI, e.g.
-        ``"review the last commit"``. Delivered as Claude Code's
-        positional prompt argument, so a multi-line prompt survives
-        intact (one argv entry — never a tmux paste). Placed before
-        the pass-through args: a trailing variadic value flag (e.g.
-        ``--mcp-config <configs...>``) would consume a trailing
-        positional as another value. ``None`` starts the TUI empty.
+    :param prompt: Optional prompt for the TUI, e.g.
+        ``"review the last commit"``. Remote launches queue it as a
+        message after preparing the terminal, including on explicit resume.
+        Local launches pass it as one leading positional argv entry.
+        ``None`` starts the TUI empty.
     :param command: Executable to run in the terminal resource,
         e.g. ``"claude"``. Kept off the public CLI surface so v0
         always exposes Claude Code, while tests can supply a fake
@@ -1654,14 +1697,7 @@ def run_claude_native(
     _preflight_local_tools(resolved_command)
     startup_profiler.mark("local tools ready")
     sanitized_args = _strip_resume_from_claude_args(claude_args)
-    # Claude Code takes the initial prompt as a positional argument, so it
-    # rides along with the launch args (persisted for the runner on the remote
-    # path). One argv entry keeps newlines and quotes intact. The prompt goes
-    # first: pass-through args may end in a variadic value flag (e.g.
-    # ``--mcp-config <configs...>``) that would swallow a trailing positional
-    # as another value, while every later merge point only appends flags.
-    if prompt and prompt.strip():
-        sanitized_args = (prompt, *sanitized_args)
+    prompt = prompt if prompt and prompt.strip() else None
     startup_profiler.mark("claude args normalized")
     # Resolve the launch config across all offerings: a configured provider
     # (configure harnesses), the Databricks ucode profile, or Claude's own
@@ -1679,11 +1715,13 @@ def run_claude_native(
         spec_path = _materialize_claude_agent_spec(Path(tmpdir))
         startup_profiler.mark("agent spec materialized")
         if server is None:
+            # Keep the one-shot local prompt ahead of variadic flag values.
+            local_args = (prompt, *sanitized_args) if prompt is not None else sanitized_args
             _run_with_local_server(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                claude_args=sanitized_args,
+                claude_args=local_args,
                 command=resolved_command,
                 claude_config=claude_config,
                 auto_open_conversation=auto_open_conversation,
@@ -1699,6 +1737,7 @@ def run_claude_native(
                 session_id=session_id,
                 resume_picker=resume_picker,
                 claude_args=sanitized_args,
+                prompt=prompt,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
             )
@@ -2475,7 +2514,10 @@ def _copy_transcript_with_cwd(
         clone's own Claude session id rather than the source's. ``None``
         (the cwd-only redirect/move path) leaves ``sessionId`` untouched.
         The ``uuid`` / ``parentUuid`` chain is preserved verbatim in
-        either case.
+        either case. A clone also sheds the source's live background
+        sub-agent launch handles (see
+        :func:`_detach_cloned_background_launch`); the move keeps them,
+        since that session's own process really did exit.
     :returns: None.
     :raises click.ClickException: If a transcript line is malformed.
     """
@@ -2495,10 +2537,66 @@ def _copy_transcript_with_cwd(
             if isinstance(payload, dict):
                 if isinstance(payload.get("cwd"), str):
                     payload["cwd"] = current_text
-                if new_session_id is not None and isinstance(payload.get("sessionId"), str):
-                    payload["sessionId"] = new_session_id
+                if new_session_id is not None:
+                    if isinstance(payload.get("sessionId"), str):
+                        payload["sessionId"] = new_session_id
+                    _detach_cloned_background_launch(payload)
                 _sanitize_cloned_tool_result_record(payload)
             dst.write(json.dumps(payload, separators=(",", ":")) + "\n")
+
+
+def _is_background_subagent_launch(tool_use_result: object) -> bool:
+    """
+    Whether ``toolUseResult`` metadata is a live background sub-agent handle.
+
+    These are the shapes Claude Code's ``--resume`` scan treats as a background
+    agent still owed a ``<task-notification>``: an ``Agent`` launch with
+    ``status: "async_launched"``, or a ``Skill`` fork with ``status: "forked"``
+    and ``background: true``, each carrying the agent id.
+
+    :param tool_use_result: The record's ``toolUseResult`` value.
+    :returns: ``True`` for a background launch handle.
+    """
+    if not isinstance(tool_use_result, dict):
+        return False
+    if not isinstance(tool_use_result.get("agentId"), str):
+        return False
+    status = tool_use_result.get("status")
+    return status == "async_launched" or (
+        status == "forked" and tool_use_result.get("background") is True
+    )
+
+
+def _detach_cloned_background_launch(payload: _JsonObject) -> None:
+    """
+    Detach a background sub-agent launch handle from one cloned record, in place.
+
+    On ``--resume`` Claude Code reads ``toolUseResult`` metadata for background
+    agents that were launched but never reported back and treats them as
+    orphaned by a process exit: it injects a failed/stopped
+    ``<task-notification>`` for each (and may restart the agent), and the model
+    then answers that notice in the resumed session. A clone is a new Claude
+    session that cannot own the source's still-running agents, so the handle is
+    replaced with the JSON-safe string form Omnigent writes for rebuilt tool
+    results. The model-visible ``tool_result`` content is left as it was.
+
+    :param payload: One decoded transcript record (mutated).
+    :returns: None.
+    """
+    if not _is_background_subagent_launch(payload.get("toolUseResult")):
+        return
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    result_text = ""
+    for block in content if isinstance(content, list) else ():
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            inner = block.get("content")
+            if isinstance(inner, str):
+                result_text = inner
+            elif inner is not None:
+                result_text = json.dumps(inner, separators=(",", ":"))
+            break
+    payload["toolUseResult"] = _json_safe_tool_use_result(result_text)
 
 
 def _sanitize_cloned_tool_result_record(payload: _JsonObject) -> None:
@@ -4858,6 +4956,7 @@ def _run_with_remote_server(
     session_id: str | None,
     resume_picker: bool,
     claude_args: tuple[str, ...],
+    prompt: str | None = None,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
 ) -> None:
@@ -4884,6 +4983,8 @@ def _run_with_remote_server(
         launches ``claude`` itself and derives the ucode config from the
         provider config, so this path takes neither a ``command`` nor a
         ``claude_config``.)
+    :param prompt: Optional message to submit once after preparation,
+        outside terminal attach/reconnect attempts.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after the session is prepared.
     :param startup_profiler: Optional startup profiler for timing
@@ -5028,6 +5129,18 @@ def _run_with_remote_server(
             headers.clear()
             headers.update(new_headers)
 
+        if prompt:
+            asyncio.run(
+                post_initial_prompt(
+                    base_url=base_url,
+                    headers=headers,
+                    session_id=prepared.session_id,
+                    prompt=prompt,
+                    auth=forwarder_auth,
+                    harness_name="Claude",
+                )
+            )
+            record_startup_event("initial_prompt_submitted")
         startup_profiler.mark("opening remote terminal attach")
         outcome = asyncio.run(
             _attach_with_transcript_forwarder(
@@ -5789,10 +5902,11 @@ def _claude_transcript_records_from_session_items(
                     }
                 )
                 parent_uuid = boundary_uuid
-                for compacted_index, compacted_value in enumerate(compacted_messages):
-                    compacted_message = _json_object(compacted_value)
-                    if compacted_message is None:
-                        continue
+                rejoined, dropped_source_ids = _rejoin_split_server_tool_results(
+                    compacted_messages
+                )
+                snapshot_item_ids.update(_snapshot_item_ids(session_id, dropped_source_ids))
+                for compacted_index, compacted_message in enumerate(rejoined):
                     cm_uuid = _synthetic_claude_transcript_uuid(
                         session_id=session_id,
                         external_session_id=external_session_id,
@@ -5811,16 +5925,9 @@ def _claude_transcript_records_from_session_items(
                     if cm_record is not None:
                         records.append(cm_record)
                         parent_uuid = cm_uuid
-                        source_ids = compacted_message.get("forwarded_source_ids")
-                        if isinstance(source_ids, list):
-                            snapshot_item_ids.update(
-                                uuid.uuid5(
-                                    uuid.NAMESPACE_URL,
-                                    f"omnigent-external-item:{session_id}:{source_id}",
-                                ).hex
-                                for source_id in source_ids
-                                if isinstance(source_id, str)
-                            )
+                        snapshot_item_ids.update(
+                            _snapshot_item_ids(session_id, _snapshot_source_ids(compacted_message))
+                        )
             continue
         record_uuid = _synthetic_claude_transcript_uuid(
             session_id=session_id,
@@ -5880,7 +5987,8 @@ def _claude_transcript_record_from_session_item(
     :param bridge_dir: Session bridge directory for re-materializing
         attachment blocks.
     :param allow_native_message_content: Accept Claude-native string and
-        content-block shapes when API-block conversion finds no content.
+        content-block shapes when API-block conversion finds no content, and
+        write a snapshot entry's ``message_id`` back as ``message.id``.
     :returns: Claude transcript record, or ``None`` for unsupported or
         empty Omnigent items.
     """
@@ -5910,6 +6018,10 @@ def _claude_transcript_record_from_session_item(
             message = {"role": "assistant", "content": assistant_content}
         else:
             return None
+        message_id = item.get("message_id") if allow_native_message_content else None
+        if isinstance(message_id, str) and message_id:
+            # Claude Code rejoins records sharing message.id into one API message.
+            message["id"] = message_id
     elif item_type == "function_call":
         name = item.get("name")
         call_id = item.get("call_id")
@@ -6036,6 +6148,155 @@ def _claude_native_message_content(
     # downgrade any unusable image block to its omitted-image placeholder.
     sanitized = sanitize_replayed_image_blocks(blocks)
     return cast(list[_JsonObject], sanitized)
+
+
+_SERVER_TOOL_CALL_TYPES = frozenset({"server_tool_use", "mcp_tool_use"})
+
+
+def _server_tool_result_call_id(block: object) -> str | None:
+    """Return the call id a provider-executed tool result block answers."""
+    if not isinstance(block, dict):
+        return None
+    block_type, call_id = block.get("type"), block.get("tool_use_id")
+    if (
+        isinstance(block_type, str)
+        and block_type != "tool_result"
+        and block_type.endswith("_tool_result")
+        and isinstance(call_id, str)
+    ):
+        return call_id
+    return None
+
+
+def _server_tool_call_ids(blocks: list[object]) -> set[str]:
+    """Return the ids of provider-executed tool calls among assistant blocks."""
+    return {
+        block["id"]
+        for block in blocks
+        if isinstance(block, dict)
+        and block.get("type") in _SERVER_TOOL_CALL_TYPES
+        and isinstance(block.get("id"), str)
+    }
+
+
+def _assistant_snapshot_blocks(entry: _JsonObject) -> list[object] | None:
+    """Return an assistant snapshot entry's content blocks, else ``None``."""
+    content = entry.get("content")
+    if (
+        entry.get("type") == "message"
+        and entry.get("role") == "assistant"
+        and isinstance(content, list)
+    ):
+        return content
+    return None
+
+
+def _snapshot_source_ids(entry: _JsonObject) -> list[object]:
+    """Return the forwarded item source ids a snapshot entry already covers."""
+    source_ids = entry.get("forwarded_source_ids")
+    return list(source_ids) if isinstance(source_ids, list) else []
+
+
+def _snapshot_item_ids(session_id: str, source_ids: list[object]) -> set[str]:
+    """Return the Omnigent item ids of forwarded items a snapshot already covers."""
+    return {
+        uuid.uuid5(uuid.NAMESPACE_URL, f"omnigent-external-item:{session_id}:{source_id}").hex
+        for source_id in source_ids
+        if isinstance(source_id, str)
+    }
+
+
+def _rejoin_split_server_tool_results(
+    compacted_messages: list[object],
+) -> tuple[list[_JsonObject], list[object]]:
+    """
+    Return snapshot entries with each server tool result beside its call.
+
+    A snapshot stored without ``message_id`` replays a ``server_tool_use`` and
+    its ``*_tool_result`` as separate assistant messages, which Claude Code
+    treats as an interrupted call and the API rejects. Fold each result into
+    the preceding assistant run holding its call; drop results whose call is gone.
+
+    :param compacted_messages: Snapshot entries of a compaction item.
+    :returns: String-keyed entries with every server tool pair in one message,
+        and the forwarded source ids of entries dropped as orphaned results,
+        which the snapshot still covers.
+    """
+    rejoined: list[_JsonObject] = []
+    dropped_source_ids: list[object] = []
+    for value in compacted_messages:
+        entry = _json_object(value)
+        if entry is None:
+            continue
+        blocks = _assistant_snapshot_blocks(entry)
+        if blocks is None:
+            rejoined.append(entry)
+            continue
+        called = _server_tool_call_ids(blocks)
+        missing = {
+            call_id
+            for block in blocks
+            if (call_id := _server_tool_result_call_id(block)) is not None
+            and call_id not in called
+        }
+        if not missing:
+            rejoined.append(entry)
+            continue
+        # Claude Code rejoins records of one response only; never fold across ids.
+        known_message_id = entry.get("message_id") or None
+        start = len(rejoined)
+        for index in range(len(rejoined) - 1, -1, -1):
+            run_entry = rejoined[index]
+            run_blocks = _assistant_snapshot_blocks(run_entry)
+            run_message_id = run_entry.get("message_id") or None
+            if run_blocks is None or (
+                known_message_id and run_message_id and run_message_id != known_message_id
+            ):
+                break
+            known_message_id = known_message_id or run_message_id
+            found = missing & _server_tool_call_ids(run_blocks)
+            if found:
+                missing -= found
+                start = index
+            if not missing:
+                break
+        if missing:
+            _logger.warning(
+                "Dropping orphaned server tool result(s) from a Claude compaction "
+                "snapshot; tool_use_ids=%s",
+                sorted(missing),
+            )
+        kept: _JsonObject = {
+            **entry,
+            "content": [
+                block for block in blocks if _server_tool_result_call_id(block) not in missing
+            ],
+        }
+        if start == len(rejoined):
+            if kept["content"]:
+                rejoined.append(kept)
+            else:
+                dropped_source_ids.extend(_snapshot_source_ids(kept))
+            continue
+        run = [*rejoined[start:], kept]
+        del rejoined[start:]
+        rejoined.append(_merge_assistant_snapshot_entries(run))
+    return rejoined, dropped_source_ids
+
+
+def _merge_assistant_snapshot_entries(entries: list[_JsonObject]) -> _JsonObject:
+    """Merge consecutive assistant snapshot entries of one response into one message."""
+    merged: _JsonObject = {**entries[0]}
+    merged["content"] = [
+        block for entry in entries for block in cast(list[object], entry["content"])
+    ]
+    message_id = next((entry["message_id"] for entry in entries if entry.get("message_id")), None)
+    if message_id is not None:
+        merged["message_id"] = message_id
+    source_ids = [source_id for entry in entries for source_id in _snapshot_source_ids(entry)]
+    if source_ids:
+        merged["forwarded_source_ids"] = source_ids
+    return merged
 
 
 def _synthetic_claude_transcript_uuid(
@@ -6643,7 +6904,7 @@ def _claude_terminal_request(
         # Remove provider/session variables that can override the
         # ucode apiKeyHelper or make Claude think it is nested.
         unset_env_vars = [
-            _ANTHROPIC_API_KEY_ENV,
+            *native_claude_auth_env_unset(claude_config),
             _CLAUDE_CODE_NESTED_SESSION_ENV,
         ]
         env_args = [part for var in unset_env_vars for part in ("-u", var)]
@@ -6946,9 +7207,8 @@ async def _read_fd_with_reader(loop: asyncio.AbstractEventLoop, fd: int) -> byte
     try:
         return await fut
     finally:
-        if not fut.done():
-            with contextlib.suppress(Exception):
-                loop.remove_reader(fd)
+        with contextlib.suppress(Exception):
+            loop.remove_reader(fd)
 
 
 async def _send_resize(ws: _WebSocketClient, stdin_fd: int) -> None:

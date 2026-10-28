@@ -33,12 +33,17 @@ from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
+    CAP_HARNESS_ACCOUNTS,
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHarnessStartupResultFrame,
     HostHelloFrame,
@@ -54,6 +59,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
+    HostProbeAccountsResultFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -76,10 +82,12 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.feature_flags import HarnessInstallGate, harness_install_enabled
 from omnigent.server.host_registry import (
     HostConnection,
     HostRegistry,
     RunnerExitReports,
+    update_harness_accounts,
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
@@ -92,6 +100,7 @@ PING_MISS_THRESHOLD = 3
 _HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
 # Per phase: persistence/workers, diagnostics and notification total at most 15s.
 _DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
+_HARNESS_ACCOUNT_PROBE_TIMEOUT_S = 30.0
 # WebSocket close codes a host sends on purpose: 1000 normal, 1001 going away.
 _CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
@@ -148,6 +157,7 @@ def create_host_tunnel_router(
     on_runner_exited: RunnerExitedCallback | None = None,
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
+    harness_install: HarnessInstallGate = False,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -191,6 +201,8 @@ def create_host_tunnel_router(
     :param runner_exit_reports: Shared store for ``host.runner_exited``
         reports, read by the runner status endpoint. ``None`` (e.g.
         minimal test wiring) drops the reports.
+    :param harness_install: Static or callable harness-install gate. A capable
+        host is asked for accounts after connect only when this resolves true.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -460,6 +472,14 @@ def create_host_tunnel_router(
                     ),
                     name=f"host-receive:{host_id}",
                 )
+                account_probe_task: asyncio.Task[None] | None = None
+                if CAP_HARNESS_ACCOUNTS in frame.capabilities and harness_install_enabled(
+                    harness_install
+                ):
+                    account_probe_task = asyncio.create_task(
+                        _probe_accounts_after_connect(host_registry, conn),
+                        name=f"host-account-probe:{host_id}",
+                    )
 
                 try:
                     if on_host_connect is not None:
@@ -494,17 +514,17 @@ def create_host_tunnel_router(
                     # Shield teardown from ASGI cancellation, but do not let a
                     # stalled dependency hold shutdown indefinitely.
                     try:
-                        for task in (sender_task, ping_task, receive_task, heartbeat_task):
+                        cleanup_tasks = [sender_task, ping_task, receive_task, heartbeat_task]
+                        if account_probe_task is not None:
+                            cleanup_tasks.append(account_probe_task)
+                        for task in cleanup_tasks:
                             task.cancel()
                         with anyio.move_on_after(
                             _DISCONNECT_CLEANUP_TIMEOUT_S, shield=True
                         ) as cleanup_scope:
                             try:
                                 await asyncio.gather(
-                                    sender_task,
-                                    ping_task,
-                                    receive_task,
-                                    heartbeat_task,
+                                    *cleanup_tasks,
                                     return_exceptions=True,
                                 )
                             finally:
@@ -682,6 +702,31 @@ async def _refuse_upgrade(ws: WebSocket, *, status: int, reason: str) -> None:
         await ws.close(code=4009, reason=reason)
 
 
+async def _probe_accounts_after_connect(
+    host_registry: HostRegistry,
+    conn: HostConnection,
+) -> None:
+    """Best-effort initial account probe for a capable, feature-enabled host."""
+    try:
+        result = await host_registry.request_harness_accounts(
+            conn,
+            refresh_codex=False,
+            timeout_s=_HARNESS_ACCOUNT_PROBE_TIMEOUT_S,
+        )
+        if result.get("status") != "ok":
+            _logger.warning(
+                "Initial harness account probe failed for host %s: %s",
+                conn.host_id,
+                result.get("error") or "unknown error",
+            )
+    except asyncio.CancelledError:
+        raise
+    except (ConnectionError, TimeoutError):
+        _logger.warning("Initial harness account probe ended for host %s", conn.host_id)
+    except Exception:
+        _logger.exception("Initial harness account probe failed for host %s", conn.host_id)
+
+
 async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
     """Send queued frames on the WebSocket owner loop.
 
@@ -811,6 +856,8 @@ async def _receive_loop(
                 frame.configured_harnesses,
             )
             conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+            if frame.harness_accounts is not None:
+                conn.hello.harness_accounts = dict(frame.harness_accounts)
             conn.hello.gateway_inference = (
                 dict(frame.gateway_inference) if frame.gateway_inference is not None else None
             )
@@ -831,6 +878,7 @@ async def _receive_loop(
                         "runner_id": frame.runner_id,
                         "error": frame.error,
                         "error_code": frame.error_code,
+                        "workspace_recreated": frame.workspace_recreated,
                     }
                 )
             continue
@@ -961,6 +1009,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "harness_accounts": frame.harness_accounts,
                         "version": frame.version,
                         "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
@@ -975,7 +1024,90 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "harness_accounts": frame.harness_accounts,
                         "gateway_inference": frame.gateway_inference,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostProbeAccountsResultFrame):
+            if frame.status == "ok" and frame.harness_accounts is not None:
+                update_harness_accounts(conn, frame.harness_accounts)
+                if on_host_update is not None:
+                    try:
+                        await on_host_update(host_id, conn.owner)
+                    except Exception:
+                        _logger.exception("on_host_update callback failed for %s", host_id)
+            probe_future = conn.pending_harness_account_probes.pop(frame.request_id, None)
+            if probe_future is not None and not probe_future.done():
+                probe_future.set_result(
+                    {
+                        "status": frame.status,
+                        "harness_accounts": frame.harness_accounts,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostHarnessLoginResultFrame):
+            login_future = conn.pending_harness_login_starts.pop(frame.request_id, None)
+            if login_future is not None and not login_future.done():
+                login_future.set_result(
+                    {
+                        "status": frame.status,
+                        "login_id": frame.login_id,
+                        "verification_url": frame.verification_url,
+                        "user_code": frame.user_code,
+                        "expires_at": frame.expires_at,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostHarnessLoginCancelResultFrame):
+            cancel_future = conn.pending_harness_login_cancels.pop(frame.request_id, None)
+            if cancel_future is not None and not cancel_future.done():
+                cancel_future.set_result({"status": frame.status, "error": frame.error})
+            continue
+
+        if isinstance(frame, HostHarnessLoginCompletedFrame):
+            state = conn.harness_logins.get(frame.login_id)
+            if state is not None and state.status == "pending":
+                state.status = (
+                    "succeeded" if frame.success else "expired" if frame.expired else "failed"
+                )
+                state.expired = frame.expired
+                state.error = frame.error
+                state.terminal_at = int(time.time())
+                state.terminal_event.set()
+                state.configured_harnesses = frame.configured_harnesses
+                state.harness_accounts = frame.harness_accounts
+                conn.active_harness_logins.pop(state.harness, None)
+                if frame.configured_harnesses is not None:
+                    await asyncio.to_thread(
+                        host_store.update_harness_readiness,
+                        host_id,
+                        frame.configured_harnesses,
+                    )
+                    conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+                    if frame.harness_accounts is not None:
+                        update_harness_accounts(conn, frame.harness_accounts)
+                    if on_host_update is not None:
+                        try:
+                            await on_host_update(host_id, conn.owner)
+                        except Exception:
+                            _logger.exception("on_host_update callback failed for %s", host_id)
+            continue
+
+        if isinstance(frame, HostHarnessLogoutResultFrame):
+            logout_future = conn.pending_harness_logouts.pop(frame.request_id, None)
+            if logout_future is not None and not logout_future.done():
+                logout_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "harness_accounts": frame.harness_accounts,
                         "error": frame.error,
                     }
                 )
@@ -988,6 +1120,7 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,
+                        "harness_accounts": frame.harness_accounts,
                         "gateway_inference": frame.gateway_inference,
                         "error": frame.error,
                     }

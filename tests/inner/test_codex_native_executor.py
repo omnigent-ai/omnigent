@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import errno
 import json
 import logging
 from collections.abc import Callable
@@ -512,6 +514,32 @@ def test_draining_delivery_reconnects_and_accepts_input_once(
     )
 
 
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+def test_accepted_steer_keeps_unchanged_state_when_disk_is_full(
+    draining_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_injection: bool
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_steered")
+    before = read_bridge_state(tmp_path)
+    draining_client.delivery_errors = []
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge.tempfile.mkstemp", disk_full)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if live_injection:
+        assert asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
+    else:
+        assert [type(event) for event in _collect_turn_events(executor, "synthetic input")] == [
+            TurnComplete
+        ]
+
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "synthetic input"}]]
+    assert len(draining_client.requests) == 1
+    assert draining_client.requests[0][0] == "turn/steer"
+    assert read_bridge_state(tmp_path) == before
+
+
 @pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
 def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
     draining_client, active_turn_id: str | None, tmp_path: Path
@@ -553,7 +581,11 @@ def test_error_after_draining_retry_stays_ambiguous(
 
     assert isinstance(failure, ExecutorError)
     assert failure.undelivered is False
-    assert failure.code is None
+    assert failure.code == (
+        "codex_delivery_unconfirmed" if isinstance(error, ConnectionResetError) else None
+    )
+    assert failure.preserve_session is isinstance(error, ConnectionResetError)
+    assert failure.retryable is False
     assert draining_client.connections == 2
     assert len(draining_client.requests) == 2
     assert draining_client.accepted_inputs == []
@@ -1801,6 +1833,11 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
                     asyncio.run(executor.enqueue_session_message("main", "do not duplicate"))
                 else:
                     _collect_turn_events(executor, "do not duplicate")
+        elif live_injection and isinstance(
+            error, (OSError, InvalidMessage, ConnectionClosedError)
+        ):
+            with pytest.raises(InjectionDeliveryAmbiguous):
+                asyncio.run(executor.enqueue_session_message("main", "do not duplicate"))
         elif live_injection:
             assert (
                 asyncio.run(executor.enqueue_session_message("main", "do not duplicate")) is False
@@ -2805,9 +2842,99 @@ def test_run_turn_error_after_submit_is_not_marked_undelivered(
     failure = events[0]
     assert isinstance(failure, ExecutorError)
     assert failure.undelivered is False
-    assert failure.code is None
-    assert failure.message.startswith("Codex native executor error:")
+    assert failure.code == "codex_delivery_unconfirmed"
+    assert failure.preserve_session is True
+    assert failure.retryable is False
     assert [method for method, _params in _ResetAfterSubmitClient.requests] == ["turn/start"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submission", ["turn/start", "turn/steer", "live-steer", "before-send"])
+async def test_transport_failure_keeps_native_work_running(
+    tmp_path: Path, submission: str
+) -> None:
+    """A failed submission cannot interrupt existing work or resend accepted input."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    method = "turn/start" if submission == "turn/start" else "turn/steer"
+    requests: list[str] = []
+    native_running = submission == "before-send"
+
+    async def handle(websocket: ServerConnection) -> None:
+        nonlocal native_running
+        async for raw in websocket:
+            request = json.loads(raw)
+            rpc_method = request["method"]
+            if "id" not in request:
+                continue
+            requests.append(rpc_method)
+            if submission == "before-send" and requests == ["initialize"]:
+                websocket.transport.abort()
+                return
+            if rpc_method == method:
+                native_running = True
+                state = read_bridge_state(tmp_path)
+                assert state is not None
+                write_bridge_state(tmp_path, replace(state, active_turn_id="turn_accepted"))
+                websocket.transport.abort()
+                return
+            if rpc_method == "turn/interrupt":
+                native_running = False
+            await websocket.send(json.dumps({"id": request["id"], "result": {}}))
+
+    async with serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        _start_state(tmp_path)
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        write_bridge_state(
+            tmp_path,
+            replace(
+                state,
+                socket_path=f"ws://127.0.0.1:{port}",
+                active_turn_id="turn_accepted" if method == "turn/steer" else None,
+            ),
+        )
+        executor = CodexNativeExecutor(bridge_dir=tmp_path)
+        adapter = ExecutorAdapter(executor_factory=lambda: executor)
+        request = CreateResponseRequest(model="test-agent", input="keep working")
+        ctx = TurnContext(
+            response_id="resp_delivery", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        if submission == "live-steer":
+            ctx._push_injection(request.model_copy(update={"injection_id": "inj_delivery"}))
+            watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))
+            try:
+                consumed = await asyncio.wait_for(ctx._event_queue.get(), timeout=5)
+                assert isinstance(consumed, InjectionConsumedEvent)
+                assert consumed.injection_id == "inj_delivery"
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
+        else:
+            with pytest.raises(RuntimeError) as caught:
+                await asyncio.wait_for(adapter.run_turn(request, ctx), timeout=5)
+            if adapter._abandoned_executor_cleanup is not None:
+                await adapter._abandoned_executor_cleanup
+            if submission == "before-send":
+                assert str(caught.value) == CODEX_APP_SERVER_STOPPED.message
+                assert caught.value.undelivered is True
+            else:
+                assert "may already be running" in str(caught.value)
+
+        assert requests.count(method) == (0 if submission == "before-send" else 1)
+        assert "turn/interrupt" not in requests
+        assert native_running
+        if submission != "live-steer":
+            assert adapter._executor is executor
+
+        # Explicit user Stop still owns cancellation of the native turn.
+        await executor.interrupt_session("main")
+        assert requests.count("turn/interrupt") == 1
+        assert not native_running
 
 
 def test_run_turn_leaves_non_connection_connect_failures_unclassified(

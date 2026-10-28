@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -636,6 +637,11 @@ _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
 # Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+# ``false`` is the widest JSON value ``runner_online`` can take, so sizing pages
+# with it keeps the output budget valid after real values are filled in.
+_RUNNER_ONLINE_SIZING_PLACEHOLDER = False
+# Max concurrent ``GET /v1/runners/{id}/status`` lookups per ``sys_session_list``.
+_RUNNER_STATUS_CONCURRENCY = 8
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
 # Match the existing default ceiling for ``sys_os_shell`` output. Discovery
@@ -4760,6 +4766,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "workspace",
     "host_id",
     "execution_target",
+    "project_id",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4776,6 +4783,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "host_id",
     "execution_target",
     "state",
+    "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -4785,6 +4793,42 @@ def _scheduled_task_url(task_id: object) -> str | None:
     if not isinstance(task_id, str) or not _SCHEDULED_TASK_ID_RE.fullmatch(task_id):
         return None
     return f"/v1/scheduled-tasks/{task_id.lower()}"
+
+
+async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+    """
+    Return the id of the caller's project named *name*, creating it if missing.
+
+    Uses the projects API the web picker uses, so a typed name files sessions
+    and automations into the same project. A create that loses a race to the
+    same name (409) reuses the project the other request made.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param name: The project name, e.g. ``"nightly triage"``.
+    :returns: The project id.
+    :raises ValueError: If the name is blank or the project can't be resolved.
+    """
+    trimmed = name.strip()
+    if not trimmed:
+        raise ValueError("project_name must not be empty")
+
+    async def find() -> str | None:
+        resp = await server_client.get("/v1/projects", timeout=30.0)
+        if resp.status_code >= 400:
+            raise ValueError(f"could not list projects: {resp.text[:200]}")
+        projects = resp.json().get("data", [])
+        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
+
+    existing = await find()
+    if existing is not None:
+        return existing
+    created = await server_client.post("/v1/projects", json={"name": trimmed}, timeout=30.0)
+    if created.status_code < 400:
+        return str(created.json()["id"])
+    racer = await find() if created.status_code == 409 else None
+    if racer is not None:
+        return racer
+    raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
 
 
 async def _execute_scheduled_task_tool(
@@ -4814,12 +4858,35 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if "project_name" in args and "project_id" in args:
+        return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
+    raw_project_name = args.get("project_name")
+    if "project_name" in args and not isinstance(raw_project_name, str):
+        return json.dumps(
+            {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
+        )
+    project_name = raw_project_name if isinstance(raw_project_name, str) else None
+    wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
+        "project_name" in args or "project_id" in args
+    )
 
     try:
+        if wants_project:
+            # Older servers reject the field; refuse before creating a project for it.
+            info = await server_client.get("/v1/info", timeout=30.0)
+            if info.status_code >= 400 or info.json().get("scheduled_task_projects") is not True:
+                return json.dumps(
+                    {
+                        "error": f"{tool_name}: this server does not support automation "
+                        "projects; retry without project_name or project_id"
+                    }
+                )
         if tool_name == "sys_scheduled_task_list":
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            if project_name is not None:
+                payload["project_id"] = await _project_id_for_name(server_client, project_name)
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
@@ -4834,7 +4901,18 @@ async def _execute_scheduled_task_tool(
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
-                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                resp = None
+                if project_name is not None:
+                    # Confirm the task first so a bad id doesn't leave a new project behind.
+                    existing = await server_client.get(task_url, timeout=30.0)
+                    if existing.status_code >= 400:
+                        resp = existing
+                    else:
+                        payload["project_id"] = await _project_id_for_name(
+                            server_client, project_name
+                        )
+                if resp is None:
+                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -5199,6 +5277,9 @@ async def _session_get_info_via_rest(
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
+            "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
+                CREATED_BY_SESSION_LABEL_KEY
+            ),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
             # Effective model: a per-session override wins over the
@@ -6021,7 +6102,7 @@ async def _session_list_via_rest(
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
     )
-    return _bounded_discovery_result(
+    result = _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
         limit=limit,
         cursor_state=cursor_state,
@@ -6031,6 +6112,33 @@ async def _session_list_via_rest(
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
+    return await _fill_returned_runner_online(result, server_client)
+
+
+async def _fill_returned_runner_online(result: str, server_client: httpx.AsyncClient) -> str:
+    """
+    Resolve ``runner_online`` for the session rows the tool actually returns.
+
+    The global view fetches up to :data:`_AGENT_LIST_PAGE_LIMIT` sessions but
+    the output budget usually keeps far fewer, so resolving before paging
+    fired one status call per runner across the whole fetch. Rows are sized
+    with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`, the widest value, so
+    the chosen page stays within the budget once real values replace it.
+
+    :param result: Serialized ``sys_session_list`` result from
+        :func:`_bounded_discovery_result`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The same result with each returned row's ``runner_online``
+        resolved; error results pass through unchanged.
+    """
+    payload = json.loads(result)
+    rows = payload.get("sessions")
+    if not isinstance(rows, list) or not rows:
+        return result
+    online = await _resolve_runner_online_map(rows, server_client)
+    for row in rows:
+        row["runner_online"] = online.get(_optional_string(row.get("runner_id")) or "")
+    return json.dumps(payload)
 
 
 async def _open_file_via_rest(
@@ -6234,9 +6342,15 @@ async def _resolve_runner_online_map(
         if isinstance(rid, str) and rid and rid not in seen:
             seen.add(rid)
             unique_ids.append(rid)
-    results = await asyncio.gather(
-        *(_runner_online_or_none(rid, server_client) for rid in unique_ids)
-    )
+    # Spread the lookups so one tool call can't burst the server (and the
+    # caller's per-user rate limit) with a status call per runner at once.
+    concurrency = asyncio.Semaphore(_RUNNER_STATUS_CONCURRENCY)
+
+    async def _bounded_lookup(runner_id: str) -> bool | None:
+        async with concurrency:
+            return await _runner_online_or_none(runner_id, server_client)
+
+    results = await asyncio.gather(*(_bounded_lookup(rid) for rid in unique_ids))
     # strict=True: results is gathered in unique_ids order, so lengths
     # match by construction — assert it rather than silently truncating.
     return dict(zip(unique_ids, results, strict=True))
@@ -6250,12 +6364,13 @@ async def _collect_global_sessions(
     limit: int,
 ) -> _DiscoveryPage:
     """
-    Fetch the global session list via ``GET /v1/sessions``, with connectivity.
+    Fetch the global session list via ``GET /v1/sessions``.
 
     Projects each accessible session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id}``.
-    ``runner_online`` is resolved once per unique bound runner (see
-    :func:`_resolve_runner_online_map`). An optional ``agent_name``
+    ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
+    :func:`_fill_returned_runner_online` resolves it for the rows that
+    survive paging. An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
@@ -6286,7 +6401,6 @@ async def _collect_global_sessions(
     if page.failed:
         return page
     rows = page.rows
-    online = await _resolve_runner_online_map(rows, server_client)
     return _DiscoveryPage(
         [
             {
@@ -6299,8 +6413,11 @@ async def _collect_global_sessions(
                 "title": r.get("title"),
                 "status": r.get("status"),
                 "runner_id": r.get("runner_id"),
-                "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                "runner_online": _RUNNER_ONLINE_SIZING_PLACEHOLDER,
                 "parent_session_id": r.get("parent_session_id"),
+                "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
+                    CREATED_BY_SESSION_LABEL_KEY
+                ),
             }
             for r in rows
         ],

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
 
 HOST = "git.example.test:8443"
 URL = f"https://{HOST}/team/sub/project/-/merge_requests/7"
@@ -195,7 +195,12 @@ def stub(
         else:
             route.fulfill(json=info(selected))
 
+    def unlink(url: str) -> None:
+        urls.remove(url)
+        requested.append(("pull-requests", url))
+
     page.route(re.compile(r"/resources/github(?:/|\?|$)"), respond)
+    stub_session_pull_requests(page, lambda: info(None)["prs"], unlink)
     return requested
 
 
@@ -302,7 +307,7 @@ def test_gitlab_unlink_last_mr_clears_selection(
     expect(panel.get_by_text(re.compile("Couldn.t load pull request"))).to_have_count(0)
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     page.screenshot(path=str(tmp_path / f"gitlab-unlinked-{entry}.png"), animations="disabled")
-    removal = next(i for i, (resource, _) in enumerate(requested) if resource == "prs")
+    removal = next(i for i, (resource, _) in enumerate(requested) if resource == "pull-requests")
     page.reload()
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     page.wait_for_timeout(1200)
@@ -339,17 +344,39 @@ def test_gitlab_partial_data_is_visible(
 def test_gitlab_canvas_link_uses_merge_request_identity(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path
 ) -> None:
-    from tests.e2e_ui.sessions.test_canvas_page import _serve_list, _session, _stub_server_info
+    from tests.e2e_ui.sessions.test_canvas_page import (
+        _refuse_live_pull_requests,
+        _serve_list,
+        _session,
+        _stub_server_info,
+    )
 
     base_url, session_id = seeded_session
-    stub(page)
-    _stub_server_info(page, canvas=True)
+    live_lookups = _refuse_live_pull_requests(page)
+    _stub_server_info(page, canvas=True, session_pull_requests=True)
     # Keep live session updates from replacing the mocked Canvas branch.
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     page.route(
         "**/v1/sessions?*",
         _serve_list(
-            [_session(session_id, "GitLab canvas session", 1, git_branch="feature/widget")]
+            [
+                _session(
+                    session_id,
+                    "GitLab canvas session",
+                    1,
+                    git_branch="feature/widget",
+                    pull_request={
+                        "url": URL,
+                        "provider": "gitlab",
+                        "provider_display": DISPLAY,
+                        "repository": "team/sub/project",
+                        "number": 7,
+                        "title": "Add the widget",
+                        "state": "OPEN",
+                        "is_draft": False,
+                    },
+                )
+            ]
         ),
     )
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
@@ -359,4 +386,5 @@ def test_gitlab_canvas_link_uses_merge_request_identity(
     link = card.get_by_role("link", name="Open merge request !7")
     expect(link).to_be_visible(timeout=30_000)
     expect(link).to_have_attribute("href", URL)
+    assert live_lookups == []
     page.screenshot(path=str(tmp_path / "gitlab-canvas.png"), animations="disabled")

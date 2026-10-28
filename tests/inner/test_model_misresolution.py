@@ -115,7 +115,7 @@ async def test_databricks_profile_model_selection(
     finally:
         await executor.close()
 
-    expected = selected or "databricks-claude-opus-4-8"
+    expected = selected or "system.ai.claude-opus-4-8"
     assert captured == [expected, expected]
     substitutions = [
         record.getMessage()

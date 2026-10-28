@@ -195,11 +195,11 @@ describe("ChatComposer", () => {
     );
   });
 
-  it("uses the theme primary color for an enabled send action", () => {
+  it("keeps an enabled send action independent from the theme accent", () => {
     render(<ComposerSendButton label="Send" />);
     expect(screen.getByRole("button", { name: "Send" })).toHaveClass(
-      "bg-primary",
-      "text-primary-foreground",
+      "bg-primary-cta",
+      "text-primary-cta-foreground",
       "disabled:bg-muted",
       "disabled:text-muted-foreground",
     );

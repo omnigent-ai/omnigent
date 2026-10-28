@@ -113,6 +113,7 @@ class FakeScheduledTaskStore:
     def __init__(self, rows: dict[str, ScheduledTask] | None = None) -> None:
         self._rows = rows or {}
         self.updates: list[dict[str, Any]] = []
+        self.clear_calls: list[tuple[str, str, bool]] = []
         self.runs: list[dict[str, Any]] = []
         self.get_workspace_ids: list[int] = []
         self.update_workspace_ids: list[int] = []
@@ -126,6 +127,14 @@ class FakeScheduledTaskStore:
         self.update_workspace_ids.append(current_workspace_id())
         self.updates.append({"id": scheduled_task_id, **kwargs})
         return self._rows.get(scheduled_task_id)
+
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        row = self._rows.get(scheduled_task_id)
+        cleared = row is not None and row.project_id == project_id
+        self.clear_calls.append((scheduled_task_id, project_id, cleared))
+        if cleared:
+            self.updates.append({"id": scheduled_task_id, "project_id": None})
+        return cleared
 
     def create_run(
         self, run_id: str, scheduled_task_id: str, status: str, scheduled_at: int, **kwargs: Any
@@ -371,6 +380,8 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
         startup_inputs=overrides.get("startup_inputs"),
+        project_store=overrides.get("project_store"),
+        single_user_owner=overrides.get("single_user_owner", RESERVED_USER_LOCAL),
     )
 
 
@@ -510,6 +521,169 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+class FakeProjectStore:
+    def __init__(self, existing: set[tuple[str, str | None]]) -> None:
+        self.existing = existing
+        self.lookups: list[tuple[str, str | None]] = []
+
+    def get(self, project_id: str, *, user_id: str | None) -> SimpleNamespace | None:
+        self.lookups.append((project_id, user_id))
+        found = (project_id, user_id) in self.existing
+        return SimpleNamespace(id=project_id) if found else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_owner", "single_user_owner", "existing", "filed_into"),
+    [
+        ("alice@example.com", RESERVED_USER_LOCAL, {("proj_1", "alice@example.com")}, "proj_1"),
+        ("alice@example.com", RESERVED_USER_LOCAL, {("proj_1", "bob@example.com")}, None),
+        ("alice@example.com", RESERVED_USER_LOCAL, set(), None),
+        # A single-user task stores no owner; its projects belong to "local",
+        # or to no owner on a server without an auth provider.
+        (None, RESERVED_USER_LOCAL, {("proj_1", RESERVED_USER_LOCAL)}, "proj_1"),
+        (None, None, {("proj_1", None)}, "proj_1"),
+    ],
+    ids=["owned", "other-users", "deleted", "single-user-local", "single-user-no-auth"],
+)
+async def test_fired_session_is_filed_into_the_task_project(
+    task_owner: str | None,
+    single_user_owner: str | None,
+    existing: set[tuple[str, str | None]],
+    filed_into: str | None,
+) -> None:
+    conv_store = FakeConversationStore()
+    projects = FakeProjectStore(existing)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=task_owner, project_id="proj_1")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            project_store=projects,
+            single_user_owner=single_user_owner,
+        ),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] == filed_into
+    # One lookup per fire, as the task's owner.
+    assert projects.lookups == [("proj_1", task_owner or single_user_owner)]
+    # A missing project leaves the session unfiled and is cleared from the task;
+    # the run still starts.
+    assert [run["status"] for run in store.runs] == ["running"]
+    cleared = [u for u in store.updates if u.get("project_id", "unset") is None]
+    assert len(cleared) == (0 if filed_into else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_owner", "single_user_owner", "announced_to"),
+    [
+        ("alice@example.com", RESERVED_USER_LOCAL, ["alice@example.com"]),
+        (None, RESERVED_USER_LOCAL, [RESERVED_USER_LOCAL]),
+        (None, None, [None]),
+    ],
+    ids=["owner", "single-user-local", "single-user-no-auth"],
+)
+async def test_fired_session_is_pushed_to_the_owners_open_tabs(
+    task_owner: str | None,
+    single_user_owner: str | None,
+    announced_to: list[str | None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open sidebars learn of the run, so a project folder shows it without a reload."""
+    perm = FakePermissionStore()
+    announced: list[tuple[str | None, str, int]] = []
+    monkeypatch.setattr(
+        fire_mod,
+        "_announce_session_added",
+        lambda owner, session_id: announced.append((owner, session_id, len(perm.grants))),
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=task_owner)})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    deps = _deps(store, permission_store=perm, single_user_owner=single_user_owner)
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    [session_id] = {session for _, session, _ in announced}
+    assert [owner for owner, _, _ in announced] == announced_to
+    # Announced only once the owner can read it: the stream access-checks it.
+    assert all(grants >= 1 for _, _, grants in announced)
+    assert session_id == store.runs[0]["conversation_id"]
+
+
+@pytest.mark.asyncio
+async def test_fire_keeps_a_project_the_task_moved_to_mid_fire() -> None:
+    stale = _task(project_id="proj_1")
+    store = SequencedScheduledTaskStore([stale, stale])
+    # The row has moved on to another project by the time the fire clears it.
+    store._rows["task_1"] = _task(project_id="proj_2")
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    conv_store = FakeConversationStore()
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, project_store=FakeProjectStore(set())),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    # The clear was tried for the stale project and refused, so proj_2 stays.
+    assert store.clear_calls == [("task_1", "proj_1", False)]
+    assert not [u for u in store.updates if "project_id" in u]
+    assert conv_store.created[0]["project_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_fire_runs_unfiled_when_clearing_a_deleted_project_fails() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})
+
+    def _fail_clear(scheduled_task_id: str, project_id: str) -> bool:
+        raise RuntimeError("database unavailable")
+
+    store.clear_project_id = _fail_clear
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, project_store=FakeProjectStore(set())),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_fire_without_a_project_store_files_nothing() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
 
 
 @pytest.mark.asyncio

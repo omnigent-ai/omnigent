@@ -51,6 +51,27 @@ from tests.server.helpers import (
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("suffix", ["", "/resources/environments/default/filesystem/README.md"])
+async def test_provisional_session_lookup_returns_404_before_store_parsing(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    """Session snapshots and file reads must reject optimistic route IDs."""
+
+    def reject_store_read(*args: object, **kwargs: object) -> None:
+        pytest.fail("A provisional route reached a store")
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "resolve_access", reject_store_read)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "get_conversation", reject_store_read)
+    response = await auth_client.get(
+        f"/v1/sessions/temp%3A0123456789abcdef0123456789abcdef{suffix}",
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
 # ── Fixtures ─────────────────────────────────────────────────
 
 

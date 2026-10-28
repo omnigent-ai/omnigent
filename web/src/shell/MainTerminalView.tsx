@@ -27,10 +27,12 @@ import {
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import {
   reconcileTerminalSplit,
   resizeTerminalSplit,
   terminalLayoutGeometry,
+  terminalLayoutKeys,
 } from "@/lib/terminalSplitLayout";
 import type { Session } from "@/lib/types";
 import { TerminalSplitDivider } from "./TerminalSplitDivider";
@@ -256,6 +258,13 @@ export function MainTerminalView({
     updateTerminalSplit(conversationId, (current) =>
       current && current.focusedKey !== key ? { ...current, focusedKey: key } : current,
     );
+  // The newly focused pane's xterm claims the keyboard as it becomes active.
+  usePaneCycleHotkey({
+    enabled: split !== undefined,
+    paneKeys: split ? terminalLayoutKeys(split.layout) : [],
+    focusedKey: split?.focusedKey,
+    onFocusPane: focusPane,
+  });
   const resizePane = (path: number[], ratio: number) =>
     updateTerminalSplit(conversationId, (current) =>
       current ? { ...current, layout: resizeTerminalSplit(current.layout, path, ratio) } : current,

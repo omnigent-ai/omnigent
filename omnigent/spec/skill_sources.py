@@ -286,11 +286,18 @@ def resolve_session_skills(
     for skill in resolve_harness_skills(ctx, harness):
         if skill.name in seen:
             continue
-        if skill.skill_dir is not None and skill.skill_dir.resolve() in seen_dirs:
-            continue
-        seen.add(skill.name)
+        resolved_dir = None
         if skill.skill_dir is not None:
-            seen_dirs.add(skill.skill_dir.resolve())
+            try:
+                resolved_dir = skill.skill_dir.resolve()
+            except FileNotFoundError:
+                _log.warning("Skipping host skill whose directory disappeared during discovery")
+                continue
+            if resolved_dir in seen_dirs:
+                continue
+        seen.add(skill.name)
+        if resolved_dir is not None:
+            seen_dirs.add(resolved_dir)
         merged.append(skill)
     return merged
 

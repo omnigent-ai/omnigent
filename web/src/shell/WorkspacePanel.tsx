@@ -1081,16 +1081,20 @@ function WorkspacePanelImpl({
       />
     );
   const closeSideChat = async (childId: string) => {
+    // Take the queue first so the stop's idle status can't send it to the closing chat.
+    const queued = useChatStore.getState().clearQueuedMessages(childId);
     if (!childId.startsWith("pending:")) {
       try {
         await stopSession(childId);
       } catch {
+        useChatStore.getState().restoreQueuedMessages(queued);
         toast.error("Couldn't close side chat. Try again.");
         return;
       }
     }
-    // The tab is gone, so its unsent text/attachments and any seeded question
-    // that never got to send have nowhere to return to.
+    // The tab is gone, so its unsent text/attachments, follow-ups queued during the
+    // stop, and any seeded question that never got to send have nowhere to return to.
+    useChatStore.getState().clearQueuedMessages(childId);
     useChatStore.getState().clearSideChatComposer(childId);
     useChatStore.getState().clearSideChatDraft(childId);
     sideChats.close(childId);
@@ -1244,7 +1248,7 @@ function WorkspacePanelImpl({
     })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
       key: `browser:${tabId}`,
-      label: `Browser ${index + 1}`,
+      label: browsers.labelFor(tabId, index),
       active: browserSelected && browsers.selected === tabId,
       select: () => {
         browsers.select(tabId);
@@ -1542,7 +1546,8 @@ function WorkspacePanelImpl({
                         type="button"
                         role="tab"
                         aria-selected={browserSelected && browsers.selected === tabId}
-                        className="flex items-center gap-1"
+                        title={browsers.labelFor(tabId, index)}
+                        className="flex min-w-0 items-center gap-1"
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -1554,12 +1559,12 @@ function WorkspacePanelImpl({
                           onRightRailTabChange("browser");
                         }}
                       >
-                        <GlobeIcon className="size-4" />
-                        Browser {index + 1}
+                        <GlobeIcon className="size-4 shrink-0" />
+                        <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
                       </button>
                       <button
                         type="button"
-                        aria-label={`Close Browser ${index + 1}`}
+                        aria-label={`Close ${browsers.labelFor(tabId, index)}`}
                         className="flex size-4 items-center justify-center rounded hover:bg-muted"
                         onClick={() => void closeBrowserTab(tabId)}
                       >

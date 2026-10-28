@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import pytest
 
@@ -11,6 +12,7 @@ from omnigent.server.feature_flags import (
     FEATURES_ENV_VAR,
     Feature,
     FeatureFlags,
+    harness_install_enabled,
     resolve_feature_flags,
 )
 
@@ -19,7 +21,9 @@ from omnigent.server.feature_flags import (
 def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
     flags = resolve_feature_flags(environ)
 
-    assert flags.enabled_features == frozenset({Feature.CLAUDE_OSC_STATUS})
+    assert flags.enabled_features == frozenset(
+        {Feature.CLAUDE_OSC_STATUS, Feature.SESSION_ORCHESTRATION}
+    )
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
@@ -40,27 +44,38 @@ def test_resolves_comma_separated_enabled_set() -> None:
 
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
-    assert flags.enabled_names() == ("claude_osc_status", "harness_install", "usage_page")
+    assert flags.enabled_names() == (
+        "claude_osc_status",
+        "harness_install",
+        "session_orchestration",
+        "usage_page",
+    )
 
 
 @pytest.mark.parametrize(
-    "features",
+    "override",
     [
-        "-claude_osc_status",
-        "claude_osc_status,-claude_osc_status",
-        "-claude_osc_status,claude_osc_status",
+        "-{feature}",
+        "{feature},-{feature}",
+        "-{feature},{feature}",
     ],
 )
-def test_explicit_disable_wins_and_preserves_other_features(features: str) -> None:
+@pytest.mark.parametrize("feature", ["claude_osc_status", "session_orchestration"])
+def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
+    features = override.format(feature=feature)
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
-    assert flags.enabled_names() == ("usage_page",)
+    assert set(flags.enabled_names()) == {
+        "claude_osc_status",
+        "session_orchestration",
+        "usage_page",
+    } - {feature}
 
 
 def test_default_off_features_can_also_be_explicitly_disabled() -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: "usage_page,-usage_page"})
 
-    assert flags.enabled_names() == ("claude_osc_status",)
+    assert flags.enabled_names() == ("claude_osc_status", "session_orchestration")
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
@@ -79,7 +94,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
 
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
-    assert flags.enabled_names() == ("canvas", "claude_osc_status")
+    assert flags.enabled_names() == ("canvas", "claude_osc_status", "session_orchestration")
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:
@@ -89,12 +104,13 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
-def test_claude_osc_status_is_runner_only() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: "claude_osc_status"})
+@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS, Feature.SESSION_ORCHESTRATION])
+def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: feature.value})
 
-    assert flags.enabled(Feature.CLAUDE_OSC_STATUS)
-    assert "claude_osc_status" in flags.enabled_names()
-    assert "claude_osc_status" not in flags.frontend_dict()
+    assert flags.enabled(feature)
+    assert feature.value in flags.enabled_names()
+    assert feature.value not in flags.frontend_dict()
 
 
 @pytest.mark.parametrize("name", ["usage-pgae", "-usage-pgae", "-", "--claude_osc_status"])
@@ -117,6 +133,18 @@ def test_snapshot_is_immutable_and_does_not_follow_environment_mutation() -> Non
     assert not flags.enabled(Feature.HARNESS_INSTALL)
     with pytest.raises(dataclasses.FrozenInstanceError):
         flags.enabled_features = frozenset()  # type: ignore[misc]
+
+
+def test_harness_install_callable_failure_fails_closed(caplog: pytest.LogCaptureFixture) -> None:
+    """A broken deployment gate cannot expose setup routes or break requests."""
+
+    def broken_gate() -> bool:
+        raise RuntimeError("gate unavailable")
+
+    with caplog.at_level(logging.WARNING):
+        assert harness_install_enabled(broken_gate) is False
+
+    assert "harness_install gate failed" in caplog.text
 
 
 def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:

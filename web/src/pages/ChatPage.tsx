@@ -940,13 +940,17 @@ export function ChatPage() {
     conversationsData !== undefined,
   );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
-  const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
+  const { reconnect, reconnectsArca, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
     useSessionReconnect({
       sessionId: urlConvId ?? null,
       hostId: reconnectHostId,
       hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
+      hostResumable: activeSession?.hostResumable ?? false,
       isOwner: isOwnerLevel(permissionLevel),
     });
+  // A message to an offline Arca host reconnects it from the desktop and waits
+  // in the queue until the host is back.
+  const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
 
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
@@ -966,6 +970,12 @@ export function ChatPage() {
       // Recover the unreachable host before dispatching another turn.
       if (urlConvId && isUnreachable) {
         void reconnect();
+        // Posting now could record a failed turn, so the message waits for the host.
+        if (sendReconnectsArca) {
+          useChatStore
+            .getState()
+            .enqueueMessage(text, files, replyDraft, urlConvId, { waitingForHost: true });
+        }
         return;
       }
       // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
@@ -1011,6 +1021,7 @@ export function ChatPage() {
       isUnboundFork,
       canResumeOnLocalHost,
       isUnreachable,
+      sendReconnectsArca,
       reconnect,
       navigate,
     ],
@@ -1196,6 +1207,7 @@ export function ChatPage() {
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
+      sendReconnectsArca={sendReconnectsArca}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1349,6 +1361,8 @@ interface MainAgentSurfaceProps {
   onSendSlashCommand?: (name: string, args: string) => void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
+  /** Sending reconnects the offline Arca host, so the composer stays enabled. */
+  sendReconnectsArca: boolean;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   /** Whether older messages exist that haven't been loaded yet. */
@@ -1524,6 +1538,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   onNewSession,
   onStop,
   onShowReconnectHelp,
+  sendReconnectsArca,
   agents,
   selectedAgentId,
   hasMoreHistory,
@@ -1874,6 +1889,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               !sandboxLaunching &&
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
             }
+            sendReconnectsArca={sendReconnectsArca}
             onShowReconnectHelp={onShowReconnectHelp}
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
@@ -2021,6 +2037,11 @@ interface ComposerProps {
    * banner below is the only affordance.
    */
   unreachable?: boolean;
+  /**
+   * Sending reconnects the session's offline Arca host: the textarea stays
+   * enabled while `unreachable`, and the placeholder says so.
+   */
+  sendReconnectsArca?: boolean;
   /**
    * Open the reconnect help dialog. Always wired to the status line's host
    * badge, which turns itself into a clickable reconnect affordance whenever
@@ -2360,6 +2381,7 @@ function ComposerImpl(
     showPollyCodexGoalControl = false,
     isNativeWrapper = false,
     unreachable = false,
+    sendReconnectsArca = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
     subAgentLabel = null,
@@ -2477,6 +2499,9 @@ function ComposerImpl(
   const hasPendingElicitation = useChatStore((s) =>
     hasPendingOwnElicitation(s.blocks, s.conversationId),
   );
+  const readyPlaceholder = sendReconnectsArca
+    ? "Send a message to reconnect Arca…"
+    : "Send a message…";
 
   const codexPlanMode = useChatStore((s) => s.codexPlanMode);
   // Harness/agent identity shown in the status tray below the card, separate
@@ -2859,9 +2884,14 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
+  const composerServerInfo = useServerInfo();
   // /clear runs the harness's own /clear in the session terminal, which moves
-  // the terminal onto a fresh session the view then follows.
-  const showClear = sessionHarness === "claude-native" || sessionHarness === "codex-native";
+  // the terminal onto a fresh session the view then follows. Older servers
+  // reject the clear control, so a typed /clear stays plaintext there.
+  const showClear =
+    (sessionHarness === "claude-native" || sessionHarness === "codex-native") &&
+    composerServerInfo !== "loading" &&
+    !!composerServerInfo.session_event_types?.includes("clear");
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3290,6 +3320,12 @@ function ComposerImpl(
     dirtyRef.current = true;
   };
 
+  // Commands can't wait in the queue for the host, so they stay here while Arca reconnects.
+  const holdCommandForArca = () => {
+    onShowReconnectHelp?.();
+    setCommandError("Send this command again once Arca is back online.");
+  };
+
   // Skills insert at the caret; Enter/click executes standalone no-argument built-ins.
   const applyMenuSelection = (cmd: string) => {
     if (cmd === "/mcp" && !slashCompletion.inline) {
@@ -3299,6 +3335,9 @@ function ComposerImpl(
     }
     if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
       completeMenuSelection(cmd);
+    } else if (sendReconnectsArca) {
+      completeMenuSelection(cmd);
+      holdCommandForArca();
     } else {
       // Execute immediately — no argument needed.
       // /compact clears its draft only after the busy guard accepts it.
@@ -3317,7 +3356,6 @@ function ComposerImpl(
   );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
-  const composerServerInfo = useServerInfo();
   const registryEnabled =
     composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
   const hasRegistryServers =
@@ -3467,7 +3505,8 @@ function ComposerImpl(
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
     appendReplyQuote(text) {
-      if (disabled || isReadOnly || unreachable || composerLockedByBtw || !text.trim()) return;
+      const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
+      if (blocked || composerLockedByBtw || !text.trim()) return;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3599,10 +3638,16 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
       };
+      // Commands that run here or as a `slash_command` event can't wait in the queue for
+      // the host; plain slash text below still goes through `onSend`, which queues it.
+      const runCommand = (run: () => void) => {
+        if (sendReconnectsArca) holdCommandForArca();
+        else run();
+      };
       // A multi-word catalog skill outranks a built-in that matches only its
       // first word: "/Help Desk summarize" invokes the skill, not /help.
       if (skill !== null && skill.command !== parts[0]) {
-        sendSkill(skill);
+        runCommand(() => sendSkill(skill));
         return;
       }
       // Bare "/model" when the session has a switchable model (claude-native):
@@ -3618,10 +3663,12 @@ function ComposerImpl(
       // a model-less modal. ("/model <name>" still routes to setModel there.)
       const canOpenModelPicker = codexModelOptions.length > 0;
       if (cmd === "/model" && !arg && showModels && canOpenModelPicker) {
-        dirtyRef.current = true;
-        setValue("");
-        setCommandError(null);
-        setPickerOpenNonce((n) => n + 1);
+        runCommand(() => {
+          dirtyRef.current = true;
+          setValue("");
+          setCommandError(null);
+          setPickerOpenNonce((n) => n + 1);
+        });
         return;
       }
       // /btw is a built-in for menu/autocomplete purposes only — it is NOT
@@ -3634,21 +3681,26 @@ function ComposerImpl(
         cmd in BUILTIN_SLASH_COMMANDS &&
         cmd in slashCommands
       ) {
-        executeSlashCommand(cmd, cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg);
+        runCommand(() =>
+          executeSlashCommand(
+            cmd,
+            cmd === "/compact" ? trimmed.slice(parts[0].length).trim() : arg,
+          ),
+        );
         return;
       }
       // /side opens a side chat. Codex forks in-process (falls through to the
       // plaintext path so its runner forks); every other harness forks
       // server-side here into an empty side chat, carrying the typed question.
       if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
-        openGenericSideChat(trimmed.slice(cmd.length).trim());
+        runCommand(() => openGenericSideChat(trimmed.slice(cmd.length).trim()));
         return;
       }
       // Known skill on an in-process session: send a `slash_command` event so
       // the server resolves it. Native-terminal sessions have no
       // `onSendSlashCommand`; their vendor TUI loads the skill from plaintext.
       if (skill !== null) {
-        sendSkill(skill);
+        runCommand(() => sendSkill(skill));
         return;
       }
     }
@@ -3725,7 +3777,8 @@ function ComposerImpl(
     if (conversationId !== null && !hasPendingElicitation && shouldSteerAllFromKeyboard) {
       e.preventDefault();
       if (!mentionListingPending) submit();
-      steerAllQueuedMessages(conversationId);
+      // While unreachable the queue waits for the host, so nothing is steered.
+      if (!unreachable) steerAllQueuedMessages(conversationId);
       return;
     }
     // "@"-mention menu navigation (shared useMentionBrowser) — mutually
@@ -3768,18 +3821,8 @@ function ComposerImpl(
       onStop();
       return;
     }
-    // ArrowUp/Down recall — only when the caret is already at the very
-    // start (ArrowUp) or end (ArrowDown) of the text.  Checking for the
-    // absence of "\n" before/after the cursor is not sufficient: long
-    // single-line text that wraps visually contains no newlines, so that
-    // check always fires and history recall intercepts cursor movement
-    // within the wrapped line.  Gating on position 0 / length ensures the
-    // browser gets to move the caret through wrapped lines first; only the
-    // final ArrowUp-at-start / ArrowDown-at-end triggers recall.
-    // Recall is for UNmodified arrows only. Cmd/Ctrl+↑/↓ (switch session) and
-    // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
-    // fire even mid-compose; without this guard the recall below intercepts
-    // them (replacing the draft) and the hotkeys appear broken in the composer.
+    // Recall starts from empty text; boundary checks preserve caret movement
+    // through wrapped recalled entries. Modified arrows belong to global hotkeys.
     if (
       (draft.quotes.length === 0 || recallingRef.current) &&
       (e.key === "ArrowUp" || e.key === "ArrowDown") &&
@@ -3790,7 +3833,7 @@ function ComposerImpl(
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         // Empty-composer recall takes the last queued row before browsing history.
-        if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
+        if (fullText === "" && files.length === 0 && mentionedItems.length === 0) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
           if (target !== undefined) {
             e.preventDefault();
@@ -3972,7 +4015,7 @@ function ComposerImpl(
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
-                : unreachable && sendDisabledReason === null
+                : unreachable && !sendReconnectsArca && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
@@ -3980,10 +4023,11 @@ function ComposerImpl(
                       ? "Waiting for agents…"
                       : isStreaming
                         ? "Send a follow-up (queued) — Esc to stop"
-                        : "Send a message…",
+                        : readyPlaceholder,
           rows: 1,
+          // An Arca send waits in the queue for the host, so typing reopens; other gates stay.
           disabled:
-            ((disabled || unreachable) && sendDisabledReason === null) ||
+            ((disabled || (unreachable && !sendReconnectsArca)) && sendDisabledReason === null) ||
             isReadOnly ||
             composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
@@ -4002,7 +4046,12 @@ function ComposerImpl(
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
                 keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                disabled={
+                  disabled ||
+                  isReadOnly ||
+                  (unreachable && !sendReconnectsArca) ||
+                  composerLockedByBtw
+                }
                 onGrowth={onViewportShrinkPinScroll}
                 onRemove={(id) => {
                   removeQuote(id);

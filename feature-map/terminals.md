@@ -50,7 +50,10 @@ with their own terminal retain the switcher.
   divider (or focus it and use the arrow keys along its axis) to resize. "Close
   pane" asks for confirmation, then kills the focused shell; the agent pane
   cannot be closed. Panes are saved per session in this browser and show only
-  for desktop owners outside grid cells.
+  for desktop owners outside grid cells. ⌘/Ctrl+Alt+Shift+\ splits right and
+  ⌘/Ctrl+Alt+- splits down with the default shell, skipping the picker; the
+  chords work only while those buttons show. ⌘/Ctrl+Alt+Shift+] / [ focus the
+  next / previous pane. All of them work with focus inside a terminal.
 
 **User shells:**
 
@@ -102,13 +105,20 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
-- **`agent-terminal-view`, `user-shell`, keyboard:** no e2e coverage; component
-  tests `web/src/hooks/useViewModeToggleHotkey.test.tsx` and
-  `web/src/hooks/useNewShellHotkey.test.tsx` (`pnpm --dir web test`). Manually,
+- **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
+  coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
+  `web/src/hooks/useNewShellHotkey.test.tsx`,
+  `web/src/hooks/useTerminalSplitHotkey.test.tsx`,
+  `web/src/hooks/usePaneCycleHotkey.test.tsx`,
+  `web/src/shell/TerminalSplitControls.test.tsx` and
+  `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
   in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
   twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
   expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
-  shell focused and expect no second shell.
+  shell focused and expect no second shell. With `splittable_terminal_view_ui`,
+  in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
+  and expect a default shell pane on the right that takes typing; press
+  ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
 - **`scrollback`, wheel:**
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_wheel_scroll_reaches_mouse_tracking_program`
 - **`scrollback`, touch:**
@@ -140,6 +150,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   resource facade through three failed launches and a successful retry for
   Claude/Codex terminal roles and an auxiliary shell. The successful real pane
   must accept input, and final cleanup must release every allocated instance.
+  `tests/runner/test_native_terminal_start_error_payload.py::test_host_setup_error_surfaces_its_remedy`
+  (plain `uv run pytest`) checks that a host without a usable tmux shows how
+  to fix it, not a runner-log pointer.
 - **`hidden-terminal`:**
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**

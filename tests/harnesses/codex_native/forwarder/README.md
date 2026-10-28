@@ -20,7 +20,7 @@ parameterization produces additional collected cases.
 | [test_subagents.py](test_subagents.py) | Subagents | 16 |
 | [test_turn_errors.py](test_turn_errors.py) | Turn errors | 21 |
 | [test_usage.py](test_usage.py) | Usage | 2 |
-| [test_user_messages.py](test_user_messages.py) | User messages | 4 |
+| [test_user_messages.py](test_user_messages.py) | User messages | 6 |
 
 Helpers shared by multiple modules live in `_support.py`; helpers used by one
 module stay beside their tests. Search a retained test name to find an old failure:

@@ -578,6 +578,20 @@ function PlainTextFallback({ text }: { text: string }) {
   );
 }
 
+interface MarkdownNode {
+  type: string;
+  children?: MarkdownNode[];
+}
+
+/** Turns raw HTML nodes into text nodes holding the same source. */
+function remarkHtmlAsText() {
+  const visit = (node: MarkdownNode) => {
+    if (node.type === "html") node.type = "text";
+    node.children?.forEach(visit);
+  };
+  return visit;
+}
+
 /**
  * Wraps `MessageResponse` with {@link WorkspacePathInlineCode} via Streamdown's
  * `inlineCode` slot — NOT `code` — so fenced code blocks keep their default
@@ -591,20 +605,30 @@ function PlainTextFallback({ text }: { text: string }) {
  * `remarkPlugins` prop *replaces* its defaults rather than merging, so we
  * extend `defaultRemarkPlugins` (which carries remark-gfm) — passing
  * `[remarkBreaks]` alone would silently drop GFM tables / strikethrough.
+ *
+ * When `literalHtml` is set, raw HTML shows as written instead of rendering,
+ * so markup or comments in a tool's text can't hide part of it.
  */
 export function FilePathAwareMessageResponse({
   children,
   breaks = false,
+  literalHtml = false,
   ...props
-}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean }) {
+}: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
 
-  // Extend (don't replace) Streamdown's defaults so remark-gfm survives;
-  // append remark-breaks only when `breaks` is requested. When `breaks` is
-  // false we pass `undefined` so Streamdown uses its own defaults unchanged.
+  // Extend (don't replace) Streamdown's defaults so remark-gfm survives. With
+  // neither option set we pass `undefined` so Streamdown uses its defaults unchanged.
   const remarkPlugins = useMemo(
-    () => (breaks ? [...Object.values(defaultRemarkPlugins), remarkBreaks] : undefined),
-    [breaks],
+    () =>
+      breaks || literalHtml
+        ? [
+            ...Object.values(defaultRemarkPlugins),
+            ...(literalHtml ? [remarkHtmlAsText] : []),
+            ...(breaks ? [remarkBreaks] : []),
+          ]
+        : undefined,
+    [breaks, literalHtml],
   );
 
   // Throttle the markdown so the live (still-growing) bubble re-parses a few

@@ -4,7 +4,7 @@ import { type ComponentProps, useContext, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -19,6 +19,7 @@ const fixture = vi.hoisted(() => ({
   permissionLevel: null as number | null,
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
+  composerDisabled: false,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -80,7 +81,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     const terminal = useTerminalFirst();
     return (
       <>
-        <input aria-label="Message" />
+        <textarea aria-label="Message" disabled={fixture.composerDisabled} />
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -138,6 +139,7 @@ afterEach(() => {
   fixture.permissionLevel = null;
   fixture.terminals = [];
   fixture.terminalPending = false;
+  fixture.composerDisabled = false;
   vi.restoreAllMocks();
 });
 
@@ -210,6 +212,76 @@ it("keeps cell views, input, permissions and shortcut targets independent", asyn
   expect(
     within(screen.getByRole("region", { name: "second" })).getByLabelText("Message"),
   ).toBeVisible();
+});
+
+it("cycles keyboard focus through cells and toggles the grid workspace from the keyboard", () => {
+  fixture.labels = { "omnigent.ui": "terminal" };
+  fixture.terminals = [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }];
+  const layout = splitGrid(
+    splitGrid("first", "first", "second", "right")!,
+    "second",
+    "third",
+    "bottom",
+  )!;
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid grid={{ id: "cycle", layout }} />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const cell = (name: string) => screen.getByRole("region", { name: new RegExp(`^${name}`) });
+  // Clicking the switch also selects the third cell, so cycling starts there.
+  fireEvent.click(within(cell("third")).getByRole("button", { name: "Terminal view" }));
+  const next = () =>
+    fireEvent.keyDown(window, {
+      code: "BracketRight",
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: true,
+    });
+
+  next();
+  expect(cell("first")).toHaveAttribute("data-active", "true");
+  expect(within(cell("first")).getByRole("textbox", { name: "Message" })).toHaveFocus();
+  next();
+  expect(within(cell("second")).getByRole("textbox", { name: "Message" })).toHaveFocus();
+  // A connected terminal claims focus itself; until then the cell holds it.
+  next();
+  expect(cell("third")).toHaveAttribute("data-active", "true");
+  expect(within(cell("third")).getByLabelText("Terminal input")).toHaveAttribute(
+    "data-active",
+    "true",
+  );
+  expect(cell("third")).toHaveFocus();
+  fireEvent.keyDown(window, { code: "BracketLeft", ctrlKey: true, altKey: true, shiftKey: true });
+  expect(cell("second")).toHaveAttribute("data-active", "true");
+  // A handled request must not pull focus back when the cell's view changes later.
+  const outside = document.body.appendChild(document.createElement("button"));
+  onTestFinished(() => outside.remove());
+  outside.focus();
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true });
+  expect(outside).toHaveFocus();
+
+  const toggle = screen.getByRole("button", { name: /grid workspace$/ });
+  const label = toggle.getAttribute("aria-label");
+  fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true });
+  expect(toggle).not.toHaveAttribute("aria-label", label);
+  fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true });
+  expect(toggle).toHaveAttribute("aria-label", label);
+});
+
+it("focuses the cell itself when its composer is not ready", () => {
+  fixture.composerDisabled = true;
+  render(
+    <MemoryRouter>
+      <RearrangeableGrid
+        grid={{ id: "not-ready", layout: splitGrid("first", "first", "second", "right")! }}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.keyDown(window, { code: "BracketRight", ctrlKey: true, altKey: true, shiftKey: true });
+  expect(screen.getByRole("region", { name: "second (active)" })).toHaveFocus();
 });
 
 it("uses the terminal default and changes startup into a scoped resume action", async () => {
