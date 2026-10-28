@@ -52,6 +52,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   a managed sandbox launching before its host is bound (its provider's default catalog),
   long mixed catalog (grouped), search with no matches, unidentified models
   (Other models).
+  Equivalent model-ID spellings use the catalog's display name consistently,
+  including case, gateway-prefix, and version-punctuation differences; context
+  variants keep their own labels and checked rows, including in side chats.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).

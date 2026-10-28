@@ -192,11 +192,16 @@ class StartupLease:
         error: str | None = None,
         error_code: str | None = None,
     ) -> None:
-        """Record prompt delivery or a known startup failure, with a live lease."""
-        if status not in {"running", "failed", "skipped"}:
+        """Record prompt delivery or a known startup failure, with a live lease.
+
+        ``succeeded`` is for a prompt delivered into a continued session, whose
+        run does not wait for the turn it joins.
+        """
+        if status not in {"running", "succeeded", "failed", "skipped"}:
             raise ValueError(
                 f"Cannot finish startup with status {status!r}. "
-                "Use 'running' after sending the prompt, 'failed' for a known failure, "
+                "Use 'running' after sending the prompt, 'succeeded' after delivering it "
+                "into a continued session, 'failed' for a known failure, "
                 "or 'skipped' when execution is intentionally skipped."
             )
 
@@ -214,7 +219,7 @@ class StartupLease:
                     outcome=status,
                     error_code=error_code,
                     prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
-                    if status == "running"
+                    if status in ("running", "succeeded")
                     else None,
                 ),
             )

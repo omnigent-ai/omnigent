@@ -208,6 +208,18 @@ describe("resolveServerInfo scheduled_task_projects", () => {
   });
 });
 
+describe("resolveServerInfo scheduled_task_session_modes", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ scheduled_task_session_modes: true })).scheduled_task_session_modes).toBe(
+      true,
+    );
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).scheduled_task_session_modes).toBe(false);
+  });
+});
+
 describe("resolveServerInfo archive_worktree_cleanup", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);

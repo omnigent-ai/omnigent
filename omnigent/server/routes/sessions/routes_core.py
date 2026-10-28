@@ -31,7 +31,12 @@ from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
 from omnigent.db.utils import generate_agent_id, generate_file_id
-from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
+from omnigent.debug_logging import (
+    add_audit_attrs,
+    debug_event,
+    set_current_runner_id,
+    set_current_user_id,
+)
 from omnigent.entities import (
     Agent,
     CommentsFingerprint,
@@ -2268,6 +2273,10 @@ def register_core_routes(
                 code=status.WS_1008_POLICY_VIOLATION,
                 reason="authentication required",
             )
+        # WebSockets bypass the HTTP middleware that attributes debug-log rows
+        # to the request's user; this handler task is per-connection, so the
+        # binding cannot leak across sockets.
+        set_current_user_id(user_id)
         await websocket.accept()
         _logger.info(
             "session-updates stream connected",

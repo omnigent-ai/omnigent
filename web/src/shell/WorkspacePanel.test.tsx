@@ -632,16 +632,24 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-media-active", "false");
   });
 
-  it("renders the FileViewer for the active path (not the scope panel)", () => {
-    renderWorkspace({
+  it("keeps the FilesPanel mounted but hidden behind the active file", () => {
+    const { rerender } = renderWorkspace({
       openFiles: ["src/App.tsx"],
-      selectedFilePath: "src/App.tsx",
+      selectedFilePath: null,
     });
+    const panel = screen.getByTestId("files-panel-stub");
+    expect(panel.parentElement).not.toHaveClass("invisible");
 
-    // A selected file shows its viewer in the content slot; the scope panel
-    // must not also mount. The stub echoes the path it received.
+    rerender({ selectedFilePath: "src/App.tsx" });
+    // The viewer owns the slot; the scope panel stays mounted (same node, so
+    // tree state survives) inside an invisible wrapper.
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
-    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel.parentElement).toHaveClass("invisible");
+
+    rerender({ selectedFilePath: null });
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel.parentElement).not.toHaveClass("invisible");
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
@@ -720,6 +728,17 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ openTerminals: [termKey] });
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
+  });
+
+  it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({ rightRailTab: "files", openTerminals: [termKey] });
+    const panel = screen.getByTestId("files-panel-stub");
+
+    rerender({ selectedTerminalKey: termKey });
+    expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("files-panel-stub")).toBe(panel);
+    expect(panel.parentElement).toHaveClass("invisible");
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {

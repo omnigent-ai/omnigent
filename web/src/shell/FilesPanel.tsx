@@ -220,12 +220,9 @@ function SearchFilterInput({
 
 /**
  * Browse location per conversation, surviving unmount/remount within a JS
- * session. Opening a file swaps this panel for the FileViewer (see
- * WorkspacePanel's content slot), which unmounts it — with plain state,
- * closing the viewer snapped the tree back to the workspace root instead of
- * the directory the file was opened from. Same pattern as FolderTree's
- * expandedPathsCache. Keyed by conversation, so a session switch still lands
- * on that session's own last location (or its root), never another's.
+ * session (e.g. a session switch, or the mobile drawer closing). Same pattern
+ * as FolderTree's expandedPathsCache. Keyed by conversation, so a session
+ * switch still lands on that session's own last location (or its root).
  */
 const browseLocationCache = new Map<string, string>();
 
@@ -301,8 +298,7 @@ export function FilesPanel({
   // workspace chip uses.
   const { session } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
-  // from the per-conversation cache so the location survives the panel
-  // unmounting while a file is open in the viewer.
+  // from the per-conversation cache so the location survives a remount.
   const [browseLocation, setBrowseLocation] = useState<string | null>(
     () => (conversationId && browseLocationCache.get(conversationId)) || null,
   );

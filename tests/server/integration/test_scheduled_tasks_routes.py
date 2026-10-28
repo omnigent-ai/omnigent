@@ -7,9 +7,11 @@ validation (400s) and live-scheduler sync on every mutation.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
@@ -2422,3 +2424,219 @@ async def test_legacy_retry_keeps_tasks_created_and_edited_during_load(
         assert scheduler.job_count == 2
         assert scheduler.next_run_at(created.json()["id"]) == created.json()["next_run_at"]
         assert scheduler.next_run_at(existing.id) == edited.json()["next_run_at"]
+
+
+_HOST_ID = "4b653f6031f35d168cc0b37caa1306d1"
+
+
+def _owned_session(
+    db_uri: str, owner: str = "alice@example.com", *, archived: bool = False, **fields: object
+) -> str:
+    """A top-level session on the test host, with an owner grant for *owner*."""
+    from omnigent.server.auth import LEVEL_OWNER
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    values: dict[str, object] = {
+        "agent_id": builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        "host_id": _HOST_ID,
+        "workspace": "/repo",
+    }
+    values.update(fields)
+    conv = conversations.create_conversation(**values)  # type: ignore[arg-type]
+    if archived:
+        conversations.update_conversation(conv.id, archived=True)
+    SqlAlchemyPermissionStore(db_uri).grant(owner, conv.id, LEVEL_OWNER)
+    return conv.id
+
+
+async def test_picking_a_session_pins_the_host_it_runs_on(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """The session cannot move, so an unpinned task routes every run to its host."""
+    session_id = _owned_session(db_uri)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            session_mode="continue", session_id=session_id, host_id=None, workspace=None
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["host_id"] == _HOST_ID
+
+    unpinned = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", host_id=None, workspace=None),
+            headers=_headers(),
+        )
+    ).json()
+    assert unpinned["host_id"] is None
+    picked = await auth_client.patch(
+        f"/v1/scheduled-tasks/{unpinned['id']}",
+        json={"session_id": _owned_session(db_uri)},
+        headers=_headers(),
+    )
+    assert picked.status_code == 200, picked.text
+    assert picked.json()["host_id"] == _HOST_ID
+
+
+async def test_session_mode_round_trips_and_a_null_session_starts_a_new_one(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """``continue`` keeps the first run's session until a PATCH clears it or picks ``new``."""
+    default = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert (default["session_mode"], default["session_id"]) == ("new", None)
+
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue"),
+            headers=_headers(),
+        )
+    ).json()
+    assert (created["session_mode"], created["session_id"]) == ("continue", None)
+    task_id = created["id"]
+    first_session = _owned_session(db_uri)
+    schedules = SqlAlchemyScheduledTaskStore(db_uri)
+    snapshot = schedules.get(task_id)
+    assert schedules.adopt_session(task_id, first_session, snapshot=snapshot) == "adopted"
+
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.json()["session_id"] == first_session
+
+    cleared = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_id": None}, headers=_headers()
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert (cleared.json()["session_mode"], cleared.json()["session_id"]) == ("continue", None)
+
+    picked = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_id": first_session}, headers=_headers()
+    )
+    assert picked.status_code == 200, picked.text
+    assert picked.json()["session_id"] == first_session
+
+    to_new = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"session_mode": "new"}, headers=_headers()
+    )
+    assert (to_new.json()["session_mode"], to_new.json()["session_id"]) == ("new", None)
+
+
+async def test_create_can_continue_a_session_the_owner_picked(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+
+    resp = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_mode="continue", session_id=session_id),
+        headers=_headers(),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert (body["session_mode"], body["session_id"]) == ("continue", session_id)
+    # The task runs the session's own agent rather than taking a copy.
+    assert body["agent_id"] == builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME)
+
+
+async def test_a_picked_session_must_be_the_owners_and_fit_the_task(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    bobs = _owned_session(db_uri, "bob@example.com")
+    cases = {
+        "someone else's": (bobs, 404),
+        # Nothing else about a session the caller can't see is told.
+        "someone else's archived": (_owned_session(db_uri, "bob@example.com", archived=True), 404),
+        "someone else's sub-agent": (
+            _owned_session(db_uri, "bob@example.com", parent_conversation_id=bobs),
+            404,
+        ),
+        "missing": ("cd" * 16, 404),
+        "archived": (_owned_session(db_uri, archived=True), 400),
+        "on another workspace": (_owned_session(db_uri, workspace="/elsewhere"), 400),
+    }
+    for label, (session_id, status) in cases.items():
+        resp = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", session_id=session_id),
+            headers=_headers(),
+        )
+        assert resp.status_code == status, (label, resp.text)
+
+    new_mode = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(session_id=_owned_session(db_uri)),
+        headers=_headers(),
+    )
+    assert new_mode.status_code == 422, new_mode.text
+
+
+async def test_a_patch_that_picks_a_session_takes_no_agent_copy(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A picked session keeps the agent it runs, so switching to it copies nothing."""
+    from omnigent.native.native_coding_agents import CODEX_NATIVE_AGENT_NAME
+
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(session_mode="continue"), headers=_headers()
+        )
+    ).json()
+    copies: list[str] = []
+
+    def _copy(
+        agent_store: object, artifact_store: object, agent: SimpleNamespace, user_id: object
+    ) -> SimpleNamespace:
+        # Stands in for an agent shared by another user, which binding copies;
+        # this app has no fixture for one.
+        copies.append(agent.id)
+        return SimpleNamespace(id=uuid.uuid4().hex)
+
+    monkeypatch.setattr(scheduled_tasks_routes, "agent_for_user", _copy)
+    codex = builtin_agent_id(CODEX_NATIVE_AGENT_NAME)
+    session_id = _owned_session(db_uri, agent_id=codex)
+
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"agent_id": codex, "session_id": session_id},
+        headers=_headers(),
+    )
+
+    assert patched.status_code == 200, patched.text
+    assert (patched.json()["agent_id"], patched.json()["session_id"]) == (codex, session_id)
+    assert copies == []
+
+
+async def test_changing_where_a_task_runs_starts_a_new_session(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A continued session cannot follow a new pin, so the next run starts a new one."""
+    session_id = _owned_session(db_uri)
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", session_id=session_id),
+            headers=_headers(),
+        )
+    ).json()
+
+    resent = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}",
+        json={"name": "renamed", "host_id": _HOST_ID, "workspace": "/repo"},
+        headers=_headers(),
+    )
+    assert resent.json()["session_id"] == session_id
+
+    moved = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created['id']}", json={"workspace": "/other"}, headers=_headers()
+    )
+
+    assert moved.status_code == 200, moved.text
+    assert (moved.json()["session_mode"], moved.json()["session_id"]) == ("continue", None)

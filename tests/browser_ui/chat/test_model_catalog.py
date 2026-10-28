@@ -25,6 +25,7 @@ def test_catalog_rows_render_for_every_native_picker(
 ) -> None:
     """The real chat page consumes runner-owned rows for every picker family."""
     chat = chat_session_contract
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
     for harness in (
         "claude-native",
         "codex-native",
@@ -35,15 +36,22 @@ def test_catalog_rows_render_for_every_native_picker(
         "devin-native",
         "acp",
     ):
+        wrapper = {
+            "claude-native": "claude-code-native-ui",
+            "codex-native": "codex-native-ui",
+        }.get(harness)
+        chat.update_session(labels={"omnigent.wrapper": wrapper} if wrapper else {})
         chat.set_catalog(
             harness=harness,
             models=[
                 model_option("primary", display_name="Primary", is_default=True),
                 model_option("alternate", display_name="Alternate"),
             ],
-            selected_model="primary",
+            selected_model="PRIMARY" if wrapper else "primary",
         )
         page.goto(chat.url)
+        if wrapper:
+            expect(page.get_by_test_id("composer-agent-model-value")).to_have_text("Primary")
         _open_models(page)
 
         rows = page.locator('[role="menuitemcheckbox"][data-model-id]')

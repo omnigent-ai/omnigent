@@ -18,6 +18,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -57,6 +58,7 @@ import {
   ScheduledTaskApiError,
   type ScheduledTask,
   type ScheduledTaskExecutionTarget,
+  type ScheduledTaskSessionMode,
 } from "@/lib/scheduledTasksApi";
 import { localTimezone } from "@/lib/timezones";
 
@@ -90,6 +92,7 @@ export function CreateScheduledTaskDialog({
     isError: projectsFailed,
   } = useProjects({ enabled: open && projectsSupported });
   const resolveProjectId = useResolveOrCreateProjectId();
+  const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   // Provider-named label for the sandbox host option (e.g. "Modal Sandbox"),
   // falling back to the generic "New Sandbox" — same helper the New Chat picker uses.
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
@@ -232,6 +235,8 @@ export function CreateScheduledTaskDialog({
   // Id of the existing project picked, captured at pick time so a later rename
   // can't redirect the save; null for a newly typed name.
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
+  const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
+  const [startNewSession, setStartNewSession] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
 
@@ -260,6 +265,8 @@ export function CreateScheduledTaskDialog({
         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
         setProjectChoice(null);
         setPickedProjectId(null);
+        setSessionMode(editingTask.sessionMode);
+        setStartNewSession(false);
       } else {
         setName(initialName ?? "");
         setPrompt(initialPrompt ?? "");
@@ -267,6 +274,8 @@ export function CreateScheduledTaskDialog({
         setPickedModel("");
         setPickedEffort("");
         setPickedPermission("");
+        setSessionMode("new");
+        setStartNewSession(false);
         setSchedule(DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
@@ -380,6 +389,7 @@ export function CreateScheduledTaskDialog({
         ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
           ? { workspace: workspace.trim() }
           : {}),
+        ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
       const projectInput = await projectChangeInput(
         // Saving over a deleted project clears it, matching the "No project" shown.
@@ -406,6 +416,9 @@ export function CreateScheduledTaskDialog({
             ...input,
             ...overrides,
             ...projectInput,
+            ...(sessionMode === "continue" && startNewSession && editingTask.sessionId !== null
+              ? { sessionId: null }
+              : {}),
             // Only on a real switch: sending the unchanged agent is a server-side
             // no-op, but omitting it keeps the PATCH honest about what changed.
             ...(agentChanged && effectiveAgentId !== null ? { agentId: effectiveAgentId } : {}),
@@ -589,6 +602,51 @@ export function CreateScheduledTaskDialog({
             </p>
           )}
 
+          {sessionModesSupported && (
+            <div className="flex flex-col gap-1.5" data-testid="task-session-mode-field">
+              <Label htmlFor="task-session-mode">Session</Label>
+              <Select
+                value={sessionMode}
+                componentId="tasks.scheduled.session_mode"
+                onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
+                onOpenChange={handleSelectOpenChange}
+              >
+                <SelectTrigger
+                  id="task-session-mode"
+                  data-testid="task-session-mode-trigger"
+                  className="w-full"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value="new">New session each run</SelectItem>
+                  <SelectItem value="continue" data-testid="task-session-mode-continue">
+                    Continue one session
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                {sessionMode === "continue"
+                  ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                  : "Each run starts a new session."}
+              </p>
+              {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="task-start-new-session"
+                    checked={startNewSession}
+                    onCheckedChange={(checked) => setStartNewSession(checked === true)}
+                    data-testid="task-start-new-session"
+                    componentId="tasks.scheduled.start_new_session"
+                  />
+                  <label htmlFor="task-start-new-session" className="cursor-pointer text-sm">
+                    Start a new session on the next run
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Timezone is inferred from the browser (localTimezone via Intl) and
               intentionally has no visible control. It is still sent in the create
               payload so the schedule evaluates in the user's local zone. */}
@@ -643,9 +701,10 @@ export function CreateScheduledTaskDialog({
 
           {/* Host / execution target. When the server offers managed sandboxes,
               a "New Sandbox" entry sits in the same picker (mirroring the New Chat
-              composer): choosing it provisions a FRESH sandbox per fire
-              (execution_target=managed_sandbox, hostless) instead of a connected
-              host. Otherwise the picker is the optional connected-host pin. */}
+              composer): choosing it provisions a FRESH sandbox per fire, or one
+              kept sandbox for a continue task (execution_target=managed_sandbox,
+              hostless), instead of a connected host. Otherwise the picker is the
+              optional connected-host pin. */}
           <div className="flex flex-col gap-1.5" data-testid="task-host-field">
             <Label htmlFor="task-host">Host (optional)</Label>
             <Select
@@ -691,7 +750,9 @@ export function CreateScheduledTaskDialog({
             </Select>
             <p className="text-sm text-muted-foreground">
               {sandboxMode
-                ? "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
+                ? sessionMode === "continue"
+                  ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
+                  : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
                 : "Leave unset to run on your connected host when the automation fires."}
             </p>
           </div>

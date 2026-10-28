@@ -4763,6 +4763,8 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "session_mode",
+    "session_id",
     "workspace",
     "host_id",
     "execution_target",
@@ -4779,6 +4781,8 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "max_cost_usd",
+    "session_mode",
+    "session_id",
     "workspace",
     "host_id",
     "execution_target",
@@ -4786,6 +4790,30 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# Fields a server accepts only once it advertises ``scheduled_task_session_modes``.
+_SCHEDULED_TASK_SESSION_FIELDS = ("session_mode", "session_id")
+
+
+async def _scheduled_task_session_fields_refusal(
+    server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
+) -> str | None:
+    """An error for session fields this server would reject, or ``None`` to send them.
+
+    An older server forbids unknown fields, so the payload would fail with a 422
+    that does not say why. Asked only when the call carries one of the fields; an
+    unreadable ``/v1/info`` counts as unsupported, as for task projects.
+    """
+    if not any(field in payload for field in _SCHEDULED_TASK_SESSION_FIELDS):
+        return None
+    info = await server_client.get("/v1/info", timeout=30.0)
+    if info.status_code < 400 and info.json().get("scheduled_task_session_modes") is True:
+        return None
+    return json.dumps(
+        {
+            "error": f"{tool_name}: this Omnigent server does not support session_mode or "
+            "session_id; omit them to start a new session on every run"
+        }
+    )
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
@@ -4885,6 +4913,11 @@ async def _execute_scheduled_task_tool(
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
+            refusal = await _scheduled_task_session_fields_refusal(
+                server_client, tool_name, payload
+            )
+            if refusal is not None:
+                return refusal
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
             resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
@@ -4901,6 +4934,11 @@ async def _execute_scheduled_task_tool(
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
+                refusal = await _scheduled_task_session_fields_refusal(
+                    server_client, tool_name, payload
+                )
+                if refusal is not None:
+                    return refusal
                 resp = None
                 if project_name is not None:
                     # Confirm the task first so a bad id doesn't leave a new project behind.

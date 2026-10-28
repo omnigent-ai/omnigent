@@ -178,6 +178,19 @@ but records each one on the claimed run instead of inserting a new run:
      prompt fails, the launch is cancelled, the sandbox is torn down, and the run
      fails with `sandbox_registration_timeout`.
 
+A task that continues a session replaces steps 2 to 4 once it has a
+`session_id`: it checks the session, wakes its runner the way a user message
+would, and sends the prompt, also while the session is busy with an earlier turn.
+It records `succeeded` once the prompt is delivered, without waiting for the turn.
+If the replica stops before recording, recovery finds no session on the run and
+records `failed`; it never resends. A first run of such a task records its
+session on the task once the session exists and its owner is granted, so a run
+never finds a recorded session it cannot continue. Of two first runs, the one that records
+second deletes its unused session and records `skipped`.
+A sandbox task's first run starts its sandbox under the task's host ID. If that
+host already exists, left by a reset session, the new session joins it in that
+session's workspace, or replaces its sandbox when that session is unknown.
+
 Known failures record `failed` with the same `error_code` as legacy fires, such as
 `host_offline` or `launch_failed`. A managed launch records where it failed instead:
 `sandbox_create_failed` before the host connects, or `runner_start_failed` after.
@@ -212,11 +225,15 @@ The built-in recovery decides from the saved session, as shown in
 wrong:
 
 - A run counts as a managed sandbox run when its `host_id` is the sandbox ID
-  derived from its task and trigger key. This uses the run, not the task's current
+  derived from its task and trigger key, or, for a task that continues a
+  session, from its task alone. This uses the run, not the task's current
   target, which may have been edited since the claim.
 - An `idle` session alone does not mean the turn finished: a session can be idle
   with its prompt saved but never run. Runner bookkeeping such as `resource_event`
   items does not count as evidence either.
+- Recovery never tears down a continue task's sandbox: other sessions of the task,
+  such as one started after a reset, may be using it, and the task's next run
+  reuses it. The provider's lifetime cap still applies.
 - Teardown only applies to server-managed sandbox hosts, and is safe to repeat, so
   two replicas can recover the same run.
 
@@ -260,6 +277,7 @@ stateDiagram-v2
     }
 
     Starting --> Running : prompt sent, or sandbox bound
+    Starting --> Succeeded : prompt delivered into a continued session
     Starting --> Failed : known error, e.g. host_offline
     Starting --> Skipped : unsupported target
     Starting --> Recovering : lease expired
@@ -408,6 +426,12 @@ same mode.
 - A key is the occurrence's host ID, or, for a task with no host, the workspace ID
   as a decimal string. Host IDs are bare lowercase 32-character hex, the same
   string a host or sandbox sends as its routing key.
+- A task that continues a session keys every run, its first included, by one
+  host: its pinned connected host, or for a sandbox task a host ID derived from
+  the task alone, so the replica holding that sandbox's connection runs it. A
+  connected-host task without a pin is pinned to its session's host when the
+  session is recorded or picked, so only its first run, before any session
+  exists, keys by the workspace ID.
 - The scheduler calls `owned_hosts` once per page of due tasks, of Run now
   requests, and of expired startups, listing each key once.
 - If the call raises, or takes longer than `recovery_seconds` during recovery,

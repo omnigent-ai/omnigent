@@ -706,7 +706,12 @@ def _schedule_deferred_elicitation_clear(
                 reason="unanswered",
             )
 
-    task = asyncio.create_task(_clear_after_grace())
+    clear_coroutine = _clear_after_grace()
+    try:
+        task = asyncio.create_task(clear_coroutine)
+    except BaseException:
+        clear_coroutine.close()
+        raise
     _deferred_elicitation_clear_tasks.add(task)
     task.add_done_callback(_deferred_elicitation_clear_tasks.discard)
 

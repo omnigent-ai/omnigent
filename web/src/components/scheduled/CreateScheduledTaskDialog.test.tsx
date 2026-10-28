@@ -210,6 +210,8 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
@@ -1279,5 +1281,91 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
     expect(shouldGuardDialogDismiss(plain, { selectOpen: false, msSinceSelectClose: 500 })).toBe(
       false,
     );
+  });
+});
+
+describe("CreateScheduledTaskDialog session mode", () => {
+  function renderWithSessionModes(editingTask?: ScheduledTasksApiModule.ScheduledTask) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />
+      </CapabilitiesProvider>,
+    );
+  }
+
+  function chooseContinue() {
+    const trigger = screen.getByTestId("task-session-mode-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("task-session-mode-continue"));
+  }
+
+  it("hides the Session control on a server that does not accept session modes", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("sends sessionMode only when continue is chosen on create", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    chooseContinue();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
+  });
+
+  it("leaves sessionMode out of a create that keeps a new session per run", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("says a sandbox automation that continues a session keeps one sandbox", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          managed_sandboxes_enabled: true,
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    chooseContinue();
+    const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(
+      screen.getByText(
+        "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("clears the continued session when asked to start a new one on the next run", async () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionId).toBeNull();
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("offers no new-session option before the first run creates a session", () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue" }));
+    expect(screen.queryByTestId("task-start-new-session")).toBeNull();
   });
 });

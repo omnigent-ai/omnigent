@@ -6057,6 +6057,11 @@
             "title": "Scheduled Task Projects",
             "type": "boolean"
           },
+          "scheduled_task_session_modes": {
+            "default": true,
+            "title": "Scheduled Task Session Modes",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"
