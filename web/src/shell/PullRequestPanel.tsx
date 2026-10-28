@@ -1079,6 +1079,9 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const storesPrs = storesSessionPullRequests(useServerInfo());
   const stored = useSessionPullRequests(conversationId, info.data);
   const hostOffline = useHostOffline(conversationId, info);
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  // Linking verifies the PR with the host's provider account.
+  const linkNeedsHost = storesPrs && hostOffline;
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
     data: Associations;
@@ -1283,11 +1286,8 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                   {refreshIcon}
                 </IconButton>
                 <IconButton
-                  // Linking verifies the PR with the host's provider account.
-                  label={
-                    storesPrs && hostOffline ? "Link a PR (needs the host online)" : "Link a PR"
-                  }
-                  disabled={storesPrs && hostOffline}
+                  label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
+                  disabled={linkNeedsHost}
                   onClick={() => setLinking(!linking)}
                 >
                   <PlusIcon className="size-3.5" aria-hidden="true" />
@@ -1345,8 +1345,18 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           emptyStateAction={
             associations?.tracking_available && linkInEmptyState ? (
               <div className="mt-2 w-full max-w-sm">
-                {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
-                {linkControls}
+                {linkNeedsHost ? (
+                  <p role="status" className="text-ui text-muted-foreground">
+                    {sandboxAsleep
+                      ? "To link a PR, send a message to start the session’s sandbox."
+                      : "To link a PR, please reconnect the session’s host."}
+                  </p>
+                ) : (
+                  <>
+                    {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
+                    {linkControls}
+                  </>
+                )}
               </div>
             ) : (
               openPrFallback

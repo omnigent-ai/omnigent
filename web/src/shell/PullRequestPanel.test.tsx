@@ -75,6 +75,8 @@ const state = vi.hoisted(() => ({
   storesPrs: true,
   unlink: { mutate: vi.fn(), isPending: false, isError: false, error: null as Error | null },
   sandboxAsleep: false,
+  // False once the session's host disconnects, which leaves cached live info without an error.
+  serveable: undefined as boolean | undefined,
 }));
 
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
@@ -149,6 +151,7 @@ vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
   useWorkspaceAsleep: () => state.sandboxAsleep,
+  useWorkspaceServeable: () => state.serveable,
 }));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
@@ -266,6 +269,7 @@ beforeEach(() => {
   state.storesPrs = true;
   state.unlink = { mutate: vi.fn(), isPending: false, isError: false, error: null };
   state.sandboxAsleep = false;
+  state.serveable = undefined;
   // Fire the observer callback immediately on observe so lazy sections mount.
   class IO {
     private cb: IntersectionObserverCallback;
@@ -2342,6 +2346,54 @@ describe("session PR selection", () => {
       expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull(),
     );
     expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+  });
+
+  it.each([
+    {
+      offline: "the host is disconnected",
+      serveable: false,
+      sandboxAsleep: false,
+      message: "To link a PR, please reconnect the session’s host.",
+    },
+    {
+      offline: "the sandbox is asleep",
+      serveable: undefined,
+      sandboxAsleep: true,
+      message: "To link a PR, send a message to start the session’s sandbox.",
+    },
+  ])(
+    "asks for the host instead of offering to link a PR while $offline",
+    async ({ serveable, sandboxAsleep, message }) => {
+      state.serveable = serveable;
+      state.sandboxAsleep = sandboxAsleep;
+      // Cached from before the host went away, as after unlinking the last PR offline.
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        prs: [],
+        pr: null,
+        selected_pr_url: undefined,
+      });
+      state.stored.conv_1 = [];
+      renderPanel();
+
+      expect(await screen.findByText(message)).toBeInTheDocument();
+      expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    },
+  );
+
+  it("still offers to link a PR on an older server while the host is disconnected", () => {
+    state.storesPrs = false;
+    state.serveable = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      prs: [],
+      pr: null,
+      selected_pr_url: undefined,
+    });
+    renderPanel();
+
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
   });
 
   it("says when the server hasn't imported the session's PRs yet", async () => {
