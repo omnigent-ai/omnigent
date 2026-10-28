@@ -27,12 +27,17 @@ _CONVERSATIONS = 'aside[aria-label="Conversations"]'
 _PEEK_CARD = "aside.conversations-sidebar.is-peek"
 # Park spot well away from the sidebar, the header, and the peek card.
 _PARK = (900, 500)
-# The dwell-to-peek delay in ChatHeader.tsx (onPeekSidebar) is 400ms; the peek
-# card then fades/slides in over 200ms. Clicking ~60ms after the timer fires
+# The dwell-to-peek delay in SidebarOpenButton.tsx (onPeekSidebar) is 400ms; the
+# peek card then fades/slides in over 200ms. Clicking ~60ms after the timer fires
 # lands squarely in the "peek mounted but not yet visible" window the report
 # describes as "before any preview shows up".
+_PEEK_DELAY_MS = 400
 _JUST_PAST_PEEK_DELAY_MS = 460
 _WELL_BEFORE_PEEK_DELAY_MS = 120
+# Holds the peek card at the start of its fade-in, so only the test's clock ends it.
+_FREEZE_PEEK_FADE = (
+    "aside.conversations-sidebar.is-peek { animation-play-state: paused !important; }"
+)
 
 
 def _collapse_sidebar(page: Page) -> None:
@@ -59,6 +64,10 @@ def _hover_toggle_then_click(page: Page, dwell_ms: int) -> bool:
     click just like it would in real use (locator ``click()`` would instead
     wait for the button to become the hit target and mask the bug).
 
+    The page clock is paused and the peek fade frozen while the pointer dwells,
+    so the click lands ``dwell_ms`` into the journey however slow the machine
+    is; real-time waits let a loaded runner drift past the invisible-peek window.
+
     :returns: Whether the peek card was already mounted when the click landed
         (diagnostic context for the assertion message).
     """
@@ -68,11 +77,16 @@ def _hover_toggle_then_click(page: Page, dwell_ms: int) -> bool:
     assert box is not None
     cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
 
+    page.add_style_tag(content=_FREEZE_PEEK_FADE)
+    page.clock.pause_at(page.evaluate("Date.now() / 1_000 + 1"))
     page.mouse.move(cx, cy, steps=2)  # pointerenter arms the 400ms peek timer
-    page.wait_for_timeout(dwell_ms)
+    page.clock.run_for(dwell_ms)
+    if dwell_ms > _PEEK_DELAY_MS:
+        expect(page.locator(_PEEK_CARD)).to_have_count(1)
     peek_mounted = page.locator(_PEEK_CARD).count() > 0
     page.mouse.down()
     page.mouse.up()
+    page.clock.resume()
     return peek_mounted
 
 
@@ -111,6 +125,7 @@ def test_click_during_invisible_peek_still_opens_sidebar(
     """
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": 1280, "height": 800})
+    page.clock.install()
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
 
@@ -136,6 +151,7 @@ def test_click_before_peek_delay_opens_sidebar(
     """
     base_url, session_id = seeded_session
     page.set_viewport_size({"width": 1280, "height": 800})
+    page.clock.install()
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
 

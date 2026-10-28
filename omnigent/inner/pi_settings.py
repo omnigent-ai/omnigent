@@ -1,17 +1,15 @@
 """Helpers for seeding a managed Pi agent dir (``PI_CODING_AGENT_DIR``).
 
-When the pi harness runs in gateway mode it relocates Pi's agent root to a
-per-session temp directory (for ``models.json``). That hides the user's global
-``~/.pi/agent/settings.json`` and installed package trees. This module copies
-the global settings metadata into the managed dir and symlinks install
-directories so Pi's native loader still sees extensions and ``pi install``
-packages — without mutating the user's home directory.
+Session model/auth files live in an isolated agent root. Preserve supported
+user resources there while keeping global instruction and session files out.
+Linked resources remain shared and writable, as in standalone Pi.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -23,19 +21,24 @@ _Settings: TypeAlias = dict[str, object]
 # Default global Pi agent root (``PI_CODING_AGENT_DIR`` when unset).
 DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 
-# Install / checkout trees Pi places under the agent dir. Symlinked into the
-# managed dir so ``packages`` entries in settings keep resolving. MCP server
-# config and auth are shared the same way.
-_PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git", "mcp.json", "mcp-auth.json")
+_PI_RESOURCE_TYPES = ("extensions", "skills", "prompts", "themes")
+_PI_AGENT_RESOURCES = (
+    *_PI_RESOURCE_TYPES,
+    "npm",
+    "git",
+    "mcp.json",
+    "mcp-auth.json",
+    "keybindings.json",
+)
 
 
 def _read_settings_file(path: Path) -> _Settings:
     """Load a Pi ``settings.json`` file, returning ``{}`` when absent/invalid."""
-    if not path.is_file():
-        return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
         _logger.warning("Ignoring unreadable Pi settings at %s: %s", path, exc)
         return {}
     return cast(_Settings, raw) if isinstance(raw, dict) else {}
@@ -53,12 +56,55 @@ def _deep_merge_settings(base: Mapping[str, object], overlay: Mapping[str, objec
     return merged
 
 
-def _symlink_agent_resource_dirs(
+def _relocate_resource_settings(
+    settings: _Settings, agent_root: Path, managed_dir: Path
+) -> _Settings:
+    """Keep settings paths relative to the original user root, including exclusions."""
+    settings = dict(settings)
+    for kind in _PI_RESOURCE_TYPES:
+        entries = settings.get(kind)
+        if not isinstance(entries, list):
+            continue
+        relocated: list[object] = []
+        for entry in entries:
+            if not isinstance(entry, str) or not entry:
+                continue
+            prefix = entry[0] if entry[0] in "!+-" else ""
+            path = entry[len(prefix) :]
+            if not path or path.startswith(("~", "builtin:")):
+                relocated.append(entry)
+                continue
+            # Keep relative patterns for auto-discovery through the managed symlink.
+            if prefix:
+                relocated.append(entry)
+                normalized_path = Path(os.path.normpath(path))
+                if normalized_path.is_absolute() and normalized_path.is_relative_to(agent_root):
+                    relocated.append(
+                        prefix + str(managed_dir / normalized_path.relative_to(agent_root))
+                    )
+            relocated.append(prefix + str(agent_root / path))
+        settings[kind] = list(dict.fromkeys(relocated))
+    packages = settings.get("packages")
+    if isinstance(packages, list):
+        relocated_packages: list[object] = []
+        for package in packages:
+            source = package.get("source") if isinstance(package, dict) else package
+            if isinstance(source, str) and source.startswith(("./", "../")):
+                absolute = str(agent_root / source)
+                package = (
+                    {**package, "source": absolute} if isinstance(package, dict) else absolute
+                )
+            relocated_packages.append(package)
+        settings["packages"] = relocated_packages
+    return settings
+
+
+def _symlink_agent_resources(
     managed_dir: Path,
     global_agent_dir: Path,
 ) -> None:
-    """Symlink package install trees from *global_agent_dir* into *managed_dir*."""
-    for name in _PI_AGENT_RESOURCE_DIRS:
+    """Link supported resources, retaining existing session-owned files."""
+    for name in _PI_AGENT_RESOURCES:
         source = global_agent_dir / name
         target = managed_dir / name
         try:
@@ -91,26 +137,33 @@ def prepare_managed_pi_agent_dir(
 
     Copies (merges) ``settings.json`` from the user's global agent dir into
     *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
-    symlinks install trees (``npm/``, ``git/``) so ``packages`` entries keep
-    working, plus ``mcp.json`` and ``mcp-auth.json``, which Pi may update
-    (e.g. refreshed MCP OAuth tokens).
+    links supported resources, and preserves their relative settings paths.
+    Linked resources are writable shared state; Pi may update MCP OAuth tokens.
+    Global instruction files and model credentials are not linked.
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.
 
     :param managed_dir: Per-session agent root (already contains ``models.json``).
     :param overlay: Settings merged on top of the copied global file.
-    :param global_agent_dir: Override for tests; defaults to
+    :param global_agent_dir: Caller-resolved source root; defaults to
         :data:`DEFAULT_PI_AGENT_DIR`.
     """
     agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
-    settings = _read_settings_file(agent_root / "settings.json")
+    agent_root = Path(os.path.abspath(agent_root.expanduser()))
+    if managed_dir.resolve() == agent_root.resolve():
+        return
+    settings = _relocate_resource_settings(
+        _read_settings_file(agent_root / "settings.json"), agent_root, managed_dir.absolute()
+    )
     if overlay:
         settings = _deep_merge_settings(settings, overlay)
 
     managed_dir.mkdir(parents=True, exist_ok=True)
     settings_path = managed_dir / "settings.json"
     try:
+        if settings_path.is_symlink():
+            settings_path.unlink()
         settings_path.write_text(
             json.dumps(settings, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -119,4 +172,4 @@ def prepare_managed_pi_agent_dir(
         _logger.warning("Could not write managed Pi settings at %s: %s", settings_path, exc)
         return
 
-    _symlink_agent_resource_dirs(managed_dir, agent_root)
+    _symlink_agent_resources(managed_dir, agent_root)

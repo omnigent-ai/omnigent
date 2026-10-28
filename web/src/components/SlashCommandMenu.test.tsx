@@ -60,6 +60,8 @@ describe("skill discovery state", () => {
   it("keeps Commands usable while the Skills section loads", () => {
     const onSelect = vi.fn();
     render(<SlashCommandMenu {...props} skillsStatus="loading" onSelect={onSelect} />);
+    expect(screen.getByTestId("slash-command-menu")).toHaveClass("menu-surface", "w-full");
+    expect(screen.getByTestId("slash-command-menu")).not.toHaveClass("w-[28rem]");
     expect(screen.getByText("Commands")).toBeVisible();
     expect(screen.getByText("Skills")).toBeVisible();
     expect(screen.getByRole("status")).toHaveTextContent("Loading skills…");

@@ -83,7 +83,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   isAgentTerminalKey,
@@ -1867,10 +1867,10 @@ function AppShellImpl() {
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    const surfaceBrowserTab = (sourceConversationId: string) => {
+    const surfaceBrowserTab = (sourceConversationId: string, tabId: string) => {
       // The mounted WorkspacePanel hook owns the active session's tab state.
       // Persist here only for background sessions that have no mounted hook.
-      if (sourceConversationId !== conversationId) openAgentBrowserTab(sourceConversationId);
+      if (sourceConversationId !== conversationId) openBrowserTab(sourceConversationId, tabId);
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
         setRightPanelOpenAnimated(true);
@@ -1879,7 +1879,7 @@ function AppShellImpl() {
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
       if (evt.action !== "navigate" || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId);
+      surfaceBrowserTab(sourceConversationId, AGENT_BROWSER_TAB_ID);
     });
     return () => {
       unsubscribeLink();
@@ -2375,9 +2375,8 @@ function AppShellImpl() {
     <FileViewerContext.Provider value={fileViewerContextValue}>
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
-          {/* `app-shell` paints the near-white brand gradient canvas (see
-        index.css); bg-sidebar is the fallback the gradient sits over. The
-        white sidebar / workspace cards float on this canvas.
+          {/* `app-shell` paints the shared canvas behind the sidebar and
+        workspace surfaces (see index.css).
 
         The frameless-window CSS in index.css is scoped by data-electron-mac
         on <html> (set at boot): the macOS Electron shell hides the native
@@ -2386,6 +2385,11 @@ function AppShellImpl() {
         freed space. */}
           <div
             className="app-shell relative flex h-dvh bg-sidebar text-foreground"
+            style={
+              {
+                "--app-sidebar-width": `${sidebarOpen ? sidebarWidth : 0}px`,
+              } as CSSProperties
+            }
             // Reflect the docked sidebar's open state so CSS can drop the
             // traffic-light clearance on surfaces the sidebar covers (see the
             // maximized workspace rail's tab strip in index.css): with the

@@ -117,7 +117,17 @@ def test_pi_run_prompt_settings(
         agent_path = source / "agent.yaml"
         agent_path.write_text(yaml.safe_dump(config))
 
-    env = {**mock_credentials_env, "OMNIGENT_CONFIG_HOME": str(config_home)}
+    pi_home = tmp_path / "pi-agent"
+    skill = pi_home / "skills" / "hidden" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: hidden\ndescription: UNREQUESTED_SKILL_72DB\n---\nProbe.")
+    for name in ("AGENTS.md", "SYSTEM.md", "APPEND_SYSTEM.md"):
+        (pi_home / name).write_text("UNREQUESTED_GLOBAL_CONTEXT_72DB")
+    env = {
+        **mock_credentials_env,
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "PI_CODING_AGENT_DIR": str(pi_home),
+    }
     # A stale ambient value must never override the YAML/default policy.
     env["HARNESS_PI_CONTEXT_FILES"] = "true" if enabled is False else "false"
     env["HARNESS_PI_SYSTEM_PROMPT_MODE"] = "append" if mode == "replace" else "replace"
@@ -148,6 +158,8 @@ def test_pi_run_prompt_settings(
             for message in request["messages"]
             if message["role"] in ("system", "developer")
         )
+        assert "UNREQUESTED_SKILL_72DB" not in system
+        assert "UNREQUESTED_GLOBAL_CONTEXT_72DB" not in system
         assert "AUTHORED_PROMPT_42D9" in system
         assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION in system
         assert ("ANCESTOR_CONTEXT_73D2" in system) is (enabled is not False)

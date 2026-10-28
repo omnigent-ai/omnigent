@@ -10,7 +10,8 @@ import logging
 import re
 import urllib.error
 import urllib.request
-from collections.abc import AsyncIterator, Callable
+from collections import deque
+from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,10 +48,12 @@ from omnigent.harnesses.codex_native.bridge import (
     pending_mcp_servers,
     read_bridge_state,
     read_certificate_failure,
+    read_child_usage_baselines,
     read_codex_config_developer_instructions_state,
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -411,6 +414,15 @@ class _PartialTextBuffer:
         return "".join(self.parts)
 
 
+# Codex token totals as ``(input, cached input, output)``, in the order of
+# ``_CUMULATIVE_TOKEN_KEYS``.
+_UsageTotals = tuple[int, int, int]
+# One usage frame as ``(turn id, totals)``.
+_UsageFrame = tuple[str | None, _UsageTotals]
+_NO_INHERITED_USAGE: _UsageTotals = (0, 0, 0)
+_RECENT_USAGE_FRAMES_PER_THREAD = 64
+
+
 @dataclass
 class _CodexForwarderState:
     """
@@ -504,6 +516,18 @@ class _CodexForwarderState:
         repeatedly as edits land; only the newest diff is kept and it is
         flushed once at the terminal turn boundary (see
         :func:`_handle_turn_diff_updated` / :func:`_flush_turn_diff`).
+    :param recent_usage_frames: Raw usage frames each thread most recently
+        reported on this connection, e.g.
+        ``{"thread_parent": deque([("turn_1", (5000, 4000, 100))])}``.
+    :param usage_source_threads: Thread each Codex child was spawned from, per
+        its ``thread/started``, e.g. ``{"thread_child": "thread_parent"}``.
+        Other children, such as ``thread/fork`` side chats, fork the parent.
+    :param child_usage_baselines: Token totals each Codex child thread inherited
+        from the thread it was forked from, keyed by child thread id and
+        subtracted from the child's posted usage. Zeros for a fresh child.
+    :param child_usage_baseline_dir: Bridge directory that persists
+        ``child_usage_baselines`` across forwarder restarts. ``None`` keeps
+        them in memory only.
     """
 
     model: str | None = None
@@ -568,6 +592,63 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
+    recent_usage_frames: dict[str, deque[_UsageFrame]] = field(default_factory=dict)
+    usage_source_threads: dict[str, str] = field(default_factory=dict)
+    child_usage_baselines: dict[str, _UsageTotals] = field(default_factory=dict)
+    child_usage_baseline_dir: Path | None = None
+
+    def __post_init__(self) -> None:
+        """
+        Load inherited child usage persisted by an earlier forwarder.
+
+        :returns: None.
+        """
+        if self.child_usage_baseline_dir is not None:
+            self.child_usage_baselines.update(
+                read_child_usage_baselines(self.child_usage_baseline_dir)
+            )
+
+    def note_usage_frame(self, params: _JsonObject, parent_thread_id: str | None) -> None:
+        """
+        Record one Codex usage frame, deciding a new child thread's inherited usage.
+
+        A forked thread starts with its source thread's totals (``thread/fork``,
+        and ``spawn_agent`` forks before Codex 0.153). Its first frame either
+        repeats a source frame, turn id included, or adds its own first request
+        to a source total. Codex reports source totals before forking; a child
+        whose source frame was not seen, e.g. across a restart, keeps its usage.
+        Callers record frames before routing, so an unregistered child counts.
+
+        :param params: Codex ``thread/tokenUsage/updated`` params.
+        :param parent_thread_id: Current parent Codex thread id, e.g.
+            ``"thread_parent"``. Its usage is never treated as inherited.
+        :returns: None.
+        """
+        token_usage = params.get("tokenUsage")
+        if not isinstance(token_usage, dict):
+            return
+        total = _usage_token_totals(token_usage.get("total"))
+        thread_id = _thread_id_from_params(params)
+        if total is None or thread_id is None:
+            return
+        turn_id = params.get("turnId")
+        frame: _UsageFrame = (turn_id if isinstance(turn_id, str) else None, total)
+        if thread_id != parent_thread_id and thread_id not in self.child_usage_baselines:
+            source_thread_id = self.usage_source_threads.get(thread_id, parent_thread_id)
+            source_frames = (
+                self.recent_usage_frames.get(source_thread_id, ())
+                if source_thread_id is not None
+                else ()
+            )
+            baseline = _inherited_usage_baseline(
+                frame, _usage_token_totals(token_usage.get("last")), source_frames
+            )
+            self.child_usage_baselines[thread_id] = baseline
+            if self.child_usage_baseline_dir is not None:
+                record_child_usage_baseline(self.child_usage_baseline_dir, thread_id, baseline)
+        self.recent_usage_frames.setdefault(
+            thread_id, deque(maxlen=_RECENT_USAGE_FRAMES_PER_THREAD)
+        ).append(frame)
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -731,6 +812,8 @@ class _CodexForwarderState:
             ``"thread_parent"``. ``None`` when Codex omitted it.
         :returns: None.
         """
+        if parent_thread_id is not None:
+            self.usage_source_threads[thread_id] = parent_thread_id
         if thread_id not in self.subagents_by_thread:
             self.pending_child_threads[thread_id] = parent_thread_id
 
@@ -1797,6 +1880,7 @@ class _SessionUsageCoalescer:
         client: httpx.AsyncClient,
         session_id: str,
         model: str | None = None,
+        baseline: _UsageTotals | None = None,
     ) -> None:
         """
         Initialize the usage coalescer.
@@ -1808,6 +1892,9 @@ class _SessionUsageCoalescer:
             ``None`` and ``record()`` receives no model — without it the server
             cannot price the child's cumulative tokens. ``None`` for the parent
             coalescer, which learns its model via :meth:`record`.
+        :param baseline: ``(input, cached input, output)`` token totals a forked
+            child thread inherited, subtracted from its cumulative counts so the
+            child posts only its own usage. ``None`` posts Codex's totals as-is.
         :returns: None.
         """
         self._client = client
@@ -1815,6 +1902,7 @@ class _SessionUsageCoalescer:
         self._pending: dict[str, int] = {}
         self._last_posted: dict[str, int] = {}
         self._model: str | None = model
+        self._baseline = baseline
 
     def record(self, params: _JsonObject, model: str | None = None) -> None:
         """
@@ -1834,6 +1922,10 @@ class _SessionUsageCoalescer:
         data = _session_usage_data_from_params(params)
         if data is None:
             return
+        if self._baseline is not None:
+            for key, inherited in zip(_CUMULATIVE_TOKEN_KEYS, self._baseline, strict=True):
+                if key in data:
+                    data[key] = max(0, data[key] - inherited)
         self._pending.update(data)
 
     async def flush(self) -> None:
@@ -2270,6 +2362,7 @@ async def supervise_forwarder(
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
+            child_usage_baseline_dir=bridge_dir,
         )
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
@@ -2967,13 +3060,13 @@ async def _replay_resume_response(
                     expected_thread_id=thread_id,
                     forwarder_state=forwarder_state,
                 )
-    await _post_resume_terminal_status(
-        client,
-        session_id=session_id,
-        bridge_dir=bridge_dir,
-        thread_id=thread_id,
-        turns=turns,
-    )
+        await _post_resume_turn_status(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            thread_id=thread_id,
+            turns=turns,
+        )
 
 
 def _resume_turns_from(turns: list[object], replay_from_turn_id: str | None) -> list[object]:
@@ -2990,7 +3083,7 @@ def _resume_turns_from(turns: list[object], replay_from_turn_id: str | None) -> 
     return turns
 
 
-async def _post_resume_terminal_status(
+async def _post_resume_turn_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
@@ -2999,14 +3092,12 @@ async def _post_resume_terminal_status(
     turns: list[object],
 ) -> None:
     """
-    Publish a missing terminal status edge from ``thread/resume`` data.
+    Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
 
-    A reconnect can miss the live ``turn/started`` and
-    ``turn/completed`` / ``turn/failed`` notifications. When the resume
-    payload explicitly says the latest turn on the current thread is
-    terminal, the forwarder can close the Omnigent session status even though no
-    live terminal boundary was observed. It deliberately does not infer
-    terminal state from transcript items alone.
+    A fresh thread cannot be subscribed until its first turn creates a rollout,
+    so the forwarder can miss ``turn/started``. Reconcile the latest turn's
+    explicit status while replay still owns delivery order, before queued live
+    boundaries run. Transcript items alone do not establish activity.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -3018,23 +3109,23 @@ async def _post_resume_terminal_status(
     """
     if thread_id is None:
         return
-    edge = _resume_terminal_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
     await _post_turn_status_edge(client, session_id, edge)
 
 
-def _resume_terminal_status_edge_for_latest_turn(
+def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
 ) -> _CodexTurnStatusEdge | None:
     """
-    Return the Omnigent terminal status represented by the latest resume turn.
+    Return the Omnigent status represented by the latest resume turn.
 
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
-    :returns: Terminal status edge when the latest turn is terminal and
+    :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
     state = read_bridge_state(bridge_dir)
@@ -3051,7 +3142,7 @@ def _resume_terminal_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        update_active_turn_id(bridge_dir, None)
+        update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
@@ -3075,8 +3166,8 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
 
     :param turn: Codex resume turn object, e.g.
         ``{"id": "turn_123", "status": "completed"}``.
-    :returns: Omnigent status literal for terminal turns, or ``None`` for active
-        or unrecognized statuses.
+    :returns: Omnigent status literal for explicit active or terminal turns,
+        or ``None`` for unrecognized statuses.
     """
     # A ``turn.error`` forces ``failed`` regardless of the recorded status.
     if _terminal_error_from_turn({"turn": turn}) is not None:
@@ -3084,6 +3175,8 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     status = turn.get("status")
     if isinstance(status, dict):
         status = status.get("type") or status.get("status")
+    if status == "inProgress":
+        return "running"
     if status in {"completed", "interrupted", "cancelled", "canceled"}:
         return "idle"
     if status in {"failed", "errored"}:
@@ -3170,6 +3263,8 @@ async def _handle_event(
         await _settle_mcp_startup(
             client, session_id=session_id, bridge_dir=bridge_dir, reason="thread went idle"
         )
+    if method == "thread/tokenUsage/updated" and forwarder_state is not None:
+        forwarder_state.note_usage_frame(params, expected_thread_id)
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
         params, method, expected_thread_id, forwarder_state, fallback_session_id=session_id
@@ -3178,6 +3273,7 @@ async def _handle_event(
         return
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
+    child_usage_baseline: _UsageTotals | None = None
     if is_child and forwarder_state is not None:
         child_thread_id = _thread_id_from_params(params)
         assert child_thread_id is not None
@@ -3186,6 +3282,7 @@ async def _handle_event(
             return
         event_state = child_stream.state
         delta_coalescer = child_stream.delta_coalescer
+        child_usage_baseline = forwarder_state.child_usage_baselines.get(child_thread_id)
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.
@@ -3254,15 +3351,15 @@ async def _handle_event(
         forwarder_state=event_state,
     ):
         return
-    # Child token-usage events must post to the child session, not the
-    # parent's coalescer. A fresh coalescer is created per-event for
-    # children and flushed immediately so accumulated data is not lost.
-    # Seed it with the session model so the server can price the child's tokens.
+    # Child token-usage events post to the child session through a per-event
+    # coalescer, flushed immediately and seeded with the session model for
+    # pricing and with the usage the child inherited at its fork.
     child_coalescer = (
         _SessionUsageCoalescer(
             client,
             route_session_id,
             model=event_state.model if event_state is not None else None,
+            baseline=child_usage_baseline,
         )
         if is_child
         else None
@@ -7720,6 +7817,56 @@ def _session_usage_data_from_params(params: _JsonObject) -> dict[str, int] | Non
     if not data:
         return None
     return data
+
+
+def _usage_token_totals(usage: object) -> _UsageTotals | None:
+    """
+    Read a Codex token breakdown as ``(input, cached input, output)`` totals.
+
+    :param usage: Codex ``tokenUsage.total`` or ``tokenUsage.last`` object.
+    :returns: Token totals, e.g. ``(5000, 4000, 100)``, or ``None`` when the
+        input count is missing or any count is malformed.
+    """
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = usage.get("inputTokens")
+    cached_input_tokens = usage.get("cachedInputTokens", 0)
+    output_tokens = usage.get("outputTokens", 0)
+    if not (
+        isinstance(input_tokens, int)
+        and isinstance(cached_input_tokens, int)
+        and isinstance(output_tokens, int)
+    ):
+        return None
+    if min(input_tokens, cached_input_tokens, output_tokens) < 0:
+        return None
+    return input_tokens, cached_input_tokens, output_tokens
+
+
+def _inherited_usage_baseline(
+    frame: _UsageFrame,
+    last: _UsageTotals | None,
+    source_frames: Collection[_UsageFrame],
+) -> _UsageTotals:
+    """
+    Return the token totals a child thread's first usage frame inherited.
+
+    :param frame: Turn id and cumulative totals from the child's first frame.
+    :param last: Latest-request totals from the same frame, or ``None``.
+    :param source_frames: Frames the child's source thread reported on this
+        connection.
+    :returns: The source totals the frame repeats under the source's turn id,
+        or adds its latest request to; zeros for a fresh thread.
+    """
+    turn_id, total = frame
+    if turn_id is not None and frame in source_frames:
+        return total
+    if last is None or last == total:
+        return _NO_INHERITED_USAGE
+    inherited = (total[0] - last[0], total[1] - last[1], total[2] - last[2])
+    if min(inherited) >= 0 and any(source_total == inherited for _, source_total in source_frames):
+        return inherited
+    return _NO_INHERITED_USAGE
 
 
 @dataclass

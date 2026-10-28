@@ -238,7 +238,7 @@ export function KeyboardShortcutsList({
   );
   const settings = variant === "settings";
   return (
-    <div className={settings ? "flex flex-col gap-6" : undefined}>
+    <div className={settings ? "flex flex-col gap-10" : undefined}>
       {groups.map((group) => (
         <section key={group.title} className={settings ? "" : "mb-4 last:mb-0"}>
           <h3

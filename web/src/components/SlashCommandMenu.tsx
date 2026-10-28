@@ -536,7 +536,7 @@ export function SlashCommandMenu({
   return (
     <div
       data-testid="slash-command-menu"
-      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
       <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}

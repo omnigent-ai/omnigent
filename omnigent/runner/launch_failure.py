@@ -185,6 +185,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+    # The gateway launcher checks the installed Claude Code before it starts it.
+    _TerminalMatcher(
+        "gateway_claude_too_old",
+        lambda s: s.output_contains_any(("ug requires claude code",)),
+        FailureDiagnosis(
+            title="Claude Code is too old for the Databricks gateway",
+            cause=(
+                "The gateway launcher needs a newer Claude Code than the one installed, "
+                "and it does not update a copy that a package manager manages."
+            ),
+            remediation=(
+                "Update Claude Code on the host using the same installer or package manager "
+                "you used to install it, then send your message again."
+            ),
+        ),
+    ),
 )
 
 

@@ -2990,17 +2990,24 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
         if isinstance(event_name, str) and event_name:
             state["last_hook_event_name"] = event_name
         claude_session_id = payload.get("session_id")
+        transcript_path = payload.get("transcript_path")
+        agent_id = payload.get("agent_id")
+        child_identity = (isinstance(agent_id, str) and bool(agent_id)) or (
+            isinstance(transcript_path, str) and "subagents" in Path(transcript_path).parts
+        )
         pinned = state.get("claude_session_id")
         # Identity pin: only a SessionStart or an event from the already-pinned
         # session may change transcript/session identity; a side-channel event
         # (e.g. a background Task agent's edge) must not re-aim the forwarder.
-        identity_allowed = event_name == "SessionStart" or (
-            isinstance(claude_session_id, str)
-            and claude_session_id != ""
-            and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
+        identity_allowed = not child_identity and (
+            event_name == "SessionStart"
+            or (
+                isinstance(claude_session_id, str)
+                and claude_session_id != ""
+                and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
+            )
         )
         if identity_allowed:
-            transcript_path = payload.get("transcript_path")
             if isinstance(transcript_path, str) and transcript_path:
                 state["transcript_path"] = transcript_path
             if isinstance(claude_session_id, str) and claude_session_id:
@@ -3813,10 +3820,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
 
-    Only counts stop events from the parent Claude process — subagent
-    stop events (carrying an ``agent_id``, or whose ``transcript_path``
-    contains a ``subagents/`` component) are ignored so a finishing
-    subagent does not prematurely signal the parent turn as complete.
+    Only counts stop events from the parent Claude process. A foreign
+    native session, ``agent_id``, or ``subagents/`` transcript identifies
+    a child whose completion must not end the parent's turn.
 
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before a
@@ -3825,6 +3831,7 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
         ``StopFailure`` hook has been recorded after the cursor.
     """
     path = bridge_dir / _HOOKS_FILE
+    parent_session_ids = read_seen_claude_session_ids(bridge_dir)
     try:
         with path.open("r", encoding="utf-8") as handle:
             for index, line in enumerate(handle, start=1):
@@ -3836,13 +3843,19 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                     continue
                 payload = envelope.get("payload") if isinstance(envelope, dict) else None
                 event_name = payload.get("hook_event_name") if isinstance(payload, dict) else None
-                if event_name in {"Stop", "StopFailure"}:
-                    transcript_path = (
-                        payload.get("transcript_path") if isinstance(payload, dict) else None
-                    )
+                if event_name in {"Stop", "StopFailure"} and isinstance(payload, dict):
+                    native_session_id = payload.get("session_id")
+                    if (
+                        parent_session_ids
+                        and isinstance(native_session_id, str)
+                        and native_session_id
+                        and native_session_id not in parent_session_ids
+                    ):
+                        continue
+                    transcript_path = payload.get("transcript_path")
                     if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
                         continue
-                    if isinstance(payload, dict) and payload.get("agent_id"):
+                    if payload.get("agent_id"):
                         continue
                     return True
     except FileNotFoundError:
@@ -6095,6 +6108,10 @@ def _restore_occupied_input(
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
 
+    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    it once with Ctrl+L before any edit keys can erase its identifying prefix,
+    then check the actual composer and pending prompts again.
+
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
@@ -6128,6 +6145,7 @@ def _restore_occupied_input(
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
+    notice_redrawn = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -6144,6 +6162,17 @@ def _restore_occupied_input(
             return None
         surface = _occupying_surface(pane)
         delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
+        box = _composer_box(pane)
+        if (
+            not notice_redrawn
+            and box is not None
+            and any("[idle-compact]" in row for row in box.rows)
+        ):
+            _logger.info("claude-native: redrawing an idle-compaction notice over the input box")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-l")
+            notice_redrawn = True
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         if surface is None:
             return None
         now = time.monotonic()
@@ -6345,7 +6374,16 @@ def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     if len(rules) < 2:
         return rules
     frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
-    return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+    rules = [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+    last_prompt = next((line for line in lines[rules[-1] + 1 :] if line.strip()), "")
+    if (
+        last_prompt.strip()[:1] in _COMPOSER_MODE_GLYPHS
+        and len(last_prompt) - len(last_prompt.lstrip()) == frame_indent
+    ):
+        # A lower prompt makes the last rule an opening edge. The older frame
+        # cannot establish that this clipped draft is complete or empty.
+        return [rules[-1]]
+    return rules
 
 
 def _composer_box(pane: str) -> _ComposerBox | None:
