@@ -83,3 +83,28 @@ def test_a_link_in_a_skill_tarball_is_rejected() -> None:
         tf.addfile(link)
     with pytest.raises(SkillTarballError, match="unsupported entry type"):
         overlay_skills(BUNDLE, [("evil", out.getvalue())])
+
+
+def test_namespaced_and_reserved_names_keep_bundle_precedence() -> None:
+    # A bundle skill two levels down is still ``triage``; the parsed spec's
+    # canonical names (``code-review`` for a legacy ``Code_Review`` dir) win too.
+    bundle = _tar(
+        {
+            "config.yaml": b"name: a\n",
+            "skills/team/triage/SKILL.md": b"---\nname: triage\n---\n",
+            "skills/Code_Review/SKILL.md": b"---\nname: review\n---\n",
+        }
+    )
+    assert bundle_skill_names(bundle) == {"triage", "Code_Review"}
+    merged = overlay_skills(
+        bundle,
+        [("triage", SKILL), ("code-review", SKILL), ("fresh", SKILL)],
+        reserved={"code-review"},
+    )
+    assert _names(merged) == [
+        "config.yaml",
+        "skills/Code_Review/SKILL.md",
+        "skills/fresh/SKILL.md",
+        "skills/fresh/notes.txt",
+        "skills/team/triage/SKILL.md",
+    ]

@@ -24,8 +24,17 @@ from omnigent.skills.git_source import (
 )
 
 CATALOG_TTL_S = 600.0
+# Per skill and per install request; checked while packing, before reading more.
+MAX_SKILL_BYTES = 20 * 1024 * 1024
+MAX_SKILL_ENTRIES = 2_000
+MAX_INSTALL_BYTES = 100 * 1024 * 1024
 
 Cloner = Callable[[str, str | None, Path], None]
+
+
+def server_clone(clone_url: str, ref: str | None, dest: Path) -> None:
+    """The marketplace's clone: isolated from the server's own git credentials."""
+    clone_github_source(clone_url, ref, dest, isolated=True)
 
 
 @dataclass(frozen=True)
@@ -65,7 +74,7 @@ def resolve_source(source: str, ref: str | None = None) -> tuple[str, str | None
 class SkillFetcher:
     """Clone, index and package skills from GitHub repositories."""
 
-    def __init__(self, *, clone: Cloner = clone_github_source, ttl_s: float = CATALOG_TTL_S):
+    def __init__(self, *, clone: Cloner = server_clone, ttl_s: float = CATALOG_TTL_S):
         self._clone = clone
         self._ttl_s = ttl_s
         self._catalogs: dict[tuple[str, str | None], FetchedCatalog] = {}
@@ -119,14 +128,23 @@ class SkillFetcher:
             if missing:
                 raise GitSourceError(f"No such skill in {url}: {', '.join(sorted(missing))}")
             packaged = []
+            total = 0
             for name in names:
                 entry = by_name[name]
                 skill_dir = checkout / entry.path
-                packaged.append(
-                    PackagedSkill(
-                        entry=entry,
-                        tarball=tar_untrusted_dir(skill_dir, what="a skill"),
-                        markdown=skill_markdown(skill_dir),
+                tarball = tar_untrusted_dir(
+                    skill_dir,
+                    what="a skill",
+                    max_bytes=MAX_SKILL_BYTES,
+                    max_entries=MAX_SKILL_ENTRIES,
+                )
+                total += len(tarball)
+                if total > MAX_INSTALL_BYTES:
+                    raise GitSourceError(
+                        f"The requested skills exceed {MAX_INSTALL_BYTES // (1024 * 1024)} MB "
+                        "together; install fewer at a time."
                     )
+                packaged.append(
+                    PackagedSkill(entry=entry, tarball=tarball, markdown=skill_markdown(skill_dir))
                 )
             return checkout_commit(checkout), packaged

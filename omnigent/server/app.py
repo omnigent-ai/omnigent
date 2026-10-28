@@ -1822,6 +1822,12 @@ def create_app(
         scheduled_task_store.configure_dispatch(automations_v2_enabled)
     resolved_extension_state = _resolve_extension_state(extension_state)
     extension_bundles, extension_asset_errors = _resolve_extension_assets(resolved_extension_state)
+    # The skills marketplace is one switch for everything it touches: when the
+    # feature is off, installed rows stay in the database but neither the
+    # routes, nor discovery, nor served bundles read them.
+    active_skill_store: SkillStore | None = (
+        skill_store if resolved_feature_flags.enabled(Feature.SKILLS_MARKETPLACE) else None
+    )
 
     # First-boot admin bootstrap for the accounts auth provider.
     # Runs before any route is mounted so the login page is never
@@ -2268,15 +2274,15 @@ def create_app(
     )
     app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
-    app.state.skill_store = skill_store
+    app.state.skill_store = active_skill_store
     # Tests swap in a fetcher whose clone copies a fixture repository.
     app.state.skill_fetcher = SkillFetcher()
-    if skill_store is not None and resolved_feature_flags.enabled(Feature.SKILLS_MARKETPLACE):
+    if active_skill_store is not None:
         from omnigent.server.routes.skill_marketplace import create_skill_marketplace_router
 
         app.include_router(
             create_skill_marketplace_router(
-                skill_store=skill_store,
+                skill_store=active_skill_store,
                 artifact_store=artifact_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
@@ -3752,7 +3758,7 @@ def create_app(
             conversation_store,
             agent_store,
             file_store=file_store,
-            skill_store=skill_store,
+            skill_store=active_skill_store,
             artifact_store=artifact_store,
             runner_router=runner_router,
             auth_provider=auth_provider,
@@ -4966,7 +4972,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
-                skill_store=skill_store,
+                skill_store=active_skill_store,
             ),
             prefix="/v1",
             tags=["skills"],

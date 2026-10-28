@@ -58,9 +58,21 @@ async function json<T>(res: Response): Promise<T> {
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
-export async function listSkillSources(signal?: AbortSignal): Promise<SkillSource[]> {
-  const res = await authenticatedFetch("/v1/skill-sources", { signal });
-  return (await json<{ data: SkillSource[] }>(res)).data;
+/** One page of a keyset-paginated list; pass `last_id` as `after` for the next. */
+export interface Page<T> {
+  data: T[];
+  has_more: boolean;
+  last_id: string | null;
+}
+
+export async function listSkillSources(
+  after: string | null = null,
+  signal?: AbortSignal,
+): Promise<Page<SkillSource>> {
+  const params = new URLSearchParams({ limit: "50" });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(`/v1/skill-sources?${params}`, { signal });
+  return json<Page<SkillSource>>(res);
 }
 
 export async function addSkillSource(input: {
@@ -109,9 +121,14 @@ export async function previewCatalog(input: {
   return json<SkillCatalog>(res);
 }
 
-export async function listInstalledSkills(signal?: AbortSignal): Promise<InstalledSkill[]> {
-  const res = await authenticatedFetch("/v1/installed-skills", { signal });
-  return (await json<{ data: InstalledSkill[] }>(res)).data;
+export async function listInstalledSkills(
+  after: string | null = null,
+  signal?: AbortSignal,
+): Promise<Page<InstalledSkill>> {
+  const params = new URLSearchParams({ limit: "50" });
+  if (after) params.set("after", after);
+  const res = await authenticatedFetch(`/v1/installed-skills?${params}`, { signal });
+  return json<Page<InstalledSkill>>(res);
 }
 
 export async function installSkills(input: {

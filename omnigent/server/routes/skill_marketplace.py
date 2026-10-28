@@ -13,12 +13,12 @@ import hashlib
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from omnigent.entities import InstalledSkill, SkillSource
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import AuthProvider, local_single_user_enabled
+from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -27,11 +27,13 @@ from omnigent.skills.overlay import SkillTarballError, validate_skill_tarball
 from omnigent.skills.service import FetchedCatalog, SkillFetcher, resolve_source
 from omnigent.stores import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.stores.skill_store import SkillStore
+from omnigent.stores.skill_store import DEFAULT_PAGE, MAX_PAGE, SkillStore, SkillValueError
 
 _logger = logging.getLogger(__name__)
 
-MAX_NAMES_PER_INSTALL = 50
+MAX_NAMES_PER_INSTALL = 20
+# Clones and packaging are CPU, disk and network work; bound how many run at once.
+_FETCH_CONCURRENCY = 2
 
 
 # ── wire models ──────────────────────────────────────────────────────────
@@ -49,7 +51,11 @@ class SkillSourceObject(BaseModel):
 
 
 class SkillSourceList(BaseModel):
+    """One page; pass ``last_id`` as ``after`` for the next."""
+
     data: list[SkillSourceObject]
+    has_more: bool = False
+    last_id: str | None = None
 
 
 class SkillSourceCreate(BaseModel):
@@ -105,7 +111,11 @@ class InstalledSkillObject(BaseModel):
 
 
 class InstalledSkillList(BaseModel):
+    """One page; pass ``last_id`` as ``after`` for the next."""
+
     data: list[InstalledSkillObject]
+    has_more: bool = False
+    last_id: str | None = None
 
 
 class InstallSkillsRequest(BaseModel):
@@ -159,7 +169,8 @@ def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
 
 
 def _is_admin(user_id: str | None, permission_store: PermissionStore | None) -> bool:
-    if permission_store is None or local_single_user_enabled():
+    """Single-user mode (no permission store) is all-admin, like the other admin gates."""
+    if permission_store is None:
         return True
     return user_id is not None and permission_store.is_admin(user_id)
 
@@ -213,6 +224,18 @@ def _invalid(exc: Exception) -> OmnigentError:
     return OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT)
 
 
+async def _all_installed(skill_store: SkillStore, user_id: str | None) -> list[InstalledSkill]:
+    """Every installed skill the user can see, read page by page."""
+    out: list[InstalledSkill] = []
+    after: str | None = None
+    while True:
+        page = await asyncio.to_thread(skill_store.list_for_user, user_id, after=after)
+        out.extend(page.data)
+        if not page.has_more or page.last_id is None:
+            return out
+        after = page.last_id
+
+
 # ── router ───────────────────────────────────────────────────────────────
 
 
@@ -226,18 +249,34 @@ def create_skill_marketplace_router(
     """Build the marketplace routes; the fetcher is read from ``app.state.skill_fetcher``."""
     router = APIRouter()
     mutating = [Depends(require_trusted_origin), Depends(require_json_content_type)]
+    fetch_slots = asyncio.Semaphore(_FETCH_CONCURRENCY)
 
     def fetcher(request: Request) -> SkillFetcher:
         return request.app.state.skill_fetcher
 
+    async def fetch(fn, *args, **kwargs):  # type: ignore[no-untyped-def]  # thin thread hop
+        async with fetch_slots:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+
     # ── sources ──
 
     @router.get("/skill-sources")
-    async def list_skill_sources(request: Request) -> SkillSourceList:
-        """The repositories the marketplace browses."""
+    async def list_skill_sources(
+        request: Request,
+        limit: int = Query(default=DEFAULT_PAGE, ge=1, le=MAX_PAGE),
+        after: str | None = Query(default=None),
+    ) -> SkillSourceList:
+        """A page of the repositories the marketplace browses."""
         require_user(request, auth_provider)
-        sources = await asyncio.to_thread(skill_store.list_sources)
-        return SkillSourceList(data=[_source_object(s) for s in sources])
+        try:
+            page = await asyncio.to_thread(skill_store.list_sources, limit=limit, after=after)
+        except SkillValueError as exc:
+            raise _invalid(exc) from None
+        return SkillSourceList(
+            data=[_source_object(s) for s in page.data],
+            has_more=page.has_more,
+            last_id=page.last_id,
+        )
 
     @router.post("/skill-sources", status_code=201, dependencies=mutating)
     async def add_skill_source(request: Request, body: SkillSourceCreate) -> SkillSourceObject:
@@ -248,13 +287,16 @@ def create_skill_marketplace_router(
             url, ref = resolve_source(body.source, body.ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        source = await asyncio.to_thread(
-            skill_store.add_source,
-            url=url,
-            ref=ref,
-            name=body.name or source_label(url),
-            created_by=user_id,
-        )
+        try:
+            source = await asyncio.to_thread(
+                skill_store.add_source,
+                url=url,
+                ref=ref,
+                name=body.name or source_label(url),
+                created_by=user_id,
+            )
+        except SkillValueError as exc:
+            raise _invalid(exc) from None
         return _source_object(source)
 
     @router.delete("/skill-sources/{source_id}", status_code=204, dependencies=mutating[:1])
@@ -276,13 +318,12 @@ def create_skill_marketplace_router(
         if source is None:
             raise OmnigentError("Skill source not found", code=ErrorCode.NOT_FOUND)
         try:
-            fetched = await asyncio.to_thread(
+            fetched = await fetch(
                 fetcher(request).catalog, source.url, source.ref, refresh=refresh
             )
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        installed = await asyncio.to_thread(skill_store.list_for_user, user_id)
-        return _catalog_response(fetched, installed)
+        return _catalog_response(fetched, await _all_installed(skill_store, user_id))
 
     @router.post("/skill-catalog", dependencies=mutating)
     async def preview_skill_catalog(
@@ -291,20 +332,32 @@ def create_skill_marketplace_router(
         """The skills an arbitrary GitHub repository offers (the Add from URL path)."""
         user_id = require_user(request, auth_provider)
         try:
-            fetched = await asyncio.to_thread(fetcher(request).catalog, body.source, body.ref)
+            fetched = await fetch(fetcher(request).catalog, body.source, body.ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        installed = await asyncio.to_thread(skill_store.list_for_user, user_id)
-        return _catalog_response(fetched, installed)
+        return _catalog_response(fetched, await _all_installed(skill_store, user_id))
 
     # ── installed skills ──
 
     @router.get("/installed-skills")
-    async def list_installed_skills(request: Request) -> InstalledSkillList:
-        """The org's installed skills plus the caller's own."""
+    async def list_installed_skills(
+        request: Request,
+        limit: int = Query(default=DEFAULT_PAGE, ge=1, le=MAX_PAGE),
+        after: str | None = Query(default=None),
+    ) -> InstalledSkillList:
+        """A page of the org's installed skills plus the caller's own."""
         user_id = require_user(request, auth_provider)
-        skills = await asyncio.to_thread(skill_store.list_for_user, user_id)
-        return InstalledSkillList(data=[_skill_object(s) for s in skills])
+        try:
+            page = await asyncio.to_thread(
+                skill_store.list_for_user, user_id, limit=limit, after=after
+            )
+        except SkillValueError as exc:
+            raise _invalid(exc) from None
+        return InstalledSkillList(
+            data=[_skill_object(s) for s in page.data],
+            has_more=page.has_more,
+            last_id=page.last_id,
+        )
 
     @router.post("/installed-skills", status_code=201, dependencies=mutating)
     async def install_skills(request: Request, body: InstallSkillsRequest) -> InstalledSkillList:
@@ -314,34 +367,42 @@ def create_skill_marketplace_router(
             _require_admin(user_id, permission_store)
         names = list(dict.fromkeys(body.names))
         try:
-            commit, packaged = await asyncio.to_thread(
-                fetcher(request).package, body.source, body.ref, names
-            )
+            commit, packaged = await fetch(fetcher(request).package, body.source, body.ref, names)
             url, ref = resolve_source(body.source, body.ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        installed: list[InstalledSkill] = []
+        # Validate every tarball and every stored value before the first write,
+        # so a bad request leaves no artifact and no row behind.
         for skill in packaged:
             try:
                 validate_skill_tarball(skill.tarball)
-            except SkillTarballError as exc:
+                _check_metadata(
+                    skill.entry.name, skill.entry.display_name, skill.entry.description
+                )
+            except (SkillTarballError, SkillValueError) as exc:
                 raise _invalid(exc) from None
+        installed: list[InstalledSkill] = []
+        for skill in packaged:
             location = _skill_location(skill.entry.name, body.scope, user_id, skill.tarball)
             await asyncio.to_thread(artifact_store.put, location, skill.tarball)
-            row = await asyncio.to_thread(
-                skill_store.install,
-                name=skill.entry.name,
-                display_name=skill.entry.display_name,
-                description=skill.entry.description,
-                source_url=url,
-                ref=ref,
-                commit=commit,
-                path=skill.entry.path,
-                scope=body.scope,
-                owner_user_id=user_id,
-                bundle_location=location,
-                installed_by=user_id,
-            )
+            try:
+                row = await asyncio.to_thread(
+                    skill_store.install,
+                    name=skill.entry.name,
+                    display_name=skill.entry.display_name,
+                    description=skill.entry.description,
+                    source_url=url,
+                    ref=ref,
+                    commit=commit,
+                    path=skill.entry.path,
+                    scope=body.scope,
+                    owner_user_id=user_id,
+                    bundle_location=location,
+                    installed_by=user_id,
+                )
+            except SkillValueError as exc:
+                _drop_artifact(artifact_store, location)
+                raise _invalid(exc) from None
             installed.append(row)
         return InstalledSkillList(data=[_skill_object(s) for s in installed])
 
@@ -373,23 +434,28 @@ def create_skill_marketplace_router(
         skill = await _load(skill_id, user_id)
         _require_can_mutate(skill, user_id, permission_store)
         try:
-            commit, packaged = await asyncio.to_thread(
+            commit, packaged = await fetch(
                 fetcher(request).package, skill.source_url, skill.ref, [skill.name]
             )
             validate_skill_tarball(packaged[0].tarball)
-        except (GitSourceError, SkillTarballError) as exc:
+            fresh = packaged[0]
+            _check_metadata(fresh.entry.name, fresh.entry.display_name, fresh.entry.description)
+        except (GitSourceError, SkillTarballError, SkillValueError) as exc:
             raise _invalid(exc) from None
-        fresh = packaged[0]
         location = _skill_location(skill.name, skill.scope, skill.owner_user_id, fresh.tarball)
         await asyncio.to_thread(artifact_store.put, location, fresh.tarball)
-        updated = await asyncio.to_thread(
-            skill_store.update,
-            skill.id,
-            commit=commit,
-            bundle_location=location,
-            description=fresh.entry.description,
-            display_name=fresh.entry.display_name,
-        )
+        try:
+            updated = await asyncio.to_thread(
+                skill_store.update,
+                skill.id,
+                commit=commit,
+                bundle_location=location,
+                description=fresh.entry.description,
+                display_name=fresh.entry.display_name,
+            )
+        except SkillValueError as exc:
+            _drop_artifact(artifact_store, location)
+            raise _invalid(exc) from None
         if updated is None:
             raise OmnigentError("Installed skill not found", code=ErrorCode.NOT_FOUND)
         if location != skill.bundle_location:
@@ -421,6 +487,20 @@ def create_skill_marketplace_router(
         return Response(status_code=204)
 
     return router
+
+
+def _check_metadata(name: str, display_name: str | None, description: str) -> None:
+    """Reject repository metadata that would not fit its column, before any write."""
+    from omnigent.stores.skill_store import (
+        MAX_DESCRIPTION_CHARS,
+        MAX_DISPLAY_NAME_CHARS,
+        MAX_NAME_CHARS,
+        check_bound,
+    )
+
+    check_bound("name", name, MAX_NAME_CHARS)
+    check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
+    check_bound("description", description, MAX_DESCRIPTION_CHARS)
 
 
 def _drop_artifact(artifact_store: ArtifactStore, location: str) -> None:

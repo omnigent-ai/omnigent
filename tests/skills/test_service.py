@@ -56,3 +56,29 @@ def test_package_names_the_missing_skill(plain_repo: Path, fake_clone) -> None:
     fetcher = SkillFetcher(clone=fake_clone(plain_repo))
     with pytest.raises(GitSourceError, match=r"No such skill .*: nope"):
         fetcher.package("acme/skills", None, ["review", "nope"])
+
+
+def test_package_bounds_the_whole_request(
+    plain_repo: Path, fake_clone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.skills import service
+
+    monkeypatch.setattr(service, "MAX_INSTALL_BYTES", 10)
+    fetcher = SkillFetcher(clone=fake_clone(plain_repo))
+    with pytest.raises(GitSourceError, match=r"exceed .* together"):
+        fetcher.package("acme/skills", None, ["review", "triage"])
+
+
+def test_fetcher_clones_isolated_from_server_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.skills import service
+
+    seen: dict[str, object] = {}
+
+    def clone(url: str, ref: str | None, dest: Path, *, isolated: bool = False) -> None:
+        seen["isolated"] = isolated
+        raise GitSourceError("stop")
+
+    monkeypatch.setattr(service, "clone_github_source", clone)
+    with pytest.raises(GitSourceError):
+        service.server_clone("https://github.com/a/b.git", None, Path("/nonexistent"))
+    assert seen["isolated"] is True

@@ -79,7 +79,13 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
   const remove = useDeleteInstalledSkill();
   const [viewing, setViewing] = useState<InstalledSkill | null>(null);
   const [removing, setRemoving] = useState<InstalledSkill | null>(null);
-  const skills = installed.data ?? [];
+  const skills = useMemo(
+    () => installed.data?.pages.flatMap((page) => page.data) ?? [],
+    [installed.data],
+  );
+  // The server enforces this on every mutation; hiding the controls spares a
+  // regular user a 403 on an "Everyone" skill.
+  const canMutate = (skill: InstalledSkill) => isAdmin || skill.scope === "user";
 
   if (installed.isPending) return <Loading label="Loading installed skills" />;
   if (installed.isError) return <ErrorLine error={installed.error} />;
@@ -117,38 +123,60 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
             </span>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            <Switch
-              aria-label={`Enable ${skill.name}`}
-              data-testid={`installed-skill-toggle-${skill.name}`}
-              checked={skill.enabled}
-              disabled={toggle.isPending}
-              onCheckedChange={(next) => toggle.mutate({ id: skill.id, enabled: next })}
-              componentId="settings.skills.toggle"
-            />
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label={`Update ${skill.name}`}
-              disabled={update.isPending}
-              onClick={() => update.mutate(skill.id)}
-              componentId="settings.skills.update"
-            >
-              <RefreshCwIcon />
-            </Button>
-            {(isAdmin || skill.scope === "user") && (
-              <Button
-                variant="ghost"
-                size="icon"
-                aria-label={`Remove ${skill.name}`}
-                onClick={() => setRemoving(skill)}
-                componentId="settings.skills.remove"
+            {canMutate(skill) ? (
+              <>
+                <Switch
+                  aria-label={`Enable ${skill.name}`}
+                  data-testid={`installed-skill-toggle-${skill.name}`}
+                  checked={skill.enabled}
+                  disabled={toggle.isPending}
+                  onCheckedChange={(next) => toggle.mutate({ id: skill.id, enabled: next })}
+                  componentId="settings.skills.toggle"
+                />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Update ${skill.name}`}
+                  disabled={update.isPending}
+                  onClick={() => update.mutate(skill.id)}
+                  componentId="settings.skills.update"
+                >
+                  <RefreshCwIcon />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={`Remove ${skill.name}`}
+                  onClick={() => setRemoving(skill)}
+                  componentId="settings.skills.remove"
+                >
+                  <TrashIcon />
+                </Button>
+              </>
+            ) : (
+              <span
+                className="text-xs text-muted-foreground"
+                data-testid={`installed-skill-managed-${skill.name}`}
               >
-                <TrashIcon />
-              </Button>
+                {skill.enabled ? "On for everyone" : "Off for everyone"} · managed by an
+                administrator
+              </span>
             )}
           </div>
         </div>
       ))}
+      {installed.hasNextPage && (
+        <Button
+          variant="outline"
+          size="sm"
+          className="self-start"
+          disabled={installed.isFetchingNextPage}
+          onClick={() => void installed.fetchNextPage()}
+          componentId="settings.skills.load_more"
+        >
+          Load more
+        </Button>
+      )}
       <SkillContentDialog skill={viewing} onClose={() => setViewing(null)} />
       <Dialog open={removing !== null} onOpenChange={(open) => !open && setRemoving(null)}>
         <DialogContent>
@@ -222,7 +250,10 @@ function BrowseTab({ isAdmin }: { isAdmin: boolean }) {
   const sources = useSkillSources(true);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
   const [preview, setPreview] = useState<SkillCatalog | null>(null);
-  const list = sources.data ?? [];
+  const list = useMemo(
+    () => sources.data?.pages.flatMap((page) => page.data) ?? [],
+    [sources.data],
+  );
   const activeId = selectedId ?? list[0]?.id;
   const catalog = useSourceCatalog(preview ? undefined : activeId, true);
   const shown = preview ?? catalog.data ?? null;
@@ -257,6 +288,18 @@ function BrowseTab({ isAdmin }: { isAdmin: boolean }) {
             </li>
           ))}
         </ul>
+        {sources.hasNextPage && (
+          <Button
+            variant="link"
+            size="sm"
+            className="self-start"
+            disabled={sources.isFetchingNextPage}
+            onClick={() => void sources.fetchNextPage()}
+            componentId="settings.skills.sources_more"
+          >
+            More sources
+          </Button>
+        )}
         {!sources.isPending && list.length === 0 && (
           <p className="text-ui text-muted-foreground" data-testid="skill-sources-empty">
             {isAdmin

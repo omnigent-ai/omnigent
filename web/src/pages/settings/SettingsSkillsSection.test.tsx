@@ -77,14 +77,34 @@ function json(body: unknown, status = 200) {
 }
 
 const calls: { method: string; url: string; body?: unknown }[] = [];
+const state = {
+  installed: [review] as InstalledSkill[],
+  failPatch: false,
+  secondPage: null as InstalledSkill[] | null,
+};
+const page = <T,>(data: T[], has_more = false, last_id: string | null = null) => ({
+  data,
+  has_more,
+  last_id,
+});
 
 function script() {
   fetchMock.mockImplementation(async (input, init) => {
     const url = String(input);
     const method = init?.method ?? "GET";
     calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
-    if (url === "/v1/installed-skills" && method === "GET") return json({ data: [review] });
-    if (url === "/v1/skill-sources" && method === "GET") return json({ data: [source] });
+    if (url.startsWith("/v1/installed-skills?") && method === "GET") {
+      if (url.includes("after=") && state.secondPage) return json(page(state.secondPage));
+      return json(
+        page(state.installed, state.secondPage !== null, state.secondPage ? "cursor" : null),
+      );
+    }
+    if (url.startsWith("/v1/skill-sources?") && method === "GET") return json(page([source]));
+    if (url === "/v1/skill-sources" && method === "POST") return json(source, 201);
+    if (url === "/v1/skill-sources/src1" && method === "DELETE")
+      return new Response(null, { status: 204 });
+    if (url === "/v1/installed-skills/sk1" && method === "PATCH" && state.failPatch)
+      return json({ error: { message: "Administrator access required" } }, 403);
     if (url.startsWith("/v1/skill-sources/src1/catalog")) return json(catalog);
     if (url === "/v1/skill-catalog")
       return json({ ...catalog, url: "https://github.com/other/repo.git" });
@@ -121,6 +141,9 @@ function renderSection() {
 beforeEach(() => {
   flags.feature = true;
   flags.admin = true;
+  state.installed = [review];
+  state.failPatch = false;
+  state.secondPage = null;
   calls.length = 0;
   fetchMock.mockReset();
   script();
@@ -214,6 +237,92 @@ describe("SettingsSkillsSection", () => {
           names: ["triage"],
           scope: "user",
         },
+      }),
+    );
+  });
+
+  it("updates, and removes behind a confirmation that can be cancelled", async () => {
+    renderSection();
+    const row = await screen.findByTestId("installed-skill-review");
+    fireEvent.click(within(row).getByRole("button", { name: "Update review" }));
+    await waitFor(() =>
+      expect(calls).toContainEqual({
+        method: "POST",
+        url: "/v1/installed-skills/sk1/update",
+        body: undefined,
+      }),
+    );
+
+    fireEvent.click(within(row).getByRole("button", { name: "Remove review" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+
+    fireEvent.click(within(row).getByRole("button", { name: "Remove review" }));
+    fireEvent.click(await screen.findByTestId("confirm-remove-skill"));
+    await waitFor(() =>
+      expect(calls).toContainEqual({
+        method: "DELETE",
+        url: "/v1/installed-skills/sk1",
+        body: undefined,
+      }),
+    );
+  });
+
+  it("shows the server's message when a mutation is refused", async () => {
+    state.failPatch = true;
+    renderSection();
+    const row = await screen.findByTestId("installed-skill-review");
+    fireEvent.click(within(row).getByTestId("installed-skill-toggle-review"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Administrator access required");
+  });
+
+  it("loads further pages of installed skills on request", async () => {
+    state.secondPage = [{ ...review, id: "sk9", name: "later", display_name: "Later skill" }];
+    renderSection();
+    await screen.findByTestId("installed-skill-review");
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    expect(await screen.findByTestId("installed-skill-later")).toBeInTheDocument();
+    expect(calls.some((c) => c.url.includes("after=cursor"))).toBe(true);
+  });
+
+  it("gives a regular user no controls on an everyone skill", async () => {
+    flags.admin = false;
+    state.installed = [
+      { ...review, scope: "org", owner_user_id: null },
+      { ...review, id: "sk2", name: "mine" },
+    ];
+    renderSection();
+    const org = await screen.findByTestId("installed-skill-review");
+    expect(within(org).queryByRole("switch")).toBeNull();
+    expect(within(org).queryByRole("button", { name: /Update|Remove/ })).toBeNull();
+    expect(within(org).getByTestId("installed-skill-managed-review")).toHaveTextContent(
+      "managed by an administrator",
+    );
+    const mine = screen.getByTestId("installed-skill-mine");
+    expect(within(mine).getByRole("switch")).toBeInTheDocument();
+    expect(within(mine).getByRole("button", { name: "Remove mine" })).toBeInTheDocument();
+  });
+
+  it("lets an admin add and remove sources", async () => {
+    renderSection();
+    openBrowse();
+    await screen.findByTestId("skill-source-src1");
+    fireEvent.change(screen.getByTestId("skill-source-input"), { target: { value: "acme/more" } });
+    fireEvent.change(screen.getByTestId("skill-source-ref"), { target: { value: "main" } });
+    fireEvent.click(screen.getByRole("button", { name: /Add source/ }));
+    await waitFor(() =>
+      expect(calls).toContainEqual({
+        method: "POST",
+        url: "/v1/skill-sources",
+        body: { source: "acme/more", ref: "main" },
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove source acme/skills" }));
+    await waitFor(() =>
+      expect(calls).toContainEqual({
+        method: "DELETE",
+        url: "/v1/skill-sources/src1",
+        body: undefined,
       }),
     );
   });

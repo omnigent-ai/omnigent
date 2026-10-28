@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import io
 import tarfile
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import PurePosixPath
 
 MAX_SKILL_BYTES = 20 * 1024 * 1024
@@ -60,28 +60,38 @@ def validate_skill_tarball(data: bytes) -> None:
 
 
 def bundle_skill_names(bundle_bytes: bytes) -> set[str]:
-    """Names of the skills a bundle already carries under ``skills/``."""
+    """Directory names of every ``SKILL.md`` under ``skills/``, at any depth.
+
+    The parser names a skill after its directory, so ``skills/team/triage``
+    is ``triage``. Callers that have the parsed agent spec should pass its
+    canonical names to :func:`overlay_skills` as well; this scan is the
+    fallback for a bundle whose spec is unavailable.
+    """
     names: set[str] = set()
     with _open(bundle_bytes) as tf:
         for member in tf:
-            parts = PurePosixPath(member.name).parts
-            if parts and parts[0] == ".":
-                parts = parts[1:]
-            if len(parts) >= 3 and parts[0] == "skills" and parts[2] == "SKILL.md":
-                names.add(parts[1])
+            parts = [part for part in PurePosixPath(member.name).parts if part != "."]
+            if len(parts) >= 3 and parts[0] == "skills" and parts[-1] == "SKILL.md":
+                names.add(parts[-2])
     return names
 
 
-def overlay_skills(bundle_bytes: bytes, skills: Sequence[tuple[str, bytes]]) -> bytes:
+def overlay_skills(
+    bundle_bytes: bytes,
+    skills: Sequence[tuple[str, bytes]],
+    *,
+    reserved: Collection[str] = (),
+) -> bytes:
     """Return *bundle_bytes* with each ``(name, tarball)`` added as ``skills/<name>/``.
 
-    A name the bundle already has is left alone. An unsafe tarball raises
-    rather than being skipped, so a bad row is noticed instead of silently
-    missing from the menu.
+    A name the bundle already has, or one in *reserved* (the parsed spec's
+    canonical skill names), is left alone. The archive is rebuilt once for
+    all skills. An unsafe tarball raises rather than being skipped, so a bad
+    row is noticed instead of silently missing from the menu.
     """
     if not skills:
         return bundle_bytes
-    present = bundle_skill_names(bundle_bytes)
+    present = bundle_skill_names(bundle_bytes) | set(reserved)
     out = io.BytesIO()
     with _open(bundle_bytes) as src, tarfile.open(fileobj=out, mode="w:gz") as dst:
         for member in src:

@@ -26,6 +26,10 @@ LFS_POINTER = b"version https://git-lfs.github.com/spec/"
 
 CLONE_TIMEOUT_S = 300
 
+# Inherited git configuration is dropped for a server-side fetch so a request
+# from one user can never borrow the operator's credential helpers or config.
+_INHERITED_GIT_ENV_PREFIXES = ("GIT_", "SSH_", "GPG_")
+
 
 class GitSourceError(Exception):
     """A fetch or packaging step refused the repository; the message is user-facing."""
@@ -63,22 +67,60 @@ def parse_github_source(source: str) -> GitHubSource | None:
     )
 
 
-def clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
+def isolated_git_env() -> dict[str, str]:
+    """An environment for a server-side clone: no inherited git, ssh or gpg settings.
+
+    Global and system git config are pointed at empty files and credential
+    helpers are disabled on the command line, so the clone can only reach
+    what an anonymous HTTPS client can.
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(_INHERITED_GIT_ENV_PREFIXES)
+    }
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LFS_SKIP_SMUDGE": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_ASKPASS": "",
+            "SSH_ASKPASS": "",
+        }
+    )
+    return env
+
+
+def clone_github_source(
+    clone_url: str, ref: str | None, dest: Path, *, isolated: bool = False
+) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts.
 
+    :param isolated: Drop the inherited git configuration and credential
+        helpers (a server fetching on a user's behalf). The CLI keeps the
+        developer's own git setup.
     :raises GitSourceError: When git is missing, the clone times out, or git fails.
     """
     cmd = ["git", "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
-           "-c", "protocol.https.allow=always", "clone", "--depth", "1",
-           "--no-recurse-submodules", "--quiet"]  # fmt: skip
+           "-c", "protocol.https.allow=always"]  # fmt: skip
+    if isolated:
+        cmd += ["-c", "credential.helper="]
+    cmd += ["clone", "--depth", "1", "--no-recurse-submodules", "--quiet"]
     if ref:
         cmd += ["--branch", ref]
+    env = (
+        isolated_git_env()
+        if isolated
+        else {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
+    )
     try:
         proc = subprocess.run(
             [*cmd, "--", clone_url, str(dest)],
             capture_output=True,
             text=True,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"},
+            env=env,
             check=False,
             timeout=CLONE_TIMEOUT_S,
         )
@@ -111,18 +153,28 @@ def checkout_commit(checkout: Path) -> str | None:
     return sha if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
 
-def tar_untrusted_dir(source: Path, *, what: str = "an agent") -> bytes:
+def tar_untrusted_dir(
+    source: Path,
+    *,
+    what: str = "an agent",
+    max_bytes: int | None = None,
+    max_entries: int | None = None,
+) -> bytes:
     """Tar a directory from a remote repo as is.
 
     ``${VAR}`` references are left unexpanded so a repo cannot pull this
     process's secrets into its config, symlinks are refused so it cannot pull
     in files from outside the checkout, ``.git`` is skipped, and Git LFS
-    pointers (never downloaded) are refused.
+    pointers (never downloaded) are refused. The limits are checked while
+    walking, before a file is read, so an oversized tree stops early.
 
     :param source: Directory to pack; entries are stored relative to it.
     :param what: Noun for error messages, e.g. ``"an agent"`` or ``"a skill"``.
-    :raises GitSourceError: On a symlink or an LFS pointer.
+    :param max_bytes: Total size of regular files allowed, or ``None``.
+    :param max_entries: Number of entries allowed, or ``None``.
+    :raises GitSourceError: On a symlink, an LFS pointer, or a limit.
     """
+    total = entries = 0
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for file_path in sorted(source.rglob("*")):
@@ -134,7 +186,15 @@ def tar_untrusted_dir(source: Path, *, what: str = "an agent") -> bytes:
                     f"{printable(str(rel))} is a symlink; refusing to install "
                     f"{what} with symlinks from a remote repo."
                 )
+            entries += 1
+            if max_entries is not None and entries > max_entries:
+                raise GitSourceError(f"{what} has more than {max_entries} files; refusing it.")
             if file_path.is_file():
+                total += file_path.lstat().st_size
+                if max_bytes is not None and total > max_bytes:
+                    raise GitSourceError(
+                        f"{what} is larger than {max_bytes // (1024 * 1024)} MB; refusing it."
+                    )
                 with file_path.open("rb") as fh:
                     if fh.read(len(LFS_POINTER)) == LFS_POINTER:
                         raise GitSourceError(

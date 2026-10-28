@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import builtins
 import uuid
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlInstalledSkill, SqlSkillSource, current_workspace_id
@@ -18,7 +17,21 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import InstalledSkill, SkillSource
 from omnigent.entities.skill import SkillScope
-from omnigent.stores.skill_store import MAX_LIST, SkillStore
+from omnigent.stores.skill_store import (
+    DEFAULT_PAGE,
+    MAX_DESCRIPTION_CHARS,
+    MAX_DISPLAY_NAME_CHARS,
+    MAX_LOCATION_CHARS,
+    MAX_NAME_CHARS,
+    MAX_PAGE,
+    MAX_PATH_CHARS,
+    MAX_REF_CHARS,
+    MAX_URL_CHARS,
+    SkillPage,
+    SkillStore,
+    SkillValueError,
+    check_bound,
+)
 
 
 def _source_entity(row: SqlSkillSource) -> SkillSource:
@@ -67,6 +80,10 @@ class SqlAlchemySkillStore(SkillStore):
     def add_source(
         self, *, url: str, ref: str | None, name: str, created_by: str | None
     ) -> SkillSource:
+        check_bound("url", url, MAX_URL_CHARS)
+        check_bound("ref", ref, MAX_REF_CHARS)
+        check_bound("name", name, MAX_DISPLAY_NAME_CHARS)
+
         def write(session: Session) -> SkillSource:
             existing = session.scalar(
                 select(SqlSkillSource).where(
@@ -91,15 +108,37 @@ class SqlAlchemySkillStore(SkillStore):
 
         return run_write_transaction(self._session_immediate, "add_skill_source", write)
 
-    def list_sources(self, *, limit: int = MAX_LIST) -> builtins.list[SkillSource]:
+    def list_sources(
+        self, *, limit: int = DEFAULT_PAGE, after: str | None = None
+    ) -> SkillPage[SkillSource]:
+        limit = max(1, min(limit, MAX_PAGE))
         with self._session("list_skill_sources") as session:
-            rows = session.scalars(
+            stmt = (
                 select(SqlSkillSource)
                 .where(SqlSkillSource.workspace_id == current_workspace_id())
-                .order_by(SqlSkillSource.created_at, SqlSkillSource.name)
-                .limit(limit)
-            ).all()
-            return [_source_entity(row) for row in rows]
+                .order_by(SqlSkillSource.created_at, SqlSkillSource.id)
+                .limit(limit + 1)
+            )
+            if after is not None:
+                cursor = session.get(SqlSkillSource, (current_workspace_id(), after))
+                if cursor is None:
+                    raise SkillValueError("unknown cursor")
+                # Compared column by column so each bind takes the column's type
+                # (the id is 16 raw bytes, not its hex spelling).
+                stmt = stmt.where(
+                    or_(
+                        SqlSkillSource.created_at > cursor.created_at,
+                        and_(
+                            SqlSkillSource.created_at == cursor.created_at,
+                            SqlSkillSource.id > cursor.id,
+                        ),
+                    )
+                )
+            rows = session.scalars(stmt).all()
+            page = [_source_entity(row) for row in rows[:limit]]
+            return SkillPage(
+                data=page, has_more=len(rows) > limit, last_id=page[-1].id if page else None
+            )
 
     def get_source(self, source_id: str) -> SkillSource | None:
         with self._session("get_skill_source") as session:
@@ -134,6 +173,13 @@ class SqlAlchemySkillStore(SkillStore):
         installed_by: str | None,
     ) -> InstalledSkill:
         owner = owner_user_id if scope == "user" else None
+        check_bound("name", name, MAX_NAME_CHARS)
+        check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
+        check_bound("description", description, MAX_DESCRIPTION_CHARS)
+        check_bound("source_url", source_url, MAX_URL_CHARS)
+        check_bound("ref", ref, MAX_REF_CHARS)
+        check_bound("path", path, MAX_PATH_CHARS)
+        check_bound("bundle_location", bundle_location, MAX_LOCATION_CHARS)
 
         def write(session: Session) -> InstalledSkill:
             # Reinstalling replaces the row in place so the id stays stable.
@@ -179,21 +225,39 @@ class SqlAlchemySkillStore(SkillStore):
             return None if row is None else _skill_entity(row)
 
     def list_for_user(
-        self, user_id: str | None, *, limit: int = MAX_LIST
-    ) -> builtins.list[InstalledSkill]:
+        self, user_id: str | None, *, limit: int = DEFAULT_PAGE, after: str | None = None
+    ) -> SkillPage[InstalledSkill]:
+        limit = max(1, min(limit, MAX_PAGE))
         with self._session("list_installed_skills") as session:
             visible = SqlInstalledSkill.scope == encode_installed_skill_scope("org")
             if user_id is not None:
                 visible = or_(visible, SqlInstalledSkill.owner_user_id == user_id)
             else:
                 visible = or_(visible, SqlInstalledSkill.owner_user_id.is_(None))
-            rows = session.scalars(
+            stmt = (
                 select(SqlInstalledSkill)
                 .where(SqlInstalledSkill.workspace_id == current_workspace_id(), visible)
-                .order_by(SqlInstalledSkill.installed_at, SqlInstalledSkill.name)
-                .limit(limit)
-            ).all()
-            return [_skill_entity(row) for row in rows]
+                .order_by(SqlInstalledSkill.installed_at, SqlInstalledSkill.id)
+                .limit(limit + 1)
+            )
+            if after is not None:
+                cursor = session.get(SqlInstalledSkill, (current_workspace_id(), after))
+                if cursor is None:
+                    raise SkillValueError("unknown cursor")
+                stmt = stmt.where(
+                    or_(
+                        SqlInstalledSkill.installed_at > cursor.installed_at,
+                        and_(
+                            SqlInstalledSkill.installed_at == cursor.installed_at,
+                            SqlInstalledSkill.id > cursor.id,
+                        ),
+                    )
+                )
+            rows = session.scalars(stmt).all()
+            page = [_skill_entity(row) for row in rows[:limit]]
+            return SkillPage(
+                data=page, has_more=len(rows) > limit, last_id=page[-1].id if page else None
+            )
 
     def update(
         self,
@@ -204,6 +268,10 @@ class SqlAlchemySkillStore(SkillStore):
         description: str,
         display_name: str | None,
     ) -> InstalledSkill | None:
+        check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
+        check_bound("description", description, MAX_DESCRIPTION_CHARS)
+        check_bound("bundle_location", bundle_location, MAX_LOCATION_CHARS)
+
         def write(session: Session) -> InstalledSkill | None:
             row = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
             if row is None:

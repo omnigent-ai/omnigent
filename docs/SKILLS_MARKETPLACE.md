@@ -36,12 +36,16 @@ so every harness discovers them exactly like skills the agent author bundled.
 The agent spec's `skills:` filter applies to them as it does to host skills,
 and a skill the bundle itself carries always wins a name collision.
 
-Sessions pick up installs, updates and removals when they next start.
+Sessions pick up installs, updates and removals when they next start. With
+the feature switched off, installed rows stay in the database but nothing
+reads them: the routes are absent and neither discovery nor served bundles
+include them.
 
 ## Scope and permissions
 
 - A user's installs are visible only to them. An administrator can install
-  for **Everyone**, which every user receives.
+  for **Everyone**, which every user receives. When a user and the org both
+  have a skill of the same name, the user's copy wins for that user.
 - Only administrators add or remove browsable sources. Deleting a source does
   not remove skills already installed from it.
 - Anyone can preview a repository by URL and install from it for themselves.
@@ -55,8 +59,12 @@ references. A skill is markdown and supporting files the harness reads; it
 runs with whatever the harness already allows. Every card and installed entry
 shows the repository and the commit it was taken from.
 
-Both keys of the install request are bounded: at most 50 skills per request,
-20 MB and 2,000 files per skill.
+The server's clone is isolated from its own git configuration and credential
+helpers, so a user cannot reach a private repository through the operator's
+credentials. Limits are checked while packing, before more is read: at most
+20 skills per request, 20 MB and 2,000 files per skill, 100 MB per request,
+and two fetches at a time. Repository metadata that would not fit its column
+is rejected before anything is stored.
 
 ## API
 
@@ -64,10 +72,10 @@ Under `/v1`, mounted only when the feature is on:
 
 | Route | Purpose |
 | --- | --- |
-| `GET/POST/DELETE /skill-sources` | Browsable repositories (POST and DELETE are admin-only) |
+| `GET/POST/DELETE /skill-sources` | Browsable repositories, paged (POST and DELETE are admin-only) |
 | `GET /skill-sources/{id}/catalog` | The skills a source offers; `?refresh=true` re-fetches |
 | `POST /skill-catalog` | Index any GitHub repository (the Add-from-URL path) |
-| `GET/POST /installed-skills` | List, and install by name from a repository |
+| `GET/POST /installed-skills` | List (paged with `limit` and `after`), and install by name from a repository |
 | `PATCH/DELETE /installed-skills/{id}` | Enable or disable, and remove |
 | `POST /installed-skills/{id}/update` | Refetch at the same ref |
 | `GET /installed-skills/{id}/content` | The stored `SKILL.md` |

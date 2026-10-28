@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import logging
 
-from omnigent.entities import Agent
+from omnigent.entities import Agent, InstalledSkill
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.skills.overlay import SkillTarballError, overlay_skills
+from omnigent.skills.overlay import SkillTarballError, overlay_skills, validate_skill_tarball
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import ArtifactStore
 from omnigent.stores.skill_store import SkillStore
@@ -50,18 +50,25 @@ def with_installed_skills(
     artifact_store: ArtifactStore,
     spec: AgentSpec | None = None,
 ) -> bytes:
-    """Return the bundle with the owner's enabled installed skills added under ``skills/``."""
+    """Return the bundle with the owner's enabled installed skills added under ``skills/``.
+
+    The bundle's own skills, by their canonical parsed names, always win a
+    collision; a user-scoped install wins over an org-scoped one of the same
+    name. A tarball that fails validation drops only itself.
+    """
     try:
-        installed = skill_store.list_for_user(owner_id)
+        installed = effective_installed_skills(skill_store, owner_id)
     except Exception:
         _logger.warning("could not list installed skills for %s", owner_id, exc_info=True)
         return bundle_bytes
+    reserved = {skill.name for skill in getattr(spec, "skills", None) or []}
+    accepted: list[tuple[str, bytes]] = []
     for skill in installed:
-        if not skill.enabled or not skill_allowed(spec, skill.name):
+        if not skill_allowed(spec, skill.name) or skill.name in reserved:
             continue
         try:
             tarball = artifact_store.get(skill.bundle_location)
-            bundle_bytes = overlay_skills(bundle_bytes, [(skill.name, tarball)])
+            validate_skill_tarball(tarball)
         except (SkillTarballError, OSError, KeyError, ValueError):
             _logger.warning(
                 "skipping installed skill %s (%s): unreadable tarball",
@@ -69,4 +76,35 @@ def with_installed_skills(
                 skill.id,
                 exc_info=True,
             )
-    return bundle_bytes
+            continue
+        accepted.append((skill.name, tarball))
+    try:
+        return overlay_skills(bundle_bytes, accepted, reserved=reserved)
+    except SkillTarballError:
+        _logger.warning(
+            "could not overlay installed skills; serving the bundle as is", exc_info=True
+        )
+        return bundle_bytes
+
+
+def effective_installed_skills(
+    skill_store: SkillStore, owner_id: str | None
+) -> list[InstalledSkill]:
+    """The owner's enabled installed skills, one per name, user scope winning over org.
+
+    Pages through the store so the read stays bounded per call.
+    """
+    by_name: dict[str, InstalledSkill] = {}
+    after: str | None = None
+    while True:
+        page = skill_store.list_for_user(owner_id, after=after)
+        for skill in page.data:
+            if not skill.enabled:
+                continue
+            current = by_name.get(skill.name)
+            if current is None or (current.scope == "org" and skill.scope == "user"):
+                by_name[skill.name] = skill
+        if not page.has_more or page.last_id is None:
+            break
+        after = page.last_id
+    return list(by_name.values())

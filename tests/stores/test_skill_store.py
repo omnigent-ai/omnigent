@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.stores.skill_store import SkillValueError
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 
 
@@ -43,11 +44,11 @@ def test_sources_dedupe_on_url_and_ref(store: SqlAlchemySkillStore) -> None:
 
     assert again.id == first.id and again.name == "Acme"
     assert tagged.id != first.id
-    assert sorted(s.name for s in store.list_sources()) == ["Acme", "Acme v2"]
+    assert sorted(s.name for s in store.list_sources().data) == ["Acme", "Acme v2"]
     assert store.get_source(first.id) == first
     assert store.delete_source(first.id) is True
     assert store.delete_source(first.id) is False
-    assert [s.name for s in store.list_sources()] == ["Acme v2"]
+    assert [s.name for s in store.list_sources().data] == ["Acme v2"]
 
 
 def test_users_see_org_skills_and_their_own_only(store: SqlAlchemySkillStore) -> None:
@@ -56,9 +57,10 @@ def test_users_see_org_skills_and_their_own_only(store: SqlAlchemySkillStore) ->
     _install(store, "theirs", owner="bob")
 
     # Same-second installs order by name, so the listing is stable.
-    assert [s.name for s in store.list_for_user("alice")] == ["mine", "shared"]
-    assert [s.name for s in store.list_for_user("bob")] == ["shared", "theirs"]
-    assert [s.name for s in store.list_for_user("carol")] == ["shared"]
+    names = lambda user: sorted(s.name for s in store.list_for_user(user).data)  # noqa: E731
+    assert names("alice") == ["mine", "shared"]
+    assert names("bob") == ["shared", "theirs"]
+    assert names("carol") == ["shared"]
 
 
 def test_org_scope_ignores_the_owner_argument(store: SqlAlchemySkillStore) -> None:
@@ -73,7 +75,7 @@ def test_reinstall_replaces_in_place_and_keeps_the_id(store: SqlAlchemySkillStor
     assert second.id == first.id
     assert second.commit == "b" * 40 and second.description == "newer"
     assert second.updated_at is not None and second.installed_at == first.installed_at
-    assert len(store.list_for_user("alice")) == 1
+    assert len(store.list_for_user("alice").data) == 1
     # The same name under another user is a different row.
     other = _install(store, "review", owner="bob")
     assert other.id != first.id
@@ -111,12 +113,60 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
     assert store.set_enabled(row.id, True) is None
 
 
-def test_list_reads_are_bounded(store: SqlAlchemySkillStore) -> None:
-    for i in range(3):
-        _install(store, f"s{i}", scope="org", owner=None)
-    assert len(store.list_for_user("alice", limit=2)) == 2
-    for i in range(3):
+def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySkillStore) -> None:
+    for i in range(7):
+        _install(store, f"s{i:02d}", scope="org", owner=None)
+    seen: list[str] = []
+    after = None
+    pages = 0
+    while True:
+        page = store.list_for_user("alice", limit=3, after=after)
+        pages += 1
+        seen.extend(s.name for s in page.data)
+        assert len(page.data) <= 3
+        if not page.has_more:
+            assert page.last_id == (page.data[-1].id if page.data else None)
+            break
+        after = page.last_id
+    assert pages == 3
+    assert sorted(seen) == [f"s{i:02d}" for i in range(7)] and len(seen) == len(set(seen))
+
+    for i in range(4):
         store.add_source(
             url=f"https://github.com/acme/r{i}.git", ref=None, name=f"r{i}", created_by=None
         )
-    assert len(store.list_sources(limit=2)) == 2
+    first = store.list_sources(limit=3)
+    rest = store.list_sources(limit=3, after=first.last_id)
+    assert first.has_more and not rest.has_more
+    assert len(first.data) + len(rest.data) == 4
+    assert len({s.id for s in first.data + rest.data}) == 4
+    with pytest.raises(SkillValueError, match="unknown cursor"):
+        store.list_sources(after="0" * 32)
+
+
+def test_page_size_is_clamped(store: SqlAlchemySkillStore) -> None:
+    for i in range(3):
+        _install(store, f"s{i}", scope="org", owner=None)
+    assert len(store.list_for_user("alice", limit=0).data) == 1
+    assert len(store.list_for_user("alice", limit=10_000).data) == 3
+
+
+def test_values_that_would_not_fit_are_rejected_before_writing(
+    store: SqlAlchemySkillStore,
+) -> None:
+    # Multibyte text counts in characters, matching the column declarations.
+    with pytest.raises(SkillValueError, match="description"):
+        _install(store, "wordy", description="é" * 1025)
+    with pytest.raises(SkillValueError, match="display_name"):
+        _install(store, "titled", display_name="名" * 257)
+    with pytest.raises(SkillValueError, match="url"):
+        store.add_source(
+            url="https://github.com/" + "a" * 600, ref=None, name="x", created_by=None
+        )
+    assert store.list_for_user("alice").data == []
+    row = _install(store, "ok")
+    with pytest.raises(SkillValueError, match="description"):
+        store.update(
+            row.id, commit=None, bundle_location="x", description="z" * 1025, display_name=None
+        )
+    assert store.get(row.id).description == "ok description"

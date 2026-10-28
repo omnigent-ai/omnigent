@@ -19,7 +19,7 @@ from omnigent.server.routes._host_launch import host_absent_error, resolve_host_
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.routes.skill_marketplace import source_label
 from omnigent.server.schemas import SkillSummary
-from omnigent.server.skill_injection import skill_allowed
+from omnigent.server.skill_injection import effective_installed_skills, skill_allowed
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
@@ -176,7 +176,7 @@ def create_skills_router(
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
         if skill_store is not None:
-            installed = await asyncio.to_thread(skill_store.list_for_user, user_id)
+            installed = await asyncio.to_thread(effective_installed_skills, skill_store, user_id)
             skills += installed_skill_summaries(installed, spec, {s.name for s in skills})
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
@@ -236,10 +236,14 @@ async def request_host_skills(
 def installed_skill_summaries(
     installed: list[InstalledSkill], spec: AgentSpec | None, taken: set[str]
 ) -> list[SkillSummary]:
-    """Installed skills the menu should list: enabled, allowed by the spec, not shadowed."""
+    """Installed skills the menu should list: allowed by the spec and not shadowed.
+
+    *installed* is already enabled-only and one per name
+    (:func:`effective_installed_skills`).
+    """
     out: list[SkillSummary] = []
     for skill in installed:
-        if not skill.enabled or skill.name in taken or not skill_allowed(spec, skill.name):
+        if skill.name in taken or not skill_allowed(spec, skill.name):
             continue
         taken.add(skill.name)
         out.append(

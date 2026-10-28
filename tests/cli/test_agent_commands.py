@@ -310,50 +310,30 @@ def test_add_github_repo_refuses_a_symlinked_subpath(
     assert "goes through a symlink" in result.output
 
 
-@pytest.mark.parametrize(
-    ("source", "parsed"),
-    [
-        ("acme/agents", ("https://github.com/acme/agents.git", None, "", None)),
-        (
-            "github:acme/agents/sub/x@orion",
-            ("https://github.com/acme/agents.git", None, "sub/x", "orion"),
-        ),
-        (
-            "https://github.com/acme/agents/tree/v1@orion",
-            ("https://github.com/acme/agents.git", "v1", "", "orion"),
-        ),
-        (
-            "https://github.com/acme/agents/tree/v1/sub@orion",
-            ("https://github.com/acme/agents.git", "v1", "sub", "orion"),
-        ),
-        ("./orion", None),
-        ("acme/../etc", None),
-    ],
-)
-def test_parse_github_source(source: str, parsed: object) -> None:
-    assert cli_mod._parse_github_source(source) == parsed
+def test_parse_github_source_keeps_the_cli_tuple_shape() -> None:
+    # The parsing itself is covered in tests/skills; the CLI adapter returns a tuple.
+    assert cli_mod._parse_github_source("https://github.com/acme/agents/tree/v1/sub@orion") == (
+        "https://github.com/acme/agents.git",
+        "v1",
+        "sub",
+        "orion",
+    )
+    assert cli_mod._parse_github_source("./orion") is None
 
 
-def test_clone_github_source_is_hardened(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    seen: list[tuple[list[str], dict[str, str]]] = []
-
+def test_clone_github_source_translates_git_failures(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The clone flags are covered in tests/skills; here the CLI wraps the shared
+    # error into a ClickException, keeping the SHA hint.
     def run(cmd: list[str], **kwargs: object) -> object:
-        seen.append((cmd, kwargs["env"]))  # type: ignore[arg-type]
         return type("P", (), {"returncode": 128, "stderr": "fatal: not found\n"})()
 
     monkeypatch.setattr(cli_mod.subprocess, "run", run)
     with pytest.raises(click.ClickException, match=r"Could not clone .*: fatal: not found"):
         cli_mod._clone_github_source("https://github.com/a/b.git", "v1", tmp_path / "r")
-    cmd, env = seen[0]
-    assert {"core.hooksPath=/dev/null", "protocol.allow=never", "--no-recurse-submodules"} <= set(
-        cmd
-    )
-    assert cmd[cmd.index("--branch") + 1] == "v1" and cmd[-3] == "--"
-    assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_LFS_SKIP_SMUDGE"] == "1"
-    # A hex-looking name can be a real branch or tag, so git decides; a failure hints at SHAs.
     with pytest.raises(click.ClickException, match="not commit SHAs"):
         cli_mod._clone_github_source("https://github.com/a/b.git", "deadbee", tmp_path / "r")
-    assert seen[1][0][seen[1][0].index("--branch") + 1] == "deadbee"
 
 
 @pytest.mark.parametrize(

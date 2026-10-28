@@ -3655,7 +3655,7 @@
             "items": {
               "type": "string"
             },
-            "maxItems": 50,
+            "maxItems": 20,
             "minItems": 1,
             "title": "Names",
             "type": "array"
@@ -3709,6 +3709,7 @@
         "type": "object"
       },
       "InstalledSkillList": {
+        "description": "One page; pass `last_id` as `after` for the next.",
         "properties": {
           "data": {
             "items": {
@@ -3716,6 +3717,22 @@
             },
             "title": "Data",
             "type": "array"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
           }
         },
         "required": [
@@ -10149,6 +10166,7 @@
         "type": "object"
       },
       "SkillSourceList": {
+        "description": "One page; pass `last_id` as `after` for the next.",
         "properties": {
           "data": {
             "items": {
@@ -10156,6 +10174,22 @@
             },
             "title": "Data",
             "type": "array"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
           }
         },
         "required": [
@@ -13708,8 +13742,38 @@
     },
     "/v1/installed-skills": {
       "get": {
-        "description": "The org's installed skills plus the caller's own.",
+        "description": "A page of the org's installed skills plus the caller's own.",
         "operationId": "list_installed_skills_v1_installed_skills_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -13720,6 +13784,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Installed Skills",
@@ -20222,8 +20296,38 @@
     },
     "/v1/skill-sources": {
       "get": {
-        "description": "The repositories the marketplace browses.",
+        "description": "A page of the repositories the marketplace browses.",
         "operationId": "list_skill_sources_v1_skill_sources_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -20234,6 +20338,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Skill Sources",

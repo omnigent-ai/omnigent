@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addSkillSource,
   deleteInstalledSkill,
@@ -19,17 +19,21 @@ const INSTALLED_KEY = ["skill-marketplace", "installed"] as const;
 const catalogKey = (sourceId: string) => ["skill-marketplace", "catalog", sourceId] as const;
 
 export function useSkillSources(enabled: boolean) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: SOURCES_KEY,
-    queryFn: ({ signal }) => listSkillSources(signal),
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam, signal }) => listSkillSources(pageParam, signal),
+    getNextPageParam: (page) => (page.has_more ? page.last_id : undefined),
     enabled,
   });
 }
 
 export function useInstalledSkills(enabled: boolean) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: INSTALLED_KEY,
-    queryFn: ({ signal }) => listInstalledSkills(signal),
+    initialPageParam: null as string | null,
+    queryFn: ({ pageParam, signal }) => listInstalledSkills(pageParam, signal),
+    getNextPageParam: (page) => (page.has_more ? page.last_id : undefined),
     enabled,
   });
 }
