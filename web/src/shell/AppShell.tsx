@@ -363,27 +363,40 @@ function AppShellImpl() {
   }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
 
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
-  // (except the settings menu) and widening reopens what narrowing closed.
+  // (except the settings menu) and remembers the desktop state for widening.
   const mobileViewport = useIsMobileViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
   const lastMobileViewportRef = useRef(mobileViewport);
+  const lastSidebarOpenRef = useRef(sidebarOpen);
   const sidebarOpenBeforeNarrowRef = useRef(false);
   useLayoutEffect(() => {
-    if (lastMobileViewportRef.current === mobileViewport) return;
-    lastMobileViewportRef.current = mobileViewport;
-    if (!mobileViewport) {
-      if (sidebarOpenBeforeNarrowRef.current) setSidebarOpen(true);
-      sidebarOpenBeforeNarrowRef.current = false;
+    const opened = sidebarOpen && !lastSidebarOpenRef.current;
+    lastSidebarOpenRef.current = sidebarOpen;
+    if (lastMobileViewportRef.current === mobileViewport) {
+      // Opening the drawer while narrow replaces the remembered desktop state.
+      if (mobileViewport && opened && !inSettings) sidebarOpenBeforeNarrowRef.current = false;
       return;
     }
+    lastMobileViewportRef.current = mobileViewport;
+    if (!mobileViewport) {
+      const reopen = sidebarOpenBeforeNarrowRef.current;
+      sidebarOpenBeforeNarrowRef.current = false;
+      if (inSettings && reopen) sidebarOpenBeforeSettingsRef.current = true;
+      if (inSettings || reopen) setSidebarOpen(true);
+      return;
+    }
+    if (inSettings) {
+      // Hold the settings stash here so leaving settings while narrow can't open a drawer.
+      sidebarOpenBeforeNarrowRef.current = sidebarOpenBeforeSettingsRef.current ?? false;
+      sidebarOpenBeforeSettingsRef.current = false;
+    } else {
+      sidebarOpenBeforeNarrowRef.current = sidebarOpen;
+    }
     if (atSettingsRoot) return;
-    setSidebarOpen((open) => {
-      sidebarOpenBeforeNarrowRef.current = open;
-      return false;
-    });
+    setSidebarOpen(false);
     setSidebarPeek(false);
-  }, [mobileViewport, atSettingsRoot, setSidebarOpen]);
+  }, [mobileViewport, sidebarOpen, inSettings, atSettingsRoot, setSidebarOpen]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.

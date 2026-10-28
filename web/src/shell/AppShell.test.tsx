@@ -2226,6 +2226,47 @@ describe("Sidebar across the md breakpoint", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
   });
 
+  it("keeps a drawer the user closed while narrow closed on widening", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+    fireEvent.keyDown(document, { code: "BracketLeft", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+  });
+
+  it("restores the open sidebar after leaving settings entered while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-settings"));
+    resize(1280);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
+  it("does not open a drawer when leaving settings while narrow", () => {
+    const resize = mockViewportWidth(1280);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc");
+    fireEvent.click(screen.getByTestId("nav-settings"));
+
+    resize(740);
+    fireEvent.click(screen.getByTestId("nav-home"));
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
+
+    resize(1280);
+    expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
+  });
+
   it("keeps the settings menu open when the window narrows on /settings", () => {
     const resize = mockViewportWidth(1280);
     mockConversations([]);
