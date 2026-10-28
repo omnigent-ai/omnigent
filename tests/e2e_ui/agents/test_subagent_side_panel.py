@@ -145,7 +145,8 @@ def busy_subagent(
         # A turn left parked on the gate would wedge the shared runner.
         with contextlib.suppress(httpx.HTTPError):
             _release_gate(mock_llm_server_url)
-        httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(f"{base_url}/v1/sessions/{child_id}", timeout=10.0)
 
 
 def _open_page(request: pytest.FixtureRequest, *, setting_on: bool) -> Page:

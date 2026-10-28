@@ -513,7 +513,7 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
       await click();
 
       expect(screen.getByTestId("page")).toHaveTextContent("/c/conv_root");
-      // Any panel covering the rail closes so the new tab is on screen.
+      // The opener's revealRightPanel closes panels that cover the rail.
       expect(screen.queryByTestId("execution-logs-panel")).not.toHaveAttribute(
         "data-state",
         "open",

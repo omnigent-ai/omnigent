@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
@@ -392,12 +393,13 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBeNull();
 
     // A save that storage refuses leaves the switch showing what is stored.
-    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new DOMException("Quota exceeded", "QuotaExceededError");
     });
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => "");
     fireEvent.click(toggle);
     expect(toggle).not.toBeChecked();
-    setItem.mockRestore();
+    expect(toastError).toHaveBeenCalledTimes(1);
   });
 
   it("asks before terminal copying by default and explains the scope", () => {

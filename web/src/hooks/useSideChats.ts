@@ -14,6 +14,8 @@ interface SideChatTabsState {
 
 type TabsChange = (current: SideChatTabsState) => SideChatTabsState;
 
+const MAX_UNSAVED_CHANGES = 50;
+
 function readSideChatTabsState(conversationId: string): SideChatTabsState {
   const saved = readSessionWorkspaceState(conversationId);
   const tabs = saved.openSideChats ?? [];
@@ -71,7 +73,9 @@ export function useSideChats(conversationId: string) {
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
       });
-      unsaved.current = saved ? null : { conversationId, changes };
+      // Past the cap, keep only the result so a long storage outage can't grow the replay.
+      const kept = changes.length > MAX_UNSAVED_CHANGES ? [() => next] : changes;
+      unsaved.current = saved ? null : { conversationId, changes: kept };
       setState(next);
     },
     [conversationId],

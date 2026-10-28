@@ -241,6 +241,22 @@ describe("sub-agent tabs", () => {
 });
 
 describe("side-chat tabs when storage writes fail", () => {
+  it("keep one chat's unsaved changes out of the next chat", () => {
+    const hook = renderHook(({ id }) => useSideChats(id), { initialProps: { id: "session-a" } });
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    act(() => hook.result.current.open("conv_unsaved"));
+    setItem.mockRestore();
+
+    hook.rerender({ id: "session-b" });
+    act(() => hook.result.current.open("conv_b"));
+
+    expect(hook.result.current.tabs).toEqual(["conv_b"]);
+    expect(readSessionWorkspaceState("session-b").openSideChats).toEqual(["conv_b"]);
+    expect(readSessionWorkspaceState("session-a")).toEqual({});
+  });
+
   it.each([
     ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"]],
     ["opens a tab", (hook: SideChatsHook) => hook.open("conv_y"), ["conv_z", "conv_y", "conv_x"]],

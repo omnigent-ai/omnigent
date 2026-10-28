@@ -254,6 +254,21 @@ describe("phone menu with a harness that can't start side chats", () => {
       button: 0,
     });
 
+  it("offers Side chats for sub-agent tabs restored from storage", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [subagentTabId("conv_child")],
+      selectedSideChatId: subagentTabId("conv_child"),
+    });
+    renderShell();
+
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("subagent-tab-pane")).toBeInTheDocument();
+  });
+
   it("offers Side chats once a sub-agent tab opens, without a reload", () => {
     renderShell();
     openActionsMenu();
