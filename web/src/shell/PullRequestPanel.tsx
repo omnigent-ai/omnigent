@@ -1058,6 +1058,14 @@ export function PullRequestPanel({
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
   const info = usePullRequestInfo(conversationId, { poll: active, prUrl: selected });
   const queryClient = useQueryClient();
+  // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (active && !wasActive.current) {
+      void queryClient.refetchQueries({ queryKey: ["github-info", conversationId], stale: true });
+    }
+    wasActive.current = active;
+  }, [active, conversationId, queryClient]);
   const [refreshing, setRefreshing] = useState(false);
   const refresh = async () => {
     setRefreshing(true);
