@@ -9,8 +9,20 @@ const { discoverArcaSshHost } = require("./arcaSshDiscovery");
 const { readMacAppIcon } = require("./macAppIcon");
 
 const MAC_APPS = [
-  { id: "vscode", label: "VS Code", bundle: "com.microsoft.VSCode", name: "Visual Studio Code" },
-  { id: "cursor", label: "Cursor", bundle: "com.todesktop.230313mzl4w4u92", name: "Cursor" },
+  {
+    id: "vscode",
+    label: "VS Code",
+    bundle: "com.microsoft.VSCode",
+    name: "Visual Studio Code",
+    team: "UBF8T346G9",
+  },
+  {
+    id: "cursor",
+    label: "Cursor",
+    bundle: "com.todesktop.230313mzl4w4u92",
+    name: "Cursor",
+    team: "VDXQ22DGB9",
+  },
   { id: "emacs", label: "Emacs", bundle: "org.gnu.Emacs", name: "Emacs" },
   {
     id: "terminal",
@@ -75,24 +87,53 @@ function registerFileOpen({
     return promise;
   }
 
-  async function locateApp({ name, bundle }) {
+  async function editorExecutable(appPath, appId) {
+    const executable = await fs
+      .realpath(
+        path.join(
+          appPath,
+          "Contents",
+          "Resources",
+          "app",
+          "bin",
+          appId === "cursor" ? "cursor" : "code",
+        ),
+      )
+      .catch(() => null);
+    return executable?.startsWith(`${appPath}${path.sep}`) ? executable : null;
+  }
+
+  async function locateApp({ id, name, bundle, team }) {
     const candidates = await Promise.all(
       appDirectories.map(async (directory) => {
-        const candidate = path.join(directory, `${name}.app`);
-        return (await fs.stat(candidate).catch(() => null))?.isDirectory() ? candidate : null;
+        try {
+          if (!(await fs.lstat(directory)).isDirectory()) return null;
+          const root = await fs.realpath(directory);
+          const candidate = await fs.realpath(path.join(root, `${name}.app`));
+          if (path.dirname(candidate) !== root || !(await fs.stat(candidate)).isDirectory())
+            return null;
+          if (team) {
+            if (!(await editorExecutable(candidate, id))) return null;
+            await run(
+              "/usr/bin/codesign",
+              [
+                "--verify",
+                "--deep",
+                "--strict",
+                "-R",
+                `=identifier "${bundle}" and anchor apple generic and certificate leaf[subject.OU] = "${team}"`,
+                candidate,
+              ],
+              { timeout: 5000 },
+            );
+          }
+          return candidate;
+        } catch {
+          return null;
+        }
       }),
     );
-    const installed = candidates.find(Boolean);
-    if (installed) return installed;
-    // Spotlight also finds renamed apps and custom installation locations.
-    const { stdout } = await run(
-      "/usr/bin/mdfind",
-      ["-0", `kMDItemCFBundleIdentifier == "${bundle}"`],
-      {
-        timeout: 3000,
-      },
-    );
-    return stdout.split("\0").find((candidate) => path.isAbsolute(candidate)) ?? null;
+    return candidates.find(Boolean) ?? null;
   }
 
   ipcMain.handle("omnigent:file-open-apps", async (event) => {
@@ -149,7 +190,9 @@ function registerFileOpen({
       }
       const target =
         selectedApp.directory && !stat.isDirectory() ? path.dirname(filePath) : filePath;
-      await run("/usr/bin/open", ["-b", selectedApp.bundle, target], { timeout: 5000 });
+      const appPath = await findApp(selectedApp);
+      if (!appPath || (await fs.realpath(appPath)) !== appPath || !stillAuthorized()) return false;
+      await run("/usr/bin/open", ["-a", appPath, target], { timeout: 5000 });
       return true;
     } catch {
       return false;
@@ -235,14 +278,8 @@ function registerFileOpen({
         const selectedApp = MAC_APPS.find((app) => app.id === appId);
         const appPath = await findApp(selectedApp);
         if (!appPath || !stillAuthorized()) return false;
-        const executable = path.join(
-          appPath,
-          "Contents",
-          "Resources",
-          "app",
-          "bin",
-          appId === "cursor" ? "cursor" : "code",
-        );
+        const executable = await editorExecutable(appPath, appId);
+        if (!executable || !stillAuthorized()) return false;
         const env = { ...process.env, CURSOR_CLI_BLOCK_CURSOR_AGENT: "true" };
         // A shell-launched desktop must not reuse an inherited editor's IPC connection.
         delete env.VSCODE_IPC_HOOK_CLI;

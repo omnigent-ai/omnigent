@@ -287,7 +287,7 @@ it.each(["primary", "menu"])(
       }
     };
 
-    const fingerprints = ["SHA256:new-host-key"];
+    const fingerprints = ["SHA256:DcVKDkNT1trsHMeIduuDIEvYPWDlTq3PqsRW++VXXzc"];
     getFileOpenSshHost.mockImplementation((_host, keys) =>
       Promise.resolve(keys ? "arca_new.ssh" : null),
     );
@@ -336,7 +336,9 @@ it.each(["old server", "unreachable", "unmatched", "no discovery bridge"])(
     if (mode === "unmatched")
       fetchHost.mockResolvedValue({
         ok: true,
-        json: async () => ({ ssh_host_key_fingerprints: ["SHA256:unknown"] }),
+        json: async () => ({
+          ssh_host_key_fingerprints: ["SHA256:sjpqhDnA3eVRWJPnyQweMjO4YW5jRHDyDcSSi882Cbw"],
+        }),
       });
     if (mode === "no discovery bridge")
       vi.stubGlobal("omnigentDesktop", {

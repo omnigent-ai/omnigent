@@ -7,21 +7,30 @@ const path = require("node:path");
 const { registerFileOpen } = require("../src/fileOpen");
 
 function setup(t, platform = "darwin", overrides = {}) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "omni-open-"));
+  const directory = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omni-open-")));
+  const installApp = (name, cli) => {
+    const bundle = path.join(directory, `${name}.app`);
+    fs.mkdirSync(path.join(bundle, "Contents/Resources/app/bin"), { recursive: true });
+    if (cli) fs.writeFileSync(path.join(bundle, "Contents/Resources/app/bin", cli), "fixture");
+    return bundle;
+  };
+  installApp("Visual Studio Code", "code");
   const file = path.join(directory, "a file #1.txt");
   fs.writeFileSync(file, "test");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const handlers = new Map();
   const calls = [];
+  const signatureChecks = [];
   const event = { trusted: true, sender: {} };
   const serverContext = {};
   const shell = { openPath: async () => "" };
   const run = async (command, args) => {
-    calls.push([command, args]);
-    if (command === "/usr/bin/mdfind" && !args[1].includes("com.microsoft.VSCode")) {
+    if (command === "/usr/bin/codesign") {
+      signatureChecks.push(args);
       return { stdout: "" };
     }
-    return { stdout: "/Applications/Visual Studio Code.app\0" };
+    calls.push([command, args]);
+    return { stdout: "" };
   };
   registerFileOpen({
     ipcMain: { handle: (channel, callback) => handlers.set(channel, callback) },
@@ -58,7 +67,19 @@ function setup(t, platform = "darwin", overrides = {}) {
     );
   const resolve = (fingerprints, senderEvent = event, hostId = "remote") =>
     handlers.get("omnigent:file-open-ssh-host")(senderEvent, hostId, fingerprints);
-  return { directory, file, calls, shell, list, open, openRemote, resolve, event };
+  return {
+    directory,
+    file,
+    calls,
+    signatureChecks,
+    shell,
+    list,
+    open,
+    openRemote,
+    resolve,
+    event,
+    installApp,
+  };
 }
 
 test("discovers SSH connections only for trusted requests without a known mapping", async (t) => {
@@ -83,10 +104,10 @@ test("discovers SSH connections only for trusted requests without a known mappin
 
 test("opens remote files and folders with the same SSH authority as Arca Companion", async (t) => {
   let alias = "arca.ssh";
-  const { directory, openRemote, calls, resolve } = setup(t, "darwin", {
+  const { directory, installApp, openRemote, calls, resolve } = setup(t, "darwin", {
     getVerifiedSshHost: () => alias,
   });
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  installApp("Cursor", "cursor");
   const remotePath = "/home/user/my repo/file #1.ts";
   await resolve();
   assert.equal(await openRemote(remotePath), true);
@@ -108,11 +129,13 @@ test("opens remote files and folders with the same SSH authority as Arca Compani
 });
 
 test("supports VS Code SSH workspaces without probing remote paths on the laptop", async (t) => {
-  const { openRemote, calls, resolve } = setup(t, "darwin", { getVerifiedSshHost: () => "devbox" });
+  const { directory, openRemote, calls, resolve } = setup(t, "darwin", {
+    getVerifiedSshHost: () => "devbox",
+  });
   await resolve();
   assert.equal(await openRemote("/remote/only/repo", "vscode", "devbox", true), true);
   assert.deepEqual(calls.at(-1), [
-    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+    path.join(directory, "Visual Studio Code.app/Contents/Resources/app/bin/code"),
     ["--remote", "ssh-remote+devbox", "--", "/remote/only/repo"],
   ]);
 });
@@ -125,14 +148,14 @@ test("does not inherit another editor's IPC connection and reports CLI errors", 
     else process.env.VSCODE_IPC_HOOK_CLI = previousIpcHook;
   });
   let receivedEnv;
-  const { directory, openRemote, resolve } = setup(t, "darwin", {
+  const { installApp, openRemote, resolve } = setup(t, "darwin", {
     run: async (command, _args, options) => {
-      if (command === "/usr/bin/open") return { stdout: "" };
+      if (["/usr/bin/open", "/usr/bin/codesign"].includes(command)) return { stdout: "" };
       receivedEnv = options.env;
       throw new Error("Editor unavailable");
     },
   });
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  installApp("Cursor", "cursor");
   await resolve();
   assert.equal(await openRemote("/remote/repo"), false);
   assert.equal(receivedEnv.VSCODE_IPC_HOOK_CLI, undefined);
@@ -152,13 +175,13 @@ for (const [source, stage, change] of ["verified", "discovered"].flatMap((mappin
 )) {
   test(`remote opening with ${source} SSH mapping during ${stage} handles ${change}`, async (t) => {
     const calls = [];
-    const pendingCommand = stage === "app discovery" ? "/usr/bin/mdfind" : "/usr/bin/open";
+    const pendingCommand = stage === "app discovery" ? "/usr/bin/codesign" : "/usr/bin/open";
     let alias = "arca.ssh";
     let context = {};
     const operationStarted = Promise.withResolvers();
     const operationComplete = Promise.withResolvers();
     t.after(() => operationComplete.resolve({ stdout: "" }));
-    const { directory, openRemote, resolve } = setup(t, "darwin", {
+    const { directory, installApp, openRemote, resolve } = setup(t, "darwin", {
       getVerifiedSshHost: () => (source === "verified" ? alias : null),
       discoverSshHost: () => alias,
       getServerContext: () => context,
@@ -172,11 +195,14 @@ for (const [source, stage, change] of ["verified", "discovered"].flatMap((mappin
       },
     });
     const appPath = path.join(directory, "Cursor.app");
-    if (stage === "foregrounding") fs.mkdirSync(appPath);
+    installApp("Cursor", "cursor");
     await resolve([alias]);
     const opening = openRemote("/remote/workspace");
     await operationStarted.promise;
-    assert.deepEqual(calls, [pendingCommand]);
+    assert.deepEqual(
+      calls,
+      stage === "app discovery" ? [pendingCommand] : ["/usr/bin/codesign", pendingCommand],
+    );
 
     if (change === "server change") context = {};
     if (change === "alias change" || change === "alias restoration") alias = "other.ssh";
@@ -195,25 +221,28 @@ for (const [source, stage, change] of ["verified", "discovered"].flatMap((mappin
       calls,
       unchanged
         ? [
-            ...(stage === "app discovery" ? ["/usr/bin/mdfind"] : []),
+            "/usr/bin/codesign",
             "/usr/bin/open",
             path.join(appPath, "Contents/Resources/app/bin/cursor"),
           ]
-        : [pendingCommand],
+        : stage === "app discovery"
+          ? [pendingCommand]
+          : ["/usr/bin/codesign", pendingCommand],
     );
   });
 }
 
 test("still hands off the remote path if foregrounding fails", async (t) => {
   let cliLaunched = false;
-  const { directory, openRemote, resolve } = setup(t, "darwin", {
+  const { installApp, openRemote, resolve } = setup(t, "darwin", {
     run: async (command) => {
+      if (command === "/usr/bin/codesign") return { stdout: "" };
       if (command === "/usr/bin/open") throw new Error("activation unavailable");
       cliLaunched = true;
       return { stdout: "" };
     },
   });
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  installApp("Cursor", "cursor");
   await resolve();
   assert.equal(await openRemote("/remote/workspace"), true);
   assert.equal(cliLaunched, true);
@@ -239,11 +268,11 @@ test("rejects invalid SSH destinations, local-only apps, and local hosts on the 
 test("binds remote opening to the resolved host, sender, and server connection", async (t) => {
   let context = {};
   let alias = "arca.ssh";
-  const { directory, openRemote, resolve, event, calls } = setup(t, "darwin", {
+  const { installApp, openRemote, resolve, event, calls } = setup(t, "darwin", {
     getServerContext: () => context,
     getVerifiedSshHost: () => alias,
   });
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  installApp("Cursor", "cursor");
   assert.equal(await openRemote("/repo"), false);
   await resolve();
   assert.equal(await openRemote("/repo", "cursor", "other"), false);
@@ -269,7 +298,7 @@ test("shares discovered aliases and drops in-flight results after a server chang
   const pending = new Promise((resolve) => {
     finish = resolve;
   });
-  const { resolve, openRemote, directory } = setup(t, "darwin", {
+  const { resolve, openRemote, installApp } = setup(t, "darwin", {
     getServerContext: () => context,
     getVerifiedSshHost: () => null,
     discoverSshHost: () => {
@@ -288,7 +317,7 @@ test("shares discovered aliases and drops in-flight results after a server chang
   assert.equal(await resolve(["key"]), "arca.ssh");
   assert.equal(await resolve(), "arca.ssh");
   assert.equal(discoveries, 2);
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  installApp("Cursor", "cursor");
   assert.equal(await openRemote("/repo"), true);
 });
 
@@ -297,7 +326,7 @@ test("requires fresh host fingerprints after discovered SSH mappings expire", as
   const discoveries = [];
   const oldKeys = ["SHA256:old-host-key"];
   const newKeys = ["SHA256:new-host-key"];
-  const { resolve, openRemote, directory, calls } = setup(t, "darwin", {
+  const { resolve, openRemote, installApp, calls } = setup(t, "darwin", {
     now: () => time,
     getVerifiedSshHost: () => null,
     discoverSshHost: async (keys) => {
@@ -305,7 +334,7 @@ test("requires fresh host fingerprints after discovered SSH mappings expire", as
       return keys?.[0] === newKeys[0] ? "arca_new.ssh" : "arca.ssh";
     },
   });
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  installApp("Cursor", "cursor");
   assert.equal(await resolve(oldKeys), "arca.ssh");
   time = 29_999;
   assert.equal(await resolve(), "arca.ssh");
@@ -328,8 +357,8 @@ test("requires fresh host fingerprints after discovered SSH mappings expire", as
 });
 
 test("preserves remote filenames with numeric colon suffixes", async (t) => {
-  const { directory, resolve, openRemote, calls } = setup(t);
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  const { installApp, resolve, openRemote, calls } = setup(t);
+  installApp("Cursor", "cursor");
   await resolve();
   for (const filename of ["log:12", "a:1:2"]) {
     // oxlint-disable-next-line no-await-in-loop -- inspect the command for each completed launch
@@ -338,14 +367,118 @@ test("preserves remote filenames with numeric colon suffixes", async (t) => {
   }
 });
 
+test("does not advertise or launch workspace apps returned by Spotlight", async (t) => {
+  const { directory, list, openRemote, resolve } = setup(t, "darwin", {
+    run: async () => ({ stdout: `${path.join(directory, "workspace/Visual Studio Code.app")}\0` }),
+  });
+  fs.rmSync(path.join(directory, "Visual Studio Code.app"), { recursive: true });
+  fs.mkdirSync(path.join(directory, "workspace/Visual Studio Code.app"), { recursive: true });
+  assert.deepEqual(await list(), [{ id: "default", label: "Default app" }]);
+  await resolve();
+  assert.equal(await openRemote("/repo", "vscode"), false);
+});
+
 test("offers installed apps and the default app without launching anything", async (t) => {
   const { list, calls } = setup(t);
   assert.deepEqual(await list(), [
     { id: "vscode", label: "VS Code" },
     { id: "default", label: "Default app" },
   ]);
-  assert.ok(calls.every(([command]) => command === "/usr/bin/mdfind"));
+  assert.deepEqual(calls, []);
 });
+
+for (const escape of ["application root", "bundle", "CLI"]) {
+  test(
+    `rejects a ${escape} symlink into a workspace`,
+    { skip: process.platform === "win32" },
+    async (t) => {
+      const appDirectories = [];
+      const { directory, installApp, list, open, file, resolve, openRemote, calls } = setup(
+        t,
+        "darwin",
+        { appDirectories },
+      );
+      const appPath = path.join(directory, "Visual Studio Code.app");
+      appDirectories.push(directory);
+      if (escape === "application root") {
+        const workspace = path.join(directory, "workspace");
+        installApp("workspace/Visual Studio Code", "code");
+        const link = path.join(directory, "linked-apps");
+        fs.symlinkSync(workspace, link, "dir");
+        appDirectories[0] = link;
+      } else if (escape === "bundle") {
+        const workspaceApp = installApp("workspace/Visual Studio Code", "code");
+        fs.rmSync(appPath, { recursive: true });
+        fs.symlinkSync(workspaceApp, appPath, "dir");
+      } else {
+        const cli = path.join(appPath, "Contents/Resources/app/bin/code");
+        const outside = path.join(directory, "workspace-cli");
+        fs.writeFileSync(outside, "fixture");
+        fs.unlinkSync(cli);
+        fs.symlinkSync(outside, cli);
+      }
+      assert.deepEqual(await list(), [{ id: "default", label: "Default app" }]);
+      assert.equal(await open(file), false);
+      await resolve();
+      assert.equal(await openRemote("/repo", "vscode"), false);
+      assert.deepEqual(calls, []);
+    },
+  );
+}
+
+for (const [appId, name, bundle, team] of [
+  ["vscode", "Visual Studio Code", "com.microsoft.VSCode", "UBF8T346G9"],
+  ["cursor", "Cursor", "com.todesktop.230313mzl4w4u92", "VDXQ22DGB9"],
+]) {
+  test(`requires the expected ${name} signing identity`, async (t) => {
+    const checks = [];
+    const launches = [];
+    const { installApp, list, open, file, resolve, openRemote } = setup(t, "darwin", {
+      run: async (command, args) => {
+        if (command === "/usr/bin/codesign") {
+          checks.push(args);
+          throw new Error("Signature requirement not satisfied");
+        }
+        launches.push(command);
+        return { stdout: "" };
+      },
+    });
+    const appPath = installApp(name, appId === "vscode" ? "code" : "cursor");
+    assert.ok(!(await list()).some((app) => app.id === appId));
+    assert.equal(await open(file, appId), false);
+    await resolve();
+    assert.equal(await openRemote("/repo", appId), false);
+    assert.deepEqual(
+      checks.find((args) => args.at(-1) === appPath),
+      [
+        "--verify",
+        "--deep",
+        "--strict",
+        "-R",
+        `=identifier "${bundle}" and anchor apple generic and certificate leaf[subject.OU] = "${team}"`,
+        appPath,
+      ],
+    );
+    assert.deepEqual(launches, []);
+  });
+}
+
+test(
+  "rechecks a cached editor CLI before launching",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const { directory, list, resolve, openRemote, calls } = setup(t);
+    await list();
+    const cli = path.join(directory, "Visual Studio Code.app/Contents/Resources/app/bin/code");
+    const outside = path.join(directory, "workspace-cli");
+    fs.writeFileSync(outside, "fixture");
+    fs.unlinkSync(cli);
+    fs.symlinkSync(outside, cli);
+    await resolve();
+    assert.equal(await openRemote("/repo", "vscode"), false);
+    assert.deepEqual(calls, []);
+  },
+);
 
 test("returns real app icons and caches extraction across menu mounts", async (t) => {
   let reads = 0;
@@ -363,13 +496,15 @@ test("returns real app icons and caches extraction across menu mounts", async (t
 
 test("shares app discovery and refreshes installed and missing apps after its TTL", async (t) => {
   let time = 0;
-  const { list, calls, directory } = setup(t, "darwin", { now: () => time });
+  const { list, directory, installApp, signatureChecks } = setup(t, "darwin", {
+    now: () => time,
+  });
   const [first, second] = await Promise.all([list(), list()]);
   assert.deepEqual(first, second);
-  assert.equal(calls.length, 8);
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  assert.equal(signatureChecks.length, 1);
+  installApp("Cursor", "cursor");
   assert.ok(!(await list()).some((app) => app.id === "cursor"));
-  assert.equal(calls.length, 8);
+  assert.equal(signatureChecks.length, 1);
   time += 30_000;
   assert.ok((await list()).some((app) => app.id === "cursor"));
   fs.rmSync(path.join(directory, "Cursor.app"), { recursive: true });
@@ -378,29 +513,32 @@ test("shares app discovery and refreshes installed and missing apps after its TT
 });
 
 test("finds apps in standard directories even without Spotlight metadata", async (t) => {
-  const { list, directory, calls } = setup(t);
-  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  const { list, installApp, calls } = setup(t);
+  installApp("Cursor", "cursor");
   assert.ok((await list()).some((app) => app.id === "cursor"));
-  assert.ok(calls.every(([, args]) => !args[1].includes("com.todesktop.230313mzl4w4u92")));
+  assert.deepEqual(calls, []);
 });
 
 test("opens files and folders with the selected editor using literal path arguments", async (t) => {
-  const { open, file, directory, calls } = setup(t);
+  const { open, file, directory, installApp, calls } = setup(t);
+  installApp("Cursor", "cursor");
   assert.equal(await open(file), true);
   assert.equal(await open(directory, "cursor"), true);
   assert.deepEqual(calls, [
-    ["/usr/bin/open", ["-b", "com.microsoft.VSCode", file]],
-    ["/usr/bin/open", ["-b", "com.todesktop.230313mzl4w4u92", directory]],
+    ["/usr/bin/open", ["-a", path.join(directory, "Visual Studio Code.app"), file]],
+    ["/usr/bin/open", ["-a", path.join(directory, "Cursor.app"), directory]],
   ]);
 });
 
 test("opens terminals at the selected directory or a file's containing directory", async (t) => {
-  const { open, file, directory, calls } = setup(t);
+  const { open, file, directory, installApp, calls } = setup(t);
+  installApp("Terminal");
+  installApp("iTerm");
   assert.equal(await open(file, "terminal"), true);
   assert.equal(await open(directory, "iterm"), true);
   assert.deepEqual(calls, [
-    ["/usr/bin/open", ["-b", "com.apple.Terminal", directory]],
-    ["/usr/bin/open", ["-b", "com.googlecode.iterm2", directory]],
+    ["/usr/bin/open", ["-a", path.join(directory, "Terminal.app"), directory]],
+    ["/usr/bin/open", ["-a", path.join(directory, "iTerm.app"), directory]],
   ]);
 });
 

@@ -4330,21 +4330,27 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     const serverUrl = "https://account.databricks.com/omnigent?o=123";
     const hostId = "a".repeat(32);
     const launches = [];
+    const appDirectories = [];
     const h = loadNavigationHarness({
       serverUrl,
       internalFeatures: true,
       arcaResult: { ok: true, identity: { serverUrl: arcaTarget(serverUrl), hostId } },
       fileOpenOverrides: {
         platform: "darwin",
-        appDirectories: [],
+        appDirectories,
         discoverSshHost: async () => null,
         run: async (command, args) => {
           launches.push([command, args]);
-          return { stdout: command === "/usr/bin/mdfind" ? "/fixture/Cursor.app\0" : "" };
+          return { stdout: "" };
         },
       },
     });
     t.after(h.cleanup);
+    const appRoot = fs.realpathSync(path.dirname(h.settingsPath));
+    appDirectories.push(appRoot);
+    const cli = path.join(appRoot, "Cursor.app/Contents/Resources/app/bin/cursor");
+    fs.mkdirSync(path.dirname(cli), { recursive: true });
+    fs.writeFileSync(cli, "fixture");
     h.api.registerIpc();
     const resolve = h.ipc.get("omnigent:file-open-ssh-host");
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };

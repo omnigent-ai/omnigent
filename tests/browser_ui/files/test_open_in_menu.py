@@ -63,7 +63,11 @@ def test_open_folder_and_file_in_app(
     session.contract.json(f"/v1/hosts/{host_id}/worktrees", {"data": []})
     session.contract.json(
         f"/v1/hosts/{host_id}",
-        {"ssh_host_key_fingerprints": ["SHA256:public-key"] if ssh_host else None},
+        {
+            "ssh_host_key_fingerprints": ["SHA256:Q6RvHQgdJwEw4iEKHeWflxXeAzMH0GjtxlozWyfpXT0"]
+            if ssh_host
+            else None
+        },
     )
     state = [{"id": sid, "state": {"open": True, "widthPx": width, "rightRailTab": "files"}}]
     encoded_state = json.dumps(json.dumps(state))
