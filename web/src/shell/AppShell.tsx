@@ -8,6 +8,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -33,6 +34,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
@@ -359,6 +361,29 @@ function AppShellImpl() {
       sidebarOpenBeforeSettingsRef.current = null;
     }
   }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
+
+  // Below md an open sidebar is a full-window drawer, so narrowing closes it
+  // (except the settings menu) and widening reopens what narrowing closed.
+  const mobileViewport = useIsMobileViewport();
+  const atSettingsRoot =
+    inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
+  const lastMobileViewportRef = useRef(mobileViewport);
+  const sidebarOpenBeforeNarrowRef = useRef(false);
+  useLayoutEffect(() => {
+    if (lastMobileViewportRef.current === mobileViewport) return;
+    lastMobileViewportRef.current = mobileViewport;
+    if (!mobileViewport) {
+      if (sidebarOpenBeforeNarrowRef.current) setSidebarOpen(true);
+      sidebarOpenBeforeNarrowRef.current = false;
+      return;
+    }
+    if (atSettingsRoot) return;
+    setSidebarOpen((open) => {
+      sidebarOpenBeforeNarrowRef.current = open;
+      return false;
+    });
+    setSidebarPeek(false);
+  }, [mobileViewport, atSettingsRoot, setSidebarOpen]);
 
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
