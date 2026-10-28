@@ -143,6 +143,76 @@ async def test_reinstall_updates_in_place(client) -> None:
     assert [row["description"] for row in (await _mine(client, ALICE))["data"]] == ["v2"]
 
 
+@pytest.mark.parametrize("legacy_upload", [False, True])
+async def test_bundle_update_replaces_files_and_preserves_identical_revision(
+    client, agent_store, artifact_store, legacy_upload: bool
+) -> None:
+    from omnigent.server.bundles import bundle_location
+
+    config = (
+        b"spec_version: 1\nname: orion\ndescription: same\n"
+        b"executor:\n  config:\n    harness: claude-sdk\n"
+    )
+    bundle = bundle_files({"config.yaml": config, "old.txt": b"Remove on replacement"})
+    if legacy_upload:
+        agent_id = generate_agent_id()
+        location = bundle_location(agent_id, bundle)
+        artifact_store.put(location, bundle)
+        agent_store.create_user_agent(agent_id, "orion", location, "alice@example.com", "same")
+    else:
+        installed = await client.post(
+            "/v1/agents", headers=ALICE, files={"bundle": ("agent.tar.gz", bundle)}
+        )
+        assert installed.status_code == 200, installed.text
+        agent_id = installed.json()["id"]
+    before = agent_store.get(agent_id)
+    path = f"/v1/agents/{agent_id}/bundle"
+    for mtime in (1, 2):
+        response = await client.put(
+            path, headers=ALICE, files={"bundle": ("agent.tar.gz", _retarred(bundle, mtime))}
+        )
+        assert response.status_code == 200, response.text
+        assert agent_store.get(agent_id) == before
+    artifact_store.delete(before.bundle_location)
+    restored = await client.put(path, headers=ALICE, files={"bundle": ("agent.tar.gz", bundle)})
+    assert restored.status_code == 200, restored.text
+    assert artifact_store.exists(agent_store.get(agent_id).bundle_location)
+    assert restored.json()["id"] == agent_id
+    replacement = bundle_files({"config.yaml": config, "new.txt": b"Replacement content"})
+    updated = await client.put(
+        path,
+        headers={**ALICE, "If-Match": restored.headers["etag"]},
+        files={"bundle": ("agent.tar.gz", replacement)},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["version"] == restored.json()["version"] + 1
+    assert updated.headers["etag"] != restored.headers["etag"]
+    assert artifact_store.get(agent_store.get(agent_id).bundle_location) == replacement
+
+
+async def test_bundle_update_rejects_rename_invalid_payload_and_stale_revision(
+    client, agent_store, monkeypatch
+) -> None:
+    agent_id = (await _install(client, ALICE, "orion")).json()["id"]
+    before = agent_store.get(agent_id)
+    path = f"/v1/agents/{agent_id}/bundle"
+    valid = {"bundle": ("agent.tar.gz", build_agent_bundle("orion", description="new"))}
+    for files, headers, status in (
+        ({"bundle": ("agent.tar.gz", build_agent_bundle("renamed"))}, ALICE, 409),
+        ({"bundle": ("agent.tar.gz", b"invalid")}, ALICE, 400),
+        ({"other": ("agent.tar.gz", b"invalid")}, ALICE, 422),
+        (valid, {**ALICE, "If-Match": '"' + "0" * 64 + '"'}, 412),
+        (valid, {**ALICE, "If-Match": "*"}, 400),
+        (valid, {**ALICE, "Origin": "https://evil.test"}, 403),
+    ):
+        response = await client.put(path, headers=headers, files=files)
+        assert response.status_code == status, response.text
+        assert agent_store.get(agent_id) == before
+    monkeypatch.setattr("omnigent.server.routes.builtin_agents.MAX_INSTALL_BUNDLE_BYTES", 10)
+    assert (await client.put(path, headers=ALICE, files=valid)).status_code == 413
+    assert agent_store.get(agent_id) == before
+
+
 @pytest.mark.parametrize("with_etag", [True, False])
 async def test_config_patch_preserves_identity_and_omitted_fields(
     client, agent_store, with_etag: bool
@@ -223,7 +293,11 @@ async def test_config_patch_checks_owner_before_preconditions(client, agent_stor
     unowned = agent_store.create_user_agent(generate_agent_id(), "legacy", "missing", owner=None)
     server = agent_store.create(generate_agent_id(), "server", "missing")
     for agent_id in (owned, unowned.id, server.id, generate_agent_id()):
-        for method, suffix, kwargs in (("GET", "/config", {}), ("PATCH", "", {"json": {}})):
+        for method, suffix, kwargs in (
+            ("GET", "/config", {}),
+            ("PATCH", "", {"json": {}}),
+            ("PUT", "/bundle", {}),
+        ):
             path = f"/v1/agents/{agent_id}{suffix}"
             assert (await client.request(method, path, headers=ALICE, **kwargs)).status_code == 404
             assert (await client.request(method, path, **kwargs)).status_code == 401
@@ -330,12 +404,22 @@ async def test_config_patch_preconditions_and_body_limit(client, monkeypatch) ->
 
 @pytest.mark.parametrize("with_etag", [True, False])
 @pytest.mark.parametrize("race", ["update", "identical_update", "delete", "artifact_failure"])
+@pytest.mark.parametrize("method", ["PATCH", "PUT"])
 async def test_config_patch_does_not_overwrite_racing_changes(
-    client, agent_store, artifact_store, monkeypatch, race: str, with_etag: bool
+    client, agent_store, artifact_store, monkeypatch, race: str, with_etag: bool, method: str
 ) -> None:
     installed = (await _install(client, ALICE, "orion")).json()
     path = f"/v1/agents/{installed['id']}"
     config = await client.get(f"{path}/config", headers=ALICE)
+    request_body = (
+        {"json": {"description": "loser"}}
+        if method == "PATCH"
+        else {
+            "files": {"bundle": ("agent.tar.gz", build_agent_bundle("orion", description="loser"))}
+        }
+    )
+    if method == "PUT":
+        path += "/bundle"
     before = agent_store.get(installed["id"])
     original_put = artifact_store.put
 
@@ -353,17 +437,19 @@ async def test_config_patch_does_not_overwrite_racing_changes(
     monkeypatch.setattr(artifact_store, "put", put)
     if race == "artifact_failure":
         with pytest.raises(OSError, match="artifact storage unavailable"):
-            await client.patch(
+            await client.request(
+                method,
                 path,
                 headers={**ALICE, **({"If-Match": config.headers["etag"]} if with_etag else {})},
-                json={"description": "loser"},
+                **request_body,
             )
         assert agent_store.get(installed["id"]) == before
     else:
-        result = await client.patch(
+        result = await client.request(
+            method,
             path,
             headers={**ALICE, **({"If-Match": config.headers["etag"]} if with_etag else {})},
-            json={"description": "loser"},
+            **request_body,
         )
         assert result.status_code == 412, result.text
         after = agent_store.get(installed["id"])
@@ -373,7 +459,7 @@ async def test_config_patch_does_not_overwrite_racing_changes(
             if race == "identical_update":
                 assert after.bundle_location != before.bundle_location
                 assert artifact_store.get(after.bundle_location)
-                config = await client.get(f"{path}/config", headers=ALICE)
+                config = await client.get(f"/v1/agents/{installed['id']}/config", headers=ALICE)
                 assert config.status_code == 200, config.text
                 assert config.json()["description"] == "loser"
             else:
@@ -854,10 +940,22 @@ async def test_a_same_named_upload_and_install_stay_separately_manageable(
     uploaded = await create_test_agent(c, name="orion", user="alice@example.com")
     assert uploaded["id"] != installed["id"]
 
+    replaced = await c.put(
+        f"/v1/agents/{uploaded['id']}/bundle",
+        headers=ALICE,
+        files={"bundle": ("agent.tar.gz", build_agent_bundle("orion", description="uploaded v2"))},
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert (replaced.json()["id"], replaced.json()["version"]) == (uploaded["id"], 2)
+    assert (await c.get(f"/v1/agents/{installed['id']}", headers=ALICE)).json()["version"] == 1
+
     reinstalled = (await _install(c, ALICE, "orion", "v2")).json()
     assert (reinstalled["id"], reinstalled["version"]) == (installed["id"], 2)
     listed = {row["id"]: row["name"] for row in (await _mine(c, ALICE))["data"]}
     assert listed == {installed["id"]: "orion", uploaded["id"]: "orion"}
+    assert (await c.get(f"/v1/agents/{uploaded['id']}", headers=ALICE)).json()[
+        "description"
+    ] == "uploaded v2"
 
     removed = await c.delete(f"/v1/agents/{uploaded['id']}?force=true", headers=ALICE)
     assert removed.status_code == 200, removed.text
@@ -1113,7 +1211,7 @@ async def test_mcp_edits_change_the_agent_for_every_session_using_it(
     assert "read-only" in refused.text
 
 
-@pytest.mark.parametrize("edit", ["reinstall", "patch"])
+@pytest.mark.parametrize("edit", ["reinstall", "patch", "bundle"])
 async def test_reinstall_reaches_every_session_on_its_next_turn(
     multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, edit: str
 ) -> None:
@@ -1146,7 +1244,20 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
         monkeypatch.setattr(
             "omnigent.server.routes.sessions._ensure_runner_relay_ready", relay_ready
         )
-        orion = (await _install(c, ALICE, "orion", "v1")).json()
+        if edit == "bundle":
+            parent = (await _install(c, ALICE, "parent")).json()
+            parent_session = (
+                await c.post("/v1/sessions", json={"agent_id": parent["id"]}, headers=ALICE)
+            ).json()
+            uploaded = await _upload(
+                c,
+                ALICE,
+                build_agent_bundle("orion", description="v1"),
+                {"parent_session_id": parent_session["id"]},
+            )
+            orion = {"id": uploaded["agent_id"]}
+        else:
+            orion = (await _install(c, ALICE, "orion", "v1")).json()
         # One session starts from its initial items, the other from a first message.
         kickoff = {"agent_id": orion["id"], "initial_items": [message]}
         sessions = [
@@ -1165,6 +1276,14 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
                 json={"description": "v2"},
             )
             assert updated.status_code == 200, updated.text
+        elif edit == "bundle":
+            updated = await c.put(
+                f"/v1/agents/{orion['id']}/bundle",
+                headers=ALICE,
+                files={"bundle": ("agent.tar.gz", build_agent_bundle("orion", description="v2"))},
+            )
+            assert updated.status_code == 200, updated.text
+            assert (updated.json()["id"], updated.json()["version"]) == (orion["id"], 2)
         else:
             await _install(c, ALICE, "orion", "v2")
         for session in sessions:

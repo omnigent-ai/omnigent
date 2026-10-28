@@ -139,6 +139,9 @@ describe("Custom agents settings", () => {
   it("keeps duplicate names by ID and reviews server agents without mutation actions", async () => {
     mount();
     expect(await screen.findAllByRole("link", { name: "research" })).toHaveLength(2);
+    for (const row of users) {
+      expect(screen.getByText(`${row.id} · v${row.version}`)).toBeVisible();
+    }
     expect(screen.queryByRole("link", { name: /jcode/ })).toBeNull();
     fireEvent.click(screen.getByRole("link", { name: /Polly description/ }));
     expect(await screen.findByRole("heading", { name: "Polly" })).toBeVisible();

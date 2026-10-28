@@ -12220,7 +12220,9 @@ def _agent_cli_error(message: str) -> click.ClickException:
 
 
 @contextlib.contextmanager
-def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[explicit-any]  # httpx imported lazily
+def _agent_api_client(  # type: ignore[explicit-any]  # httpx imported lazily
+    server: str | None, *, bundle_update: bool = False
+) -> Iterator[Any]:
     """Yield an authenticated client for ``/v1/agents`` on the resolved server."""
     import httpx
 
@@ -12249,6 +12251,10 @@ def _agent_api_client(server: str | None) -> Iterator[Any]:  # type: ignore[expl
             raise _agent_cli_error(
                 f"{base_url} does not support installing agents; upgrade the server "
                 "to use `omnigent agent`."
+            )
+        if bundle_update and info.json().get("agent_bundle_update") is not True:
+            raise _agent_cli_error(
+                "This server does not support bundle updates; upgrade the server."
             )
         yield client
 
@@ -12384,16 +12390,24 @@ def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
         raise _agent_cli_error(f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}")
 
 
-def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
-    resp = client.post(
-        "/v1/agents",
+def _upload_agent(  # type: ignore[explicit-any]  # httpx.Client
+    client: Any, bundle_bytes: bytes, *, agent_id: str | None = None
+) -> None:
+    from urllib.parse import quote
+
+    resp = client.request(
+        "PUT" if agent_id is not None else "POST",
+        f"/v1/agents/{quote(agent_id, safe='')}/bundle" if agent_id is not None else "/v1/agents",
         files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
     )
+    if agent_id is not None and resp.status_code in (405, 501):
+        raise _agent_cli_error("This server does not support bundle updates; upgrade the server.")
     _raise_for_agent_api(resp)
     agent = resp.json()
     name = _printable(str(agent["name"]))
-    click.echo(f"Installed {name} (version {agent['version']}, id {agent['id']})")
-    if agent["version"] > 1:
+    verb = "Updated" if agent_id is not None else "Installed"
+    click.echo(f"{verb} {name} (version {agent['version']}, id {agent['id']})")
+    if agent_id is not None or agent["version"] > 1:
         # Terminal (TUI) harnesses keep the agent they launched with.
         click.echo(
             "Sessions using it pick up this version on their next turn; "
@@ -12411,7 +12425,9 @@ def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[exp
 def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> None:
     """Install SOURCE: an agent directory, YAML file, .tar.gz bundle, or GitHub repo.
 
-    Re-adding an agent with the same name replaces your copy in place.
+    Re-adding an installed agent with the same name replaces that copy in place.
+    To replace a session upload or a particular same-named agent, use
+    ``omnigent agent update ID SOURCE`` instead.
     Workers, skills, guardrails, and supporting files in the directory are
     all kept. For a directory, ``${VAR}`` references are resolved from this
     shell, as ``omnigent run`` does; a YAML file or tarball is uploaded as is.
@@ -12501,6 +12517,26 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
                     failed.append(n)
         if failed:
             raise _agent_cli_error(f"{len(failed)} of {len(bundles)} agent(s) not installed.")
+
+
+@agent_grp.command("update")
+@click.argument("agent_id")
+@click.argument("source", type=click.Path(exists=True, path_type=Path))
+@_AGENT_SERVER_OPTION
+def agent_update(agent_id: str, source: Path, server: str | None) -> None:
+    """Replace AGENT_ID's complete bundle from a local directory, YAML, or .tar.gz.
+
+    Find the ID in `omnigent agent list` or Settings. The bundle name must
+    match. The ID stays unchanged and all sessions using it receive the update
+    on their next turn; native terminal sessions do when they relaunch.
+    Separate agents with the same name are unaffected.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", agent_id):
+        raise click.BadParameter(
+            "Use an agent ID from `omnigent agent list`.", param_hint="AGENT_ID"
+        )
+    with _agent_api_client(server, bundle_update=True) as client:
+        _upload_agent(client, _bundle(source), agent_id=agent_id)
 
 
 def _list_agents(client: Any) -> list[dict[str, Any]]:  # type: ignore[explicit-any]  # httpx.Client + JSON rows

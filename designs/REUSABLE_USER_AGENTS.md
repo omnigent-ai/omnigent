@@ -127,6 +127,7 @@ the user's 30 most recent sessions.
 | 21 | The runner's existing missing-agent text is unified to the new guidance ("This agent no longer exists. Fork this session into another agent to continue."). Text-only change; tests updated. | One message for one condition. |
 | 22 | The picker follows the "my agents" cursor until it has 50 agent names, at most 5 pages, so neither a page of skipped copies nor many rows of one name (one per run, from servers before decision 23) hides an older agent; `omnigent agent list` pages through all of them. | Bounded picker load. |
 | 23 | A top-level session upload binds the uploader's row that holds the same files under the same name, creating it on first use. Its id is derived: `sha256("uploaded:" + (owner or "") + "\0" + name + "\0" + files + "\0" + attempt)[:32]`, where `files` hashes each entry's path, type, executable bit, and bytes, not archive timestamps, owners, or order. A row an MCP edit has changed is passed over for the next `attempt` (at most 3, then a fresh row), so a session always starts on the uploaded files. A sub-agent child upload keeps a row of its own: binding an existing row would add the per-parent title check that child creates never had. Installs name their blob by the same hash. | Agents outlive sessions (decision 9), so a row per `omnigent run` would pile up in "my agents" and the picker; rerunning the same files is one agent. |
+| 24 | Explicit whole-bundle updates target an owned agent ID, including uploads and child agents, preserving its ID and session bindings. Same-named installs and uploads remain independent. | Name alone cannot identify which sessions should receive a change. Updating the existing ID fulfills decision 6 without merging unrelated agents or rebinding sessions. |
 
 ## 6. Design
 
@@ -394,6 +395,7 @@ agents stay read-only. Tests lock this in.
 
 ```
 omnigent agent add <dir | file.yaml | bundle.tar.gz> [--server URL]
+omnigent agent update <id> <dir | file.yaml | bundle.tar.gz> [--server URL]
 omnigent agent list [--server URL]
 omnigent agent remove <name | id> [--yes] [--server URL]
 ```
@@ -401,6 +403,10 @@ omnigent agent remove <name | id> [--yes] [--server URL]
 - Every command first checks `/v1/info`; a server without `agent_install` gets
   "<server> does not support installing agents; upgrade the server to use `omnigent agent`."
 - `list` pages `scope=user` to completion and prints a table of name, version, harness, and id.
+- `update` replaces the complete bundle of the specified ID, requiring the same name.
+  It also checks `/v1/info.agent_bundle_update`; older servers get an upgrade message,
+  never a fallback install. Sources are local directories, YAML files, or tarballs,
+  bundled the same way as `add`.
 - `remove` resolves an id or a name in `scope=user`; a name several agents share is refused with
   their ids, so the user removes one by id. It sends `DELETE`; on 409 shows the session count and
   asks "Remove anyway?"; `--yes` sends `force=true` directly.
@@ -418,7 +424,7 @@ omnigent agent remove <name | id> [--yes] [--server URL]
 
 ### 6.18 Revision changes reach running sessions
 
-A reinstall or MCP edit keeps the agent id and changes `bundle_location`. Every cache keyed by id
+A reinstall, explicit bundle update, or MCP edit keeps the agent id and changes `bundle_location`. Every cache keyed by id
 must notice:
 
 - **Server `AgentCache`**: entries remember the bundle location they were built from, in memory and
@@ -437,6 +443,28 @@ must notice:
 
 A native terminal session (a TUI) keeps the configuration it launched with until it relaunches. `omnigent agent add` says so when it
 updates an agent.
+
+### 6.19 Update an existing upload or child agent
+
+`PUT /v1/agents/{id}/bundle` accepts the same size-bounded, validated multipart
+bundle as installation. Only the owner can update a user agent; server agents and
+another user's copies cannot be changed. The name must match the target (409 on
+rename). This replaces all bundle files and settings, including credentials;
+omitted content is removed. Use the configuration PATCH for partial edits.
+
+The route reuses the configuration store's atomic revision check. It accepts an
+optional configuration `If-Match` ETag, returns the updated agent and ETag, and
+returns 412 for a stale tag or a concurrent edit/deletion. Identical files keep the
+revision, including older uploads whose archive metadata produced a different
+hash. Changed configuration increments the version and follows section 6.18.
+Active turns finish with their current configuration; session overrides still apply.
+
+Settings shows each owned ID and version so same-named records can be distinguished.
+To update old sessions, choose the ID those sessions already use. Updating another
+same-named ID does not move them. Both records stay manageable; the picker keeps
+its existing most-recently-changed rule. Child uploads remain independent records,
+and cross-user copies stay isolated. There is no schema migration, automatic
+deduplication, deletion, or session rebinding.
 
 ## 7. Security considerations
 

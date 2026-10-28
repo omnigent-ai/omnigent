@@ -9,6 +9,7 @@ the new-session picker, which then creates a session with
 
 User agents belong to one user (``designs/REUSABLE_USER_AGENTS.md``):
 ``POST /v1/agents`` installs one (``omnigent agent add``),
+``PUT /v1/agents/{id}/bundle`` updates one by ID (``omnigent agent update``),
 ``GET /v1/agents?scope=user`` lists the caller's own, and
 ``DELETE /v1/agents/{id}`` removes one. Uploading a bundle with a new
 session (multipart ``POST /v1/sessions``) also creates one.
@@ -185,7 +186,7 @@ class _AgentRoute(APIRoute):
     def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
         handler = super().get_route_handler()
         patch = "PATCH" in self.methods
-        if not patch and not self.path.endswith("/{agent_id}/config"):
+        if not patch and not self.path.endswith(("/{agent_id}/config", "/{agent_id}/bundle")):
             return handler
 
         async def patch_handler(request: Request) -> Response:
@@ -232,6 +233,45 @@ def _config_headers(response: Response, agent: Agent) -> None:
     response.headers["ETag"] = _config_etag(agent)
     response.headers["Cache-Control"] = "no-store"
     response.headers["Access-Control-Expose-Headers"] = "ETag"
+
+
+async def _read_agent_bundle(request: Request) -> tuple[bytes, AgentSpec]:
+    """Read a size-bounded multipart bundle and validate it as tenant input."""
+    length = request.headers.get("content-length", "")
+    if length.isdigit() and int(length) > MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES:
+        raise _too_large()
+    async with _body_capped(request).form() as form:
+        bundle = form.get("bundle")
+        if not isinstance(bundle, UploadFile):
+            raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
+        if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
+            raise _too_large()
+        bundle_bytes = await bundle.read()
+    spec = await asyncio.to_thread(
+        validate_agent_bundle, bundle_bytes, enforce_handler_allowlist=True
+    )
+    return bundle_bytes, spec
+
+
+def _check_config_revision(request: Request, agent: Agent, if_match: str | None) -> None:
+    """Reject malformed or stale revision preconditions before changing a bundle."""
+    if if_match is None:
+        return
+    if len(request.headers.getlist("if-match")) != 1 or not (
+        len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "invalid_input", "message": "Supply one strong configuration ETag"},
+        )
+    if if_match != _config_etag(agent):
+        raise HTTPException(
+            status_code=412,
+            detail={
+                "code": "precondition_failed",
+                "message": "Agent changed; reload before saving",
+            },
+        )
 
 
 def install_user_agent(
@@ -405,15 +445,7 @@ def create_builtin_agents_router(
     ) -> AgentConfigObject | JSONResponse:
         """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
-        if if_match is not None:
-            if len(request.headers.getlist("if-match")) != 1 or not (
-                len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
-            ):
-                return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
-            if if_match != _config_etag(agent):
-                return _config_error(
-                    412, "precondition_failed", "Agent changed; reload before saving"
-                )
+        _check_config_revision(request, agent, if_match)
         bundle, spec, location = await asyncio.to_thread(configuration, agent, body)
         if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
             raise _too_large()
@@ -547,20 +579,7 @@ def create_builtin_agents_router(
         require_user_agents()
         if artifact_store is None:
             raise OmnigentError("artifact store is not configured", code=ErrorCode.INTERNAL_ERROR)
-        length = request.headers.get("content-length", "")
-        if length.isdigit() and int(length) > MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES:
-            raise _too_large()
-        bundle = (await _body_capped(request).form()).get("bundle")
-        if not isinstance(bundle, UploadFile):
-            raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
-        if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
-            raise _too_large()
-        bundle_bytes = await bundle.read()
-        spec = await asyncio.to_thread(
-            validate_agent_bundle,
-            bundle_bytes,
-            enforce_handler_allowlist=True,
-        )
+        bundle_bytes, spec = await _read_agent_bundle(request)
         if spec.name is None:  # validate_agent_bundle rejects this; narrows the type
             raise OmnigentError("agent spec has no name", code=ErrorCode.INVALID_INPUT)
         agent = await asyncio.to_thread(
@@ -574,6 +593,56 @@ def create_builtin_agents_router(
         )
         # Loads (extracts) the just-written bundle; keep it off the event loop.
         return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
+
+    @router.put(
+        "/agents/{agent_id}/bundle",
+        response_model=AgentObject,
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def replace_agent_bundle(
+        request: Request,
+        agent_id: str,
+        response: Response,
+        if_match: str | None = Header(default=None),
+    ) -> AgentObject | JSONResponse:
+        """Replace an owned agent's complete bundle while preserving its ID and sessions.
+
+        Accepts the same multipart ``bundle`` as installation. The bundle name
+        must match the target; separate same-named agents remain independent.
+        Sessions resolve the new revision on their next turn; native terminals
+        adopt launch configuration when relaunched. Optional ``If-Match`` uses
+        the configuration ETag. A concurrent edit or deletion returns 412.
+        """
+        agent = await editable_agent(request, agent_id)
+        _check_config_revision(request, agent, if_match)
+        bundle_bytes, spec = await _read_agent_bundle(request)
+        if spec.name != agent.name:
+            raise OmnigentError(
+                "Bundle name must match the agent being updated; renaming is not supported",
+                code=ErrorCode.CONFLICT,
+            )
+        assert artifact_store is not None
+
+        def replace() -> Agent | None:
+            location = content_bundle_location(agent.id, bundle_bytes)
+            # Older uploads use an archive hash; identical files still keep their revision.
+            if location != agent.bundle_location and artifact_store.exists(agent.bundle_location):
+                current = artifact_store.get(agent.bundle_location)
+                if content_bundle_location(agent.id, current) == location:
+                    location = agent.bundle_location
+            artifact_store.put(location, bundle_bytes)
+            return agent_store.update_configuration(
+                agent,
+                location,
+                description=agent.description if agent.description == spec.description else None,
+            )
+
+        updated = await asyncio.to_thread(replace)
+        if updated is None:
+            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
+        agent_cache.evict(agent.id)
+        _config_headers(response, updated)
+        return await asyncio.to_thread(_to_agent_object, updated, agent_cache)
 
     @router.delete("/agents/{agent_id}")
     async def remove_agent(

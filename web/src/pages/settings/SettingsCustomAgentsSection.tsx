@@ -210,6 +210,9 @@ export function SettingsCustomAgentsSection() {
         <h2 className="mb-3 text-xs font-medium uppercase tracking-wide text-muted-foreground">
           Yours
         </h2>
+        <p className="mb-3 text-ui text-muted-foreground">
+          Each ID is a separate agent. Editing it updates sessions using that ID.
+        </p>
         {filtered.length > 0 && (
           <div className="overflow-x-auto">
             <table className="w-full min-w-[36rem] text-left text-ui">
@@ -249,6 +252,9 @@ export function SettingsCustomAgentsSection() {
                           <span className="block truncate font-medium">{agent.name}</span>
                           <span className="block truncate text-xs text-muted-foreground">
                             {agent.description}
+                          </span>
+                          <span className="block break-all font-mono text-xs text-muted-foreground">
+                            {agent.id} · v{agent.version}
                           </span>
                         </span>
                       </Link>

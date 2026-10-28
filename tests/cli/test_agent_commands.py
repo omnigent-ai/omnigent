@@ -22,6 +22,7 @@ class _FakeServer:
     def __init__(self) -> None:
         self.seen: list[httpx.Request] = []
         self.agent_install = True
+        self.agent_bundle_update = True
         self.sessions_in_use: str | None = None
         # The caller's own agents (GET /v1/agents?scope=user), one page per entry.
         self.pages = [
@@ -41,9 +42,15 @@ class _FakeServer:
         self.seen.append(request)
         if request.url.path == "/v1/info":
             return httpx.Response(
-                200, json={"agent_install": self.agent_install} if self.agent_install else {}
+                200,
+                json={
+                    "agent_install": self.agent_install,
+                    "agent_bundle_update": self.agent_bundle_update,
+                }
+                if self.agent_install
+                else {},
             )
-        if request.method == "POST":
+        if request.method in ("POST", "PUT"):
             return httpx.Response(200, json={"id": "ag_orion", "name": "orion", "version": 3})
         if request.method == "DELETE":
             if self.sessions_in_use and request.url.params.get("force") != "true":
@@ -101,7 +108,7 @@ def test_add_uploads_the_whole_directory(tmp_path: Path, server: _FakeServer) ->
 def _posted_tars(server: _FakeServer) -> list[dict[str, bytes]]:
     """The files of each uploaded bundle, in upload order."""
     out = []
-    for post in (r for r in server.seen if r.method == "POST"):
+    for post in (r for r in server.seen if r.method in ("POST", "PUT")):
         body = post.read()
         boundary = post.headers["content-type"].split("boundary=")[1].encode()
         start = body.index(b"\x1f\x8b")
@@ -109,6 +116,53 @@ def _posted_tars(server: _FakeServer) -> list[dict[str, bytes]]:
         with tarfile.open(fileobj=io.BytesIO(gzip.decompress(tar_bytes)), mode="r:") as tf:
             out.append({m.name: tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()})
     return out
+
+
+def test_update_targets_an_id_and_keeps_the_whole_bundle(
+    tmp_path: Path, server: _FakeServer
+) -> None:
+    (tmp_path / "config.yaml").write_text("spec_version: 1\nname: orion\n")
+    (tmp_path / "instructions.md").write_text("Updated instructions")
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "update", "ag_orion", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "Updated orion (version 3, id ag_orion)" in result.output
+    assert "next turn" in result.output and "relaunch" in result.output
+    assert [(r.method, r.url.path) for r in server.seen] == [
+        ("GET", "/v1/info"),
+        ("PUT", "/v1/agents/ag_orion/bundle"),
+    ]
+    assert _posted_tars(server)[0]["instructions.md"] == b"Updated instructions"
+
+
+def test_update_on_an_older_server_explains_upgrade(tmp_path: Path, server: _FakeServer) -> None:
+    server.agent_bundle_update = False
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "update", "ag_orion", str(tmp_path)])
+    assert result.exit_code != 0 and "upgrade the server" in result.output
+    assert [r.method for r in server.seen] == ["GET"]
+
+
+@pytest.mark.parametrize("status", [404, 409, 412, 405, 501])
+def test_update_failure_never_falls_back_to_install(
+    tmp_path: Path, server: _FakeServer, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    (tmp_path / "config.yaml").write_text("name: orion\n")
+    original = server.__call__
+
+    def reply(request):
+        if request.method == "PUT":
+            server.seen.append(request)
+            return httpx.Response(status, json={"detail": "Update refused"})
+        return original(request)
+
+    monkeypatch.setattr(_FakeServer, "__call__", lambda self, request: reply(request))
+    result = CliRunner().invoke(cli_mod.cli, ["agent", "update", "ag_orion", str(tmp_path)])
+    assert result.exit_code != 0
+    assert (
+        "upgrade the server" in result.output
+        if status in (405, 501)
+        else str(status) in result.output
+    )
+    assert not any(r.method == "POST" for r in server.seen)
 
 
 _FakeRepo = tuple[Path, list[tuple[str, str | None]]]

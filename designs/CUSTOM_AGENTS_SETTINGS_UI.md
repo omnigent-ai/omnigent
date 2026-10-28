@@ -12,6 +12,7 @@ send direct links to General settings. When those gates pass but
 notice and makes no agent requests.
 
 - List server agents and owned agents separately; retain duplicate names by ID.
+  Show owned IDs and versions in the list so the rows can be distinguished.
 - Page through `GET /v1/agents` and `GET /v1/agents?scope=user`.
 - Reuse the new-session creation form and bundle builder. Save with multipart
   `POST /v1/agents`, without creating a session.
@@ -30,7 +31,8 @@ management pages, capability gating, and confirmation/error states. It introduce
 no alternative agent store or mutation API. The upload helper matches #8680's
 import helper so the two UI changes can converge on one implementation.
 
-`POST /v1/agents` replaces the entire bundle for an existing owner/name. The form
+`POST /v1/agents` replaces the entire bundle for the installed owner/name identity;
+a same-named session upload remains separate. The form
 states this before saving. Summary responses do not contain the original model,
 instructions, or unredacted MCP configuration, so this PR cannot safely prefill
 an editor. Direct detail links issue one by-ID query, with a missing-agent message on
@@ -129,3 +131,12 @@ run counts and global sorting require separate server support.
 
 Verification entry points and steps are in
 [the feature map](../feature-map/custom-agents.md).
+
+## Complete bundle updates
+
+`omnigent agent update <id> <local-source>` uses `PUT /v1/agents/{id}/bundle`
+to replace an owned agent's files and settings while preserving the ID used by
+existing sessions. Unlike creation/import, this also targets session uploads and
+child agents. The source name must match. Omitted files/settings are removed;
+partial Settings edits continue to use PATCH. See the ownership, concurrency,
+and revision rules in [the reusable-agent design](REUSABLE_USER_AGENTS.md#619-update-an-existing-upload-or-child-agent).
