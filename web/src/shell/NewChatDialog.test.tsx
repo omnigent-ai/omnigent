@@ -8515,6 +8515,144 @@ describe("NewChatLandingScreen skills menu", () => {
     );
   }
 
+  it.each([
+    { agentId: "a1", harness: "claude-native", prefix: "/" },
+    { agentId: "a2", harness: "codex-native", prefix: "$" },
+  ])(
+    "discovers Arca skills before provisioning and delivers the first $harness prompt",
+    async ({ agentId, harness, prefix }) => {
+      const { useSkills: realHook } =
+        await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");
+      vi.mocked(useSkills).mockImplementation(realHook);
+      mockHosts([host("online"), { ...host("online"), host_id: "arca", name: "corey's arca" }]);
+      localStorage.setItem(LAST_AGENT_KEY, agentId);
+      authenticatedFetchMock.mockImplementation(async (url) =>
+        String(url).startsWith("/v1/skills?")
+          ? ({
+              ok: true,
+              json: async () => ({
+                skills: [{ name: "arca-review", description: "Review on Arca" }],
+              }),
+            } as Response)
+          : ({ ok: true, json: async () => ({ id: "conv_new" }) } as Response),
+      );
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "arclet",
+        durable_initial_input: true,
+      });
+      typeMessage(`${prefix}arca`);
+      fireEvent.click(await screen.findByTestId("slash-menu-item-arca-review"));
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(`${prefix}arca-review `);
+      expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
+      const discoveryUrl = new URL(String(authenticatedFetchMock.mock.calls[0]![0]), "http://test");
+      expect(Object.fromEntries(discoveryUrl.searchParams)).toEqual({
+        host_id: "arca",
+        harness,
+        path: "~",
+        agent_id: agentId,
+      });
+      typeMessage(`${prefix}arca-review check these changes`);
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(
+          true,
+        ),
+      );
+      const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+      const body = JSON.parse(init!.body as string);
+      expect(body).toMatchObject({
+        host_type: "managed",
+        sandbox_provider: "arclet",
+        initial_input: {
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: `${prefix}arca-review check these changes` }],
+          },
+        },
+      });
+      expect(body.host_id).toBeUndefined();
+    },
+  );
+
+  it("loads Arclet skills when hosts arrive and hides them when the Arca disconnects", () => {
+    const arca: Host = { ...host("online"), host_id: "arca", name: "corey's arca" };
+    mockHosts(undefined);
+    mockSkills({ skills: [{ name: "arca-review", description: "Review on Arca" }] });
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "arclet" });
+    typeMessage("/");
+    expect(screen.getByText("Loading skills…")).toBeInTheDocument();
+    mockHosts([arca]);
+    typeMessage("/arca");
+    expect(screen.getByTestId("slash-menu-item-arca-review")).toBeInTheDocument();
+    mockHosts([host("online"), { ...arca, status: "offline" }]);
+    typeMessage("/arc");
+    expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Connect your Arca to discover skills before the sandbox starts."),
+    ).toBeInTheDocument();
+    expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
+  });
+
+  it.each([
+    { prompt: "/arca-review check these changes", bundled: false },
+    { prompt: "/review-pr check these changes", bundled: true },
+  ])(
+    "keeps SDK Arclet skill invocation scoped to its bundle: $prompt",
+    async ({ prompt, bundled }) => {
+      mockAgents([skilledAgent()]);
+      mockHosts([{ ...host("online"), name: "corey's arca" }]);
+      mockSkills({ skills: [{ name: "arca-review", description: "Only available on Arca" }] });
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "arclet",
+        durable_initial_input: true,
+      });
+      typeMessage("/");
+      expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+      expect(screen.getByTestId("slash-menu-item-review-pr")).toBeInTheDocument();
+      expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
+      typeMessage(prompt);
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() =>
+        expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(
+          true,
+        ),
+      );
+      const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+      const body = JSON.parse(init!.body as string);
+      expect(body.host_type).toBe("managed");
+      expect(body.initial_input).toEqual(
+        bundled
+          ? {
+              type: "slash_command",
+              data: { kind: "skill", name: "review-pr", arguments: "check these changes" },
+            }
+          : {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: prompt }] },
+            },
+      );
+    },
+  );
+
+  it("keeps other sandbox providers from previewing connected Arca skills", () => {
+    mockHosts([{ ...host("online"), name: "corey's arca" }]);
+    mockSkills({ skills: [{ name: "arca-review", description: "Review on Arca" }] });
+    renderLanding({ managed_sandboxes_enabled: true, sandbox_provider: "modal" });
+    typeMessage("/");
+    expect(screen.queryByTestId("slash-menu-item-arca-review")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Host skills will be available after the sandbox starts."),
+    ).toBeInTheDocument();
+    expect(useSkills).toHaveBeenLastCalledWith({ target: null, enabled: false, starting: false });
+  });
+
   it("updates and selects arriving skills under StrictMode without retyping", async () => {
     const { useSkills: realHook } =
       await vi.importActual<typeof UseSkillsModule>("@/hooks/useSkills");

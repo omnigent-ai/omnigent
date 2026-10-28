@@ -300,6 +300,14 @@ and steers messages while the agent is busy.
   resumes after the first input is delivered.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session.
+- With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
+  and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
+  catalog; selecting a skill completes the prompt while the launch stays on Arclet.
+  Runtime availability follows Arclet's existing skill sync and plugin installation;
+  custom skill roots or plugins installed only on Arca may be absent on Arclet.
+  With no connected Arca, host skills become available after the sandbox starts.
+  SDK agents continue using their bundled skills before the sandbox starts.
+  Browser coverage: `tests/browser_ui/chat/test_arclet_skills.py`.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections

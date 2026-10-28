@@ -9,6 +9,7 @@ Covers ``omnigent.host.local_server``: reuse-vs-respawn detection
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import textwrap
 from pathlib import Path
@@ -1063,6 +1064,7 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_process_uses_local_data_dir", lambda pid: True)
     terminated: list[int] = []
     monkeypatch.setattr(local_server, "_terminate_pid", terminated.append)
 
@@ -1071,6 +1073,64 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     # The first lsof PID is the listener; it must actually be terminated.
     assert result == 93359
     assert terminated == [93359]
+
+
+def test_stop_untracked_local_server_preserves_other_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_server, "_local_server_health_ok", lambda url: True)
+    monkeypatch.setattr(local_server, "_pid_listening_on_port", lambda port: 93359)
+    monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_process_uses_local_data_dir", lambda pid: False)
+    monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
+    assert local_server.stop_untracked_local_server(port=8000) is None
+
+
+@pytest.mark.parametrize(
+    "home_name,data_dir,expected",
+    [
+        ("owner", None, True),
+        ("other", None, False),
+        ("other", "{root}/owner/.omnigent", True),
+        ("owner", "{root}/other/.omnigent", False),
+        ("owner", ".omnigent", True),
+        ("owner", ".", False),
+        ("owner", "~", False),
+        ("owner", "~/.omnigent", True),
+        ("owner", "~///.omnigent", True),
+        ("other", "~//{root}/owner/.omnigent", False),
+        (None, "{root}/owner/.omnigent", True),
+        (None, "~/.omnigent", False),
+        (None, None, False),
+    ],
+)
+def test_process_runtime_ownership_uses_its_environment_and_working_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    home_name: str | None,
+    data_dir: str | None,
+    expected: bool,
+) -> None:
+    owner_home = tmp_path / "owner"
+    monkeypatch.setattr(local_server, "_local_data_dir", lambda: owner_home / ".omnigent")
+    environment = {"USERPROFILE": str(owner_home)} if os.name == "posix" else {}
+    if home_name is not None:
+        environment["HOME"] = str(tmp_path / home_name)
+    if data_dir is not None:
+        environment["OMNIGENT_DATA_DIR"] = data_dir.format(root=tmp_path)
+    with patch.object(local_server.psutil, "Process") as process:
+        process.return_value.environ.return_value = environment
+        process.return_value.cwd.return_value = str(owner_home)
+        assert local_server._process_uses_local_data_dir(93359) is expected
+
+
+@pytest.mark.parametrize("error_name", ["AccessDenied", "NoSuchProcess"])
+def test_process_runtime_ownership_refuses_uninspectable_process(
+    error_name: str,
+) -> None:
+    with patch.object(local_server.psutil, "Process") as process:
+        process.return_value.environ.side_effect = getattr(local_server.psutil, error_name)(93359)
+        assert local_server._process_uses_local_data_dir(93359) is False
 
 
 def test_stop_untracked_local_server_noop_when_nothing_listening(

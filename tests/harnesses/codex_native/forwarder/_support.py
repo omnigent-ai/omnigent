@@ -10,6 +10,47 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
 )
 
+_Tokens = tuple[int, int, int]
+
+
+def _usage_event(
+    thread_id: str, total: _Tokens, last: _Tokens, turn_id: str | None = None
+) -> dict:
+    """Build a ``thread/tokenUsage/updated`` notification from ``(input, cached, output)``."""
+
+    def breakdown(tokens: _Tokens) -> dict[str, int]:
+        return {
+            "inputTokens": tokens[0],
+            "cachedInputTokens": tokens[1],
+            "outputTokens": tokens[2],
+        }
+
+    return {
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id or f"turn_{thread_id}",
+            "tokenUsage": {
+                "total": breakdown(total),
+                "last": breakdown(last),
+                "modelContextWindow": 258400,
+            },
+        },
+    }
+
+
+def _posted_cumulative_tokens(posts: list[tuple[str, dict]], session_id: str) -> list[_Tokens]:
+    """Return the cumulative ``(input, cached, output)`` usage posted to one session."""
+    return [
+        (
+            body["data"]["cumulative_input_tokens"],
+            body["data"]["cumulative_cache_read_input_tokens"],
+            body["data"]["cumulative_output_tokens"],
+        )
+        for url, body in posts
+        if url == f"/v1/sessions/{session_id}/events" and body["type"] == "external_session_usage"
+    ]
+
 
 class _RecordingClient:
     """

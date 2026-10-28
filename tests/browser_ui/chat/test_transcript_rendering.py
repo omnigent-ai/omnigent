@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -402,6 +403,94 @@ def test_virtualized_transcript_returns_after_losing_layout(
         transcript.evaluate("element => { element.style.display = ''; }")
         page.wait_for_timeout(150)  # Let restored layout observers settle.
         expect(newest_reply).to_be_visible(timeout=5_000)
+
+
+def _tall_topped_history() -> list[dict[str, object]]:
+    """A short session whose two tallest messages sit just past the overscan at the bottom."""
+    log = "\n".join(
+        f"[ERROR] step {i}: cherry-pick conflict in build settings for dbr-branch-{i}"
+        for i in range(48)
+    )
+    answer = "\n\n".join(
+        f"Paragraph {i}: the backport needs the build-settings change from master "
+        "before the 19.x job can pass, so both targets get the same fix."
+        for i in range(13)
+    )
+    chronological = [
+        message_item("tall-log", "user", log, response_id="tall-0"),
+        message_item("tall-ack", "assistant", "Looking at that log now.", response_id="tall-0"),
+        message_item("tall-ask", "user", "What does it say?", response_id="tall-1"),
+        message_item("tall-answer", "assistant", answer, response_id="tall-1"),
+    ]
+    for n in range(6):
+        response_id = f"short-{n}"
+        reply = "Done." if n % 2 else "Checked both branches; the master audit still passes."
+        chronological += [
+            message_item(
+                f"{response_id}-ask",
+                "user",
+                f"Follow-up {n}: keep going.",
+                response_id=response_id,
+            ),
+            message_item(f"{response_id}-reply", "assistant", reply, response_id=response_id),
+        ]
+    return list(reversed(chronological))
+
+
+def _wheel(page: Page, total: float, steps: int = 40) -> None:
+    """A trackpad-like fling: front-loaded wheel deltas that taper off."""
+    for i in range(steps):
+        page.mouse.wheel(0, total / steps * 2.0 * (steps - i) / steps)
+        page.wait_for_timeout(8)
+
+
+def test_reduced_motion_transcript_holds_still_at_the_bottom(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """With reduced motion, the bottom of a live turn doesn't flip between rows every frame."""
+    page.emulate_media(reduced_motion="reduce")
+    chat = chat_session_contract
+    chat.set_items(_tall_topped_history())
+    chat.update_session(status="running")
+    open_live(page, chat, {"width": 1240, "height": 1051})
+    chat.emit_busy("tall-live")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible(timeout=20_000)
+
+    transcript = page.locator("[data-virtualized-transcript]")
+    # Rows mount and unmount at once, so the padding that stands in for them must too.
+    applied = transcript.evaluate(
+        """el => {
+          const list = el.querySelector('[data-index]').parentElement;
+          const before = list.style.paddingTop;
+          list.style.paddingTop = '123px';
+          const value = getComputedStyle(list).paddingTop;
+          list.style.paddingTop = before;
+          return value;
+        }"""
+    )
+    assert applied == "123px"
+
+    box = transcript.bounding_box()
+    assert box
+    page.mouse.move(box["x"] + box["width"] * 0.85, box["y"] + box["height"] * 0.7)
+    _wheel(page, -1200)
+    page.wait_for_timeout(300)
+    _wheel(page, 3000)
+    page.mouse.move(box["x"] + 5, box["y"] + 5)
+    heights = transcript.evaluate(
+        """el => new Promise((resolve) => {
+          const heights = [];
+          const tick = () => {
+            heights.push(el.scrollHeight);
+            if (heights.length < 90) requestAnimationFrame(tick);
+            else resolve(heights);
+          };
+          requestAnimationFrame(tick);
+        })"""
+    )
+    changes = sum(1 for before, after in pairwise(heights) if before != after)
+    assert changes <= 2, heights
 
 
 _ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"

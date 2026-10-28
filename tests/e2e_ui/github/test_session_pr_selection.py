@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui.conftest import stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO
 
 
@@ -140,6 +141,7 @@ def test_session_pr_selection_and_unlink(
                 route.fulfill(json=info(url))
 
     page.route(re.compile(r"/resources/github(?:/|\?|$)"), respond)
+    stub_session_pull_requests(page, lambda: info(None)["prs"], urls.remove)
     page.goto(f"{base_url}/c/{session_id}")
     indicator = page.get_by_test_id("composer-pr-link")
     expect(indicator).to_have_accessible_name("2 PRs", timeout=30_000)
@@ -318,6 +320,7 @@ def test_session_pr_picker_long_title(
         "pr": {**_INFO["pr"], "url": url, "number": 42, "title": title},
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
@@ -405,6 +408,7 @@ def test_session_pr_account_fallback(
         "selected_account": "personal",
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     rail = page.get_by_role("complementary", name="Workspace")

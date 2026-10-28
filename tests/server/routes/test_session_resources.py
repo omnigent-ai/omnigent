@@ -4766,6 +4766,74 @@ async def test_shell_proxies_to_runner(
     assert published == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "response_body", "kind"),
+    [
+        (502, "", "empty"),
+        (503, "private-upstream-body", "invalid_json"),
+        (403, "private-upstream-body", "invalid_json"),
+        (200, "private-upstream-body", "invalid_json"),
+        (200, "[]", "non_object"),
+    ],
+    ids=["empty-gateway-error", "unavailable", "forbidden", "non-json-success", "array-success"],
+)
+@pytest.mark.parametrize(
+    ("method", "resource_path", "body"),
+    [
+        ("POST", "shell", {"command": "private-shell-command"}),
+        ("PUT", "filesystem/new.txt", {"content": "private-file-content"}),
+        ("PATCH", "filesystem/existing.txt", {"old_text": "old", "new_text": "new"}),
+        ("DELETE", "filesystem/old.txt", None),
+    ],
+)
+async def test_resource_mutation_invalid_response_preserves_status_without_replaying(
+    client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    response_body: str,
+    kind: str,
+    method: str,
+    resource_path: str,
+    body: dict[str, Any] | None,
+) -> None:
+    """Unreadable replies retain error status, safe evidence and mutation uncertainty."""
+    path = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/"
+        + resource_path
+    )
+    fake_runner = _FakeRunnerClient(
+        text_responses={
+            path: (
+                status,
+                response_body,
+                {"content-type": "private-content-type", "x-request-id": "private-request-id"},
+            )
+        }
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.ERROR):
+        response = await client.request(method, path, json=body)
+
+    assert response.status_code == (status if status >= 400 else 502)
+    assert "operation may have completed" in response.json()["detail"]
+    assert fake_runner.calls == [(method, path)]
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_resource_response_invalid"
+    ]
+    assert len(records) == 1
+    attributes = records[0].attributes
+    assert attributes["http_status"] == status
+    assert attributes["method"] == method
+    assert attributes["response_kind"] == kind
+    assert attributes["response_bytes"] == len(response_body)
+    assert attributes["content_type"] == "other"
+    assert "private-" not in response.text + records[0].getMessage() + json.dumps(attributes)
+
+
 # ── Conversation deletion cleanup test ───────────────────────────
 
 

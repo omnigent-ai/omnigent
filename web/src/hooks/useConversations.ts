@@ -41,7 +41,8 @@ import {
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
   PINNED_LABEL_KEY,
-  PROJECT_FOLDER_FILTERS,
+  filtersFromProjectQueryKey,
+  parseProjectSessionsQueryKey,
   PROJECT_LABEL_KEY,
   recentlyCreatedSessions,
   removeIdsFromPages,
@@ -69,6 +70,7 @@ import {
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
+import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
 
@@ -233,6 +235,17 @@ export interface Conversation {
    * detection only — never displayed. See `comments_count`.
    */
   comments_updated_at?: number | null;
+  /**
+   * The session's first linked pull request as the server last stored it, so
+   * list surfaces show it while the host is offline. Absent on older servers.
+   */
+  pull_request?: SessionPullRequestSummary | null;
+  /**
+   * Whether the server has imported the session's PRs from its host, so a
+   * missing `pull_request` means "none" rather than "not known yet". Absent on
+   * older servers.
+   */
+  pull_requests_synced?: boolean | null;
   /**
    * The requesting user's "last seen" wall-clock baseline (seconds) for
    * this session, or null/undefined when they've never seen it. Per-viewer,
@@ -2357,8 +2370,8 @@ export function useMoveToProject() {
     const itemsById = new Map<string, SessionListWireItem>([
       [id, { id, project_id: projectId, labels }],
     ]);
-    // Each sort has its own loaded window; the inactive sort may hold different rows.
-    const windowSorts = new Set<SessionSortBy>();
+    // Sort and archive slices have independent loaded windows.
+    const windowScopes = new Set<string>();
     for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey: ["conversations"],
     })) {
@@ -2368,27 +2381,37 @@ export function useMoveToProject() {
         filtersFromConversationQueryKey(key),
         undefined,
       );
-      if (found.has(id)) windowSorts.add(key[5] === "created_at" ? "created_at" : "updated_at");
+      if (found.has(id) && next?.pages.some((page) => page.data.some((c) => c.id === id))) {
+        windowScopes.add(
+          `${key[5] === "created_at" ? "created_at" : "updated_at"}:${row.archived === true}`,
+        );
+      }
       if (next !== data) queryClient.setQueryData(key, next);
     }
     // Target folder cache: overlay the row's fields if already present, and
     // insert a deep row (outside the flat window) into the first page.
-    const visibleSorts = new Set(windowSorts);
+    const visibleScopes = new Set(windowScopes);
     if (targetProjectName !== null) {
       for (const [targetKey, targetData] of queryClient.getQueriesData<ConversationsInfiniteData>({
         queryKey: ["project-sessions", targetProjectName],
       })) {
         if (!targetData) continue;
-        const sortBy = targetKey[2] === "created_at" ? "created_at" : "updated_at";
+        const { sortBy, archived } = parseProjectSessionsQueryKey(targetKey);
+        const filters = filtersFromProjectQueryKey(targetKey);
+        const scope = `${sortBy}:${archived}`;
         const { data: merged, found } = mergeItemsIntoPages(
           targetData,
           itemsById,
-          PROJECT_FOLDER_FILTERS,
+          filters,
           undefined,
         );
+        if (filters.includeArchived !== (row.archived === true)) {
+          if (merged !== targetData) queryClient.setQueryData(targetKey, merged);
+          continue;
+        }
         let next = merged ?? targetData;
         const [first, ...rest] = next.pages;
-        if (!found.has(id) && !windowSorts.has(sortBy) && first) {
+        if (!found.has(id) && !windowScopes.has(scope) && first) {
           next = {
             ...next,
             pages: [
@@ -2398,14 +2421,15 @@ export function useMoveToProject() {
           };
         }
         if (next !== targetData) queryClient.setQueryData(targetKey, next);
-        if (found.has(id) || first !== undefined) visibleSorts.add(sortBy);
+        if (found.has(id) || first !== undefined) visibleScopes.add(scope);
       }
     }
     for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey: ["project-sessions"],
     })) {
-      const sortBy = key[2] === "created_at" ? "created_at" : "updated_at";
-      if (key[1] === targetProjectName || !visibleSorts.has(sortBy)) continue;
+      const { project, sortBy, archived } = parseProjectSessionsQueryKey(key);
+      const scope = `${sortBy}:${archived}`;
+      if (project === targetProjectName || !visibleScopes.has(scope)) continue;
       const { data: next, removed } = removeIdsFromPages(data, new Set([id]));
       if (removed) queryClient.setQueryData(key, next);
     }
@@ -2548,34 +2572,49 @@ export async function fetchProjectSessionIds(project: string, limit = 2): Promis
   return page.data.map((conv) => conv.id);
 }
 
-/** One page of the viewer's active sessions in a project, newest-first. */
+/** One page of the viewer's sessions in a project, newest-first. */
 async function fetchProjectSessionsPage(
   project: string,
   after?: string,
   limit = 20,
   sortBy: SessionSortBy = "updated_at",
+  archived = false,
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
     sort_by: sortBy,
     limit: String(limit),
-    visibility: "mine",
+    visibility: archived ? "all" : "mine",
     project,
   });
+  // The all+project path resolves owned first-class projects on older servers too.
+  if (archived) params.set("include_archived", "true");
   if (after) params.set("after", after);
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
-  // Carries the server's `code`, so a dead cursor stays recognizable.
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  return applySessionTombstones((await res.json()) as ConversationsPage, true);
+  // Requests are sequential because each page supplies the next cursor.
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    // Carries the server's code, so a dead cursor stays recognizable.
+    // eslint-disable-next-line no-await-in-loop
+    if (!res.ok) throw await apiErrorFromResponse(res);
+    // eslint-disable-next-line no-await-in-loop
+    const page = applySessionTombstones((await res.json()) as ConversationsPage, !archived);
+    if (!archived) return page;
+    const data = page.data.filter((row) => row.archived === true);
+    if (data.length || !page.has_more || !page.last_id) return { ...page, data };
+    // Skip live-only pages so an empty folder can still reach later archives.
+    params.set("after", page.last_id);
+  }
 }
 
 /**
  * Cursor-paginated list of the sessions filed under one project, fetched
  * server-side via `?project=` so a folder shows ALL its members regardless of
- * how far the global sidebar list has been scrolled. Archived sessions are
- * excluded (they leave the active sidebar). `enabled` gates the fetch so a
+ * how far the global sidebar list has been scrolled. `archived` selects the
+ * archived slice in its own cache. `enabled` gates the fetch so a
  * collapsed folder costs nothing — pass the folder's expanded state.
  *
+ * Archived pages filter a compatible mixed slice, advancing past live-only pages.
  * Folders keep their own 20-row pages and infinite-scroll sentinel,
  * independently of the global list's configured page size.
  */
@@ -2583,12 +2622,13 @@ export function useProjectSessions(
   project: string,
   enabled: boolean,
   sortBy: SessionSortBy = "updated_at",
+  archived = false,
 ) {
-  const queryKey = ["project-sessions", project, ...(sortBy === "created_at" ? [sortBy] : [])];
+  const queryKey = ["project-sessions", project, sortBy, archived];
   const query = useInfiniteQuery({
     queryKey,
     queryFn: ({ pageParam }) =>
-      fetchProjectSessionsPage(project, pageParam as string | undefined, 20, sortBy),
+      fetchProjectSessionsPage(project, pageParam as string | undefined, 20, sortBy, archived),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,

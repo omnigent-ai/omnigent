@@ -386,6 +386,7 @@ function makeWebContents({
   canBack = false,
   canForward = false,
   url = "https://example.com/restored",
+  title = "",
 } = {}) {
   const calls = [];
   // Cookies pushed into the (fake) session by the Chrome import handlers.
@@ -421,6 +422,7 @@ function makeWebContents({
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
     getURL: () => url,
+    getTitle: () => title,
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -525,15 +527,16 @@ function setup({
   return { ipcMain, registry, wc, sent, event };
 }
 
-it("restores the URL and history state for the requested browser tab only", () => {
+it("restores URL, title and history state for the requested browser tab only", () => {
   const viewId = "browser-tab:conv_1:tab-two";
   const { ipcMain, event } = setup({
     conversationId: viewId,
-    webContents: makeWebContents({ canBack: true }),
+    webContents: makeWebContents({ canBack: true, title: "Restored page" }),
   });
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
     url: "https://example.com/restored",
+    title: "Restored page",
     canGoBack: true,
     canGoForward: false,
   });
@@ -1103,24 +1106,42 @@ describe("browserIpc — devtools toggle", () => {
 });
 
 describe("browserIpc — url live-tracking", () => {
-  it("open-or-navigate wires did-navigate listeners that emit url + nav-state", async () => {
+  it("tracks navigation and title changes for a detached browser tab", async () => {
     const { ipcMain, registry, sent, event } = setup({ conversationId: null });
+    const viewId = "browser-tab:conv_1:background-tab";
     await ipcMain.invoke("omnigent:browser-open-or-navigate", event, {
-      conversationId: "conv_1",
+      conversationId: viewId,
       url: "https://example.com",
     });
     // The created entry's webContents got did-navigate listeners.
-    const wc = registry.get("conv_1").view.webContents;
+    const wc = registry.get(viewId).view.webContents;
+    wc.getURL = () => "https://example.com/after-redirect";
+    wc.getTitle = () => "Redirected page";
     wc.emit("did-navigate", "https://example.com/after-redirect");
     const urlEvents = sent.filter((s) => s.channel === "browser-url-changed");
     const navEvents = sent.filter((s) => s.channel === "browser-nav-state");
     assert.equal(urlEvents.length, 1);
     assert.deepEqual(urlEvents[0].payload, {
-      conversationId: "conv_1",
+      conversationId: viewId,
       url: "https://example.com/after-redirect",
+      title: "Redirected page",
     });
     assert.equal(navEvents.length, 1);
-    assert.equal(navEvents[0].payload.conversationId, "conv_1");
+    assert.equal(navEvents[0].payload.conversationId, viewId);
+
+    wc.emit("page-title-updated", "Changed title");
+    assert.deepEqual(sent.at(-1), {
+      channel: "browser-url-changed",
+      payload: { conversationId: viewId, url: wc.getURL(), title: "Changed title" },
+    });
+
+    wc.getURL = () => "https://example.com/untitled";
+    wc.getTitle = () => "";
+    wc.emit("did-finish-load");
+    assert.deepEqual(sent.at(-1), {
+      channel: "browser-url-changed",
+      payload: { conversationId: viewId, url: wc.getURL(), title: "" },
+    });
   });
 
   it("did-navigate-in-page only emits for the main frame", async () => {

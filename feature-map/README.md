@@ -121,7 +121,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
-  per-harness coverage gaps separately from observed results.
+  per-harness coverage gaps separately from observed results. Its
+  [comparison guidance](./harness-acceptance.md#compare-harnesses-by-user-journey)
+  separates declared capabilities, mapped tests and observed CUJ results.
 
 - [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
   before/after recordings, load probes, and complementary persistence checks.
