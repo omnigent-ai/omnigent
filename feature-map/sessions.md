@@ -885,8 +885,9 @@ plain `uv run pytest`, which starts a private server for the test.
   macOS title-bar clearance, sidebar opening from the titlebar toggle or mobile
   hamburger, and conversation focus/return at wide and narrow widths run in
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_controls_clear_the_macos_titlebar`;
-  at the wide width it also returns home from the split view through the board's
-  Home link. `web/src/pages/CanvasPage.test.tsx` checks that link targets `/`.
+  at both widths it also checks the board's Home link clears the title bar and
+  returns home after the board is restored, beside the conversation at the wide
+  width. `web/src/pages/CanvasPage.test.tsx` checks that link targets `/`.
   This Chromium journey emulates the macOS preload bridge and user agent; it
   verifies the app's layout around the title bar, not native traffic-light rendering.
   `web/src/embed.test.tsx` checks that the compiled Canvas clearance selector
