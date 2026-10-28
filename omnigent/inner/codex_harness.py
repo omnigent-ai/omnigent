@@ -129,9 +129,6 @@ _ENV_AGENT_NAME = "HARNESS_CODEX_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_CODEX_GATEWAY_BASE_URL"
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_CODEX_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
-_ENV_SIGNER_PROVIDER = "HARNESS_CODEX_SIGNER_PROVIDER"
-_ENV_SIGNER_ENDPOINT = "HARNESS_CODEX_SIGNER_ENDPOINT"
-_ENV_MODEL_EGRESS = "HARNESS_CODEX_MODEL_EGRESS"
 
 # Truthy strings the wrap accepts for boolean env vars. Must
 # match the claude-sdk wrap's parser for consistency — operators
@@ -272,32 +269,36 @@ def _resolve_skills_filter() -> str | list[str]:
     return "all"
 
 
-def _resolve_signer_launch_config() -> SignerLaunchConfig | None:
-    """Build typed signer authority from the trusted workflow envelope."""
-    provider_id = os.environ.get(_ENV_SIGNER_PROVIDER, "").strip()
-    endpoint = os.environ.get(_ENV_SIGNER_ENDPOINT, "").strip()
-    raw_model_egress = os.environ.get(_ENV_MODEL_EGRESS, "").strip()
+def _resolve_signer_launch_config(env_prefix: str = "HARNESS_CODEX") -> SignerLaunchConfig | None:
+    """Build typed signer authority from the trusted workflow envelope.
+
+    :param env_prefix: The harness's env-var prefix, ``"HARNESS_GENIE"`` for
+        the genie fork, which reads the same keys under its own names.
+    """
+    provider_id = os.environ.get(f"{env_prefix}_SIGNER_PROVIDER", "").strip()
+    endpoint = os.environ.get(f"{env_prefix}_SIGNER_ENDPOINT", "").strip()
+    raw_model_egress = os.environ.get(f"{env_prefix}_MODEL_EGRESS", "").strip()
     if not provider_id:
         if endpoint or raw_model_egress:
             raise ValueError("partial model signer configuration is not allowed")
         return None
     if provider_id != UCODE_SIGNER_BINDING_ID:
         raise ValueError(f"unsupported model signer provider {provider_id!r}")
-    if _parse_truthy(_ENV_GATEWAY, default=False):
+    if _parse_truthy(f"{env_prefix}_GATEWAY", default=False):
         raise ValueError("signer-backed Codex conflicts with the legacy gateway mode")
-    if os.environ.get(_ENV_GATEWAY_AUTH_COMMAND):
+    if os.environ.get(f"{env_prefix}_GATEWAY_AUTH_COMMAND"):
         raise ValueError("signer-backed Codex conflicts with a legacy gateway auth command")
     if any(
-        os.environ.get(name)
+        os.environ.get(f"{env_prefix}_{name}")
         for name in (
-            _ENV_GATEWAY_BASE_URL,
-            _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS,
-            _ENV_MODEL_PROVIDER,
+            "GATEWAY_BASE_URL",
+            "GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+            "MODEL_PROVIDER",
         )
     ):
         raise ValueError("signer-backed Codex conflicts with legacy provider overrides")
-    host = os.environ.get(_ENV_GATEWAY_HOST, "").strip()
-    profile = os.environ.get(_ENV_DATABRICKS_PROFILE, "").strip()
+    host = os.environ.get(f"{env_prefix}_GATEWAY_HOST", "").strip()
+    profile = os.environ.get(f"{env_prefix}_DATABRICKS_PROFILE", "").strip()
     if not endpoint or not host or not profile:
         raise ValueError("ucode signer requires trusted endpoint, host, and profile")
     if not raw_model_egress:

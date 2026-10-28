@@ -583,8 +583,12 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary("codex", env_var=_CODEX_PATH_ENV)
 
 
-async def _codex_cli_version_text(codex_path: str) -> str | None:
-    """Return the exact version token reported by ``codex --version``."""
+async def _codex_cli_version_text(codex_path: str, *, banner: str = "codex-cli") -> str | None:
+    """Return the exact version token reported by ``codex --version``.
+
+    :param banner: The CLI name preceding the version, e.g. ``"codex-cli"``
+        (codex) or ``"genie"`` (the Databricks fork).
+    """
     try:
         proc = await _create_subprocess_exec(
             codex_path,
@@ -606,10 +610,17 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         close_subprocess_transport(proc)
         return None
     match = re.fullmatch(
-        r"\s*codex-cli\s+(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)\s*",
+        rf"\s*{re.escape(banner)}\s+(\d+\.\d+\.\d+(?:[-.][A-Za-z0-9.-]+)?)\s*",
         stdout.decode("utf-8", errors="replace"),
     )
     return match.group(1) if match is not None else None
+
+
+# Default on-disk home spelling for the codex CLI. Genie (a Databricks fork of
+# codex, driven by :class:`~omnigent.inner.genie_executor.GenieExecutor`) reads
+# ``GENIE_HOME`` / ``~/.genie`` instead.
+_DEFAULT_HOME_ENV_VAR = "CODEX_HOME"
+_DEFAULT_HOME_DIR_NAME = ".codex"
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -640,27 +651,32 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
 _BROKERED_CODEX_MIN_VERSION = Version("0.146.0")
 
 
-async def _require_brokered_codex_version(codex_path: str) -> None:
+async def _require_brokered_codex_version(
+    codex_path: str,
+    *,
+    banner: str = "codex-cli",
+    minimum: Version = _BROKERED_CODEX_MIN_VERSION,
+    cli_name: str = "Codex",
+) -> None:
     """Fail closed unless Codex is a stable release at or above the brokered-auth floor.
 
     The signer rebuilds every request strictly, so a newer Codex that sends an
     unexpected request fails its turn rather than reaching the model.
+
+    :param banner: The ``--version`` CLI name, ``"genie"`` for the fork.
+    :param minimum: The lowest release verified against the signer.
+    :param cli_name: The CLI's display name for the error, e.g. ``"Genie"``.
     """
-    raw = await _codex_cli_version_text(codex_path)
+    raw = await _codex_cli_version_text(codex_path, banner=banner)
     try:
         version = Version(raw) if raw is not None else None
     except InvalidVersion:
         version = None
-    if (
-        version is None
-        or version.is_prerelease
-        or version.is_postrelease
-        or version < _BROKERED_CODEX_MIN_VERSION
-    ):
+    if version is None or version.is_prerelease or version.is_postrelease or version < minimum:
         shown = raw or "unparseable"
         raise RuntimeError(
-            "unsupported Codex wire version "
-            f"{shown}; brokered authentication requires a stable Codex 0.146.0 or newer"
+            f"unsupported {cli_name} wire version "
+            f"{shown}; brokered authentication requires a stable {cli_name} {minimum} or newer"
         )
 
 
@@ -1086,7 +1102,10 @@ def _resolve_codex_home_config_source(source_dir: Path, home_codex_home: Path) -
     return source_dir
 
 
-def _codex_home_config_source_from_env() -> Path:
+def _codex_home_config_source_from_env(
+    home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+    home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
+) -> Path:
     """
     Return the Codex home whose auth/config should be bridged.
 
@@ -1096,12 +1115,16 @@ def _codex_home_config_source_from_env() -> Path:
     can inherit a parent private home, so this resolver maps that specific
     inherited session-state home back to the user's default ``~/.codex``.
 
+    :param home_env_var: The env var naming the user's source home, e.g.
+        ``"CODEX_HOME"`` (codex) or ``"GENIE_HOME"`` (the genie fork).
+    :param home_dir_name: The default home dir under ``~`` when the env var is
+        unset, e.g. ``".codex"`` or ``".genie"``.
     :returns: Host Codex home to read ``auth.json`` and ``config.toml`` from,
         e.g. ``Path.home() / ".codex"`` or an explicit user ``CODEX_HOME``.
     """
-    home_codex_home = Path.home() / ".codex"
+    home_codex_home = Path.home() / home_dir_name
     return _resolve_codex_home_config_source(
-        Path(os.environ.get("CODEX_HOME") or str(home_codex_home)),
+        Path(os.environ.get(home_env_var) or str(home_codex_home)),
         home_codex_home,
     )
 
@@ -1380,17 +1403,68 @@ def materialize_codex_provider_config(
                 headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
             )
 
+    _write_private_config(codex_home, tomlkit.dumps(document))
+    return argv_overrides
+
+
+def _write_private_config(codex_home: Path, text: str) -> None:
+    """Atomically replace ``codex_home/config.toml`` with *text*, mode 0600."""
+    config_path = codex_home / "config.toml"
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
         os.chmod(tmp_name, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
+            handle.write(text)
         os.replace(tmp_name, config_path)
         os.chmod(config_path, 0o600)
     finally:
         with suppress(FileNotFoundError):
             os.unlink(tmp_name)
-    return argv_overrides
+
+
+def write_codex_config_overrides(codex_home: Path, config_overrides: Iterable[str]) -> None:
+    """Write ``-c``-style ``key=value`` overrides into a private ``config.toml``.
+
+    For CLIs that reject ``-c`` on the command line (the genie fork denies it),
+    the overrides must live in the session-owned config instead. Values follow
+    ``-c`` semantics: parsed as TOML, falling back to a literal string, and a
+    dotted key sets a nested table entry.
+
+    :param codex_home: Private session home holding ``config.toml``.
+    :param config_overrides: Override strings, e.g. ``['model="gpt-5.4-mini"']``.
+    :raises ValueError: If an override is not ``key=value`` or a dotted key
+        crosses a non-table value.
+    """
+    overrides = list(config_overrides)
+    if not overrides:
+        return
+    import tomlkit
+
+    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    config_path = codex_home / "config.toml"
+    existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    document = tomlkit.parse(existing) if existing else tomlkit.document()
+    for override in overrides:
+        key, sep, raw_value = override.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f"Codex config override must be key=value, got {override!r}")
+        try:
+            value: object = tomlkit.parse(f"value = {raw_value.strip()}")["value"]
+        except Exception:  # noqa: BLE001 - mirror ``-c``: unparseable TOML is a literal string
+            value = raw_value.strip()
+        *parents, leaf = key.split(".")
+        table: MutableMapping[str, object] = document
+        for part in parents:
+            child = table.get(part)
+            if child is None:
+                child = tomlkit.table()
+                table[part] = child
+            if not isinstance(child, MutableMapping):
+                raise ValueError(f"Codex config key {part!r} in {key!r} is not a table")
+            table = child
+        table[leaf] = value
+    _write_private_config(codex_home, tomlkit.dumps(document))
 
 
 # Bridge directory holding the ``subagent_router.json`` advertisement. Its
@@ -2797,6 +2871,10 @@ class _CodexAppServerSession:
         signer_factory: Callable[[], ModelSignerSession] | None = None,
         provider_auth_authority: tuple[str, str] | None = None,
         thread_model_provider: str | None = None,
+        home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+        home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
+        config_overrides_in_file: bool = False,
+        brokered_catalog_probe: bool = True,
     ) -> None:
         self._codex_path = codex_path
         self._cwd = cwd
@@ -2820,6 +2898,15 @@ class _CodexAppServerSession:
         self._closing = False
         self._cleaned = True
         self._cleanup_task: asyncio.Task[None] | None = None
+        # Home-dir spelling for the wrapped CLI. Codex reads ``CODEX_HOME`` /
+        # ``~/.codex``; the genie fork reads ``GENIE_HOME`` / ``~/.genie``.
+        self._home_env_var = home_env_var
+        self._home_dir_name = home_dir_name
+        # Write overrides into the private config.toml instead of passing
+        # ``-c``, for CLIs that deny ``-c`` (the genie fork).
+        self._config_overrides_in_file = config_overrides_in_file
+        # The fork has no ``debug models`` command; its catalog is compiled in.
+        self._brokered_catalog_probe = brokered_catalog_probe
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -2971,7 +3058,7 @@ class _CodexAppServerSession:
         # definitions) from ``$CODEX_HOME``; without this step a freshly-
         # created temp dir has neither, causing 401 Unauthorized errors
         # for subscription-authenticated users.
-        config_source = _codex_home_config_source_from_env()
+        config_source = _codex_home_config_source_from_env(self._home_env_var, self._home_dir_name)
         # When the runner advertises a subagent-routing endpoint, the user's
         # hooks.json is merged into a generated file registering the routing
         # hooks instead of being symlinked in untouched. Only an auto-harness
@@ -3005,7 +3092,9 @@ class _CodexAppServerSession:
                     Path(self._cwd or os.getcwd()).resolve(strict=False),
                     self._os_env_spec,
                 )
-                if self._signer is not None and self._os_env_spec is not None
+                if self._signer is not None
+                and self._os_env_spec is not None
+                and self._brokered_catalog_probe
                 else None
             ),
         )
@@ -3021,6 +3110,9 @@ class _CodexAppServerSession:
                     "features.memories=false",
                 ]
             )
+        if self._config_overrides_in_file:
+            write_codex_config_overrides(self._codex_home_dir, self._codex_config_overrides)
+            self._codex_config_overrides = []
         if router_bridge_dir is not None:
             write_codex_router_hooks_file(
                 self._codex_home_dir,
@@ -3028,10 +3120,11 @@ class _CodexAppServerSession:
                 session_id=codex_router_session_id(self._env),
                 user_hooks_source=config_source / _CODEX_HOOKS_FILENAME,
             )
-        # Override CODEX_HOME so Codex stores its data (including conversation
-        # history) in a private temp directory rather than the user's ~/.codex/.
-        # This prevents subagent sessions from polluting the user's Codex history.
-        proc_env = {**self._env, "CODEX_HOME": str(self._codex_home_dir)}
+        # Override the home env var so the CLI stores its data (including
+        # conversation history) in a private temp directory rather than the
+        # user's ~/.codex/ (or ~/.genie/ for the fork). This prevents subagent
+        # sessions from polluting the user's real history.
+        proc_env = {**self._env, self._home_env_var: str(self._codex_home_dir)}
         if self._signer is not None:
             # Newer Codex builds keep some SQLite stores relative to HOME even
             # when CODEX_HOME is set. Keep those stores inside the same private,
@@ -4531,6 +4624,9 @@ class _AppSessionFactory(Protocol):
         skills_filter: str | list[str],
         skills_dir: Path | None,
         os_env: OSEnvSpec | None,
+        home_env_var: str,
+        home_dir_name: str,
+        config_overrides_in_file: bool,
     ) -> _CodexAppServerSession: ...
 
 
@@ -4548,6 +4644,10 @@ def _default_app_session_factory(
     skills_dir: Path | None = None,
     os_env: OSEnvSpec | None,
     signer_launch_config: SignerLaunchConfig | None = None,
+    brokered_catalog_probe: bool = True,
+    home_env_var: str,
+    home_dir_name: str,
+    config_overrides_in_file: bool,
 ) -> _CodexAppServerSession:
     return _CodexAppServerSession(
         codex_path=codex_path,
@@ -4574,10 +4674,22 @@ def _default_app_session_factory(
         thread_model_provider=(
             _BROKERED_CODEX_PROVIDER_NAME if signer_launch_config is not None else None
         ),
+        home_env_var=home_env_var,
+        home_dir_name=home_dir_name,
+        config_overrides_in_file=config_overrides_in_file,
+        brokered_catalog_probe=brokered_catalog_probe,
     )
 
 
 class CodexExecutor(Executor):
+    # The ``--version`` CLI name and lowest release verified against the
+    # brokered signer, and whether ``debug models --bundled`` can write the
+    # brokered catalog. Overridden by the genie fork.
+    _brokered_cli_name = "Codex"
+    _brokered_version_banner = "codex-cli"
+    _brokered_min_version = _BROKERED_CODEX_MIN_VERSION
+    _brokered_catalog_probe = True
+
     def __init__(
         self,
         *,
@@ -4601,6 +4713,9 @@ class CodexExecutor(Executor):
         skills_filter: str | list[str] = "all",
         skills_dir: Path | None = None,
         signer_launch_config: SignerLaunchConfig | None = None,
+        home_env_var: str = _DEFAULT_HOME_ENV_VAR,
+        home_dir_name: str = _DEFAULT_HOME_DIR_NAME,
+        config_overrides_in_file: bool = False,
     ) -> None:
         """Create a CodexExecutor.
 
@@ -4698,13 +4813,16 @@ class CodexExecutor(Executor):
         self._skills_dir = skills_dir
         self._signer_backed = signer_launch_config is not None
         self._brokered_version_identity: tuple[int, int, int, int] | None = None
-        resolved_codex = codex_path or _find_codex_cli()
+        # Home-dir spelling for the wrapped CLI (codex: ``CODEX_HOME`` /
+        # ``~/.codex``; genie fork: ``GENIE_HOME`` / ``~/.genie``), threaded
+        # into each per-session app-server so the private temp home uses the
+        # right env var. See :class:`~omnigent.inner.genie_executor.GenieExecutor`.
+        self._home_env_var = home_env_var
+        self._home_dir_name = home_dir_name
+        self._config_overrides_in_file = config_overrides_in_file
+        resolved_codex = codex_path or self._find_cli()
         if not resolved_codex:
-            raise ImportError(
-                "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
-                "installed on a PATH the host daemon didn't inherit (e.g. an "
-                f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
-            )
+            raise ImportError(self._cli_missing_message())
         self._codex_path = resolved_codex
         self._env = _clean_codex_env(declared_passthrough(self._os_env_spec))
         # Retry policy → OpenAI SDK env vars (Codex uses the OpenAI
@@ -4740,7 +4858,7 @@ class CodexExecutor(Executor):
                 )
             self._codex_config_overrides.extend(
                 _brokered_codex_config_overrides(
-                    model=model,
+                    model=self._cli_model_id(model),
                     base_url=signer_launch_config.endpoint,
                 )
             )
@@ -4833,7 +4951,7 @@ class CodexExecutor(Executor):
             self._env["DATABRICKS_HOST"] = host
             self._codex_config_overrides.extend(
                 _databricks_codex_config_overrides(
-                    model=effective_model,
+                    model=self._cli_model_id(effective_model),
                     base_url=base_url,
                     auth_command=auth_command,
                     auth_refresh_interval_ms=self._gateway_auth_refresh_interval_ms,
@@ -4855,8 +4973,37 @@ class CodexExecutor(Executor):
                 partial(
                     _default_app_session_factory,
                     signer_launch_config=signer_launch_config,
+                    brokered_catalog_probe=self._brokered_catalog_probe,
                 ),
             )
+
+    def _find_cli(self) -> str | None:
+        """Resolve the wrapped CLI binary when no explicit path was given.
+
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor` to
+        search for ``genie`` instead of ``codex``.
+        """
+        return _find_codex_cli()
+
+    def _cli_model_id(self, model: str) -> str:
+        """Translate an Omnigent model id into the id the wrapped CLI expects.
+
+        Identity for codex. Overridden by
+        :class:`~omnigent.inner.genie_executor.GenieExecutor`, whose CLI only
+        honors models in its bundled catalog.
+        """
+        return model
+
+    def _cli_missing_message(self) -> str:
+        """Error text when the wrapped CLI cannot be resolved.
+
+        Overridden by :class:`~omnigent.inner.genie_executor.GenieExecutor`.
+        """
+        return (
+            "CodexExecutor requires the 'codex' CLI on PATH. If codex is "
+            "installed on a PATH the host daemon didn't inherit (e.g. an "
+            f"nvm-managed bin dir), set {_CODEX_PATH_ENV}=/path/to/codex."
+        )
 
     def supports_streaming(self) -> bool:
         return True
@@ -4998,6 +5145,9 @@ class CodexExecutor(Executor):
             skills_filter=self._skills_filter,
             skills_dir=self._skills_dir,
             os_env=self._os_env_spec,
+            home_env_var=self._home_env_var,
+            home_dir_name=self._home_dir_name,
+            config_overrides_in_file=self._config_overrides_in_file,
         )
         state.app_session = app_session
         state.signature = signature
@@ -5017,7 +5167,12 @@ class CodexExecutor(Executor):
         ):
             # This probe must precede app-session construction: the latter
             # creates and preflights the signer before launching the worker.
-            await _require_brokered_codex_version(self._codex_path)
+            await _require_brokered_codex_version(
+                self._codex_path,
+                banner=self._brokered_version_banner,
+                minimum=self._brokered_min_version,
+                cli_name=self._brokered_cli_name,
+            )
             validated_identity = _codex_binary_identity(self._codex_path)
             if binary_identity is not None and validated_identity != binary_identity:
                 raise RuntimeError("Codex executable changed during brokered version validation")
@@ -5047,6 +5202,8 @@ class CodexExecutor(Executor):
                 # the vocabulary authority: the bundled OpenAI catalog's newest
                 # row is a bare family alias its backend rejects.
                 model = CODEX_DEFAULT_MODEL
+        if model is not None:
+            model = self._cli_model_id(model)
         effective_cwd = (
             self._cwd or (self._os_env_spec.cwd if self._os_env_spec else None) or os.getcwd()
         )

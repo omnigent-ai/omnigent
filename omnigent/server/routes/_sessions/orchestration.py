@@ -7229,9 +7229,12 @@ async def _forward_event_to_runner(
         _parent_routing_on = _parent_conv is not None and subagent_routing_enabled(
             _parent_conv.subagent_routing_override
         )
+    # Genie runs only its bundled catalog's models, so a routed gateway pick
+    # would either fail or silently run genie's default: never route it.
     _routing_enabled = (
-        conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None
-    ) or _parent_routing_on
+        (conv.cost_control_mode_override == "on" and conv.parent_conversation_id is None)
+        or _parent_routing_on
+    ) and _resolve_harness(conv) != "genie"
     _routed_model: str | None = None
     _routed_harness: str | None = None
     _verdict: dict[str, Any] | None = None

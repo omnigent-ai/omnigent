@@ -18,6 +18,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from packaging.version import Version
 
 from omnigent.inner.codex_executor import (
     _TURN_EVENT_WARN_SECONDS,
@@ -4215,7 +4216,7 @@ def test_app_server_negotiates_direct_tools_from_server_version(
     """Only compatible servers receive the direct dynamic-tool setting."""
     monkeypatch.setattr(
         "omnigent.inner.codex_executor._codex_home_config_source_from_env",
-        lambda: tmp_path / "empty-config",
+        lambda *_args, **_kwargs: tmp_path / "empty-config",
     )
     monkeypatch.setattr(
         "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",
@@ -5017,7 +5018,12 @@ async def test_brokered_version_failure_precedes_signer_session_construction(
             )
         )
 
-    version_gate.assert_awaited_once_with("/usr/local/bin/codex")
+    version_gate.assert_awaited_once_with(
+        "/usr/local/bin/codex",
+        banner="codex-cli",
+        minimum=Version("0.146.0"),
+        cli_name="Codex",
+    )
     app_session_factory.assert_not_called()
     assert executor._session_states == {}
 

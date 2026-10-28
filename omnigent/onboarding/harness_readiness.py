@@ -262,6 +262,13 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(HERMES_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
+    if canonical == "genie":
+        # Must agree with the picker map's genie branch: the host's quick probe
+        # uses this function, and a True here against a "binary-missing" map
+        # entry makes every readiness tick look like a new install.
+        from omnigent.onboarding.harness_install import GENIE_KEY
+
+        return _installer_only_availability(GENIE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -848,6 +855,38 @@ def _global_auth_configured() -> bool:
         return False
 
 
+def _genie_provider_availability() -> HarnessAvailability:
+    """Whether a genie launch resolves a provider it can route through.
+
+    Genie has no login of its own, and its spawn-env builder refuses a launch
+    with no provider, a ``subscription`` one, or a ``cli-config`` one (a
+    ``~/.codex/config.toml`` pin only codex reads). Resolving with the launch
+    resolver itself keeps the picker and the launch in agreement. Never raises.
+
+    :returns: ``True`` or ``"needs-auth"``.
+    """
+    try:
+        from omnigent.runtime.workflow import _resolve_provider_for_build
+        from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+        spec = AgentSpec(
+            spec_version=1,
+            name="genie",
+            instructions="",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "genie"}),
+        )
+        provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
+    except Exception as exc:
+        # Class-only: provider config errors may embed credential material.
+        _logger.debug("readiness: genie provider check failed (%s)", type(exc).__name__)
+        return HARNESS_NEEDS_AUTH
+    if provider is not None and _provider_entry_locally_credentialed(
+        provider, OPENAI_FAMILY, _SDK_UNUSABLE_PROVIDER_KINDS
+    ):
+        return True
+    return HARNESS_NEEDS_AUTH
+
+
 def _sdk_harness_availability(canonical: str) -> HarnessAvailability:
     """Picker-facing readiness for an in-process SDK harness.
 
@@ -958,6 +997,17 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
         return False
+    if canonical == "genie":
+        # Genie is Databricks' fork of Codex: it uses the genie binary and
+        # authenticates via an Omnigent provider, not Codex's subscription
+        # path. Report "binary-missing" like Codex so the UI can show install
+        # guidance, then "needs-auth" until a provider genie can use resolves.
+        from omnigent.onboarding.harness_install import GENIE_KEY
+
+        binary_state = _binary_availability_reason(GENIE_KEY)
+        if binary_state is not True:
+            return binary_state
+        return _genie_provider_availability()
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
@@ -1027,9 +1077,15 @@ def harness_is_configured(harness: str) -> bool:
 
 
 def _is_codex_family_harness(canonical: str) -> bool:
-    """Return whether a canonical harness uses Codex readiness semantics."""
+    """Return whether a canonical harness uses Codex readiness semantics.
+
+    Genie is in ``CODEX_CANONICAL_HARNESSES`` for model routing but gates on its
+    own binary, so it must not share Codex's readiness probe or cache entry.
+    """
     return (
-        canonical in CODEX_CANONICAL_HARNESSES and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
+        canonical in CODEX_CANONICAL_HARNESSES
+        and canonical != "genie"
+        and _HARNESS_FAMILY.get(canonical) == OPENAI_FAMILY
     )
 
 

@@ -257,7 +257,9 @@ def _start_app_server(
         return _MODEL_CATALOG
 
     monkeypatch.setattr(codex_executor, "populate_codex_skills_from_bundle", lambda *a, **k: None)
-    monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(
+        codex_executor, "_codex_home_config_source_from_env", lambda *a, **k: source
+    )
     monkeypatch.setattr(codex_executor, "_create_subprocess_exec", fake_exec)
     # Never shell out to a real ``codex debug models`` from a unit test, and
     # never let one session's cached catalog answer another's probe count.
@@ -480,7 +482,9 @@ def test_an_old_codex_cli_keeps_the_sdk_harness_hooks_symlinked(
         raise RuntimeError("stop")
 
     monkeypatch.setattr(codex_executor, "populate_codex_skills_from_bundle", lambda *a, **k: None)
-    monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(
+        codex_executor, "_codex_home_config_source_from_env", lambda *a, **k: source
+    )
     monkeypatch.setattr(codex_executor, "_create_subprocess_exec", fake_exec)
     session = codex_executor._CodexAppServerSession(
         codex_path="/bin/echo",

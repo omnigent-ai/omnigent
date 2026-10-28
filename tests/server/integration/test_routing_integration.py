@@ -1774,6 +1774,59 @@ async def test_turn_candidates_come_from_the_panes_own_vocabulary(
     ]
 
 
+@pytest.mark.parametrize(("harness", "routed"), [("codex", True), ("genie", False)])
+async def test_a_genie_session_is_never_routed(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+    routed: bool,
+) -> None:
+    """Genie runs only its bundled catalog's models, so its turns skip the judge.
+
+    A routed gateway pick would either fail on genie or silently run genie's
+    default while the chip named the routed model.
+    """
+    agent = await create_test_agent(client, name=f"routing-top-level-{harness}")
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert resp.status_code == 201, resp.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.update_conversation(resp.json()["id"], harness_override=harness)
+    assert conv is not None
+    routing_client = FakeRoutingClient(
+        RoutingResult(model=GPT_MODEL, rationale="cheap arm", harness="codex")
+    )
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "refactor auth"}]},
+    )
+    from omnigent.server import smart_routing as smart_routing_module
+
+    async def _fake_fetch(*_args: Any, **_kwargs: Any) -> dict[str, list[str]]:
+        # The runner's catalog for the session, so routing has candidates.
+        return {"self": [GPT_MODEL, GLM_MODEL]}
+
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)),
+        patch.object(smart_routing_module, "fetch_runner_models", _fake_fetch),
+    ):
+        async with echo_runner_client() as runner_client:
+            await orchestration_module._forward_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                conv_store,
+                runner_client,
+            )
+
+    assert (len(routing_client.calls) == 1) is routed
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert (refreshed.model_override == GPT_MODEL) is routed
+
+
 # ── 10. A routed child's harness is chosen once, not per message ─────
 
 

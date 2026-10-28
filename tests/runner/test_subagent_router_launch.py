@@ -317,6 +317,40 @@ def test_the_claude_spawn_env_never_carries_the_codex_catalog_flag(
     assert CODEX_EXTENDED_CATALOG_ENV_VAR not in env
 
 
+def test_the_genie_spawn_env_never_carries_the_codex_catalog_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Genie is never routed, and the catalog probe would run codex, not genie."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n"
+        "  openai:\n"
+        "    kind: key\n"
+        "    default: true\n"
+        "    openai:\n"
+        "      base_url: https://api.openai.com/v1\n"
+        "      api_key: $OPENAI_API_KEY\n"
+        "      models:\n"
+        "        default: gpt-5-4\n"
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="x",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "genie"}),
+    )
+    subagent_routing.remember_session_routing_class("conv_spawn_env", _AUTO)
+    try:
+        env = _build_spawn_env_from_spec(spec, "genie", session_id="conv_spawn_env")
+    finally:
+        subagent_routing.forget_session_routing_class("conv_spawn_env")
+
+    assert env is not None
+    assert env["HARNESS_GENIE_GATEWAY_BASE_URL"] == "https://api.openai.com/v1"
+    assert CODEX_EXTENDED_CATALOG_ENV_VAR not in env
+
+
 async def test_router_env_is_scoped_to_the_launching_harness(tmp_path: Path) -> None:
     """A codex spawn beneath a claude session must not see the codex vars.
 
