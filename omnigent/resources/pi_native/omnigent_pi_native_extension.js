@@ -767,6 +767,86 @@ function contentBlocks(message) {
   return message.content;
 }
 
+// Pi's convertToLlm renders these messages as user text.
+const _PI_COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:" +
+  "\n\n<summary>\n";
+const _PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+const _PI_BRANCH_SUMMARY_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+const _PI_BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+function bashExecutionText(message) {
+  let text = `Ran \`${message.command}\`\n`;
+  text += message.output ? `\`\`\`\n${message.output}\n\`\`\`` : "(no output)";
+  if (message.cancelled) text += "\n\n(command cancelled)";
+  else if (message.exitCode !== null && message.exitCode !== undefined && message.exitCode !== 0)
+    text += `\n\nCommand exited with code ${message.exitCode}`;
+  if (message.truncated && message.fullOutputPath)
+    text += `\n\n[Output truncated. Full output: ${message.fullOutputPath}]`;
+  return text;
+}
+
+// Pi's model context in the item shapes forwarded live, so any harness can replay it.
+// Like live forwarding, it keeps text only: images and tool-result error flags are dropped.
+function compactionSnapshotItems(messages) {
+  const items = [];
+  const addUserText = (text) => {
+    if (!text) return;
+    items.push({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+  };
+  for (const message of messages) {
+    switch (message?.role) {
+      case "compactionSummary":
+        addUserText(
+          _PI_COMPACTION_SUMMARY_PREFIX + message.summary + _PI_COMPACTION_SUMMARY_SUFFIX,
+        );
+        break;
+      case "branchSummary":
+        addUserText(_PI_BRANCH_SUMMARY_PREFIX + message.summary + _PI_BRANCH_SUMMARY_SUFFIX);
+        break;
+      case "bashExecution":
+        // `!!` shell output never reaches the model.
+        if (!message.excludeFromContext) addUserText(bashExecutionText(message));
+        break;
+      case "user":
+      case "custom":
+        addUserText(textFromMessage(message));
+        break;
+      case "assistant": {
+        const text = textFromMessage(message);
+        if (text) {
+          items.push({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text }],
+          });
+        }
+        for (const block of contentBlocks(message)) {
+          if (block?.type !== "toolCall" || !block.id || !block.name) continue;
+          items.push({
+            type: "function_call",
+            call_id: String(block.id),
+            name: String(block.name),
+            arguments: safeJsonStringify(block.arguments ?? {}),
+          });
+        }
+        break;
+      }
+      case "toolResult":
+        if (message.toolCallId) {
+          items.push({
+            type: "function_call_output",
+            call_id: String(message.toolCallId),
+            output: textFromToolResult(message),
+          });
+        }
+        break;
+    }
+  }
+  return items;
+}
+
 function fingerprint(text) {
   let hash = 5381;
   for (let i = 0; i < text.length; i += 1) {
@@ -846,6 +926,16 @@ const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
 const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
 
+function settledWithinBudget(settled) {
+  let timeout;
+  return Promise.race([
+    settled.then(() => true),
+    new Promise(resolve => {
+      timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+    }),
+  ]).finally(() => clearTimeout(timeout));
+}
+
 function boundedSourceId(sourceId) {
   const value = typeof sourceId === "string" ? sourceId.trim() : "";
   if (!value) throw new Error("assistant conversation item requires source_id");
@@ -915,7 +1005,7 @@ function assistantItemPostTimeoutMs(config) {
 }
 
 // History and completion delivery share bounded retries.
-async function postEventWithRetry(config, body, signal) {
+async function postEventWithRetry(config, body, signal, readReceipt = false) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
   const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
@@ -929,11 +1019,18 @@ async function postEventWithRetry(config, body, signal) {
       Math.min(assistantItemPostTimeoutMs(config), remaining),
     );
     try {
-      return await postEventChecked(
+      const response = await postEventChecked(
         config,
         body,
         signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       );
+      if (!readReceipt) return response;
+      try {
+        // Receipt reads share the POST timeout; an accepted write is never retried.
+        return await response?.json?.();
+      } catch (_err) {
+        return;
+      }
     } catch (err) {
       lastError = err;
     } finally {
@@ -963,13 +1060,18 @@ function createHistoryQueue(config) {
   let queuedBytes = 0;
   let worker = null;
   let closed = false;
+  let lastItemId = null;
 
   async function deliver(item) {
     if (item.accepted) return;
-    await postEventWithRetry(config, {
+    if (item.data.item_type === "compaction") {
+      item.data.item_data.last_item_id ||= lastItemId || `compact_boundary_${config.sessionId}`;
+    }
+    const receipt = await postEventWithRetry(config, {
       type: "external_conversation_item",
       data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
-    }, controller.signal);
+    }, controller.signal, true);
+    lastItemId = typeof receipt?.item_id === "string" ? receipt.item_id : null;
     item.accepted = true;
     item.onAccepted?.();
   }
@@ -1038,18 +1140,7 @@ function createHistoryQueue(config) {
     },
     async flush() {
       // Later prompts must not extend the ending turn's delivery barrier.
-      const settled = Promise.all([...pending.values()].map(item => item.settled));
-      let timeout;
-      try {
-        return await Promise.race([
-          settled.then(() => true),
-          new Promise(resolve => {
-            timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
-          }),
-        ]);
-      } finally {
-        clearTimeout(timeout);
-      }
+      return settledWithinBudget(Promise.all([...pending.values()].map(item => item.settled)));
     },
     async close() {
       closed = true;
@@ -1580,6 +1671,46 @@ module.exports = function (pi) {
   const config = readConfig();
   const history = createHistoryQueue(config);
   pi.on("session_shutdown", () => history.close());
+  pi.on("session_compact", async (_event, ctx) => {
+    const manager = ctx?.sessionManager;
+    if (typeof manager?.buildSessionProjection !== "function") return;
+    const notifyFailure = () =>
+      ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error");
+    let checkpoint;
+    let compactedMessages;
+    let sourceId;
+    try {
+      const projection = manager.buildSessionProjection();
+      // Pi 1.3's event can name an older entry when summaries repeat.
+      checkpoint = projection?.entries?.[0]?.sourceEntry;
+      if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") {
+        throw new Error("Pi's projection does not start with a compaction checkpoint");
+      }
+      sourceId = `pi:compaction:${manager.getSessionId()}:${checkpoint.id}`;
+      compactedMessages = compactionSnapshotItems(projection.messages ?? []);
+    } catch (error) {
+      console.error("[pi-native] Compaction snapshot failed:", error);
+      notifyFailure();
+      return;
+    }
+    const item = history.enqueue(
+      {
+        item_type: "compaction",
+        item_data: {
+          summary: checkpoint.summary,
+          last_item_id: "",
+          model: ctx.model?.id || null,
+          token_count: Math.ceil(checkpoint.summary.length / 4),
+          window_id: checkpoint.id,
+          compacted_messages: compactedMessages,
+        },
+      },
+      sourceId,
+      { onFailure: notifyFailure },
+    );
+    // Pi awaits this handler before finishing compaction.
+    if (item) await settledWithinBudget(item.settled);
+  });
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;

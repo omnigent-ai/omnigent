@@ -5,6 +5,9 @@ PR, else the PR of the workspace's branch) and which git provider serves it,
 and keeps the session's tracked PRs and their cached titles. Every step that
 talks to a forge goes through that provider's
 :class:`~omnigent.runner.git_providers.PullRequestFacet`.
+
+Servers that track a session's PRs vouch for the PR a request targets
+(:func:`server_tracking`), so it is served even if this host never recorded it.
 """
 
 from __future__ import annotations
@@ -13,10 +16,11 @@ import logging
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -31,6 +35,7 @@ from omnigent.git_providers import (
     providers,
     resolve_remote,
 )
+from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
@@ -43,6 +48,11 @@ from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, Sessi
 from omnigent.runtime.filesystem_registry import _git_timeout_seconds
 
 _logger = logging.getLogger(__name__)
+
+# Whether the server vouches for the request's PR, and its first PR for requests that select none.
+_SERVER_TRACKING: ContextVar[tuple[bool, str | None]] = ContextVar(
+    "server_tracked_pull_request", default=(False, None)
+)
 
 # Cache failed lookups too so inaccessible PRs do not add work to every poll.
 _PR_TITLE_CACHE_SECONDS = 300.0
@@ -202,17 +212,51 @@ def _serving_facet(root: str, reference: PullRequestRef | None) -> PullRequestFa
     return _facet(_resolve(root, reference).provider)
 
 
+@contextmanager
+def server_tracking(server_tracked: object, default_pr_url: object = None) -> Iterator[None]:
+    """Serve the PR the server tracks for the session, even if this host never recorded it.
+
+    :param server_tracked: The request's ``server_tracked`` value; servers that
+        track the session's PRs send ``True`` (``"1"`` in a query string).
+    :param default_pr_url: The server's first PR, served when the request selects none.
+    """
+    tracked = server_tracked is True or server_tracked in ("1", "true")
+    default = default_pr_url if tracked and isinstance(default_pr_url, str) else None
+    token = _SERVER_TRACKING.set((tracked, default or None))
+    try:
+        yield
+    finally:
+        _SERVER_TRACKING.reset(token)
+
+
 def _selected_pr(session_id: str, pr_url: str) -> SessionPullRequest:
     reference = PullRequestRef.from_url(pr_url)
-    for entry in SessionPrRegistry(session_id).list():
+    tracked, _ = _SERVER_TRACKING.get()
+    try:
+        entries = SessionPrRegistry(session_id).list()
+    except ValueError:
+        if not tracked:
+            raise
+        entries = []
+    for entry in entries:
         if entry.url == reference.url:
             return entry
+    if tracked:
+        now = time.time()
+        return SessionPullRequest(
+            **reference.model_dump(),
+            relationship="attached",
+            source="server",
+            first_seen_at=now,
+            last_seen_at=now,
+        )
     raise ValueError("This pull request is not associated with the session")
 
 
 def _default_pr(session_id: str | None, pr_url: str | None) -> SessionPullRequest | None:
     if session_id is None:
         return None
+    pr_url = pr_url or _SERVER_TRACKING.get()[1]
     if pr_url:
         return _selected_pr(session_id, pr_url)
     entries = SessionPrRegistry(session_id).list()
@@ -386,6 +430,7 @@ def _associate_discovered_pr(
             registry.record(
                 [inferred], relationship="inferred", source="branch", timestamp=timestamp
             )
+            pr_reports.notify(registry.session_id)
             if any(entry.url == inferred.url for entry in registry.list()):
                 candidate["selected_pr_url"] = inferred.url
                 try:
@@ -454,8 +499,13 @@ def pr_info(
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
     entries = registry.list()
-    reference = _selected_pr(session_id, pr_url) if pr_url else entries[0] if entries else None
+    default_url = pr_url or _SERVER_TRACKING.get()[1]
+    reference = (
+        _selected_pr(session_id, default_url) if default_url else entries[0] if entries else None
+    )
     tracked_providers = {entry.provider for entry in entries}
+    if reference is not None:
+        tracked_providers.add(reference.provider)
     resolutions = (
         []
         if pr_url

@@ -99,7 +99,9 @@ class _TunnelConnectionAttrs(TunnelDiagnosticAttrs):
     asgi_application_state: str
 
 
-def _tunnel_helper_outcomes(tasks: list[asyncio.Task[None]]) -> tuple[str | None, int | None]:
+def _tunnel_helper_outcomes(
+    tasks: list[asyncio.Task[None]], *, last_send_error_type: str | None = None
+) -> tuple[str | None, int | None]:
     """Retain peer-close evidence even when another helper's error is raised first."""
     outcomes: dict[str, str] = {}
     receive_close_code: int | None = None
@@ -112,7 +114,12 @@ def _tunnel_helper_outcomes(tasks: list[asyncio.Task[None]]) -> tuple[str | None
         elif task.cancelled():
             outcomes[role] = "cancelled"
         elif (error := task.exception()) is None:
-            outcomes[role] = "completed"
+            # A sender can consume its transport error when a concurrent close wins.
+            outcomes[role] = (
+                f"error:{last_send_error_type}"
+                if role == "sender" and last_send_error_type is not None
+                else "completed"
+            )
         else:
             outcomes[role] = f"error:{type(error).__name__[:64]}"
             if role == "receive" and isinstance(error, WebSocketDisconnect):
@@ -520,7 +527,12 @@ def create_runner_tunnel_router(
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
-            helper_outcomes, receive_close_code = _tunnel_helper_outcomes(owned)
+            diagnostics: TunnelDiagnosticAttrs = (
+                session.diagnostics.snapshot() if session is not None else {}
+            )
+            helper_outcomes, receive_close_code = _tunnel_helper_outcomes(
+                owned, last_send_error_type=diagnostics.get("last_send_error_type")
+            )
             attrs: _TunnelConnectionAttrs = {
                 "runner_id": runner_id,
                 "ended_by": ended_by,
@@ -538,9 +550,7 @@ def create_runner_tunnel_router(
                 "asgi_client_state": ws.client_state.name,
                 "asgi_application_state": ws.application_state.name,
             }
-            if session is not None:
-                return {**attrs, **session.diagnostics.snapshot()}
-            return attrs
+            return {**attrs, **diagnostics}
 
         def _report_diagnostics() -> None:
             _logger.warning(

@@ -62,6 +62,7 @@ from omnigent.models.claude_model_vocabulary import (
     served_canonical_overrides,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_serialization import json_dumps_transport_safe
@@ -1788,8 +1789,8 @@ class ClaudeSDKExecutor(Executor):
                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                 the SDK's ``settings.apiKeyHelper`` option at turn time.
         """
-        # Fail loud: a ``databricks-*`` model requires the gateway transport.
-        if not gateway and model is not None and model.startswith("databricks-"):
+        # Fail loud: a Databricks model requires the gateway transport.
+        if not gateway and model is not None and is_databricks_model_id(model):
             raise ValueError(
                 f"Model {model!r} is a Databricks-hosted model but gateway "
                 "routing is disabled (gateway=False). "
@@ -1918,11 +1919,7 @@ class ClaudeSDKExecutor(Executor):
         if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
             self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
-        # Retry policy → Anthropic SDK env vars passed to the Claude
-        # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
-        # ``ANTHROPIC_REQUEST_TIMEOUT_SECONDS`` are speculative — the
-        # CLI's retry budget isn't publicly documented as env-tunable.
-        # See ``RetryPolicy.claude_cli.env()``.
+        # Pass the retry budget and response-header timeout to the Claude CLI.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._extra_env.update(self._retry_policy.claude_cli.env())
 
@@ -2852,8 +2849,9 @@ class ClaudeSDKExecutor(Executor):
         # (HTTP 400); they require "adaptive" instead (those tiers are
         # adaptive-only). Sonnet is fine, so scope to those tiers only.
         # This is Databricks-specific: it is gated on the ``databricks-
-        # claude-opus-`` / ``databricks-claude-fable-`` model prefixes, so
-        # it never fires for a generic gateway model.
+        # claude-opus-`` / ``databricks-claude-fable-`` model prefixes (and
+        # their ``system.ai.`` Unity Catalog spellings), so it never fires
+        # for a generic gateway model.
         if (
             self._gateway
             and isinstance(model, str)

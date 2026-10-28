@@ -712,7 +712,7 @@ function TurnWorkedFold({
       data-testid="turn-worked-fold"
     >
       <div ref={rowRef} className={cn("turn-fold-row", animateCollapse && "turn-fold-row-enter")}>
-        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-chat outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
+        <CollapsibleTrigger className="flex cursor-pointer items-center gap-2 rounded-sm py-1 text-left text-muted-foreground text-ui outline-none transition-colors hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50">
           <span className="shrink-0">{label}</span>
           <ChevronRightIcon className="size-2.5 shrink-0 transition-transform group-data-[state=open]/turn-fold:rotate-90" />
         </CollapsibleTrigger>
@@ -895,7 +895,7 @@ function renderItem(
       );
     case "tool":
       // Intelligent routing's fan-out sizing gets a structured plan card
-      // instead of the generic name(json) row + raw-JSON expansion.
+      // instead of the generic tool row.
       if (ADVISE_MODELS_NAMES.has(item.execution.name)) {
         return (
           <SmartRoutingCard
@@ -910,7 +910,6 @@ function renderItem(
         <ToolCard
           key={key}
           name={item.execution.name}
-          argsSummary={item.execution.argsSummary}
           arguments={item.execution.arguments}
           output={item.output}
           state={item.state}

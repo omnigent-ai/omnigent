@@ -217,6 +217,12 @@ export interface PullRequestAssociation {
   /** Git provider id; absent from hosts that predate providers (GitHub). */
   provider?: string;
   provider_display?: GitProviderDisplay;
+  /** "OPEN" | "MERGED" | "CLOSED" as the host last fetched it; null until it does. */
+  state?: string | null;
+  /** Whether the PR was a draft at that fetch. */
+  is_draft?: boolean;
+  /** Epoch seconds of that fetch, or null. */
+  state_checked_at?: number | null;
 }
 
 function prQuery(prUrl?: string): string {
@@ -345,7 +351,7 @@ class PullRequestApiError extends Error {
 
 /** Surface the server's error message (e.g. a git failure) rather than a bare
  *  status code, mirroring the workspace hooks. */
-async function errorFromResponse(res: Response): Promise<Error> {
+export async function errorFromResponse(res: Response): Promise<Error> {
   let message = `${res.status} ${res.statusText}`;
   try {
     const body = (await res.json()) as { error?: { message?: string }; detail?: unknown };
@@ -671,21 +677,30 @@ export function usePullRequestDiff(
   });
 }
 
+/** Link or unlink a PR through the runner or host; returns the refreshed info. */
+export async function updateSessionPr(
+  conversationId: string,
+  body: { url: string; action: "attach" | "remove" },
+): Promise<PullRequestInfo> {
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  if (!response.ok) throw await errorFromResponse(response);
+  return normalizePullRequestInfo((await response.json()) as PullRequestInfo);
+}
+
 export function useUpdateSessionPr(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (body: { url: string; action: "attach" | "remove" }) => {
-      const response = await authenticatedFetch(
-        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/prs`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        },
-      );
-      if (!response.ok) throw await errorFromResponse(response);
-      return normalizePullRequestInfo((await response.json()) as PullRequestInfo);
-    },
+    // Per session, so a link still running after a session switch updates only its own.
+    mutationKey: ["update-session-pr", conversationId],
+    mutationFn: (body: { url: string; action: "attach" | "remove" }) =>
+      updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
       queryClient.setQueryData(["github-info", conversationId], info);

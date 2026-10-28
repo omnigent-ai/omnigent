@@ -1187,13 +1187,20 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user"])
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user", "compaction"])
 def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
     script = (
         _ASSISTANT_DURABILITY_HARNESS
         + r"""
 (async () => {
   const kind = process.argv[3];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "boundary", summary: "checkpoint" } }],
+      messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 100 }],
+    }),
+  };
   const events = {
     tool_call: ["message_update", { assistantMessageEvent: {
       type: "toolcall_end", toolCall: { id: "call-1", name: "read", arguments: { path: "a" } },
@@ -1205,6 +1212,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
       type: "thinking_end", contentIndex: 0, content: "plan",
     } }],
     user: ["input", { text: "terminal prompt", source: "extension" }],
+    compaction: ["session_compact", {}],
   };
   if (kind === "tool_result") {
     await handlers.message_update(events.tool_call[1], ctx);
@@ -1224,6 +1232,9 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
   assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.deepEqual(
+    notices, kind === "compaction" ? ["Omnigent could not save the compaction checkpoint."] : [],
+  );
   let items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 5);
   assert.ok(items[0].data.source_id);
@@ -1234,7 +1245,8 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
   await settleHistory();
   items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 6);
-  if (kind !== "user") {
+  if (kind === "compaction") assert.equal(items[5].data.source_id, items[0].data.source_id);
+  if (kind !== "user" && kind !== "compaction") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
     assert.deepEqual(items[0], items[5]);
     await invoke();
@@ -1249,6 +1261,185 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("receipt", ["valid", "unreadable", "absent", "timeout"])
+def test_compaction_snapshot_orders_history_and_tolerates_receipts(
+    tmp_path: Path, receipt: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const receiptMode = process.argv[3];
+  const messages = [
+    { role: "system", content: "", sections: {tools: "read"} },
+    { role: "compactionSummary", summary: "checkpoint", tokensBefore: 9000 },
+    { role: "branchSummary", summary: "branch work", fromId: "branch-1" },
+    { role: "user", content: [
+      {type: "text", text: "look"}, {type: "image", data: "SU1BR0U=", mimeType: "image/png"},
+    ] },
+    { role: "custom", customType: "note", content: "extension note", display: true },
+    { role: "assistant", content: [
+      { type: "thinking", thinking: "hidden reasoning" },
+      { type: "text", text: "reading" },
+      { type: "toolCall", id: "read-1", name: "read", arguments: {path: "a"} },
+    ] },
+    { role: "toolResult", toolCallId: "read-1", toolName: "read",
+      content: [{type: "text", text: "retained result"}] },
+    { role: "bashExecution", command: "ls", output: "in context", exitCode: 0 },
+    { role: "bashExecution", command: "make", output: "", exitCode: 2 },
+    { role: "bashExecution", command: "sleep 9", output: "partial", exitCode: null,
+      cancelled: true },
+    { role: "bashExecution", command: "cat big", output: "head", exitCode: 0, truncated: true,
+      fullOutputPath: "/tmp/full.log" },
+    { role: "bashExecution", command: "cat .env", output: "excluded", excludeFromContext: true },
+  ];
+  const userText = (text) => ({
+    type: "message", role: "user", content: [{type: "input_text", text}],
+  });
+  const expectedSnapshot = [
+    userText(
+      "The conversation history before this point was compacted into the following summary:" +
+      "\n\n<summary>\ncheckpoint\n</summary>",
+    ),
+    userText(
+      "The following is a summary of a branch that this conversation came back from:" +
+      "\n\n<summary>\nbranch work</summary>",
+    ),
+    userText("look"),
+    userText("extension note"),
+    { type: "message", role: "assistant", content: [{type: "output_text", text: "reading"}] },
+    { type: "function_call", call_id: "read-1", name: "read", arguments: '{"path":"a"}' },
+    { type: "function_call_output", call_id: "read-1", output: "retained result" },
+    userText("Ran `ls`\n```\nin context\n```"),
+    userText("Ran `make`\n(no output)\n\nCommand exited with code 2"),
+    userText("Ran `sleep 9`\n```\npartial\n```\n\n(command cancelled)"),
+    userText("Ran `cat big`\n```\nhead\n```\n\n[Output truncated. Full output: /tmp/full.log]"),
+  ];
+  ctx.sessionManager = {
+    getSessionId: () => "native-1",
+    buildSessionProjection: () => ({
+      entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+      messages,
+    }),
+  };
+  let release;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.data.item_type === "message") {
+      await new Promise(resolve => { release = resolve; });
+    }
+    const response = { ok: true, status: 200 };
+    if (receiptMode !== "absent") response.json = async () => {
+      if (receiptMode === "unreadable") throw new Error("receipt truncated after commit");
+      if (receiptMode === "timeout") await new Promise((_resolve, reject) => {
+        const fail = () => reject(new Error("receipt timed out"));
+        if (request.signal.aborted) return fail();
+        request.signal.addEventListener("abort", fail);
+      });
+      return { item_id: "persisted-user" };
+    };
+    return response;
+  };
+  await handlers.input({text: "covered input", source: "extension"}, ctx);
+  // Repeated summary text can make Pi's event point at an older checkpoint.
+  const compacting = handlers.session_compact(
+    {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
+  );
+  messages[6].content[0].text = "later mutation";
+  assert.equal(posted.length, 1, "checkpoint cannot overtake pending history");
+  release();
+  await compacting;
+  assert.equal(posted.length, 2);
+  const compact = posted[1].data;
+  assert.equal(compact.item_type, "compaction");
+  assert.equal(compact.source_id, "pi:compaction:native-1:latest");
+  assert.equal(compact.item_data.window_id, "latest");
+  assert.equal(compact.item_data.summary, "checkpoint");
+  assert.equal(compact.item_data.last_item_id,
+    receiptMode === "valid" ? "persisted-user" : "compact_boundary_session-1");
+  assert.deepEqual(compact.item_data.compacted_messages, expectedSnapshot);
+  assert.deepEqual(retryDelays, []);
+  assert.deepEqual(diagnostics, []);
+  assert.deepEqual(notices, []);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), receipt)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unsupported",
+        "projection_error",
+        "unreadable_message",
+        "no_checkpoint",
+        "session_id_error",
+        "stalled",
+    ],
+)
+def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const failure = process.argv[3];
+  const projection = {
+    entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
+    messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 1 }],
+  };
+  ctx.sessionManager = { getSessionId: () => {
+    if (failure === "session_id_error") throw new Error("session id unavailable");
+    return "native-1";
+  } };
+  if (failure === "no_checkpoint") projection.entries = [{ sourceEntry: { type: "message" } }];
+  if (failure !== "unsupported") {
+    ctx.sessionManager.buildSessionProjection = () => {
+      if (failure === "projection_error") throw new Error("projection failed");
+      return projection;
+    };
+  }
+  if (failure === "unreadable_message") {
+    projection.messages.push({ role: "custom", get content() { throw new Error("unreadable"); } });
+  }
+  let budgetWaits = 0;
+  if (failure === "stalled") {
+    global.fetch = async (_url, request) => {
+      posted.push(JSON.parse(request.body));
+      return new Promise(() => {});
+    };
+    await handlers.input({ text: "stuck input", source: "extension" }, ctx);
+    const harnessSetTimeout = global.setTimeout;
+    global.setTimeout = (callback, delay, ...args) => {
+      if (delay !== 30000) return harnessSetTimeout(callback, delay, ...args);
+      budgetWaits += 1;
+      queueMicrotask(() => callback(...args));
+      return {};
+    };
+  }
+  let guard;
+  await Promise.race([
+    handlers.session_compact({}, ctx),
+    new Promise((_resolve, reject) => {
+      guard = originalSetTimeout(() => reject(new Error("session_compact blocked Pi")), 2000);
+    }),
+  ]).finally(() => clearTimeout(guard));
+  const items = posted.filter((body) => body.type === "external_conversation_item");
+  const itemTypes = items.map((body) => body.data.item_type);
+  assert.deepEqual(itemTypes, failure === "stalled" ? ["message"] : []);
+  assert.equal(budgetWaits, failure === "stalled" ? 1 : 0);
+  const failed = failure !== "unsupported" && failure !== "stalled";
+  assert.deepEqual(notices, failed ? ["Omnigent could not save the compaction checkpoint."] : []);
+  if (failed) assert.match(diagnostics.join("\n"), /Compaction snapshot failed/);
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), failure)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

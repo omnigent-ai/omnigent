@@ -224,6 +224,12 @@ export interface ServerInfo {
    */
   session_search_scope?: boolean;
   /**
+   * True when scheduled tasks accept ``session_mode`` and ``session_id``.
+   * Older servers reject the fields, so the automation dialog hides its
+   * Session control there. Fails to ``false``.
+   */
+  scheduled_task_session_modes?: boolean;
+  /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
    * ``false``.
@@ -242,10 +248,17 @@ export interface ServerInfo {
   /** Types the session events route accepts; empty on older servers. */
   session_event_types?: readonly string[];
   /**
+   * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
+   * and ``Conversation.pull_request``); absent on older servers (off).
+   */
+  session_pull_requests?: boolean;
+  /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
    */
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
+  /** Scheduled tasks accept a project; absent on older servers (off). */
+  scheduled_task_projects?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
 }
@@ -325,6 +338,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   archive_worktree_cleanup: false,
   session_search_scope: false,
+  scheduled_task_session_modes: false,
   request_managed_sandbox_host_id: false,
   branding: null,
 };
@@ -439,6 +453,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
+          scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
@@ -446,7 +461,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_event_types: Array.isArray(data.session_event_types)
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
+          session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
+          scheduled_task_projects: data.scheduled_task_projects === true,
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

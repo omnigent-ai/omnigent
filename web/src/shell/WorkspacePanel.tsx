@@ -983,7 +983,10 @@ function WorkspacePanelImpl({
           if (sendFailed) throw new Error("side chat send failed");
         });
     }
-    return createSideChat(conversationId).then(
+    return createSideChat(
+      conversationId,
+      useChatStore.getState().sideChatComposers[pendingId]?.settings,
+    ).then(
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
         // shared queue, so overlapping launches can't cross-assign. Seeding the
@@ -1248,7 +1251,7 @@ function WorkspacePanelImpl({
     })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId, index) => ({
       key: `browser:${tabId}`,
-      label: `Browser ${index + 1}`,
+      label: browsers.labelFor(tabId, index),
       active: browserSelected && browsers.selected === tabId,
       select: () => {
         browsers.select(tabId);
@@ -1362,6 +1365,24 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
+  // The selected tab's view, beneath any open file or shell tab.
+  const scopeView =
+    sideChatSelected && !isMobile
+      ? "sidechat"
+      : browserSelected && showBrowserTab
+        ? "browser"
+        : rightRailTab === "github" && showGithubTab
+          ? "github"
+          : rightRailTab === "subagents" && rootSessionId
+            ? "subagents"
+            : rightRailTab === null
+              ? "empty"
+              : rightRailTab === "content-search" && showContentSearch
+                ? "content-search"
+                : "files";
+  // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
+  const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
+  const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1546,7 +1567,8 @@ function WorkspacePanelImpl({
                         type="button"
                         role="tab"
                         aria-selected={browserSelected && browsers.selected === tabId}
-                        className="flex items-center gap-1"
+                        title={browsers.labelFor(tabId, index)}
+                        className="flex min-w-0 items-center gap-1"
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -1558,12 +1580,12 @@ function WorkspacePanelImpl({
                           onRightRailTabChange("browser");
                         }}
                       >
-                        <GlobeIcon className="size-4" />
-                        Browser {index + 1}
+                        <GlobeIcon className="size-4 shrink-0" />
+                        <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
                       </button>
                       <button
                         type="button"
-                        aria-label={`Close Browser ${index + 1}`}
+                        aria-label={`Close ${browsers.labelFor(tabId, index)}`}
                         className="flex size-4 items-center justify-center rounded hover:bg-muted"
                         onClick={() => void closeBrowserTab(tabId)}
                       >
@@ -1696,11 +1718,11 @@ function WorkspacePanelImpl({
             </WorkspaceTabTooltip>
           </div>
         </div>
-        {/* Tab content — single slot. An open shell tab holds its xterm; a
-          file tab holds FileViewer; the Files/Changes tabs show FilesPanel
-          (tree vs changed-only list); Subagents lists the root's children +
-          a "main" link back to the parent. */}
-        <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
+        <div
+          data-workspace-panel-content
+          className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+        >
           {showContentSearch && showFilesPanel && !pending && (
             <div
               className={cn(
@@ -1715,6 +1737,27 @@ function WorkspacePanelImpl({
                 key={conversationId}
                 conversationId={conversationId}
                 onFileSelect={openFileViewer}
+              />
+            </div>
+          )}
+          {filesPanelMounted && (
+            <div
+              className={cn(
+                "flex min-h-0 flex-1 flex-col",
+                // Not display:none: hidden rows would measure 0px and collapse
+                // the virtualized tree's height, losing its scroll position.
+                !filesPanelActive && "invisible absolute inset-0",
+              )}
+            >
+              <FilesPanel
+                conversationId={contained ? conversationId : undefined}
+                frameless
+                onFileSelect={openFileViewer}
+                flatView={rightRailTab === "changes"}
+                showHidden={filesPanelShowHidden}
+                onShowHiddenChange={onShowHiddenChange}
+                sort={filesPanelSort}
+                onSortChange={onSortChange}
               />
             </div>
           )}
@@ -1754,12 +1797,12 @@ function WorkspacePanelImpl({
                 sort={filesPanelSort}
               />
             </ResponsiveViewerSlot>
-          ) : sideChatSelected && !isMobile ? (
+          ) : scopeView === "sidechat" ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it
             // in the side-chats drawer instead, so it never mounts twice.
             selectedSideChatPane
-          ) : browserSelected && showBrowserTab ? (
+          ) : scopeView === "browser" ? (
             // Browser soft tab — BrowserPane self-gates and measures this rail
             // slot to position the native view over it.
             <BrowserPane
@@ -1769,29 +1812,16 @@ function WorkspacePanelImpl({
               active={open}
               className="min-h-0 flex-1"
             />
-          ) : rightRailTab === "github" && showGithubTab ? (
+          ) : scopeView === "github" ? (
             <PullRequestPanel conversationId={conversationId} />
-          ) : rightRailTab === "subagents" && rootSessionId ? (
+          ) : scopeView === "subagents" && rootSessionId ? (
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-          ) : rightRailTab === null ? (
+          ) : scopeView === "empty" ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
               <PlusIcon className="size-6" />
               <p className="text-sm">Open a Workspace tab from the + menu.</p>
             </div>
-          ) : rightRailTab === "content-search" && showContentSearch ? null : (
-            showFilesPanel && (
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
-            )
-          )}
+          ) : null}
         </div>
       </div>
     </aside>

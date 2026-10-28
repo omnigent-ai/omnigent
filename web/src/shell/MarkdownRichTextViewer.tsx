@@ -29,7 +29,7 @@ import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceI
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
-import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { type FinishServerCheck, useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useScrollRestore } from "./useScrollRestore";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
@@ -45,6 +45,7 @@ import {
 } from "./TipTapSearchExtension";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
+import { applyExternalMarkdown } from "./TipTapEditorHelpers";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -125,7 +126,7 @@ export function MarkdownRichTextViewer({
     discardAndApplyExternal,
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } = useMarkdownEditorSync({
     content,
     path,
@@ -158,7 +159,7 @@ export function MarkdownRichTextViewer({
       discardAndApplyExternal={discardAndApplyExternal}
       dismissExternalUpdate={dismissExternalUpdate}
       markSaved={markSaved}
-      reconcileServerContent={reconcileServerContent}
+      beginServerCheck={beginServerCheck}
       comments={comments}
       activeSelection={activeSelection}
       onSetActiveSelection={onSetActiveSelection}
@@ -191,7 +192,7 @@ interface InnerProps {
   discardAndApplyExternal: () => void;
   dismissExternalUpdate: () => void;
   markSaved: (content: string) => void;
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
   comments: Comment[];
   activeSelection: ActiveSelection | null;
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
@@ -217,7 +218,7 @@ function MarkdownRichTextViewerInner({
   discardAndApplyExternal,
   dismissExternalUpdate,
   markSaved,
-  reconcileServerContent,
+  beginServerCheck,
   comments,
   activeSelection,
   onSetActiveSelection,
@@ -320,7 +321,7 @@ function MarkdownRichTextViewerInner({
     [markSaved],
   );
 
-  // All save orchestration — write mutation, mid-turn conflict check, teardown
+  // All save orchestration — write mutation, pre-write conflict check, teardown
   // guard, and debounce/flush wiring — lives in the shared hook, identical to
   // the Monaco editor. This surface only supplies its own content access.
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
@@ -331,7 +332,7 @@ function MarkdownRichTextViewerInner({
     setDirty,
     hasExternalUpdate,
     markSaved: markDocumentSaved,
-    reconcileServerContent,
+    beginServerCheck,
     dismissExternalUpdate,
     baselineRef,
     getContent,
@@ -413,21 +414,15 @@ function MarkdownRichTextViewerInner({
     };
   }, [editor, autoSave]);
 
-  // Register an in-place content setter so the outer sync hook can update
-  // the editor without triggering a full remount (preserves scroll/cursor).
-  // emitUpdate=false suppresses onUpdate so we recapture baseline manually,
-  // preventing the editor from being incorrectly flagged as dirty.
-  //
-  // Scroll is saved and restored via requestAnimationFrame: ProseMirror's
-  // selectionToDOM re-establishes the cursor in the new DOM, which can cause
-  // the browser to scroll the selection into view after the full-document
-  // replace — undoing the user's scroll position.
+  // In-place setter for the sync hook; skipping a remount keeps scroll and caret.
+  // It emits no onUpdate, so re-baseline here, and restore scroll next frame
+  // because selectionToDOM can scroll the caret into view.
   useEffect(() => {
     if (!editor) return;
     setContentRef.current = (newContent: string) => {
       if (editor.isDestroyed) return;
       const savedScroll = scrollContainerRef.current?.scrollTop ?? 0;
-      editor.commands.setContent(newContent, { emitUpdate: false, contentType: "markdown" });
+      applyExternalMarkdown(editor, newContent);
       baselineRef.current = editor.getMarkdown();
       baselineDocRef.current = editor.state.doc;
       // Programmatic replace establishes a fresh baseline — no user edits relative to it.
