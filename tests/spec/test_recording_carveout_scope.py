@@ -39,6 +39,22 @@ def test_lane_recording_blockers_are_explicit_and_do_not_block_delivery() -> Non
     assert "Do not block the verdict, fix, or PR" in lanes
 
 
+def test_finishing_a_clip_checks_observed_states_and_discloses_limits() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    assert "ffmpeg -i <clip> -update 1 last-frame.png" in lanes
+    assert "Record any inspection failure and" in lanes
+    assert "If frame inspection is unavailable, disclose that" in lanes
+
+
+def test_absence_clip_rules_out_unrelated_errors_after_the_stall_is_visible() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    assert "first wait until the stall context the" in lanes
+    assert "then assert that no unrelated error is on screen" in lanes
+    assert "A zero-count assertion passes vacuously while the page is still loading" in lanes
+    assert '[data-testid="error-pill"][data-level="error"]' in lanes
+    assert '[data-testid="session-state-badge"][data-state="error"]' in lanes
+
+
 def test_repro_recording_rules_match_the_shared_guide() -> None:
     instructions = _normalized(_REPRO_AGENT / "AGENTS.md")
     lanes = _normalized(_DEV / "recording-lanes.md")

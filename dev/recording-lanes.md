@@ -356,6 +356,22 @@ labels do not establish what the screen displayed. Describe icon-only controls
 by their visible appearance. If frame inspection is unavailable, disclose that
 and limit claims to states the recording driver actually verified.
 
+Inspect the frames for each state named in the caption. To extract the final
+frame, use `ffmpeg -i <clip> -update 1 last-frame.png`; this decodes the whole
+clip, including WebM files without a duration. Record any inspection failure and
+its supporting assertions in `evidence`.
+
+For a missing element or silent stall, first wait until the stall context the
+caption describes is visible (the user message, the pending tool call, or the
+running-turn indicator), then assert that no unrelated error is on screen. A
+zero-count assertion passes vacuously while the page is still loading. In the web
+lane, check the transcript error pill
+(`[data-testid="error-pill"][data-level="error"]`; `data-level="info"` is an
+informational notice) and the session's sidebar badge
+(`[data-testid="session-state-badge"][data-state="error"]`). If an error appears,
+find what raised it and fix the setup before filming: a clip of an error demonstrates
+that error, not a silent stall.
+
 ### Timed captions inside the video
 
 For every newly captured clip, **burn in step-by-step captions before declaring
