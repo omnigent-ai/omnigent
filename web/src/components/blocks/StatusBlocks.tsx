@@ -256,7 +256,10 @@ function ErrorForkAction({
   const scopedForkSource =
     forkDialog.currentSessionId != null && conversationId !== forkDialog.currentSessionId;
   if (!scopedForkSource && !forkDialog.canFork) return null;
-  const disabledReason = scopedForkSource ? undefined : forkDialog.disabledReason;
+  const disabledReason = scopedForkSource
+    ? undefined
+    : (forkDialog.disabledReason ??
+      (workspaceRecovery ? forkDialog.workspaceRecoveryDisabledReason : undefined));
   return (
     <div className={className} onClick={(event) => event.stopPropagation()}>
       <DisabledActionTooltip reason={disabledReason} label={label} className="max-w-full">

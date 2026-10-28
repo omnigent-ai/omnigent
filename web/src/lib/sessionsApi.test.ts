@@ -174,6 +174,7 @@ describe("createSession", () => {
       backgroundTaskCount: undefined,
       todos: [],
       codexModelOptions: [],
+      sideChatSettingsSupported: false,
       terminalPending: false,
       sandboxStatus: null,
       mcpStartup: null,
@@ -581,6 +582,26 @@ describe("createSideChat", () => {
     created_at: 1704067200,
     labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
+
+  it.each(["max", null])(
+    "passes draft effort %s into the fork before binding its runner",
+    async (reasoningEffort) => {
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse(source))
+        .mockResolvedValueOnce(mockJsonResponse(fork))
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+      await createSideChat(source.id, { modelOverride: "gpt-6-sol", reasoningEffort });
+      const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(url).toBe(`/v1/sessions/${source.id}/fork`);
+      expect(JSON.parse(init.body as string)).toEqual({
+        title: "Side chat",
+        side_chat: true,
+        model_override: "gpt-6-sol",
+        reasoning_effort: reasoningEffort,
+      });
+      expect(fetchMock.mock.calls[2][0]).toBe(`/v1/sessions/${fork.id}`);
+    },
+  );
 
   it.each(["worktree-from-another-machine", "main", null])(
     "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
@@ -992,6 +1013,19 @@ describe("runner binding", () => {
 });
 
 describe("getSession", () => {
+  it.each([undefined, false, true])("reads side-chat settings support (%s)", async (supported) => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "side",
+        agent_id: "agent",
+        status: "idle",
+        created_at: 0,
+        side_chat_settings_supported: supported,
+      }),
+    );
+    expect((await getSession("side")).sideChatSettingsSupported).toBe(supported === true);
+  });
+
   it("GETs the sessions endpoint and parses the response", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

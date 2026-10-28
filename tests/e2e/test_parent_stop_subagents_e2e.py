@@ -184,9 +184,10 @@ def test_native_parent_teardown_preserves_child_outcome(
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
         launcher = bin_dir / "codex"
+        # Before "$@": Codex ignores top-level -c once the subcommand has its own.
         launcher.write_text(
-            f'#!/bin/sh\nexec {shlex.quote(codex)} "$@" '
-            "-c mcp_servers.omnigent.startup_timeout_sec=60\n"
+            f"#!/bin/sh\nexec {shlex.quote(codex)} "
+            '-c mcp_servers.omnigent.startup_timeout_sec=60 "$@"\n'
         )
         launcher.chmod(0o755)
         base_env["PATH"] = f"{bin_dir}{os.pathsep}{base_env['PATH']}"
