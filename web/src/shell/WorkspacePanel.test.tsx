@@ -661,6 +661,23 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
   });
+
+  it("unmounts the FilesPanel while the rail is collapsed and remounts it on reopen", () => {
+    const { rerender } = renderWorkspace({ rightRailTab: "files", open: false, inert: true });
+
+    // A collapsed rail stays mounted; its listing body must not run.
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+
+    rerender({ open: true, inert: false });
+    expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+  });
+
+  it("keeps an open file's viewer mounted while the rail is collapsed", () => {
+    renderWorkspace({ selectedFilePath: "src/App.tsx", open: false, inert: true });
+
+    // Unsaved edits live in the viewer, so collapsing must not unmount it.
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
+  });
 });
 
 describe("WorkspacePanel shell tabs", () => {

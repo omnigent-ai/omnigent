@@ -863,6 +863,8 @@ function WorkspacePanelImpl({
   onMobileSideChatsOpenChange,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
+  // A collapsed rail stays mounted; skip the listing/polling bodies until it is shown again.
+  const bodiesActive = open && !inert;
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const browsers = useBrowserTabs(conversationId);
@@ -1771,16 +1773,19 @@ function WorkspacePanelImpl({
               className="min-h-0 flex-1"
             />
           ) : rightRailTab === "github" && showGithubTab ? (
-            <PullRequestPanel conversationId={conversationId} />
+            bodiesActive && <PullRequestPanel conversationId={conversationId} />
           ) : rightRailTab === "subagents" && rootSessionId ? (
-            <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+            bodiesActive && (
+              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+            )
           ) : rightRailTab === null ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
               <PlusIcon className="size-6" />
               <p className="text-sm">Open a Workspace tab from the + menu.</p>
             </div>
           ) : rightRailTab === "content-search" && showContentSearch ? null : (
-            showFilesPanel && (
+            showFilesPanel &&
+            bodiesActive && (
               <FilesPanel
                 conversationId={contained ? conversationId : undefined}
                 frameless
