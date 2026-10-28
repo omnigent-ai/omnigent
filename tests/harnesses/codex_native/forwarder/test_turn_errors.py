@@ -960,7 +960,7 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
         }
     ]
 
-    edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
+    edge = fwd._resume_turn_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
 
     assert edge is not None
     assert edge.status == "failed"
