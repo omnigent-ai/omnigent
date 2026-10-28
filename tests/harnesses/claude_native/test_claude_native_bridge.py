@@ -12424,6 +12424,7 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     error: type[Exception],
 ) -> None:
     """A dialog exposed by recovery receives no clearing, paste or submit keystrokes."""
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 1.0)
     composer = _EditableComposer(
         "draft\n──────\n❯ quote\n──────\nhidden" if recovery == "quoted-frame" else "",
         cursor=0,
@@ -12486,7 +12487,7 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     assert redrawn == (recovery == "notice-redraw")
     if recovery != "notice-redraw":
         assert claude_native_bridge.time.monotonic() < 2, (
-            "recovery must retain the caller's budget"
+            "recovery must retain the configured readiness budget"
         )
     if pane != _REVERSE_SEARCH_PANE:
         assert recovery_keys == []

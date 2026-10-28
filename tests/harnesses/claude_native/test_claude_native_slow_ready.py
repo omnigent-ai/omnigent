@@ -30,7 +30,7 @@ import tty
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[4])
-from tests.harnesses.claude_native.test_claude_native_shell_mode_draft import _InputBox
+from tests.harnesses.claude_native._terminal import InputBox
 
 gate_started, delivered = map(Path, sys.argv[1:3])
 startup = sys.argv[3]
@@ -51,7 +51,7 @@ draft = (
 )
 if startup.startswith("quoted-"):
     draft = "draft\n──────\n❯ quoted prompt\n──────\nHIDDEN ONE\nHIDDEN TWO\nHIDDEN THREE"
-box = _InputBox("bash" if startup in {"stale-shell-frame", "late-shell"} else "prompt", draft)
+box = InputBox("bash" if startup in {"stale-shell-frame", "late-shell"} else "prompt", draft)
 received_bytes = 0
 
 
@@ -119,6 +119,7 @@ while True:
     "startup",
     [
         "slow",
+        "slow-short-pane",
         "dead",
         "dead-no-status",
         "base-budget-only",
@@ -208,6 +209,8 @@ def test_first_message_survives_slow_terminal_startup(
                     "-y",
                     "6"
                     if startup.startswith("stale-")
+                    else "5"
+                    if startup == "slow-short-pane"
                     else "7"
                     if startup.startswith("quoted-")
                     else "24",
@@ -256,13 +259,17 @@ def test_first_message_survives_slow_terminal_startup(
                     [*tmux, "display-message", "-p", "-t", "main", "#{window_height}"], text=True
                 ).strip()
                 assert geometry == "7"
-            elif startup == "slow":
+            elif startup in {"slow", "slow-short-pane"}:
                 bridge.inject_user_message(
                     bridge_dir, content="FIRST_PROMPT_DELIVERED", timeout_s=0.3
                 )
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
+                geometry = subprocess.check_output(
+                    [*tmux, "display-message", "-p", "-t", "main", "#{window_height}"], text=True
+                ).strip()
+                assert geometry == ("5" if startup == "slow-short-pane" else "24")
             elif startup.startswith("stale-") or startup == "late-shell":
                 bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=2.0)
                 assert json.loads(delivered.read_text()) == [["prompt", "ONLY_NEW_INPUT"]]

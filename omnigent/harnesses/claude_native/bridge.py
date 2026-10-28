@@ -4313,7 +4313,6 @@ def inject_user_message(
         info["tmux_target"],
         timeout_s=timeout_s,
         bridge_dir=bridge_dir,
-        extend_for_slow_boot=not resized,
     )
     # Escape unsupported commands as user text; supported controls and skills
     # pass through unchanged.
@@ -6299,9 +6298,13 @@ def _background_panel_close_hint(pane: str) -> bool:
     panel = lines[last_rule + 1 :]
     if last_rule < 0 or not panel or panel[0] != "Background":
         return False
-    # Only this panel's navigation footer is collapsed, never decision-dialog text.
-    footer = " ".join(" ".join(panel[-3:]).split())
-    return footer.endswith("↑/↓ to select · Enter to view · x to stop · Esc to close")
+    # Terminal wraps can split words and span any number of rows. Only join
+    # the complete navigation footer under this panel's heading.
+    for start, line in enumerate(panel[1:], start=1):
+        if line.startswith("↑/↓"):
+            footer = "".join("".join(panel[start:]).split())
+            return footer == "↑/↓toselect·Entertoview·xtostop·Esctoclose"
+    return False
 
 
 def _escape_quits_claude(pane: str) -> bool:

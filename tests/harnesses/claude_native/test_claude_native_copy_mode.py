@@ -36,11 +36,11 @@ import tty
 from pathlib import Path
 
 sys.path.insert(0, sys.argv[4])
-from tests.harnesses.claude_native.test_claude_native_shell_mode_draft import _InputBox
+from tests.harnesses.claude_native._terminal import InputBox
 
 received, delivered = map(Path, sys.argv[1:3])
 panel_open = sys.argv[3] == "background"
-box = _InputBox("prompt", "")
+box = InputBox("prompt", "")
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
@@ -58,7 +58,7 @@ def render(*_args):
 
 signal.signal(signal.SIGWINCH, render)
 if panel_open:
-    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 50 + "\r\n"
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
         "  Background\r\n  1 active shell\r\n  ❯ ● make test   running\r\n"
         "  ↑/↓ to select · Enter to view · x to stop · Esc to close\r\n")
     sys.stdout.flush()
@@ -141,12 +141,18 @@ def initial_surface() -> str:
     return "composer"
 
 
+@pytest.fixture
+def pane_width() -> int:
+    return 120
+
+
 @pytest.fixture(params=["emacs", "vi"])
 def pane(
     request: pytest.FixtureRequest,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     initial_surface: str,
+    pane_width: int,
 ) -> Iterator[_Pane]:
     """Start the stand-in composer in tmux with the parametrized copy-mode key table."""
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
@@ -180,7 +186,7 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "50" if initial_surface == "background" else "120",
+                    str(pane_width),
                     "-y",
                     "24",
                     command,
@@ -233,14 +239,18 @@ def test_message_from_web_ui_reaches_scrolled_back_pane(pane: _Pane) -> None:
 
 @pytest.mark.parametrize("pane", ["emacs"], indirect=True)
 @pytest.mark.parametrize("initial_surface", ["background"])
+@pytest.mark.parametrize(
+    ("pane_width", "wrapped_close_hint"),
+    [(50, "Esc\nto close"), (24, "Es\nc to close"), (16, "Es\nc to close")],
+)
 def test_web_message_dismisses_wrapped_background_panel(
-    pane: _Pane, monkeypatch: pytest.MonkeyPatch
+    pane: _Pane, monkeypatch: pytest.MonkeyPatch, wrapped_close_hint: str
 ) -> None:
     """A real terminal wraps the close hint before delivery reclaims the composer."""
     monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 2.0)
     captured = bridge._capture_pane(pane.tmux[-1], "main")
     assert "Esc to close" not in captured
-    assert "Esc\nto close" in captured
+    assert wrapped_close_hint in captured
 
     bridge.inject_user_message(pane.bridge_dir, content="AFTER_BACKGROUND_PANEL", timeout_s=2.0)
 

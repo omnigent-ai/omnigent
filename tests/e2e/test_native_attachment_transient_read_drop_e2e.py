@@ -33,7 +33,7 @@ from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import TurnComplete
 from omnigent.runner.app import _resolve_forwarded_message_content
 from tests._helpers.live_server import find_free_port
-from tests.e2e.test_claude_native_delivery_timeout_e2e import _FAKE_CLAUDE_TUI
+from tests.harnesses.claude_native._terminal import FAKE_CLAUDE_TUI
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -223,7 +223,7 @@ def claude_pane() -> Iterator[Path]:
     # Keep the socket path short: a long path overflows the AF_UNIX limit.
     socket_path = work / "t.sock"
     tui_path = work / "fake_claude_tui.py"
-    tui_path.write_text(_FAKE_CLAUDE_TUI, encoding="utf-8")
+    tui_path.write_text(FAKE_CLAUDE_TUI, encoding="utf-8")
 
     subprocess.run(
         [

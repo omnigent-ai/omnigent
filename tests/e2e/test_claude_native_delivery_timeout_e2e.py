@@ -52,6 +52,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from tests.harnesses.claude_native._terminal import FAKE_CLAUDE_TUI
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux on PATH")
 
@@ -69,86 +70,6 @@ _TUI_STALL_S = 13.0
 # ceiling constant so this bound tracks it if the window is later tuned.
 _DELIVERY_BOUND_S = _SUBMIT_VERIFY_TIMEOUT_S + 5.0
 
-# The fake Claude TUI. It renders the framed composer Claude Code shows -- a
-# box rule, a prompt row, a closing rule -- so the bridge's readiness gate and
-# draft-visibility poll both pass and the pasted draft is seen to land. Once
-# the draft contains the expected message (argv[1]) it goes unresponsive for
-# argv[2] seconds -- stdin queues in the pty, exactly like a CPU-starved TUI
-# at submit time -- then recovers and processes the queued submit Enter, which
-# moves the draft into the transcript and clears the input box.
-_FAKE_CLAUDE_TUI = r"""
-import codecs, os, sys, termios, time, tty
-
-sys.path.insert(0, __REPO_ROOT__)
-from tests.harnesses.claude_native.test_claude_native_shell_mode_draft import _InputBox
-
-STALL_TRIGGER = sys.argv[1] if len(sys.argv) > 1 else None
-STALL_S = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
-
-
-def main():
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setraw(fd)
-    box = _InputBox("prompt", "")
-    decoder = codecs.getincrementaldecoder("utf-8")()
-    pending = ""
-    pasted = False
-    stalled = False
-    keys = ("\x1b[107;5u", "\x1b[117;5u", "\x1b[200~", "\x1b[201~")
-
-    def render():
-        transcript = "".join("sent: " + text + "\n" for _, text in box.submitted)
-        sys.stdout.write("\x1b[2J\x1b[H" + (transcript + box.pane()).replace("\n", "\r\n"))
-        cursor_row = len(transcript.splitlines()) + 1 + box.draft[:box.cursor].count("\n")
-        cursor_column = len(box.draft[:box.cursor].rsplit("\n", 1)[-1]) + 2
-        sys.stdout.write(f"\x1b[{cursor_row + 1};{cursor_column + 1}H")
-        sys.stdout.flush()
-
-    sys.stdout.write("\x1b[?2004h")
-    render()
-    try:
-        while True:
-            data = os.read(fd, 65536)
-            if not data:
-                break
-            pending += decoder.decode(data)
-            while pending:
-                token = next((key for key in keys if pending.startswith(key)), None)
-                if token is not None:
-                    pending = pending[len(token):]
-                    if token == "\x1b[200~":
-                        pasted = True
-                    elif token == "\x1b[201~":
-                        pasted = False
-                    else:
-                        box.key(token)
-                elif any(key.startswith(pending) for key in keys):
-                    break
-                else:
-                    ch, pending = pending[0], pending[1:]
-                    if ch == "\x03":
-                        return
-                    if ch in {"\x7f", "\b"} and not pasted:
-                        box.key("BSpace")
-                    elif ch == "\r" and not pasted:
-                        if box.draft.strip():
-                            box.key("Enter")
-                    elif ch >= " " or (pasted and ch in "\r\n"):
-                        ch = "\n" if ch == "\r" else ch
-                        box.draft = box.draft[:box.cursor] + ch + box.draft[box.cursor:]
-                        box.cursor += 1
-                render()
-                if not stalled and STALL_TRIGGER and STALL_TRIGGER in box.draft:
-                    stalled = True
-                    time.sleep(STALL_S)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-main()
-""".replace("__REPO_ROOT__", repr(str(Path(__file__).resolve().parents[2])))
-
 
 @pytest.fixture
 def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
@@ -163,7 +84,7 @@ def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
     # Keep the socket path short: a long path overflows the AF_UNIX limit.
     socket_path = work / "t.sock"
     tui_path = work / "fake_claude_tui.py"
-    tui_path.write_text(_FAKE_CLAUDE_TUI, encoding="utf-8")
+    tui_path.write_text(FAKE_CLAUDE_TUI, encoding="utf-8")
 
     subprocess.run(
         [
