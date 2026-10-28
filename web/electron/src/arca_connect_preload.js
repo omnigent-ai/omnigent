@@ -28,6 +28,6 @@ contextBridge.exposeInMainWorld("arcaConnect", {
   onStarted: (callback) => on("arca-connect:started", callback),
   /** A chunk of live stdout/stderr. */
   onOutput: (callback) => on("arca-connect:output", callback),
-  /** `{ ok, error, authRequired?, command? }` after a command or before sign-in consent. */
+  /** `{ ok, error }` once the connect, and any sign-in it needed, finishes. */
   onDone: (callback) => on("arca-connect:done", callback),
 });

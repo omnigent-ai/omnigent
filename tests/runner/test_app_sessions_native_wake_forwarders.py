@@ -1402,6 +1402,223 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
 
+async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A resume that briefly finds no rollout retries and keeps the thread.
+
+    Codex can answer ``no rollout found`` for a rollout the runner just wrote
+    until it indexes the file; one retry must resume the same thread, with no
+    reset notice and no fresh-thread discovery.
+
+    :param tmp_path: Temporary directory for isolated bridge state.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    import omnigent.runner.native.orchestration as orchestration_mod
+
+    monkeypatch.setattr(orchestration_mod, "_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S", (0.0, 0.0))
+    session_id = "d7a1c2e3f4b5a6c7d8e9f0a1b2c3d4e5"
+    thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936e"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+
+    posted: list[str] = []
+
+    class _SnapshotServerClient:
+        """Server client whose snapshot carries a persisted resume thread."""
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Return the session snapshot / items consumed by the helper.
+
+            :param url: Request path, e.g. ``"/v1/sessions/conv_..."``.
+            :param kwargs: Request keyword arguments (ignored).
+            :returns: HTTP 200 response carrying launch config or items.
+            """
+            del kwargs
+            if url == f"/v1/sessions/{session_id}/items":
+                return httpx.Response(
+                    200,
+                    json={"data": [], "has_more": False},
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                json={"external_session_id": thread_id},
+                request=httpx.Request("GET", url),
+            )
+
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            """
+            Record any notice the launch posts.
+
+            :param url: Request path.
+            :param kwargs: Request keyword arguments (ignored).
+            :returns: HTTP 202 acknowledgement.
+            """
+            del kwargs
+            posted.append(url)
+            return httpx.Response(202, json={}, request=httpx.Request("POST", url))
+
+    class _FakeCodexAppServer:
+        """Minimal app-server object used by ``codex_terminal_env``."""
+
+        codex_path = "/opt/codex/bin/codex"
+        codex_cli_version: tuple[int, int, int] | None = None
+
+        def __init__(self) -> None:
+            """:returns: None."""
+            self.env = {"OPENAI_API_KEY": "sk-test"}
+            self.codex_home = tmp_path / "unconfigured-codex-home"
+            self.listen_url: str | None = None
+            self.config_overrides: list[str] = []
+            self.proc = SimpleNamespace(returncode=None)
+
+        async def start(self) -> None:
+            """:returns: None."""
+
+        async def close(self) -> None:
+            """Fail if the retried resume tears the app-server down."""
+            raise AssertionError("a resume that succeeds on retry must keep the app-server")
+
+    def _fake_build_codex_native_server(**kwargs: Any) -> _FakeCodexAppServer:
+        """
+        Build a fake app-server bound to the requested CODEX_HOME.
+
+        :param kwargs: Keyword arguments passed by the runner helper.
+        :returns: Fake app-server.
+        """
+        app_server = _FakeCodexAppServer()
+        app_server.codex_home = kwargs["codex_home"]
+        return app_server
+
+    class _UnexpectedDiscoveryClient:
+        """App-server client that must not connect on a known-thread resume."""
+
+        def __init__(self, *, ws_url: str, client_name: str) -> None:
+            """
+            :param ws_url: App-server WebSocket URL.
+            :param client_name: JSON-RPC client name.
+            """
+            self.ws_url = ws_url
+            self.client_name = client_name
+
+        async def connect(self) -> None:
+            """Fail if the resume path falls back to a fresh thread."""
+            raise AssertionError("resume path must not connect discovery client")
+
+        async def close(self) -> None:
+            """:returns: None."""
+
+    preloads: list[str] = []
+
+    async def _late_rollout_preload(
+        transport: str,
+        loaded_thread_id: str,
+        *,
+        terminal_launch_args: list[str] | None = None,
+        retain_client: bool = False,
+        cwd: Path | None = None,
+        model_provider: str | None = None,
+    ) -> None:
+        """
+        Report the rollout missing on the first resume only.
+
+        :param transport: App-server transport URL (ignored).
+        :param loaded_thread_id: Thread id passed to ``thread/resume``.
+        :raises CodexAppServerResponseError: On the first call.
+        """
+        del transport, terminal_launch_args
+        preloads.append(loaded_thread_id)
+        if len(preloads) == 1:
+            raise codex_app_mod.CodexAppServerResponseError(
+                {"code": -32600, "message": f"no rollout found for thread id {loaded_thread_id}"}
+            )
+
+    runs: list[_ForwarderRun] = []
+
+    async def _parking_forward_known_thread(**kwargs: Any) -> None:
+        """Park forever in place of the known-thread forwarder."""
+        del kwargs
+        run = _ForwarderRun(task=asyncio.current_task())
+        runs.append(run)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    launched_args: list[list[str]] = []
+
+    class _FakeResourceRegistry:
+        """Captures the TUI argv instead of launching tmux."""
+
+        async def launch_auxiliary_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Record the launch argv and return a terminal resource view."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched_args.append(list(spec.args))
+            return SessionResourceView(
+                id="terminal_codex_main",
+                type="terminal",
+                session_id=session_id,
+                name="Codex",
+            )
+
+    monkeypatch.setattr(
+        codex_app_mod,
+        "build_codex_native_server",
+        _fake_build_codex_native_server,
+    )
+    monkeypatch.setattr(codex_app_mod, "CodexAppServerClient", _UnexpectedDiscoveryClient)
+    monkeypatch.setattr(codex_app_mod, "preload_codex_thread_for_resume", _late_rollout_preload)
+    monkeypatch.setattr(
+        runner_app_mod, "_codex_forward_known_thread", _parking_forward_known_thread
+    )
+
+    agent_spec = AgentSpec(
+        spec_version=1,
+        name="codex",
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native", "model": "gpt-5-default"},
+        ),
+    )
+
+    try:
+        await runner_app_mod._auto_create_codex_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _evt: None,
+            agent_spec=agent_spec,
+            server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        )
+        await asyncio.sleep(0)
+
+        assert preloads == [thread_id, thread_id]
+        assert posted == [], "a resume that succeeds on retry must not post a reset notice"
+        assert launched_args and thread_id in launched_args[0]
+        assert len(runs) == 1 and runs[0].cancelled is False
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        await _drain_forwarder_runs(runs)
+
+
 @pytest.mark.parametrize(
     ("resume_error_payload", "expected_error_substring"),
     [
@@ -1427,8 +1644,15 @@ async def test_auto_create_codex_terminal_refused_resume_closes_app_server(
             },
             "source rollout is not paginated",
         ),
+        (
+            {
+                "code": -32600,
+                "message": "no rollout found for thread id 019e96aa-0be2-7343-8d3b-6f914d60936d",
+            },
+            "no rollout found",
+        ),
     ],
-    ids=["thread_store_error", "unpaginated_lineage"],
+    ids=["thread_store_error", "unpaginated_lineage", "missing_rollout"],
 )
 async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     tmp_path: Path,
@@ -1440,9 +1664,10 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
     """
     A thread codex cannot read falls back to a fresh thread on the same app-server.
 
-    Covers two permanent-mismatch shapes: the large-rollout incident
-    (``-32603 failed to read thread … invalid UTF-8``) and the paginated-lineage
-    mismatch (``-32600 … source rollout is not paginated``). In both cases
+    Covers the permanent-mismatch shapes: the large-rollout incident
+    (``-32603 failed to read thread … invalid UTF-8``), the paginated-lineage
+    mismatch (``-32600 … source rollout is not paginated``), and a rollout the
+    runner just wrote that codex still reports missing after retries. In each case
     re-raising fails every turn for good; the fallback must keep the app-server,
     take the fresh-thread path (discovery listener connected, TUI launched without
     the thread id, discovery forwarder) and log the Codex-side context it drops.
@@ -1455,7 +1680,9 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
         the reset notice surfaced into the session.
     """
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
+    import omnigent.runner.native.orchestration as orchestration_mod
 
+    monkeypatch.setattr(orchestration_mod, "_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S", (0.0, 0.0))
     session_id = "c8e3d2f1bb225c63c8d3a2e4f5b6c7d8"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936d"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")

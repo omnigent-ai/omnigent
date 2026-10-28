@@ -126,7 +126,7 @@ function setupHooks(
     discardAndApplyExternal: vi.fn(),
     dismissExternalUpdate: vi.fn(),
     markSaved: vi.fn(),
-    reconcileServerContent: vi.fn().mockReturnValue(false),
+    beginServerCheck: vi.fn(() => () => "write"),
   });
   vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
     isPending: overrides.isPending ?? false,

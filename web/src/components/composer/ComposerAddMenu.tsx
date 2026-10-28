@@ -17,6 +17,17 @@ import {
 
 const EMPTY_PROJECTS: readonly { name: string }[] = [];
 
+function ActionText({ label, description }: { label: string; description: string }) {
+  // A description that doesn't fit beside the label wraps onto the clipped
+  // second line, so narrow menus hide it instead of cutting it off.
+  return (
+    <span className="flex h-lh min-w-0 flex-wrap items-center gap-x-2 overflow-hidden">
+      <span className="min-w-0 truncate">{label}</span>
+      <span className="text-xs leading-4 text-muted-foreground">{description}</span>
+    </span>
+  );
+}
+
 export function ComposerAddMenu({
   disabled,
   onAttach,
@@ -167,10 +178,10 @@ export function ComposerAddMenu({
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <MessagesSquareIcon className="size-3.5" />
                       </span>
-                      <span className="shrink-0">Start a new side chat</span>
-                      <span className="truncate text-xs leading-4 text-muted-foreground">
-                        Ask without affecting this conversation
-                      </span>
+                      <ActionText
+                        label="Start a new side chat"
+                        description="Ask without affecting this conversation"
+                      />
                     </DropdownMenuItem>
                   )}
                   {showGoal && (
@@ -186,10 +197,7 @@ export function ComposerAddMenu({
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <TargetIcon className="size-3.5" />
                       </span>
-                      <span>Goal</span>
-                      <span className="truncate text-xs leading-4 text-muted-foreground">
-                        {goalDescription}
-                      </span>
+                      <ActionText label="Goal" description={goalDescription} />
                     </DropdownMenuItem>
                   )}
                   {showPlan && (
@@ -204,10 +212,10 @@ export function ComposerAddMenu({
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <LightbulbIcon className="size-3.5" />
                       </span>
-                      <span>Plan</span>
-                      <span className="truncate text-xs leading-4 text-muted-foreground">
-                        {planActive ? "Plan mode is on" : "Turn plan mode on"}
-                      </span>
+                      <ActionText
+                        label="Plan"
+                        description={planActive ? "Plan mode is on" : "Turn plan mode on"}
+                      />
                     </DropdownMenuItem>
                   )}
                   {onProjectSelect && (
@@ -220,10 +228,10 @@ export function ComposerAddMenu({
                       <span className="flex size-4 shrink-0 items-center justify-center">
                         <FolderIcon className="size-3.5" />
                       </span>
-                      <span className="shrink-0">Work in a project</span>
-                      <span className="truncate text-xs leading-4 text-muted-foreground">
-                        Choose a project for this session
-                      </span>
+                      <ActionText
+                        label="Work in a project"
+                        description="Choose a project for this session"
+                      />
                     </DropdownMenuItem>
                   )}
                 </div>

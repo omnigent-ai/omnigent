@@ -90,7 +90,7 @@ def create_host_credentials_router(host_store: HostStore) -> APIRouter:
             raise HTTPException(status_code=404, detail="unknown credential provider")
         try:
             payload = await resolver(managed.user_id, store=store, client=client)
-        except Exception:  # noqa: BLE001 - a provider resolver fault must degrade, not 500
+        except Exception:  # a provider resolver fault must degrade, not 500
             _logger.warning("credential resolve failed for provider %r", provider, exc_info=True)
             return {"connected": False}
         if payload is None:

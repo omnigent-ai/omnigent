@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import importlib.metadata
+import tomllib
 from pathlib import Path
 
-import tomllib
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 

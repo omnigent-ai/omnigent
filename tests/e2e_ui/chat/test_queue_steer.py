@@ -25,35 +25,19 @@ whether) the SPA POSTs the steered message.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 
 from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.polling import poll_until_async
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 _MSG1 = "sentinel-steer-msg1-2b8d first message, holds the turn open"
 _MSG2 = "sentinel-steer-msg2-6f4a queued then steered"
 
 _EVENTS_RE = re.compile(r"/v1/sessions/([^/]+)/events$")
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    """Poll ``predicate`` on the event loop until true or timeout.
-
-    :param predicate: Zero-arg callable returning truthy when satisfied.
-    :param timeout_s: Max seconds to wait before failing the test.
-    :raises AssertionError: If the predicate never becomes truthy.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def test_steer_sends_queued_message_while_busy(
@@ -112,7 +96,7 @@ async def _drive_steer(base_url: str, session_id: str) -> None:
             # no idle event arrives, so the session stays busy.
             await composer.fill(_MSG1)
             await send_button.click()
-            await _wait_until(lambda: any(text == _MSG1 for _, text in event_posts))
+            await poll_until_async(lambda: any(text == _MSG1 for _, text in event_posts))
 
             # msg2 → typed while busy → held in the client-side queue, shown in
             # the docked strip, NOT POSTed (auto-flush only fires on idle, which
@@ -142,7 +126,7 @@ async def _drive_steer(base_url: str, session_id: str) -> None:
             # idle. This is what distinguishes steer from the idle auto-flush:
             # the only reason msg2 could POST here is the explicit steer.
             await steer_button.click()
-            await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
+            await poll_until_async(lambda: any(text == _MSG2 for _, text in event_posts))
 
             # The steered message left the queue (strip empties).
             await page.get_by_test_id("composer-queued-strip").wait_for(

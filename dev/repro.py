@@ -58,11 +58,12 @@ def _launch_env(bug_url: str) -> dict[str, str]:
     (itself allowlisted), which tells the runner env-build to forward it the rest
     of the way. Maintainers usually export the plain ``LINEAR_API_KEY`` locally,
     so mirror that into the ``DATABRICKS_`` name when only the plain one is set.
-    Only kicks in for Linear URLs; if neither is set we warn rather than fail (the
+    Only kicks in for Linear URLs, and not under CI's credential proxy
+    (``DATABRICKS_REPRO_LINEAR_TOKEN`` set). If neither key is set we warn rather than fail (the
     agent stops with ``needs_more_info`` and names the missing key).
     """
     env = os.environ.copy()
-    if "linear.app" not in bug_url:
+    if "linear.app" not in bug_url or env.get("DATABRICKS_REPRO_LINEAR_TOKEN"):
         return env
     if not env.get("DATABRICKS_LINEAR_API_KEY") and env.get("LINEAR_API_KEY"):
         env["DATABRICKS_LINEAR_API_KEY"] = env["LINEAR_API_KEY"]
@@ -203,9 +204,9 @@ def main() -> None:
     print(f"→ worktree: {worktree}  (branch {created.branch})")
 
     # Run the agent FROM the worktree so the worktree is its workspace (local
-    # mode uses the runner's cwd as the workspace). dev/repro-agent resolves
-    # relative to the worktree, which is a full checkout of the same commit.
-    cmd = ["omnigent", "run", _AGENT_REL, "-p", prompt]
+    # mode uses the runner's cwd as the workspace). Use the source agent path
+    # so local preparation does not dirty the reproduction branch.
+    cmd = ["omnigent", "run", str(agent_dir), "-p", prompt]
     if args.server is not None:
         cmd += ["--server", args.server]
 

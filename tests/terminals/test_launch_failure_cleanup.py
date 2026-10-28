@@ -7,6 +7,7 @@ import contextlib
 import errno
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -273,11 +274,13 @@ async def test_immediate_exit_closes_once_and_keeps_exit_evidence(
 
 @requires_tmux
 @pytest.mark.parametrize("cancel_stage", ["spawn", "liveness"])
+@pytest.mark.parametrize("program_status_app", [None, "claude-code"])
 async def test_cancelled_launch_reaps_real_tmux(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     cancel_stage: str,
+    program_status_app: str | None,
 ) -> None:
     created = _capture_instances(monkeypatch)
     caplog.set_level(logging.INFO, logger=registry.__name__)
@@ -285,9 +288,15 @@ async def test_cancelled_launch_reaps_real_tmux(
     release = asyncio.Event()
     original_launch = TerminalInstance.launch
     original_alive = TerminalInstance.is_alive
+    child_pids: list[int] = []
 
     async def launch(instance: TerminalInstance, *, cwd: Path | None = None) -> None:
         await original_launch(instance, cwd=cwd)
+        if instance.program_status is not None:
+            async with asyncio.timeout(5):
+                while instance.program_status.child_pid is None:
+                    await asyncio.sleep(0.02)
+            child_pids.append(instance.program_status.child_pid)
         if cancel_stage == "spawn":
             reached.set()
             await release.wait()
@@ -303,7 +312,13 @@ async def test_cancelled_launch_reaps_real_tmux(
     monkeypatch.setattr(TerminalInstance, "is_alive", alive)
     terminal_registry = TerminalRegistry()
     task = asyncio.create_task(
-        terminal_registry.launch("owned-session", "shell", "main", _spec(tmp_path))
+        terminal_registry.launch(
+            "owned-session",
+            "shell",
+            "main",
+            _spec(tmp_path),
+            program_status_app=program_status_app,
+        )
     )
     try:
         await asyncio.wait_for(reached.wait(), timeout=5)
@@ -314,6 +329,14 @@ async def test_cancelled_launch_reaps_real_tmux(
         instance = created[0]
         assert not instance.private_dir.exists()
         assert not instance.running
+        for pid in child_pids:
+            async with asyncio.timeout(5):
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    await asyncio.sleep(0.02)
         result = subprocess.run(
             ["tmux", "-S", str(instance.socket_path), "has-session"],
             check=False,

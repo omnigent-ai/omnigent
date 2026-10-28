@@ -22,6 +22,7 @@ import logging
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from typing import TypeAlias
+from urllib.parse import quote
 
 import httpx
 
@@ -150,7 +151,9 @@ class OpenCodeClient:
         self._base_url = base_url.rstrip("/")
         default_headers: dict[str, str] = dict(headers or {})
         if directory:
-            default_headers.setdefault("x-opencode-directory", directory)
+            # Percent-encoded like OpenCode's own SDK; ``serve`` decodes it, and a raw
+            # non-ASCII path is not a valid header value.
+            default_headers.setdefault("x-opencode-directory", quote(directory, safe="!~*'()"))
         self._directory = directory
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(

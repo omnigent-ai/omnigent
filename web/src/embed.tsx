@@ -44,7 +44,7 @@ import {
 } from "./lib/host";
 import { prefetchSessionHostChain } from "./hooks/useSession";
 import { resolveIdentity, setSessionHostResolver } from "./lib/identity";
-import { isMacElectronShell } from "./lib/nativeBridge";
+import { isMacElectronShell, isNativeShell } from "./lib/nativeBridge";
 import {
   applyStoredUiFontSize,
   applyUiFontFamily,
@@ -224,6 +224,7 @@ function OmnigentProviders({
     >
       <div
         ref={scopeRef}
+        tabIndex={isNativeShell() ? undefined : -1}
         className={cn(isDarkMode && "dark", "text-foreground")}
         style={{ height: "100%", width: "100%" }}
       >

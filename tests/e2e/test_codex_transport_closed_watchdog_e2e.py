@@ -140,7 +140,7 @@ async def test_event_consumer_woken_when_app_server_closes_stdout(
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "src-codex-home"))
     try:
         events = await _drive_until_eof(tmp_path, mode="event_consumer")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pytest.fail(
             "run_turn did not wake within "
             f"{_WAKE_BOUND_S}s after the app-server closed stdout mid-turn -- "
@@ -169,7 +169,7 @@ async def test_pending_rpc_failed_when_app_server_closes_stdout(
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "src-codex-home"))
     try:
         events = await _drive_until_eof(tmp_path, mode="pending_rpc")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pytest.fail(
             "run_turn did not wake within "
             f"{_WAKE_BOUND_S}s after the app-server closed stdout with a "

@@ -72,3 +72,24 @@ def uuid_to_bytes(value: str | uuid.UUID) -> bytes:
         return bytes.fromhex(normalized)
     except ValueError as exc:
         raise InvalidUuidError(f"invalid hex uuid: {value!r}") from exc
+
+
+def normalize_uuid(value: str | None) -> str | None:
+    """Return the bare 32-char hex form of *value*, or *value* unchanged.
+
+    The forgiving companion to :func:`uuid_to_bytes` for **Python-side** id
+    comparisons (e.g. a store's scope check against an ORM attribute, which
+    always reads back bare hex). A legacy-prefixed or dashed input normalises
+    to bare hex; a malformed input is returned as-is so the comparison simply
+    mismatches — preserving the pre-migration "unknown id = not found"
+    behaviour instead of raising. ``None`` passes through.
+
+    :param value: Any caller-supplied id string, or ``None``.
+    :returns: The bare 32-char hex form, or *value* verbatim if not a uuid.
+    """
+    if value is None:
+        return None
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError:
+        return value
