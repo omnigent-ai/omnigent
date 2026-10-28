@@ -2821,7 +2821,7 @@ async def _auto_create_pi_terminal(
 
     model_auth_dir = Path(pi_env[AUTH_DIR_ENV]) if AUTH_DIR_ENV in pi_env else None
     if model_auth_dir is not None:
-        await refresh_model_auth(model_auth_dir)
+        await refresh_model_auth(model_auth_dir, workspace=launch_config.workspace)
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -2926,6 +2926,7 @@ async def _auto_create_pi_terminal(
                     bridge_dir,
                     launch_config.server_url,
                     auth_dir=model_auth_dir,
+                    workspace=launch_config.workspace,
                     refresh_bridge=bool(auth_token),
                 ),
                 name=f"pi-auth-refresh-{session_id}",

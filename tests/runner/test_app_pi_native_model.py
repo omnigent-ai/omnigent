@@ -89,11 +89,11 @@ def _key_provider_config() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cached_auth", [False, True])
+@pytest.mark.parametrize("auth_path", [None, "absolute", "relative"])
 async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    cached_auth: bool,
+    auth_path: str | None,
 ) -> None:
     """End-to-end: the spec's ``executor.model`` reaches the generated models.json.
 
@@ -113,14 +113,19 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     import omnigent.harnesses.pi_native.credentials as creds
     from omnigent.runner.native.orchestration import _cancel_auto_forwarder_task
 
+    cached_auth = auth_path is not None
     if cached_auth and (os.name != "posix" or shutil.which("node") is None):
         pytest.skip("the native Pi token cache requires POSIX and Node")
 
     session_id = "conv_pi_model_e2e"
-    token_file = tmp_path / "token"
-    token_file.write_text("cached-key")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    token_file = workspace / "token"
+    token_file.write_text("cached-key")
+    runner_dir = tmp_path / "runner"
+    runner_dir.mkdir()
+    (runner_dir / "token").write_text("wrong-runner-key")
+    monkeypatch.chdir(runner_dir)
     # Redirect the bridge tree into tmp so the generated managed Pi config dir
     # (and its models.json) lands somewhere isolated and inspectable.
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
@@ -142,10 +147,11 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
         captured["model"] = model
         provider = real_resolve(model=model, config_loader=_key_provider_config)
         assert provider is not None
+        token_path = "token" if auth_path == "relative" else str(token_file)
         return (
             replace(
                 provider,
-                api_key=f"!cat {shlex.quote(str(token_file))}",
+                api_key=f"!cat {shlex.quote(token_path)}",
                 auth_refresh_interval_ms=900_000,
             )
             if cached_auth
