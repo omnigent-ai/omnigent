@@ -12,6 +12,7 @@ const started = performance.now();
 let deadline = Infinity;
 let child;
 let timer;
+let retryTimer;
 let finished = false;
 let chunks = [];
 let bytes = 0;
@@ -29,6 +30,7 @@ function finish(kind, token) {
   if (finished) return;
   finished = true;
   clearTimeout(timer);
+  clearTimeout(retryTimer);
   killHelper();
   chunks = [];
   try {
@@ -59,6 +61,58 @@ process.on("exit", () => {
   if (!finished) killHelper();
 });
 
+function retryOrFinish(kind, command, retryDelays) {
+  const [delay, ...rest] = retryDelays;
+  if (delay === undefined || performance.now() + delay >= deadline) {
+    return finish(kind);
+  }
+  killHelper();
+  child = undefined;
+  retryTimer = setTimeout(() => {
+    // A stalled event loop can run this after the deadline; the deadline timer finishes then.
+    if (performance.now() >= deadline) return;
+    try {
+      runAttempt(command, rest);
+    } catch (_) {
+      finish("start_failed");
+    }
+  }, delay);
+}
+
+function runAttempt(command, retryDelays) {
+  chunks = [];
+  bytes = 0;
+  const attempt = spawn(command, {
+    shell: true,
+    detached: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  child = attempt;
+  attempt.on("error", () => {
+    if (attempt === child) finish("start_failed");
+  });
+  attempt.stdout.on("data", (chunk) => {
+    if (attempt !== child) return;
+    bytes += chunk.length;
+    if (bytes > 1024 * 1024) finish("output_limit");
+    else chunks.push(chunk);
+  });
+  attempt.on("close", (code) => {
+    if (finished || attempt !== child) return;
+    if (code !== 0) return retryOrFinish("failed_exit", command, retryDelays);
+    let token;
+    try {
+      token = new TextDecoder("utf-8", { fatal: true })
+        .decode(Buffer.concat(chunks))
+        .trim();
+    } catch (_) {
+      return finish("invalid_output");
+    }
+    if (token) finish("ok", token);
+    else retryOrFinish("empty", command, retryDelays);
+  });
+}
+
 try {
   const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
   if (typeof config.command !== "string" || !config.command.trim()) {
@@ -66,29 +120,7 @@ try {
   }
   deadline = started + config.timeoutMs;
   timer = setTimeout(() => finish("timeout"), Math.max(0, deadline - performance.now()));
-  child = spawn(config.command, {
-    shell: true,
-    detached: true,
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  child.on("error", () => finish("start_failed"));
-  child.stdout.on("data", (chunk) => {
-    bytes += chunk.length;
-    if (bytes > 1024 * 1024) finish("output_limit");
-    else chunks.push(chunk);
-  });
-  child.on("close", (code) => {
-    if (finished) return;
-    if (code !== 0) return finish("failed_exit");
-    try {
-      const token = new TextDecoder("utf-8", { fatal: true })
-        .decode(Buffer.concat(chunks))
-        .trim();
-      finish(token ? "ok" : "empty", token);
-    } catch (_) {
-      finish("invalid_output");
-    }
-  });
+  runAttempt(config.command, config.retryDelaysMs || []);
 } catch (_) {
   finish("start_failed");
 }

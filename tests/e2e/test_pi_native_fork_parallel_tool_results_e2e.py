@@ -109,6 +109,8 @@ def pi_fork_rig(
             "if mode == 'failed_exit':\n"
             " print('PRIVATE-HELPER-ERROR',file=sys.stderr); sys.exit(7)\n"
             "if mode == 'empty': sys.exit(0)\n"
+            "if mode == 'fail_once' and not (root / 'failed-once').exists():\n"
+            " (root / 'failed-once').write_text('1'); sys.exit(7)\n"
             "print((root / 'token').read_text())\n"
         )
         # Keep a shell after the helper so cleanup must reach its process group.
@@ -116,7 +118,8 @@ def pi_fork_rig(
             "auth_command": shlex.join([sys.executable, str(helper)]) + "; code=$?; exit $code"
         }
         replies[2:] = [
-            anthropic_sse_text_response(f"AUTH-RECOVERED-{i}", model=_MODEL) for i in range(3)
+            anthropic_sse_text_response("AUTH-TRANSIENT-OK", model=_MODEL),
+            *(anthropic_sse_text_response(f"AUTH-RECOVERED-{i}", model=_MODEL) for i in range(3)),
         ]
 
     class Handler(BaseHTTPRequestHandler):
@@ -396,7 +399,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
 def test_pi_native_token_failure_recovers_without_replaying_tools(
     pi_fork_rig: tuple[httpx.Client, str, list[dict[str, Any]]], tmp_path: Path
 ) -> None:
-    """Real server/runner/Pi: refresh, classified failures, cleanup and same-PID recovery."""
+    """Real server/runner/Pi: refresh, transient tolerance, classified failures and recovery."""
     client, runner_id, requests = pi_fork_rig
     workspace = tmp_path / "workspace"
     spec = _materialize_pi_agent_spec(tmp_path)
@@ -427,12 +430,11 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
         response.raise_for_status()
         assert response.json()["queued"]
 
+    def helper_runs() -> list[str]:
+        return (workspace / "auth-pids.jsonl").read_text().splitlines()
+
     def native_pids() -> set[str]:
-        return {
-            row["pi"]
-            for line in (workspace / "auth-pids.jsonl").read_text().splitlines()
-            if (row := json.loads(line))["pi"]
-        }
+        return {row["pi"] for line in helper_runs() if (row := json.loads(line))["pi"]}
 
     try:
         bind_session_runner(client.patch, "", session_id, runner_id)
@@ -441,6 +443,27 @@ def test_pi_native_token_failure_recovers_without_replaying_tools(
         assert len(requests) == 2
         pids = native_pids()
         assert len(pids) == 1
+
+        (workspace / "auth-mode").write_text("fail_once")
+        before = len(requests)
+        runs_before = len(helper_runs())
+        errors_before = {item["id"] for item in items() if item["type"] == "error"}
+        send("Continue after one failed token refresh.")
+
+        def transient_outcome() -> str | None:
+            current = items()
+            if any(
+                item["type"] == "error" and item["id"] not in errors_before for item in current
+            ):
+                return "error"
+            return "reply" if "AUTH-TRANSIENT-OK" in json.dumps(current) else None
+
+        assert _wait(transient_outcome) == "reply", [
+            item for item in items() if item["type"] == "error"
+        ]
+        assert len(requests) == before + 1
+        assert (workspace / "failed-once").exists()
+        assert len(helper_runs()) >= runs_before + 2
         for i, (mode, kind) in enumerate(
             [
                 ("failed_exit", "failed_exit"),
