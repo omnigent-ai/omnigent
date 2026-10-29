@@ -1,7 +1,7 @@
 // React 18 drops the boolean `inert` prop, so a hidden panel passed
 // `inert={true}` stays focusable. Set the DOM attribute directly instead.
 
-import { type Ref, type RefCallback, useCallback, useLayoutEffect, useRef } from "react";
+import { type Ref, type RefCallback, useCallback, useInsertionEffect, useRef } from "react";
 
 /**
  * Build a ref callback that toggles the element's `inert` attribute.
@@ -21,7 +21,9 @@ export function useInertRef<T extends HTMLElement>(
 ): RefCallback<T> {
   const elementRef = useRef<T | null>(null);
   const inertRef = useRef(inert);
-  useLayoutEffect(() => {
+  // Apply during DOM mutation, as React would for a native prop, so layout
+  // effects (e.g. ResponsiveViewerSlot restoring focus) see the final state.
+  useInsertionEffect(() => {
     inertRef.current = inert;
     elementRef.current?.toggleAttribute("inert", inert);
   }, [inert]);
