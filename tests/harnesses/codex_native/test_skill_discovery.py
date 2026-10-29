@@ -120,14 +120,23 @@ def test_installed_plugin_survives_marketplace_failure(
     assert selected_version() == "local"
     config.write_text("")
     assert selected_version() is None
-    # An unreadable config still answers skills/list, with the failure in its errors.
+    # An unreadable config fails `plugin list`. Codex 0.158 and later still answer
+    # skills/list and report the failure in its errors; 0.142 rejects the request.
+    # Either way the menu must say the plugin skills are missing.
     config.write_text(f'{enabled_config}model = "unterminated\n')
     warnings: list[str] = []
     broken = SkillSourceContext(
         (workspace,), tmp_path, "all", None, codex_home=home, warnings=warnings
     )
     assert resolve_harness_skills(broken, "codex-native") == []
-    assert warnings == [
-        "Codex plugin skills may be incomplete: `codex plugin list` exited 1 and "
-        "`codex app-server` reported errors loading skills; see the host log for details."
-    ]
+    failed = "`codex plugin list` exited 1 and `codex app-server`"
+    assert warnings in (
+        [
+            f"Codex plugin skills may be incomplete: {failed} reported errors loading skills; "
+            "see the host log for details."
+        ],
+        [
+            f"Codex plugin skills unavailable: {failed} could not list skills; "
+            "see the host log for details."
+        ],
+    )
