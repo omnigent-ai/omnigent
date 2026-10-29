@@ -4536,7 +4536,7 @@ def test_models_json_attributes_only_unity_gateway_providers() -> None:
     assert attributed == {"databricks-openai", "databricks-mlflow"}
     assert providers["databricks-openai"]["headers"] == {
         "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent",
+        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli",
     }
 
 

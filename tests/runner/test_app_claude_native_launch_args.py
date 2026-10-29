@@ -929,6 +929,7 @@ async def test_runner_launch_error_is_logged_before_cancellable_diagnostic_drain
     session_id = "conv_launch_cancelled_during_drain"
     original_error = httpx.ConnectError("original launch transport failure")
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = original_error
     session_init = _claude_auto_create_session_init(session_id, bridge_dir)
     loop = asyncio.get_running_loop()
@@ -1357,6 +1358,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     def record_seed(workspace: Path, env: dict[str, str] | None = None) -> None:
@@ -1446,6 +1448,7 @@ async def test_auto_create_claude_terminal_cleans_routers_when_trust_seeding_fai
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(ValueError, match="config is not a JSON object"):
         await _auto_create_claude_terminal_for_test(
@@ -1520,6 +1523,7 @@ async def test_auto_create_claude_terminal_seed_cleanup_attempts_both_shutdowns(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", failing_seed
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(propagated):
         await _auto_create_claude_terminal_for_test(
@@ -1578,6 +1582,7 @@ async def test_auto_create_claude_terminal_seeds_env_chdir_with_relative_config_
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
 
     with pytest.raises(RuntimeError, match="stop after seeding"):
@@ -1634,6 +1639,7 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
         ],
     )
     registry = Mock(spec=SessionResourceRegistry)
+    registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
 
     with pytest.raises(OmnigentError) as excinfo:
         await _auto_create_claude_terminal_for_test(

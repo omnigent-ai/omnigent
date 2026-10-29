@@ -65,14 +65,24 @@ def test_reconstructs_authority_and_bearer_from_frozen_inputs() -> None:
 @pytest.mark.parametrize(
     ("host", "path", "via_ug", "surfaces"),
     [
-        ("workspace.cloud.databricks.com", "/ai-gateway/codex/v1/responses", False, "omnigent"),
+        (
+            "workspace.cloud.databricks.com",
+            "/ai-gateway/codex/v1/responses",
+            False,
+            "omnigent, omnigent-cli",
+        ),
         (
             "workspace.cloud.databricks.com",
             "/ai-gateway/codex/v1/responses",
             True,
-            "omnigent, ug",
+            "omnigent, omnigent-cli, ug",
         ),
-        ("workspace.ai-gateway.cloud.databricks.com", "/v1/responses", False, "omnigent"),
+        (
+            "workspace.ai-gateway.cloud.databricks.com",
+            "/v1/responses",
+            False,
+            "omnigent, omnigent-cli",
+        ),
         (_HOST, _PATH, True, None),
     ],
     ids=["workspace", "ug", "dedicated", "serving-endpoint"],

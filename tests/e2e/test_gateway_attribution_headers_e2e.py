@@ -29,6 +29,7 @@ from omnigent.harnesses.opencode_native.provider import (
     write_opencode_provider_config,
 )
 from omnigent.harnesses.pi_native.credentials import PiProviderConfig
+from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
 from omnigent.inner.codex_executor import (
     _databricks_codex_config_overrides,
     materialize_codex_provider_config,
@@ -49,6 +50,7 @@ _SURFACES_HEADER = "Databricks-Custom-Client-Surfaces"
 @pytest.fixture
 def recording_gateway(
     isolated_mock_llm_server_url: str,
+    tmp_path: Path,
 ) -> Iterator[tuple[str, list[tuple[dict[str, list[str]], bytes]]]]:
     requests: list[tuple[dict[str, list[str]], bytes]] = []
     set_fallback_mock_llm(isolated_mock_llm_server_url, key="default", text=_REPLY)
@@ -99,20 +101,32 @@ def recording_gateway(
         finally:
             server.shutdown()
             thread.join(timeout=5)
+            (tmp_path / "gateway-headers.json").write_text(
+                json.dumps(
+                    [
+                        {"headers": headers, "contains_prompt": _PROMPT.encode() in body}
+                        for headers, body in requests
+                    ],
+                    indent=2,
+                )
+            )
 
 
 @pytest.mark.posix_only
 @pytest.mark.timeout(90)
 @pytest.mark.parametrize(
-    ("coding_cli", "config_source"),
+    ("coding_cli", "config_source", "client_surface"),
     [
-        ("codex", "codex"),
-        ("claude", "claude-native"),
-        ("pi", "pi-native"),
-        ("pi", "pi"),
-        ("opencode", "opencode"),
+        (coding_cli, config_source, surface)
+        for coding_cli, config_source in (("codex", "codex"), ("claude", "claude-native"))
+        for surface in ("desktop", "web", "ios", "android", "cli")
+    ]
+    + [
+        ("claude", "claude-sdk", "desktop"),
+        ("pi", "pi-native", "cli"),
+        ("pi", "pi", "cli"),
+        ("opencode", "opencode", "cli"),
     ],
-    ids=["codex", "claude-native", "pi-native", "pi-sdk", "opencode"],
 )
 def test_gateway_headers_reach_real_cli_requests(
     tmp_path: Path,
@@ -120,6 +134,7 @@ def test_gateway_headers_reach_real_cli_requests(
     recording_gateway: tuple[str, list[tuple[dict[str, list[str]], bytes]]],
     coding_cli: str,
     config_source: str,
+    client_surface: str,
 ) -> None:
     executable = shutil.which(coding_cli)
     if executable is None:
@@ -138,6 +153,7 @@ def test_gateway_headers_reach_real_cli_requests(
     state_path.write_text(json.dumps({"workspaces": {_ORIGIN: {"workspace": _ORIGIN}}}))
     monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", client_surface)
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -150,6 +166,7 @@ def test_gateway_headers_reach_real_cli_requests(
         "PI_TELEMETRY": "0",
         "OPENCODE_DISABLE_MODELS_FETCH": "true",
         "OPENCODE_DISABLE_AUTOUPDATE": "true",
+        "OMNIGENT_CLIENT_SURFACE": client_surface,
     }
     if coding_cli == "codex":
         codex_home = Path(env["CODEX_HOME"])
@@ -182,9 +199,20 @@ def test_gateway_headers_reach_real_cli_requests(
                 }
             }
         )["test"]
-        launch = _provider_config_for_native_claude(entry)
-        assert launch is not None
-        env.update(build_native_claude_terminal_env(launch))
+        if config_source == "claude-native":
+            launch = _provider_config_for_native_claude(entry)
+            assert launch is not None
+            env.update(build_native_claude_terminal_env(launch))
+            api_key_helper = launch.api_key_helper
+        else:
+            gateway_env = _resolve_gateway_env(
+                profile=None,
+                host_override=_ORIGIN,
+                base_url_override=_ORIGIN,
+                auth_command_override="printf synthetic-key",
+            )
+            api_key_helper = gateway_env.pop("OMNIGENT_CLAUDE_API_KEY_HELPER")
+            env.update(gateway_env)
         env["ANTHROPIC_BASE_URL"] = destination.removesuffix("/v1")
         args = [
             "--print",
@@ -199,7 +227,7 @@ def test_gateway_headers_reach_real_cli_requests(
             "--mcp-config",
             '{"mcpServers":{}}',
             "--settings",
-            json.dumps({"apiKeyHelper": launch.api_key_helper}),
+            json.dumps({"apiKeyHelper": api_key_helper}),
         ]
     elif coding_cli == "pi":
         provider_id = "omnigent" if config_source == "pi-native" else "databricks-openai"
@@ -259,4 +287,5 @@ def test_gateway_headers_reach_real_cli_requests(
     assert prompt_requests, "the user prompt never reached the recording gateway"
     for headers in prompt_requests:
         assert headers[_AGENT_HEADER] == ["claude-code" if coding_cli == "claude" else coding_cli]
-        assert headers[_SURFACES_HEADER] == ["omnigent, ug"]
+        surface = "mobile" if client_surface in ("ios", "android") else client_surface
+        assert headers[_SURFACES_HEADER] == [f"omnigent, omnigent-{surface}, ug"]

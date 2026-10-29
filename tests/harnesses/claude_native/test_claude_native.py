@@ -472,7 +472,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             )
             + (
                 "\nDatabricks-Custom-Coding-Agent: claude-code"
-                "\nDatabricks-Custom-Client-Surfaces: omnigent, ug"
+                "\nDatabricks-Custom-Client-Surfaces: omnigent, omnigent-cli, ug"
                 if gateway
                 else ""
             ),
@@ -9193,9 +9193,15 @@ def test_provider_config_for_native_claude_attributes_a_unity_gateway(
         "ANTHROPIC_CUSTOM_HEADERS": (
             "X-Team: search\n"
             "Databricks-Custom-Coding-Agent: claude-code\n"
-            "Databricks-Custom-Client-Surfaces: omnigent"
+            "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli"
         ),
     }
+    terminal_env = claude_native.build_native_claude_terminal_env(cfg, client_surface="desktop")
+    assert terminal_env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        "X-Team: search",
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent, omnigent-desktop",
+    ]
 
 
 def test_bedrock_config_for_native_claude_static_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -12512,7 +12518,7 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
         "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent",
+        "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli",
     ]
     assert config.api_key_helper is not None
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
@@ -12566,7 +12572,7 @@ def test_connect_fallback_prefers_ucode_state(
         *(
             [
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent, ug",
+                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli, ug",
             ]
             if gateway
             else []

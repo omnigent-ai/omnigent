@@ -1302,6 +1302,7 @@ def materialize_codex_provider_config(
     *,
     retry_policy: RetryPolicy | None = None,
     include_managed_config: bool = True,
+    client_surface: str | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1417,6 +1418,7 @@ def materialize_codex_provider_config(
                 {**metadata, **(headers if isinstance(headers, Mapping) else {})},
                 CODEX_AGENT,
                 base_url,
+                client_surface=client_surface,
             )
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))

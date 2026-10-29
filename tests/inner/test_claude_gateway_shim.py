@@ -297,7 +297,10 @@ async def test_shim_forwards_non_opus_and_non_messages_traffic_verbatim(upstream
 @pytest.mark.parametrize(
     ("upstream_url", "surfaces"),
     [
-        ("https://ws.cloud.databricks.com/ai-gateway/anthropic", "omnigent, ug, inner"),
+        (
+            "https://ws.cloud.databricks.com/ai-gateway/anthropic",
+            "omnigent, omnigent-cli, ug, inner",
+        ),
         ("https://ws.cloud.databricks.com/serving-endpoints/anthropic", "ug, inner"),
     ],
     ids=["gateway", "serving-endpoint"],

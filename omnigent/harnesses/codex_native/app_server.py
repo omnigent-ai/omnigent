@@ -28,6 +28,7 @@ from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -2323,6 +2324,7 @@ class CodexNativeAppServer:
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+            client_surface=self.env.get(CLIENT_SURFACE_ENV_VAR),
         )
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(

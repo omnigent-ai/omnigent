@@ -1565,6 +1565,8 @@ def native_claude_auth_env_unset(
 
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
+    *,
+    client_surface: str | None = None,
 ) -> dict[str, str]:
     """
     Build env overrides for a native Claude Code terminal process.
@@ -1599,6 +1601,15 @@ def build_native_claude_terminal_env(
     configured_base_url = (
         claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
     )
+    base_url = configured_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    if is_databricks_ai_gateway_url(base_url):
+        terminal_env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
+            terminal_env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV)
+            or os.environ.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
+            CLAUDE_CODE_AGENT,
+            via_ug=is_ug_route(base_url),
+            client_surface=client_surface,
+        )
     if _ambient_env_is_non_anthropic_gateway(configured_base_url):
         terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
     # A raw credential can override the helper or open Claude's API-key menu.

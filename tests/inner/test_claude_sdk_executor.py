@@ -1765,7 +1765,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             [
                 "x-databricks-use-coding-agent-mode: true",
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent",
+                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli",
             ],
         )
 
@@ -1900,7 +1900,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             [
                 "X-Trace: keep",
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent",
+                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli",
             ],
         )
 

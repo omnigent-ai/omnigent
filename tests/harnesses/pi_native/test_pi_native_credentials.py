@@ -1046,12 +1046,12 @@ def test_to_models_config_attributes_unity_gateway_providers() -> None:
 
     assert providers["omnigent"]["headers"] == {
         "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent",
+        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli",
     }
     assert providers["ug-openai"]["headers"] == {
         "User-Agent": "ucode/0.1.0 pi/0.80.0",
         "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli, ug",
     }
     assert "headers" not in providers["other"]
     # The configured payload is shared across renders, so it stays unstamped.
@@ -3401,10 +3401,10 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     renders = 0
     original = creds.PiProviderConfig.to_models_config
 
-    def _counting(self: creds.PiProviderConfig) -> object:
+    def _counting(self: creds.PiProviderConfig, *, client_surface: str | None = None) -> object:
         nonlocal renders
         renders += 1
-        return original(self)
+        return original(self, client_surface=client_surface)
 
     monkeypatch.setattr(creds.PiProviderConfig, "to_models_config", _counting)
 

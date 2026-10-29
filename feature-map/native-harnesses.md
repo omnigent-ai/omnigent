@@ -14,6 +14,8 @@ implements them separately, so a fix for one harness does not reach the others.
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
+- `gateway-attribution`: Unity Gateway requests name the coding agent and the
+  interface that created its session: desktop app, web UI, mobile, or CLI.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
   repair conflicting defaults, and keep the connection across tool turns.
 - `needs-auth`: a harness without usable credentials is shown as needing
@@ -114,6 +116,14 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Gateway attribution:** start a fresh Claude Code or Codex session from the
+desktop app, browser, iOS/Android app, and CLI. The session keeps that creating
+interface across resumes; backend children inherit it, and a fork records the
+interface creating the fork. Gateway requests carry `Databricks-Custom-Coding-Agent`
+(`claude-code` or `codex`) and `Databricks-Custom-Client-Surfaces`: `omnigent`
+followed by `omnigent-desktop`, `omnigent-web`, `omnigent-mobile`, or `omnigent-cli`.
+Routes configured by ug retain the additional `ug` surface.
 
 **Agent instructions (Pi native):** launch an agent whose spec contains inline
 instructions or references a bundled instruction file. Reopen its terminal and
@@ -256,6 +266,23 @@ and record each harness's missing or blocked checks, not just its passing ones.
 verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
+
+**`gateway-attribution` (own environment):** run
+`uv run --no-sync pytest tests/e2e/test_gateway_attribution_headers_e2e.py --reruns 0 -v`.
+The recorder requires real CLIs, uses synthetic credentials and scripted local
+model responses, and checks one copy of each header on actual prompt requests.
+It covers Codex and native Claude Code for desktop, web, iOS, Android and CLI
+launch metadata, plus Claude SDK and the Pi/OpenCode writers. Missing binaries
+or machine policy that would redirect requests are explicit skips. On Linux,
+use a disposable mount namespace with empty `/etc/codex` and `/etc/claude-code`
+to test ordinary configuration without changing the host's mandatory policy.
+Claude mandatory settings can still replace its header block or destination;
+that policy case requires gateway support for `x-client-app: omnigent` or a
+managed-policy update. Source persistence and launch isolation are checked by
+`tests/server/routes/test_sessions_crud.py::test_creating_client_surface_survives_create_child_and_fork`,
+`tests/runner/test_app_sessions_native_workflow_init.py::test_create_session_envelope_is_single_flight_and_skips_metadata_callbacks`,
+and `tests/runner/test_resource_registry.py::test_terminal_resource_role_is_private_and_cleared_on_close`.
+These process/configuration checks do not launch the desktop or mobile shells.
 
 **Pi Smart Routing (own environment):**
 `tests/e2e/test_pi_native_smart_routing.py::test_pi_native_smart_routing_applies_pick`

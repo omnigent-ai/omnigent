@@ -11,9 +11,12 @@ so each harness names the coding agent and client surfaces the same way.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
+
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 
 # Trusted parent domains for a Databricks-owned host. The Unity Gateway lives
 # under a per-workspace subdomain of one of these (the canonical form is
@@ -107,23 +110,53 @@ OPENCODE_AGENT: Final[str] = "opencode"
 # ug stamps ``ucode/<version> <agent>/<version>`` on the providers it writes.
 _UG_USER_AGENT_PREFIX: Final[str] = "ucode/"
 
+_OMNIGENT_CLIENT_SURFACES: Final[dict[str, str]] = {
+    "desktop": "omnigent-desktop",
+    "web": "omnigent-web",
+    "ios": "omnigent-mobile",
+    "android": "omnigent-mobile",
+    "mobile": "omnigent-mobile",
+    "cli": "omnigent-cli",
+}
+
 _HeaderValue = TypeVar("_HeaderValue")
 
 
 def gateway_attribution_headers(
-    coding_agent: str, *, via_ug: bool = False, client_surfaces: Iterable[str] = ()
+    coding_agent: str,
+    *,
+    via_ug: bool = False,
+    client_surfaces: Iterable[str] = (),
+    client_surface: str | None = None,
 ) -> dict[str, str]:
     """Return the attribution headers for a Unity Gateway request Omnigent originates.
 
     :param coding_agent: The harness making the request, e.g. ``"codex"``.
     :param via_ug: Whether the route comes from ug's configuration.
     :param client_surfaces: Existing inner surfaces, in their original order.
+    :param client_surface: Creating interface; defaults to launch metadata or CLI.
     :returns: e.g. ``{"Databricks-Custom-Coding-Agent": "codex",
-        "Databricks-Custom-Client-Surfaces": "omnigent, ug"}``.
+        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug"}``.
     """
     surfaces: list[str] = []
     seen: set[str] = set()
-    for surface in ("omnigent", *client_surfaces, *(("ug",) if via_ug else ())):
+    source = (
+        client_surface
+        if client_surface is not None
+        else os.environ.get(CLIENT_SURFACE_ENV_VAR, "cli")
+    )
+    qualified_surface = _OMNIGENT_CLIENT_SURFACES.get(source)
+    inner_surfaces = (
+        surface
+        for surface in client_surfaces
+        if surface.strip().lower() not in _OMNIGENT_CLIENT_SURFACES.values()
+    )
+    for surface in (
+        "omnigent",
+        *((qualified_surface,) if qualified_surface else ()),
+        *inner_surfaces,
+        *(("ug",) if via_ug else ()),
+    ):
         name = surface.strip()
         if name and name.lower() not in seen:
             seen.add(name.lower())
@@ -145,6 +178,7 @@ def with_gateway_attribution(
     base_url: str,
     *,
     via_ug: bool = False,
+    client_surface: str | None = None,
 ) -> dict[str, _HeaderValue | str]:
     """Return a provider's static *headers* plus the attribution headers.
 
@@ -166,13 +200,20 @@ def with_gateway_attribution(
     return {
         **existing,
         **gateway_attribution_headers(
-            coding_agent, via_ug=via_ug or is_ug_route(base_url), client_surfaces=surfaces
+            coding_agent,
+            via_ug=via_ug or is_ug_route(base_url),
+            client_surfaces=surfaces,
+            client_surface=client_surface,
         ),
     }
 
 
 def with_gateway_attribution_lines(
-    custom_headers: str | None, coding_agent: str, *, via_ug: bool = False
+    custom_headers: str | None,
+    coding_agent: str,
+    *,
+    via_ug: bool = False,
+    client_surface: str | None = None,
 ) -> str:
     """Merge attribution into Claude Code's ``ANTHROPIC_CUSTOM_HEADERS`` block.
 
@@ -190,7 +231,9 @@ def with_gateway_attribution_lines(
             headers[lowered] = ",".join(filter(None, (headers.get(lowered), value.strip())))
         if lowered not in (CODING_AGENT_HEADER.lower(), CLIENT_SURFACES_HEADER.lower()):
             lines.append(line)
-    attribution = with_gateway_attribution(headers, coding_agent, "", via_ug=via_ug)
+    attribution = with_gateway_attribution(
+        headers, coding_agent, "", via_ug=via_ug, client_surface=client_surface
+    )
     lines.extend(
         f"{name}: {attribution[name]}" for name in (CODING_AGENT_HEADER, CLIENT_SURFACES_HEADER)
     )
