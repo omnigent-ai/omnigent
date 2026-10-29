@@ -751,10 +751,6 @@ export function ForkSessionForm(
   return <SupportedForkSessionForm {...props} sandboxOnlyProvider={forkSandboxProvider} />;
 }
 
-// Sources with a clone request in flight in this tab, so a reopened dialog
-// can't start a duplicate while the first clone runs in the background.
-const sourcesBeingCloned = new Set<string>();
-
 interface ForkSubmit {
   running: boolean;
   /** Set once the dialog closes mid-submit; the outcome then lands on this toast. */
@@ -764,7 +760,8 @@ interface ForkSubmit {
 /** Move a running clone's outcome to a toast once its dialog closes. */
 function moveSubmitToToast(submit: ForkSubmit): void {
   if (submit.running && submit.backgroundToast === undefined) {
-    submit.backgroundToast = toast.loading("Cloning session…");
+    // Dismissible, so a request that never settles can't pin a spinner on screen.
+    submit.backgroundToast = toast.loading("Cloning session…", { closeButton: true });
   }
 }
 
@@ -811,16 +808,18 @@ function SupportedForkSessionForm({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Closing the dialog mid-submit doesn't cancel the clone; a toast reports its
-  // outcome instead. Act on `open` (the exit animation keeps this form mounted),
-  // with unmount as the fallback for hosts that drop the form outright.
+  // outcome instead. The cleanup runs synchronously when `open` turns false (the
+  // exit animation keeps this form mounted) or the form unmounts; reopening the
+  // still-mounted form takes the outcome back from the toast.
   const submit = useRef<ForkSubmit>({ running: false });
   useLayoutEffect(() => {
-    if (!open) moveSubmitToToast(submit.current);
-  }, [open]);
-  useEffect(() => {
     const current = submit.current;
+    if (open && current.backgroundToast !== undefined) {
+      toast.dismiss(current.backgroundToast);
+      current.backgroundToast = undefined;
+    }
     return () => moveSubmitToToast(current);
-  }, []);
+  }, [open]);
   // Ready-to-send model/effort/permission overrides from the run-config
   // section. Empty until that section (rendered only for a native target)
   // reports its seeded value.
@@ -1313,15 +1312,10 @@ function SupportedForkSessionForm({
       setFocusField(submitBlocker.field);
       return;
     }
-    if (sourcesBeingCloned.has(sourceSessionId)) {
-      setError("This session is still being cloned. Try again when that clone finishes.");
-      return;
-    }
     setSubmitting(true);
     setError(null);
     const current = submit.current;
     current.running = true;
-    sourcesBeingCloned.add(sourceSessionId);
     try {
       // Pre-flight the directory BEFORE creating anything: the runner
       // launch below is detached and its failure is swallowed, so a
@@ -1450,7 +1444,7 @@ function SupportedForkSessionForm({
         setError(message);
       } else {
         // Stays until dismissed: the user may be busy elsewhere when it lands.
-        toast.error("Couldn't clone the session. Nothing was created.", {
+        toast.error("Couldn't clone the session", {
           id: current.backgroundToast,
           description: message,
           duration: Infinity,
@@ -1458,7 +1452,6 @@ function SupportedForkSessionForm({
         });
       }
     } finally {
-      sourcesBeingCloned.delete(sourceSessionId);
       current.running = false;
       current.backgroundToast = undefined;
       setSubmitting(false);

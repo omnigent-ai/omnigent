@@ -38,7 +38,7 @@ vi.mock("react-router-dom", async (importOriginal) => {
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
 vi.mock("sonner", () => ({
-  toast: { loading: vi.fn(() => "cloning"), success: vi.fn(), error: vi.fn() },
+  toast: { loading: vi.fn(() => "cloning"), success: vi.fn(), error: vi.fn(), dismiss: vi.fn() },
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
@@ -226,6 +226,7 @@ beforeEach(() => {
   vi.mocked(toast.loading).mockClear();
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
+  vi.mocked(toast.dismiss).mockClear();
   // The submit pre-flight passes by default; the nonexistent-directory
   // test overrides it with a failure message.
   checkHostDirectoryMock.mockReset();
@@ -500,7 +501,7 @@ describe("ForkSessionDialog", () => {
     fireEvent.click(screen.getByText("Close", { selector: "button" }));
     expect(onOpenChange).toHaveBeenCalledWith(false);
     setOpen(false);
-    expect(toast.loading).toHaveBeenCalledWith("Cloning session…");
+    expect(toast.loading).toHaveBeenCalledWith("Cloning session…", { closeButton: true });
     settle({ id: "conv_fork" } as Fork);
 
     await waitFor(() =>
@@ -555,7 +556,7 @@ describe("ForkSessionDialog", () => {
     fail(new Error("403 forbidden"));
 
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("Couldn't clone the session. Nothing was created.", {
+      expect(toast.error).toHaveBeenCalledWith("Couldn't clone the session", {
         id: "cloning",
         description: "403 forbidden",
         duration: Infinity,
@@ -564,7 +565,7 @@ describe("ForkSessionDialog", () => {
     );
   });
 
-  it("refuses a second clone of the same source while one runs in the background", async () => {
+  it("hands a clone off to a toast when its host drops the form outright", async () => {
     type Fork = Awaited<ReturnType<typeof forkSession>>;
     let settle: (value: Fork) => void = () => {};
     forkSessionMock.mockReturnValue(
@@ -572,19 +573,40 @@ describe("ForkSessionDialog", () => {
         settle = resolve;
       }),
     );
-    const first = renderDialog();
+    const { unmount } = renderDialog();
     fireEvent.click(screen.getByTestId("fork-session-submit"));
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
-    first.setOpen(false);
 
-    renderDialog();
-    fireEvent.click(screen.getByTestId("fork-session-submit"));
-    expect(screen.getByTestId("fork-session-error")).toHaveTextContent(
-      "This session is still being cloned",
-    );
-    expect(forkSessionMock).toHaveBeenCalledTimes(1);
+    // Sidebar renders the dialog conditionally, so closing can unmount it at once.
+    unmount();
+    expect(toast.loading).toHaveBeenCalledWith("Cloning session…", { closeButton: true });
     settle({ id: "conv_fork" } as Fork);
+
     await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it("takes the clone back from the toast when reopened before the form unmounts", async () => {
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let settle: (value: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    const { setOpen } = renderDialog({ sourceTitle: "My session", bareForm: true });
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+
+    setOpen(false);
+    setOpen(true);
+    expect(toast.dismiss).toHaveBeenCalledWith("cloning");
+    // Still the in-flight form, so a second submit stays blocked.
+    expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
+    settle({ id: "conv_fork" } as Fork);
+
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    expect(toast.success).not.toHaveBeenCalled();
   });
 
   it("surfaces the server error inline on failure and does not navigate", async () => {
