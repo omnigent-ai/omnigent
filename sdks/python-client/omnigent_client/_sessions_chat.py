@@ -286,6 +286,10 @@ class SessionsChat:
     constructor directly — the constructor only wires already-resolved
     state and does NOT issue any HTTP requests.
 
+    A Claude prompt left waiting in the agent's terminal expires as
+    unanswered unless the client sends ``{TERMINAL_FALLBACK_HEADER: "on"}``
+    in its ``headers``; then :meth:`send` skips it and logs refused answers.
+
     :param namespace: The :class:`SessionsNamespace` this helper
         delegates to. Borrowed from the parent
         :class:`OmnigentClient`; the chat helper does not own
