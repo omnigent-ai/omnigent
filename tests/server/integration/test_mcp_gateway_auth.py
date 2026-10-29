@@ -2,11 +2,14 @@
 
 import asyncio
 import json
+from contextlib import suppress
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import yaml
+from fastapi import Request
 from mcp.types import Tool
 
 from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig, McpService
@@ -17,6 +20,7 @@ from tests.server.integration.test_session_agent_owner import auth_app as auth_a
 @pytest.fixture(autouse=True)
 def multi_user(monkeypatch):
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "ab" * 32)
 
 
 @pytest.mark.asyncio
@@ -34,8 +38,6 @@ async def test_delayed_shell_result_keeps_original_turn_actor(
     from tests.server.integration.test_session_agent_owner import _share_editor
 
     owner, first = "owner@example.test", "first@example.test"
-    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "credentials"))
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", raising=False)
     expression = (
         'event.type == "tool_result" && event.target == "sys_os_shell" '
         f'&& event.context.actor.run_as != "{owner}" '
@@ -137,21 +139,57 @@ async def test_delayed_shell_result_keeps_original_turn_actor(
             assert runner.inboxes[sid].empty()
         finally:
             release.set()
-            await asyncio.gather(*(task for task, _ in runner.async_tasks[sid].values()))
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(task for task, _ in runner.async_tasks[sid].values()),
+                        return_exceptions=True,
+                    ),
+                    timeout=5,
+                )
 
 
 @pytest.mark.asyncio
-async def test_delayed_shell_missing_context_is_rejected_without_policies(auth_client):
+@pytest.mark.parametrize("valid_context", [False, True])
+async def test_delayed_shell_context_is_verified_without_policies(
+    auth_app, auth_client, monkeypatch, valid_context
+):
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.mcp_identity import shell_result_context
+    from omnigent.server.routes import sessions as sessions_mod
+
     owner = "owner@example.test"
     agent = await create_test_agent(auth_client, user=owner)
+    sid = agent["_session_id"]
+    binding = "test-delayed-shell-binding"
+    store = get_conversation_store()
+    store.set_runner_id(sid, token_bound_runner_id(binding))
+    request_data = {"name": "sys_os_shell", "arguments": {}}
+    context = shell_result_context(
+        Request(
+            {
+                "type": "http",
+                "app": auth_app,
+                "headers": [(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), binding.encode())],
+            }
+        ),
+        store.get_conversation(sid),
+        {"run_as": owner},
+        request_data,
+    )
+    assert context is not None
+    caps = replace(sessions_mod.get_caps(), native_hook_allow_cache_seconds=lambda: 30.0)
+    monkeypatch.setattr(sessions_mod, "get_caps", lambda: caps)
     response = await auth_client.post(
-        f"/v1/sessions/{agent['_session_id']}/policies/evaluate",
-        headers={"X-Forwarded-Email": owner},
+        f"/v1/sessions/{sid}/policies/evaluate",
+        headers={"X-Forwarded-Email": owner, RUNNER_TUNNEL_TOKEN_HEADER: binding},
         json={
-            "_omnigent_shell_result_context": None,
+            "_omnigent_shell_result_context": context if valid_context else None,
+            "_omnigent_shell_result_handle": context["handle_id"],
             "event": {
                 "type": "PHASE_TOOL_RESULT",
-                "request_data": {"name": "sys_os_shell", "arguments": {}},
+                "request_data": request_data,
                 "data": {
                     "name": "sys_os_shell",
                     "result": "private output",
@@ -159,8 +197,16 @@ async def test_delayed_shell_missing_context_is_rejected_without_policies(auth_c
             },
         },
     )
-    assert response.status_code == 400
-    assert "Unverified shell result context" in response.text
+    if valid_context:
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "result": "POLICY_ACTION_ALLOW",
+            "allow_cache_seconds": 30.0,
+            "_omnigent_shell_result_handle": context["handle_id"],
+        }
+    else:
+        assert response.status_code == 400
+        assert "Unverified shell result context" in response.text
 
 
 @pytest.mark.asyncio

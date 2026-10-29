@@ -498,6 +498,50 @@ def _build_branding_app(
     )
 
 
+def test_shell_result_context_works_across_replicas(db_uri, runtime_init, tmp_path, monkeypatch):
+    from omnigent.entities import Conversation
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.auth import UnifiedAuthProvider
+    from omnigent.server.mcp_identity import shell_result_actor, shell_result_context
+
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "ab" * 32)
+    binding = "test-shell-runner"
+    requests = []
+    for replica in ("first", "second"):
+        monkeypatch.setenv(
+            "OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / replica / "credentials")
+        )
+        app = _build_branding_app(
+            db_uri, tmp_path, replica, auth_provider=UnifiedAuthProvider(source="header")
+        )
+        requests.append(
+            Request(
+                {
+                    "type": "http",
+                    "app": app,
+                    "headers": [(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), binding.encode())],
+                }
+            )
+        )
+    conversation = Conversation(
+        id="shell-session",
+        root_conversation_id="shell-session",
+        created_at=0,
+        updated_at=0,
+        runner_id=token_bound_runner_id(binding),
+    )
+    actor = {"run_as": "editor@example.test"}
+    call = {"name": "sys_os_shell", "arguments": {"command": "build"}}
+    # Requests use the startup configuration, without reading or generating a key.
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "not-hex")
+    context = shell_result_context(requests[0], conversation, actor, call)
+    assert context is not None
+    assert (
+        shell_result_actor(requests[1], conversation, context, context["handle_id"], call) == actor
+    )
+    assert not list(tmp_path.rglob("accounts-cookie-secret"))
+
+
 @pytest.mark.asyncio
 async def test_info_harness_install_gate_overrides_feature_snapshot(
     db_uri: str,

@@ -18,9 +18,12 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI, Request
 
 from omnigent.entities.conversation import Conversation
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.policies.types import EvaluationContext, PolicyResult
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes._sessions import orchestration
@@ -29,7 +32,14 @@ from omnigent.server.routes.sessions import (
     _pending_policy_ask_writes,
     _PendingPolicyAskWrites,
 )
-from omnigent.spec.types import LabelDef, Phase, PolicyAction, StateUpdate, StateUpdateAction
+from omnigent.spec.types import (
+    AgentSpec,
+    LabelDef,
+    Phase,
+    PolicyAction,
+    StateUpdate,
+    StateUpdateAction,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 # ---------------------------------------------------------------------------
@@ -222,14 +232,35 @@ def _parse_rpc_error(response: Any) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ["sys_os_read", "sys_os_shell"])
-async def test_deferred_flag_without_shell_context_still_checks_result_policy(
-    monkeypatch, approval_state, tool
+@pytest.mark.parametrize(
+    ("tool", "yield_after", "has_key"),
+    [
+        pytest.param("sys_os_read", None, True, id="non-shell"),
+        pytest.param("sys_os_shell", None, True, id="not-enabled"),
+        pytest.param("sys_os_shell", 30, True, id="legacy-runner"),
+        pytest.param("sys_os_shell", 30, False, id="missing-key"),
+    ],
+)
+async def test_shell_yield_checks_configuration_and_foreground_result_policy(
+    monkeypatch, approval_state, tool, yield_after, has_key
 ):
     from unittest.mock import AsyncMock
 
     store, _conv, engine = approval_state
     evaluations = []
+    calls = []
+    binding = "test-shell-runner"
+    store.set_runner_id(_SESSION_ID, token_bound_runner_id(binding))
+    app = FastAPI()
+    app.state._shell_result_signing_key = b"test-shell-key".ljust(32, b"_") if has_key else None
+    request = Request(
+        {
+            "type": "http",
+            "app": app,
+            "headers": [(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), binding.encode())],
+        }
+    )
+    spec = AgentSpec(spec_version=1, os_env=OSEnvSpec(shell_yield_after=yield_after))
 
     async def evaluate(ctx):
         evaluations.append(ctx.phase)
@@ -239,11 +270,18 @@ async def test_deferred_flag_without_shell_context_still_checks_result_policy(
         )
 
     def runner_response(request):
-        assert "_omnigent_background_shell" not in json.loads(request.content)
-        return httpx.Response(200, json={"result": {"output": "private output", "deferred": True}})
+        calls.append(request)
+        body = json.loads(request.content)
+        result = {"output": "private output"}
+        if yield_after is None:
+            assert "_omnigent_background_shell" not in body
+            result["deferred"] = True
+        else:
+            assert body["_omnigent_background_shell"]["handle_id"]
+        return httpx.Response(200, json={"result": result})
 
     monkeypatch.setattr(engine, "evaluate", evaluate)
-    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "fake_spec")
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: spec)
     monkeypatch.setattr(
         sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
     )
@@ -258,9 +296,16 @@ async def test_deferred_flag_without_shell_context_still_checks_result_policy(
             conversation_store=store,
             agent_store=_StubAgentStore(),
             runner_router=None,
+            request=request,
         )
-    assert evaluations == [Phase.TOOL_CALL, Phase.TOOL_RESULT]
-    assert "Result suppressed by policy: private" in bytes(response.body).decode()
+    if has_key:
+        assert len(calls) == 1
+        assert evaluations == [Phase.TOOL_CALL, Phase.TOOL_RESULT]
+        assert "Result suppressed by policy: private" in bytes(response.body).decode()
+    else:
+        assert not calls
+        assert evaluations == [Phase.TOOL_CALL]
+        assert "OMNIGENT_ACCOUNTS_COOKIE_SECRET" in _parse_rpc_error(response)["message"]
     assert "private output" not in bytes(response.body).decode()
 
 

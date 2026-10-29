@@ -34,14 +34,14 @@ pytestmark = pytest.mark.asyncio
 @pytest.mark.posix_only
 @pytest.mark.parametrize(("result_action", "times_out"), [("ALLOW", False), ("DENY", True)])
 async def test_background_shell_keeps_execution_and_policies_across_http(
+    app,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     result_action: str,
     times_out: bool,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "credentials"))
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", raising=False)
+    monkeypatch.setattr(app.state, "_shell_result_signing_key", b"test-shell-key".ljust(32, b"_"))
     script = (
         "import time; from pathlib import Path; "
         "Path('starts').open('a').write('started\\n'); "

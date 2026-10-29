@@ -8,7 +8,11 @@ from fastapi import FastAPI, Request
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.entities import Conversation
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
-from omnigent.server.mcp_identity import shell_result_actor, shell_result_context
+from omnigent.server.mcp_identity import (
+    resolve_shell_result_signing_key,
+    shell_result_actor,
+    shell_result_context,
+)
 
 
 @pytest.mark.parametrize(
@@ -26,9 +30,8 @@ from omnigent.server.mcp_identity import shell_result_actor, shell_result_contex
         "missing",
     ],
 )
-def test_shell_result_context_rejects_changed_binding(change, monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "credentials"))
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", raising=False)
+def test_shell_result_context_rejects_changed_binding(change, monkeypatch) -> None:
+    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "ab" * 32)
     token = "test-runner-binding"
     request = Request(
         {
@@ -37,6 +40,7 @@ def test_shell_result_context_rejects_changed_binding(change, monkeypatch, tmp_p
             "headers": [(RUNNER_TUNNEL_TOKEN_HEADER.lower().encode(), token.encode())],
         }
     )
+    request.app.state._shell_result_signing_key = resolve_shell_result_signing_key(None)
     conv = Conversation(
         id="session",
         root_conversation_id="session",
@@ -67,8 +71,6 @@ def test_shell_result_context_rejects_changed_binding(change, monkeypatch, tmp_p
     elif change == "missing":
         context = None
     if change is None:
-        # A fresh server instance reads the same persisted key.
-        request = Request({**request.scope, "app": FastAPI()})
         assert shell_result_actor(request, conv, context, handle, arguments) == original_actor
     else:
         with (
@@ -76,3 +78,14 @@ def test_shell_result_context_rejects_changed_binding(change, monkeypatch, tmp_p
             pytest.raises(ValueError, match="Unverified"),
         ):
             shell_result_actor(request, conv, context, handle, arguments)
+
+
+@pytest.mark.parametrize("secret", [None, "not-hex", "ab"])
+def test_shell_signing_requires_an_explicit_valid_secret(monkeypatch, secret):
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", raising=False)
+    if secret is None:
+        assert resolve_shell_result_signing_key(None) is None
+    else:
+        monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", secret)
+        with pytest.raises(ValueError, match=r"hex string|32-byte"):
+            resolve_shell_result_signing_key(None)

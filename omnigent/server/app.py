@@ -2182,6 +2182,9 @@ def create_app(
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
     app.state.runner_tunnel_tokens = runner_tunnel_tokens
+    from omnigent.server.mcp_identity import resolve_shell_result_signing_key
+
+    app.state._shell_result_signing_key = resolve_shell_result_signing_key(auth_provider)
 
     def _admit_host_launch(
         host_id: str,

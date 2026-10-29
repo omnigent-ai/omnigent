@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import os
 import uuid
 from typing import Any
 
@@ -11,8 +12,7 @@ from fastapi import Request
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities import Conversation
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
-from omnigent.server.accounts_secret import load_or_generate_cookie_secret
-from omnigent.server.admin_list import resolve_data_dir
+from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
 from omnigent.server.routes._sessions.helpers import _build_actor
 
@@ -59,26 +59,32 @@ def _shell_result_signature(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    return hmac.new(_shell_result_signing_key(request), message, hashlib.sha256).hexdigest()
+    key = getattr(request.app.state, "_shell_result_signing_key", None)
+    if not isinstance(key, bytes):
+        raise ValueError(
+            "shell_yield_after requires a shared server signing key. Set "
+            "OMNIGENT_ACCOUNTS_COOKIE_SECRET to the same 64+ hex characters "
+            "on every server replica and restart the servers."
+        )
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
-def _shell_result_signing_key(request: Request) -> bytes:
-    """Derive a server-only key; replicas reuse their existing cookie secret."""
-    cached = getattr(request.app.state, "_shell_result_signing_key", None)
-    if isinstance(cached, bytes):
-        return cached
-    auth = getattr(request.app.state, "mcp_registry_auth", None)
+def resolve_shell_result_signing_key(auth: AuthProvider | None) -> bytes | None:
+    """Resolve once at startup; proxy-auth replicas require an explicit shared secret."""
     config = getattr(auth, "_oidc_config", None) or getattr(auth, "_accounts_config", None)
-    secret = (
-        config.cookie_secret
-        if config is not None
-        else bytes.fromhex(load_or_generate_cookie_secret(resolve_data_dir()))
-    )
+    if config is not None:
+        secret = config.cookie_secret
+    else:
+        configured = os.environ.get("OMNIGENT_ACCOUNTS_COOKIE_SECRET", "").strip()
+        if not configured:
+            return None
+        try:
+            secret = bytes.fromhex(configured)
+        except ValueError as exc:
+            raise ValueError("OMNIGENT_ACCOUNTS_COOKIE_SECRET must be a valid hex string") from exc
     if len(secret) < 32:
         raise ValueError("Shell result signing requires a 32-byte server secret")
-    key = hmac.new(secret, b"omnigent.shell-result-context.v1", hashlib.sha256).digest()
-    request.app.state._shell_result_signing_key = key
-    return key
+    return hmac.new(secret, b"omnigent.shell-result-context.v1", hashlib.sha256).digest()
 
 
 def shell_result_context(

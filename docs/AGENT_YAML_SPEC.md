@@ -393,9 +393,11 @@ retains the normal shell output limits.
 This is off by default and requires `async: true`
 (the default). Both server and runner must support the option. Calls without
 a verified runner binding stay in the foreground.
-Server replicas must share their cookie signing secret so delayed results
-remain verifiable after reconnects. Header-auth servers use
-`OMNIGENT_ACCOUNTS_COOKIE_SECRET` or the existing secret in the server's data directory.
+The signing key is resolved at server startup. OIDC/accounts deployments use
+their cookie secret, shared across replicas. Header/proxy-auth deployments must
+set the same `OMNIGENT_ACCOUNTS_COOKIE_SECRET` (at least 64 hex characters) on
+every replica. Without it, opted-in shell calls return a configuration error
+before starting the command; no local secret is generated.
 
 Handles live in the runner; a runner restart does not restore their commands.
 As with explicit async calls, cancelling a blocking shell helper may leave its

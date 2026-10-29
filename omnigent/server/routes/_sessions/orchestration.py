@@ -12776,9 +12776,12 @@ async def _handle_mcp_tools_call(
         ):
             from omnigent.server.mcp_identity import shell_result_context
 
-            delayed_context = shell_result_context(
-                request, conv, actor, {"name": namespaced_name, "arguments": arguments}
-            )
+            try:
+                delayed_context = shell_result_context(
+                    request, conv, actor, {"name": namespaced_name, "arguments": arguments}
+                )
+            except ValueError as exc:
+                return _mcp_error_response(rpc_id, -32000, str(exc))
         try:
             exec_resp = await runner_client.post(
                 f"/v1/sessions/{session_id}/mcp/execute",
