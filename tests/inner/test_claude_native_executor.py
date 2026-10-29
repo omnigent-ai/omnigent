@@ -2042,6 +2042,65 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("launcher_output", "expected_code"),
+    [
+        (
+            "ERROR Could not parse Databricks CLI version from `databricks --version` "
+            "output: 'Databricks CLI v1.22.1'\n│ Claude Code exited with code 1 │",
+            "required_terminal_exited",
+        ),
+        ("│ Claude Code exited with code 1 │", None),
+    ],
+)
+async def test_run_turn_explains_a_launcher_that_exited_before_the_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launcher_output: str,
+    expected_code: str | None,
+) -> None:
+    """A launcher's known fatal error reaches the card as its diagnosis, not a bare exit."""
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudeTerminalExited(
+            "The Claude Code terminal has exited (status 0), so the message was not "
+            f"delivered. Last terminal output:\n{launcher_output}",
+            exit_status="0",
+        )
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: None,
+    )
+
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(tmp_path / "bridge").run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert error.undelivered is True
+    assert error.code == expected_code
+    if expected_code is None:
+        assert error.title is None
+        return
+    assert error.title == "The Databricks gateway launcher couldn't check the Databricks CLI"
+    assert error.remediation is not None
+    assert "databricks --version" in error.remediation
+    # The pane's own text stays in the message for the person to read.
+    assert "Databricks CLI v1.22.1" in error.message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["message", "steering", "model"])
 @pytest.mark.parametrize("watchdog", [False, True])
 async def test_cancelled_delivery_drains_worker_before_unlocking(

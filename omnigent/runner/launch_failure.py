@@ -146,6 +146,25 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             remediation="Run the host as a non-root user (uid != 0).",
         ),
     ),
+    # The Databricks gateway launcher checks `databricks --version` before it
+    # starts Claude Code; a probe that times out or fails ends the launch with
+    # this error, even when the version it then prints is valid.
+    _TerminalMatcher(
+        "gateway_databricks_cli_version_unread",
+        lambda s: "could not parse databricks cli version" in s.output,
+        FailureDiagnosis(
+            title="The Databricks gateway launcher couldn't check the Databricks CLI",
+            cause=(
+                "The launcher exited before starting Claude Code because "
+                "`databricks --version` failed or answered too slowly on the host."
+            ),
+            remediation=(
+                "Run `databricks --version` on the host. If it is slow or fails, reinstall "
+                "or update the Databricks CLI. Then send your message again."
+            ),
+            category=ErrorCategory.UPSTREAM,
+        ),
+    ),
     _TerminalMatcher(
         "missing_binary",
         lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
