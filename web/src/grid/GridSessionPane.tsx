@@ -6,6 +6,7 @@ import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { useInertRef } from "@/hooks/useInertRef";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -156,6 +157,8 @@ export function GridSessionPane({
     [sessionId],
   );
   const showTerminal = terminalFirst && view === "terminal";
+  const setChatRef = useInertRef(showTerminal, chatRef);
+  const terminalInertRef = useInertRef<HTMLDivElement>(!showTerminal);
   // A connected terminal focuses itself as the cell activates; otherwise focus
   // the chat composer, or the cell itself when there is nothing to type into.
   const handledFocusRequest = useRef<object | null>(null);
@@ -386,11 +389,7 @@ export function GridSessionPane({
             </Button>
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-            <div
-              ref={chatRef}
-              className={cn("h-full", showTerminal && "hidden")}
-              inert={showTerminal}
-            >
+            <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
               <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal) && (
@@ -399,8 +398,8 @@ export function GridSessionPane({
                   "absolute inset-0 flex flex-col",
                   !showTerminal && "invisible opacity-0",
                 )}
+                ref={terminalInertRef}
                 aria-hidden={!showTerminal}
-                inert={!showTerminal}
               >
                 <MainTerminalView
                   conversationId={sessionId}
