@@ -8,6 +8,7 @@ import {
   Loader2Icon,
   MonitorCloudIcon,
 } from "lucide-react";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -154,6 +155,7 @@ export function ComposerPermissionPicker({
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
+  shortcut,
   onSelect,
   testIdPrefix = "composer",
 }: {
@@ -169,36 +171,48 @@ export function ComposerPermissionPicker({
   iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
+  /** Key chord shown in the hover tooltip; omit when the chord is unbound. */
+  shortcut?: readonly string[];
   onSelect: (value: string) => void;
   testIdPrefix?: string;
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
-        <button
-          type="button"
-          disabled={disabled || (loading && !interactiveWhileLoading)}
-          aria-busy={loading || undefined}
-          className={cn(
-            "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
-            loading && "disabled:opacity-100",
-          )}
-          aria-label={`${label}: ${value}`}
-          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
-          data-testid={`${testIdPrefix}-permission-chip`}
-          data-permission-concept={permissionModeConcept(harness, selectedValue)}
-        >
-          <HandIcon className="size-3 shrink-0" />
-          {!iconOnly && (
-            <span
-              className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+      {/* The wrapper takes the hover: a disabled button may not emit pointer events. */}
+      <KeyboardShortcutTooltip
+        label={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
+        keys={shortcut}
+      >
+        <span className="flex min-w-0">
+          <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
+            <button
+              type="button"
+              disabled={disabled || (loading && !interactiveWhileLoading)}
+              aria-busy={loading || undefined}
+              className={cn(
+                "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:pointer-events-none disabled:cursor-default disabled:opacity-50 md:h-7",
+                loading && "disabled:opacity-100",
+              )}
+              aria-label={`${label}: ${value}`}
+              data-testid={`${testIdPrefix}-permission-chip`}
+              data-permission-concept={permissionModeConcept(harness, selectedValue)}
             >
-              {value}
-            </span>
-          )}
-          <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
-        </button>
-      </DropdownMenuTrigger>
+              <HandIcon className="size-3 shrink-0" />
+              {!iconOnly && (
+                <span
+                  className={cn(
+                    "min-w-0 truncate text-ui font-normal",
+                    COMPOSER_COLLAPSED_LABEL_CLASS,
+                  )}
+                >
+                  {value}
+                </span>
+              )}
+              <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
+            </button>
+          </DropdownMenuTrigger>
+        </span>
+      </KeyboardShortcutTooltip>
       <DropdownMenuContent
         align="start"
         className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"

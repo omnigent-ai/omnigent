@@ -23,6 +23,7 @@ import {
   XIcon,
 } from "lucide-react";
 
+import { ARROW_UP_KEY, KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -78,6 +79,11 @@ interface QueuedMessagesStripProps {
    */
   onReorder?: (queueId: string, beforeQueueId: string | null) => void;
   /**
+   * The row an empty composer's ↑ recalls (the queue tail). Its edit button
+   * shows the ↑ hint; omit when the composer holds text, since ↑ then edits nothing.
+   */
+  arrowUpRecallQueueId?: string;
+  /**
    * Layout class aligning the strip with the composer surface it docks
    * onto (its tuck only hides behind a surface at least as wide, so match
    * that surface's width — e.g. the workspace bar's inset).
@@ -93,6 +99,7 @@ function QueuedRow({
   onSteer,
   steerBlocked,
   reorderable,
+  recallsOnArrowUp,
 }: {
   message: QueuedMessage;
   onDelete: (queueId: string) => void;
@@ -101,6 +108,8 @@ function QueuedRow({
   /** The conversation waits for its host, so nothing can be sent now. */
   steerBlocked: boolean;
   reorderable: boolean;
+  /** Whether an empty composer's ↑ edits this row. */
+  recallsOnArrowUp: boolean;
 }) {
   // The whole row drags (via its grip) and is the drop target, so the row
   // follows the finger and dropping anywhere on another row reorders.
@@ -208,16 +217,21 @@ function QueuedRow({
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       <span className="flex shrink-0 items-center gap-0">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          aria-label="Edit queued message"
-          className={ACTION_BUTTON_CLASS}
-          onClick={() => onEdit(message.queueId)}
+        <KeyboardShortcutTooltip
+          label="Edit queued message"
+          keys={recallsOnArrowUp ? [ARROW_UP_KEY] : undefined}
         >
-          <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
-        </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Edit queued message"
+            className={ACTION_BUTTON_CLASS}
+            onClick={() => onEdit(message.queueId)}
+          >
+            <PencilIcon className={ACTION_ICON_CLASS} aria-hidden="true" />
+          </Button>
+        </KeyboardShortcutTooltip>
         {onSteer ? (
           <Tooltip>
             <TooltipTrigger asChild>
@@ -271,6 +285,7 @@ export function QueuedMessagesStrip({
   onEdit,
   onSteer,
   onReorder,
+  arrowUpRecallQueueId,
   widthClassName,
 }: QueuedMessagesStripProps) {
   // Pointer sensors use activation constraints so pressing the grip does not
@@ -307,6 +322,7 @@ export function QueuedMessagesStrip({
       onSteer={onSteer}
       steerBlocked={steerBlocked}
       reorderable={onReorder !== undefined}
+      recallsOnArrowUp={message.queueId === arrowUpRecallQueueId}
     />
   ));
 

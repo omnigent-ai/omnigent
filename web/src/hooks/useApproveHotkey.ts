@@ -24,9 +24,13 @@
 import { useEffect } from "react";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
+import { ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import type { ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
+
+/** Glyphs for the chord this hook matches; shown on plain Approve buttons. */
+export const APPROVE_KEYS = [MOD_KEY, ENTER_KEY] as const;
 
 /**
  * Whether the keystroke landed in a text field that holds a draft — the

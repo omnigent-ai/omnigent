@@ -1,8 +1,9 @@
 "use client";
 
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
-import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
@@ -469,7 +470,8 @@ export const ComposerMicButton = ({
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // whenever dictation could run (Web Speech OR the server path) and the
   // composer isn't disabled, so the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled);
+  const hotkeyEnabled = enableHotkey && (Boolean(Ctor) || serverAvailable) && !disabled;
+  useVoiceDictationHotkey(toggle, hotkeyEnabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
@@ -520,48 +522,52 @@ export const ComposerMicButton = ({
   const tooltip = error ?? (connecting ? "Starting voice input…" : a11yLabel);
 
   return (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      disabled={disabled}
-      onClick={toggle}
-      aria-pressed={isListening}
-      aria-busy={connecting}
-      aria-label={a11yLabel}
-      data-server-dictation-available={serverAvailable}
-      title={tooltip}
-      className={cn(
-        "size-9 md:size-8",
-        isListening &&
-          "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
-        error && "text-destructive",
-        className,
-      )}
+    <KeyboardShortcutTooltip
+      label={tooltip}
+      keys={hotkeyEnabled ? VOICE_DICTATION_KEYS : undefined}
     >
-      {connecting ? (
-        <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
-      ) : isListening ? (
-        // Bars fade out and stop icon fades in on hover OR keyboard focus,
-        // so keyboard users get the stop affordance without needing hover.
-        <span className="relative flex size-4 items-center justify-center" aria-hidden>
-          <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
-            {BAR_BINS.map(([lo, hi], i) => (
-              <span
-                key={`${lo}-${hi}`}
-                ref={(el) => {
-                  barRefs.current[i] = el;
-                }}
-                className="block h-3 w-[2px] origin-center rounded-full bg-current"
-                style={{ transform: `scaleY(${BAR_BASELINE})` }}
-              />
-            ))}
+      <Button
+        type="button"
+        size="icon"
+        variant="ghost"
+        disabled={disabled}
+        onClick={toggle}
+        aria-pressed={isListening}
+        aria-busy={connecting}
+        aria-label={a11yLabel}
+        data-server-dictation-available={serverAvailable}
+        className={cn(
+          "size-9 md:size-8",
+          isListening &&
+            "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
+          error && "text-destructive",
+          className,
+        )}
+      >
+        {connecting ? (
+          <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
+        ) : isListening ? (
+          // Bars fade out and stop icon fades in on hover OR keyboard focus,
+          // so keyboard users get the stop affordance without needing hover.
+          <span className="relative flex size-4 items-center justify-center" aria-hidden>
+            <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
+              {BAR_BINS.map(([lo, hi], i) => (
+                <span
+                  key={`${lo}-${hi}`}
+                  ref={(el) => {
+                    barRefs.current[i] = el;
+                  }}
+                  className="block h-3 w-[2px] origin-center rounded-full bg-current"
+                  style={{ transform: `scaleY(${BAR_BASELINE})` }}
+                />
+              ))}
+            </span>
+            <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
           </span>
-          <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
-        </span>
-      ) : (
-        <MicIcon className="size-4" data-icon-size="16" />
-      )}
-    </Button>
+        ) : (
+          <MicIcon className="size-4" data-icon-size="16" />
+        )}
+      </Button>
+    </KeyboardShortcutTooltip>
   );
 };

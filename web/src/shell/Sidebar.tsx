@@ -2648,7 +2648,9 @@ function ConversationList({
             </Link>
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom">New session</TooltipContent>
+        <TooltipContent side="bottom" shortcut={newSessionShortcutKeys()}>
+          New session
+        </TooltipContent>
       </Tooltip>
       {!unifiedSelection && selectSessionsButton}
     </div>

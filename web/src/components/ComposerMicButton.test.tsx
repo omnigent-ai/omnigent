@@ -18,10 +18,17 @@
 
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { DictationSessionEvents } from "@/lib/dictation";
 import { ComposerMicButton } from "./ComposerMicButton";
+
+/** Hovers the mic button and returns the tooltip it opens. */
+async function hoverMicTooltip(button: HTMLElement): Promise<HTMLElement> {
+  fireEvent.pointerMove(button, { pointerType: "mouse" });
+  return screen.findByRole("tooltip");
+}
 
 // Controllable DictationSession stand-in for the server-mode tests. The
 // factory reads the mutable spies at call time, so each test installs its
@@ -231,7 +238,7 @@ describe("ComposerMicButton", () => {
     expect(onTranscript).not.toHaveBeenCalled();
   });
 
-  it("surfaces a permission-denied error in the tooltip and a toast", () => {
+  it("surfaces a permission-denied error in the tooltip and a toast", async () => {
     render(
       <CapabilitiesContext.Provider value={DICTATION_INFO}>
         <ComposerMicButton onTranscript={vi.fn()} />
@@ -241,18 +248,30 @@ describe("ComposerMicButton", () => {
 
     act(() => handlers.error?.({ error: "not-allowed" }));
     const message = "Microphone access denied. Allow access and try again.";
-    expect(button).toHaveAttribute("title", message);
+    expect(await hoverMicTooltip(button)).toHaveTextContent(message);
     expect(showToastMock).toHaveBeenCalledWith(message);
     expect(sessionStartMock).not.toHaveBeenCalled();
   });
 
-  it("ignores routine no-speech/aborted errors (no tooltip change, no toast)", () => {
+  it("ignores routine no-speech/aborted errors (no tooltip change, no toast)", async () => {
     render(<ComposerMicButton onTranscript={vi.fn()} />);
     const button = screen.getByRole("button", { name: "Voice dictation" });
 
     act(() => handlers.error?.({ error: "no-speech" }));
-    expect(button).toHaveAttribute("title", "Voice dictation");
+    expect(await hoverMicTooltip(button)).toHaveTextContent("Voice dictation");
     expect(showToastMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the dictation chord in its tooltip only while the hotkey is enabled", async () => {
+    const { unmount } = render(<ComposerMicButton onTranscript={vi.fn()} enableHotkey />);
+    const tooltip = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "V"]);
+    unmount();
+
+    render(<ComposerMicButton onTranscript={vi.fn()} />);
+    const plain = await hoverMicTooltip(screen.getByRole("button", { name: "Voice dictation" }));
+    expect(plain.querySelector('[data-slot="kbd"]')).toBeNull();
   });
 
   it("snapshots via onVoiceStart when dictation begins", () => {
@@ -416,7 +435,7 @@ describe("ComposerMicButton (server dictation)", () => {
     // Handshake in flight: busy, not yet pressed (no audio is flowing).
     expect(button).toHaveAttribute("aria-busy", "true");
     expect(button).toHaveAttribute("aria-pressed", "false");
-    expect(button).toHaveAttribute("title", "Starting voice input…");
+    expect(await hoverMicTooltip(button)).toHaveTextContent("Starting voice input…");
 
     await act(async () => {
       resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
@@ -473,10 +492,8 @@ describe("ComposerMicButton (server dictation)", () => {
     renderServerMode();
     await clickMic();
     const message = "Microphone access denied. Allow access and try again.";
-    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
-      "title",
-      message,
-    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    expect(await hoverMicTooltip(button)).toHaveTextContent(message);
     expect(showToastMock).toHaveBeenCalledWith(message);
   });
 
@@ -488,7 +505,9 @@ describe("ComposerMicButton (server dictation)", () => {
     act(() => sessionEvents?.onError("dictation failed"));
     const button = screen.getByRole("button", { name: "Voice dictation" });
     expect(button).toHaveAttribute("aria-pressed", "false");
-    expect(button).toHaveAttribute("title", "Voice input failed. Please try again.");
+    expect(await hoverMicTooltip(button)).toHaveTextContent(
+      "Voice input failed. Please try again.",
+    );
     expect(showToastMock).toHaveBeenCalledWith("Voice input failed. Please try again.");
     // No partial was in flight, so the interim region is just cleared.
     expect(onInterim).toHaveBeenCalledWith("");
@@ -529,7 +548,7 @@ describe("ComposerMicButton (server dictation)", () => {
     // the silent switch, and partials flow.
     expect(sessionStartMock).toHaveBeenCalledTimes(1);
     expect(button).toHaveAttribute("aria-pressed", "true");
-    expect(button).toHaveAttribute("title", "Voice dictation");
+    expect(await hoverMicTooltip(button)).toHaveTextContent("Voice dictation");
     act(() => sessionEvents?.onPartial("via server"));
     expect(onInterim).toHaveBeenCalledWith("via server");
 
@@ -554,8 +573,8 @@ describe("ComposerMicButton (server dictation)", () => {
     });
     renderServerMode();
     await clickMic();
-    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
-      "title",
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    expect(await hoverMicTooltip(button)).toHaveTextContent(
       "Voice input is busy. Please try again shortly.",
     );
   });
@@ -570,7 +589,9 @@ describe("ComposerMicButton (server dictation)", () => {
     fireEvent.click(button);
     await act(async () => handlers.error?.({ error }));
     expect(sessionStartMock).not.toHaveBeenCalled();
-    expect(button).toHaveAttribute("title", "Voice input isn't available on this device.");
+    expect(await hoverMicTooltip(button)).toHaveTextContent(
+      "Voice input isn't available on this device.",
+    );
     expect(showToastMock).toHaveBeenCalledWith("Voice input isn't available on this device.");
   });
 

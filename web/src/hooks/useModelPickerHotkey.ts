@@ -10,6 +10,11 @@
 
 import { useEffect, useRef } from "react";
 
+import { CTRL_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
+
+/** Glyphs for the chord `isModelPickerHotkey` matches; shown in control tooltips. */
+export const MODEL_PICKER_KEYS = [CTRL_KEY, SHIFT_KEY, "M"] as const;
+
 /** Selector for surfaces that own their keystrokes (terminals, code editor). */
 const HOTKEY_OWNING_SURFACES = ".xterm, .monaco-editor";
 

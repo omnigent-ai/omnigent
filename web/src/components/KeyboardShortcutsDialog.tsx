@@ -16,11 +16,14 @@ import {
   ARCHIVE_SESSION_KEYS,
   CLOSE_KEYS,
   CLOSE_WINDOW_KEYS,
+  ARROW_DOWN_KEY,
+  ARROW_UP_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
   CTRL_KEY,
   ENTER_KEY,
+  ESC_KEY,
   Kbd,
   MOD_KEY,
   NEW_BROWSER_TAB_KEYS,
@@ -63,9 +66,9 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const UP = "↑";
-const DOWN = "↓";
+// Same glyph constants the control tooltips use, so the dialog and tooltips match.
+const UP = ARROW_UP_KEY;
+const DOWN = ARROW_DOWN_KEY;
 const BRACKET_LEFT = "[";
 const BRACKET_RIGHT = "]";
 
@@ -116,7 +119,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Cycle permission mode (in session)", keys: [SHIFT_KEY, "Tab"] },
       { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
-      { label: "Stop response", keys: ["Esc"] },
+      { label: "Stop response", keys: [ESC_KEY] },
     ],
   },
   {
@@ -160,7 +163,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Navigate suggestions", keys: [UP, DOWN] },
       { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
+      { label: "Dismiss menu", keys: [ESC_KEY] },
     ],
   },
 ];
