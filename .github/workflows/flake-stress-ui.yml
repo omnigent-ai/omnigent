@@ -77,7 +77,7 @@ jobs:
     # out across (arrays must exist at job-graph construction time; the
     # downstream job picks it up via ``fromJSON``).
     name: Validate inputs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       attempts_json: ${{ steps.gen.outputs.attempts_json }}
     steps:
@@ -156,7 +156,7 @@ jobs:
     # under test.
     name: build codex-parity sidecar
     needs: prep
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -196,7 +196,7 @@ jobs:
   repro:
     name: Attempt ${{ matrix.attempt }}
     needs: [prep, build-sidecar]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       # Keep going after a failure to observe the full distribution.
@@ -219,7 +219,7 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Install uv
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: true
 
@@ -276,12 +276,12 @@ jobs:
           pnpm --filter web run build
 
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex
 
@@ -345,7 +345,7 @@ jobs:
     name: Summarize results
     needs: repro
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all attempt artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2

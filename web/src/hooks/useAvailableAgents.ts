@@ -7,8 +7,7 @@ import { agentRootName } from "@/lib/forkHarness";
 import { capitalizeAgentName, useAcpHarnessIds, useHarnessLabels } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAvailableAgent,
-  nativeCodingAgentForAgentName,
-  nativeCodingAgentForHarness,
+  type NativeCodingAgentSpec,
 } from "@/lib/nativeCodingAgents";
 import type { SkillSummary } from "@/lib/types";
 
@@ -68,32 +67,58 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
+/**
+ * The vendor whose stock harness row this is: the canonical wrapper name
+ * (`claude-native-ui`) or a clone of it. A custom agent that merely runs on a
+ * native harness is its own picker entry, labelled by its own name.
+ */
+function stockNativeAgent(
+  agent: Pick<AvailableAgent, "name" | "harness">,
+): NativeCodingAgentSpec | undefined {
+  const spec = nativeCodingAgentForAvailableAgent(agent);
+  return spec !== undefined && agentRootName(agent.name) === spec.agentName ? spec : undefined;
+}
+
+/**
+ * The vendor wrapper slot a row folds into for dedup and shadow removal: the
+ * stock wrapper, or a flagless legacy/session row that matches a native vendor
+ * by harness alone. A row the server flags `builtin` keeps its own picker row.
+ */
+function nativeWrapperSlot(
+  agent: Pick<AvailableAgent, "name" | "harness" | "builtin">,
+): NativeCodingAgentSpec | undefined {
+  const stock = stockNativeAgent(agent);
+  if (stock !== undefined) return stock;
+  if (agent.builtin !== undefined) return undefined;
+  return nativeCodingAgentForAvailableAgent(agent);
+}
+
 function displayNameForAgent(name: string, harness?: string | null): string {
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
-    nativeCodingAgentForAgentName(name)?.displayName ??
+    stockNativeAgent({ name, harness: harness ?? null })?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );
 }
 
+/** Keep one row per stock native wrapper, preferring the canonically named one. */
 function dedupeNativeAgents(agents: AvailableAgent[]): AvailableAgent[] {
   const result: AvailableAgent[] = [];
-  const nativeIndex = new Map<string, number>();
+  const stockIndex = new Map<string, number>();
   for (const agent of agents) {
-    const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-    if (nativeAgent === undefined) {
+    const stock = nativeWrapperSlot(agent);
+    if (stock === undefined) {
       result.push(agent);
       continue;
     }
-    const existingIndex = nativeIndex.get(nativeAgent.key);
+    const existingIndex = stockIndex.get(stock.key);
     if (existingIndex === undefined) {
-      nativeIndex.set(nativeAgent.key, result.length);
+      stockIndex.set(stock.key, result.length);
       result.push(agent);
       continue;
     }
     const existing = result[existingIndex];
-    if (agent.name === nativeAgent.agentName && existing.name !== nativeAgent.agentName) {
+    if (agent.name === stock.agentName && existing.name !== stock.agentName) {
       result[existingIndex] = agent;
     }
   }
@@ -118,14 +143,26 @@ interface BuiltinAgentsListWire {
   data: BuiltinAgentWire[];
   has_more?: boolean;
   last_id?: string | null;
+  // Packaged built-ins the deployment trimmed via OMNIGENT_SEEDED_AGENTS.
+  // Absent on older servers.
+  suppressed_agent_names?: string[];
+}
+
+/** The built-in catalog plus the packaged names the deployment hides. */
+export interface AgentCatalog {
+  agents: AvailableAgent[];
+  // A hidden built-in with prior sessions must not resurface from session
+  // discovery as a "custom" agent, so the merge drops these names.
+  suppressedNames: ReadonlySet<string>;
 }
 
 /**
  * Fetch the built-in agents from the read-only list `GET /v1/agents`
  * (see designs/BUILTIN_AGENTS.md).
  */
-export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
+export async function fetchAgentCatalog(): Promise<AgentCatalog> {
   const rows: BuiltinAgentWire[] = [];
+  const suppressedNames = new Set<string>();
   let after: string | null = null;
   // Each page provides the cursor for the next request.
   /* oxlint-disable no-await-in-loop */
@@ -137,11 +174,13 @@ export async function fetchAgentCatalog(): Promise<AvailableAgent[]> {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
     rows.push(...body.data);
+    for (const name of body.suppressed_agent_names ?? []) suppressedNames.add(name);
     after = body.has_more === true && body.last_id ? body.last_id : null;
   } while (after != null);
   /* oxlint-enable no-await-in-loop */
 
-  return rows.map(agentFromWire);
+  const agents = rows.map(agentFromWire);
+  return { agents, suppressedNames };
 }
 
 function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
@@ -190,8 +229,6 @@ export async function fetchUserAgents(): Promise<AvailableAgent[]> {
   /* oxlint-enable no-await-in-loop */
   return rows.map((a) => ({
     ...agentFromWire(a),
-    // By its own name: "orion" on claude-native is Orion, not "Claude Code".
-    display_name: displayNameForAgent(a.name),
     updated_at: a.updated_at ?? null,
     mine: true as const,
   }));
@@ -271,17 +308,13 @@ export async function prefetchAvailableAgentDetails(
               skills: json.skills ?? [],
             },
       );
-      // If enrichment reveals this agent is a native coding agent (e.g. a
-      // kiro-native session with a non-canonical name), remove it when a
-      // seeded built-in with the same native key already exists so it doesn't
-      // surface as a duplicate picker row.
+      // If enrichment folds this agent into a stock native wrapper and that
+      // wrapper's seeded row already exists, drop it so it isn't a duplicate row.
       const enrichedAgent = enriched.find((a) => a.id === agent.id);
-      const enrichedKey = enrichedAgent
-        ? nativeCodingAgentForAvailableAgent(enrichedAgent)?.key
-        : undefined;
+      const enrichedKey = enrichedAgent ? nativeWrapperSlot(enrichedAgent)?.key : undefined;
       if (enrichedKey) {
         const builtinExists = enriched.some(
-          (a) => a.id !== agent.id && nativeCodingAgentForAvailableAgent(a)?.key === enrichedKey,
+          (a) => a.id !== agent.id && nativeWrapperSlot(a)?.key === enrichedKey,
         );
         if (builtinExists) return enriched.filter((a) => a.id !== agent.id);
       }
@@ -322,12 +355,23 @@ async function fetchAvailableAgents(
     createdAt: agent.created_at ?? null,
     agent,
   }));
-  const merged = mergeAvailableAgents(catalog, discovered, userAgents);
+  const merged = mergeAvailableAgents(
+    catalog.agents,
+    discovered,
+    userAgents,
+    catalog.suppressedNames,
+  );
   for (const id of pinnedAgentIds) {
     if (merged.some((agent) => agent.id === id)) continue;
+    // A pin (e.g. a project default) must not resurface a trimmed built-in
+    // from session history; the caller's own same-named agent still resolves
+    // through `userAgents` below.
+    const sessionAgent = sessionAgents.find((a) => a.id === id);
     const agent =
-      sessionAgents.find((a) => a.id === id) ??
-      catalog.find((a) => a.id === id) ??
+      (sessionAgent && !catalog.suppressedNames.has(agentRootName(sessionAgent.name))
+        ? sessionAgent
+        : undefined) ??
+      catalog.agents.find((a) => a.id === id) ??
       userAgents.find((a) => a.id === id);
     if (agent) merged.push(agent);
   }
@@ -338,6 +382,7 @@ function mergeAvailableAgents(
   catalog: AvailableAgent[],
   discovered: DiscoveredSessionAgent[],
   userAgents: AvailableAgent[] = [],
+  suppressedNames: ReadonlySet<string> = new Set(),
 ): AvailableAgent[] {
   // Seeded built-ins are emitted verbatim and protected; user-registered
   // templates seed the newest-wins buckets so an upload can supersede them.
@@ -349,7 +394,7 @@ function mergeAvailableAgents(
   const catalogIds = new Set(catalog.map((a) => a.id));
   const userAgentIds = new Set(userAgents.map((a) => a.id));
   const seededNames = new Set(seeded.map((a) => agentRootName(a.name)));
-  const hasKiroBuiltin = seeded.some((a) => nativeCodingAgentForAvailableAgent(a)?.key === "kiro");
+  const hasKiroBuiltin = seeded.some((a) => nativeWrapperSlot(a)?.key === "kiro");
   const kiroLegacyNames = new Set(["kiro"]);
 
   const recencyOf = (a: AvailableAgent): number => a.created_at ?? 0;
@@ -385,6 +430,8 @@ function mergeAvailableAgents(
     if (userAgentIds.has(agent.agentId)) continue;
     // Seeded built-in name (incl. fork/switch clones): the built-in wins.
     if (seededNames.has(base)) continue;
+    // A packaged built-in the deployment trimmed: hidden, not a custom upload.
+    if (suppressedNames.has(base)) continue;
     if (hasKiroBuiltin && kiroLegacyNames.has(base.toLocaleLowerCase())) continue;
     // Genuine custom upload (or a clone of one). Newest same-named row wins,
     // superseding an older user-registered template seeded above. Strict `>`
@@ -411,10 +458,7 @@ function mergeAvailableAgents(
 
   const resolved = Array.from(byName.values())
     .map((c) => (c.template !== null ? c.template : sessionAgentFromDiscovery(c.discovered!)))
-    .filter((agent) => {
-      const nativeKey = nativeCodingAgentForAvailableAgent(agent)?.key;
-      return nativeKey !== "kiro" || !hasKiroBuiltin;
-    });
+    .filter((agent) => nativeWrapperSlot(agent)?.key !== "kiro" || !hasKiroBuiltin);
   // Seeded built-ins first; user templates / custom uploads follow, newest
   // first. NewChatDialog's display-order sort is stable, so unranked names
   // keep this relative order.
@@ -515,7 +559,10 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // partial list read isPlaceholderData to tell this state apart.
   //
   const placeholderData = useMemo(
-    () => (catalog === undefined ? undefined : mergeAvailableAgents(catalog, [])),
+    () =>
+      catalog === undefined
+        ? undefined
+        : mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames),
     [catalog],
   );
   const query = useQuery({

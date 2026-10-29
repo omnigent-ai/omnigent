@@ -14,6 +14,7 @@ from typing import get_args
 
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.harnesses.claude_native.bridge import (
+    RESUME_COPY_MARKER_SUFFIX,
     ClaudeTranscriptItem,
     read_transcript_items_from_offset,
 )
@@ -331,7 +332,9 @@ def _recent_local_sessions_with_recency(
         candidates = [
             (path, path.stem)
             for path in root.rglob("*.jsonl")
-            if "subagents" not in path.parts and path.is_file()
+            if "subagents" not in path.parts
+            and path.is_file()
+            and not path.with_suffix(RESUME_COPY_MARKER_SUFFIX).exists()
         ]
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
@@ -553,6 +556,10 @@ def load_claude_session(
     transcript_path = _find_transcript(root, session_id)
     if transcript_path is None:
         raise SessionImportNotFoundError(f"Claude Code session {session_id!r} was not found")
+    if transcript_path.with_suffix(RESUME_COPY_MARKER_SUFFIX).exists():
+        raise SessionImportNotFoundError(
+            f"Claude Code session {session_id!r} is an Omnigent resume copy"
+        )
 
     parsed = read_transcript_items_from_offset(
         transcript_path,
@@ -1117,6 +1124,10 @@ def _pi_active_branch(records: list[dict[str, object]]) -> list[dict[str, object
             legacy_entry_id = f"legacy-{index}"
             entry["id"] = legacy_entry_id
             entry["parentId"] = legacy_parent_id
+            if entry.get("type") == "compaction":
+                kept_index = entry.get("firstKeptEntryIndex")
+                if type(kept_index) is int and 0 < kept_index <= index:
+                    entry["firstKeptEntryId"] = f"legacy-{kept_index}"
             migrated.append(entry)
             legacy_parent_id = legacy_entry_id
         records = migrated
@@ -1150,7 +1161,9 @@ def _pi_active_branch(records: list[dict[str, object]]) -> list[dict[str, object
         current = by_id[parent_id]
 
 
-def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, ...]:
+def _pi_message_items(
+    record: dict[str, object], *, text_only: bool = False
+) -> tuple[NewConversationItem, ...]:
     """Convert one Pi message entry to visible Omnigent items."""
     if record.get("type") == "branch_summary":
         summary = record.get("summary")
@@ -1207,7 +1220,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
     items: list[NewConversationItem] = []
     content = message.get("content")
     if role == "user":
-        normalized = _pi_message_content(content, role=role)
+        normalized = _pi_message_content(_pi_text(content) if text_only else content, role=role)
         if not normalized:
             return ()
         items.append(
@@ -1291,6 +1304,59 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
     return tuple(items)
 
 
+def _pi_compaction_item(
+    branch: list[dict[str, object]], index: int
+) -> tuple[NewConversationItem, ...]:
+    """Keep a checkpoint alongside history for the shared native resume converter."""
+    checkpoint = branch[index]
+    summary = checkpoint.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return ()
+    first_kept = checkpoint.get("firstKeptEntryId")
+    kept_index = next(
+        (position for position in range(index + 1) if branch[position]["id"] == first_kept),
+        None,
+    )
+    # A damaged boundary cannot justify discarding any of the readable history.
+    if kept_index is None:
+        return ()
+    # Match the live extension's text-only resume snapshot; keep images in history.
+    snapshot = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": "The conversation history before this point was compacted into "
+                    f"the following summary:\n\n<summary>\n{summary}\n</summary>",
+                }
+            ],
+        },
+        *(
+            {"type": item.type, **item.data.model_dump()}
+            for record in branch[kept_index:index]
+            for item in _pi_message_items(record, text_only=True)
+        ),
+    ]
+    return (
+        NewConversationItem(
+            type="compaction",
+            response_id=_bounded_response_id(f"pi:{checkpoint['id']}"),
+            data=parse_item_data(
+                "compaction",
+                {
+                    "summary": summary,
+                    "last_item_id": "",
+                    "token_count": (len(summary) + 3) // 4,
+                    "window_id": checkpoint["id"],
+                    "compacted_messages": snapshot,
+                },
+            ),
+        ),
+    )
+
+
 def load_pi_session(
     session_id: str,
     *,
@@ -1328,8 +1394,15 @@ def load_pi_session(
         )
     workspace_value = header.get("cwd")
     workspace = workspace_value.strip() if isinstance(workspace_value, str) else None
+    branch = _pi_active_branch(records)
     items = tuple(
-        item for record in _pi_active_branch(records) for item in _pi_message_items(record)
+        item
+        for index, record in enumerate(branch)
+        for item in (
+            _pi_compaction_item(branch, index)
+            if record.get("type") == "compaction"
+            else _pi_message_items(record)
+        )
     )
     if not items:
         raise SessionImportNotFoundError(f"Pi session {session_id!r} has no importable history")

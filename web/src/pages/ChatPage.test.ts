@@ -26,7 +26,6 @@ import {
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
-  readOnlyReasonForSessionLabels,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -40,13 +39,14 @@ import {
   splitSlashCommand,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
-  subAgentComposerLabel,
-  modelPickerKindForConv,
   unboundSessionResumableInApp,
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
+import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
+import { subAgentComposerLabel } from "@/shell/subagentLabel";
 
 // The Composer's read-only and disabled states are derived from
 // permissionLevel. These tests pin the derivation logic so a
@@ -1091,8 +1091,25 @@ describe("shouldShowWorkingIndicator", () => {
 // ── workingIndicatorLabel ───────────────────────────────────────────────────
 
 describe("workingIndicatorLabel — parked on a dialog", () => {
-  it("names what the agent is waiting on", () => {
-    expect(workingIndicatorLabel(0, "permission prompt")).toBe("Blocked on: permission prompt");
+  it("names what the agent is waiting on beside a chat card that can answer it", () => {
+    expect(workingIndicatorLabel(0, "permission prompt", { answerableInChat: true })).toBe(
+      "Blocked on: permission prompt",
+    );
+  });
+
+  it("says a permission prompt with no chat card needs approval in the terminal", () => {
+    expect(workingIndicatorLabel(0, "permission prompt")).toBe(
+      "Waiting for your approval in the agent's terminal.",
+    );
+    expect(workingIndicatorLabel(0, "permission prompt", { terminalView: true })).toBe(
+      "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+    );
+  });
+
+  it("names other terminal-only block reasons", () => {
+    expect(workingIndicatorLabel(0, "input needed")).toBe(
+      "Waiting for you in the agent's terminal (input needed).",
+    );
   });
 
   it("outranks the rotation", () => {
