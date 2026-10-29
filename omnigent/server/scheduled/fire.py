@@ -609,6 +609,9 @@ async def _run_fire_for_task(
     try:
         effective = await _own_task_agent(deps, effective)
         conv = await _create_session(deps, effective)
+    except OmnigentError as exc:
+        await recorder.finish("failed", error=exc.message, error_code=exc.code)
+        return
     except Exception:
         _logger.exception("scheduled fire: failed to create session for task %s", task.id)
         await recorder.finish(
