@@ -36,7 +36,7 @@ on:
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per shard (-n flag). Empty uses the E2E_UI_PARALLELISM repository variable, else 1 (serial)."
+        description: "Number of pytest workers per UI shard and for browser-contract (-n flag). Empty uses the E2E_UI_PARALLELISM repository variable, else 1 (serial)."
         required: false
         default: ""
 
@@ -218,12 +218,22 @@ jobs:
       - name: Run browser-contract tests
         env:
           UI_SCOPE: ${{ needs.setup.outputs.ui }}
+          # Same worker count as the UI shards: dispatch input, else the
+          # E2E_UI_PARALLELISM repository variable (unset on fork PRs), else serial.
+          PARALLELISM_INPUT: ${{ inputs.parallelism || vars.E2E_UI_PARALLELISM || '1' }}
         run: |
+          if ! [[ "$PARALLELISM_INPUT" =~ ^[1-9]$ ]]; then
+            echo "Invalid parallelism input: $PARALLELISM_INPUT (expected 1-9)" >&2
+            exit 1
+          fi
           targets=(tests/browser_ui)
           extra_args=()
           if [[ "$UI_SCOPE" == "dependency" ]]; then
             targets=(tests/browser_ui/chat/test_transcript_rendering.py tests/browser_ui/files/test_markdown_editor_journey.py)
             extra_args=(-p tests._helpers.required_tests)
+          elif [[ "$PARALLELISM_INPUT" -gt 1 ]]; then
+            # Each worker serves its own copy of the built SPA on a free port.
+            extra_args=(-n "$PARALLELISM_INPUT" --dist=loadfile)
           fi
           time uv run pytest "${targets[@]}" "${extra_args[@]}" \
             -v --tb=long --showlocals -r a \

@@ -527,6 +527,7 @@ def create_runner_tunnel_router(
         session: RunnerSession | None = None
         ended_by: str | None = None
         peer_close_code: int | None = None
+        receive_task: asyncio.Task[None] | None = None
         owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
@@ -751,6 +752,14 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                # A sender failure can win exception handling while receive has the
+                # actual peer close. Preserve it for lifecycle reconciliation.
+                if receive_task is not None and not receive_task.cancelled():
+                    receive_error = receive_task.exception()
+                    if isinstance(receive_error, WebSocketDisconnect):
+                        peer_close_code = receive_error.code
+                        session.peer_close_reason = receive_error.reason or None
+                        shutdown_state.note_tunnel_close_code(peer_close_code)
                 # Snapshot before deregister records its own cleanup close on the session.
                 session.ended = TunnelEnd(
                     at=ended_at,
