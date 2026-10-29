@@ -11,22 +11,24 @@ from omnigent.util.json_types import JsonObject
 MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
 
 
-def cap_tool_output(output: str) -> str:
-    """Cap *output* to ``MAX_TOOL_OUTPUT_BYTES`` UTF-8 on a char boundary for AP's mirror."""
+def cap_tool_output(output: str, *, max_bytes: int | None = None) -> str:
+    """Cap *output* to *max_bytes* UTF-8 on a char boundary (AP's mirror cap by default)."""
+    if max_bytes is None:
+        max_bytes = MAX_TOOL_OUTPUT_BYTES
     encoded = output.encode("utf-8")
-    if len(encoded) <= MAX_TOOL_OUTPUT_BYTES:
+    if len(encoded) <= max_bytes:
         return output
-    output = _cap_image_envelope(output)
+    output = _cap_image_envelope(output, max_bytes)
     encoded = output.encode("utf-8")
-    if len(encoded) <= MAX_TOOL_OUTPUT_BYTES:
+    if len(encoded) <= max_bytes:
         return output
-    omitted = len(encoded) - MAX_TOOL_OUTPUT_BYTES
+    omitted = len(encoded) - max_bytes
     # Drop a partial trailing multibyte char left by slicing on a byte boundary.
-    kept = encoded[:MAX_TOOL_OUTPUT_BYTES].decode("utf-8", errors="ignore")
+    kept = encoded[:max_bytes].decode("utf-8", errors="ignore")
     return f"{kept}\n\n[output truncated by omnigent: {omitted} of {len(encoded)} bytes omitted]"
 
 
-def _cap_image_envelope(output: str) -> str:
+def _cap_image_envelope(output: str, max_bytes: int) -> str:
     """Omit large history images before truncating text that follows them."""
     try:
         result = decode_mcp_image_result(json.loads(output))
@@ -52,6 +54,6 @@ def _cap_image_envelope(output: str) -> str:
             if result.is_error:
                 content = [{"type": "text", "text": "Error:"}, *content]
             output = json.dumps(content)
-        if len(output.encode("utf-8")) <= MAX_TOOL_OUTPUT_BYTES:
+        if len(output.encode("utf-8")) <= max_bytes:
             return output
     return output

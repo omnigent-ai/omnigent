@@ -62,7 +62,12 @@
   },
   {
     "group": "misc",
-    "paths": "tests --ignore=tests/e2e --ignore=tests/integration --ignore=tests/runtime --ignore=tests/inner --ignore=tests/tools --ignore=tests/test_errors.py --ignore=tests/frontends --ignore=tests/repl --ignore=tests/terminals --ignore=tests/server --ignore=tests/onboarding --ignore=tests/spec --ignore=tests/llms --ignore=tests/codex_parity --ignore=tests/runner --ignore=tests/stores",
+    "paths": "tests --ignore=tests/e2e --ignore=tests/integration --ignore=tests/runtime --ignore=tests/inner --ignore=tests/tools --ignore=tests/test_errors.py --ignore=tests/frontends --ignore=tests/repl --ignore=tests/terminals --ignore=tests/server --ignore=tests/onboarding --ignore=tests/spec --ignore=tests/llms --ignore=tests/codex_parity --ignore=tests/runner --ignore=tests/stores --ignore=tests/scripts",
+    "dist": "worksteal"
+  },
+  {
+    "group": "ci-tooling",
+    "paths": "tests/scripts",
     "dist": "worksteal"
   },
   {
