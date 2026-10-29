@@ -1993,12 +1993,13 @@ function AppShellImpl() {
   // the selected file keeps the rail's single content slot unambiguous — a
   // shell tab and a file tab can't both be "active".
   const openTerminalTab = useCallback(
-    (key: string) => {
+    (key: string, { focus = true }: { focus?: boolean } = {}) => {
       // The tab already exists (tabs derive 1:1 from the terminal list); this
       // just focuses it and reveals the rail. The selection is sticky (never
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
-      autoFocusTerminalKeyRef.current = key;
+      // `focus: false` shows the shell but leaves keyboard focus where it is.
+      autoFocusTerminalKeyRef.current = focus ? key : null;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);

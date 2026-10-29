@@ -3563,7 +3563,7 @@ function buildMenu() {
         label: "New Browser Tab",
         accelerator: "CmdOrCtrl+T",
         enabled: canRun("new-browser-tab"),
-        click: () => runCommand("new-browser-tab"),
+        click: () => focusAppAndSend("new-browser-tab"),
       },
       {
         id: "focus_address_bar",
@@ -5507,12 +5507,16 @@ function reloadFocused() {
   else focused.webContents.reload();
 }
 
-/** Take keyboard focus back from an embedded page, then hand `command` to the app. */
+/**
+ * Take keyboard focus back from an embedded page, then hand `command` to the
+ * app, naming the page that had focus so the app can return to it.
+ */
 function focusAppAndSend(command) {
   const target = desktopCommandTarget(command);
   if (!target) return;
+  const browserViewId = focusedBrowserViewId(target);
   target.webContents.focus();
-  sendDesktopCommand(target, command);
+  sendDesktopCommand(target, command, { browserViewId });
 }
 
 /**

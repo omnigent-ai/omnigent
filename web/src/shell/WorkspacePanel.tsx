@@ -66,7 +66,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
-import { useBrowserTabs } from "@/hooks/useBrowserTabs";
+import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -754,7 +754,7 @@ interface WorkspacePanelProps {
   onCommentsOpenChange: (open: boolean) => void;
   /** Open a shell as a rail tab (adds/activates its tab), surfacing its
    *  xterm in the content slot. */
-  openTerminalTab: (key: string) => void;
+  openTerminalTab: (key: string, options?: { focus?: boolean }) => void;
   /** Ordered list of open shell tab keys, shown as a strip beside the file
    *  tabs. */
   openTerminals: string[];
@@ -813,6 +813,21 @@ const closedTabsBySession = new Map<string, ClosedTab[]>();
 function rememberClosedTab(conversationId: string, tab: ClosedTab): void {
   const closed = closedTabsBySession.get(conversationId) ?? [];
   closedTabsBySession.set(conversationId, [...closed.slice(-19), tab]);
+}
+
+/**
+ * Where a just-opened browser tab returns when it closes before the user
+ * switches away, as in a browser: the rail tab that was on screen, whether the
+ * rail was open, and where keyboard focus was.
+ */
+interface ReturnPoint {
+  tabId: string;
+  railTab: string | null;
+  railOpen: boolean;
+  /** An element outside the rail (such as the chat box), that tab's page or address bar, or the rail. */
+  focus: { element: HTMLElement } | { browser: "address" | "page" } | { rail: true } | null;
+  /** Set once the new tab is on screen; switching away after that forgets the point. */
+  shown: boolean;
 }
 
 /**
@@ -891,11 +906,23 @@ function WorkspacePanelImpl({
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  const returnPointRef = useRef<ReturnPoint | null>(null);
+  // One-shot focus for a browser tab's pane: its address bar or its page.
+  const [browserFocus, setBrowserFocus] = useState<{
+    viewId: string;
+    target: "address" | "page";
+  } | null>(null);
+  const clearBrowserFocus = useCallback(() => setBrowserFocus(null), []);
   const closeBrowserTab = async (tabId: string) => {
     const url = browsers.urlFor(tabId);
+    const returnPoint = returnPointRef.current?.tabId === tabId ? returnPointRef.current : null;
     const closed = await browsers.close(tabId);
-    if (closed) rememberClosedTab(conversationId, { kind: "browser", url });
-    else toast.error("Couldn't close browser tab. Try again.");
+    if (!closed) {
+      toast.error("Couldn't close browser tab. Try again.");
+      return;
+    }
+    rememberClosedTab(conversationId, { kind: "browser", url });
+    if (returnPoint) returnFrom(returnPoint);
   };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -906,15 +933,42 @@ function WorkspacePanelImpl({
     browsers.selected !== null &&
     selectedFilePath === null &&
     selectedTerminalKey === null;
-  const addBrowser = () => {
-    browsers.add();
+  // `focusedViewId` names the browser page that had keyboard focus, if any.
+  const addBrowser = (focusedViewId: string | null = null) => {
+    const active = document.activeElement;
+    const inRail = railRef.current?.contains(active) === true;
+    let focus: ReturnPoint["focus"] = null;
+    if (browserSelected && focusedViewId !== null && focusedViewId === browsers.viewId) {
+      focus = { browser: "page" };
+    } else if (inRail) {
+      focus =
+        browserSelected && active instanceof HTMLInputElement
+          ? { browser: "address" }
+          : { rail: true };
+    } else if (
+      !inRail &&
+      active instanceof HTMLElement &&
+      active !== document.body &&
+      !active.closest('[role="menu"]')
+    ) {
+      focus = { element: active };
+    }
+    const tabId = browsers.add();
+    returnPointRef.current = {
+      tabId,
+      railTab: panelOptions.find((option) => option.active)?.key ?? null,
+      railOpen: open,
+      focus,
+      shown: false,
+    };
+    setBrowserFocus({ viewId: browserViewId(conversationId, tabId), target: "address" });
     onRightRailTabChange("browser");
     onReveal?.();
   };
   useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
   useDesktopCommand(
     "new-browser-tab",
-    showBrowserTab && !pending && !contained ? addBrowser : null,
+    showBrowserTab && !pending && !contained ? (event) => addBrowser(event.browserViewId) : null,
   );
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
@@ -1192,7 +1246,7 @@ function WorkspacePanelImpl({
       conversationId={conversationId}
       panels={unpinnedTabs}
       onOpenPanel={selectPermanentTab}
-      onOpenBrowser={showBrowserTab ? addBrowser : undefined}
+      onOpenBrowser={showBrowserTab ? () => addBrowser() : undefined}
       onOpenSideChat={onNewSideChat}
       onOpenTerminal={openTerminalTab}
       onCreateStart={onShellCreateStart}
@@ -1460,6 +1514,29 @@ function WorkspacePanelImpl({
     },
     { priority: 10 },
   );
+  // Back to the tab, and the focus, that a just-opened browser tab came from.
+  const returnFrom = ({ railTab, railOpen, focus }: ReturnPoint) => {
+    returnPointRef.current = null;
+    if (railTab !== null && openTerminals.includes(railTab)) {
+      // A shell takes focus when shown; only let it if focus was in the rail.
+      openTerminalTab(railTab, { focus: focus !== null && "rail" in focus });
+    } else {
+      panelOptions.find((option) => option.key === railTab)?.select();
+    }
+    if (!railOpen) onHide?.();
+    if (focus && "element" in focus) {
+      if (focus.element.isConnected) focus.element.focus();
+    } else if (focus && "browser" in focus && railTab?.startsWith("browser:")) {
+      const tabId = railTab.slice("browser:".length);
+      setBrowserFocus({ viewId: browserViewId(conversationId, tabId), target: focus.browser });
+    }
+  };
+  useEffect(() => {
+    const point = returnPointRef.current;
+    if (!point) return;
+    if (browserSelected && browsers.selected === point.tabId) point.shown = true;
+    else if (point.shown) returnPointRef.current = null;
+  });
   // Desktop ⇧⌘[ / ⇧⌘] step through the tabs in strip order; ⇧⌘T reopens the last closed one.
   const showAdjacentTab = (step: -1 | 1) => {
     const options = panelOptions.filter((option) => !option.disabled);
@@ -1915,6 +1992,8 @@ function WorkspacePanelImpl({
               conversationId={browsers.viewId!}
               agentBrowser={browsers.agentBrowser}
               active={open}
+              focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
+              onFocused={clearBrowserFocus}
               className="min-h-0 flex-1"
             />
           ) : scopeView === "github" ? (

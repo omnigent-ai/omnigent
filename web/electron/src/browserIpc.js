@@ -475,6 +475,10 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const conversationId = args?.conversationId ?? null;
     const r = g.registry.setActive(conversationId);
+    // A tab the user returns to gets keyboard focus back in its page.
+    if (r.ok && conversationId !== null && args?.focus === true) {
+      g.registry.get(conversationId)?.view.webContents.focus();
+    }
     return { ok: r.ok, error: r.error };
   });
 
