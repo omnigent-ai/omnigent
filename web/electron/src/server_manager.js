@@ -474,6 +474,20 @@ async function shutdown(cliPath) {
   if (cliPath) await stopOwnedLocalServer(cliPath);
 }
 
+/**
+ * What `shutdown` would stop right now: connected host processes and a local
+ * server this app started. Read-only; the quit prompt uses it for its wording.
+ *
+ * @returns {{ hosts: number, localServer: boolean }}
+ */
+function runningWork() {
+  let hosts = 0;
+  for (const key of hostChildren.keys()) {
+    if (ownsLiveHost(key)) hosts += 1;
+  }
+  return { hosts, localServer: ownedLocalServer !== null };
+}
+
 module.exports = {
   ensureHostConnected,
   ensureServerAuth,
@@ -482,6 +496,7 @@ module.exports = {
   startLocalServer,
   stopOwnedLocalServer,
   shutdown,
+  runningWork,
   onChange,
   // Exposed for tests / introspection.
   _hostChildren: hostChildren,

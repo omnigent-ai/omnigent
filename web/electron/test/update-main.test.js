@@ -20,6 +20,7 @@ function loadMainHarness({
   platform = process.platform,
   developerMode = false,
   desktopVersionOverride,
+  runningWork = { hosts: 0, localServer: false },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
@@ -96,6 +97,7 @@ function loadMainHarness({
 
   const electron = {
     app: {
+      name: "Omnigent",
       isPackaged,
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
@@ -211,6 +213,7 @@ function loadMainHarness({
     },
     "./server_manager": {
       shutdown: () => serverShutdown(),
+      runningWork: () => runningWork,
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
       ensureHostConnected: async () => ({ ok: true }),
@@ -419,6 +422,149 @@ describe("About menu wiring", () => {
 
     assert.equal(aboutItem.label, "About Omnigent");
     assert.equal(harness.calls.aboutOpens.length, 1);
+  });
+});
+
+function submenuIds(menu, label) {
+  const entry = menu.template.find((item) => item.label === label);
+  return plain(entry.submenu.map((item) => item.id ?? item.role ?? item.type));
+}
+
+function topLevelMenus(menu) {
+  return plain(
+    menu.template.map((item) => item.label ?? item.role).filter((label) => label !== "Debug"),
+  );
+}
+
+describe("application menu layout", () => {
+  it("keeps updates, Settings, and the confirming Quit in the macOS app menu", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.deepEqual(topLevelMenus(menu), [
+      "Omnigent",
+      "File",
+      "Edit",
+      "View",
+      "Server",
+      "windowMenu",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Omnigent"), [
+      "open_about",
+      "check_for_updates",
+      "restart_to_update",
+      "separator",
+      "open_settings",
+      "separator",
+      "services",
+      "separator",
+      "hide",
+      "hideOthers",
+      "unhide",
+      "separator",
+      "confirm_before_quit",
+      "quit",
+    ]);
+    assert.deepEqual(submenuIds(menu, "File"), [
+      "new_session",
+      "new_window",
+      "new_server_window",
+      "separator",
+      "close",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Server"), [
+      "change_server",
+      "sign_out_server",
+      "separator",
+      "export_diagnostics",
+    ]);
+  });
+
+  it("keeps Settings and Quit in File and updates in Help on Windows and Linux", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.deepEqual(topLevelMenus(menu), ["File", "Edit", "View", "Server", "windowMenu", "Help"]);
+    assert.deepEqual(submenuIds(menu, "File"), [
+      "new_session",
+      "new_window",
+      "new_server_window",
+      "separator",
+      "open_settings",
+      "separator",
+      "close",
+      "separator",
+      "confirm_before_quit",
+      "quit",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Help"), [
+      "check_for_updates",
+      "restart_to_update",
+      "separator",
+      "open_about",
+    ]);
+    assert.equal(findMenuItem(menu, "confirm_before_quit").label, "Warn Before Quitting (Ctrl+Q)");
+  });
+});
+
+describe("Quit confirmation wiring", () => {
+  it("asks before the Quit item quits, naming the hosts that go offline", async (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      runningWork: { hosts: 1, localServer: false },
+      dialogResponses: [
+        { response: 1, checkboxChecked: false },
+        { response: 0, checkboxChecked: false },
+      ],
+    });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    const quit = findMenuItem(harness.calls.setApplicationMenu.at(-1), "quit");
+
+    assert.equal(quit.label, "Quit Omnigent");
+    assert.equal(quit.accelerator, "CmdOrCtrl+Q");
+    quit.click();
+    await flushPromises();
+    const prompt = harness.calls.showMessageBox.at(-1);
+    assert.equal(prompt.options.message, "Quit Omnigent?");
+    assert.equal(prompt.options.detail, "Sessions running on this computer will go offline.");
+    assert.equal(harness.calls.appQuit, 0);
+
+    quit.click();
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 1);
+  });
+
+  it("persists Don't ask again and the Warn Before Quitting toggle", async (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      dialogResponses: [{ response: 0, checkboxChecked: true }],
+    });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "quit").click();
+    await flushPromises();
+    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(harness.readSettings().confirm_before_quit, false);
+
+    harness.api.buildMenu();
+    const warn = findMenuItem(harness.calls.setApplicationMenu.at(-1), "confirm_before_quit");
+    assert.equal(warn.checked, false);
+    warn.click({ checked: true });
+    assert.equal(harness.readSettings().confirm_before_quit, true);
+  });
+
+  it("does not prompt from the before-quit path that Dock Quit and logout take", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    assert.equal(harness.calls.showMessageBox.length, 0);
   });
 });
 
