@@ -28,6 +28,11 @@ Each harness records the boundary differently:
 A transcript can be compacted more than once, so the boundary that matters is
 the **last** one: everything before it is already folded into that baseline.
 
+Codex cold resume orders parallel tool results to match their calls in both
+ordinary history and a compaction snapshot's replacement history. This keeps
+providers that pair results by position from assigning a result to the wrong
+tool. Message, reasoning and compaction boundaries retain their positions.
+
 ## Import trimming
 
 `load_claude_session` / `load_codex_session`

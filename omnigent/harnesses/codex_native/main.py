@@ -2287,6 +2287,7 @@ def _codex_rollout_records_from_session_items(
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
             if isinstance(compacted_msgs, list) and compacted_msgs:
+                compacted_msgs = _codex_items_with_outputs_in_call_order(compacted_msgs)
                 replacement_history: list[object] = []
                 for message in compacted_msgs:
                     if isinstance(message, dict):
@@ -2301,6 +2302,18 @@ def _codex_rollout_records_from_session_items(
                             message = {
                                 **message,
                                 "arguments": _codex_replayed_arguments(message["arguments"]),
+                            }
+                        elif (
+                            message.get("type")
+                            in (
+                                "function_call_output",
+                                "custom_tool_call_output",
+                            )
+                            and "output" in message
+                        ):
+                            message = {
+                                **message,
+                                "output": sanitize_replayed_image_blocks(message["output"]),
                             }
                     replacement_history.append(message)
                 replacement_call_ids = {
@@ -2317,6 +2330,10 @@ def _codex_rollout_records_from_session_items(
                     for call_id, payload in open_function_calls.items()
                     if call_id in remaining_function_outputs
                     and call_id not in replacement_call_ids
+                )
+                # Later results can belong to calls retained only in this snapshot.
+                items[index + 1 :] = _codex_items_with_outputs_in_call_order(
+                    items[index + 1 :], call_history=replacement_history
                 )
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
@@ -2381,6 +2398,8 @@ def _codex_rollout_records_from_session_items(
 
 def _codex_items_with_outputs_in_call_order(
     items: list[_JsonObject],
+    *,
+    call_history: Sequence[object] = (),
 ) -> list[_JsonObject]:
     """
     Reorder tool outputs separated only by metadata to match their calls' order.
@@ -2389,12 +2408,15 @@ def _codex_items_with_outputs_in_call_order(
     in call order, and providers that pair outputs by position reject the swap.
 
     :param items: Flat Omnigent item dicts in chronological order.
+    :param call_history: Prior replacement history containing calls still awaiting results.
     :returns: Items with output slots sorted by their calls' positions, preserving
         metadata positions and all content or compaction boundaries. Unmatched
         outputs keep their relative order at the end of the run.
     """
     call_positions: dict[str, int] = {}
-    for position, item in enumerate(items):
+    for position, item in enumerate([*call_history, *items]):
+        if not isinstance(item, dict):
+            continue
         call_id = item.get("call_id")
         if item.get("type") == "function_call" and isinstance(call_id, str):
             call_positions.setdefault(call_id, position)
@@ -2415,10 +2437,17 @@ def _codex_items_with_outputs_in_call_order(
         output_positions.clear()
 
     for position, item in enumerate(items):
+        if not isinstance(item, dict):
+            flush_run()
+            continue
         item_type = item.get("type")
         if item_type == "function_call_output":
             output_positions.append(position)
-        elif item_type == "compaction" or item_type not in NON_CONTENT_ITEM_TYPES:
+        elif (
+            not isinstance(item_type, str)
+            or item_type not in NON_CONTENT_ITEM_TYPES
+            or item_type == "compaction"
+        ):
             flush_run()
     flush_run()
     return ordered

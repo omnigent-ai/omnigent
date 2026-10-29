@@ -90,7 +90,12 @@ def _invalid_image_url_paths(body: dict[str, Any]) -> list[str]:
     for i, item in enumerate(body.get("input") or []):
         if not isinstance(item, dict):
             continue
-        content = item.get("content")
+        field = (
+            "output"
+            if item.get("type") in {"function_call_output", "custom_tool_call_output"}
+            else "content"
+        )
+        content = item.get(field)
         if not isinstance(content, list):
             continue
         for j, block in enumerate(content):
@@ -99,7 +104,7 @@ def _invalid_image_url_paths(body: dict[str, Any]) -> list[str]:
             url = block.get("image_url")
             ok = isinstance(url, str) and url.startswith(("http://", "https://", "data:"))
             if not ok:
-                paths.append(f"input[{i}].content[{j}].image_url")
+                paths.append(f"input[{i}].{field}[{j}].image_url")
     return paths
 
 
@@ -192,7 +197,7 @@ def _sse_text_response(text: str) -> bytes:
     ).encode()
 
 
-def _stored_session_items() -> list[dict[str, Any]]:
+def _stored_session_items(item_type: str = "message") -> list[dict[str, Any]]:
     """Session items as the codex-native forwarder persists them.
 
     The compaction item's ``compacted_messages`` (Codex's ``compacted`` event
@@ -222,17 +227,32 @@ def _stored_session_items() -> list[dict[str, Any]]:
         "role": "assistant",
         "content": [{"type": "output_text", "text": "Noted both images."}],
     }
+    history = [user_with_screenshot, user_with_linked_image, assistant_ack]
+    if item_type != "message":
+        call_type = item_type.removesuffix("_output")
+        arguments_field = "arguments" if call_type == "function_call" else "input"
+        history = [
+            {
+                "type": call_type,
+                "name": "view_image",
+                "call_id": "call_image",
+                arguments_field: "{}",
+            },
+            {
+                "type": item_type,
+                "call_id": "call_image",
+                "output": user_with_screenshot["content"],
+            },
+            user_with_linked_image,
+            assistant_ack,
+        ]
     stored = CompactionData.model_validate(
         {
             "summary": "User shared a screenshot and a linked image.",
             "last_item_id": "msg_3",
             "token_count": 42,
             "window_id": "01a070e2-2665-7d62-9b74-973decf239b7",
-            "compacted_messages": [
-                user_with_screenshot,
-                user_with_linked_image,
-                assistant_ack,
-            ],
+            "compacted_messages": history,
         }
     ).model_dump()
     # Precondition, not the assertion under test: storage redaction dropped
@@ -308,8 +328,12 @@ def _codex_subprocess_env(codex_home: Path) -> dict[str, str]:
 
 @pytest.mark.posix_only
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "item_type", ["message", "function_call_output", "custom_tool_call_output"]
+)
 async def test_codex_cold_resume_survives_compaction_omitted_screenshot(
     tmp_path: Path,
+    item_type: str,
 ) -> None:
     """A text-only turn after a cold resume must complete, not 400 forever.
 
@@ -328,8 +352,11 @@ async def test_codex_cold_resume_survives_compaction_omitted_screenshot(
     codex_home.mkdir()
     workspace.mkdir()
 
-    rollout = await _write_cold_resume_rollout(_stored_session_items(), codex_home, workspace)
+    rollout = await _write_cold_resume_rollout(
+        _stored_session_items(item_type), codex_home, workspace
+    )
     assert rollout.exists()
+    assert _VALID_IMAGE_URL in rollout.read_text(), "Omnigent dropped the valid image reference"
 
     provider = _LoopbackResponsesProvider()
     threading.Thread(target=provider.serve_forever, daemon=True).start()
@@ -394,8 +421,10 @@ async def test_codex_cold_resume_survives_compaction_omitted_screenshot(
         f"stderr={proc.stderr[-2000:]!r}"
     )
 
-    # The valid image reference must survive the replay untouched.
+    # Codex versions that reject remote images replace the preserved URL with a notice.
     outgoing = json.dumps(provider.requests)
-    assert _VALID_IMAGE_URL in outgoing, (
-        "the replay dropped a valid image URL from the compacted history"
-    )
+    (tmp_path / "provider-requests.json").write_text(outgoing)
+    assert (
+        _VALID_IMAGE_URL in outgoing
+        or "image content omitted because remote image URLs are not supported" in outgoing
+    ), "the native request lost both the preserved image URL and its unsupported-image notice"
