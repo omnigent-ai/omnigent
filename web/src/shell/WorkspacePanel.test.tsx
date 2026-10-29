@@ -435,6 +435,8 @@ describe("WorkspacePanel surface presentation", () => {
     expect(panel).toHaveAttribute("data-animate-visibility", "true");
     expect(panel).toHaveAttribute("data-resizing", "true");
     expect(panel).toHaveAttribute("aria-hidden", "true");
+    // A focusable closed rail lets Tab scroll the shell sideways.
+    expect(panel).toHaveAttribute("inert");
   });
 
   it("presents the fixed pane tabs as compact icon controls with accessible labels", () => {

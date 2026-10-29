@@ -970,6 +970,8 @@ export function CodeViewer({
   if (isHtmlPreview) {
     return (
       <HtmlCommentViewer
+        // A different file, or the same path in another conversation, starts at 100% zoom.
+        key={`${conversationId}:${path}`}
         conversationId={conversationId}
         content={content}
         truncated={truncated}

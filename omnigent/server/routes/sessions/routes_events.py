@@ -1450,7 +1450,7 @@ def register_events_routes(
                 # Log and treat as DENY so the session doesn't hang on
                 # "working" forever. The full cause is logged for admins;
                 # the denial reason returned to (and streamed at) the client
-                # stays generic so the raw exception text isn't exposed.
+                # names only the exception class, never its message.
                 _logger.warning(
                     "Input policy evaluation failed for %s: %s",
                     session_id,
@@ -1459,7 +1459,10 @@ def register_events_routes(
                 )
                 _input_verdict = {
                     "verdict": "deny",
-                    "reason": "Denied by policy (policy evaluation error).",
+                    "reason": (
+                        "Denied by policy (policy evaluation error: "
+                        f"{type(_policy_exc).__name__})."
+                    ),
                 }
             if _input_verdict is not None:
                 # DENY or ASK — don't forward to runner. Publish a
