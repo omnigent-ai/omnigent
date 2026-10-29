@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeSubmitBlockedUnconfirmed,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
@@ -383,6 +384,14 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc), undelivered=True)
+            return
+        except ClaudeSubmitBlockedUnconfirmed as exc:
+            # The hook refused the prompt, so the pane stays up for the person to inspect.
+            _logger.warning(
+                "claude-native: a hook blocked the message; message not run",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc), code=exc.code)
             return
         except (TmuxSessionNotAdvertised, ClaudeMessageNotAccepted) as exc:
             # The terminal may still launch, or its unsent draft may be recoverable.
