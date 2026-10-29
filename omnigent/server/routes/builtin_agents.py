@@ -236,7 +236,6 @@ def _config_headers(response: Response, agent: Agent) -> None:
 def install_user_agent(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
-    agent_cache: AgentCache,
     *,
     owner: str | None,
     name: str,
@@ -264,7 +263,7 @@ def install_user_agent(
             f"{name!r} is a server agent. Update your client or use a different name.",
             code=ErrorCode.CONFLICT,
         )
-    agent = save_user_agent(
+    return save_user_agent(
         agent_store,
         artifact_store,
         owner=owner,
@@ -272,8 +271,6 @@ def install_user_agent(
         bundle_bytes=bundle_bytes,
         description=description,
     )
-    agent_cache.evict(agent.id)
-    return agent
 
 
 def create_builtin_agents_router(
@@ -550,7 +547,6 @@ def create_builtin_agents_router(
             install_user_agent,
             agent_store,
             artifact_store,
-            agent_cache,
             owner=user_id,
             name=spec.name,
             bundle_bytes=bundle_bytes,

@@ -532,7 +532,7 @@ def _retarred(bundle: bytes, mtime: int) -> bytes:
     "retar", [False, True], ids=["identical-bytes", "same-files-tarred-again"]
 )
 async def test_reinstalling_the_same_files_is_a_no_op(
-    client, agent_store, artifact_store, retar: bool
+    client, agent_store, artifact_store, tmp_path, retar: bool
 ) -> None:
     """However the client tars the same files, reinstalling them keeps the id and version."""
     bundle = build_agent_bundle("orion", description="same")
@@ -546,6 +546,11 @@ async def test_reinstalling_the_same_files_is_a_no_op(
         )
         assert resp.status_code == 200, resp.text
         installed.append((resp.json()["id"], resp.json()["version"]))
+        session_file = tmp_path / "cache" / resp.json()["id"] / "session-state.txt"
+        if mtime == 1:
+            session_file.write_text("in use")
+        else:
+            assert session_file.read_text() == "in use"
     assert installed[1] == installed[0]
     assert installed[0][1] == 1
     location = agent_store.get(installed[0][0]).bundle_location
