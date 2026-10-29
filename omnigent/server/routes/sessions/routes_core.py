@@ -3040,6 +3040,16 @@ def register_core_routes(
             raise _session_not_found()
         previous_runner_id = conv.runner_id
         if body.runner_id is not None:
+            add_audit_attrs(
+                previous_runner_id=previous_runner_id,
+                previous_host_id=conv.host_id,
+                requested_runner_id=body.runner_id
+                if len(body.runner_id) <= 256
+                and body.runner_id.isascii()
+                and (body.runner_id == "" or body.runner_id.isprintable())
+                else None,
+                binding_action="clear" if body.runner_id == "" else "bind",
+            )
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             if body.runner_id == "":
@@ -3049,7 +3059,12 @@ def register_core_routes(
                     raise _session_not_found() from exc
                 _logger.info(
                     "Session unbound from runner",
-                    extra=debug_event("session_runner_unbound", session_id=session_id),
+                    extra=debug_event(
+                        "session_runner_unbound",
+                        session_id=session_id,
+                        previous_runner_id=previous_runner_id,
+                        previous_host_id=conv.host_id,
+                    ),
                 )
             else:
                 from omnigent.server.routes import sessions as _sf
@@ -3094,6 +3109,8 @@ def register_core_routes(
                         "session_runner_bound",
                         session_id=session_id,
                         runner_id=runner_id,
+                        previous_runner_id=previous_runner_id,
+                        previous_host_id=conv.host_id,
                         operation="bind",
                         stage="runner_launch",
                     ),

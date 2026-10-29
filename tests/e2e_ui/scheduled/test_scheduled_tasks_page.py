@@ -815,3 +815,28 @@ def test_scheduled_task_create_persists_continuing_one_session(
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == "Continue create")
     assert (created["session_mode"], created["session_id"]) == ("continue", None), created
+
+
+def test_scheduled_task_trigger_template_creates_hourly_manager_task(
+    page: Page,
+    live_server: str,
+) -> None:
+    """The Jira trigger chip saves an hourly continue task with the rendered prompt."""
+    name = f"Jira trigger {uuid.uuid4().hex[:8]}"
+    page.goto(f"{live_server}/tasks")
+    page.get_by_test_id("suggestion-trigger-jira").click()
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
+    page.get_by_test_id("task-name-input").fill(name)
+    page.get_by_test_id("task-trigger-scope").fill("ES")
+    page.get_by_test_id("task-trigger-add-condition").click()
+    page.get_by_test_id("task-trigger-condition-0-value").fill("omnigent")
+    page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    created = next(t for t in tasks if t["name"] == name)
+    assert created["session_mode"] == "continue", created
+    assert created["rrule"].startswith("FREQ=HOURLY"), created
+    # The prompt's details are covered by the dialog and renderer tests.
+    assert '(project = "ES" AND labels = "omnigent")' in created["prompt"], created

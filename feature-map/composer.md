@@ -110,6 +110,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   chat shows no menu and sends slash text to the vendor TUI. Claude Code and
   Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
   `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
+  States: loading, error/retry, unavailable while disconnected, and an
+  incomplete catalog.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -131,6 +133,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
+  When neither `codex plugin list` nor Codex's loaded-skill catalog can be read,
+  the menu names the failure with Retry beside the skills it did read, instead
+  of "No skills available".
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
@@ -141,7 +146,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Escape discards it. The button is absent when neither the browser nor the
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
-  Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+  Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
+  Inbox reply box follows the same shortcut.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
   dismissed or the missing setup is completed.
@@ -237,6 +243,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   on the new-session composer.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
+  A plugin catalog the host could not read is named in the Skills section with
+  a Retry link.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
@@ -323,7 +331,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   that all three reached the agent in order. Ordinary busy-session queueing
   resumes after the first input is delivered.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
-  namespaced plugin suggestion before starting the session.
+  namespaced plugin suggestion before starting the session; an unreadable
+  plugin catalog shows the same warning and Retry here.
 - With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
   and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
   catalog; selecting a skill completes the prompt while the launch stays on Arclet.
@@ -555,7 +564,9 @@ Other connection providers alone do not enable the managed MCP picker.
   No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
-  `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
+  `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
+  incomplete catalog:
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under

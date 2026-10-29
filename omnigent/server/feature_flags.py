@@ -56,7 +56,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Private-owner session messaging and independent worker creation",
         owner="server",
         review_by_release="0.22.0",
-        frontend_visible=False,
+        # The Automations page offers trigger templates only when managers can
+        # start workers.
         default_enabled=True,
     ),
     FeatureDefinition(

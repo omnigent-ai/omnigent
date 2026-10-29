@@ -689,6 +689,26 @@ class SandboxLifecycle(ABC):
             "own tooling."
         )
 
+    def stop(self, sandbox_id: str) -> None:
+        """
+        Stop a sandbox's compute without deleting it, so :meth:`resume` can
+        restart the SAME sandbox with its filesystem intact.
+
+        Optional capability: the default implementation raises
+        :class:`SandboxCapabilityError`. Providers that implement
+        :meth:`resume` may override it to park an idle sandbox at
+        storage-only cost. Implementations must treat an already stopped
+        or archived sandbox as success.
+
+        :param sandbox_id: The sandbox to stop, e.g. ``"sb-a1b2c3"``.
+        :raises SandboxCapabilityError: When the provider cannot stop a
+            sandbox without deleting it.
+        :raises SandboxGoneError: When the sandbox generation definitively no
+            longer exists.
+        :raises click.ClickException: If the stop fails.
+        """
+        raise self._capability_error("stop a sandbox without deleting it")
+
     def resume(self, sandbox_id: str) -> None:
         """
         Resume a stopped sandbox in place, reattaching its persistent

@@ -2877,7 +2877,10 @@ async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bridge", ["_elicitation_choice_handler", "_form_elicitation_handler"])
+@pytest.mark.parametrize(
+    "bridge",
+    ["_elicitation_choice_handler", "_form_elicitation_handler", "_ask_question_handler"],
+)
 @pytest.mark.parametrize("supported", [False, True])
 async def test_run_turn_installs_optional_bridges_only_where_supported(
     bridge: str,
@@ -3078,3 +3081,158 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_returns_answers_on_accept() -> None:
+    """AskUserQuestion bridge renders the clickable form and, on accept,
+    feeds the user's selections back via ``{**tool_input, "answers": ...}``
+    (the shape Claude Code expects so it returns them as the tool result).
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="accept", content={"q1": "dev"}))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    tool_input = {
+        "questions": [
+            {"question": "Which environment?", "options": [{"label": "dev"}, {"label": "prod"}]}
+        ]
+    }
+    out = await adapter._stable_ask_question_handler(tool_input)
+    assert out == {**tool_input, "answers": {"q1": "dev"}}
+    [(_, params)] = ctx.seen
+    payload = getattr(params, "ask_user_question", None)
+    assert payload is not None, (
+        "AskUserQuestion elicitation must carry the structured ask_user_question "
+        "extra so the UI renders clickable options."
+    )
+    assert payload["questions"][0]["question"] == "Which environment?"
+    # Distinct from the generic tool-call card so a REPL "approve always"
+    # on tool calls can't auto-accept a question.
+    assert params.phase == "pre_tool_use"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "content", "expected"),
+    [
+        ("decline", None, "The user dismissed the question without answering."),
+        ("cancel", None, "The user dismissed the question without answering."),
+        # A client without the question form (the terminal REPL) can only
+        # approve, so the model must re-ask instead of hearing "dismissed".
+        (
+            "accept",
+            None,
+            "The user's client could not show these options and no answer came "
+            "back. Ask the question again in plain text.",
+        ),
+    ],
+    ids=["declined", "cancelled", "accepted-without-answers"],
+)
+async def test_ask_question_handler_explains_unanswered_question(
+    action: str, content: dict[str, Any] | None, expected: str
+) -> None:
+    """An unanswered question denies with a reason and leaves the turn running."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action=action, content=content))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    out = await adapter._stable_ask_question_handler(
+        {"questions": [{"question": "Q", "options": ["a", "b"]}]}
+    )
+    assert out == expected
+    assert not ctx.cancelled.was_set
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_denies_without_elicit_when_no_questions() -> None:
+    """Input with no usable questions never elicits and tells the model why."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class _NoElicitCtx:
+        def __init__(self) -> None:
+            self.response_id = "resp_aq"
+
+        async def elicit(self, elicitation_id: str, params: object) -> object:
+            raise AssertionError("elicit must not be called when there are no questions")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._current_ctx = _NoElicitCtx()  # type: ignore[assignment]
+    out = await adapter._stable_ask_question_handler({"not": "questions"})
+    assert isinstance(out, str)
+    assert "nothing was shown to the user" in out
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_denies_without_an_active_turn() -> None:
+    """An orphaned callback has no turn to ask in, so it denies without eliciting."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    assert adapter._current_ctx is None
+    out = await adapter._stable_ask_question_handler(
+        {"questions": [{"question": "Q", "options": ["a", "b"]}]}
+    )
+    assert out == "AskUserQuestion is unavailable outside an active Omnigent turn."
+
+
+@pytest.mark.asyncio
+async def test_ask_user_question_roundtrip_real_executor_hook_through_adapter_bridge() -> None:
+    """Integration seam across components: a real ClaudeSDKExecutor's PreToolUse
+    hook calls the real adapter ``_stable_ask_question_handler`` it was wired
+    with, which elicits and returns the user's selections via ``updatedInput``.
+
+    Unit tests exercise each half with mocks; this pins the seam — the
+    ``_ask_question_handler`` attribute name and the async signature must match
+    between the adapter's install and the executor's hook, or the round-trip
+    breaks even though both halves pass in isolation.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    executor = ClaudeSDKExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    # Wire the bridge exactly as ExecutorAdapter does on first use (the
+    # executor must define the attribute for the adapter's hasattr guard).
+    assert hasattr(executor, "_ask_question_handler")
+    executor._ask_question_handler = adapter._stable_ask_question_handler  # type: ignore[attr-defined]
+
+    ctx = _ElicitingTurnContext(ElicitationResult(action="accept", content={"q1": "prod"}))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    # Register the real hook via a minimal fake SDK exposing HookMatcher.
+    class _HookMatcher:
+        def __init__(self, matcher=None, timeout=None, hooks=None) -> None:
+            self.matcher = matcher
+            self.timeout = timeout
+            self.hooks = hooks
+
+    class _FakeSdk:
+        HookMatcher = _HookMatcher
+
+    class _Opts:
+        def __init__(self) -> None:
+            self.hooks = None
+
+    opts = _Opts()
+    executor._install_ask_user_question_hook(_FakeSdk, opts)
+    matcher = next(m for m in opts.hooks["PreToolUse"] if m.matcher == "AskUserQuestion")
+    hook_cb = matcher.hooks[0]
+
+    tool_input = {"questions": [{"question": "Env?", "options": ["dev", "prod"]}]}
+    out = await hook_cb({"tool_input": tool_input}, "tuid", {})
+
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "allow"
+    assert hso["updatedInput"] == {**tool_input, "answers": {"q1": "prod"}}
+    # The elicited params carried the clickable form spec the UI renders.
+    [(_, params)] = ctx.seen
+    payload = getattr(params, "ask_user_question", None)
+    assert payload is not None
+    assert payload["questions"][0]["question"] == "Env?"

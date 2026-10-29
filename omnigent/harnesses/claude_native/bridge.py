@@ -102,7 +102,7 @@ if TYPE_CHECKING:
 from omnigent.inner.hook_scripts.subagent_router import (
     AGENT_TOOL_MATCHER as CLAUDE_SUBAGENT_TOOL_MATCHER,
 )
-from omnigent.native import native_bridge_common
+from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -384,6 +384,8 @@ _UNKNOWN_COMMAND_REJECTION_PREFIX = "Unknown command: "
 # Claude Code collapses large pastes into this placeholder in the
 # input box instead of rendering the text itself.
 _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
+# Hint Claude Code shows in the empty input box while a submitted message is queued.
+_QUEUED_MESSAGE_HINT = "Press up to edit queued messages"
 # How many characters of the draft's first line to use when checking
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
@@ -1807,6 +1809,7 @@ def prepare_bridge_dir(
         token = config.get("token") if isinstance(config, dict) else None
         if not isinstance(token, str) or not token:
             token = secrets.token_urlsafe(32)
+        previous_session_id = config.get("active_session_id") if isinstance(config, dict) else None
         payload: dict[str, object] = {
             "bridge_id": resolved_bridge_id,
             "active_session_id": conversation_id,
@@ -1829,6 +1832,9 @@ def prepare_bridge_dir(
         if sandbox is not None:
             payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
+        if previous_session_id != conversation_id:
+            # A window opened for another session must not answer this one's hooks.
+            policy_allow_cache.invalidate(bridge_dir)
         # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
         # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
         # breaks approval routing on reattach/rebind. ``build_hook_settings``
@@ -2257,6 +2263,8 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    # The new session's policies were never checked.
+    policy_allow_cache.invalidate(bridge_dir)
 
 
 def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
@@ -2511,8 +2519,12 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
-    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    observer_hook = hook_settings(
+        bridge_dir,
+        python,
+        "omnigent.harnesses.claude_native.hook",
+        wrap_python=_pin_runner_tmpdir,
+    )
     hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
@@ -2591,7 +2603,9 @@ def build_hook_settings(
         )
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
-            "command": evaluate_policy_command,
+            "command": policy_allow_cache.guarded_hook_command(
+                bridge_dir, evaluate_policy_command
+            ),
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
@@ -6685,6 +6699,8 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
+    # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
+    tail = tail.replace(_QUEUED_MESSAGE_HINT, "")
     target = _comparable_draft_text(needle)
     return bool(target) and target in _comparable_draft_text(tail)
 
@@ -7630,7 +7646,16 @@ def _tool_relay_handler_factory(
                 return
             if not isinstance(arguments, dict):
                 arguments = {}
-            self._send_json(_run_relay_tool(tool_executor, loop, name, arguments))
+            # Native hooks may be reusing a no-policy ALLOW; keep that from
+            # outliving a policy this call adds.
+            mutation = (
+                policy_allow_cache.policy_mutation(bridge_dir)
+                if name == "sys_add_policy" and bridge_dir is not None
+                else contextlib.nullcontext()
+            )
+            with mutation:
+                result = _run_relay_tool(tool_executor, loop, name, arguments)
+            self._send_json(result)
 
         def _respond_hook_output(self, output: dict[str, object] | None) -> None:
             """Answer a hook-evaluate request with final hook output JSON.
@@ -7694,6 +7719,15 @@ def _tool_relay_handler_factory(
             import urllib.parse as _up
 
             url = f"/v1/sessions/{_up.quote(session_id, safe='')}/policies/evaluate"
+            cache_generation = (
+                policy_allow_cache.generation(bridge_dir) if bridge_dir is not None else None
+            )
+            # This relay evaluates its own session; a bridge that has switched
+            # sessions must not get a window from that answer.
+            relay_session_active = bridge_dir is not None and read_active_session_id(
+                bridge_dir
+            ) in (None, session_id)
+            requested_at = time.time()
             verdict: object = None
             last_error: str | None = None
             attempts = 0
@@ -7743,6 +7777,8 @@ def _tool_relay_handler_factory(
                 )
                 self._respond_hook_output(fail_ask_hook_output(hook_event, last_error))
                 return
+            if bridge_dir is not None and relay_session_active:
+                policy_allow_cache.record(bridge_dir, cache_generation, verdict, requested_at)
             hook_output = evaluation_response_to_hook_output(hook_event, verdict)
             hook_specific = (hook_output or {}).get("hookSpecificOutput")
             decision = (
