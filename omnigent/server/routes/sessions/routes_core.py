@@ -133,6 +133,7 @@ from omnigent.server.routes._sessions.helpers import (
     _announce_session_added,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
+    _client_supports_terminal_fallback,
     _codex_plan_mode_enabled,
     _delete_stored_session_bundle_after_failure,
     _discovery_key,
@@ -1965,7 +1966,10 @@ def register_core_routes(
         agent_names_by_id, harnesses_by_id = agent_metadata
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
-        pending_counts = pending_elicitations.counts_for(conv_ids)
+        pending_counts = pending_elicitations.counts_for(
+            conv_ids,
+            include_terminal_held=_client_supports_terminal_fallback(request.headers),
+        )
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
         pull_requests = await _pull_requests_for(conv_ids)
         # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
@@ -2127,6 +2131,8 @@ def register_core_routes(
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
+        *,
+        include_terminal_held: bool,
     ) -> list[dict[str, Any]]:
         """
         Build current list-item payloads for the watched ids.
@@ -2149,6 +2155,8 @@ def register_core_routes(
             deduplicated and length-capped by the caller.
         :param user_id: The authenticated requesting user, or ``None``
             when permissions are disabled, e.g. ``"alice@example.com"``.
+        :param include_terminal_held: Whether pending counts include prompts
+            held in the agent's terminal, which only opted-in clients show.
         :returns: One JSON-ready dict per accessible, existing watched
             session, in no particular order.
         """
@@ -2206,7 +2214,9 @@ def register_core_routes(
             _pull_requests_for(conv_ids),
         )
         agent_names_by_id, harnesses_by_id = agent_metadata
-        pending_counts = pending_elicitations.counts_for(conv_ids)
+        pending_counts = pending_elicitations.counts_for(
+            conv_ids, include_terminal_held=include_terminal_held
+        )
         items = [
             _build_session_list_item(
                 conv,
@@ -2264,6 +2274,9 @@ def register_core_routes(
           ``{"type": "removed", "ids": [...]}`` deltas as watched
           sessions change, and ``{"type": "heartbeat"}`` when idle.
 
+        Pending counts include prompts held in the agent's terminal only
+        for a client that connects with ``?omnigent_terminal_fallback=on``.
+
         Watched-row freshness is pull-based — each interval the server
         re-reads the watched ids (the same read ``GET /v1/sessions`` does)
         and emits only what changed. *Discovery* of sessions the client
@@ -2289,6 +2302,9 @@ def register_core_routes(
         # to the request's user; this handler task is per-connection, so the
         # binding cannot leak across sockets.
         set_current_user_id(user_id)
+        include_terminal_held = _client_supports_terminal_fallback(
+            websocket.headers, websocket.query_params
+        )
         await websocket.accept()
         _logger.info(
             "session-updates stream connected",
@@ -2329,7 +2345,9 @@ def register_core_routes(
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
-            items = await _fetch_watched_items(watched, user_id)
+            items = await _fetch_watched_items(
+                watched, user_id, include_terminal_held=include_terminal_held
+            )
             dumps = {item["id"]: item for item in items}
             last_sent.clear()
             last_sent.update(dumps)
@@ -2341,7 +2359,9 @@ def register_core_routes(
             been idle."""
             nonlocal last_send_monotonic
             if watched:
-                items = await _fetch_watched_items(watched, user_id)
+                items = await _fetch_watched_items(
+                    watched, user_id, include_terminal_held=include_terminal_held
+                )
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost
@@ -2470,7 +2490,9 @@ def register_core_routes(
                         if sid in watched:
                             continue
                         try:
-                            items = await _fetch_watched_items([sid], user_id)
+                            items = await _fetch_watched_items(
+                                [sid], user_id, include_terminal_held=include_terminal_held
+                            )
                             if items:
                                 await _send({"type": "changed", "items": items})
                         except WebSocketDisconnect:

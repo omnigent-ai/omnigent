@@ -135,6 +135,22 @@ def test_pending_count_hook_persists_publish_and_resolve(
     ]
 
 
+def test_pending_count_hook_leaves_out_prompts_held_in_terminal(
+    recording_store: _RecordingStore,
+) -> None:
+    """Every client reads the persisted count, so a prompt held in the terminal leaves it."""
+    pending_elicitations.set_count_persist_hook(session_live_state.persist_pending_count)
+    request = {"type": "response.elicitation_request", "elicitation_id": "elicit_1", "params": {}}
+    held = {**request, "params": {"terminal_fallback": {"answer_undelivered": False}}}
+    pending_elicitations.record_publish("conv_held", request)
+    pending_elicitations.record_publish("conv_held", held)
+    try:
+        _wait_until(lambda: len(recording_store.pending_writes) >= 2)
+        assert recording_store.pending_writes == [("conv_held", 1), ("conv_held", 0)]
+    finally:
+        pending_elicitations.resolve("conv_held", "elicit_1")
+
+
 def test_runner_liveness_touch_and_clear_pass_through(
     recording_store: _RecordingStore,
 ) -> None:

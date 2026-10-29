@@ -90,7 +90,9 @@ def set_elicitation_observer(
 # Optional per-session count sink, fired with the new count whenever the
 # index changes. The server wires it to persist the count on the
 # conversation row so replicas that don't hold this session's runner
-# tunnel still show parked approvals. Must be cheap + non-blocking.
+# tunnel still show parked approvals. The count leaves out prompts held in
+# the agent's terminal, which older clients don't show. Must be cheap +
+# non-blocking.
 _count_persist_hook: Callable[[str, int], None] | None = None
 
 
@@ -100,7 +102,8 @@ def set_count_persist_hook(hook: Callable[[str, int], None] | None) -> None:
 
     :param hook: Callback invoked as ``hook(conversation_id, count)``
         after every index mutation (publish adds, resolve drops), with
-        the session's new outstanding count. Pass ``None`` to clear.
+        the session's new outstanding count, not counting prompts held
+        in the agent's terminal. Pass ``None`` to clear.
     """
     global _count_persist_hook
     _count_persist_hook = hook
@@ -111,6 +114,26 @@ def _notify_count_hook(conversation_id: str, count: int) -> None:
     hook = _count_persist_hook
     if hook is not None:
         hook(conversation_id, count)
+
+
+def is_held_in_terminal(event: dict[str, Any]) -> bool:
+    """
+    Return whether a tracked prompt waits for its answer in the agent's terminal.
+
+    :param event: A ``response.elicitation_request`` payload from the index.
+    :returns: ``True`` when its ``params`` carry ``terminal_fallback``.
+    """
+    params = event.get("params")
+    return isinstance(params, dict) and "terminal_fallback" in params
+
+
+def _count(ids: dict[str, dict[str, Any]] | None, *, include_terminal_held: bool) -> int:
+    """Count one session's tracked prompts, optionally leaving out held ones."""
+    if ids is None:
+        return 0
+    if include_terminal_held:
+        return len(ids)
+    return sum(1 for event in ids.values() if not is_held_in_terminal(event))
 
 
 def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
@@ -158,7 +181,7 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> None:
             ids = _pending.setdefault(conversation_id, {})
             ids[elicitation_id] = event
             _native_resolutions.pop((conversation_id, elicitation_id), None)
-            count = len(ids)
+            count = _count(ids, include_terminal_held=False)
         _notify_count_hook(conversation_id, count)
         _notify_observer(conversation_id, event)
         return
@@ -227,28 +250,31 @@ def resolve(conversation_id: str, elicitation_id: str) -> None:
         if ids is None:
             return
         removed = ids.pop(elicitation_id, None) is not None
-        count = len(ids)
+        count = _count(ids, include_terminal_held=False)
         if not ids:
             _pending.pop(conversation_id, None)
     if removed:
         _notify_count_hook(conversation_id, count)
 
 
-def count_for(conversation_id: str) -> int:
+def count_for(conversation_id: str, *, include_terminal_held: bool = True) -> int:
     """
     Return the number of outstanding elicitations for one session.
 
     :param conversation_id: Conversation/session id to query,
         e.g. ``"conv_abc123"``.
+    :param include_terminal_held: ``False`` leaves out prompts held in the
+        agent's terminal, for clients that don't show them.
     :returns: Count of outstanding elicitations; ``0`` when the
         session has none tracked.
     """
     with _lock:
-        ids = _pending.get(conversation_id)
-        return len(ids) if ids is not None else 0
+        return _count(_pending.get(conversation_id), include_terminal_held=include_terminal_held)
 
 
-def counts_for(conversation_ids: list[str]) -> dict[str, int]:
+def counts_for(
+    conversation_ids: list[str], *, include_terminal_held: bool = True
+) -> dict[str, int]:
     """
     Batch lookup of pending counts for a list of session ids.
 
@@ -259,12 +285,14 @@ def counts_for(conversation_ids: list[str]) -> dict[str, int]:
 
     :param conversation_ids: Conversation/session ids to query,
         e.g. ``["conv_abc123", "conv_def456"]``.
+    :param include_terminal_held: ``False`` leaves out prompts held in the
+        agent's terminal, for clients that don't show them.
     :returns: Mapping from each id in the input to its outstanding
         count. Ids not tracked in the index map to ``0``.
     """
     with _lock:
         return {
-            conv_id: len(_pending[conv_id]) if conv_id in _pending else 0
+            conv_id: _count(_pending.get(conv_id), include_terminal_held=include_terminal_held)
             for conv_id in conversation_ids
         }
 

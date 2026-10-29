@@ -56,7 +56,7 @@ import {
   readPinnedConversationIds,
   setLegacyPinnedConversationId,
 } from "@/shell/sidebarNav";
-import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
+import { TERMINAL_FALLBACK_HEADERS, apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
@@ -571,7 +571,10 @@ export async function fetchConversationsPage({
   // hang, and the palette shows "Searching…" for the whole in-flight window.
   // Plain list pagination is indexed/fast, so it keeps no timeout.
   const signal = searchQuery ? AbortSignal.timeout(SEARCH_FETCH_TIMEOUT_MS) : requestSignal;
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, { signal });
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    signal,
+    headers: TERMINAL_FALLBACK_HEADERS,
+  });
   // Carries the server's `code`, so a dead cursor stays recognizable as
   // `stale_cursor` instead of an opaque "400 Bad Request".
   if (!res.ok) throw await apiErrorFromResponse(res);
@@ -1711,7 +1714,9 @@ async function fetchPinnedScope(
     visibility,
     pinned: "true",
   });
-  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+  const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+    headers: TERMINAL_FALLBACK_HEADERS,
+  });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const rows = applySessionTombstones((await res.json()) as ConversationsPage, true).data;
   const conversations = rows.filter((c) => c.labels?.[PINNED_LABEL_KEY] != null);
@@ -2611,7 +2616,9 @@ async function fetchProjectSessionsPage(
   // Requests are sequential because each page supplies the next cursor.
   for (;;) {
     // eslint-disable-next-line no-await-in-loop
-    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`);
+    const res = await authenticatedFetch(`/v1/sessions?${params.toString()}`, {
+      headers: TERMINAL_FALLBACK_HEADERS,
+    });
     // Carries the server's code, so a dead cursor stays recognizable.
     // eslint-disable-next-line no-await-in-loop
     if (!res.ok) throw await apiErrorFromResponse(res);

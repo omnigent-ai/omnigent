@@ -9781,21 +9781,26 @@ async def _evaluate_output_policy(
 # A client that shows prompts held in the agent's terminal sets this header;
 # older clients keep seeing such a prompt expire and their late answers saved.
 TERMINAL_FALLBACK_CLIENT_HEADER = "x-omnigent-terminal-fallback"
+# Browsers can't set WebSocket handshake headers, so a socket opts in by query.
+TERMINAL_FALLBACK_CLIENT_QUERY_PARAM = "omnigent_terminal_fallback"
 
 
-def _client_supports_terminal_fallback(headers: Mapping[str, str]) -> bool:
+def _client_supports_terminal_fallback(
+    headers: Mapping[str, str], query_params: Mapping[str, str] | None = None
+) -> bool:
     """Return whether the client knows prompts held in the agent's terminal."""
-    return headers.get(TERMINAL_FALLBACK_CLIENT_HEADER, "").lower() == "on"
+    if headers.get(TERMINAL_FALLBACK_CLIENT_HEADER, "").lower() == "on":
+        return True
+    return (
+        query_params is not None
+        and query_params.get(TERMINAL_FALLBACK_CLIENT_QUERY_PARAM, "").lower() == "on"
+    )
 
 
 def _is_prompt_held_in_terminal(event: dict[str, Any]) -> bool:
     """Return whether ``event`` publishes a prompt held in the agent's terminal."""
-    params = event.get("params")
-    return (
-        event.get("type") == "response.elicitation_request"
-        and isinstance(params, dict)
-        and "terminal_fallback" in params
-    )
+    is_request = event.get("type") == "response.elicitation_request"
+    return is_request and pending_elicitations.is_held_in_terminal(event)
 
 
 def _expire_held_prompt_for_older_client(event: dict[str, Any]) -> dict[str, Any]:
@@ -11432,8 +11437,11 @@ def _child_session_summary_from_conversation(
         last_message_preview=last_message_preview,
         # Surface the sub-agent's parked-elicitation count from the same
         # in-memory index that feeds the sidebar badge, so the Agents
-        # rail can flag a child that's awaiting user input.
-        pending_elicitations_count=pending_elicitations.count_for(conv.id),
+        # rail can flag a child that's awaiting user input. Every client
+        # receives this summary, so prompts held in the terminal are left out.
+        pending_elicitations_count=pending_elicitations.count_for(
+            conv.id, include_terminal_held=False
+        ),
         # The model routing picked for this child, reported only when a
         # decision actually produced it: a user-pinned model_override is not a
         # routed model, and reporting one with a null decision id makes the

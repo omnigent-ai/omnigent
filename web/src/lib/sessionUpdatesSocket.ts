@@ -19,6 +19,7 @@
 import { isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
 import { isPageHidden, nextReconnectDelay } from "@/lib/reconnectBackoff";
 import { modalHostId } from "@/lib/sessionHost";
+import { TERMINAL_FALLBACK_QUERY } from "@/lib/sessionsApi";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 /** A frame pushed by the server over the updates stream. */
@@ -74,15 +75,16 @@ export const HEALTHY_CONNECTION_MS = 5_000;
  * the modal host is resolved (see `isModalHostResolved`), so this reads a
  * settled value. Omitted on an unsharded server and when no host was picked.
  *
+ * Always opts in to pending counts that include prompts held in the agent's
+ * terminal, matching the session list requests.
+ *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
   const path = "/v1/sessions/updates";
-  if (!isHostRoutingEnabled()) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
-  return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
-  );
+  const sliceKey = isHostRoutingEnabled() ? modalHostId() : null;
+  const routing = sliceKey ? `omnigent_slice_key=${encodeURIComponent(sliceKey)}&` : "";
+  return resolveWebSocketUrl(`${path}?${routing}${TERMINAL_FALLBACK_QUERY}`);
 }
 
 /**

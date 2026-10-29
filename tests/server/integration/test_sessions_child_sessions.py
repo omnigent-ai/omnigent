@@ -273,9 +273,19 @@ async def test_child_sessions_surfaces_durable_failure_error(
 # ── Pending elicitation count ─────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("params", "pending_count"),
+    [
+        ({"mode": "form", "message": "Pick one"}, 1),
+        ({"mode": "form", "message": "Pick one", "terminal_fallback": {}}, 0),
+    ],
+    ids=["parked", "held_in_terminal"],
+)
 async def test_child_sessions_surfaces_pending_elicitation_count(
     client: httpx.AsyncClient,
     db_uri: str,
+    params: dict[str, Any],
+    pending_count: int,
 ) -> None:
     """
     A child parked on an elicitation reports ``pending_elicitations_count``.
@@ -284,10 +294,13 @@ async def test_child_sessions_surfaces_pending_elicitation_count(
     badge for a sub-agent that needs attention. The count
     comes from the same in-memory index that feeds the sidebar badge;
     seed it via ``record_publish`` (the SSE publish chokepoint's hook)
-    and confirm the endpoint surfaces it.
+    and confirm the endpoint surfaces it. Every client receives this
+    summary, so a prompt held in the agent's terminal is left out.
 
     :param client: The test HTTP client.
     :param db_uri: Per-test SQLite database URI.
+    :param params: Params of the child's prompt.
+    :param pending_count: Expected count on the child's row.
     """
     from omnigent.runtime import pending_elicitations
 
@@ -305,16 +318,15 @@ async def test_child_sessions_surfaces_pending_elicitation_count(
         {
             "type": "response.elicitation_request",
             "elicitation_id": "elicit_q1",
-            "params": {"mode": "form", "message": "Pick one"},
+            "params": params,
         },
     )
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
     assert resp.status_code == 200
     row = resp.json()["data"][0]
-    # 1 = the child is parked on one prompt; the rail badges it.
-    # 0 here means the count isn't surfaced from the index, so the
-    # Agents tab stays blind to a sub-agent needing input.
-    assert row["pending_elicitations_count"] == 1
+    # A parked prompt reads 0 here when the count isn't surfaced from the
+    # index, so the Agents tab stays blind to a sub-agent needing input.
+    assert row["pending_elicitations_count"] == pending_count
 
 
 async def test_parent_session_snapshot_replays_child_pending_elicitation(

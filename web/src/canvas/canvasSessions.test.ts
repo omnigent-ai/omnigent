@@ -123,6 +123,10 @@ describe("loadAllSessions", () => {
     expect(queries[0].get("kind")).toBe("default");
     expect(queries[0].get("sort_by")).toBe("updated_at");
     expect(queries.map((query) => query.get("visibility"))).toEqual(["mine", "mine"]);
+    const headers = vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.map(([, init]) => new Headers(init?.headers).get("x-omnigent-terminal-fallback"));
+    expect(headers).toEqual(["on", "on"]);
     expect(progress).toEqual([
       { ids: ["a", "b"], hasMore: true },
       { ids: ["a", "b", "c"], hasMore: false },

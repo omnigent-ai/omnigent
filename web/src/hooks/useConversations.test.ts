@@ -61,6 +61,12 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 
 const fetchMock = vi.fn();
 
+/** The terminal-fallback opt-in header sent by the `call`th fetch. */
+function terminalFallbackHeader(call: number): string | null {
+  const init = fetchMock.mock.calls[call][1] as RequestInit | undefined;
+  return new Headers(init?.headers).get("x-omnigent-terminal-fallback");
+}
+
 beforeEach(() => {
   fetchMock.mockReset();
   vi.mocked(useSessionUpdatesConnected).mockReturnValue(false);
@@ -282,6 +288,7 @@ describe.each([undefined, "updated_at", "created_at"] as const)(
         expect(params.get("visibility")).toBe(visibility ?? "all");
         expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
         expect(params.get("order")).toBe("desc");
+        expect(terminalFallbackHeader(0)).toBe("on");
         queryClient.clear();
       },
     );
@@ -2064,6 +2071,7 @@ describe("fetchPinnedConversations filter-honored detection", () => {
 
     expect(result.filterHonored).toBe(true);
     expect(result.conversations.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
+    expect(terminalFallbackHeader(0)).toBe("on");
   });
 
   it("reports honored for an empty page (a user with no pins)", async () => {
@@ -2550,6 +2558,7 @@ describe("useProjectSessions", () => {
       );
       expect(queryClient.getQueryData(expectedKey)).toBeDefined();
       expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+      expect(terminalFallbackHeader(0)).toBe("on");
     },
   );
 

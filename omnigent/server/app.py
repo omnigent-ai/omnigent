@@ -4467,7 +4467,8 @@ def create_app(
                             prefetch_session_routing_catalogs(conv.id, conv, routed.client)
                         # A crash can leave a persisted count absent from the live index.
                         session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
+                            conv.id,
+                            pending_elicitations.count_for(conv.id, include_terminal_held=False),
                         )
                         cached_sandbox = _session_sandbox_status_cache.get(conv.id)
                         # A reconnect proves readiness only for a launch already marked failed.

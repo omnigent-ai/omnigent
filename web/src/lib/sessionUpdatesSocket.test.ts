@@ -92,6 +92,7 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
       socket.start();
       const first = latestWs();
       expect(new URL(first.url).searchParams.get("omnigent_slice_key")).toBe("host_oss");
+      expect(new URL(first.url).searchParams.get("omnigent_terminal_fallback")).toBe("on");
       first.open();
       first.close();
       vi.advanceTimersByTime(RECONNECT_CEILING_MS);
@@ -101,6 +102,13 @@ describe("sessionUpdatesSocket heartbeat watchdog", () => {
       socket.stop();
       vi.resetModules();
     }
+  });
+
+  it("opts in to counts that include prompts held in the terminal without host routing", () => {
+    sessionUpdatesSocket.start();
+    const url = new URL(latestWs().url);
+    expect(url.pathname).toBe("/v1/sessions/updates");
+    expect([...url.searchParams]).toEqual([["omnigent_terminal_fallback", "on"]]);
   });
 
   it("forces a reconnect after the watchdog window of total silence", () => {

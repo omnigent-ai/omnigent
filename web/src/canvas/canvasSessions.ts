@@ -16,6 +16,7 @@ import {
 } from "@/hooks/useConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { TERMINAL_FALLBACK_HEADERS } from "@/lib/sessionsApi";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { sessionVisibility } from "@/lib/sessionVisibility";
 import { dedupeConversationsById, isOwnedByViewer } from "@/shell/sidebarNav";
@@ -246,6 +247,7 @@ async function fetchSessionPage(
 ): Promise<ConversationsPage> {
   const response = await authenticatedFetch(`/v1/sessions?${sessionListQuery(after, limit)}`, {
     signal,
+    headers: TERMINAL_FALLBACK_HEADERS,
   });
   if (!response.ok) throw new Error(`Session list request failed (${response.status})`);
   return (await response.json()) as ConversationsPage;

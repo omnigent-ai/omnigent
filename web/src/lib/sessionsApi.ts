@@ -1404,6 +1404,9 @@ export const TERMINAL_FALLBACK_HEADERS: Readonly<Record<string, string>> = {
   "x-omnigent-terminal-fallback": "on",
 };
 
+/** The same opt-in for a WebSocket, whose browser handshake can't set headers. */
+export const TERMINAL_FALLBACK_QUERY = "omnigent_terminal_fallback=on";
+
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
 

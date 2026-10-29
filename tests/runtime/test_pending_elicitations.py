@@ -246,6 +246,25 @@ def test_counts_for_returns_zero_for_untracked_sessions() -> None:
     assert counts == {"conv_a": 1, "conv_b": 0, "conv_c": 0}
 
 
+def test_counts_can_leave_out_prompts_held_in_terminal() -> None:
+    """Clients that don't show prompts held in the agent's terminal get counts without them."""
+    held = {
+        **_elicit_event("elicit_held"),
+        "params": {"terminal_fallback": {"answer_undelivered": False}},
+    }
+    pending_elicitations.record_publish("conv_a", _elicit_event("elicit_open", "Bash"))
+    pending_elicitations.record_publish("conv_a", held)
+    pending_elicitations.record_publish("conv_b", held)
+
+    assert pending_elicitations.count_for("conv_a") == 2
+    assert pending_elicitations.count_for("conv_a", include_terminal_held=False) == 1
+    assert pending_elicitations.counts_for(["conv_a", "conv_b"]) == {"conv_a": 2, "conv_b": 1}
+    assert pending_elicitations.counts_for(["conv_a", "conv_b"], include_terminal_held=False) == {
+        "conv_a": 1,
+        "conv_b": 0,
+    }
+
+
 def test_counts_for_handles_empty_input() -> None:
     """
     An empty session list returns an empty mapping, not a

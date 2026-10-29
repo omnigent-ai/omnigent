@@ -2710,6 +2710,10 @@ async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_ret
         assert [event["elicitation_id"] for event in snapshot.json()["pending_elicitations"]] == [
             _REATTACH_ELICITATION_ID
         ]
+        for headers, listed_count in (({}, 0), (_TERMINAL_FALLBACK_HEADERS, 1)):
+            listed = await client.get("/v1/sessions", params={"limit": 1000}, headers=headers)
+            [row] = [row for row in listed.json()["data"] if row["id"] == session_id]
+            assert row["pending_elicitations_count"] == listed_count
 
         answer = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
         answer_by_url = await client.post(

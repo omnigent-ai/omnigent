@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.runtime import pending_elicitations
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -209,6 +210,49 @@ def test_watch_returns_snapshot_of_accessible_sessions(
         if row["event_name"] == "session_updates" and row["attributes"].get("phase") == "connected"
     ]
     assert [row["user_id"] for row in connected] == [ALICE]
+
+
+@pytest.mark.parametrize(
+    ("headers", "socket_query", "pending_count"),
+    [
+        ({}, "", 0),
+        ({"x-omnigent-terminal-fallback": "on"}, "?omnigent_terminal_fallback=on", 1),
+    ],
+    ids=["older_client", "opted_in_client"],
+)
+def test_pending_count_includes_prompt_held_in_terminal_only_when_opted_in(
+    app: FastAPI,
+    stores,
+    headers: dict[str, str],
+    socket_query: str,
+    pending_count: int,
+) -> None:
+    """Older clients don't show a prompt held in the terminal, so neither do their counts."""
+    session_id = _seed_session(stores, owner=ALICE, title="held")
+    pending_elicitations.record_publish(
+        session_id,
+        {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_held",
+            "params": {"terminal_fallback": {"answer_undelivered": False}},
+        },
+    )
+    try:
+        client = TestClient(app)
+        listed = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE, **headers})
+        assert [row["pending_elicitations_count"] for row in listed.json()["data"]] == [
+            pending_count
+        ]
+        with client.websocket_connect(
+            f"/v1/sessions/updates{socket_query}", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+            snapshot = _recv_until(ws, {"snapshot"})
+        assert [item["pending_elicitations_count"] for item in snapshot["items"]] == [
+            pending_count
+        ]
+    finally:
+        pending_elicitations.reset_for_tests()
 
 
 def test_child_busy_rollup_flows_through_updates_stream(
