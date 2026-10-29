@@ -32,6 +32,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   connected, disconnected, asleep (resumable managed host), unknown, no host,
   and a launching or failed sandbox with its stage; before launch also a
   selected sandbox and connecting.
+- `sandbox-worktree-note`: with a sandbox selected, a new-session chip named
+  after the sandbox fills the worktree slot. Hovering, clicking, or tapping it
+  explains that worktrees need one of your machines. Its label collapses with
+  the other workspace chips on narrow screens.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Long catalogs scroll inside a compact menu
   capped at 40% of viewport height, between 20rem and 36rem, and never taller
@@ -286,6 +290,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.
+- With a sandbox selected, hover, click, or tap the sandbox chip beside the
+  repository chip to see why worktrees are unavailable. Pick a machine from the
+  host menu to get the branch and worktree choices back.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi, Devin), and permission mode before the session exists. Ctrl+Shift+M also
   opens the agent/model picker here.
@@ -416,6 +423,11 @@ Other connection providers alone do not enable the managed MCP picker.
   unit tests for the new-session dialog cover it. Manually: open the landing
   page, hover the host chip, and expect the same card as the pill's tooltip
   with the host and its status, not a plain browser title tooltip.
+- **`sandbox-worktree-note`:**
+  `tests/e2e_ui/start_session/test_start_session.py::test_start_session_managed_repository_uses_workspace_bar`
+  checks the chip's label on desktop, its collapsed label on a phone viewport,
+  and the tapped note on a stubbed managed deployment. Component coverage:
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`pill-opens-config`:**
   `tests/e2e_ui/chat/test_composer_pill_hover_matches_hit_area.py::test_composer_pill_highlighted_label_is_clickable`
 - **`model-picker`, in-session:**

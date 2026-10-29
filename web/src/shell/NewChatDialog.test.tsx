@@ -7935,16 +7935,11 @@ describe("NewChatLandingScreen", () => {
     expect(contextBar).toContainElement(screen.getByTestId("new-chat-landing-repo-chip"));
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
     expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
-    // The host chip is icon-only; its aria-label and hover tooltip are not visible text.
-    const composer = screen.getByTestId("new-chat-landing-composer-surface");
-    expect(within(composer).queryAllByText(/sandbox/i)).not.toHaveLength(0);
-    expect([
-      ...within(composer).queryAllByText(/worktree/i),
-      ...within(composer).queryAllByTitle(/worktree/i),
-    ]).not.toHaveLength(0);
+    // The host chip is icon-only, so this chip is the visible sandbox name.
     const sandboxWorktreeChip = screen.getByTestId("new-chat-landing-sandbox-worktree-chip");
     expect(contextBar).toContainElement(sandboxWorktreeChip);
     expect(sandboxWorktreeChip.textContent).toContain("New Sandbox");
+    expect(sandboxWorktreeChip.getAttribute("title")).toMatch(/worktrees aren't available/);
     // Touch and keyboard users get the explanation without a hover title.
     fireEvent.click(sandboxWorktreeChip);
     expect(screen.getByTestId("new-chat-landing-sandbox-worktree-note").textContent).toMatch(
