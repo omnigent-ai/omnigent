@@ -3124,6 +3124,8 @@ def _mitm_client_read_until_close(
         ("/backend-api/bodyless", b"", b"HTTP/1.1 204", b"", True),
         ("/backend-api/other-protocol", b"", b"HTTP/1.1 502", None, True),
         ("/backend-api/conflicting", b"", b"HTTP/1.1 502", None, True),
+        ("/backend-api/unparseable-length", b"", b"HTTP/1.1 502", None, True),
+        ("/backend-api/negative-length", b"", b"HTTP/1.1 502", None, True),
         ("/backend-api/declined", b"abc", b"HTTP/1.1 403", None, False),
     ],
     ids=[
@@ -3133,6 +3135,8 @@ def _mitm_client_read_until_close(
         "bodyless",
         "other-protocol",
         "conflicting-framing",
+        "unparseable-length",
+        "negative-length",
         "with-body",
     ],
 )
@@ -3172,6 +3176,10 @@ async def test_refused_websocket_upgrade_closes_the_tunnel(
                     b"HTTP/1.1 426 Upgrade Required\r\nTransfer-Encoding: chunked\r\n\r\n"
                     b"5\r\nnope!\r\n0\r\n\r\n"
                 )
+            elif b" /backend-api/unparseable-length " in request_line:
+                writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4x\r\n\r\nnope")
+            elif b" /backend-api/negative-length " in request_line:
+                writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: -4\r\n\r\nnope")
             else:
                 writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4\r\n\r\nnope")
             await writer.drain()
