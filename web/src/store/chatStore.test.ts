@@ -13224,12 +13224,25 @@ describe("chatStore — startStreamPump reconnect loop", () => {
   const getState = useChatStore.getState as unknown as Parameters<typeof startStreamPump>[3];
 
   /** Route `/stream` opens to controllable sinks; everything else hits the
-   *  default handler. Returns the growing list of opened stream sinks. */
-  function routeStreamOpens(epochs: readonly string[] = []): StreamSink[] {
+   *  default handler. Returns the growing list of opened stream sinks.
+   *  Opens numbered in `heldOpens` (1-based) never answer until aborted. */
+  function routeStreamOpens(
+    epochs: readonly string[] = [],
+    heldOpens: readonly number[] = [],
+  ): StreamSink[] {
     const sinks: StreamSink[] = [];
+    let opens = 0;
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
+        if (heldOpens.includes(opens)) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            );
+          });
+        }
         const sink = pushableStream();
         sinks.push(sink);
         const response = mockResponse(null, { bodyStream: sink.stream });
@@ -14339,6 +14352,31 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     expect(opensAfterWait).toBeGreaterThanOrEqual(3);
     expect(renderedItemIds).toContain(gapItem.id);
+  });
+
+  it("backs off before retrying a reconnect that got no response", async () => {
+    seedSession("conv_hung_backoff", []);
+    const sinks = routeStreamOpens([], [2]);
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_hung_backoff", abortController: controller });
+
+    const loop = startStreamPump("conv_hung_backoff", controller, setState, getState);
+    await drainAsync();
+    sinks[0]!.error();
+    await drainAsync();
+
+    // The held open's deadline passes within this advance; the retry still
+    // waits out the first backoff (125-250 ms).
+    await vi.advanceTimersByTimeAsync(SSE_STALL_TIMEOUT_MS);
+    expect(sinks).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await drainAsync(2);
+    await loop;
   });
 
   it("acks an optimistic user bubble when reconnect backfills its committed item", async () => {
