@@ -2,7 +2,8 @@
 Unit + integration tests for :mod:`omnigent.terminals.control_bridge`.
 
 Covers the pure helpers (``unescape_control_output`` octal round-trip,
-``_hex_send_keys_commands`` chunking) and an end-to-end drive of
+``_WindowNameFilter`` escape stripping, ``_hex_send_keys_commands`` chunking)
+and an end-to-end drive of
 ``bridge_tmux_control_to_websocket`` against a real private tmux server via a
 fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input,
 and the detach close code.
@@ -33,6 +34,7 @@ from omnigent.terminals.control_bridge import (
     _clipboard_buffer_name,
     _hex_send_keys_commands,
     _read_tmux_buffer,
+    _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
@@ -68,6 +70,32 @@ def test_unescape_control_output_round_trips_control_bytes() -> None:
     assert unescape_control_output(rb"a\134b") == b"a\\b"
     # Printable bytes pass through untouched.
     assert unescape_control_output(b"plain text 123") == b"plain text 123"
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        # oh-my-zsh names the window after each command it runs.
+        (b"\x1bkecho\x1b\\tmux-256color\r\n", b"\x1b\\tmux-256color\r\n"),
+        # Other escapes, OSC strings, and UTF-8 text pass through unchanged.
+        (
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+        ),
+        # A name ended by another escape keeps that escape.
+        (b"\x1bkname\x1b[0mtext", b"\x1b\\\x1b[0mtext"),
+        # CAN and SUB end a name and are dropped with it.
+        (b"\x1bkone\x18a\x1bktwo\x1ab", b"\x1b\\a\x1b\\b"),
+        # An OSC that the name's ESC ended still ends there.
+        (b"\x1b]0;T\x1bkname\x1b\\text", b"\x1b]0;T\x1b\\text"),
+    ],
+)
+def test_window_name_filter_drops_window_names(stream: bytes, expected: bytes) -> None:
+    """Window names are dropped whole, however tmux splits the stream."""
+    assert _WindowNameFilter().feed(stream) == expected
+    # tmux can end an %output line anywhere, including mid-sequence.
+    byte_filter = _WindowNameFilter()
+    assert b"".join(byte_filter.feed(stream[i : i + 1]) for i in range(len(stream))) == expected
 
 
 def test_clipboard_buffer_name_accepts_only_safe_notifications() -> None:
@@ -555,6 +583,30 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
     )
 
     # Kill the server → the control client's stdout closes → bridge exits.
+    await _kill_and_join(sock, task)
+
+
+@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.asyncio
+async def test_control_bridge_drops_window_name_escape() -> None:
+    """A pane's ``ESC k`` window name, which tmux streams raw, never reaches the browser."""
+    # The pane prints only after the bridge's input arrives, so the escape
+    # reaches the browser through %output rather than the capture-pane seed.
+    sock, target = await _new_private_tmux(
+        "read -r line; printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat"
+    )
+    ws = _FakeWebSocket(inbound=[{"type": "websocket.receive", "bytes": b"go\r"}])
+    task = asyncio.create_task(
+        bridge_tmux_control_to_websocket(
+            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        )
+    )
+
+    async with asyncio.timeout(10):
+        while b"after-name" not in b"".join(ws.sent):
+            await asyncio.sleep(0.05)
+    assert b"WINDOW-NAME" not in b"".join(ws.sent)
+
     await _kill_and_join(sock, task)
 
 
