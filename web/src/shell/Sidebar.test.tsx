@@ -2680,6 +2680,8 @@ describe("Sidebar project Show more", () => {
     toggleFolder();
 
     expect(folderRowIds()).toEqual(filedIds(5));
+    // The hand cursor, like the session rows' links.
+    expect(screen.getByTestId("project-show-more")).toHaveClass("cursor-pointer");
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(folderRowIds()).toEqual(filedIds(10));
     fireEvent.click(screen.getByTestId("project-show-more"));

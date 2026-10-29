@@ -1797,7 +1797,7 @@ function ProjectShowMoreRow({
         }}
         className={cn(
           SIDEBAR_ROW,
-          "relative flex w-full items-center text-left text-muted-foreground transition-colors",
+          "relative flex w-full cursor-pointer items-center text-left text-muted-foreground transition-colors aria-disabled:cursor-default",
           SIDEBAR_HOVER_HIGHLIGHT,
         )}
       >
