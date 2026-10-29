@@ -3087,22 +3087,28 @@ async def test_answer_during_cancelled_hook_cleanup_is_kept(
 
 
 @pytest.mark.parametrize(
-    ("waiting_in_terminal", "delete_parent"), [(True, False), (False, False), (True, True)]
+    ("waiting_in_terminal", "delete_parent", "ancestor_lookup_fails"),
+    [(True, False, False), (False, False, False), (True, True, False), (True, False, True)],
 )
 async def test_deleting_session_releases_prompt_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     waiting_in_terminal: bool,
     delete_parent: bool,
+    ancestor_lookup_fails: bool,
 ) -> None:
     """
     A deleted session's status can stay mid-turn, so deleting it or an ancestor ends its hold.
 
-    Deleting during the re-park grace or the hold also clears the surviving parent's mirror.
+    Deleting during the re-park grace or the hold also clears the surviving parent's mirror,
+    even when the parent links can't be read before the delete.
     """
     from omnigent.runtime import pending_elicitations
 
-    name = f"test-terminal-fallback-deleted-{waiting_in_terminal}-{delete_parent}"
+    name = (
+        f"test-terminal-fallback-deleted-{waiting_in_terminal}-{delete_parent}"
+        f"-{ancestor_lookup_fails}"
+    )
     parent_agent = await create_test_agent(client, f"{name}-parent")
     parent_id = await _create_session(client, parent_agent["id"])
     parent_collector = await start_session_stream_collector(parent_id)
@@ -3143,6 +3149,14 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
             event["elicitation_id"] for event in aware_parent.json()["pending_elicitations"]
         ] == [_REATTACH_ELICITATION_ID]
 
+        if ancestor_lookup_fails:
+
+            def _ancestor_lookup_fails(*_args: Any, **_kwargs: Any) -> list[str]:
+                raise RuntimeError("ancestor lookup failed")
+
+            monkeypatch.setattr(
+                sessions_orchestration, "_ancestor_session_ids", _ancestor_lookup_fails
+            )
         deleted = await client.delete(f"/v1/sessions/{parent_id if delete_parent else session_id}")
         assert deleted.status_code == 200, deleted.text
         assert sessions_route._session_status_cache.get(session_id) == "running"
@@ -3152,6 +3166,11 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
         assert pending_elicitations.count_for(session_id) == 0
         assert pending_elicitations.count_for(parent_id) == 0
+        if not delete_parent:
+            surviving_parent = await client.get(
+                f"/v1/sessions/{parent_id}", headers=_TERMINAL_FALLBACK_HEADERS
+            )
+            assert surviving_parent.json()["pending_elicitations"] == []
     finally:
         await collector.stop()
         await parent_collector.stop()

@@ -1012,8 +1012,12 @@ async def _release_deleted_session_prompts(
                 _harness_unparked_elicitations.pop(elicitation_id, None)
         # Prompts whose hooks exited during the delete may still have cards up.
         for session_id, elicitation_id in prompts:
+            mirror_ids = ancestor_ids.get(session_id)
+            if mirror_ids is None:
+                # The ancestor read failed; the pending index still records the mirrors.
+                mirror_ids = _mirrored_prompt_session_ids(session_id, elicitation_id)
             await _expire_deleted_session_prompt(
-                session_id, elicitation_id, conversation_store, ancestor_ids.get(session_id, [])
+                session_id, elicitation_id, conversation_store, mirror_ids
             )
     finally:
         for session_id in deleted:
@@ -1048,6 +1052,18 @@ async def _expire_deleted_session_prompt(
             session_id,
             exc_info=True,
         )
+
+
+def _mirrored_prompt_session_ids(session_id: str, elicitation_id: str) -> list[str]:
+    """Return the other sessions whose pending index holds a mirror of ``session_id``'s prompt."""
+    mirror_ids: list[str] = []
+    for candidate_id in pending_elicitations.pending_session_ids():
+        if candidate_id == session_id:
+            continue
+        entry = pending_elicitations.lookup(elicitation_id, conversation_id=candidate_id)
+        if entry is not None and entry[1].get("params", {}).get("target_session_id") == session_id:
+            mirror_ids.append(candidate_id)
+    return mirror_ids
 
 
 # Strong references to detached archive stops so the tasks can't be
