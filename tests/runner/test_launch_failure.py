@@ -119,6 +119,31 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+def test_classifies_sigkill_as_a_kill_outside_omnigent() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env", exit_status=None, output="", exit_signal="SIGKILL"
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "The agent was force-killed outside Omnigent"
+    assert diagnosis.category is ErrorCategory.USER
+
+
+def test_specific_output_wins_over_sigkill() -> None:
+    diagnosis = classify_terminal_failure(
+        command="claude", exit_status=None, output=_ROOT_REFUSAL_OUTPUT, exit_signal="SIGKILL"
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code can't run as root"
+
+
+@pytest.mark.parametrize("exit_signal", [None, "SIGHUP"])
+def test_other_exits_are_not_reported_as_force_killed(exit_signal: str | None) -> None:
+    diagnosis = classify_terminal_failure(
+        command="env", exit_status=None, output="", exit_signal=exit_signal
+    )
+    assert diagnosis is None
+
+
 def test_classifies_gateway_claude_version_failure() -> None:
     diagnosis = classify_terminal_failure(
         command="env",

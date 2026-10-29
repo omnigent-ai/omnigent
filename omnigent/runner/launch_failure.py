@@ -68,11 +68,13 @@ class _Signal:
     :param command: Launched executable basename, lowercased (``""`` if unknown).
     :param exit_code: Inner process exit code, or ``None`` if unknown.
     :param output: Terminal's last captured output, lowercased (``""`` if none).
+    :param exit_signal: Signal tmux saw end the pane, e.g. ``"SIGKILL"``, or ``None``.
     """
 
     command: str
     exit_code: int | None
     output: str
+    exit_signal: str | None = None
 
     def output_contains_any(self, needles: tuple[str, ...]) -> bool:
         return any(n in self.output for n in needles)
@@ -205,6 +207,25 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+    # Omnigent ends a pane by closing its tmux session, which never sends SIGKILL.
+    _TerminalMatcher(
+        "killed_by_sigkill",
+        lambda s: s.exit_signal == "SIGKILL",
+        FailureDiagnosis(
+            title="The agent was force-killed outside Omnigent",
+            cause=(
+                "The agent's terminal process was killed with SIGKILL, which Omnigent does "
+                "not use to end a terminal. A `kill -9` or `pkill -9` run on the host, or "
+                "the system's out-of-memory killer, ends it this way."
+            ),
+            remediation=(
+                "Send your message again to relaunch the agent. If several sessions ended at "
+                "once, check the host's free memory and any script or agent command that "
+                "kills processes."
+            ),
+            category=ErrorCategory.USER,
+        ),
+    ),
 )
 
 
@@ -213,6 +234,7 @@ def classify_terminal_failure(
     command: str | None,
     exit_status: int | None,
     output: str | None,
+    exit_signal: str | None = None,
 ) -> FailureDiagnosis | None:
     """Classify a required-terminal exit into a :class:`FailureDiagnosis`.
 
@@ -220,6 +242,7 @@ def classify_terminal_failure(
         basename is matched, case-insensitively.
     :param exit_status: The inner process's exit code, or ``None`` if unknown.
     :param output: The terminal's last captured output, or ``None``.
+    :param exit_signal: The signal that ended the pane, e.g. ``"SIGKILL"``, if known.
     :returns: A diagnosis when a matcher recognizes the failure, else ``None``
         (the caller falls back to the generic message).
     """
@@ -227,6 +250,7 @@ def classify_terminal_failure(
         command=(command or "").rsplit("/", 1)[-1].lower(),
         exit_code=exit_status,
         output=(output or "").lower(),
+        exit_signal=exit_signal,
     )
     for matcher in _TERMINAL_EXIT_MATCHERS:
         if matcher.predicate(signal):
