@@ -807,6 +807,28 @@ describe("close-window request", () => {
   });
 });
 
+describe("global show shortcut IPC", () => {
+  it("refuses both handlers from a page off the pinned server and saves nothing", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:get-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.throws(
+      () =>
+        harness.ipcHandlers.get("omnigent:set-global-shortcut")(harness.events.unpinned, {
+          enabled: true,
+          accelerator: "Control+Shift+K",
+        }),
+      /connected server page/,
+    );
+    assert.equal(harness.readSettings().global_shortcut, undefined);
+  });
+});
+
 describe("Quit confirmation wiring", () => {
   it("asks before the Quit item quits, naming the hosts that go offline", async (t) => {
     const harness = loadMainHarness({
