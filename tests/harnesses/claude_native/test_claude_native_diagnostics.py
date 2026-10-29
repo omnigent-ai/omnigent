@@ -683,3 +683,77 @@ def test_invalid_marker_cannot_select_other_files(
     assert health["diagnostic_marker_present"] is True
     if kind == "malformed":
         assert health["diagnostic_read_error_kind"] == "JSONDecodeError"
+
+
+def _helper_line(stderr: str, status: str = "exited 1") -> str:
+    """Return a debug-log record as Claude writes a failed apiKeyHelper run."""
+    escaped = stderr.replace("\n", "\\n")
+    return (
+        "2026-10-29T21:51:01.817Z [ERROR] "
+        f'"Error getting API key from apiKeyHelper: {status}: {escaped}"'
+    )
+
+
+@pytest.mark.parametrize("status", ["exited 1", "[REDACTED] 1", "timed out"])
+def test_latest_api_key_helper_error_keeps_stderr_as_one_bounded_line(status: str) -> None:
+    stderr = (
+        "ERROR no credential was printed by the helper. Retry the request.\n"
+        "Run the sign-in command for the workspace, then retry."
+    )
+    assert diagnostics.latest_api_key_helper_error([_helper_line(stderr, status)]) == (
+        "ERROR no credential was printed by the helper. Retry the request. "
+        "Run the sign-in command for the workspace, then retry."
+    )
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param(
+            "2026-10-29T21:51:01.817Z [ERROR] "
+            '"Error getting API key from apiKeyHelper: returned output that cannot be used '
+            'as an API key: synthetic-token-value. The script must print only the key to stdout."',
+            id="stdout-rejection-is-not-stderr",
+        ),
+        pytest.param(
+            '2026-10-29T21:51:01.817Z [ERROR] "Error getting API key from apiKeyHelper: '
+            'did not return a value"',
+            id="empty-stdout-has-no-stderr",
+        ),
+        pytest.param(
+            "2026-10-29T21:51:01.817Z [DEBUG] apiKeyHelper is refreshed in the background",
+            id="unrelated-helper-mention",
+        ),
+    ],
+)
+def test_latest_api_key_helper_error_ignores_stdout_and_unrelated_lines(record: str) -> None:
+    assert diagnostics.latest_api_key_helper_error([record]) is None
+
+
+def test_latest_api_key_helper_error_prefers_newest_and_redacts_credentials() -> None:
+    older = _helper_line("ERROR old failure")
+    newer = _helper_line("ERROR password synthetic-pass-123 was rejected")
+    result = diagnostics.latest_api_key_helper_error([older, "ordinary line", newer])
+    assert result is not None
+    assert result.startswith("ERROR password [REDACTED]")
+    assert "synthetic-pass-123" not in result
+
+
+def test_latest_api_key_helper_error_is_length_bounded() -> None:
+    result = diagnostics.latest_api_key_helper_error([_helper_line("ERROR " + "x" * 1000)])
+    assert result is not None
+    assert len(result) == 400
+    assert result.endswith("...")
+
+
+def test_follower_keeps_newest_helper_error_for_the_launch(capture_file: Path) -> None:
+    follower = diagnostics.ClaudeDebugLogFollower(capture_file.parent)
+    assert follower.latest_credential_helper_error() is None
+    capture_file.write_text(_helper_line("ERROR first failure") + "\nordinary line\n")
+    follower.poll("conv_helper")
+    assert follower.latest_credential_helper_error() == "ERROR first failure"
+    with capture_file.open("a") as handle:
+        handle.write(_helper_line("ERROR second failure") + "\n")
+    follower.poll("conv_helper")
+    follower.close("conv_helper")
+    assert follower.latest_credential_helper_error() == "ERROR second failure"

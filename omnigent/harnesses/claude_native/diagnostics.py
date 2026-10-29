@@ -18,6 +18,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.harnesses.diagnostics import (
     DIAGNOSTIC_TAIL_BYTES,
     bounded_diagnostic_tail,
+    sanitize_diagnostic_text,
 )
 from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.process_logging import harness_stderr_capture_enabled
@@ -29,6 +30,15 @@ _CLOSE_READS = 4
 _MARKER_BYTES = 4096
 _LAUNCH_ID = re.compile(r"[0-9a-f]{32}\Z")
 _logger = logging.getLogger(__name__)
+_API_KEY_HELPER_ERROR_MARKER = "Error getting API key from apiKeyHelper: "
+# Claude logs a failed helper as "exited <code>: <stderr>" or "timed out: <stderr>",
+# and its own redactor may replace the status word. Only the stderr is captured:
+# the helper's stdout (the credential) never appears in these lines.
+_API_KEY_HELPER_ERROR = re.compile(
+    re.escape(_API_KEY_HELPER_ERROR_MARKER)
+    + r"(?:exited \d+|timed out|\[REDACTED\](?: \d+)?): (?P<stderr>.+?)\"?\s*$"
+)
+_API_KEY_HELPER_ERROR_MAX_CHARS = 400
 
 
 @dataclass(frozen=True)
@@ -85,6 +95,29 @@ def _clear_capture(directory_fd: int) -> None:
                     os.unlink(filename, dir_fd=directory_fd)
     with contextlib.suppress(FileNotFoundError):
         os.unlink(CLAUDE_DEBUG_LOG_MARKER, dir_fd=directory_fd)
+
+
+def latest_api_key_helper_error(records: list[str]) -> str | None:
+    """Return the newest helper stderr in ``records`` as one sanitized, bounded line.
+
+    :param records: Complete debug-log lines, oldest first.
+    :returns: e.g. ``"ERROR no token for the gateway. Run the login command."``, or ``None``.
+    """
+    for record in reversed(records):
+        if _API_KEY_HELPER_ERROR_MARKER not in record:
+            continue
+        match = _API_KEY_HELPER_ERROR.search(record)
+        if match is None:
+            continue
+        # Claude JSON-escapes the helper's newlines inside the single logged line.
+        lines = [line.strip() for line in match["stderr"].replace("\\n", "\n").splitlines()]
+        text = " ".join(sanitize_diagnostic_text(line).strip() for line in lines if line).strip()
+        if not text:
+            continue
+        if len(text) > _API_KEY_HELPER_ERROR_MAX_CHARS:
+            text = text[: _API_KEY_HELPER_ERROR_MAX_CHARS - 3].rstrip() + "..."
+        return text
+    return None
 
 
 def augment_claude_debug_args(args: list[str], bridge_dir: Path) -> list[str]:
@@ -147,6 +180,7 @@ class ClaudeDebugLogFollower:
         self._lines_omitted = 0
         self._bytes_omitted = 0
         self._truncated = False
+        self._credential_helper_error: str | None = None
         self._health: FailureContext = {
             "diagnostic_capture_enabled": True,
             "diagnostic_capture_state": "not_polled",
@@ -157,6 +191,10 @@ class ClaudeDebugLogFollower:
         if not harness_stderr_capture_enabled():
             return {"diagnostic_capture_enabled": False, "diagnostic_capture_state": "disabled"}
         return dict(self._health)
+
+    def latest_credential_helper_error(self) -> str | None:
+        """Return the newest apiKeyHelper error seen in this launch's debug log."""
+        return self._credential_helper_error
 
     def _update_health(self, error: Exception | None = None) -> None:
         state = (
@@ -214,6 +252,7 @@ class ClaudeDebugLogFollower:
                 self._last_read_offset = None
                 self._lines_omitted = self._bytes_omitted = 0
                 self._truncated = False
+                self._credential_helper_error = None
                 # Count the known predecessor only on attachment to this launch;
                 # later rotations are handled through the already-open inode.
                 if capture is not None:
@@ -333,6 +372,9 @@ class ClaudeDebugLogFollower:
         self._lines_omitted += total_lines_omitted
         self._bytes_omitted += total_bytes_omitted
         self._truncated |= bool(snapshot["truncated"] or omitted_lines or omitted_bytes)
+        helper_error = latest_api_key_helper_error(records)
+        if helper_error is not None:
+            self._credential_helper_error = helper_error
         _logger.info(
             "Claude diagnostic output; session=%s launch=%s offset=%d "
             "lines_omitted=%d bytes_omitted=%d\n%s",
