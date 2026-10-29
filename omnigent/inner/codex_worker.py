@@ -120,7 +120,7 @@ def _contain_host_codex_home_links(
     if host_login is None:
         return policy
     if not share_host_login:
-        # Native tools share this sandbox; an API-key login never rotates, so a copy is safe.
+        # An API-key login never rotates, so a private copy keeps the host file out of reach.
         login.unlink()
         shutil.copy(host_login, login)
         return policy
@@ -227,9 +227,11 @@ def prepare_codex_worker(
         )
         policy = replace(policy, allow_network=True)
         native_tools_allowed = False
-    if signer_readiness is None and native_tools_allowed:
+    share_host_login = False
+    if signer_readiness is None:
         host_login = _host_link_target(codex_home / "auth.json")
-        if host_login is not None and _login_rotates(host_login):
+        share_host_login = host_login is not None and _login_rotates(host_login)
+        if share_host_login and native_tools_allowed:
             logger.warning(
                 "Sharing the host's Codex login with the sandboxed worker so token "
                 "refreshes reach it; disabling Codex's native tools and keeping its file "
@@ -248,7 +250,7 @@ def prepare_codex_worker(
         policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
     else:
         policy = _contain_host_codex_home_links(
-            policy, codex_home, share_host_login=not native_tools_allowed
+            policy, codex_home, share_host_login=share_host_login
         )
     staged_env = dict(worker_env) if worker_env is not None else None
     if signer_readiness is not None:

@@ -291,13 +291,14 @@ def test_worker_grants_plain_host_login_and_snapshots_host_memories(
         worker.close()
 
 
+@pytest.mark.parametrize("allow_network", [True, False], ids=["allow-network", "no-route"])
 @pytest.mark.parametrize(
-    ("login_text", "native_tools_allowed"),
+    ("login_text", "rotates"),
     [
-        ('{"OPENAI_API_KEY": "sk-test", "tokens": null}', True),
-        ('{"auth_mode": "chatgpt", "tokens": {"refresh_token": "rt"}}', False),
-        ('{"OPENAI_API_KEY": "sk-test", "tokens": {"refresh_token": "rt"}}', False),
-        ("not json", False),
+        ('{"OPENAI_API_KEY": "sk-test", "tokens": null}', False),
+        ('{"auth_mode": "chatgpt", "tokens": {"refresh_token": "rt"}}', True),
+        ('{"OPENAI_API_KEY": "sk-test", "tokens": {"refresh_token": "rt"}}', True),
+        ("not json", True),
     ],
     ids=["api-key", "chatgpt", "api-key-and-chatgpt", "unparseable"],
 )
@@ -305,9 +306,10 @@ def test_worker_copies_host_login_only_when_it_cannot_rotate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     login_text: str,
-    native_tools_allowed: bool,
+    rotates: bool,
+    allow_network: bool,
 ) -> None:
-    """Native tools may see only a private copy of a login that Codex never refreshes."""
+    """Only a login Codex may refresh is shared; any other worker gets a private copy."""
     host_codex = tmp_path / "host-codex"
     host_codex.mkdir()
     host_login = host_codex / "auth.json"
@@ -324,7 +326,7 @@ def test_worker_copies_host_login_only_when_it_cannot_rotate(
     create_launcher = Mock(return_value=str(tmp_path / "launcher"))
     monkeypatch.setattr(
         "omnigent.inner.codex_worker.resolve_sandbox",
-        Mock(return_value=_active_policy(tmp_path)),
+        Mock(return_value=replace(_active_policy(tmp_path), allow_network=allow_network)),
     )
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
@@ -337,15 +339,15 @@ def test_worker_copies_host_login_only_when_it_cannot_rotate(
         spawn_env_names=["PATH", "CODEX_HOME"],
     )
     try:
-        assert worker.native_tools_allowed is native_tools_allowed
-        granted = [] if native_tools_allowed else [host_login.resolve()]
+        assert worker.native_tools_allowed is (allow_network and not rotates)
+        granted = [host_login.resolve()] if rotates else []
         for policy in (
             backend.wrap_launcher_argv.call_args.args[1],
             create_launcher.call_args.args[1],
         ):
             assert policy.write_files == granted
         private_login = codex_home / "auth.json"
-        if native_tools_allowed:
+        if not rotates:
             assert not private_login.is_symlink()
             assert private_login.stat().st_mode & 0o777 == 0o600
             private_login.write_text('{"auth_mode": "changed"}')
@@ -962,7 +964,7 @@ async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> Non
     reason="requires Linux with bubblewrap",
 )
 async def test_real_bwrap_worker_without_model_route_refreshes_login_and_keeps_memories_private(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, tmp_path: Path
 ) -> None:
     """A network-denied worker reaches the model, refreshes the host login, and copies memories."""
     host_home = tmp_path / "host-home"
@@ -970,6 +972,7 @@ async def test_real_bwrap_worker_without_model_route_refreshes_login_and_keeps_m
     host_codex.mkdir(parents=True)
     (host_codex / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     host_memories = sqlite3.connect(host_codex / "memories_1.sqlite")
+    request.addfinalizer(host_memories.close)
     host_memories.execute("PRAGMA journal_mode=WAL")
     host_memories.execute("CREATE TABLE memory (note TEXT)")
     host_memories.execute("INSERT INTO memory VALUES ('from the host')")
@@ -1037,7 +1040,6 @@ async def test_real_bwrap_worker_without_model_route_refreshes_login_and_keeps_m
         "refreshed": True,
     }
     host_notes = [row[0] for row in host_memories.execute("SELECT note FROM memory")]
-    host_memories.close()
     assert host_notes == ["from the host"]
 
 
