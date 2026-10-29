@@ -14,7 +14,8 @@ Regression coverage for two bugs in the HTML artifact preview
     while a handler the artifact registers on ``window`` afterwards must still
     be able to cancel such a click.
 
-It also covers the new "Open in new tab" toolbar button, which pops the
+It also covers zoom shortcuts pressed inside the preview, which scale only the
+rendered file instead of the whole app, and the "Open in new tab" toolbar button, which pops the
 artifact into a blank, app-controlled tab and renders it inside the same
 sandboxed (opaque-origin) iframe — full-window viewing without giving the
 artifact the app's own origin.
@@ -30,13 +31,14 @@ prove the script actually executed.
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import FrameLocator, Locator, Page, expect
 
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes
 # seeded files into the server process's cwd — the repo root (this file is
@@ -155,7 +157,6 @@ def test_html_preview_links_and_sandboxed_popout(
     base_url, session_id = seeded_html
     # Keep the viewport wide so the responsive toolbar renders its actions
     # inline (the "Open in new tab" button is found by role, not via overflow).
-    page.set_viewport_size({"width": 1600, "height": 900})
     # HTML files default to the preview view, so the iframe mounts directly.
     page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
@@ -255,3 +256,121 @@ def test_html_preview_links_and_sandboxed_popout(
     assert popped.url == "about:blank"
 
     popped.close()
+
+
+def _box(locator: Locator) -> dict[str, float]:
+    box = locator.bounding_box()
+    assert box is not None, "element is not rendered"
+    return box
+
+
+def _host_scale(page: Page) -> list[float]:
+    """Viewport width and pixel ratio, which a browser-level zoom would change."""
+    return page.evaluate("() => [window.innerWidth, window.devicePixelRatio]")
+
+
+def _expect_scaled(heading: Locator, base_height: float, scale: float) -> None:
+    # The frame relays out at 1/scale of the pane like browser zoom, so block widths
+    # stay put on screen while text height scales.
+    assert abs(_box(heading)["height"] / base_height - scale) < 0.02
+
+
+_ZOOM_VIEWPORT = {"width": 1600, "height": 900}
+
+
+def _hold_for_recording(page: Page) -> None:
+    """Leave each zoom step on screen long enough to follow in a recorded run."""
+    if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+        page.wait_for_timeout(1_200)
+
+
+def _press_in_preview(page: Page, preview: FrameLocator, chord: str) -> bool:
+    """Press ``chord`` with focus in the preview; return whether the frame cancelled it."""
+    preview.locator("body").evaluate(
+        """() => {
+            window.__zoomKeyCancelled = null;
+            // Registered after the bridge, so it observes the bridge's decision.
+            const onKey = (e) => {
+                if (["Control", "Meta", "Shift", "Alt"].includes(e.key)) return;
+                window.__zoomKeyCancelled = e.defaultPrevented;
+                window.removeEventListener("keydown", onKey);
+            };
+            window.addEventListener("keydown", onKey);
+        }"""
+    )
+    page.keyboard.press(chord)
+    # Key events dispatch synchronously, so the listener has run by now.
+    return preview.locator("body").evaluate("() => window.__zoomKeyCancelled")
+
+
+@pytest.mark.browser_context_args(viewport=_ZOOM_VIEWPORT, record_video_size=_ZOOM_VIEWPORT)
+def test_html_preview_zoom_shortcuts_scale_only_the_preview(
+    request: pytest.FixtureRequest,
+    seeded_html: tuple[str, str],
+) -> None:
+    """Cmd/Ctrl +, - and 0 inside the preview zoom the rendered file, not the app."""
+    base_url, session_id = seeded_html
+    # Create the page after setup so a recording starts at the user's journey.
+    page: Page = request.getfixturevalue("page")
+    page.set_viewport_size({"width": 1600, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    preview = file_viewer.frame_locator('iframe[title="HTML preview"]')
+    heading = preview.get_by_role("heading", name="HTML preview fixture")
+    expect(preview.locator("#js-status")).to_have_text("js-ran", timeout=10_000)
+    # The bridge takes over the shortcuts once the parent connects; it paints the
+    # (empty) comment highlights as soon as that happens.
+    preview_frame = (
+        file_viewer.locator('iframe[title="HTML preview"]').element_handle().content_frame()
+    )
+    assert preview_frame is not None
+    preview_frame.wait_for_function("() => CSS.highlights.has('omni-comment')", timeout=10_000)
+    badge = file_viewer.get_by_test_id("html-preview-zoom")
+    base_height = _box(heading)["height"]
+    host_before = _host_scale(page)
+    viewer_before = _box(file_viewer)
+    _hold_for_recording(page)
+
+    heading.click()
+    assert _press_in_preview(page, preview, "Control+Equal")
+    expect(badge).to_have_text("Preview zoom 110%")
+    _expect_scaled(heading, base_height, 1.1)
+    _hold_for_recording(page)
+    # The badge is transient and leaves no visible chrome behind.
+    expect(badge).to_have_text("", timeout=5_000)
+
+    assert _press_in_preview(page, preview, "Meta+Equal")
+    expect(badge).to_have_text("Preview zoom 125%")
+    _expect_scaled(heading, base_height, 1.25)
+    _hold_for_recording(page)
+
+    # Commenting still lines up with the zoomed text: the button sits just above the
+    # selection's on-screen position.
+    status_line = preview.locator("#js-status")
+    status_line.select_text()
+    add_comment = page.get_by_role("button", name="Add comment")
+    expect(add_comment).to_be_visible()
+    button_box, selected_box = _box(add_comment), _box(status_line)
+    assert abs(button_box["x"] - selected_box["x"]) < 4
+    assert abs(button_box["y"] + button_box["height"] + 6 - selected_box["y"]) < 4
+    _hold_for_recording(page)
+
+    # Zooming moves the text, so the stale button is dropped.
+    assert _press_in_preview(page, preview, "Control+Minus")
+    expect(add_comment).to_be_hidden()
+    expect(badge).to_have_text("Preview zoom 110%")
+    _expect_scaled(heading, base_height, 1.1)
+    _hold_for_recording(page)
+
+    assert _press_in_preview(page, preview, "Control+0")
+    expect(badge).to_have_text("Preview zoom 100%")
+    _expect_scaled(heading, base_height, 1.0)
+    _hold_for_recording(page)
+
+    # Other shortcuts still reach the page untouched.
+    assert not _press_in_preview(page, preview, "Control+9")
+
+    # The app itself never zoomed.
+    assert _host_scale(page) == host_before
+    assert _box(file_viewer) == viewer_before

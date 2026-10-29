@@ -20,6 +20,7 @@
     "selection",
     "commentClick",
     "selectionCleared",
+    "zoom",
   ];
   if (requiredTypes.some((name) => typeof T[name] !== "string")) return;
   let port = null;
@@ -311,6 +312,25 @@
   document.addEventListener("selectionchange", function () {
     if (selTimer) clearTimeout(selTimer);
     selTimer = setTimeout(emitSelection, 150);
+  });
+
+  // Browser zoom shortcuts would zoom the whole app; once the parent is
+  // connected, zoom only this preview instead. An artifact that handles the
+  // shortcut itself (and cancels it) keeps it.
+  function zoomAction(e) {
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;
+    if (e.key === "=" || e.key === "+" || e.code === "NumpadAdd") return "in";
+    if (e.key === "-" || e.key === "_" || e.code === "NumpadSubtract") return "out";
+    if (e.key === "0" || e.code === "Numpad0") return "reset";
+    return null;
+  }
+
+  window.addEventListener("keydown", function (e) {
+    if (!port || e.defaultPrevented) return;
+    const action = zoomAction(e);
+    if (!action) return;
+    e.preventDefault();
+    send({ type: T.zoom, action: action });
   });
 
   window.addEventListener("message", function (e) {

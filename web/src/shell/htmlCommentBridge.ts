@@ -26,6 +26,7 @@
 import { escapeHtmlAttr } from "@/lib/html";
 import bridgeRuntime from "./htmlCommentBridgeRuntime.js?raw";
 import { prepareHtmlPreviewDoc } from "./codeViewerHelpers";
+import { type HtmlPreviewZoomAction, isHtmlPreviewZoomAction } from "./htmlPreviewZoom";
 
 /** Protocol version — bump on any breaking change to the message shapes. */
 export const BRIDGE_VERSION = 1;
@@ -49,6 +50,8 @@ export const BRIDGE_MSG = {
   commentClick: "omni:commentClick",
   /** iframe → parent: the selection collapsed without hitting a comment. */
   selectionCleared: "omni:selectionCleared",
+  /** iframe → parent: the user pressed a zoom shortcut inside the preview. */
+  zoom: "omni:zoom",
 } as const;
 
 /** Rect of a selection in the iframe's own viewport coordinates. */
@@ -83,9 +86,14 @@ export interface BridgeReady {
   type: typeof BRIDGE_MSG.ready;
 }
 
+export interface BridgeZoom {
+  type: typeof BRIDGE_MSG.zoom;
+  action: HtmlPreviewZoomAction;
+}
+
 /** Any message the iframe can send to the parent (post-handshake). */
 export type InboundBridgeMessage =
-  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared;
+  BridgeReady | BridgeSelection | BridgeCommentClick | BridgeSelectionCleared | BridgeZoom;
 
 // ---------------------------------------------------------------------------
 // Inbound message validation
@@ -133,6 +141,8 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
       return null;
     case BRIDGE_MSG.selectionCleared:
       return { type: BRIDGE_MSG.selectionCleared };
+    case BRIDGE_MSG.zoom:
+      return isHtmlPreviewZoomAction(d.action) ? { type: BRIDGE_MSG.zoom, action: d.action } : null;
     default:
       return null;
   }

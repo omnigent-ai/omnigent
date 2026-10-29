@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   anchorOccurrence,
   BRIDGE_MSG,
@@ -103,6 +103,114 @@ describe("injectCommentBridge", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bridge runtime — zoom shortcuts inside the preview
+// ---------------------------------------------------------------------------
+
+describe("bridge runtime zoom shortcuts", () => {
+  const NONCE = "zoom-nonce";
+  const added: [EventTarget, string, EventListenerOrEventListenerObject, unknown][] = [];
+
+  afterEach(() => {
+    for (const [target, type, listener, options] of added.splice(0)) {
+      target.removeEventListener(type, listener, options as EventListenerOptions);
+    }
+    vi.restoreAllMocks();
+  });
+
+  /** Run the runtime in this document, as the injected script would, and connect a port. */
+  function startRuntime({ connect = true } = {}) {
+    for (const target of [window, document]) {
+      const original = target.addEventListener.bind(target);
+      vi.spyOn(target, "addEventListener").mockImplementation((type, listener, options) => {
+        if (listener) added.push([target, type, listener, options]);
+        original(type, listener, options);
+      });
+    }
+    const script = document.createElement("script");
+    script.setAttribute("data-omni-nonce", NONCE);
+    script.setAttribute(
+      "data-omni-protocol",
+      JSON.stringify({ source: BRIDGE_SOURCE, types: BRIDGE_MSG }),
+    );
+    vi.spyOn(document, "currentScript", "get").mockReturnValue(script);
+    new Function(HTML_COMMENT_BRIDGE_RUNTIME)();
+    vi.mocked(window.addEventListener).mockRestore();
+    vi.mocked(document.addEventListener).mockRestore();
+
+    const port = { postMessage: vi.fn(), onmessage: null };
+    if (connect) {
+      const init = new Event("message");
+      Object.defineProperties(init, {
+        data: { value: { source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.init } },
+        ports: { value: [port] },
+      });
+      window.dispatchEvent(init);
+      port.postMessage.mockClear(); // drop the ready message
+    }
+    return port;
+  }
+
+  function press(init: KeyboardEventInit): boolean {
+    const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+    document.body.dispatchEvent(event);
+    return event.defaultPrevented;
+  }
+
+  function sentZoomActions(port: { postMessage: ReturnType<typeof vi.fn> }) {
+    return port.postMessage.mock.calls.map(([msg]) => {
+      expect(msg).toMatchObject({ source: BRIDGE_SOURCE, nonce: NONCE, type: BRIDGE_MSG.zoom });
+      return (msg as { action: string }).action;
+    });
+  }
+
+  it.each([
+    [{ key: "=", metaKey: true }, "in"],
+    [{ key: "+", metaKey: true, shiftKey: true }, "in"],
+    [{ key: "=", ctrlKey: true }, "in"],
+    [{ key: "Unidentified", code: "NumpadAdd", ctrlKey: true }, "in"],
+    [{ key: "-", metaKey: true }, "out"],
+    [{ key: "_", ctrlKey: true, shiftKey: true }, "out"],
+    [{ key: "Unidentified", code: "NumpadSubtract", metaKey: true }, "out"],
+    [{ key: "0", metaKey: true }, "reset"],
+    [{ key: "Insert", code: "Numpad0", ctrlKey: true }, "reset"],
+  ])("cancels %o and asks the parent to zoom %s", (init, action) => {
+    const port = startRuntime();
+    expect(press(init)).toBe(true);
+    expect(sentZoomActions(port)).toEqual([action]);
+  });
+
+  it.each([
+    { key: "=" },
+    { key: "-", shiftKey: true },
+    { key: "=", metaKey: true, altKey: true },
+    { key: "9", metaKey: true },
+    { key: "f", ctrlKey: true },
+  ])("leaves %o to the page", (init) => {
+    const port = startRuntime();
+    expect(press(init)).toBe(false);
+    expect(port.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps the app's zoom until the parent connects", () => {
+    const port = startRuntime({ connect: false });
+    expect(press({ key: "=", metaKey: true })).toBe(false);
+    expect(port.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("leaves the shortcut to an artifact that already handled it", () => {
+    const port = startRuntime();
+    const artifactHandler = (event: Event) => event.preventDefault();
+    document.addEventListener("keydown", artifactHandler);
+    try {
+      press({ key: "=", metaKey: true });
+    } finally {
+      document.removeEventListener("keydown", artifactHandler);
+    }
+    expect(port.postMessage).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseBridgeMessage — inbound validation (guards against spoofed postMessage)
 // ---------------------------------------------------------------------------
 
@@ -164,6 +272,17 @@ describe("parseBridgeMessage", () => {
     expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.ready }, NONCE)).toEqual({
       type: BRIDGE_MSG.ready,
     });
+  });
+
+  it("accepts a zoom request only with a known action", () => {
+    for (const action of ["in", "out", "reset"]) {
+      expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.zoom, action }, NONCE)).toEqual({
+        type: BRIDGE_MSG.zoom,
+        action,
+      });
+    }
+    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.zoom, action: "2" }, NONCE)).toBeNull();
+    expect(parseBridgeMessage({ ...base, type: BRIDGE_MSG.zoom }, NONCE)).toBeNull();
   });
 
   it("rejects a wrong nonce (spoof from artifact JS)", () => {

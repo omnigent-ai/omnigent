@@ -223,6 +223,7 @@ def test_html_comment_external_runtime_connects_under_strict_csp(
               selection: "omni:selection",
               commentClick: "omni:commentClick",
               selectionCleared: "omni:selectionCleared",
+              zoom: "omni:zoom",
             },
           }).replaceAll("&", "&amp;").replaceAll('"', "&quot;");
           const iframe = document.createElement("iframe");

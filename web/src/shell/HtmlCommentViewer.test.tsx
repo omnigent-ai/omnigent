@@ -1,8 +1,9 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
+import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({
@@ -189,5 +190,134 @@ describe("HtmlCommentViewer", () => {
   it("does not show the floating Add-comment button before any selection", () => {
     renderViewer("<body><p>doc</p></body>");
     expect(document.querySelector("[data-add-comment-btn]")).toBeNull();
+  });
+});
+
+describe("HtmlCommentViewer zoom", () => {
+  /** Wait for the frame to load and return the bridge's end of the channel the viewer hands it. */
+  async function connectBridge(iframe: HTMLIFrameElement) {
+    if (!iframe.contentWindow) throw new Error("Preview has no content window");
+    const postMessage = vi.spyOn(iframe.contentWindow, "postMessage");
+    // jsdom loads the srcdoc itself; a synthetic load would be superseded by it.
+    await waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1));
+    const [init, , transfer] = postMessage.mock.calls[0] as unknown as [
+      { nonce: string },
+      string,
+      MessagePort[],
+    ];
+    const port = transfer[0];
+    const send = (msg: Record<string, unknown>) =>
+      port.postMessage({ source: BRIDGE_SOURCE, nonce: init.nonce, ...msg });
+    return { port, send };
+  }
+
+  function previewParts() {
+    const iframe = screen.getByTitle<HTMLIFrameElement>("HTML preview");
+    return { iframe, zoomBox: iframe.parentElement as HTMLElement };
+  }
+
+  it("scales only the preview for zoom requests from the frame and shows the level", async () => {
+    renderViewer("<body><p>doc</p></body>");
+    const { iframe, zoomBox } = previewParts();
+    const { port, send } = await connectBridge(iframe);
+    const badge = screen.getByTestId("html-preview-zoom");
+    expect(zoomBox.style.transform).toBe("");
+    expect(badge.textContent).toBe("");
+
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    await waitFor(() => expect(zoomBox.style.transform).toBe("scale(1.1)"));
+    expect(zoomBox.style.width).toBe(`${100 / 1.1}%`);
+    expect(badge.textContent).toBe("Preview zoom 110%");
+
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    await waitFor(() => expect(zoomBox.style.transform).toBe("scale(1.25)"));
+    send({ type: BRIDGE_MSG.zoom, action: "out" });
+    send({ type: BRIDGE_MSG.zoom, action: "out" });
+    send({ type: BRIDGE_MSG.zoom, action: "out" });
+    await waitFor(() => expect(zoomBox.style.transform).toBe("scale(0.9)"));
+    expect(badge.textContent).toBe("Preview zoom 90%");
+
+    send({ type: BRIDGE_MSG.zoom, action: "reset" });
+    await waitFor(() => expect(zoomBox.style.transform).toBe(""));
+    expect(badge.textContent).toBe("Preview zoom 100%");
+    port.close();
+  });
+
+  it("hides the zoom level shortly after the last change", async () => {
+    renderViewer("<body><p>doc</p></body>");
+    const { iframe, zoomBox } = previewParts();
+    const { port, send } = await connectBridge(iframe);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    await vi.waitFor(() => expect(zoomBox.style.transform).toBe("scale(1.1)"));
+    act(() => vi.advanceTimersByTime(1_000));
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    await vi.waitFor(() => expect(zoomBox.style.transform).toBe("scale(1.25)"));
+    // The second change restarts the timer.
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(screen.getByTestId("html-preview-zoom").textContent).toBe("Preview zoom 125%");
+    act(() => vi.advanceTimersByTime(600));
+    expect(screen.getByTestId("html-preview-zoom").textContent).toBe("");
+    port.close();
+  });
+
+  it("ignores zoom requests with an unknown action", async () => {
+    renderViewer("<body><p>doc</p></body>");
+    const { iframe, zoomBox } = previewParts();
+    const { port, send } = await connectBridge(iframe);
+    send({ type: BRIDGE_MSG.zoom, action: "max" });
+    send({ type: BRIDGE_MSG.ready });
+    // ready is answered with the comment state, so once it arrives the bad request was handled.
+    const answered = new Promise((resolve) => {
+      port.onmessage = resolve;
+    });
+    await answered;
+    expect(zoomBox.style.transform).toBe("");
+    expect(screen.getByTestId("html-preview-zoom").textContent).toBe("");
+    port.close();
+  });
+
+  it("keeps the zoom when the content reloads", async () => {
+    const { rerender } = renderViewer("<body><p>first</p></body>");
+    const { send, port } = await connectBridge(previewParts().iframe);
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
+    await waitFor(() => expect(previewParts().zoomBox.style.transform).toBe("scale(1.1)"));
+    rerender(
+      <HtmlCommentViewer
+        conversationId="conv_1"
+        content="<body><p>rewritten</p></body>"
+        truncated={false}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+      />,
+    );
+    expect(previewParts().iframe.getAttribute("srcdoc")).toContain("rewritten");
+    expect(previewParts().zoomBox.style.transform).toBe("scale(1.1)");
+    port.close();
+  });
+
+  it("places the Add-comment button over a selection at the zoomed position", async () => {
+    renderViewer("<body><p>Quarterly revenue</p></body>");
+    const { iframe, zoomBox } = previewParts();
+    const { port, send } = await connectBridge(iframe);
+    send({ type: BRIDGE_MSG.zoom, action: "reset" });
+    for (let step = 0; step < 5; step++) send({ type: BRIDGE_MSG.zoom, action: "in" });
+    await waitFor(() => expect(zoomBox.style.transform).toBe("scale(2)"));
+
+    send({
+      type: BRIDGE_MSG.selection,
+      text: "revenue",
+      occ: 0,
+      rect: { left: 40, top: 30, right: 90, bottom: 45 },
+    });
+    const button = await screen.findByRole("button", { name: "Add comment" });
+    // jsdom puts the frame at the origin, so the button sits at the scaled rect.
+    expect(button.style.left).toBe("80px");
+    expect(button.style.top).toBe("54px");
+
+    send({ type: BRIDGE_MSG.zoom, action: "out" });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull());
+    port.close();
   });
 });

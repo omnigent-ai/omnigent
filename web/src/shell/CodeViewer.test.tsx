@@ -7,6 +7,7 @@ import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -116,24 +117,30 @@ const MINIMAL_NB = JSON.stringify({
   cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
 });
 
+interface ViewerOptions {
+  viewMode?: "editor" | "preview" | "source" | "diff";
+  truncated?: boolean;
+  markdownSourceFallback?: boolean;
+  mediaActive?: boolean;
+  position?: { line: number; endLine?: number };
+  onRequestEditMode?: () => void;
+}
+
 function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: {
-    viewMode?: "editor" | "preview" | "source" | "diff";
-    truncated?: boolean;
-    markdownSourceFallback?: boolean;
-    mediaActive?: boolean;
-    position?: { line: number; endLine?: number };
-    onRequestEditMode?: () => void;
-  } = {},
+  opts: ViewerOptions = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return render(viewerElement(content, panelOpen, path, opts));
+}
+
+function viewerElement(content: string, panelOpen: boolean, path: string, opts: ViewerOptions) {
+  return (
     <CodeViewer
       markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
@@ -150,7 +157,7 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+    />
   );
 }
 
@@ -831,6 +838,31 @@ describe("CodeViewer HTML preview sandbox", () => {
     expect(sandbox).not.toContain("allow-same-origin");
     // #777: every link opens in a new tab via the injected base tag.
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
+  });
+
+  it("opens another file at 100% zoom", async () => {
+    const html = "<html><head></head><body><p>report</p></body></html>";
+    const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
+    const iframe = screen.getByTitle<HTMLIFrameElement>("HTML preview");
+    const postMessage = vi.spyOn(iframe.contentWindow!, "postMessage");
+    await waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1));
+    const [init, , [port]] = postMessage.mock.calls[0] as unknown as [
+      { nonce: string },
+      string,
+      MessagePort[],
+    ];
+    port.postMessage({
+      source: BRIDGE_SOURCE,
+      nonce: init.nonce,
+      type: BRIDGE_MSG.zoom,
+      action: "in",
+    });
+    const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+    await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+
+    rerender(viewerElement(html, true, "b.html", { viewMode: "preview" }));
+    expect(zoomBox().style.transform).toBe("");
+    port.close();
   });
 });
 
