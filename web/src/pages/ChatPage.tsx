@@ -2492,8 +2492,7 @@ function ComposerImpl(
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  // Native turns keep the session running after this client's send settles,
-  // and shouldQueueSend still queues while it does.
+  // Native turns keep the session running after this client's send settles.
   const turnInProgress = status === "streaming" || sessionStatus === "running";
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
@@ -3985,7 +3984,17 @@ function ComposerImpl(
                     : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
                       : turnInProgress
-                        ? "Send a follow-up (queued) — Esc to stop"
+                        ? shouldQueueSend(
+                            conversationId,
+                            status,
+                            sessionStatus,
+                            queuedMessages,
+                            readAlwaysSteer(),
+                            false,
+                            hasPendingInitialMessage,
+                          )
+                          ? "Send a follow-up (queued) — Esc to stop"
+                          : "Send a follow-up — Esc to stop"
                         : readyPlaceholder,
           rows: 1,
           // An Arca send waits in the queue for the host, so typing reopens; other gates stay.

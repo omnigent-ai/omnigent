@@ -4663,15 +4663,30 @@ describe("Composer placeholder", () => {
   });
 
   it.each([
-    ["running", "Send a follow-up (queued) — Esc to stop"],
-    ["waiting", "Send a message…"],
-    ["idle", "Send a message…"],
+    ["running", false, "Send a follow-up (queued) — Esc to stop"],
+    ["running", true, "Send a follow-up — Esc to stop"],
+    ["waiting", false, "Send a message…"],
+    ["idle", false, "Send a message…"],
   ] as const)(
-    "follows a %s session after this client's send settles",
-    (sessionStatus, placeholder) => {
-      const previous = useChatStore.getState().sessionStatus;
-      onTestFinished(() => useChatStore.setState({ sessionStatus: previous }));
-      useChatStore.setState({ sessionStatus });
+    "follows a %s session after this client's send settles (always steer: %s)",
+    (sessionStatus, alwaysSteer, placeholder) => {
+      const {
+        conversationId,
+        queuedMessages,
+        sessionStatus: previousStatus,
+      } = useChatStore.getState();
+      onTestFinished(() =>
+        useChatStore.setState({ conversationId, queuedMessages, sessionStatus: previousStatus }),
+      );
+      const previousAlwaysSteer = readAlwaysSteer();
+      onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
+      writeAlwaysSteer(alwaysSteer);
+      useChatStore.setState({
+        // A reused entry would skip mirroring an unchanged status onto the root store.
+        conversationId: `conv_placeholder_${sessionStatus}_${alwaysSteer}`,
+        queuedMessages: [],
+        sessionStatus,
+      });
       render(
         <Composer
           {...composerProps({ status: "idle", isWorking: computeIsWorking(sessionStatus) })}
