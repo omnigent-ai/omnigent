@@ -426,7 +426,7 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`sandbox-worktree-note`:**
   `tests/e2e_ui/start_session/test_start_session.py::test_start_session_managed_repository_uses_workspace_bar`
   checks the chip's label on desktop, its collapsed label on a phone viewport,
-  and the tapped note on a stubbed managed deployment. Component coverage:
+  and the clicked note on a stubbed managed deployment. Component coverage:
   `web/src/shell/NewChatDialog.test.tsx`.
 - **`pill-opens-config`:**
   `tests/e2e_ui/chat/test_composer_pill_hover_matches_hit_area.py::test_composer_pill_highlighted_label_is_clickable`

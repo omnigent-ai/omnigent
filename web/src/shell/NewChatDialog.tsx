@@ -6720,7 +6720,8 @@ export function NewChatLandingScreen() {
                 </PopoverTrigger>
                 <PopoverContent
                   align="start"
-                  className="w-80 p-3"
+                  collisionPadding={16}
+                  className="w-[min(20rem,calc(100vw-2rem))] p-3"
                   aria-label={`Worktrees unavailable in ${selectedSandboxLabel}`}
                 >
                   <p
