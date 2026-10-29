@@ -340,10 +340,12 @@ function createSshSession(options) {
     args,
     { stdin = null, holdStdin = false, timeoutMs, onStdout, onStderr, baseArgs = sshArgs } = {},
   ) {
-    // Nothing new starts after abort: with the master gone, ssh would quietly open
-    // a fresh connection of its own and carry on.
-    if (aborted) {
-      const result = { code: null, stdout: "", stderr: "", timedOut: false };
+    // Nothing new starts after abort or once the master exits: with the master gone,
+    // ssh would quietly open a fresh connection, maybe to another machine, and carry on.
+    if (aborted || masterExited) {
+      const result = aborted
+        ? { code: null, stdout: "", stderr: "", timedOut: false }
+        : { code: 255, stdout: "", stderr: "the connection closed", timedOut: false };
       return { promise: Promise.resolve(result), cancel: () => {} };
     }
     let child;
@@ -456,6 +458,10 @@ function createSshSession(options) {
             ),
           );
         });
+        // `exit` comes first; `close` can wait on a ProxyCommand child holding stderr.
+        master.on("exit", () => {
+          masterExited = true;
+        });
         master.on("close", (code) => {
           masterExited = true;
           children.delete(master);
@@ -514,18 +520,20 @@ function createSshSession(options) {
 
     /** End the shared connection, killing it if it doesn't exit in time. */
     async close() {
-      if (!master || masterExited) return;
-      await control("exit");
+      if (!master) return;
+      if (!masterExited) await control("exit");
       if (!masterExited) {
         await new Promise((resolve) => {
           const timer = setTimeout(() => {
             master.kill();
             resolve();
           }, CLOSE_GRACE_MS);
-          master.once("close", () => {
+          const done = () => {
             clearTimeout(timer);
             resolve();
-          });
+          };
+          master.once("exit", done);
+          master.once("close", done);
         });
       }
       // A ProxyCommand child can outlive ssh while holding its stderr open.

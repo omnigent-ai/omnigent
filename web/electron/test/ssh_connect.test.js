@@ -708,15 +708,66 @@ describe("createSshSession", () => {
     });
   });
 
-  it("starts no ssh once aborted, so nothing reconnects on its own", async () => {
+  // Either way the master is gone, and ssh would otherwise quietly reconnect on its own.
+  const stops = {
+    "it is aborted": [(session) => session.abort(), { code: null, stderr: "" }],
+    "its connection exits after opening": [
+      (_session, master) => master.emit("exit", 255),
+      { code: 255, stderr: "the connection closed" },
+    ],
+  };
+  for (const [label, [stop, refused]] of Object.entries(stops)) {
+    it(`starts no ssh once ${label}`, async () => {
+      const spawned = [];
+      let master;
+      const spawn = (command, args) => {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.kill = () => child.emit("close", null);
+        spawned.push(args.includes("-M") ? "master" : args.join(" "));
+        if (args.includes("-M")) master = child;
+        else setImmediate(() => child.emit("close", 0));
+        return child;
+      };
+      const session = createSshSession({
+        destination: "my-ec2",
+        socketPath: "/tmp/s/m",
+        spawn,
+        pathExists: () => true,
+      });
+      await session.open();
+      const before = spawned.length;
+
+      stop(session, master);
+
+      const forward = await session.forwardLocal(8020);
+      const run = await session.exec("true").promise;
+      assert.deepEqual([forward.code, forward.stderr], [refused.code, refused.stderr]);
+      assert.deepEqual([run.code, run.stderr], [refused.code, refused.stderr]);
+      assert.equal(spawned.length, before);
+    });
+  }
+
+  it("doesn't start the host when the connection drops right after sign-in", async () => {
     const spawned = [];
+    let master;
     const spawn = (command, args) => {
       const child = new EventEmitter();
       child.stdout = new EventEmitter();
       child.stderr = new EventEmitter();
       child.kill = () => child.emit("close", null);
-      spawned.push(args.includes("-M") ? "master" : args.join(" "));
-      if (!args.includes("-M")) setImmediate(() => child.emit("close", 0));
+      const line = args.join(" ");
+      spawned.push(line);
+      if (args.includes("-M")) {
+        master = child;
+        return child;
+      }
+      setImmediate(() => {
+        // Sign-in succeeds, then the shared connection drops before the next step.
+        if (line.includes("omnigent login")) master.emit("exit", 255);
+        child.emit("close", 0);
+      });
       return child;
     };
     const session = createSshSession({
@@ -725,14 +776,16 @@ describe("createSshSession", () => {
       spawn,
       pathExists: () => true,
     });
-    await session.open();
-    const before = spawned.length;
+    const { ctx } = connectContext(session);
 
-    session.abort();
+    const result = await runSshConnect(ctx);
 
-    assert.equal((await session.forwardLocal(8020)).code, null);
-    assert.equal((await session.exec("true").promise).code, null);
-    assert.equal(spawned.length, before);
+    assert.deepEqual(result, {
+      ok: false,
+      error: "Starting the Omnigent host on my-ec2 failed: the connection closed",
+    });
+    assert.ok(spawned.some((line) => line.includes("omnigent login")));
+    assert.ok(!spawned.some((line) => line.includes("omnigent host")), spawned.join("\n"));
   });
 
   it("opens one shared connection and sends forwards over it", async () => {
