@@ -47,6 +47,12 @@ import {
   saveAskUserQuestionDraft,
 } from "@/lib/askUserQuestionDrafts";
 import {
+  ACK_SETTLE_MS,
+  getLocalElicitationResolutions,
+  observeSessionPendingCounts,
+  resetLocalElicitationResolutionsForTests,
+} from "@/lib/localElicitationResolutions";
+import {
   clearSessionDrafts,
   getSessionDraft,
   promoteSessionDraft,
@@ -563,6 +569,7 @@ afterEach(() => {
   // `reader.read()`. Close the streams so those reads actually settle.
   closeOpenEmptyStreams();
   resetStreamSlotManager();
+  resetLocalElicitationResolutionsForTests();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   // Reset the stubbed viewer identity to the default (null) so a value set
@@ -10920,6 +10927,7 @@ describe("chatStore — submitApproval", () => {
       expect(block.status).toBe("pending");
       expect(block.response).toBeNull();
     }
+    expect(getLocalElicitationResolutions().answeredElicitationIds.has("elic_xyz")).toBe(false);
   });
 
   it("rolls back on the answering conversation when the failure outlives a switch", async () => {
@@ -21473,3 +21481,53 @@ it.each(["restore", "newer", "foreign", "delivered", "no-id", "refused", "unsett
     if (scenario !== "foreign") expect(takeFailedSendDraft(id, false)).toBeNull();
   },
 );
+
+describe("chatStore — sidebar holds for submitted verdicts", () => {
+  it("holds the answer while the POST is in flight and keeps it once acknowledged", async () => {
+    bindConversationForTest("conv_hold");
+    observeSessionPendingCounts([{ id: "conv_hold", pending_elicitations_count: 1 }]);
+    useChatStore.setState({ blocks: [elicitationBlock("elic_hold")] });
+    let finish!: (response: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+
+    const submitting = useChatStore.getState().submitApproval("elic_hold", "accept");
+
+    expect(getLocalElicitationResolutions().answeredElicitationIds.has("elic_hold")).toBe(true);
+    expect(getLocalElicitationResolutions().heldBySession.get("conv_hold")?.answers).toBe(1);
+
+    finish(mockResponse({ queued: false }, { ok: true, status: 202 }));
+    await submitting;
+
+    expect(getLocalElicitationResolutions().answeredElicitationIds.has("elic_hold")).toBe(true);
+  });
+
+  it.each([
+    ["succeeds", { ok: true, status: 202 }],
+    ["fails", { ok: false, status: 500 }],
+  ] as const)("keeps a retry's hold when the earlier POST %s", async (_outcome, init) => {
+    vi.useFakeTimers();
+    bindConversationForTest("conv_hold_retry");
+    useChatStore.setState({ blocks: [elicitationBlock("elic_retry")] });
+    const finishes: ((response: Response) => void)[] = [];
+    const deferred = () =>
+      new Promise<Response>((resolve) => {
+        finishes.push(resolve);
+      });
+    fetchMock.mockImplementationOnce(deferred).mockImplementationOnce(deferred);
+
+    const earlier = useChatStore.getState().submitApproval("elic_retry", "accept");
+    const retry = useChatStore.getState().submitApproval("elic_retry", "accept");
+    finishes[0]?.(mockResponse({ queued: false }, init));
+    await earlier;
+    vi.advanceTimersByTime(ACK_SETTLE_MS);
+
+    expect(getLocalElicitationResolutions().answeredElicitationIds.has("elic_retry")).toBe(true);
+    finishes[1]?.(mockResponse({ queued: false }, { ok: true, status: 202 }));
+    await retry;
+  });
+});

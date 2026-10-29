@@ -61,6 +61,12 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
@@ -3448,6 +3454,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           : b,
       ),
     }));
+    // Sidebar counts drop now, before the server confirms the verdict.
+    const holdToken = beginLocalElicitationResolution(
+      elicitationId,
+      affectedSessionIds(
+        [sessionId, targetSessionId],
+        (knownSessionId) =>
+          queryClient?.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+      ),
+      { nativeDelivery: Boolean(originalBlock?.nativeDelivery) },
+    );
     // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
     // dismissed without deciding. Fires on the user's action (live only).
     emitInteractionPhase({
@@ -3464,11 +3480,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      acknowledgeLocalElicitationResolution(elicitationId, holdToken);
       clearAskUserQuestionDraft(elicitationId);
       if (elicitationRechecksAfterVerdict.delete(elicitationId)) {
         void recheckAnsweredElicitation(sessionId, elicitationId);
       }
     } catch {
+      cancelLocalElicitationResolution(elicitationId, holdToken);
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.

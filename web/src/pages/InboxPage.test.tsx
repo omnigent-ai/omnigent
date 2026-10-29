@@ -23,6 +23,7 @@ import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
+import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
 import {
   type AskUserQuestionDraft,
@@ -174,6 +175,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   resetReadStateForTests();
+  resetLocalElicitationResolutionsForTests();
   localStorage.clear();
   clearAskUserQuestionDraft("eli_1");
   clearAskUserQuestionDraft("eli_question");
@@ -369,6 +371,25 @@ describe("InboxPage approval items", () => {
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
     expect(getAskUserQuestionDraft("eli_1", draftSignature)).toBeUndefined();
+  });
+
+  it("keeps an answered approval of an unseen idle session out of the unread list", async () => {
+    // WHY: answering lowers the sidebar's count at once, but the card stays listed
+    // until the server drops the prompt, so the session must not also read as unread.
+    const row = unreadConversation({ pending_elicitations_count: 1 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(sessionsApi.approve).mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
+    );
+    expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument();
   });
 
   it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
