@@ -22,6 +22,10 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 - `canvas`: when Canvas is enabled, follow a request link on a session card.
 - `agent-tool`: create or update a request through the session's agent tools.
 
+Select a row in the PR list to open its details; **All pull requests** returns
+to the list. Stored metadata and row actions remain available while the host
+is offline; checks and merge controls resume after reconnection.
+
 ## Driving it with the repro environment
 
 Preconditions: use the [Verify Omnigent skill](skills/verify-omnigent/SKILL.md)
