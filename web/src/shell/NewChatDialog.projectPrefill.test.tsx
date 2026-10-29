@@ -41,6 +41,7 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
+import { writeProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -1223,6 +1224,92 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.cost_control_mode_override).not.toBe("on");
     expect(body.model_override).toBe("gpt-mini");
     expect(body.reasoning_effort).toBe("low");
+  });
+
+  // ── Last start ── a project's composer reopens on how its last session
+  // started, even after a later start elsewhere moved the app-global picks
+  // (last agent, per-harness model + effort, most recent workspace).
+  async function startAndLeave(): Promise<Record<string, unknown>> {
+    const body = await submitAndReadBody();
+    // Navigation is the create flow's last step.
+    await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+    cleanup();
+    navigateMock.mockReset();
+    vi.mocked(authenticatedFetch).mockReset();
+    return body;
+  }
+
+  function pickCodexModelAndEffort(model: string, effort: string): void {
+    openAgentConfig(CODEX_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: model }));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-effort-${effort}`));
+    closeAgentConfig();
+  }
+
+  it("reopens a project on its last start after a later start in another project", async () => {
+    const BETA_REPO = "/Users/corey/projects/beta";
+    setCodexAgentAndModels(["low", "medium", "high"]);
+    vi.mocked(useProjectConfig).mockImplementation(
+      (id) =>
+        ({
+          data: id === "proj_beta" ? { host_id: "host_1", workspace: BETA_REPO } : {},
+          isLoading: false,
+        }) as ReturnType<typeof useProjectConfig>,
+    );
+    // Codex's catalog default model runs unpinned (no model_override), so
+    // remembering it means sending no model again.
+    const expectAlphaStart = (body: Record<string, unknown>) => {
+      expect(body).toMatchObject({
+        agent_id: CODEX_AGENT_ID,
+        reasoning_effort: "high",
+        workspace: RECENT_WORKSPACE,
+      });
+      expect("model_override" in body).toBe(false);
+    };
+
+    renderLanding();
+    selectAgent(CODEX_AGENT_ID);
+    await waitForCodexAgent();
+    pickCodexModelAndEffort("GPT-5.5", "high");
+    expectAlphaStart(await startAndLeave());
+
+    // Beta starts Codex on another model and effort, in Beta's own workspace.
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("beta"),
+    );
+    await waitForCodexAgent();
+    pickCodexModelAndEffort("GPT mini", "low");
+    expect(await startAndLeave()).toMatchObject({
+      model_override: "gpt-mini",
+      reasoning_effort: "low",
+    });
+
+    // Alpha stores no config, so its last start rides explicitly.
+    searchParams = new URLSearchParams("project=Alpha");
+    renderLanding();
+    await waitForCodexAgent();
+    expectAlphaStart(await submitAndReadBody());
+  });
+
+  it("lets project settings edited after the last start win", async () => {
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      { agentId: "ag_other", hostId: "host_1", workspace: RECENT_WORKSPACE },
+      {},
+    );
+    setProjectConfig({ host_id: "host_1", workspace: REPO, agent_id: "ag_hello" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+
+    // Both slots hold the edited config's values, so the create leaves them
+    // to the server's default-fill.
+    const body = await submitAndReadBody();
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
   });
 
   it("seeds a Pi-only project effort for a Pi agent", async () => {

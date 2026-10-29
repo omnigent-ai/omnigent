@@ -1,12 +1,17 @@
 // Pure state-machine tests for the project-prefill config seeding. The
 // component-level rules live in NewChatDialog.projectPrefill.test.tsx; these
 // pin the transitions that need mid-flight timing (a user acting between the
-// config loading and resolving), which the rendered harness can't sequence.
+// config loading and resolving), which the rendered harness can't sequence,
+// plus the precedence rules for overlaying a project's last start.
 import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
-import { initialPrefillState, projectPrefillStep } from "./projectPrefill";
+import {
+  initialPrefillState,
+  projectPrefillStep,
+  withProjectLaunchDefaults,
+} from "./projectPrefill";
 
 const hosts: Host[] = [
   { host_id: "host_1", name: "laptop", owner: "corey", status: "online" },
@@ -221,5 +226,47 @@ describe("projectPrefill agent seeding", () => {
     // Host track can still settle, but the agent track stays open.
     expect(step).not.toBeNull();
     expect(step!.state.agentSeeded).toBe(false);
+  });
+});
+
+describe("withProjectLaunchDefaults", () => {
+  const stored = {
+    hostId: "host_1",
+    workspace: "/repos/alpha",
+    agentId: "ag_claude",
+    model: "opus",
+    effort: "low",
+    useWorktree: true,
+  };
+
+  it("keeps the stored defaults when the project has no last start", () => {
+    expect(withProjectLaunchDefaults(stored, null)).toEqual(stored);
+  });
+
+  it("replaces the stored agent and drops the stored agent's model and effort", () => {
+    // "opus" / "low" belong to Claude's harness; the Codex start's own model and
+    // effort ride in its harness options, which the composer seeds instead.
+    const launch = {
+      agentId: "ag_codex",
+      harness: "codex-native",
+      harnessOptions: { model: "", effort: "high" },
+    };
+    expect(withProjectLaunchDefaults(stored, launch)).toEqual({
+      ...stored,
+      agentId: "ag_codex",
+      model: undefined,
+      effort: undefined,
+    });
+  });
+
+  it("replaces the stored host together with its working directory", () => {
+    expect(withProjectLaunchDefaults(stored, { hostId: SANDBOX_HOST_CHOICE })).toEqual({
+      ...stored,
+      hostId: SANDBOX_HOST_CHOICE,
+      workspace: undefined,
+    });
+    expect(
+      withProjectLaunchDefaults({}, { hostId: "host_2", workspace: "/repos/working-dir-b" }),
+    ).toEqual({ hostId: "host_2", workspace: "/repos/working-dir-b" });
   });
 });

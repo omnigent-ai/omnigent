@@ -1,13 +1,15 @@
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 
 type ProjectPrefillPhase = "location" | "settled";
 
 /**
- * A project's stored session defaults, as the composer consumes them. This is
- * the ONLY project-driven prefill source: a set field seeds the composer, and
- * an absent field falls through to the composer's generic defaults (last host /
- * recent workspace / last-used agent).
+ * A project's session defaults, as the composer consumes them: its stored
+ * config overlaid with how its last session started (withProjectLaunchDefaults).
+ * This is the ONLY project-driven prefill source: a set field seeds the
+ * composer, and an absent field falls through to the composer's generic
+ * defaults (last host / recent workspace / last-used agent).
  *
  * `undefined` means the config is still loading for a project that has one — the
  * machine WAITS in that case so a generic default can't win the race. Pass an
@@ -28,6 +30,31 @@ export interface ProjectPrefillConfig {
   /** Default reasoning effort for the configured agent; consumed by the same
    *  harness-seed effect as `model`. */
   effort?: string;
+}
+
+/**
+ * Overlay how a project's last session started on its stored defaults. A
+ * started agent replaces the stored agent and drops the stored model and
+ * effort, which belong to the stored agent's harness (the start's own model and
+ * effort ride in its harness options instead). A started host replaces the
+ * stored host together with its working directory, which is a path on that host.
+ */
+export function withProjectLaunchDefaults(
+  config: ProjectPrefillConfig,
+  launch: ProjectLaunchDefaults | null,
+): ProjectPrefillConfig {
+  if (launch === null) return config;
+  const merged = { ...config };
+  if (launch.agentId !== undefined) {
+    merged.agentId = launch.agentId;
+    merged.model = undefined;
+    merged.effort = undefined;
+  }
+  if (launch.hostId !== undefined) {
+    merged.hostId = launch.hostId;
+    merged.workspace = launch.workspace;
+  }
+  return merged;
 }
 
 export interface ProjectPrefillState {

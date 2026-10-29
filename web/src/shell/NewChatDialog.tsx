@@ -178,12 +178,17 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
@@ -2253,7 +2258,9 @@ export function NewChatLandingScreen() {
     [pickerCacheKey],
   );
   // Project prefill source: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
+  // project's stored defaults (host / working directory / agent / worktree),
+  // overlaid with how the project's last session started (agent / harness
+  // options / host / working directory, remembered in localStorage).
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
   // has no config to read. Resolved before the agent catalog below so the
@@ -2268,6 +2275,23 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
+  // The project's last start wins until its stored defaults are edited after it.
+  const projectLaunch = useMemo(
+    () =>
+      configProjectId === null || projectConfigLoading
+        ? null
+        : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {}),
+    [configProjectId, projectConfigLoading, storedProjectConfig],
+  );
+  // The options the last start's harness launched with outrank the app-global
+  // per-harness memory for that harness.
+  const readRememberedHarnessOptions = useCallback(
+    (harness: string | null | undefined): HarnessOptions =>
+      harness != null && projectLaunch?.harness === harness
+        ? { ...readHarnessOptions(harness), ...projectLaunch.harnessOptions }
+        : readHarnessOptions(harness),
+    [projectLaunch],
+  );
   // Normalize into the machine's shape. `undefined` = still loading (the machine
   // waits so a generic default can't win the race); `{}` = nothing to wait for
   // (plain visit / label-only folder / genuinely empty config), so it settles
@@ -2279,21 +2303,24 @@ export function NewChatLandingScreen() {
     if (projectParam !== "" && projectListLoading) return undefined;
     if (configProjectId !== null && projectConfigLoading) return undefined;
     const c = storedProjectConfig;
-    if (!c) return {};
-    return {
-      hostId: c.host_id,
-      workspace: c.workspace,
-      agentId: c.agent_id,
-      useWorktree: c.use_worktree,
-      model: c.model,
-      effort: c.effort,
-    };
+    const stored: ProjectPrefillConfig = c
+      ? {
+          hostId: c.host_id,
+          workspace: c.workspace,
+          agentId: c.agent_id,
+          useWorktree: c.use_worktree,
+          model: c.model,
+          effort: c.effort,
+        }
+      : {};
+    return withProjectLaunchDefaults(stored, projectLaunch);
   }, [
     projectParam,
     projectListLoading,
     configProjectId,
     projectConfigLoading,
     storedProjectConfig,
+    projectLaunch,
   ]);
 
   // Preserve a configured agent through name deduplication when it is in the
@@ -4187,7 +4214,7 @@ export function NewChatLandingScreen() {
         const harness = agent.id === effectiveAgentId ? pickedHarness : readLastHarness(agent.id);
         return [agent.id, brainHarnessLabelsAll[harness ?? agent.harness ?? ""] ?? "Default"];
       }
-      const saved = readHarnessOptions(native.harness);
+      const saved = readRememberedHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
       const catalogSuppressed = sandboxHasModelCatalog && native.harness !== previewHarness;
       const catalog = catalogSuppressed
@@ -4339,7 +4366,7 @@ export function NewChatLandingScreen() {
         ? pickerEdits.options
         : {};
     const stored = {
-      ...readHarnessOptions(selectedNativeHarness),
+      ...readRememberedHarnessOptions(selectedNativeHarness),
       ...editedOptions,
     };
     // Resolve the mode to the stored value when it's still valid for this
@@ -4466,8 +4493,8 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
-    // Reseed on harness, host-catalog, and async project model/effort changes;
-    // capability flags derive from the harness.
+    // Reseed on harness, host-catalog, and async project model/effort or
+    // last-start changes; capability flags derive from the harness.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4477,6 +4504,7 @@ export function NewChatLandingScreen() {
     piModelOptions,
     projectDefaultModel,
     projectDefaultEffort,
+    readRememberedHarnessOptions,
   ]);
   useEffect(() => {
     if (!sandboxDefaultModelsEnabled || !previewHarness) return;
@@ -4484,7 +4512,7 @@ export function NewChatLandingScreen() {
       pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === previewHarness
         ? pickerEdits.options
         : {};
-    const saved = { ...readHarnessOptions(previewHarness), ...edited };
+    const saved = { ...readRememberedHarnessOptions(previewHarness), ...edited };
     const candidate =
       !userPickedModelRef.current && projectDefaultModel != null
         ? projectDefaultModel
@@ -4509,6 +4537,7 @@ export function NewChatLandingScreen() {
     pickerEdits,
     projectDefaultModel,
     projectDefaultEffort,
+    readRememberedHarnessOptions,
     setPickedModel,
   ]);
   useEffect(() => {
@@ -4544,7 +4573,7 @@ export function NewChatLandingScreen() {
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
-        : undefined) ?? readHarnessOptions(selectedNativeHarness).routing;
+        : undefined) ?? readRememberedHarnessOptions(selectedNativeHarness).routing;
     if (storedRouting === undefined) return;
     setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
   }, [
@@ -4556,6 +4585,7 @@ export function NewChatLandingScreen() {
     projectDefaultEffortValid,
     setCostControlMode,
     pickerEdits,
+    readRememberedHarnessOptions,
   ]);
   // Top-level Smart Routing pins permissions to Default (no override sent), so
   // entering it resets the mode rather than restoring one: nothing is remembered
@@ -5818,17 +5848,19 @@ export function NewChatLandingScreen() {
       // from the config. Any user interaction — even re-picking the exact
       // config value — cleared the ref, so an explicit choice is always SENT
       // (the server treats it as authoritative and only warns on mismatch).
-      // The value-equality guard covers seeds later displaced without a write.
+      // The value-equality guard compares against the server's copy of the
+      // config: it covers seeds later displaced without a write, and seeds from
+      // the project's last start, which the server would not fill in.
       const agentFromProjectConfig =
         createProjectId !== null &&
         agentFromConfigRef.current &&
-        prefillConfig?.agentId != null &&
-        effectiveAgentId === prefillConfig.agentId;
+        storedProjectConfig?.agent_id != null &&
+        effectiveAgentId === storedProjectConfig.agent_id;
       const workspaceFromProjectConfig =
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
-        prefillConfig?.workspace != null &&
-        workspaceTrimmed === prefillConfig.workspace;
+        storedProjectConfig?.workspace != null &&
+        workspaceTrimmed === storedProjectConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -6115,8 +6147,9 @@ export function NewChatLandingScreen() {
       // storage eagerly so an immediate Send cannot observe stale state; this
       // successful-create snapshot also covers restored drafts and every
       // harness-specific creation path.
+      let launchedOptions: HarnessOptions | null = null;
       if (!smartRoutingHarnessSelected) {
-        const launchedOptions = createdHarnessOptions({
+        launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
           supportsDevinMode,
@@ -6141,6 +6174,7 @@ export function NewChatLandingScreen() {
           writeHarnessOption(selectedNativeHarness, launchedOptions);
         }
       }
+      let launchProjectId = createProjectId;
       if (createProjectId !== null) {
         // The create filed the session atomically via first-class
         // `project_id` — no follow-up move. Still refresh the project lists:
@@ -6161,7 +6195,10 @@ export function NewChatLandingScreen() {
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
           const filed = await moveConversationToProject(data.id, selectedProject);
-          if (filed?.project_id) createdCanvasId = filed.project_id;
+          if (filed?.project_id) {
+            createdCanvasId = filed.project_id;
+            launchProjectId = filed.project_id;
+          }
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -6173,6 +6210,29 @@ export function NewChatLandingScreen() {
           // `project_id` promotion fails — the sidebar's dual-read grouping
           // still shows it under the project.
         }
+      }
+      // This start becomes the project's default for its next session. A
+      // just-created custom agent is skipped: its id only exists server-side.
+      if (launchProjectId !== null) {
+        writeProjectLaunchDefaults(
+          launchProjectId,
+          {
+            ...(effectiveAgentId !== PENDING_AGENT_ID
+              ? {
+                  agentId: effectiveAgentId ?? undefined,
+                  ...(launchedOptions !== null
+                    ? {
+                        harness: selectedNativeHarness ?? undefined,
+                        harnessOptions: launchedOptions,
+                      }
+                    : {}),
+                }
+              : {}),
+            hostId: sandboxSelected ? SANDBOX_HOST_CHOICE : (selectedHostId ?? undefined),
+            workspace: sandboxSelected ? undefined : workspaceTrimmed,
+          },
+          storedProjectConfig ?? {},
+        );
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
