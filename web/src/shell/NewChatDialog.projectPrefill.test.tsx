@@ -32,7 +32,7 @@ import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -41,7 +41,10 @@ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
-import { writeProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import {
+  clearProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -1422,6 +1425,29 @@ describe("NewChatLandingScreen project prefill", () => {
       expect((await submitAndReadBody()).agent_id).toBe(sentAgentId);
     },
   );
+
+  it("drops a last start that a Project settings save clears while the composer is open", async () => {
+    const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_hello" };
+    setProjectConfig(config);
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      { agentId: "ag_other", pickedHarness: null, hostId: "host_1", workspace: RECENT_WORKSPACE },
+      config,
+    );
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("foo"),
+    );
+
+    act(() => clearProjectLaunchDefaults("proj_alpha"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
+    );
+    // Back on the stored settings, which the create leaves to the server.
+    const body = await submitAndReadBody();
+    expect("agent_id" in body).toBe(false);
+    expect("workspace" in body).toBe(false);
+  });
 
   it("lets project settings edited after the last start win", async () => {
     writeProjectLaunchDefaults(

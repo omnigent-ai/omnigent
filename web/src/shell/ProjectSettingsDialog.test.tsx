@@ -712,6 +712,28 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
+  it("replaces the last start even when the saved settings match the stored ones", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults(
+      "p_1",
+      { agentId: "ag_claude", pickedHarness: null },
+      { agent_id: "ag_1" },
+    );
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+
+    // Restore the stored agent, so the saved settings match the stored ones.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
+    await waitFor(() => expect(readProjectLaunchDefaults("p_1", { agent_id: "ag_1" })).toBeNull());
+  });
+
   it("saves a last-start agent still resolving with its own model and effort", async () => {
     // Discovery so far holds only catalog rows, without the remembered agent.
     availableAgentsMock.mockReturnValue({ data: [claudeAgent()], isPlaceholderData: true });

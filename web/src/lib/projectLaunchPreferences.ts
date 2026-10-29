@@ -121,3 +121,26 @@ export function writeProjectLaunchDefaults(
     // localStorage quota or access errors shouldn't break the composer.
   }
 }
+
+const CLEARED_EVENT = "omnigent:project-launch-defaults-cleared";
+
+/**
+ * Forget how `projectId`'s last session started, once its settings are saved,
+ * and tell open composers to re-read it. Swallows quota/access errors.
+ */
+export function clearProjectLaunchDefaults(projectId: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const { [projectId]: _cleared, ...rest } = readAll();
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(rest));
+  } catch {
+    // localStorage quota or access errors shouldn't break the settings save.
+  }
+  window.dispatchEvent(new Event(CLEARED_EVENT));
+}
+
+/** Call `listener` after any project's last start is cleared; returns an unsubscribe. */
+export function onProjectLaunchDefaultsCleared(listener: () => void): () => void {
+  window.addEventListener(CLEARED_EVENT, listener);
+  return () => window.removeEventListener(CLEARED_EVENT, listener);
+}

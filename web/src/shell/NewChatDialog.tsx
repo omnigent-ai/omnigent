@@ -186,6 +186,7 @@ import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
 import {
+  onProjectLaunchDefaultsCleared,
   readProjectLaunchDefaults,
   writeProjectLaunchDefaults,
 } from "@/lib/projectLaunchPreferences";
@@ -2273,14 +2274,16 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
-  // The project's last start wins until its stored defaults are edited after it.
-  const projectLaunch = useMemo(
-    () =>
-      configProjectId === null || projectConfigLoading
-        ? null
-        : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {}),
-    [configProjectId, projectConfigLoading, storedProjectConfig],
-  );
+  // The project's last start wins until its stored defaults are saved after it;
+  // a Project settings save clears it, so re-read it then.
+  const [launchClears, setLaunchClears] = useState(0);
+  useEffect(() => onProjectLaunchDefaultsCleared(() => setLaunchClears((count) => count + 1)), []);
+  const projectLaunch = useMemo(() => {
+    void launchClears;
+    return configProjectId === null || projectConfigLoading
+      ? null
+      : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {});
+  }, [configProjectId, projectConfigLoading, storedProjectConfig, launchClears]);
   // Option keys picked per harness during this visit. A pick also updates the
   // app-global memory, so those keys keep coming from there.
   const pickedOptionKeysRef = useRef(new Map<string, Set<string>>());

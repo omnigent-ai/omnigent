@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SANDBOX_HOST_CHOICE } from "./hostPreferences";
 import {
+  clearProjectLaunchDefaults,
+  onProjectLaunchDefaultsCleared,
   projectConfigWithLaunch,
   readProjectLaunchDefaults,
   writeProjectLaunchDefaults,
@@ -64,6 +66,19 @@ describe("projectLaunchPreferences", () => {
     expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
     writeProjectLaunchDefaults("proj_a", START, {});
     expect(readProjectLaunchDefaults("proj_a", {})).toEqual(START);
+  });
+
+  it("clears one project's start and notifies listeners", () => {
+    writeProjectLaunchDefaults("proj_a", START, {});
+    writeProjectLaunchDefaults("proj_b", START, {});
+    const listener = vi.fn();
+    const unsubscribe = onProjectLaunchDefaultsCleared(listener);
+    clearProjectLaunchDefaults("proj_a");
+    expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
+    expect(readProjectLaunchDefaults("proj_b", {})).toEqual(START);
+    unsubscribe();
+    clearProjectLaunchDefaults("proj_b");
+    expect(listener).toHaveBeenCalledTimes(1);
   });
 
   it("never throws when storage is inaccessible", () => {

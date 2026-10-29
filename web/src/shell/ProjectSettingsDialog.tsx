@@ -39,7 +39,11 @@ import {
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
-import { projectConfigWithLaunch, readProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import {
+  clearProjectLaunchDefaults,
+  projectConfigWithLaunch,
+  readProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { shouldGuardDialogDismiss } from "@/lib/dialogDismissGuard";
 import { AgentHarnessPicker } from "./NewChatDialog";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -250,7 +254,14 @@ export function ProjectSettingsDialog({
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
-      { onSuccess: () => onOpenChange(false) },
+      {
+        onSuccess: () => {
+          // The saved settings replace the last start, even when they match the
+          // settings it was recorded against.
+          if (projectId !== null) clearProjectLaunchDefaults(projectId);
+          onOpenChange(false);
+        },
+      },
     );
   };
 
