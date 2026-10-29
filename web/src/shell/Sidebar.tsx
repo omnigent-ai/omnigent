@@ -2490,12 +2490,9 @@ function ConversationList({
     });
   }, []);
 
-  // Sessions each ProjectFolder has loaded, keyed by project name, with how many
-  // it lists above "Show more" (a prefix of `conversations`). A folder paginates
-  // independently of the global window, so its rows can include members the
-  // global list hasn't loaded; projects-scope selection must resolve against
-  // these to avoid silently dropping an out-of-window row from a bulk action.
-  // Folders report via `onConversationsLoaded`.
+  // Each folder's loaded rows and how many it lists above "Show more", by name.
+  // Projects-scope selection resolves against these, so a member the global
+  // window hasn't loaded isn't dropped from a bulk action.
   const [folderConversations, setFolderConversations] = useState<
     Map<string, { conversations: Conversation[]; visibleCount: number }>
   >(() => new Map());
@@ -2597,10 +2594,8 @@ function ConversationList({
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list;
-    // A project's chats are navigable only when the "Projects" group is
-    // expanded AND that individual project folder is expanded (folders are
-    // collapsed unless explicitly opened — inverse of the fixed sections), and
-    // only down to its "Show more".
+    // A project's chats are navigable only while the "Projects" group and that
+    // folder are both expanded (folders start collapsed), down to its "Show more".
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
       !projectsCollapsed && expandedProjects.includes(group.name) ? folderVisibleRows(group) : [];
@@ -2615,13 +2610,9 @@ function ConversationList({
         : visible("Chats", sections.sessions)),
     ].map((c) => c.id);
   }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects, folderVisibleRows]);
-  // Getter for the shift-select range, built on demand (at click time). Scopes
-  // to whichever section is selectable: the flat Sessions list, or the sessions
-  // across expanded project folders (in render order). For projects scope the
-  // range uses each folder's own reported rows — the same source the folder
-  // renders — so a shift target the global window hasn't loaded still resolves.
-  // Rows outside the active scope or behind "Show more" have no checkboxes, so
-  // they never enter a range.
+  // Shift-select range ids in render order, built at click time from the
+  // selectable scope. Folders contribute the rows they list above "Show more"
+  // (their own reports), so a target outside the global window still resolves.
   getVisibleIdsRef.current = () => {
     const projectIds = () => {
       if (effectiveCollapsedSections.includes("Projects")) return [];
