@@ -344,3 +344,19 @@ def test_silence_source_blames_a_local_stall_only_when_it_covers_the_silence(
     """A tunnel timeout is a local fault only when this loop was stalled for it."""
     attrs = cast(TunnelDiagnosticAttrs, {"loop_lag_s": loop_lag_s})
     assert silence_source(silent_s, attrs) == expected
+
+
+async def test_liveness_row_repeats_while_connected(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connected tunnel emits its health row periodically, not only on slow operations."""
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_LIVENESS_INTERVAL_S", 0.02)
+    diagnostics = TunnelDiagnostics()
+    liveness_rows: list[TunnelDiagnosticAttrs] = []
+
+    def liveness() -> None:
+        liveness_rows.append(diagnostics.snapshot())
+
+    async with diagnostics.monitoring(lambda: None, liveness_report=liveness):
+        await asyncio.sleep(0.2)
+    assert len(liveness_rows) >= 3
+    assert all("loop_lag_max_s" in row for row in liveness_rows)
