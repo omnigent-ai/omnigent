@@ -110,8 +110,9 @@ _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
 class _CodexNativeInputUndelivered(RuntimeError):
     """Delivery stopped after a proven refusal and before any resubmission."""
 
-    def __init__(self, failure: CodexStartupFailure) -> None:
+    def __init__(self, failure: CodexStartupFailure, *, preserve_session: bool = False) -> None:
         self.failure = failure
+        self.preserve_session = preserve_session
         super().__init__(failure.message)
 
 
@@ -164,6 +165,22 @@ def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
         _LEGACY_BRIDGE_STATE_WAIT_SECONDS,
         configured_timeout + CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     )
+
+
+def _require_codex_binding(bridge_dir: Path, expected: CodexNativeBridgeState) -> None:
+    """Refuse unsent input when an await outlives the original session binding."""
+    current = read_bridge_state(bridge_dir)
+    if current is None or any(
+        getattr(current, field) != getattr(expected, field)
+        for field in ("session_id", "thread_id", "socket_path", "codex_home")
+    ):
+        raise _CodexNativeInputUndelivered(
+            CodexStartupFailure(
+                message="Codex native session changed before this message could be delivered.",
+                remediation="Send the message again in the current session.",
+            ),
+            preserve_session=True,
+        )
 
 
 async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServerClient | None:
@@ -230,6 +247,7 @@ async def _native_delivery_request(
     bridge_dir: Path,
 ) -> CodexMessage:
     """Reconnect once after an authoritative refusal; never retry socket loss."""
+    _require_codex_binding(bridge_dir, state)
     try:
         return await _native_delivery_request_once(client, method, params, state)
     except CodexAppServerResponseError as error:
@@ -252,19 +270,7 @@ async def _native_delivery_request(
             # The rejected request cannot have delivered input, and reconnecting
             # does not send any. Keep the sender's copy if this step fails.
             raise _CodexNativeInputUndelivered(CODEX_APP_SERVER_STOPPED) from exc
-        current = read_bridge_state(bridge_dir)
-        if (
-            current is None
-            or current.session_id != state.session_id
-            or current.thread_id != state.thread_id
-            or current.socket_path != state.socket_path
-        ):
-            raise _CodexNativeInputUndelivered(
-                CodexStartupFailure(
-                    message="Codex native session changed before this message could be delivered.",
-                    remediation="Send the message again in the current session.",
-                )
-            ) from error
+        _require_codex_binding(bridge_dir, state)
         # A second refusal still proves non-delivery. Transport failure after
         # this submission remains ambiguous and cannot authorize another retry.
         return await _native_delivery_request_once(client, method, params, state)
@@ -376,6 +382,7 @@ async def _start_codex_turn(
             effort,
         )
     if settings_overrides:
+        _require_codex_binding(bridge_dir, state)
         await client.request(
             "thread/settings/update",
             {
@@ -383,6 +390,7 @@ async def _start_codex_turn(
                 **settings_overrides,
             },
         )
+        _require_codex_binding(bridge_dir, state)
         # The forwarder and a fresh forwarder state (thread resume / reconnect)
         # re-read config.toml, so mirror what applied; without it they would
         # revert a composer pick to the stale launch value.
@@ -733,7 +741,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # the local cancel above already took effect.
+                except Exception:
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
@@ -827,6 +835,7 @@ class CodexNativeExecutor(Executor):
         startup_failure: CodexStartupFailure | None = None
         undelivered = False
         delivery_unconfirmed = False
+        preserve_session = False
         while True:
             if state is None:
                 (
@@ -919,6 +928,7 @@ class CodexNativeExecutor(Executor):
                     undelivered = True
                 else:
                     try:
+                        _require_codex_binding(self._bridge_dir, state)
                         side_question = side_chat.side_chat_question(input_items)
                         if side_question is not None:
                             # /side opens an ephemeral fork as its own sub-agent chat.
@@ -950,6 +960,7 @@ class CodexNativeExecutor(Executor):
                         elif isinstance(exc, _CodexNativeInputUndelivered):
                             startup_failure = exc.failure
                             undelivered = True
+                            preserve_session = exc.preserve_session
                         elif isinstance(
                             exc, CodexAppServerResponseError
                         ) and is_server_draining_error(exc):
@@ -1003,7 +1014,8 @@ class CodexNativeExecutor(Executor):
                 # explicitly rejected the input.
                 undelivered=undelivered,
                 # Failed delivery does not own cancellation of an independent native turn.
-                preserve_session=delivery_unconfirmed
+                preserve_session=preserve_session
+                or delivery_unconfirmed
                 or (undelivered and state is not None and state.active_turn_id is not None),
             )
         else:
