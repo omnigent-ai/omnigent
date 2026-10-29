@@ -48,6 +48,7 @@ class FrameKind(str, Enum):
     EVENT_READY = "event.ready"
     EVENT_BATCH = "event.batch"
     EVENT_ACK = "event.ack"
+    RENEWAL_READY = "renewal.ready"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -89,6 +90,8 @@ class HelloFrame:
     direct_attach_token: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    renewal_permit: str | None = field(default=None, repr=False)
+    continuity_token: str | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -205,6 +208,8 @@ class WSCloseFrame:
 # Additive extension of the runner tunnel, negotiated after hello. These are
 # not tunneled HTTP responses or terminal WebSocket channel frames.
 EVENT_INGEST_CAPABILITY = "session-event-ingest-v1"
+TUNNEL_RENEWAL_CAPABILITY = "tunnel-renewal-v1"
+TUNNEL_RENEWAL_REJECTED_CLOSE_CODE = 4005
 
 # Close reason (with code 1000) a runner sends when its idle watchdog found no
 # active work, so the server settles the runner's sessions instead of failing them.
@@ -214,6 +219,14 @@ RUNNER_IDLE_SHUTDOWN_CLOSE_REASON = "runner idle shutdown"
 @dataclass
 class EventReadyFrame:
     """Server → runner: event ingestion is available on this tunnel generation."""
+
+
+@dataclass
+class RenewalReadyFrame:
+    """Confirm admission; a nonempty permit enables one future replacement."""
+
+    permit: str | None = field(repr=False)
+    continuity_token: str = field(repr=False)
 
 
 @dataclass
@@ -250,6 +263,7 @@ Frame = (
     | EventReadyFrame
     | EventBatchFrame
     | EventAckFrame
+    | RenewalReadyFrame
 )
 
 
@@ -274,6 +288,10 @@ def encode_frame(frame: Frame) -> str:
             payload["capabilities"] = list(frame.capabilities)
         if frame.connection_id:
             payload["connection_id"] = frame.connection_id
+        if frame.renewal_permit:
+            payload["renewal_permit"] = frame.renewal_permit
+        if frame.continuity_token:
+            payload["continuity_token"] = frame.continuity_token
         # Emitted only when the listener is actually up, so old servers
         # (which ignore unknown keys) and advert-less runners share one
         # wire shape.
@@ -359,6 +377,14 @@ def encode_frame(frame: Frame) -> str:
         )
     if isinstance(frame, EventReadyFrame):
         return json.dumps({"kind": FrameKind.EVENT_READY.value})
+    if isinstance(frame, RenewalReadyFrame):
+        return json.dumps(
+            {
+                "kind": FrameKind.RENEWAL_READY.value,
+                "permit": frame.permit,
+                "continuity_token": frame.continuity_token,
+            }
+        )
     if isinstance(frame, EventBatchFrame):
         return json.dumps(
             {
@@ -462,6 +488,12 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
             return _decode_ws_close(msg)
         case FrameKind.EVENT_READY:
             return EventReadyFrame()
+        case FrameKind.RENEWAL_READY:
+            permit = _optional_nullable_str(msg, "permit")
+            continuity_token = _required_str(msg, "continuity_token")
+            if permit == "" or not continuity_token:
+                raise ValueError("renewal.ready requires nonempty tokens")
+            return RenewalReadyFrame(permit=permit, continuity_token=continuity_token)
         case FrameKind.EVENT_BATCH:
             return EventBatchFrame(
                 id=_required_str(msg, "id"),
@@ -521,6 +553,8 @@ def _decode_hello(msg: _JsonObject) -> HelloFrame:
         direct_attach_token=direct_token,
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_str(msg, "connection_id", "") or None,
+        renewal_permit=_optional_str(msg, "renewal_permit", "") or None,
+        continuity_token=_optional_str(msg, "continuity_token", "") or None,
     )
 
 

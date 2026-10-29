@@ -152,6 +152,8 @@ class WSTunnelTransport(httpx.AsyncBaseTransport):
                 self._runner_id,
                 req_id,
                 generation=request.extensions.get("runner_tunnel_generation"),
+                method=request.method,
+                path=request.url.path,
             )
         except KeyError as exc:
             raise httpx.ConnectError(f"runner {self._runner_id!r} is offline") from exc
