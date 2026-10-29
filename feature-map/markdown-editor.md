@@ -245,8 +245,10 @@ instead of treating one comparison clip as complete feature verification.
   they save inline. Link definition lines show read-only, like footnotes.
 - Saves write top-level blocks the user did not change from the file's source,
   byte-for-byte; only edited blocks are re-serialized, so an edit inside a list
-  or table rewrites that whole list or table. A changed footnote or link
-  definition re-serializes the whole file. An edited block is separated from
+  or table rewrites that whole list or table. Changed definitions, or a kept
+  block that would read differently beside its new neighbour (indented code
+  after a list, an unclosed fence), re-serialize the whole file, so an unrelated
+  block's syntax can still change after a deletion. An edited block is separated from
   its neighbours by exactly one blank line. `web/src/shell/markdownSourceBlocks.ts`.
 - Load measurements do not establish typing latency. Dirty detection compares
   immutable editor documents; autosave writes edited blocks only.

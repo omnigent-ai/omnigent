@@ -384,11 +384,22 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     expect(rememberSourceBlocks).toHaveBeenLastCalledWith(fakeEditor, INITIAL);
     await act(async () => rerender(makeViewer(EDITED)));
     expect(rememberSourceBlocks).toHaveBeenLastCalledWith(fakeEditor, EDITED);
+    // The server now holds the external update, so the pre-write check passes.
+    vi.mocked(fetchFileContent).mockResolvedValue({
+      object: "session.environment.filesystem.file_content",
+      path: PATH,
+      content_type: "text/markdown",
+      encoding: "utf-8",
+      content: EDITED,
+      bytes: EDITED.length,
+    });
     vi.mocked(markdownKeepingSource).mockReturnValue("kept source\n");
     try {
       await act(async () => {
         fakeEditor!.setMarkdown(`${EDITED}more`);
         fakeEditor!.emit("update");
+      });
+      await act(async () => {
         vi.advanceTimersByTime(1000);
       });
       expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: "kept source\n" });

@@ -131,6 +131,12 @@ describe("saving without edits", () => {
     rememberSourceBlocks(ed, "* other");
     expect(saved(ed)).toBe("- star");
   });
+
+  it("forgets the previous source when a replacement was not recorded", () => {
+    const ed = makeEditor("* star");
+    rememberSourceBlocks(ed, "* never parsed");
+    expect(saved(ed)).toBe("- star");
+  });
 });
 
 describe("saving after an edit", () => {
