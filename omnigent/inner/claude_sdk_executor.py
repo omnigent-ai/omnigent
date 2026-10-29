@@ -62,6 +62,7 @@ from omnigent.models.claude_model_vocabulary import (
     served_canonical_overrides,
 )
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_serialization import json_dumps_transport_safe
@@ -87,6 +88,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
@@ -925,6 +927,27 @@ def _ensure_sdk() -> ModuleType:
             "ClaudeSDKExecutor requires the 'claude-agent-sdk' package. "
             "Install it with: pip install claude-agent-sdk"
         ) from exc
+
+
+# Tools of the in-process ``omnigent`` MCP server; only these come back through
+# ``_stable_tool_executor``. Every other tool (Claude Code's ``Skill`` and
+# ``ToolSearch``, or a user-configured MCP server) runs inside the CLI.
+_OMNIGENT_MCP_PREFIX = "mcp__omnigent__"
+
+
+def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
+    """Metadata for a ``ToolCallRequest``: its ``call_id``, and whether the CLI runs it.
+
+    A call the CLI runs itself is marked ``internally_executed`` so the
+    executor adapter keeps its id out of the dispatch-correlation queue.
+    Otherwise the id is never consumed, and every later Omnigent tool
+    dispatch in the turn pairs with the previous call's id, which records
+    each call twice under mismatched ids.
+    """
+    return {
+        "call_id": tool_block.id,
+        "internally_executed": not tool_block.name.startswith(_OMNIGENT_MCP_PREFIX),
+    }
 
 
 def _build_mcp_tools(
@@ -1766,8 +1789,8 @@ class ClaudeSDKExecutor(Executor):
                 :data:`_CLAUDE_API_KEY_HELPER_ENV_KEY` so it reaches
                 the SDK's ``settings.apiKeyHelper`` option at turn time.
         """
-        # Fail loud: a ``databricks-*`` model requires the gateway transport.
-        if not gateway and model is not None and model.startswith("databricks-"):
+        # Fail loud: a Databricks model requires the gateway transport.
+        if not gateway and model is not None and is_databricks_model_id(model):
             raise ValueError(
                 f"Model {model!r} is a Databricks-hosted model but gateway "
                 "routing is disabled (gateway=False). "
@@ -1896,11 +1919,7 @@ class ClaudeSDKExecutor(Executor):
         if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
             self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
-        # Retry policy → Anthropic SDK env vars passed to the Claude
-        # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
-        # ``ANTHROPIC_REQUEST_TIMEOUT_SECONDS`` are speculative — the
-        # CLI's retry budget isn't publicly documented as env-tunable.
-        # See ``RetryPolicy.claude_cli.env()``.
+        # Pass the retry budget and response-header timeout to the Claude CLI.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._extra_env.update(self._retry_policy.claude_cli.env())
 
@@ -2267,6 +2286,9 @@ class ClaudeSDKExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
+    def replays_tool_history(self) -> bool:
+        return True
+
     def supports_live_message_queue(self) -> bool:
         # The SDK has no API to inject into an active turn; claiming this
         # capability caused the one-turn-behind desync described in #3472.
@@ -2508,7 +2530,7 @@ class ClaudeSDKExecutor(Executor):
             return None
         # Omnigent's own tools are already TOOL_CALL-gated server-side via
         # the dispatch bridge / ProxyMcpManager — don't evaluate them twice.
-        if tool_name.startswith("mcp__omnigent__"):
+        if tool_name.startswith(_OMNIGENT_MCP_PREFIX):
             return None
         _verdict = await _policy_eval(
             "PHASE_TOOL_CALL",
@@ -2827,8 +2849,9 @@ class ClaudeSDKExecutor(Executor):
         # (HTTP 400); they require "adaptive" instead (those tiers are
         # adaptive-only). Sonnet is fine, so scope to those tiers only.
         # This is Databricks-specific: it is gated on the ``databricks-
-        # claude-opus-`` / ``databricks-claude-fable-`` model prefixes, so
-        # it never fires for a generic gateway model.
+        # claude-opus-`` / ``databricks-claude-fable-`` model prefixes (and
+        # their ``system.ai.`` Unity Catalog spellings), so it never fires
+        # for a generic gateway model.
         if (
             self._gateway
             and isinstance(model, str)
@@ -3064,7 +3087,7 @@ class ClaudeSDKExecutor(Executor):
         notice_messages = messages
         if resume_session:
             notice_messages = []
-            for message in reversed(messages):
+            for message in reversed(without_tool_history(messages)):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
@@ -3226,7 +3249,7 @@ class ClaudeSDKExecutor(Executor):
                                         # with the matching
                                         # :class:`ToolCallComplete`
                                         # by call_id.
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_call_metadata(tool_block),
                                     )
                         else:
                             # No streaming — emit events from the full message.
@@ -3257,7 +3280,7 @@ class ClaudeSDKExecutor(Executor):
                                     yield ToolCallRequest(
                                         name=tool_block.name,
                                         args=tool_block.input,
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_call_metadata(tool_block),
                                     )
 
                     elif isinstance(message, sdk.UserMessage):
@@ -3581,7 +3604,8 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
+            # The live session already holds its tool items; only a fresh one replays them.
+            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -3592,7 +3616,8 @@ class ClaudeSDKExecutor(Executor):
         # latest message's content blocks for native multimodal
         # delivery to the Anthropic API.
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
-        prior = messages[:-1] if messages else []
+        latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
+        prior = messages[:latest_index] + messages[latest_index + 1 :]
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:

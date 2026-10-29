@@ -13,14 +13,18 @@ This drives the full chain the ``useConversations`` unit test can't: the
 sidebar button → the palette → the debounce → the ``?search_query=``
 round trip → the re-rendered results. A regression in the button wiring,
 the query param, the debounce, or the empty-state copy would surface here.
+
+Title matches list under "Sessions" and content-only matches under
+"In messages", each from its own ``?search_scope=`` request.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 
 def test_search_lists_matching_sessions_in_palette(
@@ -80,3 +84,59 @@ def test_search_lists_matching_sessions_in_palette(
     # searches server-side on the title, not just filters a static page.
     palette_input.fill(marker)
     expect(dialog.get_by_text(title)).to_be_visible()
+
+
+def test_search_groups_title_matches_above_content_matches(
+    page: Page,
+    seeded_session_pair: tuple[str, str, str],
+) -> None:
+    """A title match lists under "Sessions", above a newer content-only match.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session_pair: ``(base_url, session_a_id, session_b_id)``;
+        session A is titled with the marker, then session B (now the most
+        recently updated) mentions it only in a message.
+    """
+    base_url, title_session_id, content_session_id = seeded_session_pair
+    marker = uuid.uuid4().hex[:12]
+    title = f"Release plan {marker}"
+    httpx.patch(
+        f"{base_url}/v1/sessions/{title_session_id}", json={"title": title}, timeout=10.0
+    ).raise_for_status()
+    content_title = f"Weekly sync {uuid.uuid4().hex[:8]}"
+    httpx.patch(
+        f"{base_url}/v1/sessions/{content_session_id}",
+        json={"title": content_title},
+        timeout=10.0,
+    ).raise_for_status()
+    httpx.post(
+        f"{base_url}/v1/sessions/{content_session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {"agent": "hello_world", "text": f"Check the {marker} list on Friday."},
+        },
+        timeout=10.0,
+    ).raise_for_status()
+
+    page.goto(f"{base_url}/c/{title_session_id}")
+    search_button = page.get_by_test_id("sidebar-search-button")
+    expect(search_button).to_be_visible(timeout=30_000)
+    search_button.click()
+    page.get_by_test_id("command-palette-input").fill(marker)
+
+    dialog = page.get_by_role("dialog")
+
+    def group(heading: str) -> Locator:
+        heading_locator = page.locator("[cmdk-group-heading]", has_text=re.compile(f"^{heading}$"))
+        return dialog.locator("[cmdk-group]").filter(has=heading_locator)
+
+    title_group = group("Sessions")
+    content_group = group("In messages")
+    # The assistant message is persisted asynchronously, so allow time for
+    # the content group to pick it up.
+    expect(content_group).to_contain_text(content_title, timeout=30_000)
+    expect(content_group).to_contain_text(f"{marker} list on Friday")
+    expect(title_group).to_contain_text(title)
+    expect(title_group).not_to_contain_text(content_title)
+    group_headings = dialog.locator("[cmdk-group-heading]").all_text_contents()
+    assert group_headings.index("Sessions") < group_headings.index("In messages")

@@ -30,3 +30,8 @@ export function hasCommandModifier(
 ): boolean {
   return isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
 }
+
+/** True while keyboard focus is in a dialog or menu, which keeps its own keys. */
+export function isFocusInDialogOrMenu(): boolean {
+  return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');
+}

@@ -50,6 +50,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import filelock
 import httpx
@@ -91,6 +92,9 @@ from tests.helpers.ui_configuration import (
 )
 from tests.helpers.ui_configuration import (
     pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    pytest_unconfigure as pytest_unconfigure,
 )
 from tests.helpers.ui_configuration import (
     temp_omnigent_mock_config as _temp_omnigent_mock_config,
@@ -156,6 +160,24 @@ def open_right_rail(page: Page) -> None:
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
+
+def stub_session_pull_requests(
+    page: Page, listed: Callable[[], list[dict[str, Any]]], unlink: Callable[[str], None]
+) -> None:
+    """Answer the server's stored PR list for tests that stub the PR resources.
+
+    :param page: Playwright page, before it navigates.
+    :param listed: Returns the session's linked PRs as the stub currently has them.
+    :param unlink: Receives each URL the panel unlinks with ``DELETE``.
+    """
+
+    def respond(route: Route) -> None:
+        if route.request.method == "DELETE":
+            unlink(parse_qs(urlsplit(route.request.url).query)["url"][0])
+        route.fulfill(json={"object": "list", "data": listed(), "synced": True})
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/pull-requests(?:\?|$)"), respond)
 
 
 def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:

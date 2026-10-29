@@ -2,13 +2,15 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
+import type * as UseSessionPullRequestsModule from "@/hooks/useSessionPullRequests";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type {
   PullRequest,
   PullRequestAssociation,
@@ -65,6 +67,16 @@ const state = vi.hoisted(() => ({
     error: null as Error | null,
   },
   updateReviewers: { mutate: vi.fn(), isError: false, error: null as Error | null },
+  // The server's stored PRs per session; absent sessions keep what the panel seeded.
+  stored: {} as Record<string, PullRequestAssociation[]>,
+  // Sessions the server hasn't imported yet; others are synced.
+  unsynced: new Set<string>(),
+  storedFetches: 0,
+  storesPrs: true,
+  unlink: { mutate: vi.fn(), isPending: false, isError: false, error: null as Error | null },
+  sandboxAsleep: false,
+  // False once the session's host disconnects, which leaves cached live info without an error.
+  serveable: undefined as boolean | undefined,
 }));
 
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
@@ -72,6 +84,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
   return {
     // The panel reads every info payload through the real normalizer.
     normalizePullRequestInfo: original.normalizePullRequestInfo,
+    usePullRequestCommentComposer: original.usePullRequestCommentComposer,
+    pullRequestCommentTooLong: original.pullRequestCommentTooLong,
+    MAX_PULL_REQUEST_COMMENT_CHARACTERS: original.MAX_PULL_REQUEST_COMMENT_CHARACTERS,
     applyPullRequestLabelChange: original.applyPullRequestLabelChange,
     pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
     usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
@@ -111,7 +126,33 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     }),
   };
 });
+vi.mock("@/hooks/useSessionPullRequests", async (importOriginal) => {
+  const original = await importOriginal<typeof UseSessionPullRequestsModule>();
+  const { useQuery } = await import("@tanstack/react-query");
+  return {
+    sessionPullRequestsKey: original.sessionPullRequestsKey,
+    storedListToShow: original.storedListToShow,
+    storesSessionPullRequests: () => state.storesPrs,
+    useSessionPullRequests: (id: string | undefined) => {
+      return useQuery({
+        queryKey: original.sessionPullRequestsKey(id),
+        queryFn: async () => {
+          state.storedFetches += 1;
+          return { prs: state.stored[id ?? ""] ?? [], synced: !state.unsynced.has(id ?? "") };
+        },
+        // Sessions without a server list here read live info only.
+        enabled: !!id && id in state.stored && state.storesPrs,
+      });
+    },
+    useUnlinkSessionPr: () => state.unlink,
+  };
+});
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => state.canEdit }));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
+  useWorkspaceAsleep: () => state.sandboxAsleep,
+  useWorkspaceServeable: () => state.serveable,
+}));
 
 // The diff rendering (@pierre/diffs) is exercised by the library itself; here
 // we only assert a section renders one diff per parsed file. parsePatchFiles is
@@ -175,9 +216,9 @@ function file(
   };
 }
 
-function renderPanel() {
+function renderPanel(active?: boolean) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<PullRequestPanel conversationId="conv_1" />, {
+  return render(<PullRequestPanel conversationId="conv_1" active={active} />, {
     wrapper: ({ children }) => (
       <QueryClientProvider client={client}>{children}</QueryClientProvider>
     ),
@@ -222,6 +263,13 @@ let scrollIntoView: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   // The diff-layout toggle seeds from persisted prefs; start each test clean.
   window.localStorage.clear();
+  state.stored = {};
+  state.unsynced = new Set();
+  state.storedFetches = 0;
+  state.storesPrs = true;
+  state.unlink = { mutate: vi.fn(), isPending: false, isError: false, error: null };
+  state.sandboxAsleep = false;
+  state.serveable = undefined;
   // Fire the observer callback immediately on observe so lazy sections mount.
   class IO {
     private cb: IntersectionObserverCallback;
@@ -317,6 +365,26 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
     expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("polls only while active and refreshes stale info on reactivation", async () => {
+    const refetchQueries = vi.spyOn(QueryClient.prototype, "refetchQueries");
+    onTestFinished(() => refetchQueries.mockRestore());
+    const { rerender } = renderPanel(false);
+
+    // A collapsed rail keeps the panel mounted but must not poll.
+    expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false });
+
+    expect(refetchQueries).not.toHaveBeenCalled();
+
+    rerender(<PullRequestPanel conversationId="conv_1" active />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true });
+    // Turning the poll back on doesn't fetch by itself.
+    expect(refetchQueries).toHaveBeenCalledWith({
+      queryKey: ["github-info", "conv_1"],
+      stale: true,
+    });
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
@@ -942,14 +1010,20 @@ describe("PullRequestPanel", () => {
     for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
 
-  it("jumps to a file's section when its sidebar row is clicked", async () => {
+  it("jumps to and expands a file's section when its sidebar row is clicked", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(screen.getAllByTestId("diff").map((d) => d.getAttribute("data-path"))).toEqual([
+      "hello.py",
+    ]);
     // Both the sidebar row and the section header are buttons matching the
     // name; the sidebar row (which scrolls) is first in the DOM.
     const row = screen.getAllByRole("button", { name: /app\.ts/ })[0];
     fireEvent.click(row);
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: true })).toBeInTheDocument();
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
   it("collapses a file's diff when its section header is clicked", async () => {
@@ -1792,7 +1866,7 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("No text diff available for this file.")).toBeNull();
   });
 
-  it("refreshes info, files and diff even from an error state", async () => {
+  it("refreshes info, files, diff and the stored PRs even from an error state", async () => {
     state.info!.error = new Error("Request timed out.");
     const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries").mockResolvedValue();
     onTestFinished(() => invalidate.mockRestore());
@@ -1802,6 +1876,7 @@ describe("PullRequestPanel", () => {
       "github-info",
       "github-changed-files",
       "github-pr-diff",
+      "session-pull-requests",
     ]);
   });
 
@@ -1878,16 +1953,18 @@ describe("PullRequestPanel", () => {
     expect(description.parentElement).toContainElement(link);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
     fireEvent.click(link);
-    expect(description.parentElement).toContainElement(
-      screen.getByRole("textbox", { name: "Pull request URL" }),
-    );
+    const input = screen.getByRole("textbox", { name: "Pull request URL" });
+    expect(description.parentElement).toContainElement(input);
+    expect(input).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
-    fireEvent.click(link);
+    fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "Pull request URL" }), {
       key: "Escape",
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
   it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
@@ -2175,6 +2252,264 @@ describe("session PR selection", () => {
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
   });
 
+  it("shows the server's stored PRs and lets them be unlinked while the host is offline", async () => {
+    const user = userEvent.setup();
+    const one = "https://github.com/example/one/pull/42";
+    const two = "https://github.com/example/two/pull/7";
+    const checkedAt = Date.UTC(2026, 9, 22, 17, 30) / 1000;
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [
+      {
+        url: one,
+        host: "github.com",
+        repository: "example/one",
+        number: 42,
+        title: "Ship it",
+        relationship: "created",
+        state: "MERGED",
+        is_draft: false,
+        state_checked_at: checkedAt,
+      },
+      {
+        url: two,
+        host: "github.com",
+        repository: "example/two",
+        number: 7,
+        title: null,
+        relationship: "inferred",
+      },
+    ];
+    renderPanel();
+
+    const picker = await screen.findByRole("combobox", { name: "Session pull request" });
+    expect(picker).toHaveTextContent("example/one #42 — Ship it");
+    const stored = screen.getByTestId("github-stored-pr");
+    expect(within(stored).getByRole("link", { name: /Ship it/ })).toHaveAttribute("href", one);
+    expect(within(stored).getByLabelText("Pull request status: Merged")).toBeInTheDocument();
+    expect(within(stored).getByRole("status")).toHaveTextContent(
+      `Last sync time: ${new Date(checkedAt * 1000).toLocaleString()}. To load the PR details, please reconnect the session’s host.`,
+    );
+    // Linking verifies the PR with the host's account; unlinking is the server's.
+    expect(
+      screen.getByRole("button", { name: "Link a PR (needs the host online)" }),
+    ).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Unlink PR" }));
+    expect(state.unlink.mutate).toHaveBeenCalledWith(one, expect.anything());
+    const [, { onSuccess }] = state.unlink.mutate.mock.calls[0];
+    act(() => onSuccess({ prs: state.stored.conv_1.slice(1), synced: true, complete: true }));
+    expect(picker).toHaveTextContent("example/two #7 (from branch)");
+    // A PR the host never fetched has no sync time to show.
+    expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
+      /^To load the PR details, please reconnect the session’s host\.$/,
+    );
+  });
+
+  it("switches cached live info to the stored PR once the host goes offline", async () => {
+    const url = "https://github.com/acme/app/pull/6000";
+    const attached: PullRequestAssociation = {
+      url,
+      host: "github.com",
+      repository: "acme/app",
+      number: 6000,
+      title: "Attached while online",
+      relationship: "attached",
+      state: "OPEN",
+      is_draft: false,
+      state_checked_at: Date.now() / 1000 - 60,
+    };
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [attached],
+    });
+    state.stored.conv_1 = [attached];
+    const { rerender } = renderPanel();
+    expect(
+      await screen.findByRole("combobox", { name: "Session pull request" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+
+    // React Query keeps the last payload when the refetch fails.
+    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+
+    const stored = screen.getByTestId("github-stored-pr");
+    expect(within(stored).getByRole("link", { name: /Attached while online/ })).toHaveAttribute(
+      "href",
+      url,
+    );
+    expect(within(stored).getByLabelText("Pull request status: Open")).toBeInTheDocument();
+    expect(screen.queryByText(/The agent is asleep/)).toBeNull();
+  });
+
+  it("treats an empty server list as authoritative while the host is offline", async () => {
+    const url = "https://github.com/acme/app/pull/6000";
+    const cached: PullRequestAssociation = {
+      url,
+      host: "github.com",
+      repository: "acme/app",
+      number: 6000,
+      title: "Unlinked in another tab",
+      relationship: "attached",
+    };
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [cached],
+    });
+    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    state.stored.conv_1 = [];
+    renderPanel();
+
+    await waitFor(() =>
+      expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull(),
+    );
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+  });
+
+  it.each([
+    {
+      offline: "the host is disconnected",
+      serveable: false,
+      sandboxAsleep: false,
+      message: "To link a PR, please reconnect the session’s host.",
+    },
+    {
+      offline: "the sandbox is asleep",
+      serveable: undefined,
+      sandboxAsleep: true,
+      message: "To link a PR, send a message to start the session’s sandbox.",
+    },
+  ])(
+    "asks for the host instead of offering to link a PR while $offline",
+    async ({ serveable, sandboxAsleep, message }) => {
+      state.serveable = serveable;
+      state.sandboxAsleep = sandboxAsleep;
+      // Cached from before the host went away, as after unlinking the last PR offline.
+      Object.assign(state.info!.data!, {
+        tracking_available: true,
+        prs: [],
+        pr: null,
+        selected_pr_url: undefined,
+      });
+      state.stored.conv_1 = [];
+      renderPanel();
+
+      expect(await screen.findByText(message)).toBeInTheDocument();
+      expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Link a PR/ })).toBeNull();
+    },
+  );
+
+  it("still offers to link a PR on an older server while the host is disconnected", () => {
+    state.storesPrs = false;
+    state.serveable = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      prs: [],
+      pr: null,
+      selected_pr_url: undefined,
+    });
+    renderPanel();
+
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
+  });
+
+  it("says when the server hasn't imported the session's PRs yet", async () => {
+    state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+    state.stored.conv_1 = [];
+    state.unsynced.add("conv_1");
+    renderPanel();
+
+    expect(
+      await screen.findByText(
+        "This session’s PRs haven’t synced to the server yet. To load them, please reconnect the session’s host.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps an older server's offline panel as it was", () => {
+    state.storesPrs = false;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: "https://github.com/acme/app/pull/6000",
+      prs: [
+        {
+          url: "https://github.com/acme/app/pull/6000",
+          host: "github.com",
+          repository: "acme/app",
+          number: 6000,
+          title: "Live only",
+          relationship: "attached",
+        },
+      ],
+    });
+    state.info = { ...state.info!, error: new RunnerOfflineError() };
+    renderPanel();
+
+    expect(screen.queryByTestId("github-stored-pr")).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
+  });
+
+  it.each(["javascript:alert(1)", "http://github.com/acme/app/pull/1"])(
+    "links a stored PR only over https and marks a draft: %s",
+    async (url) => {
+      state.info = { isLoading: false, error: new RunnerOfflineError(), isFetching: false };
+      state.stored.conv_1 = [
+        {
+          url,
+          host: "github.com",
+          repository: "acme/app",
+          number: 1,
+          title: "Not a link",
+          relationship: "created",
+          state: "OPEN",
+          is_draft: true,
+        },
+      ];
+      renderPanel();
+
+      // The details remount once the selection settles on the stored PR.
+      await waitFor(() =>
+        expect(
+          within(screen.getByTestId("github-stored-pr")).getByLabelText(
+            "Pull request status: Draft",
+          ),
+        ).toBeInTheDocument(),
+      );
+      const stored = screen.getByTestId("github-stored-pr");
+      expect(within(stored).queryByRole("link")).toBeNull();
+      expect(within(stored).getByText("Not a link")).toBeInTheDocument();
+    },
+  );
+
+  it("asks to start a sleeping sandbox rather than reconnect a host", () => {
+    const url = "https://github.com/acme/app/pull/6000";
+    state.sandboxAsleep = true;
+    state.info = { isLoading: false, error: null, isFetching: false };
+    state.stored.conv_1 = [
+      {
+        url,
+        host: "github.com",
+        repository: "acme/app",
+        number: 6000,
+        title: "Sandbox PR",
+        relationship: "created",
+        state: "OPEN",
+        is_draft: false,
+        state_checked_at: null,
+      },
+    ];
+    renderPanel();
+
+    return waitFor(() =>
+      expect(within(screen.getByTestId("github-stored-pr")).getByRole("status")).toHaveTextContent(
+        /^To load the PR details, send a message to start the session’s sandbox\.$/,
+      ),
+    );
+  });
+
   it.each([undefined, null, "", "   "])(
     "falls back to the PR identity when its title is %j",
     (title) => {
@@ -2258,3 +2593,44 @@ describe("session PR selection", () => {
     expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
   });
 });
+
+it.each([
+  [true, true, true],
+  [false, true, false],
+  [true, false, false],
+  [true, undefined, false],
+])(
+  "gates comment posting on edit access %s and host capability %s",
+  (canEdit, capability, visible) => {
+    state.canEdit = canEdit;
+    state.info!.data!.selected_pr_url = state.info!.data!.pr!.url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      comment_posting: capability,
+    };
+    renderComments();
+    expect(screen.queryByRole("textbox", { name: "New PR comment" }) !== null).toBe(visible);
+  },
+);
+
+it.each(["capabilities", "selected_pr_url"] as const)(
+  "hides comment posting without %s",
+  (missing) => {
+    state.info!.data!.selected_pr_url = state.info!.data!.pr!.url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      comment_posting: true,
+    };
+    if (missing === "capabilities") delete state.info!.data!.capabilities;
+    else delete state.info!.data!.selected_pr_url;
+    renderComments();
+    expect(screen.queryByRole("textbox", { name: "New PR comment" })).toBeNull();
+    expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
+  },
+);
