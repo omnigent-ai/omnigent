@@ -695,6 +695,22 @@ describe("links to folders", () => {
     expect(toastMock).not.toHaveBeenCalled();
   });
 
+  it("opens a folder named like a video in the Files tree, not a player", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "run.mp4", path: "recordings/run.mp4", type: "directory", bytes: null }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown("[run](recordings/run.mp4)", [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "run" }));
+    expect(openFolder).toHaveBeenCalledWith(`${WORKSPACE}/recordings/run.mp4`);
+    expect(screen.queryByRole("button", { name: /Play video/ })).toBeNull();
+    expect(document.querySelectorAll("video")).toHaveLength(0);
+  });
+
   it("keeps an inline-code folder path as plain code", async () => {
     fetchMock.mockResolvedValue(folderListing());
     renderMarkdown(

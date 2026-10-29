@@ -75,6 +75,8 @@ interface WorkspaceFileOpener {
   resolvedPath: string;
   /** Clipboard path: host-absolute when the root is known, else the cited path. */
   copyPath: string;
+  /** True when `open` shows a folder in the Files tree rather than a file. */
+  isFolder: boolean;
 }
 
 /**
@@ -123,6 +125,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
       unopenable: false,
       resolvedPath: linkPath,
       copyPath,
+      isFolder: true,
     };
   }
 
@@ -141,6 +144,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
         !!openFile && !rootPending && (linkPath === null || (settled && !exists && !isDirectory)),
       resolvedPath: linkPath ?? "",
       copyPath,
+      isFolder: false,
     };
   }
   return {
@@ -155,6 +159,7 @@ function useWorkspaceFileOpener(text: string, explicitLink = false): WorkspaceFi
     unopenable: false,
     resolvedPath: linkPath,
     copyPath,
+    isFolder: false,
   };
 }
 
@@ -304,6 +309,7 @@ function WorkspaceFileLink({
     unopenable,
     resolvedPath,
     copyPath,
+    isFolder,
   } = useWorkspaceFileOpener(path, true);
   // Scopes the desktop in-app browser route to this conversation's view.
   const conversationId = useFileViewerConversationId();
@@ -405,7 +411,7 @@ function WorkspaceFileLink({
     );
   }
 
-  if (conversationId && isVideoFile(resolvedPath)) {
+  if (conversationId && !isFolder && isVideoFile(resolvedPath)) {
     return (
       <VideoPlayer
         compact
