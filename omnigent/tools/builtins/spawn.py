@@ -890,12 +890,13 @@ class SysSessionCreateTool(Tool):
       an accessible session via ``sys_agent_get``). Proxies the JSON
       ``POST /v1/sessions`` create. The direct path for any
       already-registered agent: no bundle download or re-upload.
-    - **By config path** — a NEW agent uploaded from local disk: an
+    - **By config path** — a named agent uploaded from local disk: an
       agent config YAML, agent directory, or pre-built ``.tar.gz``
       bundle inside the caller's working directory (e.g. one authored
       with ``sys_os_write``). The runner bundles the source and
-      proxies the multipart ``POST /v1/sessions`` create, registering
-      a fresh session-scoped agent.
+      proxies the multipart ``POST /v1/sessions`` create. Reusing the
+      owner's agent name updates that agent for all its sessions;
+      independent configurations need different names.
 
     An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
@@ -926,10 +927,12 @@ class SysSessionCreateTool(Tool):
             "visible session. Two modes — provide "
             "exactly one: agent_id launches an existing agent (any "
             "agent_id from sys_agent_list's builtins or session_agents, "
-            "or from sys_agent_get); config_path uploads a new agent "
+            "or from sys_agent_get); config_path creates or updates your named agent "
             "from a local agent config YAML, agent directory, or "
             ".tar.gz bundle in your working directory (e.g. authored "
-            "with sys_os_write) and launches it. Always use agent_id "
+            "with sys_os_write) and launches it. Uploading the same name replaces "
+            "that agent for all its sessions, including children; use a different "
+            "name for independent configurations. Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
@@ -989,13 +992,15 @@ class SysSessionCreateTool(Tool):
                         "config_path": {
                             "type": "string",
                             "description": (
-                                "New-agent mode: path to a local agent "
+                                "Upload mode: path to a local agent "
                                 "config YAML, agent directory, or "
                                 ".tar.gz bundle, relative to your "
                                 "working directory, e.g. "
                                 "'.omnigent/agent-configs/helper.yaml'. "
-                                "Uploads it as a fresh agent and "
-                                "launches the child from it. Use "
+                                "Creates or updates your agent with that name and "
+                                "launches the child from it. Reusing a name updates "
+                                "all sessions on that agent; use a different name "
+                                "for a separate configuration. Use "
                                 "instead of agent_id."
                             ),
                         },

@@ -393,7 +393,9 @@ newest original by creation time and ID; they compare exact names, not fork-name
 
 User agents stay in Agents regardless of harness. Server agents stay in their
 server/harness groups. A user-owned name never hides behind a same-named server agent.
-A catalog failure is reported rather than silently replacing it with session history.
+An owned-catalog failure keeps the available server agents and reports the error;
+session history never substitutes for the owned catalog. Owned agents remain visible
+under Agents even when they use a native harness, including Kiro.
 
 ### 6.16 CLI
 

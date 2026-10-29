@@ -1535,7 +1535,9 @@ describe("useAvailableAgents user agents (scope=user)", () => {
 
   it("names your agents by their own name, whatever their harness", async () => {
     routeFetch({
-      [BUILTINS_URL]: CATALOG,
+      [BUILTINS_URL]: mockResponse({
+        data: [{ id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true }],
+      }),
       [MINE_URL]: sessionResponse({ object: "list", data: [], has_more: false }),
       [HARNESSES_URL]: mockResponse({
         data: [
@@ -1552,6 +1554,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
             created_at: 2,
           },
           { id: "ag_scout", name: "scout", harness: "grok", builtin: false, created_at: 1 },
+          { id: "ag_my_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: false },
         ],
         has_more: false,
       }),
@@ -1567,7 +1570,9 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     expect(mine.map((a) => [a.id, a.display_name])).toEqual([
       ["ag_orion", "orion"],
       ["ag_scout", "scout"],
+      ["ag_my_kiro", "kiro-native-ui"],
     ]);
+    expect(result.current.data?.some((a) => a.id === "ag_kiro")).toBe(true);
   });
 
   it("follows the cursor past a page of one name's repeats to older agents", async () => {
@@ -1680,21 +1685,40 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("scope=user"))).toBe(false);
   });
 
-  it("reports a catalog failure without reviving agents from session history", async () => {
-    routeFetch({
-      [BUILTINS_URL]: CATALOG,
-      [MINE_URL]: MINE,
-      [USER_AGENTS_URL]: mockResponse({}, { ok: false, status: 500 }),
-    });
+  it.each(["request", "cursor-cycle"])(
+    "keeps server agents and reports a user-catalog %s failure",
+    async (failure) => {
+      const userPages: Record<string, Response> =
+        failure === "request"
+          ? { [USER_AGENTS_URL]: mockResponse({}, { ok: false, status: 500 }) }
+          : {
+              [USER_AGENTS_URL]: mockResponse({ data: [], has_more: true, last_id: "a" }),
+              [`${USER_AGENTS_URL}&after=a`]: mockResponse({
+                data: [],
+                has_more: true,
+                last_id: "b",
+              }),
+              [`${USER_AGENTS_URL}&after=b`]: mockResponse({
+                data: [],
+                has_more: true,
+                last_id: "a",
+              }),
+            };
+      routeFetch({
+        [BUILTINS_URL]: CATALOG,
+        [MINE_URL]: MINE,
+        ...userPages,
+      });
 
-    const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
-      wrapper: wrapperWithInfo(true),
-    });
-    await waitFor(() => {
-      expect(result.current.isError).toBe(true);
-    });
+      const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
+        wrapper: wrapperWithInfo(true),
+      });
+      await waitFor(() => {
+        expect(result.current.isError).toBe(true);
+      });
 
-    expect(result.current.data?.some((a) => a.id === "ag_orion")).not.toBe(true);
-    expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
-  });
+      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
+      expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
+    },
+  );
 });

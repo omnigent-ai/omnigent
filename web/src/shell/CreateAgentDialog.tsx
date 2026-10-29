@@ -28,6 +28,8 @@ const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
 
 /** The server's rule for agent names (`omnigent/spec/validator.py`). */
 const AGENT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const AGENT_UPDATE_NOTICE =
+  "Creating or importing a name you already own updates that agent for all its sessions. Use a different name to keep a separate agent.";
 
 /** A single MCP server row in the form. */
 interface MCPFormEntry {
@@ -178,10 +180,7 @@ export function CreateAgentDialog({
         {/* px-1/-mx-1 give the fields' 3px focus ring room to paint:
             overflow-y-auto also clips horizontally at the padding box. */}
         <div className="-mx-1 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
-          <p className="text-sm text-muted-foreground">
-            Creating or importing a name you already own updates that agent for all its sessions.
-            Use a different name to keep a separate agent.
-          </p>
+          <p className="text-sm text-muted-foreground">{AGENT_UPDATE_NOTICE}</p>
           <AgentFormFields {...fields} />
         </div>
 
@@ -238,7 +237,7 @@ export function CreateAgentDialog({
 export function CreateAgentForm({
   onCreate,
   onCancel,
-  notice,
+  notice = AGENT_UPDATE_NOTICE,
   submitLabel = "Create",
 }: {
   onCreate: (input: AgentBundleInput) => void | Promise<void>;
@@ -269,10 +268,6 @@ export function CreateAgentForm({
       {notice && <p className="text-ui text-muted-foreground">{notice}</p>}
       <div className="-mx-1 flex min-h-0 min-w-0 flex-1 flex-col gap-4 overflow-y-auto px-1">
         <fieldset disabled={pending} className="contents">
-          <p className="text-sm text-muted-foreground">
-            Creating or importing a name you already own updates that agent for all its sessions.
-            Use a different name to keep a separate agent.
-          </p>
           <AgentFormFields {...fields} />
         </fieldset>
       </div>

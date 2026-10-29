@@ -513,7 +513,9 @@ def _retarred(bundle: bytes, mtime: int) -> bytes:
 @pytest.mark.parametrize(
     "retar", [False, True], ids=["identical-bytes", "same-files-tarred-again"]
 )
-async def test_reinstalling_the_same_files_is_a_no_op(client, retar: bool) -> None:
+async def test_reinstalling_the_same_files_is_a_no_op(
+    client, agent_store, artifact_store, retar: bool
+) -> None:
     """However the client tars the same files, reinstalling them keeps the id and version."""
     bundle = build_agent_bundle("orion", description="same")
     installed = []
@@ -528,6 +530,8 @@ async def test_reinstalling_the_same_files_is_a_no_op(client, retar: bool) -> No
         installed.append((resp.json()["id"], resp.json()["version"]))
     assert installed[1] == installed[0]
     assert installed[0][1] == 1
+    location = agent_store.get(installed[0][0]).bundle_location
+    assert artifact_store.get(location) == (_retarred(bundle, 1) if retar else bundle)
 
 
 async def test_reinstalling_the_same_files_restores_a_lost_bundle(
@@ -930,6 +934,11 @@ async def test_new_session_from_another_users_agent_runs_on_your_copy(
         assert conflict.status_code == 409, conflict.text
     assert agents.get(copy.id).bundle_location == copy.bundle_location
     assert [a["id"] for a in (await _mine(c, BOB))["data"]] == [copy.id]
+    selected = await c.post(
+        f"/v1/sessions/{alices.json()['id']}/fork", json={"agent_id": copy.id}, headers=BOB
+    )
+    assert selected.status_code == 201, selected.text
+    assert selected.json()["agent_id"] == copy.id
 
 
 @pytest.mark.parametrize("first", ["install", "upload", "child"])

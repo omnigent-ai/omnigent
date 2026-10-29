@@ -351,7 +351,10 @@ def save_user_agent(
                 "the source before copying it.",
                 code=ErrorCode.CONFLICT,
             )
-        artifact_store.put(current_location, bundle_bytes)
+        if current_location != existing.bundle_location or not artifact_store.exists(
+            current_location
+        ):
+            artifact_store.put(current_location, bundle_bytes)
         if not replace_existing:
             return existing
         if agent_store.supports_config_edit:

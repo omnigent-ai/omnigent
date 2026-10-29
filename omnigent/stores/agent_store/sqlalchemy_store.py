@@ -566,7 +566,7 @@ class SqlAlchemyAgentStore(AgentStore):
                 for row in session.execute(stmt.limit(_USER_AGENT_READ_CAP + 1)).scalars()
             ]
         read = rows[:_USER_AGENT_READ_CAP]
-        # At most 50 primary-key lookups hide legacy rows once a shared ID exists.
+        # Batch-fetch at most 50 shared IDs to hide their legacy duplicates.
         canonical = self.get_many(
             [installed_agent_id(owner, row.name) for row in read if _is_original(row)]
         )

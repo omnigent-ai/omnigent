@@ -203,6 +203,7 @@ function agentFromWire(a: BuiltinAgentWire): AvailableAgent {
 /** Read the same owner-scoped catalog Settings uses, through the final page. */
 export async function fetchUserAgents(): Promise<AvailableAgent[]> {
   const rows: BuiltinAgentWire[] = [];
+  const cursors = new Set<string>();
   let after: string | null = null;
   /* oxlint-disable no-await-in-loop */
   do {
@@ -212,8 +213,11 @@ export async function fetchUserAgents(): Promise<AvailableAgent[]> {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     const body = (await res.json()) as BuiltinAgentsListWire;
     rows.push(...body.data);
-    if (body.has_more !== true || !body.last_id || body.last_id === after) break;
-    after = body.last_id;
+    after = body.has_more === true && body.last_id ? body.last_id : null;
+    if (after !== null) {
+      if (cursors.has(after)) throw new Error("Agent catalog returned a repeated cursor");
+      cursors.add(after);
+    }
   } while (after !== null);
   /* oxlint-enable no-await-in-loop */
   return currentUserAgents(rows).map((a) => ({
@@ -516,7 +520,7 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // Normalized, order-stable pin key so equivalent pin sets share one cache
   // entry and a caller's fresh array literal doesn't churn the query. Agent
   // ids never contain "," so the join is unambiguous.
-  const pinnedIds = options.pinnedAgentIds;
+  const pinnedIds = includeUserAgents ? undefined : options.pinnedAgentIds;
   const pinnedKey = useMemo(
     () =>
       Array.from(new Set(pinnedIds ?? []))
@@ -555,8 +559,10 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     () =>
       catalog === undefined
         ? undefined
-        : mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames),
-    [catalog],
+        : includeUserAgents
+          ? dedupeNativeAgents(catalog.agents)
+          : mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames),
+    [catalog, includeUserAgents],
   );
   const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
@@ -576,8 +582,13 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
     placeholderData,
     select,
   });
+  const data = useMemo(
+    () => query.data ?? (query.isError && placeholderData ? select(placeholderData) : undefined),
+    [query.data, query.isError, placeholderData, select],
+  );
   return {
     ...query,
+    data,
     isLoading: query.isLoading || (enabled && query.isPending && catalogQuery.isPending),
   };
 }
