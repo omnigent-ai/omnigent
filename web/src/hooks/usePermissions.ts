@@ -81,7 +81,7 @@ export function useRevokePermission(sessionId: string) {
  * The current user's permission level on a session, as `derivePermissionLevel` resolves it,
  * or `undefined` while unresolved: only a loaded snapshot confirms a single-user `null` level.
  */
-function useSessionPermissionLevel(conversationId: string): number | null | undefined {
+function useSessionPermissionLevel(conversationId: string | null): number | null | undefined {
   const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
@@ -91,7 +91,7 @@ function useSessionPermissionLevel(conversationId: string): number | null | unde
       activeSession,
       sessionLoading,
       activeConv,
-      conversationId,
+      conversationId ?? undefined,
       conversationsData !== undefined,
     );
     return permissionLevel == null && activeSession == null ? undefined : permissionLevel;
@@ -109,9 +109,10 @@ export function useCanEdit(conversationId: string): boolean {
 
 /**
  * Returns whether the current user owns a session, which terminal input requires,
- * or `null` until that's known. A loaded single-user (`null` level) session counts as owned.
+ * or `null` until that's known or without a session. A loaded single-user (`null` level)
+ * session counts as owned.
  */
-export function useIsSessionOwner(conversationId: string): boolean | null {
+export function useIsSessionOwner(conversationId: string | null): boolean | null {
   const permissionLevel = useSessionPermissionLevel(conversationId);
   return permissionLevel === undefined ? null : isOwnerLevel(permissionLevel);
 }

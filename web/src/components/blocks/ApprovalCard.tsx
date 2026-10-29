@@ -154,7 +154,7 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 /** Offers the session's terminal to its owner; other viewers attach read-only and cannot answer. */
 function OpenTerminalAction({ onOpen }: { onOpen: () => void }) {
   const conversationId = useScopedConversationId();
-  const isOwner = useIsSessionOwner(conversationId ?? "");
+  const isOwner = useIsSessionOwner(conversationId);
   if (isOwner === null) return null; // Neither offer nor refuse the terminal before ownership loads.
   if (!isOwner) {
     return (

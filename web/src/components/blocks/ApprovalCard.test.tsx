@@ -2137,6 +2137,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "the session's owner",
       requester: null,
       sideChatId: null,
+      activeChatId: "conv_parent",
       isTerminalFirst: true,
       isOwner: true,
       opensTerminal: true,
@@ -2146,6 +2147,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "a collaborator who does not own the session",
       requester: null,
       sideChatId: null,
+      activeChatId: "conv_parent",
       isTerminalFirst: true,
       isOwner: false,
       opensTerminal: false,
@@ -2155,6 +2157,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "a viewer whose ownership is still loading",
       requester: null,
       sideChatId: null,
+      activeChatId: "conv_parent",
       isTerminalFirst: true,
       isOwner: null,
       opensTerminal: false,
@@ -2164,6 +2167,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "the session itself without a terminal view",
       requester: null,
       sideChatId: null,
+      activeChatId: "conv_parent",
       isTerminalFirst: false,
       isOwner: true,
       opensTerminal: false,
@@ -2173,6 +2177,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "an ancestor of the sub-agent",
       requester: { sessionId: "conv_child", ancestorSessionId: "conv_parent" },
       sideChatId: null,
+      activeChatId: "conv_parent",
       isTerminalFirst: true,
       isOwner: true,
       opensTerminal: false,
@@ -2182,6 +2187,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "a side chat",
       requester: null,
       sideChatId: "conv_child",
+      activeChatId: "conv_parent",
       isTerminalFirst: true,
       isOwner: true,
       opensTerminal: false,
@@ -2191,15 +2197,34 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       viewer: "a grid cell showing the session",
       requester: null,
       sideChatId: "conv_parent",
+      activeChatId: "conv_parent",
       isTerminalFirst: true,
       isOwner: true,
       opensTerminal: false,
       ownerOnlyNote: false,
     },
+    {
+      viewer: "a terminal view before its chat is bound",
+      requester: null,
+      sideChatId: null,
+      activeChatId: null,
+      isTerminalFirst: true,
+      isOwner: null,
+      opensTerminal: false,
+      ownerOnlyNote: false,
+    },
   ])(
     "offers Open terminal when viewed from $viewer: $opensTerminal",
-    ({ requester, sideChatId, isTerminalFirst, isOwner, opensTerminal, ownerOnlyNote }) => {
-      useChatStore.setState({ conversationId: "conv_parent", blocks: [] });
+    ({
+      requester,
+      sideChatId,
+      activeChatId,
+      isTerminalFirst,
+      isOwner,
+      opensTerminal,
+      ownerOnlyNote,
+    }) => {
+      useChatStore.setState({ conversationId: activeChatId, blocks: [] });
       vi.mocked(useIsSessionOwner).mockClear().mockReturnValue(isOwner);
       const setView = vi.fn();
       const terminalFirst: TerminalFirstContextValue = {
@@ -2239,7 +2264,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       const ownerOnly = screen.queryByTestId("approval-card-terminal-owner-only");
       expect(ownerOnly !== null).toBe(ownerOnlyNote);
       if (opensTerminal || ownerOnlyNote || isOwner === null) {
-        expect(vi.mocked(useIsSessionOwner)).toHaveBeenCalledWith("conv_parent");
+        expect(vi.mocked(useIsSessionOwner)).toHaveBeenCalledWith(activeChatId);
       } else {
         expect(vi.mocked(useIsSessionOwner)).not.toHaveBeenCalled();
       }
