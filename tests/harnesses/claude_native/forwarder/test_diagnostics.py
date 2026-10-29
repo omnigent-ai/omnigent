@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 from pathlib import Path
@@ -281,8 +282,13 @@ async def test_degraded_sync_log_belongs_to_the_destination_session(
 
 
 @pytest.mark.parametrize("http_status", [None, 403, 503])
+@pytest.mark.parametrize(
+    "transport_error", [httpx.ConnectError, httpx.ReadError, httpx.ReadTimeout]
+)
 def test_forward_failures_escalate_to_degraded_once(
-    http_status: int | None, caplog: pytest.LogCaptureFixture
+    http_status: int | None,
+    transport_error: type[httpx.TransportError],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Sustained forward failures flip the degraded latch exactly once (#1120).
@@ -295,7 +301,7 @@ def test_forward_failures_escalate_to_degraded_once(
     tracker = forwarder._PostRetryTracker()
     request = httpx.Request("POST", "https://example.test/events?secret=private")
     exc = (
-        httpx.ConnectError("private connection detail", request=request)
+        transport_error("private connection detail", request=request)
         if http_status is None
         else httpx.HTTPStatusError(
             "private rejection detail",
@@ -303,6 +309,7 @@ def test_forward_failures_escalate_to_degraded_once(
             response=httpx.Response(http_status, request=request, text="private body"),
         )
     )
+    exc.__cause__ = OSError(errno.ECONNRESET, "private socket detail")
 
     for _ in range(forwarder._FORWARD_DEGRADED_THRESHOLD - 1):
         tracker.record_failure("item:source-1", exc, session_id="conv_health")
@@ -329,8 +336,21 @@ def test_forward_failures_escalate_to_degraded_once(
     assert records[0].attributes == {
         "exception_type": type(exc).__name__,
         "http_status": http_status,
+        "consecutive_failures": forwarder._FORWARD_DEGRADED_THRESHOLD,
+        "transport_phase": (
+            "response_status"
+            if http_status is not None
+            else "connect"
+            if transport_error is httpx.ConnectError
+            else "read"
+        ),
+        "exception_cause_chain": f"{type(exc).__name__}/ConnectionResetError",
+        "transport_errno": errno.ECONNRESET,
+        "exception_chain_truncated": False,
+        "exception_suppressed_context": False,
     }
     assert "private" not in records[0].getMessage()
+    assert "private" not in json.dumps(records[0].attributes)
     assert records[0].exc_info is None
 
 

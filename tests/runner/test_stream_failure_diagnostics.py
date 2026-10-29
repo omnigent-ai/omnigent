@@ -18,6 +18,7 @@ edges at the runner's HTTP boundary (``POST /v1/sessions/{id}/events``):
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -90,7 +91,9 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
             # happens while the runner is parked on this read.
             if self._before_drop is not None:
                 self._before_drop()
-            raise httpx.ReadError(self._cause)
+            raise httpx.ReadError(self._cause) from OSError(
+                errno.ECONNRESET, "private socket detail"
+            )
 
 
 def _make_app(
@@ -190,7 +193,13 @@ async def test_stream_failure_logs_harness_and_response(
         # Carried so the transport cause is groupable even when the exception
         # itself has no message.
         "exception_type": "ReadError",
+        "transport_phase": "read",
+        "exception_cause_chain": "ReadError/ConnectionResetError",
+        "transport_errno": errno.ECONNRESET,
+        "exception_chain_truncated": False,
+        "exception_suppressed_context": False,
     }
+    assert "private" not in json.dumps(record.attributes)
     assert record.exc_info is not None
     assert failed["error"]["code"] == "connection_error"
 

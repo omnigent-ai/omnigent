@@ -78,6 +78,7 @@ from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
     encode_session_event_batch,
 )
+from omnigent.util.http_diagnostics import http_failure_attributes
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
 from omnigent.version import VERSION
 
@@ -468,6 +469,8 @@ def _note_forward_failure(retry_key: str, exc: httpx.HTTPError, *, session_id: s
                 "attributes": {
                     "exception_type": type(exc).__name__,
                     "http_status": _http_status_for_log(exc),
+                    "consecutive_failures": _forward_health.consecutive_failures,
+                    **http_failure_attributes(exc),
                 },
             },
         )

@@ -209,6 +209,7 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.util.http_diagnostics import http_failure_attributes
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -6397,6 +6398,7 @@ def create_runner_app(
                                 "harness": harness_name,
                                 "response_id": _response_id,
                                 "exception_type": type(exc).__name__,
+                                **http_failure_attributes(exc),
                             },
                         },
                     )
