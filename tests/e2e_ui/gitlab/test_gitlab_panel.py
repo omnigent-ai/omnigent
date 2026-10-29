@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
-from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
+from tests.e2e_ui.conftest import fetch_with_retry, open_right_rail, stub_session_pull_requests
 
 HOST = "git.example.test:8443"
 URL = f"https://{HOST}/team/sub/project/-/merge_requests/7"
@@ -69,6 +69,9 @@ def stub(
                     "url": value,
                     "title": "Add the widget" if value == URL else "Fix another project",
                     "relationship": "attached",
+                    "state": "OPEN",
+                    "is_draft": False,
+                    "state_checked_at": 1793160000,
                 }
                 for value in urls
             ],
@@ -204,12 +207,48 @@ def stub(
     return requested
 
 
-@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+@pytest.mark.parametrize(
+    ("entry", "initially_offline"),
+    [
+        pytest.param("rail", False, id="online-rail"),
+        pytest.param("composer-desktop", False, id="online-composer-desktop"),
+        pytest.param("composer-mobile", False, id="online-composer-mobile"),
+        pytest.param("rail", True, id="reconnect-rail"),
+        pytest.param("composer-mobile", True, id="reconnect-composer-mobile"),
+    ],
+)
 def test_gitlab_panel_summary_and_diff(
-    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    entry: str,
+    initially_offline: bool,
 ) -> None:
     base_url, session_id = seeded_session
     requested = stub(page)
+    offline = initially_offline
+
+    def host_availability(route: Route) -> None:
+        if offline:
+            route.fulfill(status=503, json={"error": {"code": "runner_unavailable"}})
+        else:
+            route.fallback()
+
+    page.route(re.compile(r"/resources/github(?:/|\?|$)"), host_availability)
+    if initially_offline:
+
+        def health(route: Route) -> None:
+            response = fetch_with_retry(route)
+            payload = response.json()
+            live = {"runner_online": not offline, "host_online": not offline}
+            if isinstance(payload.get("sessions"), dict):
+                payload["sessions"][session_id] = live
+            if isinstance(payload.get("session"), dict):
+                payload["session"].update(live)
+            route.fulfill(response=response, json=payload)
+
+        page.route(re.compile(r"/health(\?|$)"), health)
+        page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
@@ -226,8 +265,27 @@ def test_gitlab_panel_summary_and_diff(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
+    row = panel.get_by_role(
+        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
+    )
+    if initially_offline:
+        expect(panel.get_by_text("Host offline", exact=True)).to_be_visible()
+        expect(panel.get_by_role("button", name="1 passed", exact=True)).to_have_count(0)
+        expect(panel.get_by_role("button", name="Merge", exact=True)).to_have_count(0)
+        expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
+        page.screenshot(path=tmp_path / f"gitlab-{entry}-offline-list.png", animations="disabled")
+        row.click()
+        stored = panel.get_by_test_id("github-stored-pr")
+        expect(stored.get_by_role("status")).to_contain_text("Last sync time:")
+        expect(stored.get_by_role("status")).to_contain_text("reconnect the session’s host")
+        expect(panel.get_by_role("tab", name="Summary", exact=True)).to_have_count(0)
+        panel.get_by_role("button", name="All pull requests (1)").click()
+        offline = False
+        panel.get_by_role("button", name="Refresh", exact=True).click()
+        expect(panel.get_by_role("button", name="1 passed", exact=True)).to_be_visible()
+    row.click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("heading", name="GitLab", exact=True)).to_be_visible()
+    expect(panel.get_by_title("GitLab", exact=True)).to_be_visible()
     expect(panel.get_by_text("!7", exact=True)).to_be_visible()
     expect(panel.get_by_text("A widget from a nested GitLab project.", exact=True)).to_be_visible()
     expect(panel.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
@@ -264,16 +322,17 @@ def test_gitlab_link_select_unlink(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(SECOND)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
-    expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="team/sub/project !7").click()
+    panel.get_by_role(
+        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
+    ).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="team/sub/other !12").click()
+    panel.get_by_role("button", name="All pull requests (2)").click()
+    panel.get_by_role(
+        "button", name=f"{HOST}/team/sub/other !12 — Fix another project", exact=True
+    ).click()
+    expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("!7")
     page.screenshot(path=str(tmp_path / "gitlab-selection.png"), animations="disabled")
 
@@ -299,6 +358,9 @@ def test_gitlab_unlink_last_mr_clears_selection(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
+    panel.get_by_role(
+        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
+    ).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_visible()
@@ -322,6 +384,9 @@ def test_gitlab_partial_data_is_visible(
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role(
+        "button", name=f"{HOST}/team/sub/project !7 — Add the widget", exact=True
+    ).click()
     expect(
         panel.get_by_text(
             "GitLab comments and checks are incomplete. Refresh to retry.", exact=True

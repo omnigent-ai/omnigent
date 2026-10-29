@@ -80,7 +80,6 @@ import {
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
@@ -3714,7 +3713,6 @@ export function NewChatLandingScreen() {
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
             : [];
-  const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
     (!sandboxSelected &&
@@ -3853,7 +3851,6 @@ export function NewChatLandingScreen() {
   }, [pickerCacheKey, pickerLoading, permissionPreview]);
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
-  useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = sandboxDefaultModelsEnabled
     ? codexEffortLevelsForModel(pickerModelOptions, pickedModel).map((value) => ({
         value,
@@ -4016,16 +4013,6 @@ export function NewChatLandingScreen() {
                     {sandboxModels.data.provider_label}
                   </div>
                 )}
-              {selectedNativeHarness === "pi-native" && (
-                <Input
-                  aria-label="Search models"
-                  placeholder="Search models…"
-                  value={pickerModelSearch}
-                  onChange={(event) => setPickerModelSearch(event.target.value)}
-                  onKeyDown={(event) => event.stopPropagation()}
-                  data-testid="new-chat-landing-agent-model-search"
-                />
-              )}
               {pickerModelsLoading && pickerModelOptions.length === 0 && (
                 <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
               )}
@@ -4070,6 +4057,7 @@ export function NewChatLandingScreen() {
               testId: `new-chat-landing-agent-model-${option.id}`,
               title: nativeModelTooltip(option),
               className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+              modelOption: option,
             })),
           ],
         }
@@ -4180,20 +4168,7 @@ export function NewChatLandingScreen() {
                 }
               : undefined
           }
-          models={
-            modelSection && {
-              ...modelSection,
-              choices: modelSection.choices.filter(
-                (choice) =>
-                  choice.key === "__default__" ||
-                  pickerModelSearch
-                    .toLowerCase()
-                    .trim()
-                    .split(/\s+/)
-                    .every((term) => `${choice.key} ${choice.label}`.toLowerCase().includes(term)),
-              ),
-            }
-          }
+          models={modelSection}
           efforts={effortSection}
           extra={fusionSections}
         />

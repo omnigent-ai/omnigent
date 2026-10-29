@@ -442,7 +442,12 @@ const PULL_REQUEST_POLL_MS = 5_000;
  * polling while the panel is open+focused — we can't tell "no CI" from "checks
  * haven't registered yet", and freshness wins for the cost of a focused poll.
  */
-export function computePullRequestPollInterval(info: PullRequestInfo | undefined): number | false {
+export function computePullRequestPollInterval(
+  info: PullRequestInfo | undefined,
+  listRow = false,
+): number | false {
+  // List rows refresh less often and rest once closed; explicit Refresh still refetches them.
+  if (listRow) return info?.pr && info.pr.state !== "OPEN" ? false : 30_000;
   // No usable info yet — an initial error, or a transient fetch failure with no
   // cached data. Keep trying; runner-offline is gated off by `enabled`.
   if (!info) return PULL_REQUEST_POLL_MS;
@@ -483,7 +488,7 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
  */
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
-  options?: { poll?: boolean; prUrl?: string },
+  options?: { poll?: boolean | "list"; prUrl?: string },
 ) {
   // A `temp:*` id (navigate-first new-chat window) has no server session.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
@@ -504,9 +509,11 @@ export function usePullRequestInfo(
     staleTime: 30_000,
     refetchInterval: options?.poll
       ? (query) =>
-          query.state.data?.tracking_available
-            ? 10_000
-            : computePullRequestPollInterval(query.state.data)
+          options.poll === "list"
+            ? computePullRequestPollInterval(query.state.data, true)
+            : query.state.data?.tracking_available
+              ? 10_000
+              : computePullRequestPollInterval(query.state.data)
       : false,
     refetchIntervalInBackground: false,
   });

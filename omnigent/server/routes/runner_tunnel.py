@@ -28,7 +28,7 @@ from typing import cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
@@ -519,6 +519,10 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        # Attribute debug-log records for this tunnel to its owner, as the host
+        # tunnel does. The handler task is per-connection, so this cannot bleed
+        # across concurrent runners.
+        set_current_user_id(tunnel_owner)
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
