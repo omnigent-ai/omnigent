@@ -57,7 +57,7 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -84,6 +84,7 @@ from omnigent.harnesses.antigravity_native.rpc import (
 # (relocated from the retired transcript forwarder). The reader reuses the SAME
 # event shape so the mapped events post identically.
 from omnigent.harnesses.antigravity_native.steps import (
+    _AGENT_NAME,
     OutboundEvent,
     PendingInteraction,
     _execution_discriminator,
@@ -97,6 +98,7 @@ from omnigent.harnesses.antigravity_native.steps import (
 )
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
+from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -412,7 +414,7 @@ def _parse_activity_timestamp(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _summary_activity(summary: dict[str, object]) -> datetime | None:
@@ -463,7 +465,9 @@ def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) ->
     root — so the type alone cannot tell them apart (live-verified, agy 1.1.9).
     The distinction lives in ``trajectoryMetadata``, where a child carries a
     ``parentConversationId`` and a ``rootConversationId`` pointing at its PARENT,
-    while a root's ``rootConversationId`` is its own id::
+    while a root's ``rootConversationId`` is its own id:
+
+    .. code-block:: text
 
         root:  {"rootConversationId": "<self>"}
         child: {"parentConversationId": "<parent>", "rootConversationId": "<parent>",
@@ -3091,6 +3095,8 @@ async def _rotate_session_for_cascade(
        conversation id (the reader re-reads this on rebind to bind the new cascade).
     6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
        a failure is logged, not raised — the new session is already live).
+    7. POST the shared ``/clear`` supersession notice to the OLD conversation
+       (best-effort), so its web view stops spinning and follows the new chat.
 
     Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
     logged at WARNING and yields ``None``, and the caller keeps serving the OLD
@@ -3197,6 +3203,13 @@ async def _rotate_session_for_cascade(
             new_session_id,
             exc_info=True,
         )
+
+    await post_clear_supersession(
+        client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
+    )
 
     _logger.info(
         "agy reader rotated Omnigent session after /clear: old_session=%s new_session=%s "

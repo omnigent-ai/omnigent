@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
+import tempfile
 import textwrap
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +16,10 @@ from tests.helpers import ui_timings as timings
 from tests.helpers.ui_url_safety import DEV_PORTS, unsafe_ui_base_url_reason
 
 _ALLOW_DEV_BASE_URL_ENV = "OMNIGENT_E2E_ALLOW_DEV_BASE_URL"
+_CONFIG_HOME_ENV = "OMNIGENT_CONFIG_HOME"
+# Marks a config home created by this suite, so xdist workers replace it.
+_SUITE_CONFIG_HOME_ENV = "OMNIGENT_UI_TESTS_CONFIG_HOME"
+_CONFIG_HOME_KEY = pytest.StashKey[tuple[Path, dict[str, str | None]]]()
 _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 _CODEX_MOCK_MODEL = "gpt-4o"
 # USD per million tokens (input, output, cache read) for the mock codex provider.
@@ -49,7 +56,7 @@ def prepared_repro_environment() -> dict[str, str]:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Fail fast on unsafe e2e-ui harness options.
+    """Fail fast on unsafe e2e-ui harness options and isolate per-process state.
 
     :param config: Pytest config with repo and pytest-playwright options.
     """
@@ -63,6 +70,70 @@ def pytest_configure(config: pytest.Config) -> None:
             "tests/e2e_ui must run headless in CI. Remove --headed; headed "
             "browser windows are only allowed for local debugging."
         )
+    _isolate_config_home(config)
+    _isolate_playwright_output(config)
+
+
+# Run after the root conftest reaps leaked processes that may still use this home.
+@pytest.hookimpl(trylast=True)
+def pytest_unconfigure(config: pytest.Config) -> None:
+    """Restore the inherited config home and remove this process's private copy."""
+    if (owned := config.stash.get(_CONFIG_HOME_KEY, None)) is None:
+        return
+    home, originals = owned
+    for name, value in originals.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    shutil.rmtree(home, ignore_errors=True)
+
+
+def _isolate_config_home(config: pytest.Config) -> None:
+    """Give this pytest process a private config home seeded from the effective config.
+
+    Spawned servers, runners and CLIs inherit it, so concurrent xdist workers
+    cannot overwrite each other's mock provider config. A caller-chosen home,
+    an external server and a prepared reproduction keep their own config.
+    """
+    # The product treats an empty value as unset, so this does too.
+    inherited = os.environ.get(_CONFIG_HOME_ENV) or None
+    suite_owned = inherited is not None and inherited == os.environ.get(_SUITE_CONFIG_HOME_ENV)
+    if (inherited is not None and not suite_owned) or (
+        config.getoption("--ui-base-url", default=None)
+        or os.environ.get("OMNIGENT_REPRO_SERVER_URL")
+        # An xdist controller spawns nothing; each worker makes its own copy.
+        or (config.getoption("numprocesses", default=0) and timings.xdist_worker(config) is None)
+    ):
+        return
+    from omnigent.config import global_config_path
+
+    source = global_config_path().parent
+    home = Path(tempfile.mkdtemp(prefix="omnigent-ui-config-"))
+    # File-backed provider secrets live beside the config they resolve for.
+    for name in ("config.yaml", "secrets.json"):
+        if (source / name).is_file():
+            fd = os.open(home / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write((source / name).read_bytes())
+    originals = {name: os.environ.get(name) for name in (_CONFIG_HOME_ENV, _SUITE_CONFIG_HOME_ENV)}
+    os.environ[_CONFIG_HOME_ENV] = os.environ[_SUITE_CONFIG_HOME_ENV] = str(home)
+    config.stash[_CONFIG_HOME_KEY] = (home, originals)
+
+
+def _isolate_playwright_output(config: pytest.Config) -> None:
+    """Keep each xdist worker's Playwright artifacts in its own directory.
+
+    pytest-playwright clears ``--output`` when every worker's session starts, so
+    a shared directory would let one worker delete another's failure traces.
+    """
+    output = config.getoption("--output", default=None)
+    if output is None:
+        return
+    if worker := timings.xdist_worker(config):
+        config.option.output = os.path.join(output, worker)
+    elif config.getoption("numprocesses", default=0):
+        shutil.rmtree(output, ignore_errors=True)
 
 
 def _validate_ui_base_url(base_url: str) -> None:

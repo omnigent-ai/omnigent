@@ -206,6 +206,37 @@ def test_forwarded_framework_language_rule_keeps_default_runner_prompt() -> None
     )
 
 
+@pytest.mark.parametrize(
+    ("harness", "env", "expected"),
+    [
+        ("claude-sdk", None, "haiku"),
+        ("claude-sdk", "sonnet", "sonnet"),
+        ("claude-native", "sonnet", "sonnet"),
+        ("codex", "sonnet", "gpt-5.6-luna"),
+        ("claude-sdk", "   ", "haiku"),
+    ],
+    ids=[
+        "claude-default",
+        "claude-override",
+        "claude-native-override",
+        "codex-unaffected",
+        "blank",
+    ],
+)
+def test_background_title_model_claude_env_override(
+    harness: str,
+    env: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL overrides only the claude family."""
+    if env is None:
+        monkeypatch.delenv("OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL", env)
+    assert background_title_model(harness) == expected
+
+
 def test_operator_language_override_stays_custom_after_framework_suffix() -> None:
     forwarded = f"Always use English.\n{FOLLOW_USER_LANGUAGE_TITLE_INSTRUCTION}"
     instructions = build_background_title_instructions(forwarded)
@@ -466,6 +497,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 ) -> None:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
     captured: dict[str, Any] = {}
     claude_config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
@@ -545,6 +578,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
+    assert "ANTHROPIC_API_KEY" not in captured["kwargs"]["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["kwargs"]["env"]
 
 
 @pytest.mark.asyncio

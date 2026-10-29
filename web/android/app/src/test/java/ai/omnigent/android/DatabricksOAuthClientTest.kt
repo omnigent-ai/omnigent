@@ -13,7 +13,7 @@ class DatabricksOAuthClientTest {
     private val configuration =
         DatabricksOAuthConfiguration(
             "public-client",
-            URI("https://login.databricks.com/mobile-redirect"),
+            URI("ai.omnigent.android://mobile-redirect"),
         )
     private val attempt =
         DatabricksOAuthAttempt(
@@ -63,6 +63,10 @@ class DatabricksOAuthClientTest {
         assertTrue(form.contains("grant_type=authorization_code"))
         assertTrue(form.contains("code_verifier=verifier"))
         assertTrue(form.contains("code=code-value"))
+        assertEquals(
+            configuration.redirectUri.toString(),
+            queryItems(URI("https://example.test/?$form")).toMap()["redirect_uri"],
+        )
     }
 
     @Test

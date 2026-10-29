@@ -78,7 +78,7 @@ def _managed_pi(
     settings = {"enabledModels": enabled_models} if enabled_models is not None else {}
     settings_path = global_dir / "settings.json"
     settings_path.write_text(json.dumps(settings), encoding="utf-8")
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_dir))
     if databricks:
         config = {
             "providers": {"demo": {"kind": "databricks", "default": True, "profile": "PI_TEST"}}
@@ -218,6 +218,9 @@ def test_generic_provider_delivers_effort_through_native_tool_turn(
             metadata=ModelMetadata(
                 supported_capabilities=frozenset({ModelCapability.REASONING})
                 if reasoning
+                else frozenset(),
+                unsupported_capabilities=frozenset({ModelCapability.REASONING})
+                if not reasoning
                 else frozenset(),
                 wire_apis=frozenset(
                     {

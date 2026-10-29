@@ -38,10 +38,10 @@ load-bearing behavior — it has dedicated coverage below.
 from __future__ import annotations
 
 import os
+import tomllib
 from unittest.mock import Mock
 
 import pytest
-import tomllib
 import yaml
 from click.testing import CliRunner
 

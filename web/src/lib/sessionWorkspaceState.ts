@@ -7,6 +7,7 @@
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
+import { parseTerminalSplitState, type TerminalSplitState } from "./terminalSplitLayout";
 import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
 const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
@@ -46,9 +47,11 @@ export interface SessionWorkspaceState {
   openSideChats?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
+  /** Split panes of the main terminal view; absent while unsplit. */
+  terminalSplit?: TerminalSplitState;
 }
 
-const STORAGE_KEY = "omnigent:session-workspace-state";
+export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
 // cap is exceeded.
@@ -137,13 +140,15 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
+  const terminalSplit = parseTerminalSplitState(record.terminalSplit);
+  if (terminalSplit) state.terminalSplit = terminalSplit;
   return state;
 }
 
 function readStore(): Store {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(SESSION_WORKSPACE_STATE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -163,7 +168,7 @@ function readStore(): Store {
 function writeStore(store: Store): void {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
   } catch {
     // Storage quota/access errors must not break panel interactions.
   }

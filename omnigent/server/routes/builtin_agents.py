@@ -45,10 +45,10 @@ from omnigent.server.schemas import (
     AgentConfigObject,
     AgentConfigPatch,
     AgentDetailObject,
+    AgentList,
     AgentObject,
     ErrorResponse,
     MCPServerSummary,
-    PaginatedList,
     SkillSummary,
 )
 from omnigent.spec import AgentSpec
@@ -123,7 +123,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
-    except Exception:  # noqa: BLE001 — spec load failure must not break the list
+    except Exception:  # spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
             agent.id,
@@ -394,7 +394,6 @@ def create_builtin_agents_router(
             },
             415: {"model": ErrorResponse, "description": "A JSON request body is required"},
             422: {"model": ErrorResponse, "description": "Invalid partial configuration"},
-            428: {"model": ErrorResponse, "description": "If-Match is required"},
         },
     )
     async def patch_agent_config(
@@ -404,16 +403,17 @@ def create_builtin_agents_router(
         response: Response,
         if_match: str | None = Header(default=None),
     ) -> AgentConfigObject | JSONResponse:
-        """Patch only supplied fields; require the ETag from GET /agents/{id}/config."""
+        """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
-        if if_match is None:
-            return _config_error(428, "precondition_required", "If-Match is required")
-        if len(request.headers.getlist("if-match")) != 1 or not (
-            len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
-        ):
-            return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
-        if if_match != _config_etag(agent):
-            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
+        if if_match is not None:
+            if len(request.headers.getlist("if-match")) != 1 or not (
+                len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
+            ):
+                return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
+            if if_match != _config_etag(agent):
+                return _config_error(
+                    412, "precondition_failed", "Agent changed; reload before saving"
+                )
         bundle, spec, location = await asyncio.to_thread(configuration, agent, body)
         if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
             raise _too_large()
@@ -445,13 +445,21 @@ def create_builtin_agents_router(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         scope: str | None = Query(default=None, pattern="^user$"),
-    ) -> PaginatedList:
+    ) -> AgentList:
         """List server agents, or with ``scope=user`` the caller's own agents.
 
         Server agents come from ``agent_store.list()``, which never returns
         user agents. ``scope=user`` returns the caller's user agents newest
         first, at most 50 per page and paged with ``after`` only; ``last_id``
         is the last row the server read, which may not be in ``data``.
+
+        Packaged built-ins the deployment suppressed via
+        ``OMNIGENT_SEEDED_AGENTS`` are filtered out after the store page is
+        read, so ``first_id``, ``last_id`` and ``has_more`` describe the rows
+        read, not the rows returned. A page can hold fewer than ``limit`` rows,
+        or none; keep following ``last_id`` while ``has_more`` is true.
+        Suppressing hides a row without deleting it, so a session already
+        bound to one keeps working.
 
         :param request: The incoming FastAPI request (for auth).
         :param limit: Maximum number of agents to return (1-1000; ``scope=user``
@@ -460,16 +468,24 @@ def create_builtin_agents_router(
         :param before: Cursor: return agents before this id (server agents only).
         :param order: Sort order, ``"asc"`` or ``"desc"`` (server agents only).
         :param scope: ``"user"`` to list the caller's own agents.
-        :returns: A :class:`PaginatedList` of agents.
+        :returns: An :class:`AgentList` of agents; for server agents it also names
+            the packaged built-ins the deployment suppressed.
         """
         user_id = _require_user(request, auth_provider)
         if scope != "user":
             page = agent_store.list(limit=limit, after=after, before=before, order=order)
-            return PaginatedList(
-                data=[_to_agent_object(a, agent_cache) for a in page.data],
+            # Written at lifespan startup; absent when the app never seeded.
+            suppressed: frozenset[str] = getattr(
+                request.app.state, "suppressed_agent_names", frozenset()
+            )
+            return AgentList(
+                data=[
+                    _to_agent_object(a, agent_cache) for a in page.data if a.name not in suppressed
+                ],
                 first_id=page.first_id,
                 last_id=page.last_id,
                 has_more=page.has_more,
+                suppressed_agent_names=sorted(suppressed),
             )
         require_user_agents()
         if before is not None or order != "desc":
@@ -486,7 +502,7 @@ def create_builtin_agents_router(
         data = await asyncio.to_thread(
             lambda: [_to_agent_object(a, agent_cache) for a in page.data]
         )
-        return PaginatedList(
+        return AgentList(
             data=data, first_id=page.first_id, last_id=page.last_id, has_more=page.has_more
         )
 

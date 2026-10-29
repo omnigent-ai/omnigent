@@ -28,6 +28,8 @@ lifecycle metadata.
 
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
+| `session_orchestration` | On | Server | 0.22.0 | Private-owner peer messages and independent workers. Append `-session_orchestration` and restart every server replica to refuse new orchestration; already accepted work may finish. Existing reads and child operations remain available. Server-only; not exposed in `/v1/info`. |
+| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires a transactional store; a multi-replica deployment also supplies host ownership, and coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
@@ -58,3 +60,28 @@ for Claude working-status acceptance and kill-switch verification.
 5. Roll back with `-feature_name` and redeploy the same image. For runner
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
+
+With `automations_v2`, the built-in server entrypoints run claimed runs with the
+built-in executor and own every host, which suits a single replica. A
+multi-replica deployment passes its own host ownership through `create_app()`.
+
+For `session_orchestration`, verify the server gate with an actual peer-message
+or independent-create request; `/v1/info` does not advertise this backend flag.
+The server override is authoritative even when a host/runner enables the feature.
+The tools remain advertised while disabled. This kill switch does not cancel
+accepted work or disable existing session reads, ordinary messages or child work.
+Ownership, private-source ancestry and runner-binding checks always apply.
+Legacy sessions without the scheduled-origin marker remain eligible; the default
+change does not backfill old scheduling history. See the
+[orchestration feature map](../feature-map/session-orchestration.md).
+
+Before enabling `automations_v2`, deploy the schema and updated code to every server replica. Older servers cannot read `starting` runs or preserve their cleanup records when deleting tasks.
+
+Even with the flag off, an interrupted deletion can leave a hidden task row for
+cleanup. During a mixed-version deployment, older replicas can still show and
+edit that row until all replicas are upgraded.
+
+Before disabling `automations_v2`, stop new dispatch and let existing startups
+finish or complete recovery, including any required resource cleanup. Disabling
+the flag stops startup recovery and deleted-task sweeps; clearing scheduling
+cursors does not resolve unfinished runs or remove their retained task rows.

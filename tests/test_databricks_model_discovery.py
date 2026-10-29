@@ -114,9 +114,9 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     ).families
 
     assert families == {
-        "opus": "databricks-claude-opus-4-8",
-        "sonnet": "databricks-claude-3-7-sonnet",
-        "haiku": "databricks-claude-3-5-haiku",
+        "opus": "system.ai.claude-opus-4-8",
+        "sonnet": "system.ai.claude-3-7-sonnet",
+        "haiku": "system.ai.claude-3-5-haiku",
     }
     assert paths == [
         "/api/2.1/unity-catalog/model-services",
@@ -129,12 +129,12 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
     [
         # Two successful empty listings return empty instead of inventing models.
         (_UC_EMPTY, _GATEWAY_EMPTY, {}, ()),
-        # A transient model-services failure does not hide the legacy catalog.
+        # A transient model-services failure canonicalizes the legacy catalog.
         (
             _UC_DOWN,
             (200, {"data": [{"id": "databricks-claude-haiku-4-5"}]}),
-            {"haiku": "databricks-claude-haiku-4-5"},
-            ("databricks-claude-haiku-4-5",),
+            {"haiku": "system.ai.claude-haiku-4-5"},
+            ("system.ai.claude-haiku-4-5",),
         ),
         # Removed UC services do not revive stale models when legacy 404s.
         (_UC_EMPTY, _GATEWAY_GONE, {}, ()),
@@ -172,8 +172,8 @@ def test_anthropic_gateway_is_the_legacy_fallback() -> None:
                     ]
                 },
             ),
-            {"opus": "databricks-claude-opus-5"},
-            ("databricks-claude-opus-5", "databricks-claude-opus-4-8"),
+            {"opus": "system.ai.claude-opus-5"},
+            ("system.ai.claude-opus-5", "system.ai.claude-opus-4-8"),
         ),
         # An authoritative listing with no Claude at all yields an empty
         # catalog, not an error.
@@ -271,13 +271,13 @@ def test_duplicate_spellings_collapse_onto_the_databricks_id() -> None:
         ),
     )
     assert catalog.families == {  # type: ignore[attr-defined]
-        "opus": "databricks-claude-opus-5",
-        "sonnet": "databricks-claude-sonnet-5",
+        "opus": "system.ai.claude-opus-5",
+        "sonnet": "system.ai.claude-sonnet-5",
     }
     assert catalog.model_ids == (  # type: ignore[attr-defined]
-        "databricks-claude-sonnet-5",
-        "databricks-claude-opus-5",
-        "databricks-claude-opus-4-8",
+        "system.ai.claude-sonnet-5",
+        "system.ai.claude-opus-5",
+        "system.ai.claude-opus-4-8",
     )
 
 
@@ -287,7 +287,7 @@ def test_a_model_only_unity_catalog_serves_keeps_its_own_spelling() -> None:
         (200, {"data": [{"id": "databricks-claude-opus-5"}]}),
     )
     assert catalog.families == {  # type: ignore[attr-defined]
-        "opus": "databricks-claude-opus-5",
+        "opus": "system.ai.claude-opus-5",
         "haiku": "system.ai.claude-haiku-4-5",
     }
 
@@ -366,6 +366,43 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
         # Codex-compatible but unversioned, last.
         "system.ai.kimi-k2",
         "system.ai.glm-9",
+    )
+
+
+def test_discover_codex_models_drops_models_without_the_codex_route() -> None:
+    """A GPT-named model serving only chat routes cannot run a codex turn."""
+    servable = _discover_codex(
+        [
+            {
+                "name": "model-services/system.ai.gpt-oss-120b",
+                "supported_api_types": ["mlflow/v1/chat/completions", "mlflow/v1/responses"],
+            },
+            {
+                "name": "model-services/system.ai.gpt-5-5",
+                "supported_api_types": ["mlflow/v1/responses", "Codex/v1/Responses"],
+            },
+            # An empty list or explicit null reports nothing, like a listing that
+            # predates the field.
+            {"name": "model-services/system.ai.gpt-5-4", "supported_api_types": []},
+            {"name": "model-services/system.ai.gpt-5-4-mini", "supported_api_types": None},
+            # Values are compared trimmed.
+            {
+                "name": "model-services/system.ai.gpt-5-6-luna",
+                "supported_api_types": [" codex/v1/responses "],
+            },
+            # A malformed (non-list) value is not a name-based fallback.
+            {
+                "name": "model-services/system.ai.gpt-6-1",
+                "supported_api_types": "codex/v1/responses",
+            },
+        ]
+    )
+
+    assert servable == (
+        "system.ai.gpt-5-6-luna",
+        "system.ai.gpt-5-5",
+        "system.ai.gpt-5-4",
+        "system.ai.gpt-5-4-mini",
     )
 
 

@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 
 from dateutil.rrule import rrule, rrulestr  # type: ignore[import-untyped]
 
-from omnigent.server.scheduled._bounded_rrule import iter_bounded
+from omnigent.server.scheduled._bounded_rrule import RRuleSearchLimitError, iter_bounded
 
 # Reject anything more frequent than this. Each fire spawns a real agent
 # session, so a tight cadence gets expensive fast. One hour is the tightest
@@ -68,6 +68,10 @@ class RRuleValidationError(ValueError):
     """Raised when an RRULE string is malformed or violates a scheduler rule."""
 
 
+class RRuleSearchError(RRuleValidationError):
+    """The search budget was exceeded; this does not establish rule exhaustion."""
+
+
 class _ParsedRRule(Protocol):
     def after(self, dt: datetime, inc: bool = False) -> datetime | None:
         raise NotImplementedError
@@ -85,20 +89,33 @@ class _RRuleLimits(Protocol):
 class _BoundedRRule:
     rule: rrule
     count: int | None
+    count_after: datetime | None = None
 
     def __iter__(self) -> Iterator[datetime]:
+        return self._occurrences()
+
+    def _occurrences(self, start_at: datetime | None = None) -> Iterator[datetime]:
         try:
-            yield from islice(
-                iter_bounded(
-                    self.rule, max_steps=_MAX_SEARCH_STEPS, max_seconds=_MAX_SEARCH_SECONDS
-                ),
-                self.count,
+            occurrences = iter_bounded(
+                self.rule,
+                max_steps=_MAX_SEARCH_STEPS,
+                max_seconds=_MAX_SEARCH_SECONDS,
+                # This wrapper applies COUNT after iteration, so it must retain history.
+                start_at=start_at if self.count is None else None,
             )
+            if self.count is not None and self.count_after is not None:
+                # Occurrences at or before creation do not consume COUNT.
+                occurrences = (occ for occ in occurrences if occ > self.count_after)
+            yield from islice(occurrences, self.count)
+        except RRuleSearchLimitError as exc:
+            raise RRuleSearchError(str(exc)) from exc
         except ValueError as exc:
             raise RRuleValidationError(str(exc)) from exc
 
     def after(self, dt: datetime, inc: bool = False) -> datetime | None:
-        return next((occ for occ in self if occ > dt or (inc and occ == dt)), None)
+        return next(
+            (occ for occ in self._occurrences(dt) if occ > dt or (inc and occ == dt)), None
+        )
 
 
 def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
@@ -108,14 +125,9 @@ def _anchor_dtstart(after: datetime, tz: ZoneInfo) -> datetime:
     the instant we happen to query at: an hourly rule lands on the hour and a
     daily rule at its ``BYHOUR``/``BYMINUTE``.
 
-    Caveat for ``INTERVAL>1`` recurrences (e.g. biweekly
-    ``FREQ=WEEKLY;INTERVAL=2`` or interval-monthly): dateutil counts active
-    periods relative to ``dtstart``, so re-anchoring to midnight of the query
-    day ties the phase to whichever day the timer last re-armed. A restart on a
-    different weekday can slip such a rule by one period. ``INTERVAL=1`` rules
-    (hourly/daily/simple-weekly) are unaffected. This is acceptable for the
-    current preset set; a proper fix — persisting a stable per-task ``dtstart``
-    — is deferred to future work if unbounded-interval rules become user-facing.
+    Persisted schedules supply the creation date as their reference, so
+    INTERVAL and COUNT keep their phase across restarts. Legacy timers use
+    the query date and retain their historical re-anchoring behavior.
     """
     local = after.astimezone(tz)
     return local.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -125,10 +137,12 @@ def get_next_fire_time(
     rule_str: str,
     after: datetime,
     tz: ZoneInfo,
+    *,
+    anchor: datetime | None = None,
 ) -> datetime | None:
     """Compute the next fire strictly after ``after``, evaluated in ``tz``.
 
-    The rule is anchored at midnight of ``after``'s local day so occurrences
+    The rule is anchored at midnight of the reference day's local time so occurrences
     carry a deterministic wall-clock phase; the returned datetime is
     timezone-aware in ``tz``. Returns ``None`` when the rule is exhausted (a
     ``COUNT``/``UNTIL`` rule can legitimately end, unlike a bare cron).
@@ -136,12 +150,20 @@ def get_next_fire_time(
     :param rule_str: An RFC 5545 recurrence rule, e.g. ``"FREQ=DAILY;BYHOUR=9"``.
     :param after: The instant to search after (any tz-aware datetime).
     :param tz: The IANA timezone occurrences are evaluated in.
+    :param anchor: Creation time for persisted schedules. COUNT includes only
+        occurrences strictly after this instant; interval phase uses its local date.
+        Omit to retain the legacy timer's query-day anchor and COUNT behavior.
     :returns: The next fire as a tz-aware datetime, or ``None`` if the rule has
         no further occurrences.
     :raises RRuleValidationError: If ``rule_str`` is malformed.
     """
-    dtstart = _anchor_dtstart(after, tz)
-    rule = _parse(rule_str, dtstart)
+    dtstart = _anchor_dtstart(anchor if anchor is not None else after, tz)
+    rule = _parse(
+        rule_str,
+        dtstart,
+        horizon_from=after.astimezone(tz) if anchor is not None else None,
+        count_after=anchor.astimezone(tz) if anchor is not None else None,
+    )
     # `rule.after` compares in dtstart's timezone, so localize `after` too. A
     # spring-forward "imaginary" wall time maps to some instant via zoneinfo and
     # a fall-back duplicated time picks the earlier of the two; both are
@@ -166,7 +188,13 @@ class RRuleTrigger:
         return get_next_fire_time(self.rule, after, tz)
 
 
-def _parse(rule_str: str, dtstart: datetime) -> _ParsedRRule:
+def _parse(
+    rule_str: str,
+    dtstart: datetime,
+    *,
+    horizon_from: datetime | None = None,
+    count_after: datetime | None = None,
+) -> _ParsedRRule:
     """Parse an RRULE string anchored at ``dtstart``, normalizing errors.
 
     :raises RRuleValidationError: On any malformed input ``dateutil`` rejects.
@@ -226,18 +254,19 @@ def _parse(rule_str: str, dtstart: datetime) -> _ParsedRRule:
         if not isinstance(parsed, rrule):
             raise ValueError("Use a single recurrence rule")
         # The iterator also checks the horizon before searching each period.
-        horizon_year = min(dtstart.year + _SEARCH_YEARS, 9999)
+        reference = max(dtstart, horizon_from) if horizon_from is not None else dtstart
+        horizon_year = min(reference.year + _SEARCH_YEARS, 9999)
         try:
-            horizon = dtstart.replace(year=horizon_year)
+            horizon = reference.replace(year=horizon_year)
         except ValueError:
-            horizon = dtstart.replace(year=horizon_year, day=28)
+            horizon = reference.replace(year=horizon_year, day=28)
         limits = cast(_RRuleLimits, parsed)
         original_until = limits._until
         until = min(original_until, horizon) if original_until is not None else horizon
         # Apply COUNT outside dateutil so the bounded rule does not combine
         # COUNT and UNTIL, which RFC 5545 disallows.
         bounded = parsed.replace(count=None, until=until)
-        return _BoundedRRule(bounded, limits._count)
+        return _BoundedRRule(bounded, limits._count, count_after)
     except (ValueError, TypeError) as exc:
         raise RRuleValidationError(f"Invalid RRULE {rule_str!r}: {exc}") from exc
 

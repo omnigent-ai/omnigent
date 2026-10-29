@@ -185,6 +185,9 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
                 supported_capabilities=frozenset({ModelCapability.REASONING})
                 if reasoning
                 else frozenset(),
+                unsupported_capabilities=frozenset({ModelCapability.REASONING})
+                if not reasoning
+                else frozenset(),
                 wire_apis=frozenset(
                     {
                         ModelWireAPI.OPENAI_CHAT

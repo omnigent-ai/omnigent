@@ -26,6 +26,7 @@ Or consume semantic blocks via :class:`BlockStream`::
         ...
 """
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgentCatalog
 from ._blocks import (
     AnyBlock,
     BlockContext,
@@ -62,7 +63,7 @@ from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
 from ._query import QueryResult, QueryStream
 from ._server import LocalServer
 from ._session import Session
-from ._sessions import RegisteredAgent, SessionsNamespace
+from ._sessions import LaunchHost, RegisteredAgent, SessionsNamespace
 from ._sessions_chat import SessionsChat, SessionToolCallInfo, ToolCallable
 from ._stream import BlockStream, format_tool_args_brief
 from ._tool_handler import (
@@ -84,6 +85,7 @@ from .tools import ToolMetadata, ToolState, tool
 __all__ = [
     "MCP_ELICITATION_METHOD",
     "TERMINAL_TASK_STATUSES",
+    "AgentCatalogEntry",
     "AnyBlock",
     "BlockContext",
     "BlockStream",
@@ -93,6 +95,7 @@ __all__ = [
     "ErrorBlock",
     "File",
     "FileBlock",
+    "LaunchHost",
     "LocalServer",
     "NativeToolBlock",
     "OmnigentClient",
@@ -105,6 +108,7 @@ __all__ = [
     "ReasoningChunk",
     "ReasoningStartBlock",
     "RegisteredAgent",
+    "RegisteredAgentCatalog",
     "ResponseEndBlock",
     "ResponseStartBlock",
     "RetryBlock",

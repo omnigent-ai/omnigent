@@ -230,7 +230,7 @@ describe("control-mode terminal", () => {
     expect(
       terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
     ).toBe(true);
-    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42 });
+    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42, endLine: 50 });
   });
 });
 

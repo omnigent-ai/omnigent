@@ -47,6 +47,7 @@ import { usePublicSharingMaxLevel } from "@/hooks/useSharing";
 import { useUserSearch } from "@/hooks/useUserSearch";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { withBasePath } from "@/lib/basePath";
+import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentTransformShareLink, getOmnigentUserSearch } from "@/lib/host";
 import { workspaceSharingBlocked } from "@/lib/permissionsApi";
@@ -619,7 +620,7 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
 
   const handleCopy = useCallback(() => {
     const url = getShareableLink(sessionId, rebasePath);
-    navigator.clipboard.writeText(url).then(
+    copyText(url).then(
       () => setCopied(true),
       (err) => {
         console.warn("Failed to copy link to clipboard", err);

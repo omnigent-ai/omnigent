@@ -13,6 +13,10 @@ runner-owned Pi process routes through the Databricks Unity Gateway, whose
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,7 @@ from omnigent.runner.native.orchestration import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.pi_native import seed_pi_own_login_catalog
+from tests._helpers.polling import poll_until_async
 
 
 def _spec(model: str | None) -> AgentSpec:
@@ -84,9 +89,11 @@ def _key_provider_config() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached_auth", [False, True])
 async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    cached_auth: bool,
 ) -> None:
     """End-to-end: the spec's ``executor.model`` reaches the generated models.json.
 
@@ -104,8 +111,14 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     """
     import omnigent.harnesses.pi_native.bridge as pi_bridge
     import omnigent.harnesses.pi_native.credentials as creds
+    from omnigent.runner.native.orchestration import _cancel_auto_forwarder_task
+
+    if cached_auth and (os.name != "posix" or shutil.which("node") is None):
+        pytest.skip("the native Pi token cache requires POSIX and Node")
 
     session_id = "conv_pi_model_e2e"
+    token_file = tmp_path / "token"
+    token_file.write_text("cached-key")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # Redirect the bridge tree into tmp so the generated managed Pi config dir
@@ -127,7 +140,17 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
 
     def _resolve_with_test_config(*, model: str | None = None, config_loader: Any = None):
         captured["model"] = model
-        return real_resolve(model=model, config_loader=_key_provider_config)
+        provider = real_resolve(model=model, config_loader=_key_provider_config)
+        assert provider is not None
+        return (
+            replace(
+                provider,
+                api_key=f"!cat {shlex.quote(str(token_file))}",
+                auth_refresh_interval_ms=900_000,
+            )
+            if cached_auth
+            else provider
+        )
 
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
 
@@ -168,6 +191,14 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
             del terminal_name, session_key, resource_role, parent_os_env
             launched["args"] = list(spec.args)
             launched["env"] = dict(spec.env)
+            if cached_auth:
+                auth_dir = Path(spec.env["OMNIGENT_PI_NATIVE_AUTH_DIR"])
+                cache = next(auth_dir.glob("token-*.json"))
+                cached = json.loads(cache.read_text())
+                assert cached["token"] == "cached-key"
+                token_file.write_text("refreshed-key")
+                cached["expiresAt"] = 0
+                cache.write_text(json.dumps(cached))
             return SessionResourceView(
                 id="terminal_pi_main",
                 type="terminal",
@@ -185,13 +216,22 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
         ),
     )
 
-    await _auto_create_pi_terminal(
-        session_id,
-        _FakeResourceRegistry(),  # type: ignore[arg-type]
-        lambda _sid, _event: None,
-        server_client=_SnapshotClient(),  # type: ignore[arg-type]
-        agent_spec=spec,
-    )
+    try:
+        await _auto_create_pi_terminal(
+            session_id,
+            _FakeResourceRegistry(),  # type: ignore[arg-type]
+            lambda _sid, _event: None,
+            server_client=_SnapshotClient(),  # type: ignore[arg-type]
+            agent_spec=spec,
+        )
+        if cached_auth:
+            auth_dir = Path(launched["env"]["OMNIGENT_PI_NATIVE_AUTH_DIR"])
+            cache = next(auth_dir.glob("token-*.json"))
+            await poll_until_async(
+                lambda: json.loads(cache.read_text())["token"] == "refreshed-key", timeout_s=5
+            )
+    finally:
+        await _cancel_auto_forwarder_task(session_id)
 
     # The runner threaded the spec model into resolve_pi_native_provider.
     assert captured["model"] == "claude-opus-4-7"

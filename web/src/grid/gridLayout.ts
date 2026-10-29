@@ -72,9 +72,12 @@ export function swapGridSessions(
   layout: GridLayout,
   firstId: string,
   secondId: string,
+  edge?: SplitEdge,
 ): GridLayout {
   const ids = gridSessionIds(layout);
   if (firstId === secondId || !ids.includes(firstId) || !ids.includes(secondId)) return layout;
+  if (edge)
+    return ids.length === 2 ? (splitGrid(secondId, secondId, firstId, edge) ?? layout) : layout;
   const swap = (node: GridLayout): GridLayout => {
     if (typeof node === "string")
       return node === firstId ? secondId : node === secondId ? firstId : node;

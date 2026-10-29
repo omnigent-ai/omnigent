@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   applyPullRequestLabelChange,
+  applyPullRequestReviewerChange,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
   normalizePullRequestInfo,
@@ -21,6 +22,31 @@ const FORGE_DISPLAY = {
   request_name: "pull request",
   number_prefix: "!",
 };
+
+describe("applyPullRequestReviewerChange", () => {
+  it("withdraws, re-requests, and appends reviewers as GitHub will, ignoring case", () => {
+    const reviewers = [
+      { login: "Alice", kind: "user" as const, state: "PENDING" as const },
+      { login: "bob", kind: "user" as const, state: "APPROVED" as const },
+      { login: "core", kind: "team" as const, state: "PENDING" as const },
+    ];
+
+    expect(
+      applyPullRequestReviewerChange(reviewers, {
+        add: [
+          { login: "Bob", kind: "user" },
+          { login: "core", kind: "user" },
+        ],
+        remove: [{ login: "alice", kind: "user" }],
+      }),
+    ).toEqual([
+      { login: "bob", kind: "user", state: "PENDING" },
+      { login: "core", kind: "team", state: "PENDING" },
+      { login: "core", kind: "user", state: "PENDING" },
+    ]);
+    expect(reviewers[1].state).toBe("APPROVED");
+  });
+});
 
 describe("applyPullRequestLabelChange", () => {
   const label = (name: string, color: string | null = null) => ({
