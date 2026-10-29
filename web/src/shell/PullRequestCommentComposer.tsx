@@ -64,7 +64,7 @@ export function PullRequestCommentForm({
       tabIndex={compactReply ? -1 : undefined}
       className={
         collapsed
-          ? "min-w-0 border-t bg-muted/30 p-3"
+          ? "min-w-0 border-t bg-muted/30 p-2"
           : inline
             ? "flex max-h-96 min-w-0 flex-col gap-2 border-t bg-background p-3"
             : "flex max-h-[60%] shrink-0 flex-col gap-2 border-t bg-background p-3"
