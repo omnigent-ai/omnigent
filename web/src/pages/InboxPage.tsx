@@ -180,14 +180,16 @@ export function InboxPage() {
       retry: 1,
       // The count doesn't change while a native request re-parks or a prompt
       // waits in the agent's terminal, so poll until the snapshot settles.
-      refetchInterval: (query: Query<Session>) =>
-        query.state.data?.pendingElicitations?.length === 0 ||
-        query.state.data?.pendingElicitations?.some((event) => {
-          const params = event.params as Record<string, unknown> | undefined;
-          return params?.native_delivery !== undefined || params?.terminal_fallback !== undefined;
-        })
-          ? 1000
-          : false,
+      refetchInterval: (query: Query<Session>) => {
+        const events = query.state.data?.pendingElicitations;
+        const hasParam = (name: string) =>
+          events?.some(
+            (event) => (event.params as Record<string, unknown> | undefined)?.[name] !== undefined,
+          );
+        if (events?.length === 0 || hasParam("native_delivery")) return 1000;
+        // A terminal hold lasts until the user answers there, so poll it more slowly.
+        return hasParam("terminal_fallback") ? 5000 : false;
+      },
     })),
   });
 

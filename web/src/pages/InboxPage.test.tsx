@@ -547,19 +547,23 @@ describe("InboxPage approval items", () => {
     it("restores chat answers when a hook retry takes the prompt back", async () => {
       vi.useFakeTimers();
       pendingElicitations = [terminalPrompt];
-      const poll = () =>
+      const advance = (ms: number) =>
         act(async () => {
-          await vi.advanceTimersByTimeAsync(1001);
+          await vi.advanceTimersByTimeAsync(ms);
         });
       try {
         await act(async () => {
           renderPage(queryClient);
         });
-        await poll();
+        await advance(1);
         expect(screen.getByTestId("approval-card")).toHaveAttribute("data-state", "terminal");
 
         pendingElicitations = [chatPrompt];
-        await poll();
+        const fetchesBefore = vi.mocked(sessionsApi.getSession).mock.calls.length;
+        // A held prompt can wait for a long time, so it polls slower than a native re-park.
+        await advance(1001);
+        expect(vi.mocked(sessionsApi.getSession).mock.calls.length).toBe(fetchesBefore);
+        await advance(4000);
         expect(screen.getByRole("button", { name: "Stub Accept" })).toBeInTheDocument();
       } finally {
         cleanup();

@@ -61,6 +61,7 @@ export function ApprovePage() {
   }>();
   const [state, setState] = useState<PageState>({ kind: "loading" });
   const [reloadCount, setReloadCount] = useState(0);
+  const refusedResolveStatus = useRef<number | undefined>(undefined);
   const submission = useRef<{ revision: number; pending: boolean; attempt?: string }>({
     revision: 0,
     pending: false,
@@ -77,6 +78,8 @@ export function ApprovePage() {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = async () => {
       const revision = submission.current.revision;
+      const refusedStatus = refusedResolveStatus.current;
+      refusedResolveStatus.current = undefined;
       try {
         const res = await authenticatedFetch(
           `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}`,
@@ -99,6 +102,9 @@ export function ApprovePage() {
         if (data.status === "resolved") {
           submission.current = { revision: submission.current.revision + 1, pending: false };
           setState({ kind: polling ? "recovering" : "resolved" });
+        } else if (refusedStatus !== undefined && !data.terminal_fallback) {
+          // The prompt didn't move to the terminal, so report the refusal.
+          setState({ kind: "error", message: `Resolve failed: ${refusedStatus}` });
         } else if (revision === submission.current.revision) {
           // A new server attempt supersedes the POST still waiting on its response.
           if (
@@ -164,7 +170,8 @@ export function ApprovePage() {
         );
         if (!res.ok && submission.current === submitted) {
           if (res.status === 409) {
-            // The prompt moved to the agent's terminal; reload to show where to answer.
+            // The prompt may have moved to the agent's terminal; reload to check.
+            refusedResolveStatus.current = res.status;
             setState({ kind: "loading" });
             setReloadCount((count) => count + 1);
           } else {

@@ -286,14 +286,16 @@ describe("ApprovePage submission", () => {
     expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "decline" });
   });
 
-  it("shows a resolve error when the POST returns a non-ok status", async () => {
+  it.each([500, 409])("shows a resolve error when the POST returns %i", async (status) => {
     // WHY: a failed resolve POST routes to the `error` branch with the status.
+    // A 409 whose reload still offers chat answers is some other conflict.
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 500 }));
+      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status }));
     renderPage();
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
-    expect(await screen.findByText("Resolve failed: 500")).toBeInTheDocument();
+    expect(await screen.findByText(`Resolve failed: ${status}`)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
   });
 
   it("reloads into the terminal card when the server refuses a prompt that moved there", async () => {
