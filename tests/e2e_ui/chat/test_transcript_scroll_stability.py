@@ -617,3 +617,72 @@ def test_streaming_reply_keeps_newest_text_visible(
         behind_ms = behind_ms + (t1 - t0) if d0 > 8 and d1 > 8 else 0
         longest_behind_ms = max(longest_behind_ms, behind_ms)
     assert longest_behind_ms <= 100, (longest_behind_ms, [s for s in growing if s[1] > 8][:20])
+
+
+# --- Pinned at the bottom: a reply's completion keeps the reader at the end ---
+
+_CODE_PROMPT = "Explain the code, streamed."
+_CODE_REPLY_DONE = "code reply complete marker"
+_END_SLACK_PX = 24
+# Resolves once the distance has held for 20 frames; fails if it never does within 600.
+_SETTLED_DISTANCE_FROM_END_JS = """
+() => new Promise((resolve, reject) => {
+  const el = document.querySelector('[data-pw-scroller]');
+  let last = null;
+  let still = 0;
+  let frames = 0;
+  const tick = () => {
+    const distance = el.scrollHeight - el.clientHeight - el.scrollTop;
+    still = distance === last ? still + 1 : 0;
+    last = distance;
+    frames += 1;
+    if (still >= 20) resolve(distance);
+    else if (frames >= 600) reject(new Error(`distance never settled; last ${distance}px`));
+    else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})
+"""
+
+
+def _code_reply() -> str:
+    """A Python block and a TypeScript block, sized like a long code answer."""
+    python = "\n".join(f"    value_{n} = compute({n}, factor={n * 3})" for n in range(33))
+    typescript = "\n".join(f"  const v{n} = await fetchThing({n});" for n in range(14))
+    return (
+        "Here is the implementation and its client.\n\n"
+        f"```python\ndef run():\n{python}\n    return value_0\n```\n\n"
+        f"```ts\nexport async function load() {{\n{typescript}\n}}\n```\n\n{_CODE_REPLY_DONE}"
+    )
+
+
+def test_code_reply_completion_keeps_reader_at_bottom(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """The reader at the end of a streamed reply is still at the end after it completes."""
+    base_url, session_id = seeded_session
+    _seed_turns(session_id)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _code_reply(), "stream": True, "chunk_delay": 0.02}],
+        key="turn-end-follow",
+        match=_CODE_PROMPT,
+    )
+
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
+    assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
+    page.wait_for_timeout(500)
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(_CODE_PROMPT)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.get_by_text(_CODE_REPLY_DONE).first).to_be_visible(timeout=60_000)
+    expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
+
+    distance = page.evaluate(_SETTLED_DISTANCE_FROM_END_JS)
+    assert distance <= _END_SLACK_PX, f"reader left {distance}px above the end"
