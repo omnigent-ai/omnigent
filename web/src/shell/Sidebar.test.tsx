@@ -2687,6 +2687,53 @@ describe("Sidebar project Show more", () => {
     expect(screen.queryByTestId("project-show-more")).toBeNull();
   });
 
+  it.each([
+    {
+      reduceMotion: false,
+      animated: ["UL", "LI", "LI", "LI", "LI", "LI"],
+      listKeyframes: [
+        { height: "140px", overflow: "hidden" },
+        { height: "280px", overflow: "hidden" },
+      ],
+    },
+    { reduceMotion: true, animated: [], listKeyframes: undefined },
+  ])(
+    "slides the list open over the rows Show more adds (reduced motion: $reduceMotion)",
+    ({ reduceMotion, animated, listKeyframes }) => {
+      projectsMock.push("Customer X");
+      mockConversations(filedSessions(12));
+      // jsdom has no layout or Web Animations: lists measure 28px per row, and
+      // animations are recorded instead of played.
+      const animate = vi.fn();
+      Object.defineProperty(Element.prototype, "animate", { configurable: true, value: animate });
+      Object.defineProperty(HTMLUListElement.prototype, "offsetHeight", {
+        configurable: true,
+        get(this: HTMLUListElement) {
+          return this.children.length * 28;
+        },
+      });
+      const matchMedia = window.matchMedia;
+      window.matchMedia = (query: string) => ({
+        ...matchMedia(query),
+        matches: reduceMotion && query === "(prefers-reduced-motion: reduce)",
+      });
+      try {
+        renderSidebar();
+        toggleFolder();
+        fireEvent.click(screen.getByTestId("project-show-more"));
+
+        expect(animate.mock.contexts.map((element) => (element as Element).tagName)).toEqual(
+          animated,
+        );
+        expect(animate.mock.calls[0]?.[0]).toEqual(listKeyframes);
+      } finally {
+        Reflect.deleteProperty(Element.prototype, "animate");
+        Reflect.deleteProperty(HTMLUListElement.prototype, "offsetHeight");
+        window.matchMedia = matchMedia;
+      }
+    },
+  );
+
   it("offers no Show more for a folder of five sessions", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(5));

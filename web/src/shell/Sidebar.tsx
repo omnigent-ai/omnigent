@@ -1567,6 +1567,21 @@ function ProjectFolder({
     expanded ? conversations.findLastIndex((c) => revealed.has(c.id)) : -1,
   );
   const visibleCount = display.rows.length;
+  // A Show more click records the list's size; the rows it adds slide in once
+  // they render (after the next server page, when one is needed).
+  const listRef = useRef<HTMLUListElement>(null);
+  const growFrom = useRef<{ height: number; count: number } | null>(null);
+  useLayoutEffect(() => {
+    const from = growFrom.current;
+    growFrom.current = null;
+    if (from && listRef.current && visibleCount > from.count) {
+      slideOpenAppendedRows(listRef.current, from.height, from.count);
+    }
+  }, [visibleCount]);
+  const showMore = () => {
+    growFrom.current = { height: listRef.current?.offsetHeight ?? 0, count: visibleCount };
+    return display.loadMore();
+  };
   const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
@@ -1656,6 +1671,7 @@ function ProjectFolder({
         active={active}
         marker={marker}
         conversations={display.rows}
+        listRef={listRef}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
         // Projects default collapsed: shown only when explicitly expanded.
@@ -1721,7 +1737,7 @@ function ProjectFolder({
             <ProjectShowMoreRow
               loading={query.isFetchingNextPage}
               marker={hiddenMarker}
-              onShowMore={display.loadMore}
+              onShowMore={showMore}
             />
           ) : null
         }
@@ -1729,6 +1745,31 @@ function ProjectFolder({
       {menuDialogs}
     </div>
   );
+}
+
+// Timed like the file tree's row fade.
+const SHOW_MORE_MOTION: KeyframeAnimationOptions = {
+  duration: 180,
+  easing: "cubic-bezier(0.4, 0, 0.2, 1)",
+};
+
+/** Ease a list open from `fromHeight` while its rows past `fromCount` fade in. */
+function slideOpenAppendedRows(list: HTMLElement, fromHeight: number, fromCount: number) {
+  if (typeof list.animate !== "function") return;
+  if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+  const toHeight = list.offsetHeight;
+  if (toHeight <= fromHeight) return;
+  // Clip while it grows so the new rows don't paint over what follows.
+  list.animate(
+    [
+      { height: `${fromHeight}px`, overflow: "hidden" },
+      { height: `${toHeight}px`, overflow: "hidden" },
+    ],
+    SHOW_MORE_MOTION,
+  );
+  for (const row of Array.from(list.children).slice(fromCount)) {
+    row.animate([{ opacity: 0 }, { opacity: 1 }], SHOW_MORE_MOTION);
+  }
 }
 
 /**
@@ -3815,6 +3856,7 @@ function ConversationSection({
   afterHeader,
   footer,
   onProjectAssigned,
+  listRef,
 }: {
   headerDrag?: ProjectHeaderDrag;
   title?: string;
@@ -3860,6 +3902,8 @@ function ConversationSection({
       one, so the sidebar can expand that (possibly brand-new) project folder
       and list them. */
   onProjectAssigned?: (projectName: string, sessionIds: string[]) => void;
+  /** The rows list, for a project folder's Show more slide. */
+  listRef?: RefObject<HTMLUListElement | null>;
 }) {
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
@@ -3963,7 +4007,7 @@ function ConversationSection({
             )
           ) : (
             // Indent project chats a step under the project-folder name above.
-            <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
+            <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
               {conversations.map((conv) => (
                 <ConversationRow
                   key={conv.id}
