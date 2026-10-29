@@ -42,7 +42,7 @@ Omnigent lets you:
   conversation to continue on their own.
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
-  disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  ephemeral [Modal](https://modal.com), [Daytona](https://www.daytona.io),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [Gensee](https://gensee.ai),
