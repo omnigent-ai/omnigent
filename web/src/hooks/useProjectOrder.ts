@@ -22,15 +22,19 @@ export function useSaveProjectOrder() {
     },
     onMutate: async (projects) => {
       await client.cancelQueries({ queryKey: ["projects"] });
+      const previous = client.getQueryData<ProjectSummary[]>(["projects"]);
       // Reset waits for the server's canonical alphabetical comparison.
       if (projects !== null) client.setQueryData(["projects"], projects);
+      return { previous };
     },
-    onError: () => {
+    onError: (_error, _projects, context) => {
+      // A queued save supersedes this order; otherwise roll back even if the refetch fails.
+      if (client.isMutating({ mutationKey: ["project-order"] }) === 1 && context?.previous)
+        client.setQueryData(["projects"], context.previous);
       showToast("Couldn't save project order", { duration: 0 });
     },
     onSettled: async () => {
-      // A queued save would be overwritten by the refetch; the last one reconciles,
-      // which also rolls back a failed save.
+      // A queued save would be overwritten by the refetch; the last one reconciles.
       if (client.isMutating({ mutationKey: ["project-order"] }) > 1) return;
       await Promise.all([
         client.invalidateQueries({ queryKey: ["projects"] }),

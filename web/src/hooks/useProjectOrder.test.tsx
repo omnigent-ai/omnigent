@@ -29,7 +29,7 @@ function setup() {
 beforeEach(() => vi.resetAllMocks());
 
 describe("saving project order", () => {
-  it("previews a move immediately and refetches the confirmed order after a failed save", async () => {
+  it("previews a move immediately and restores confirmed order after a failed save", async () => {
     let reject!: (reason: Error) => void;
     vi.mocked(saveProjectOrder).mockReturnValue(
       new Promise((_resolve, rejectPromise) => {
@@ -42,6 +42,7 @@ describe("saving project order", () => {
     expect(client.getQueryData(["projects"])).toEqual([...projects].reverse());
     act(() => reject(new Error("offline")));
     await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(client.getQueryData(["projects"])).toEqual(projects);
     expect(client.getQueryState(["projects"])?.isInvalidated).toBe(true);
     expect(showToast).toHaveBeenCalledWith("Couldn't save project order", { duration: 0 });
   });

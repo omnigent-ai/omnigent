@@ -194,7 +194,9 @@ def test_project_settings_model_and_effort_defaults_round_trip(
     effort.click()
     page.get_by_role("option", name="High", exact=True).click()
     expect(effort).to_contain_text("High")
-    page.get_by_test_id("project-settings-save").click()
+    # The dialog closes on submit; wait for the background save before reading it back.
+    with page.expect_response(lambda r: r.request.method == "PATCH" and "/v1/projects/" in r.url):
+        page.get_by_test_id("project-settings-save").click()
     expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
 
     # The stored config must carry the chosen model under the `model` key —

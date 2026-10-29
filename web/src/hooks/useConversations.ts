@@ -1628,6 +1628,7 @@ export function useBulkMoveToProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({ ids, project }: { ids: string[]; project: string }) => {
+      assertProjectIdle(queryClient, project);
       const results = await Promise.allSettled(
         ids.map((id) => moveConversationToProject(id, project)),
       );
@@ -2460,8 +2461,10 @@ export function useMoveToProject() {
   };
 
   return useMutation({
-    mutationFn: ({ id, project }: { id: string; project: string }) =>
-      moveConversationToProject(id, project),
+    mutationFn: async ({ id, project }: { id: string; project: string }) => {
+      assertProjectIdle(queryClient, project);
+      return moveConversationToProject(id, project);
+    },
     onMutate: async ({ id, project }) => {
       // `""` unfiles (no id needed); a file target must exist in the cached
       // projects list for the overlay to be truthful about the outcome — an
@@ -2505,7 +2508,11 @@ export function useMoveToProject() {
       overlayMembership(row, target?.id ?? null, labels, project === "" ? null : project);
       return previous;
     },
-    onError: (_err, { id }, previous) => {
+    onError: (error, { id, project }, previous) => {
+      projectWriteFailed(
+        project ? `move the session to "${project}"` : "remove the session from its project",
+        error,
+      );
       if (previous === undefined) return;
       for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
         if (data !== undefined) queryClient.setQueryData(key, data);
@@ -2683,12 +2690,27 @@ function projectWriteFailed(action: string, error: Error) {
   showToast(`Couldn't ${action}. ${error.message}`, { duration: 0 });
 }
 
+// Rename variables name the folder by `oldName`; delete and settings by `name`.
+function projectWriteTarget(variables: unknown): string | undefined {
+  const { name, oldName } = variables as { name?: string; oldName?: string };
+  return oldName ?? name;
+}
+
+/** Filing under a name that a rename or delete is replacing would strand the session. */
+function assertProjectIdle(queryClient: QueryClient, project: string) {
+  const saving = queryClient
+    .getMutationCache()
+    .findAll({ mutationKey: PROJECT_WRITE_KEY, status: "pending" })
+    .some((mutation) => projectWriteTarget(mutation.state.variables) === project);
+  if (saving) throw new Error(`"${project}" is still saving. Try again when it finishes.`);
+}
+
 /** Whether a rename, delete, or settings write for the named project is in flight. */
 export function useProjectWritePending(name: string): boolean {
   return useMutationState({
     filters: { mutationKey: PROJECT_WRITE_KEY, status: "pending" },
-    select: (mutation) => mutation.state.variables as { name?: string; oldName?: string },
-  }).some((variables) => (variables.oldName ?? variables.name) === name);
+    select: (mutation) => projectWriteTarget(mutation.state.variables),
+  }).includes(name);
 }
 
 /**
@@ -2739,10 +2761,11 @@ export function useDeleteProject() {
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       // Deleting a project archives its members, growing the archived set.
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      // Stay pending until the folder leaves the list, so it never unlocks early.
+      return queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }
@@ -2758,9 +2781,8 @@ export function useCreateProject() {
     mutationFn: ({ name, icon }: { name: string; icon?: string }) =>
       apiCreateProject(name, icon ? { icon } : undefined),
     onError: (error, { name }) => projectWriteFailed(`create "${name}"`, error),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
-    },
+    // Stay pending until the new folder is listed.
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["projects"] }),
   });
 }
 
@@ -2827,9 +2849,11 @@ export function useRenameProject() {
     onError: (error, { oldName }) => projectWriteFailed(`rename "${oldName}"`, error),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
-      void queryClient.invalidateQueries({ queryKey: ["projects"] });
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
       void queryClient.invalidateQueries({ queryKey: ARCHIVED_PROJECT_NAMES_KEY });
+      // Stay pending until the list shows the new name: the old folder keeps its
+      // lock, and a follow-up icon write locks the new one.
+      return queryClient.invalidateQueries({ queryKey: ["projects"] });
     },
   });
 }

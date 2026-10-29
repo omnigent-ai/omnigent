@@ -29,12 +29,18 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
 
   const submit = () => {
     const trimmed = name.trim();
-    if (trimmed === "") return;
+    // A second create while one saves would only race it to a duplicate name.
+    if (trimmed === "" || createProject.isPending) return;
     setOpen(false);
-    // The hook toasts failures; the promise outlives later submits, unlike mutate callbacks.
+    setName("");
+    setIcon(undefined);
+    // The hook toasts failures; restore the draft so reopening can fix it.
     createProject.mutateAsync({ name: trimmed, icon }).then(
       (project) => onCreated(project.name),
-      () => {},
+      () => {
+        setName(trimmed);
+        setIcon(icon);
+      },
     );
   };
 
@@ -51,8 +57,6 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             className="text-muted-foreground"
             onClick={(e) => {
               e.stopPropagation();
-              setName("");
-              setIcon(undefined);
               setOpen(true);
             }}
           >
@@ -158,7 +162,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
             <Button
               type="button"
               data-testid="new-project-confirm"
-              disabled={name.trim() === ""}
+              disabled={name.trim() === "" || createProject.isPending}
               onClick={submit}
             >
               Create

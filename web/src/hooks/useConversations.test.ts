@@ -1,7 +1,7 @@
 // Unit tests for the conversation-mutation HTTP helpers, plus the
 // query-invalidation contract of the stop mutation hook.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -578,32 +578,78 @@ describe("useRenameProject", () => {
     expect(id).toBe("proj_1");
   });
 
-  it("marks the folder pending until a failed rename settles, then toasts", async () => {
-    let reject!: (error: Error) => void;
-    fetchMock.mockReturnValueOnce(
-      new Promise((_resolve, rejectFetch) => {
-        reject = rejectFetch;
-      }),
-    );
+  describe("background writes", () => {
     const toasts: string[] = [];
     const onToast = (e: Event) =>
       toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
-    window.addEventListener("omnigent:toast", onToast);
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(
-      () => ({ rename: useRenameProject(), pending: useProjectWritePending("old") }),
-      { wrapper },
-    );
+    beforeEach(() => {
+      toasts.length = 0;
+      window.addEventListener("omnigent:toast", onToast);
+    });
+    afterEach(() => window.removeEventListener("omnigent:toast", onToast));
 
-    act(() => result.current.rename.mutate({ id: "proj_1", oldName: "old", newName: "New" }));
-    await waitFor(() => expect(result.current.pending).toBe(true));
-    act(() => reject(new Error("offline")));
-    await waitFor(() => expect(result.current.pending).toBe(false));
+    function renderWithProjects(listProjects: () => Promise<{ id: string; name: string }[]>) {
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      return renderHook(
+        () => ({
+          projects: useQuery({
+            queryKey: ["projects"],
+            queryFn: listProjects,
+            initialData: [{ id: "proj_1", name: "old" }],
+            staleTime: Infinity,
+          }),
+          rename: useRenameProject(),
+          move: useMoveToProject(),
+          pending: useProjectWritePending("old"),
+        }),
+        { wrapper },
+      );
+    }
 
-    expect(toasts).toEqual([`Couldn't rename "old". offline`]);
-    window.removeEventListener("omnigent:toast", onToast);
+    it("marks the folder pending until a failed rename settles, then toasts", async () => {
+      let reject!: (error: Error) => void;
+      fetchMock.mockReturnValueOnce(
+        new Promise((_resolve, rejectFetch) => {
+          reject = rejectFetch;
+        }),
+      );
+      const { result } = renderWithProjects(() => Promise.resolve([]));
+
+      act(() => result.current.rename.mutate({ id: "proj_1", oldName: "old", newName: "New" }));
+      await waitFor(() => expect(result.current.pending).toBe(true));
+      act(() => reject(new Error("offline")));
+      await waitFor(() => expect(result.current.pending).toBe(false));
+
+      expect(toasts).toEqual([`Couldn't rename "old". offline`]);
+    });
+
+    it("keeps the old folder locked until the list drops it, refusing moves into it", async () => {
+      fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "New" })); // PATCH rename
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }), // members
+      );
+      let listed!: (projects: { id: string; name: string }[]) => void;
+      const { result } = renderWithProjects(
+        () =>
+          new Promise((resolve) => {
+            listed = resolve;
+          }),
+      );
+
+      act(() => result.current.rename.mutate({ id: "proj_1", oldName: "old", newName: "New" }));
+      await waitFor(() => expect(listed).toBeDefined());
+      expect(result.current.pending).toBe(true);
+      const moved = await result.current.move
+        .mutateAsync({ id: "conv_1", project: "old" })
+        .catch((error: Error) => error);
+
+      expect(moved).toEqual(new Error(`"old" is still saving. Try again when it finishes.`));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      act(() => listed([{ id: "proj_1", name: "New" }]));
+      await waitFor(() => expect(result.current.pending).toBe(false));
+    });
   });
 });
 

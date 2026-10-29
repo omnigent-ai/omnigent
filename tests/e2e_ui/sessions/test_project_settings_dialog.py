@@ -146,7 +146,9 @@ def test_project_settings_preserves_icon_on_save(
     expect(page.get_by_test_id("project-settings-worktree")).to_have_attribute(
         "data-state", "checked"
     )
-    page.get_by_test_id("project-settings-save").click()
+    # The dialog closes on submit; wait for the background save before reading it back.
+    with page.expect_response(lambda r: r.request.method == "PATCH" and "/v1/projects/" in r.url):
+        page.get_by_test_id("project-settings-save").click()
     expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
 
     assert _get_project_config(base_url, project_id) == {"icon": "🔥", "use_worktree": True}
