@@ -920,6 +920,12 @@ class EgressProxy:
                     client_reader, client_writer, upstream_reader, upstream_writer
                 )
                 return
+            refused = self._parse_header_dict(response_headers)
+            if "content-length" in refused and "transfer-encoding" in refused:
+                await self._send_bad_gateway(
+                    client_writer, f"upstream {host}:{port} sent conflicting body framing"
+                )
+                return
             # The tunnel closes after this single response; say so to the client.
             client_writer.write(status_line)
             client_writer.write(self._force_connection_close(response_headers))
@@ -930,7 +936,6 @@ class EgressProxy:
                 path,
                 status_line.decode("latin-1", errors="replace").strip(),
             )
-            refused = self._parse_header_dict(response_headers)
             try:
                 length = int(refused["content-length"]) if "content-length" in refused else None
             except ValueError:

@@ -5,13 +5,19 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from omnigent.inner.codex_executor import (
+    _populate_codex_home_config,
+    _strip_host_launched_config,
+)
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm
 from tests.e2e.test_polly_codex_subscription_login_e2e import (
@@ -141,3 +147,37 @@ def test_codex_agent_answers_with_subscription_login(
         _kill_local_server(home)
 
     assert outcome == 0, output[-3000:]
+
+
+@pytest.mark.timeout(180)
+def test_stripped_codex_home_ignores_trusted_project_mcp_servers(tmp_path: Path) -> None:
+    """A trusted project's ``.codex/config.toml`` cannot add MCP servers back."""
+    skip_if_harness_cli_missing("codex")
+    project = tmp_path / "project"
+    (project / ".codex").mkdir(parents=True)
+    (project / ".codex" / "config.toml").write_text(
+        '[mcp_servers.projprobe]\ncommand = "touch"\nargs = ["mcp-started"]\n', encoding="utf-8"
+    )
+    user_home = tmp_path / "user-codex"
+    user_home.mkdir()
+    (user_home / "config.toml").write_text(
+        f'[projects."{project}"]\ntrust_level = "trusted"\n', encoding="utf-8"
+    )
+    codex_home = tmp_path / "private-codex"
+    codex_home.mkdir()
+    _populate_codex_home_config(codex_home, user_home)
+
+    def listed_servers() -> str:
+        return subprocess.run(
+            [shutil.which("codex") or "codex", "mcp", "list"],
+            cwd=project,
+            env={**os.environ, "CODEX_HOME": str(codex_home)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        ).stdout
+
+    assert "projprobe" in listed_servers()
+    _strip_host_launched_config(codex_home, None, session_id=None)
+    assert "projprobe" not in listed_servers()

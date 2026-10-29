@@ -176,7 +176,7 @@ def test_network_denied_worker_without_model_route_keeps_files_contained(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """With no signer or egress_rules, only the model route opens; native tools go off."""
+    """With no signer or egress_rules, the worker shares the host network without native tools."""
     codex = tmp_path / "bin" / "codex"
     codex.parent.mkdir()
     codex.touch()
@@ -850,6 +850,7 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
         (target_dir / "config.toml").write_text(
             'model = "gpt-5.4-mini"\nnotify = ["touch", "notified"]\n'
             '[mcp_servers.probe]\ncommand = "touch"\nargs = ["mcp-started"]\n'
+            f'[projects."{tmp_path}"]\ntrust_level = "trusted"\n'
         )
         if hooks_staged_as == "symlink":
             (target_dir / "hooks.json").symlink_to(user_hooks)
@@ -875,7 +876,8 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
     assert session._disable_native_tools is True
     assert session._codex_home_dir is not None
     effective = (session._codex_home_dir / "config.toml").read_text()
-    assert "mcp_servers" not in effective and "notify" not in effective, effective
+    for inherited in ("mcp_servers", "notify", "projects"):
+        assert inherited not in effective, effective
     assert 'model = "gpt-5.4-mini"' in effective
     assert not os.path.lexists(session._codex_home_dir / "hooks.json")
     assert user_hooks.read_text() == "{}"
@@ -1260,3 +1262,79 @@ def test_real_bwrap_worker_reads_bridged_codex_home_files(
 
     assert worker.sandboxed
     assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="requires Linux bubblewrap",
+)
+@pytest.mark.parametrize(
+    ("allow_network", "egress_rules"),
+    [(True, None), (False, ["* chatgpt.com/**"])],
+    ids=["allow-network", "egress-rules"],
+)
+def test_real_bwrap_worker_with_native_tools_cannot_reach_host_login(
+    tmp_path: Path,
+    allow_network: bool,
+    egress_rules: list[str] | None,
+) -> None:
+    """Native tools share the worker sandbox, so it gets only a private copy of the login."""
+    user_codex_home = tmp_path / "home" / ".codex"
+    user_codex_home.mkdir(parents=True)
+    host_login = user_codex_home / "auth.json"
+    host_login.write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    codex = tmp_path / "install" / "bin" / "codex"
+    codex.parent.mkdir(parents=True)
+    codex.write_text(
+        '#!/bin/sh\ncat "$CODEX_HOME/auth.json" >/dev/null || exit 91\n'
+        'echo \'{"refreshed": true}\' >"$CODEX_HOME/auth.json" || exit 92\n'
+        'if cat "$HOST_LOGIN" >/dev/null 2>&1; then exit 93; fi\n',
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    codex_home = Path(tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=codex_home_staging_root()))
+    _populate_codex_home_config(codex_home, user_codex_home, minimal_config=True)
+    worker_env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path / "home"),
+        "CODEX_HOME": str(codex_home),
+        "HOST_LOGIN": str(host_login),
+    }
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=workspace,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                write_paths=["."],
+                allow_network=allow_network,
+                egress_rules=egress_rules,
+                egress_allow_private_destinations=egress_rules is not None,
+            ),
+        ),
+        spawn_env_names=list(worker_env),
+        worker_env=worker_env,
+    )
+
+    try:
+        completed = subprocess.run(
+            [worker.launch_path, "app-server"],
+            cwd=workspace,
+            env=worker_env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        worker.close()
+        shutil.rmtree(codex_home, ignore_errors=True)
+
+    assert worker.sandboxed and worker.native_tools_allowed
+    assert completed.returncode == 0, (completed.returncode, completed.stderr)
+    assert host_login.read_text(encoding="utf-8") == '{"auth_mode": "chatgpt"}'

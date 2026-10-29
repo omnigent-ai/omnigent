@@ -1118,16 +1118,18 @@ def _strip_host_launched_config(
 
     ``[mcp_servers.*]``, ``notify`` and the user ``hooks.json`` launch processes
     that would share the worker's host network when its native tools are off.
-    The router hooks, if any, are rewritten without the user's hooks.
+    ``[projects.*]`` trust is dropped too, so a project ``.codex/config.toml``
+    cannot add them back. The router hooks, if any, are rewritten alone.
     """
     import tomlkit
 
     config_path = codex_home / "config.toml"
     if config_path.is_file():
         document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
-        if "mcp_servers" in document or "notify" in document:
-            document.pop("mcp_servers", None)
-            document.pop("notify", None)
+        launch_keys = ("mcp_servers", "notify", "projects")
+        if any(key in document for key in launch_keys):
+            for key in launch_keys:
+                document.pop(key, None)
             if config_path.is_symlink():
                 # Never write through to the user's real config.toml.
                 config_path.unlink()

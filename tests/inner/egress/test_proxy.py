@@ -3123,9 +3123,18 @@ def _mitm_client_read_until_close(
         ("/backend-api/chunked", b"", b"HTTP/1.1 426", b"5\r\nnope!\r\n0\r\n\r\n", True),
         ("/backend-api/bodyless", b"", b"HTTP/1.1 204", b"", True),
         ("/backend-api/other-protocol", b"", b"HTTP/1.1 502", None, True),
+        ("/backend-api/conflicting", b"", b"HTTP/1.1 502", None, True),
         ("/backend-api/declined", b"abc", b"HTTP/1.1 403", None, False),
     ],
-    ids=["denied-path", "declined", "chunked", "bodyless", "other-protocol", "with-body"],
+    ids=[
+        "denied-path",
+        "declined",
+        "chunked",
+        "bodyless",
+        "other-protocol",
+        "conflicting-framing",
+        "with-body",
+    ],
 )
 @pytest.mark.asyncio
 async def test_refused_websocket_upgrade_closes_the_tunnel(
@@ -3152,6 +3161,11 @@ async def test_refused_websocket_upgrade_closes_the_tunnel(
                 writer.write(
                     b"HTTP/1.1 101 Switching Protocols\r\n"
                     b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+                )
+            elif b" /backend-api/conflicting " in request_line:
+                writer.write(
+                    b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4\r\n"
+                    b"Transfer-Encoding: chunked\r\n\r\n5\r\nnope!\r\n0\r\n\r\n"
                 )
             elif b" /backend-api/chunked " in request_line:
                 writer.write(
