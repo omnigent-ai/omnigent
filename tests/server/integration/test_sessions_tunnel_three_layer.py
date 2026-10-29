@@ -2607,3 +2607,35 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 await reconnect.wait(timeout=budget(2.0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("recovery_pending", [False, True])
+async def test_root_reconnect_defers_to_durable_host_recovery_on_another_replica(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_pending: bool,
+) -> None:
+    from omnigent.runtime import get_conversation_store
+    from omnigent.session_recovery import SessionRecovery
+
+    stack = tunnel_three_layer_stack
+    session_id = await _bind_failed_session(
+        stack.ap_client, error_code="runner_disconnected", error_message="Disconnected"
+    )
+    store = get_conversation_store()
+    host_id = "a" * 32
+    store.set_host_id(session_id, host_id, workspace="/restored")
+    assert stack.ap_app.state.host_registry.get(host_id) is None
+    if recovery_pending:
+        assert store.replace_session_recovery(
+            session_id, None, SessionRecovery(host_id, _RUNNER_ID, 100, phase="launching")
+        )
+    initializer = stack.ap_app.state.runner_session_initializer
+    spy = AsyncMock(wraps=initializer.initialize)
+    monkeypatch.setattr(initializer, "initialize", spy)
+    async with _reconnect_fires_connect_hook(
+        stack.ap_app, stack.fake_pm, wait_for_recover=session_id
+    ):
+        assert spy.call_args.kwargs["suppress_recovery_turn"] is recovery_pending

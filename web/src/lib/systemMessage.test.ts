@@ -78,6 +78,14 @@ describe("isClaudeAgentMessageContent", () => {
 });
 
 describe("parseSystemMessage", () => {
+  it("recognizes the automatic continuation notice", () => {
+    expect(parseSystemMessage("[System: session resumed]\nContinue existing work.")).toEqual({
+      kind: "session_resumed",
+      label: "Session resumed",
+      body: "Continue existing work.",
+    });
+  });
+
   it("returns null for plain user text", () => {
     expect(parseSystemMessage("hello world")).toBeNull();
     expect(parseSystemMessage("[note: not a system message]")).toBeNull();

@@ -2146,3 +2146,50 @@ async def test_malformed_mcp_tools_reply_returns_502(
     assert response.json() == {"detail": "host MCP tools lookup failed"}
     assert not conn.pending_mcp_tools
     await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_host_requests_recovery_without_blocking_tunnel(
+    db_uri: str, enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host.frames import HostRecoverSessionsFrame
+
+    monkeypatch.setattr("omnigent.server.routes.host_tunnel.PING_INTERVAL_S", 0.02)
+    registry, store = HostRegistry(), HostStore(db_uri)
+    started, cancelled = asyncio.Event(), asyncio.Event()
+    calls = []
+
+    async def recover(connection, runners):
+        calls.append((connection.host_id, runners))
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, on_session_recovery=recover), prefix="/v1"
+    )
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    hello = decode_host_frame(_make_hello())
+    assert isinstance(hello, HostHelloFrame)
+    hello.recover_interrupted_sessions = enabled
+    await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(hello)})
+    await asyncio.wait_for(_wait_registered(registry, _HOST_ID), timeout=budget(2))
+    request = {
+        "type": "websocket.receive",
+        "text": encode_host_frame(HostRecoverSessionsFrame(runners=["alive"])),
+    }
+    await comm.send_input(request)
+    if enabled:
+        await asyncio.wait_for(started.wait(), timeout=budget(2))
+    await comm.send_input(request)
+    await _receive_ping_and_pong(comm)
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2))
+    if enabled:
+        await asyncio.wait_for(cancelled.wait(), timeout=budget(2))
+        assert calls == [(_HOST_ID, ["alive"])]
+    else:
+        assert calls == []

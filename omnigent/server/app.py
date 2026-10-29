@@ -4591,6 +4591,20 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                             trigger="runner_connect",
+                            suppress_recovery_turn=bool(
+                                conversation_store.supports_session_recovery
+                                and conv.host_id
+                                and (
+                                    (
+                                        (recovering_host := host_registry.get(conv.host_id))
+                                        and recovering_host.hello.recover_interrupted_sessions
+                                    )
+                                    or await asyncio.to_thread(
+                                        conversation_store.get_session_recovery, conv.id
+                                    )
+                                    is not None
+                                )
+                            ),
                         )
                         # A removed agent was already logged as expected.
                         if is_session_agent_removed(response):
@@ -4711,6 +4725,7 @@ def create_app(
     # except (a hidden failure). No host_store = host support is simply
     # not enabled (host connects get 404), rather than silently broken.
     if host_store is not None:
+        from omnigent.server.host_session_recovery import HostSessionRecoverer
         from omnigent.server.routes.harness_startup import create_harness_startup_router
         from omnigent.server.routes.host_tunnel import create_host_tunnel_router
         from omnigent.server.routes.hosts import create_hosts_router
@@ -4719,6 +4734,14 @@ def create_app(
         from omnigent.server.routes.plugins import create_plugins_router
         from omnigent.server.routes.skill_content import create_skill_content_router
         from omnigent.server.routes.skills import create_skills_router
+
+        host_session_recoverer = HostSessionRecoverer(
+            conversation_store,
+            host_registry,
+            host_store,
+            runner_router,
+            runner_session_initializer,
+        )
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
@@ -4732,6 +4755,7 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
+                on_session_recovery=host_session_recoverer.recover,
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,

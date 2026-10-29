@@ -3190,6 +3190,8 @@ def create_runner_app(
                 )
                 _background_tasks.add(_turn_task)
 
+        from omnigent.session_recovery import RECOVERY_PROMPT
+
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
         ):
@@ -3209,20 +3211,22 @@ def create_runner_app(
                     "agent_id": agent_id,
                     "model": body.get("model", agent_id),
                     "browser_renderer_available": False,
+                    "stable_id": recovery_id,
                     "content": [
                         {
                             "type": "input_text",
-                            "text": (
-                                "Your runner was interrupted while this task was active. "
-                                "Continue the existing task from its current state. "
-                                "Check any interrupted operation's outcome before repeating it."
-                            ),
+                            "text": RECOVERY_PROMPT,
                         }
                     ],
                 }
                 if not is_native_harness(harness_name):
                     _session_histories.setdefault(session_id, []).append(
-                        {"type": "message", "role": "user", "content": recovery_body["content"]}
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": recovery_body["content"],
+                            "is_meta": True,
+                        }
                     )
                 recovery_task = asyncio.create_task(
                     _run_turn_bg(recovery_body, session_id), name=f"turn-recover-{session_id}"
@@ -3264,6 +3268,7 @@ def create_runner_app(
                 "id": session_id,
                 "agent_id": agent_id,
                 "status": status,
+                "recovery_turn": recovery_turn,
                 "created_at": int(_session_start_cache[session_id]),
                 "title": None,
                 "labels": {},

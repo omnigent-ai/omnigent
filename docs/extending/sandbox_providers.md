@@ -271,6 +271,49 @@ The reaper reuses one launcher per workspace and provider. Override
 `reaper_identity(workspace_id)` when background termination needs a scoped
 credential context; the default context is a no-op.
 
+## Automatic continuation after a host restart
+
+Managed deployments can opt in through the existing host configuration:
+
+```yaml
+sandbox:
+  provider: kubernetes
+  host_config:
+    host:
+      recover_interrupted_sessions: true
+```
+
+This is off by default and independent of `resume_stopped`. The provider must
+restore the workspace, credentials, and harness state **before starting the
+host**. Providers that restore files asynchronously must leave it disabled until
+that ordering is guaranteed. An opted-in host advertises the setting in its hello
+and sends `host.recover_sessions` with its live runner IDs every 30 seconds.
+Older hosts retain their existing behavior.
+
+The server considers only authorized root sessions already bound to that managed
+host. It restarts lost runners for interrupted work and sends a hidden continuation
+prompt through the existing session initializer. Live runners, idle sessions,
+pending approvals, archived/closed sessions, Stop, and newer user input prevent
+automatic continuation. Missing workspace directories are refused, not recreated.
+The feature does not provision compute or call provider wake methods: the provider
+or infrastructure supervisor must bring the host back first.
+
+Recovery intent is private conversation state, with at most three launch attempts
+and a 24-hour window per interrupted task. Launch retries back off; the budget
+survives server restarts. An uncertain continuation delivery stops automatically
+instead of replaying potentially completed work. A new user message starts a fresh
+budget. This is not an exactly-once guarantee for tool side effects.
+
+Custom conversation stores opt in with `supports_session_recovery = True` after
+implementing `get_session_recovery` and atomic `replace_session_recovery`, ordered
+with user input, Stop, archive, and deletion. The SQLAlchemy store implements this
+contract using private `omnigent.recovery.*` rows in the existing conversation
+labels table. Each field fits the existing label limit; no schema migration is
+needed. These rows are excluded from ordinary label reads and forks, and ordinary
+label writes cannot change them. Recovery and input acceptance share a transaction,
+including in split-database deployments.
+No task ledger file or customer hook configuration is required.
+
 ## Provider capabilities
 
 Providers declare their feature set via a `capabilities` property returning

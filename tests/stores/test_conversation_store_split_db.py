@@ -878,3 +878,102 @@ def test_get_conversation_takes_one_checkout_per_engine(
         "runner_split",
         "a6bfc420101272fcd5906a9eff904dfd",
     )
+
+
+def test_recovery_state_shares_input_transaction_and_workspace_scope(
+    store: SqlAlchemyConversationStore, conv_db: Path
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation(host_id="a" * 32, runner_id="old", workspace="/restored")
+    intent = SessionRecovery("a" * 32, "old", 100)
+    tables = _tables(conv_db)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    assert _tables(conv_db) == tables
+    assert "session_recovery" not in tables
+    assert _count(conv_db, "conversation_labels") > 0
+    with workspace_scope(42):
+        assert store.get_session_recovery(conv.id) is None
+        assert not store.replace_session_recovery(conv.id, None, intent)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="user",
+                type="message",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "new work"}]
+                ),
+            )
+        ],
+    )
+    assert store.get_session_recovery(conv.id) is None
+    assert not store.replace_session_recovery(conv.id, intent, None)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    asyncio.run(store.delete_conversation(conv.id))
+    assert _count(conv_db, "conversation_labels") == 0
+
+
+def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
+    store: SqlAlchemyConversationStore, conv_db: Path
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.errors import OmnigentError
+    from omnigent.session_recovery import RECOVERY_LABEL_PREFIX, SessionRecovery
+
+    conv = store.create_conversation(labels={"team": "platform"})
+    intent = SessionRecovery("a" * 64, "b" * 64, 100, attempt_id="c" * 64, attempts=3)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    assert store.get_session_recovery(conv.id) == intent
+    assert store.get_conversation(conv.id).labels == {"team": "platform"}
+    assert store.list_conversations().data[0].labels == {"team": "platform"}
+    fork = store.fork_conversation(conv.id)
+    assert store.get_session_recovery(fork.id) is None
+
+    for key in (RECOVERY_LABEL_PREFIX + "attempts", (RECOVERY_LABEL_PREFIX + "attempts").upper()):
+        with pytest.raises(OmnigentError, match="server-internal"):
+            store.create_conversation(labels={key: "0"})
+        with pytest.raises(OmnigentError, match="server-internal"):
+            store.set_labels(conv.id, {"team": "forged", key: "0"})
+        with pytest.raises(OmnigentError, match="server-internal"):
+            store.delete_label(conv.id, key)
+    with pytest.raises(ValueError, match="storage limit"):
+        store.replace_session_recovery(conv.id, intent, replace(intent, runner_id="x" * 256))
+    assert store.get_session_recovery(conv.id) == intent
+    assert store.get_conversation(conv.id).labels == {"team": "platform"}
+    assert max(map(len, _col(conv_db, "conversation_labels", "value"))) <= 256
+
+
+def test_failed_input_does_not_cancel_recovery(
+    store: SqlAlchemyConversationStore, conv_db: Path
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation()
+    intent = SessionRecovery("a" * 32, "old", 100)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    with sqlite3.connect(conv_db) as connection:
+        connection.execute(
+            "CREATE TRIGGER refuse_input BEFORE INSERT ON conversation_items "
+            "BEGIN SELECT RAISE(ABORT, 'input refused'); END"
+        )
+    with pytest.raises(IntegrityError, match="input refused"):
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="message",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "new work"}]
+                    ),
+                )
+            ],
+        )
+    assert store.get_session_recovery(conv.id) == intent

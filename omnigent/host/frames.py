@@ -150,6 +150,7 @@ def classify_launch_refusal(
 class HostFrameKind(str, Enum):
     """All host frame kinds; the value is the JSON wire string."""
 
+    RECOVER_SESSIONS = "host.recover_sessions"
     HELLO = "host.hello"
     CONNECTION_ERROR = "host.connection_error"
     HARNESS_READINESS = "host.harness_readiness"
@@ -265,6 +266,14 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    recover_interrupted_sessions: bool = False
+
+
+@dataclass
+class HostRecoverSessionsFrame:
+    """Host requests reconciliation after its provider has restored local state."""
+
+    runners: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -335,6 +344,7 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    recovery: bool = False
 
 
 @dataclass
@@ -1450,7 +1460,8 @@ class HostImportLocalDoneFrame:
 
 
 HostFrame = (
-    HostHelloFrame
+    HostRecoverSessionsFrame
+    | HostHelloFrame
     | HostConnectionErrorFrame
     | HostHarnessReadinessFrame
     | HostLaunchRunnerFrame
@@ -1550,6 +1561,13 @@ def encode_host_frame(frame: HostFrame) -> str:
     :returns: JSON string for the WebSocket text message.
     :raises TypeError: If ``frame`` is not a known host frame type.
     """
+    if isinstance(frame, HostRecoverSessionsFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.RECOVER_SESSIONS.value,
+                "runners": list(frame.runners),
+            }
+        )
     if isinstance(frame, HostHelloFrame):
         return _encode_payload(
             {
@@ -1566,6 +1584,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "recover_interrupted_sessions": frame.recover_interrupted_sessions,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1596,6 +1615,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.recovery:
+            payload["recovery"] = True
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2403,6 +2424,10 @@ def _decode_known_host_frame(
     :raises ValueError: If the kind is unexpectedly unhandled.
     """
     match kind:
+        case HostFrameKind.RECOVER_SESSIONS:
+            return HostRecoverSessionsFrame(
+                runners=_optional_str_list(msg, "runners"),
+            )
         case HostFrameKind.HELLO:
             return _decode_host_hello(msg)
         case HostFrameKind.CONNECTION_ERROR:
@@ -2636,6 +2661,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        recover_interrupted_sessions=_optional_bool(msg, "recover_interrupted_sessions"),
     )
 
 
@@ -2669,6 +2695,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         raise ValueError("inference_config must be an object or null")
     return HostLaunchRunnerFrame(
         request_id=_required_str(msg, "request_id"),
+        recovery=_optional_bool(msg, "recovery"),
         binding_token=_required_str(msg, "binding_token"),
         workspace=_required_str(msg, "workspace"),
         session_id=_optional_nullable_str(msg, "session_id"),

@@ -1086,6 +1086,18 @@ async def test_handle_launch_recreates_missing_workspace(
     _cleanup_host(host)
 
 
+async def test_recovery_launch_requires_restored_workspace(tmp_path: Path) -> None:
+    host = _make_host_process()
+    workspace = tmp_path / "missing"
+    frame = HostLaunchRunnerFrame(
+        request_id="recover", binding_token="token", workspace=str(workspace), recovery=True
+    )
+    result = await host._handle_launch(frame)
+    assert result.status == "failed"
+    assert result.error_code == "workspace_missing"
+    assert not workspace.exists()
+
+
 async def test_handle_launch_refuses_when_workspace_parent_missing(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

@@ -98,6 +98,10 @@ the header menu), and each place is a separate entry point.
   which the server still lists the session's host offline (usually because Arca
   came back as a different host), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `host-recovery`: opted-in managed hosts request continuation after their
+  provider restores local state. Lost runners resume interrupted root tasks with
+  a hidden system-tagged prompt; Stop, newer input, approvals, and archive win.
+  Automatic launch retries are bounded and survive a server restart.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -815,6 +819,19 @@ plain `uv run pytest`, which starts a private server for the test.
   drives the real SPA and server with the session patched to an asleep host. It
   checks that Reconnect host sends `retry_session` and shows the server's answer,
   not a live sandbox resume.
+- **`host-recovery`, host request, store ordering, and runner initialization:**
+  `tests/server/test_host_session_recovery.py`,
+  `tests/server/integration/test_host_tunnel_route.py::test_host_requests_recovery_without_blocking_tunnel`,
+  `tests/stores/test_conversation_store_split_db.py::test_recovery_state_shares_input_transaction_and_workspace_scope`,
+  `tests/host/test_connect.py::test_recovery_launch_requires_restored_workspace`,
+  `tests/runner/test_suppress_recovery_turn.py`.
+  Run with plain `uv run pytest`. The UI marker is covered by
+  `web/src/components/blocks/SystemMessage.test.tsx`.
+  Live proof requires a managed sandbox whose provider restores files before
+  starting its opted-in host: interrupt an active task by restarting the sandbox,
+  then confirm completion in the same chat without sending another message.
+  Keep native harness and provider lifecycle evidence separate from these tests.
+
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

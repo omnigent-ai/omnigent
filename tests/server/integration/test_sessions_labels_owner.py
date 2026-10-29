@@ -88,6 +88,12 @@ async def test_labels_updated_via_patch(
     )
     sid = session["id"]
 
+    rejected = await client.patch(
+        f"/v1/sessions/{sid}", json={"labels": {"omnigent.recovery.attempts": "0"}}
+    )
+    assert rejected.status_code == 400
+    assert "server-internal" in rejected.text
+
     # Update labels via PATCH
     patch_resp = await client.patch(
         f"/v1/sessions/{sid}",

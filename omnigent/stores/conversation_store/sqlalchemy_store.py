@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import asdict, replace
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
 
@@ -82,6 +83,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -90,6 +92,12 @@ from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
+from omnigent.session_recovery import (
+    RECOVERY_LABEL_PREFIX,
+    RECOVERY_PROMPT,
+    SessionRecovery,
+    reject_recovery_labels,
+)
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -468,6 +476,7 @@ def _created_session_from_rows(
 
 def _prepare_label_updates(updates: dict[str, str]) -> dict[str, str]:
     """Return the exact label values accepted by the persistence schema."""
+    reject_recovery_labels(updates)
     # Clamp by characters, matching PostgreSQL ``VARCHAR(n)`` semantics.
     return {key: value[:LABEL_VALUE_MAX_LEN] for key, value in updates.items()}
 
@@ -614,6 +623,7 @@ def _fetch_labels(
                 select(SqlConversationLabel.key, SqlConversationLabel.value).where(
                     SqlConversationLabel.workspace_id == current_workspace_id(),
                     SqlConversationLabel.conversation_id == conversation_id,
+                    ~SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
                 )
             )
             .tuples()
@@ -651,12 +661,53 @@ def _fetch_labels_bulk(
         ).where(
             SqlConversationLabel.workspace_id == current_workspace_id(),
             SqlConversationLabel.conversation_id.in_(conversation_ids),
+            ~SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
         )
     ).all()
     out: dict[str, dict[str, str]] = {}
     for conv_id, key, value in rows:
         out.setdefault(conv_id, {})[key] = value
     return out
+
+
+def _read_session_recovery(session: Session, conversation_id: str) -> SessionRecovery | None:
+    rows = session.execute(
+        select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
+            SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
+        )
+    ).all()
+    return (
+        SessionRecovery(
+            **{key.removeprefix(RECOVERY_LABEL_PREFIX): json.loads(value) for key, value in rows}
+        )
+        if rows
+        else None
+    )
+
+
+def _write_session_recovery(
+    session: Session, conversation_id: str, recovery: SessionRecovery | None
+) -> None:
+    """Caller holds the conversation lock; all fields share its input transaction."""
+    if recovery is None:
+        session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key.startswith(RECOVERY_LABEL_PREFIX),
+            )
+        )
+        return
+    # Each field fits an existing label; never truncate recovery identity or state.
+    updates = {
+        RECOVERY_LABEL_PREFIX + key: json.dumps(value, ensure_ascii=False)
+        for key, value in asdict(recovery).items()
+    }
+    if any(len(value) > LABEL_VALUE_MAX_LEN for value in updates.values()):
+        raise ValueError("Session recovery field exceeds label storage limit")
+    _upsert_prepared_labels(session, conversation_id, updates, now_epoch())
 
 
 def _fetch_search_snippets(
@@ -2205,6 +2256,33 @@ class SqlAlchemyConversationStore(ConversationStore):
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
+    supports_session_recovery = True
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        with self._conv_session("get_session_recovery") as session:
+            return _read_session_recovery(session, conversation_id)
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+    ) -> bool:
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            conversation = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if conversation is None or conversation.archived:
+                return False
+            actual = _read_session_recovery(session, conversation_id)
+            if actual != expected:
+                return False
+            _write_session_recovery(session, conversation_id, recovery)
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate, "replace_session_recovery", write
+        )
+
     def list_host_conversation_ids(
         self,
         host_id: str,
@@ -2582,6 +2660,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         # FOR UPDATE lock while it round-trips. strip_nul_bytes runs here so a
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
+        for item in items:
+            if (
+                isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and not item.data.user_authored
+                and item.data.content == [{"type": "input_text", "text": RECOVERY_PROMPT}]
+            ):
+                item.data = item.data.model_copy(update={"is_meta": True})
         raw_jsons = [
             strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True))) for item in items
         ]
@@ -2677,6 +2763,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                         for item in items
                         if item.stable_id is not None
                     ]
+
+            # Accepted new input cancels a pending continuation in the same transaction.
+            if any(
+                item.stable_id not in existing_by_id
+                and isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and not item.data.is_meta
+                for item in items
+            ):
+                _write_session_recovery(session, conversation_id, None)
 
             replacements: dict[str, tuple[int, int]] = {}
             for item, prepared, _ in prepared_rows:
@@ -2950,6 +3046,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: The conversation to update.
         :param key: The label key to remove, e.g. ``"omni_project"``.
         """
+        reject_recovery_labels([key])
 
         def write(session: Session) -> None:
             session.execute(
@@ -3711,6 +3808,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
                         )
                     )
+                if archived:
+                    recovery = _read_session_recovery(ap_sess, conversation_id)
+                    if recovery is not None:
+                        _write_session_recovery(
+                            ap_sess, conversation_id, replace(recovery, phase="stopped")
+                        )
                 row.archived = archived
                 ap_changed = True
             if label_updates:

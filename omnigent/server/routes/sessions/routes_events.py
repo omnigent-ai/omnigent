@@ -1280,6 +1280,13 @@ def register_events_routes(
                     f"Invalid data payload for event type {body.type!r}: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if body.type == _RETRY_SESSION_TYPE or (
+            body.type == "message" and body.data.get("role", "user") == "user"
+        ):
+            from omnigent.server.host_session_recovery import stop_recovery
+
+            await asyncio.to_thread(stop_recovery, conversation_store, conv, only_pending=True)
+
         # Set when this message sends a file outside the default extensions, which
         # the bound runtime must be able to deliver as a file.
         outgoing_needs_delivery_capability = False
@@ -1715,6 +1722,9 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            from omnigent.server.host_session_recovery import stop_recovery
+
+            await asyncio.to_thread(stop_recovery, conversation_store, conv)
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
