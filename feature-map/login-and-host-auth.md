@@ -109,9 +109,11 @@ session whose host went offline offers reconnect (see [sessions](./sessions.md))
 server; relaunching the app, New Window, deep links, and switching servers on a
 signed-in server; the app's sign-out in Settings, **Server → Sign Out of Server**
 in the native menu, and **Sign out of <server>** in the sidebar server picker (Databricks and OIDC servers; the next Connect opens
-the browser, which is how a user switches accounts). To connect a machine over SSH:
-**Connect new host** in a new session's host menu, then the SSH field in
-**Connect a host** (desktop app only; not yet on Windows).
+the browser, which is how a user switches accounts). To connect a machine over SSH,
+use the SSH field under the `omni host` command (desktop app only; not yet on
+Windows): **Connect new host** in a new session's host menu, or the clone dialog
+(from the header or the reconnect dialog's Clone tab) when no host is online or
+under **Connect another host from your terminal**. Each selects the new host.
 
 **iOS:** Connect on the connect screen to an OIDC server; a server picked in the
 native server menu or the sidebar server picker; relaunching the app, deep links,

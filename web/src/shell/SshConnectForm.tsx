@@ -1,8 +1,8 @@
-import { type FormEvent, useEffect, useId, useState } from "react";
+import { type FormEvent, useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { connectSshHost, listSshHosts } from "@/lib/nativeBridge";
+import { connectSshHost } from "@/lib/nativeBridge";
 
 /**
  * Connect a machine the user reaches over SSH as a host, through the desktop
@@ -16,22 +16,10 @@ export function SshConnectForm({
   onConnected?: (hostId: string | null) => void;
 }) {
   const queryClient = useQueryClient();
-  const listId = useId();
   const inputId = useId();
   const [destination, setDestination] = useState("");
-  const [hosts, setHosts] = useState<string[]>([]);
   const [connecting, setConnecting] = useState(false);
   const [message, setMessage] = useState<{ kind: "error" | "info"; text: string } | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    void listSshHosts().then((found) => {
-      if (active) setHosts(found);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
 
   async function connect(event: FormEvent) {
     event.preventDefault();
@@ -76,7 +64,6 @@ export function SshConnectForm({
       <div className="flex gap-2">
         <Input
           id={inputId}
-          list={listId}
           value={destination}
           onChange={(event) => setDestination(event.target.value)}
           placeholder="host alias or user@host"
@@ -85,11 +72,6 @@ export function SshConnectForm({
           componentId="new_chat.ssh_connect.destination"
           data-testid="ssh-connect-destination"
         />
-        <datalist id={listId}>
-          {hosts.map((host) => (
-            <option key={host} value={host} />
-          ))}
-        </datalist>
         <Button
           type="submit"
           variant="outline"

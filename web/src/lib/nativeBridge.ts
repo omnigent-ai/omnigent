@@ -202,8 +202,6 @@ interface ElectronDesktopApi extends NativeShellApi {
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
   connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
-  /** Host aliases from the user's ~/.ssh/config. */
-  listSshHosts?: () => Promise<string[]>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
@@ -1136,17 +1134,6 @@ export async function connectSshHost(destination: string): Promise<ArcaConnectRe
   } catch (err) {
     console.warn("[nativeBridge] electron connectSshHost failed:", err);
     return { ok: false, error: String(err) };
-  }
-}
-
-/** Host aliases from ~/.ssh/config, or [] outside the shell. */
-export async function listSshHosts(): Promise<string[]> {
-  try {
-    const hosts = await electronApi()?.listSshHosts?.();
-    return Array.isArray(hosts) ? hosts.filter((host) => typeof host === "string") : [];
-  } catch (err) {
-    console.warn("[nativeBridge] electron listSshHosts failed:", err);
-    return [];
   }
 }
 

@@ -205,38 +205,6 @@ function classifyPrompt(prompt, hint = "") {
 }
 
 /**
- * Host aliases from an ssh config file, skipping patterns like `*.corp`.
- *
- * @param {string} text
- * @returns {string[]}
- */
-function parseSshConfigHosts(text) {
-  const hosts = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const match = /^\s*Host(?:\s*=\s*|\s+)(.+)$/i.exec(raw.replace(/#.*/, ""));
-    if (!match) continue;
-    for (const name of match[1].trim().split(/\s+/)) {
-      if (DESTINATION_RE.test(name) && !hosts.includes(name)) hosts.push(name);
-    }
-  }
-  return hosts;
-}
-
-/**
- * @param {{ home?: string, readFile?: (p: string) => string }} [deps]
- * @returns {string[]} Hosts from ~/.ssh/config, or [] when it can't be read.
- */
-function listSshHosts(deps = {}) {
-  const home = deps.home ?? os.homedir();
-  const readFile = deps.readFile ?? ((p) => fs.readFileSync(p, "utf8"));
-  try {
-    return parseSshConfigHosts(readFile(path.join(home, ".ssh", "config")));
-  } catch {
-    return [];
-  }
-}
-
-/**
  * @param {number} port
  * @returns {Promise<boolean>} Whether nothing on this computer holds <port> on
  *   either loopback address; a browser may try `::1` first for localhost.
@@ -525,8 +493,10 @@ function createSshSession(options) {
       );
     },
 
-    forwardLocal: (port) => control("forward", ["-L", `${port}:127.0.0.1:${port}`]),
-    cancelLocal: (port) => control("cancel", ["-L", `${port}:127.0.0.1:${port}`]),
+    // An explicit localhost bind keeps the listener local even when the
+    // user's config sets GatewayPorts, which the master reads.
+    forwardLocal: (port) => control("forward", ["-L", `localhost:${port}:127.0.0.1:${port}`]),
+    cancelLocal: (port) => control("cancel", ["-L", `localhost:${port}:127.0.0.1:${port}`]),
     holdRemote: (port) => control("forward", ["-R", `${port}:${HELD_PORT_TARGET}`]),
     releaseRemote: (port) => control("cancel", ["-R", `${port}:${HELD_PORT_TARGET}`]),
 
@@ -597,8 +567,9 @@ async function signIn(ctx) {
   let queue = Promise.resolve();
   let run = null;
   const handleLine = async (line) => {
-    if (problem || opened) return;
-    const link = parseSignInLink(line);
+    if (problem) return;
+    // The OIDC code and any error come after the link, so only the link stops counting.
+    const link = opened ? null : parseSignInLink(line);
     if (!link) {
       const clean = line.replace(ANSI_RE, "").trim();
       const code = /^Confirm this code in the browser:\s*(\S+)/.exec(clean);
@@ -864,10 +835,8 @@ module.exports = {
   hostScript,
   installScript,
   isPortFree,
-  listSshHosts,
   loginScript,
   parseSignInLink,
-  parseSshConfigHosts,
   remoteCommand,
   runSshConnect,
   safeServerUrl,

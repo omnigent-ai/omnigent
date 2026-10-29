@@ -5384,10 +5384,13 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, []);
   });
 
-  it("lists no SSH hosts to another page", async (t) => {
+  it("gives no page a way to list the user's SSH hosts", (t) => {
+    // Aliases can name internal machines, and the server page is untrusted.
     const h = sshHarness(t);
 
-    const hosts = await h.ipc.get("omnigent:ssh-hosts")(fromElsewhere(h));
-    assert.equal(JSON.stringify(hosts), "[]");
+    assert.deepEqual(
+      [...h.ipc.keys()].filter((channel) => /ssh/i.test(channel)),
+      ["omnigent:ssh-connect"],
+    );
   });
 });

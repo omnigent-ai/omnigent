@@ -6,14 +6,12 @@ import { SshConnectForm } from "./SshConnectForm";
 interface Desktop {
   kind: "electron";
   connectSshHost: ReturnType<typeof vi.fn>;
-  listSshHosts: ReturnType<typeof vi.fn>;
 }
 
 function renderForm(result: Record<string, unknown>) {
   const desktop: Desktop = {
     kind: "electron",
     connectSshHost: vi.fn().mockResolvedValue(result),
-    listSshHosts: vi.fn().mockResolvedValue(["my-ec2", "gpu-box"]),
   };
   (window as unknown as { omnigentDesktop?: Desktop }).omnigentDesktop = desktop;
   const queryClient = new QueryClient();
@@ -40,12 +38,11 @@ afterEach(() => {
 });
 
 describe("SshConnectForm", () => {
-  it("suggests hosts from the SSH config and selects the connected host", async () => {
+  it("connects the trimmed host and selects it", async () => {
     const { desktop, invalidate, onConnected } = renderForm({
       ok: true,
       identity: { serverUrl: "https://example.com/omnigent", hostId: "h1" },
     });
-    await waitFor(() => expect(document.querySelectorAll("datalist option")).toHaveLength(2));
 
     connect("  my-ec2 ");
 

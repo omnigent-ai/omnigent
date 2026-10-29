@@ -6507,6 +6507,23 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  it.each([
+    ["the browser", undefined, false],
+    ["a desktop app without SSH connect", { kind: "electron" }, false],
+    ["a desktop app with SSH connect", { kind: "electron", connectSshHost: vi.fn() }, true],
+  ])("offers SSH connect in %s only when it can", (_name, desktop, shown) => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+
+      expect(screen.queryByTestId("ssh-connect-form") !== null).toBe(shown);
+    } finally {
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    }
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();

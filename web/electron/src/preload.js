@@ -155,8 +155,6 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          * Resolves `{ ok, error?, canceled?, identity? }`.
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
-        /** Host aliases from ~/.ssh/config. */
-        listSshHosts: () => ipcRenderer.invoke("omnigent:ssh-hosts"),
       }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),

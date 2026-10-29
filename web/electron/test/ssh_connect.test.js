@@ -17,7 +17,6 @@ const {
   isPortFree,
   loginScript,
   parseSignInLink,
-  parseSshConfigHosts,
   remoteCommand,
   runSshConnect,
   safeServerUrl,
@@ -222,20 +221,6 @@ describe("classifyPrompt", () => {
   });
 });
 
-describe("parseSshConfigHosts", () => {
-  it("lists concrete aliases and skips patterns and comments", () => {
-    const config = [
-      "Host my-ec2 bastion # jump host",
-      "  HostName 10.0.0.4",
-      "host=gpu-box",
-      "Host *.corp !skip ?x",
-      "# Host commented-out",
-      "Host my-ec2",
-    ].join("\n");
-    assert.deepEqual(parseSshConfigHosts(config), ["my-ec2", "bastion", "gpu-box"]);
-  });
-});
-
 describe("describeSshFailure", () => {
   it("names the fix for each common ssh failure", () => {
     const cases = [
@@ -330,7 +315,8 @@ function connectContext(session, overrides = {}) {
         session.calls.push(`open-browser ${url}`);
         opened.push(url);
       },
-      onStatus: (status) => statuses.push(status.step),
+      onStatus: (status) =>
+        statuses.push(status.code ? `${status.step} ${status.code}` : status.step),
       onOutput: () => {},
       askInstall: async () => true,
       readInstallScript: () => "INSTALLER",
@@ -394,7 +380,14 @@ describe("runSshConnect", () => {
       session.calls.filter((call) => /^(forward|cancel)Local/.test(call)),
       ["forwardLocal 8020", "cancelLocal 8020"],
     );
-    assert.ok(statuses.includes("waiting-for-browser"));
+    // The CLI prints its code after the link; the user needs it to finish.
+    assert.deepEqual(statuses, [
+      "connecting",
+      "signing-in",
+      "waiting-for-browser",
+      "confirm-code AB-12",
+      "starting-host",
+    ]);
   });
 
   it("asks before installing a missing CLI, pipes the bundled installer, then signs in again", async () => {
@@ -521,6 +514,18 @@ describe("runSshConnect", () => {
     );
   });
 
+  it("reports an error the CLI prints after the sign-in link", async () => {
+    const session = fakeSession({
+      logins: [{ lines: [authorizeLink(8020), "Error: Authentication was denied."], code: 1 }],
+    });
+    const { ctx } = connectContext(session);
+
+    assert.equal(
+      (await runSshConnect(ctx)).error,
+      "Signing in on my-ec2 failed: Authentication was denied.",
+    );
+  });
+
   it("explains servers that sign in with a username and password", async () => {
     const session = fakeSession({
       logins: [{ lines: ["Username [admin]: ", "Aborted!"], code: 1 }],
@@ -581,6 +586,48 @@ describe("startSshConnect", () => {
     assert.deepEqual(prompts, [{ kind: "secret", text: "pat@my-ec2's password: " }]);
     assert.equal(result.ok, false);
     assert.match(result.error, /didn't accept your sign-in/);
+    assert.equal(fs.existsSync(dir), false);
+  });
+
+  it("stops a connect that is still opening and removes its temp dir", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-connect-test-"));
+    let opening;
+    let rejectOpen;
+    const opened = new Promise((resolve) => {
+      opening = resolve;
+    });
+    let aborted = false;
+    const connect = startSshConnect(SERVER, "my-ec2", {
+      hooks: { onOutput: () => {}, onStatus: () => {}, prompt: async () => null },
+      openExternal: () => {},
+      readInstallScript: () => null,
+      makeTempDir: () => dir,
+      createAskpass: async () => ({ env: {}, close: () => {} }),
+      createSession: () => ({
+        open: () => {
+          opening();
+          return new Promise((_, reject) => {
+            rejectOpen = reject;
+          });
+        },
+        close: async () => {},
+        abort: () => {
+          aborted = true;
+          // Killing the master ends open() with ssh's own failure.
+          rejectOpen(new SshConnectError("ssh exited"));
+        },
+      }),
+    });
+
+    await opened;
+    connect.cancel();
+
+    assert.deepEqual(await connect.promise, {
+      ok: false,
+      canceled: true,
+      error: "Connecting was canceled.",
+    });
+    assert.equal(aborted, true);
     assert.equal(fs.existsSync(dir), false);
   });
 });
@@ -651,12 +698,13 @@ describe("createSshSession", () => {
 
     await session.open();
     await session.forwardLocal(8021);
+    await session.cancelLocal(8021);
     await session.holdRemote(8020);
     await session.exec("true").promise;
 
     // The user's config reaches the connection and commands, but never its
     // forwards or RemoteCommand; control requests skip the config so it can't
-    // empty theirs.
+    // empty theirs, and local forwards bind loopback whatever GatewayPorts says.
     const control = ["ssh", "-F", "/dev/null", "-S", "/tmp/s/m", "-O"];
     assert.deepEqual(spawned, [
       [
@@ -676,7 +724,8 @@ describe("createSshSession", () => {
         "my-ec2",
       ],
       [...control, "check", "my-ec2"],
-      [...control, "forward", "-L", "8021:127.0.0.1:8021", "my-ec2"],
+      [...control, "forward", "-L", "localhost:8021:127.0.0.1:8021", "my-ec2"],
+      [...control, "cancel", "-L", "localhost:8021:127.0.0.1:8021", "my-ec2"],
       [...control, "forward", "-R", "8020:127.0.0.1:9", "my-ec2"],
       [
         "ssh",

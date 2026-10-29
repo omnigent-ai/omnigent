@@ -4896,12 +4896,6 @@ function registerIpc() {
     return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
-  // SPA → host aliases from ~/.ssh/config, to suggest in the connect field.
-  ipcMain.handle("omnigent:ssh-hosts", (event) => {
-    if (!isPinnedOriginSender(event)) return [];
-    return sshConnect.listSshHosts();
-  });
-
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
   // the window's server as a host, by running `isaac omni host --background`
   // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,

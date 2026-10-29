@@ -185,8 +185,9 @@ def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) ->
             "  IdentitiesOnly yes\n  IdentityAgent none\n"
             f"  UserKnownHostsFile {laptop / 'known_hosts'}\n"
             "  StrictHostKeyChecking ask\n"
-            # A user's config may clear forwards; the app's own must still work.
-            "  ClearAllForwardings yes\n"
+            # A user's config may clear forwards or open them to the network;
+            # the app's own must still work and stay on loopback.
+            "  ClearAllForwardings yes\n  GatewayPorts yes\n"
         )
         ssh_config.chmod(0o600)
         laptop_env = {
@@ -230,6 +231,7 @@ def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) ->
             result = next((event["result"] for event in events if "result" in event), None)
             diagnostics = f"events={events}\nstderr={run.stderr[-3000:]}"
             assert result is not None and result["ok"] is True, diagnostics
+            assert {"loopbackOnly": True} in events, diagnostics
 
             # Both prompts came to the app: trust the new machine, then the key passphrase.
             prompts = [event["prompt"] for event in events if "prompt" in event]
