@@ -431,6 +431,48 @@ def test_request_web_approval_does_not_repark_after_menu_is_gone(
     assert probes == [tmp_path, tmp_path]
 
 
+@pytest.mark.parametrize(
+    ("url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request", False),
+        ("http://localhost:8787/v1/sessions/conv_x/hooks/permission-request", False),
+        (
+            "https://omnigents.example.databricksapps.com/v1/sessions/conv_x/hooks/permission-request",
+            True,
+        ),
+    ],
+)
+def test_request_web_approval_bypasses_proxy_only_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, url: str, expected_trust_env: bool
+) -> None:
+    """A loopback approval poll bypasses the ambient proxy; a remote one keeps it."""
+    captured_trust_env: list[object] = []
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            captured_trust_env.append(kwargs.get("trust_env"))
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, request_url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                json={"hookSpecificOutput": {"decision": {"behavior": "allow"}}},
+                request=httpx.Request("POST", request_url),
+            )
+
+    monkeypatch.setattr(kimi_native_hook.httpx, "Client", _Client)
+
+    body = {"_omnigent_elicitation_id": "elicit_kimi_0123456789abcdef0123456789abcdef"}
+    assert kimi_native_hook._request_web_approval(url, {}, body) == "allow"
+    assert captured_trust_env == [expected_trust_env]
+
+
 def test_permission_read_timeout_leaves_global_deadline_margin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
