@@ -100,9 +100,9 @@ describe("suppressRepliesTmuxSends", () => {
     expect(await oscReachingXterm(4, ["1;?;2;#123456"], ["osc:4"])).toEqual(["1;?;2;#123456"]);
   });
 
-  it("consumes a combined colour query only when tmux answers every colour", async () => {
-    expect(await oscReachingXterm(10, ["?;?"], ["osc:10", "osc:11"])).toEqual([]);
-    expect(await oscReachingXterm(10, ["?;?;?"], ["osc:10", "osc:11"])).toEqual(["?;?;?"]);
+  it("passes a combined colour query to xterm.js, as tmux leaves it unanswered", async () => {
+    expect(await oscReachingXterm(10, ["?;?"], ["osc:10", "osc:11"])).toEqual(["?;?"]);
+    expect(await oscReachingXterm(4, ["1;?;2;?"], ["osc:4"])).toEqual(["1;?;2;?"]);
   });
 
   it("keeps rendering the output around a dropped query", async () => {

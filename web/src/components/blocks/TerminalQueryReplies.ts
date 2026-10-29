@@ -57,19 +57,9 @@ export function suppressRepliesTmuxSends(
   const answersMode = (kind: string, params: CsiParams) =>
     answers(`${kind}*`) || answers(`${kind}${firstParam(params)}`);
 
-  // An OSC 4 query lists "index;?" pairs; a set mixed in falls through.
-  const isPaletteQuery = (data: string) => {
-    const slots = data.split(";");
-    return (
-      slots.length % 2 === 0 &&
-      slots.every((slot, index) => (index % 2 ? slot === "?" : /^\d+$/.test(slot)))
-    );
-  };
-  // "10;?;?" asks for the foreground and then the background colour.
-  const isSpecialColourQuery = (code: number, data: string) =>
-    data
-      .split(";")
-      .every((slot, index) => slot === "?" && code + index <= 12 && answers(`osc:${code + index}`));
+  // The probe asks for one colour per query, and tmux leaves combined forms
+  // such as "10;?;?" unanswered, so only a single-colour query is consumed.
+  const isPaletteQuery = (data: string) => /^\d+;\?$/.test(data);
 
   const handlers: IDisposable[] = [
     parser.registerCsiHandler(
@@ -96,7 +86,7 @@ export function suppressRepliesTmuxSends(
     ),
     parser.registerOscHandler(4, (data) => isPaletteQuery(data) && answers("osc:4")),
     ...[10, 11, 12].map((code) =>
-      parser.registerOscHandler(code, (data) => isSpecialColourQuery(code, data)),
+      parser.registerOscHandler(code, (data) => data === "?" && answers(`osc:${code}`)),
     ),
   ];
 
