@@ -1305,8 +1305,21 @@ def _server_event_to_sdk_event(event: object) -> object | None:
         return ReasoningSummaryDelta(delta=event.delta)
     if isinstance(event, ElicitationRequestEvent):
         params = event.params
-        if getattr(params, "terminal_fallback", None) is not None:
+        terminal_fallback = getattr(params, "terminal_fallback", None)
+        if terminal_fallback is not None:
             # Held in the agent's terminal; the server refuses answers sent from here.
+            if isinstance(terminal_fallback, dict) and terminal_fallback.get("answer_undelivered"):
+                return SDKErrorEvent(
+                    source="execution",
+                    tool_name=None,
+                    error=ErrorInfo(
+                        code="prompt_in_terminal",
+                        message=(
+                            "An answer to this prompt didn't reach the agent. It is "
+                            "waiting in the agent's terminal, so answer it there."
+                        ),
+                    ),
+                )
             return None
         return ElicitationRequest(
             elicitation_id=event.elicitation_id,

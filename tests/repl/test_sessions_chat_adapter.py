@@ -286,11 +286,16 @@ def test_elicitation_request_event_preserves_target_session_id() -> None:
     assert out.target_session_id == "conv_child123"
 
 
-def test_elicitation_waiting_in_terminal_is_not_prompted() -> None:
+@pytest.mark.parametrize("answer_undelivered", [False, True])
+def test_elicitation_waiting_in_terminal_is_not_prompted(answer_undelivered: bool) -> None:
     """A prompt held in the agent's terminal can't be answered from the REPL.
 
     Translating it would show a y/n prompt whose answer the server refuses.
+    An answer accepted before the hold never reached the agent, so that is
+    reported instead of passing silently.
     """
+    from omnigent_client._events import ErrorEvent as SDKErrorEvent
+
     from omnigent.server.schemas import (
         ElicitationRequestEvent,
         ElicitationRequestParams,
@@ -300,10 +305,20 @@ def test_elicitation_waiting_in_terminal_is_not_prompted() -> None:
         type="response.elicitation_request",
         elicitation_id="elicit_held",
         params=ElicitationRequestParams.model_validate(
-            {"message": "Run ls?", "terminal_fallback": {"answer_undelivered": False}}
+            {
+                "message": "Run ls?",
+                "terminal_fallback": {"answer_undelivered": answer_undelivered},
+            }
         ),
     )
-    assert _server_event_to_sdk_event(event) is None
+    out = _server_event_to_sdk_event(event)
+    if not answer_undelivered:
+        assert out is None
+        return
+    assert isinstance(out, SDKErrorEvent)
+    assert out.error.code == "prompt_in_terminal"
+    assert "didn't reach the agent" in out.error.message
+    assert "answer it there" in out.error.message
 
 
 def test_elicitation_resolve_session_id_routes_mirrored_child_to_child() -> None:
