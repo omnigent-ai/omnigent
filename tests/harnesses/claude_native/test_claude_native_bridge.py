@@ -5943,6 +5943,8 @@ def test_inject_interrupt_sends_escape_keystroke(
         return _FakeCompleted()
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    # A stopped turn: the footer is gone, so the single Escape is confirmed.
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, **__: "❯ \n")
     inject_interrupt(bridge_dir)
 
     # One tmux call: send Escape (no literal flag). If 2+, a stray

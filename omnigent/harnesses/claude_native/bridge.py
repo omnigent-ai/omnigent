@@ -333,6 +333,12 @@ _DIALOG_FOOTER_RE = re.compile(
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
+# Footer Claude Code shows only while a turn runs; it clears once the turn stops.
+_CLAUDE_BUSY_FOOTER = "esc to interrupt"
+# Escapes an interrupt sends, and how long each waits for the busy footer to clear.
+# Spacing over 1.0 s keeps two Escapes out of Claude's rewind double-Escape window.
+_INTERRUPT_ESCAPE_ATTEMPTS = 3
+_INTERRUPT_CONFIRM_WINDOW_S = 1.2
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
 # Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
 # rather than as text when they arrive in one burst.
@@ -647,6 +653,15 @@ class ClaudeTerminalDialog(RuntimeError):
     Deliberately not a :class:`ClaudePromptTimeout`: the pane is healthy and
     the dialog is answerable from the embedded terminal, so delivery handlers
     must report it without reaping the pane.
+    """
+
+
+class ClaudeTerminalBusy(RuntimeError):
+    """
+    Claude Code is still running a turn, so its input box never rendered.
+
+    Deliberately not a :class:`ClaudePromptTimeout`: the turn is alive and may
+    still finish, so delivery handlers must report it without reaping the pane.
     """
 
 
@@ -4765,9 +4780,9 @@ def inject_interrupt(
     bridge_dir: Path,
     *,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
-) -> None:
+) -> bool:
     """
-    Send an Escape keystroke into the Claude terminal via tmux send-keys.
+    Send an Escape into the Claude terminal and confirm the turn stopped.
 
     Claude Code's TUI cancels an in-flight response on a single
     ``Escape``. The harness's ``run_turn`` for ``claude-native``
@@ -4777,17 +4792,34 @@ def inject_interrupt(
     helper is the analog of :func:`inject_user_message` for the AP
     web stop button / Escape keybind.
 
+    Escape is sent up to :data:`_INTERRUPT_ESCAPE_ATTEMPTS` times, each
+    followed by a wait for the busy footer to clear. An Escape the TUI
+    swallowed (a repaint, a dialog) is therefore retried instead of
+    reported as a stop.
+
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
     :param timeout_s: Seconds to wait for ``tmux.json`` to be
         advertised by the runner, e.g. ``30.0``.
-    :returns: None.
+    :returns: ``True`` when the busy footer cleared, ``False`` when Claude
+        still showed a running turn after every attempt.
     :raises RuntimeError: If the tmux target is not advertised in
         time, or if the ``tmux send-keys`` invocation fails.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    # No ``-l``: tmux must interpret ``Escape`` as a key name.
-    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+    for _ in range(_INTERRUPT_ESCAPE_ATTEMPTS):
+        # No ``-l``: tmux must interpret ``Escape`` as a key name.
+        _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "Escape")
+        deadline = time.monotonic() + _INTERRUPT_CONFIRM_WINDOW_S
+        while True:
+            pane = _capture_pane(info["socket_path"], info["tmux_target"])
+            # An empty capture is a torn read, not proof the turn stopped.
+            if pane.strip() and _CLAUDE_BUSY_FOOTER not in pane.lower():
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    return False
 
 
 def kill_session(
@@ -6878,6 +6910,8 @@ def _wait_for_claude_prompt_ready(
         card can offer it; the pane is left alive for the sign-in to finish.
         Also raised when the launcher waits on two consecutive polls for a
         sign-in that another process started.
+    :raises ClaudeTerminalBusy: If the budget lapses while the last capture still
+        shows a running turn (the busy footer), so the box was occupied, not missing.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
         cap). The message carries the seconds actually waited, a poll
@@ -7036,6 +7070,13 @@ def _wait_for_claude_prompt_ready(
             "Relaunch the terminal to continue this conversation."
             + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
+        )
+    if _CLAUDE_BUSY_FOOTER in last_nonempty.lower():
+        raise ClaudeTerminalBusy(
+            f"Claude Code is still working on a turn after {waited_s:.1f}s, so its input "
+            "box never opened and the message was not delivered. Wait for the turn to "
+            "finish or stop it, then send the message again."
+            + _format_terminal_failure_tail(last_nonempty)
         )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "

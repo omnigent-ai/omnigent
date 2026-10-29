@@ -638,6 +638,31 @@ async def test_claude_stop_kill_failure_returns_503_without_idle(
 
 
 @pytest.mark.asyncio
+async def test_claude_interrupt_unconfirmed_keeps_session_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn that survives the retried Escapes stays running, with no cancel armed."""
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+        return f"bid-{session_id}"
+
+    monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(claude_bridge, "inject_interrupt", lambda bridge_dir, *, timeout_s: False)
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("claude-native", "conv_cl")
+
+    assert isinstance(resp, Response) and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "claude_native_interrupt_unconfirmed"
+    assert ("conv_cl", {"type": "session.status", "status": "running"}) in captured["published"]
+    assert not any(e.get("status") == "idle" for _, e in captured["published"])
+    assert runner.take_pending_interrupt("conv_cl")[0] is False
+
+
+@pytest.mark.asyncio
 async def test_claude_interrupt_resolves_bridge_id_and_injects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

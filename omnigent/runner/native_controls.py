@@ -137,6 +137,7 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
     from omnigent.harnesses.claude_native.bridge import (
         ClaudePromptTimeout,
         ClaudeSignInPending,
+        ClaudeTerminalBusy,
         ClaudeTerminalDialog,
         ClaudeTerminalExited,
         ClaudeUserPromptPending,
@@ -155,6 +156,10 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         next_step = (
             "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
             "answer or dismiss it, then switch models again."
+        )
+    elif isinstance(exc, ClaudeTerminalBusy):
+        next_step = (
+            "Claude is still working on a turn. Wait for it to finish, then switch models again."
         )
     elif isinstance(exc, ClaudeTerminalExited):
         next_step = "The Claude Code terminal has exited. Relaunch it, then switch models again."
