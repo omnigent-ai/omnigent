@@ -324,8 +324,8 @@ async def test_child_sessions_surfaces_pending_elicitation_count(
     resp = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
     assert resp.status_code == 200
     row = resp.json()["data"][0]
-    # A parked prompt reads 0 here when the count isn't surfaced from the
-    # index, so the Agents tab stays blind to a sub-agent needing input.
+    # A parked prompt badges the Agents tab; one held in the terminal is left
+    # out for every client.
     assert row["pending_elicitations_count"] == pending_count
 
 
