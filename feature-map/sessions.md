@@ -267,13 +267,18 @@ when the live lookup has none, with its age once that state is over five
 minutes old. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
 
-**Offline pull requests:** link a PR to a session, then stop its host. The
-session's Pull Requests tab still lists the PR with its title, link, and status,
-plus "Last sync time" and a note to reconnect the host (or, for a sleeping
-sandbox, to send a message). Link a PR is disabled; Unlink PR still works, and
-the server keeps the unlink. A session whose PRs the server hasn't imported yet
-says so instead. Against servers that predate stored PRs, the tab behaves as it
-did before and unlinking needs the host.
+**Offline pull requests:** link PRs to a session, then stop its host. Open the
+Pull Requests tab from the Workspace rail or composer (desktop and mobile).
+On phones, Refresh and Link sit beside Close in the single drawer header;
+in details, the header title becomes the back-to-list button.
+The list retains stored titles and status pills; each row shows **Host offline**
+(or **Sandbox asleep**) instead of checks and Merge. Hover or focus that notice
+for the last sync time and reconnect guidance. Click a row for its stored summary,
+then **All pull requests** to return. The row menu can open, copy, or unlink the
+PR while offline; linking needs the host. Reconnect and verify live checks and
+merge controls return. Unlink the last PR and verify it stays absent after refresh.
+A session not yet imported to the server says so. Older servers retain their
+host-dependent unlink behavior.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
