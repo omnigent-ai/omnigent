@@ -11,26 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
-from fastapi import FastAPI
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.runner import mcp_routes
-from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.native.orchestration import ResolvedSpec
-from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses.process_manager import NoLiveHarnessError
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
 from omnigent.tools.mcp import McpElicitationRequired
+from tests._helpers.runner_mcp import RunnerMcpHarness
 
 pytestmark = pytest.mark.asyncio
 
@@ -112,8 +108,8 @@ class _FakeProcessManager:
         return self.client
 
 
-class Harness:
-    """A FastAPI app with the MCP routes and recording fakes for every collaborator."""
+class Harness(RunnerMcpHarness):
+    """Route-test defaults; integration callers supply their own transport."""
 
     def __init__(
         self,
@@ -121,75 +117,17 @@ class Harness:
         mcp_manager: _FakeMcpManager | None = None,
         process_manager: _FakeProcessManager | None = None,
         spec_resolver: object | None = None,
-        workspace: Path | None = None,
-        server_client: httpx.AsyncClient | None = None,
     ) -> None:
-        self.app = FastAPI()
-        self.mcp_manager = mcp_manager
-        self.spec_cache: dict[str, Any] = {}
-        self.resolved_spec: AgentSpec | None = None
-        self.resolved_entry: Any = None
-        self.resolve_error: Exception | None = None
-        self.conversations: dict[str, str] = {}
-        self.published: list[tuple[str, Any]] = []
-        self.recovered: list[str] = []
-        self.registry = McpExecutionRegistry()
-        self.inboxes: dict[str, Any] = {}
-        self.async_tasks: dict[str, Any] = {}
-        self.agent_ids: dict[str, str] = {SESSION: "ag_1"}
-
-        async def _recover(session_id: str) -> None:
-            self.recovered.append(session_id)
-
-        async def _resolve_conv(response_id: str) -> str | None:
-            return self.conversations.get(response_id)
-
-        async def _resolve_spec_or_none(session_id: str) -> AgentSpec | None:
-            return self.resolved_spec
-
-        async def _resolve_entry(session_id: str) -> Any:
-            if self.resolve_error is not None:
-                raise self.resolve_error
-            return self.resolved_entry
-
-        async def _runtime_cwd(session_id: str) -> Path | None:
-            return workspace or Path("/tmp/runtime-cwd")
-
-        mcp_routes.register_mcp_routes(
-            self.app,
-            _publish_event=lambda sid, payload: self.published.append((sid, payload)),
-            _recover_undrained_subagent_results=_recover,
-            _resolve_conversation_id=_resolve_conv,
-            _resolve_session_agent_spec_or_none=_resolve_spec_or_none,
-            _resolve_session_spec_entry=_resolve_entry,
-            _session_agent_ids=self.agent_ids,
-            _session_async_tasks=self.async_tasks,
-            _session_harness_name=lambda sid: "claude-sdk",
-            _session_inboxes=self.inboxes,
-            _session_runtime_cwd=_runtime_cwd,
-            _session_spec_cache=self.spec_cache,
-            filesystem_registry=None,
-            mcp_execution_registry=self.registry,
-            mcp_manager=mcp_manager,  # type: ignore[arg-type]
-            process_manager=process_manager,  # type: ignore[arg-type]
-            resource_registry=SessionResourceRegistry(),
+        super().__init__(
+            session_id=SESSION,
+            workspace=Path("/tmp/runtime-cwd"),
             runner_workspace=Path("/tmp/runner-workspace"),
-            server_client=server_client or httpx.AsyncClient(base_url="http://server"),
-            spec_resolver=spec_resolver,  # type: ignore[arg-type]
-            terminal_registry=None,
+            server_client=httpx.AsyncClient(base_url="http://server"),
+            mcp_manager=mcp_manager,
+            process_manager=process_manager,
+            spec_resolver=spec_resolver,
         )
-
-    @asynccontextmanager
-    async def client(self) -> AsyncIterator[httpx.AsyncClient]:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=self.app), base_url="http://runner"
-        ) as client:
-            yield client
-
-    async def execute(self, body: Any) -> tuple[int, Any]:
-        async with self.client() as client:
-            resp = await client.post(EXECUTE, json=body)
-        return resp.status_code, resp.json()
+        self.agent_ids[SESSION] = "ag_1"
 
 
 def _call(name: str, **params: Any) -> dict[str, Any]:
@@ -509,7 +447,7 @@ async def test_shell_yield_is_opt_in_and_retained(
         h.inboxes[SESSION], h.async_tasks[SESSION] = asyncio.Queue(), {}
     body = {
         **_call(tool),
-        "_omnigent_background_shell": server_support,
+        "_omnigent_background_shell": {"handle_id": "async_shell"} if server_support else None,
         "_omnigent_operation": {"id": "shell-once", "step": "initial"},
     }
     call = asyncio.create_task(h.execute(body))
@@ -518,18 +456,24 @@ async def test_shell_yield_is_opt_in_and_retained(
     )
     try:
         await started.wait()
-        done, _ = await asyncio.wait({call}, timeout=0.05)
-        assert bool(done) is should_yield
         if should_yield:
-            status, response = call.result()
+            status, response = await asyncio.wait_for(asyncio.shield(call), timeout=5)
             assert response["result"]["deferred"] is True
-            assert await h.execute(body) == (status, response)
+            retry = {**body, "_omnigent_background_shell": {"handle_id": "async_reattached"}}
+            assert await h.execute(retry) == (status, response)
+        else:
+            done, _ = await asyncio.wait({call}, timeout=0.05)
+            assert not done
     finally:
         release.set()
         await call
         await asyncio.gather(*(task for task, _ in h.async_tasks.get(SESSION, {}).values()))
     if not should_yield:
         assert call.result() == (200, {"result": {"output": "finished"}})
+    else:
+        assert (
+            h.inboxes[SESSION].get_nowait()["result_context"] == body["_omnigent_background_shell"]
+        )
     assert starts == 1
 
 

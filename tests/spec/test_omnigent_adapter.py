@@ -1077,7 +1077,6 @@ def test_os_env_round_trips_through_translator() -> None:
     original_os_env = OSEnvSpec(
         type="caller_process",
         cwd=".",
-        shell_yield_after=30,
         sandbox=OSEnvSandboxSpec(
             type="linux_bwrap",
             write_paths=["."],

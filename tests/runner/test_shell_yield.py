@@ -13,6 +13,7 @@ from omnigent.runner.shell_yield import execute_shell_with_yield
 from omnigent.runner.tool_dispatch import _drain_inbox, execute_tool
 
 pytestmark = pytest.mark.asyncio
+RESULT_CONTEXT = {"handle_id": "async_shell", "actor": None, "signature": "test-signature"}
 
 
 @pytest.mark.parametrize(
@@ -53,7 +54,12 @@ async def test_slow_shell_runs_once_and_checks_its_final_output(
 
     output, deferred = await asyncio.wait_for(
         execute_shell_with_yield(
-            run(), after=0.001, arguments=arguments, inbox=inbox, tasks=tasks
+            run(),
+            after=0.001,
+            arguments=arguments,
+            result_context=RESULT_CONTEXT,
+            inbox=inbox,
+            tasks=tasks,
         ),
         timeout=1,
     )
@@ -69,7 +75,13 @@ async def test_slow_shell_runs_once_and_checks_its_final_output(
 
     def policy(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        return httpx.Response(200, json=verdict)
+        return httpx.Response(
+            200,
+            json={
+                **verdict,
+                "_omnigent_shell_result_handle": handle["handle_id"],
+            },
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(policy), base_url="http://server"
@@ -82,6 +94,9 @@ async def test_slow_shell_runs_once_and_checks_its_final_output(
     else:
         assert "private output" not in delivered
     assert len(requests) == 1
+    assert requests[0]["_omnigent_shell_result_context"] == RESULT_CONTEXT
+    assert requests[0]["_omnigent_shell_result_handle"] == handle["handle_id"]
+    assert "test-signature" not in delivered
     event = requests[0]["event"]
     assert event["type"] == "PHASE_TOOL_RESULT"
     if fails:
@@ -100,7 +115,9 @@ async def test_quick_shell_keeps_its_foreground_result() -> None:
 
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
-    result = await execute_shell_with_yield(run(), after=1, arguments={}, inbox=inbox, tasks=tasks)
+    result = await execute_shell_with_yield(
+        run(), after=1, arguments={}, result_context=RESULT_CONTEXT, inbox=inbox, tasks=tasks
+    )
     assert result == ("done", False)
     assert tasks == {} and inbox.empty()
 
@@ -120,7 +137,7 @@ async def test_yielded_shell_cancellation_handles_completion_race(completes: boo
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
     output, _ = await execute_shell_with_yield(
-        run(), after=0.001, arguments={}, inbox=inbox, tasks=tasks
+        run(), after=0.001, arguments={}, result_context=RESULT_CONTEXT, inbox=inbox, tasks=tasks
     )
     handle_id = json.loads(output)["handle_id"]
     collection = tasks[handle_id][0]
@@ -156,6 +173,7 @@ async def test_caller_cancellation_before_yield_cleans_up_execution() -> None:
             run(),
             after=60,
             arguments={},
+            result_context=RESULT_CONTEXT,
             inbox=inbox,
             tasks=tasks,
         )
@@ -167,22 +185,34 @@ async def test_caller_cancellation_before_yield_cleans_up_execution() -> None:
     assert cleaned.is_set() and tasks == {} and inbox.empty()
 
 
-async def test_policy_outage_keeps_delayed_shell_output_private_and_retryable() -> None:
+@pytest.mark.parametrize("failure", ["outage", "legacy-server", "wrong-handle"])
+async def test_unverified_shell_output_stays_private_and_retryable(failure: str) -> None:
     inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     inbox.put_nowait(
         {
             "type": "tool_result",
             "tool_name": "sys_os_shell",
             "status": "completed",
-            "handle_id": "shell-1",
+            "handle_id": RESULT_CONTEXT["handle_id"],
             "output": "private output",
             "request_data": {"name": "sys_os_shell", "arguments": {"command": "build"}},
+            "result_context": RESULT_CONTEXT,
         }
     )
+    first_response = {"result": "POLICY_ACTION_ALLOW"}
+    if failure == "wrong-handle":
+        first_response["_omnigent_shell_result_handle"] = "another-execution"
     responses = iter(
         [
-            httpx.Response(503),
-            httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW", "data": "redacted"}),
+            httpx.Response(503 if failure == "outage" else 200, json=first_response),
+            httpx.Response(
+                200,
+                json={
+                    "result": "POLICY_ACTION_ALLOW",
+                    "data": "redacted",
+                    "_omnigent_shell_result_handle": RESULT_CONTEXT["handle_id"],
+                },
+            ),
         ]
     )
     async with httpx.AsyncClient(

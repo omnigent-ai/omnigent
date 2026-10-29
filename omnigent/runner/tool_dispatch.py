@@ -8389,11 +8389,13 @@ def _inbox_tool_result_policy_request(
     """
     if payload.get("type") == "tool_result":
         return {
+            "_omnigent_shell_result_context": payload.get("result_context"),
+            "_omnigent_shell_result_handle": payload.get("handle_id"),
             "event": {
                 "type": "PHASE_TOOL_RESULT",
                 "data": {"name": payload.get("tool_name"), "result": output},
                 "request_data": payload.get("request_data"),
-            }
+            },
         }
     return {
         "event": {
@@ -8453,7 +8455,7 @@ async def _post_inbox_policy_verdict(
         )
         return None
     try:
-        return _string_object_dict(resp.json())
+        verdict = _string_object_dict(resp.json())
     except (json.JSONDecodeError, ValueError):
         _logger.warning(
             "Inbox TOOL_RESULT policy evaluation returned non-JSON for parent=%s",
@@ -8461,6 +8463,17 @@ async def _post_inbox_policy_verdict(
             extra={"session_id": conversation_id},
         )
         return None
+    if verdict is None:
+        return None
+    if payload.get("type") == "tool_result" and (
+        not isinstance(payload.get("handle_id"), str)
+        or verdict.get("_omnigent_shell_result_handle") != payload["handle_id"]
+    ):
+        _logger.warning(
+            "Inbox shell result context was not verified for session=%s", conversation_id
+        )
+        return None
+    return verdict
 
 
 def _apply_inbox_policy_verdict(

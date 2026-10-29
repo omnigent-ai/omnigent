@@ -355,9 +355,11 @@ def register_mcp_routes(
                     yield_after = spec.os_env.shell_yield_after if spec and spec.os_env else None
                     inbox = _session_inboxes.get(session_id)
                     async_tasks = _session_async_tasks.get(session_id)
+                    result_context = body.get("_omnigent_background_shell")
                     if (
                         tool_name == "sys_os_shell"
-                        and body.get("_omnigent_background_shell") is True
+                        and isinstance(result_context, dict)
+                        and isinstance(result_context.get("handle_id"), str)
                         and yield_after is not None
                         and spec is not None
                         and spec.async_enabled
@@ -370,6 +372,7 @@ def register_mcp_routes(
                             execution,
                             after=yield_after,
                             arguments=arguments,
+                            result_context=result_context,
                             inbox=inbox,
                             tasks=async_tasks,
                         )

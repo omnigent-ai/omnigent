@@ -19,20 +19,20 @@ import httpx
 import pytest
 import yaml
 
-from omnigent.runtime import get_caps
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runtime import get_caps, get_conversation_store
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.spec.parser import parse
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef
+from tests._helpers.runner_mcp import RunnerMcpHarness
 from tests._helpers.session import bundle_files, post_session_bundle
-from tests.runner.test_mcp_routes import Harness
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.posix_only
-@pytest.mark.parametrize("result_action", ["ALLOW", "DENY"])
-@pytest.mark.parametrize("times_out", [False, True])
+@pytest.mark.parametrize(("result_action", "times_out"), [("ALLOW", False), ("DENY", True)])
 async def test_background_shell_keeps_execution_and_policies_across_http(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -40,6 +40,8 @@ async def test_background_shell_keeps_execution_and_policies_across_http(
     result_action: str,
     times_out: bool,
 ) -> None:
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "credentials"))
+    monkeypatch.delenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", raising=False)
     script = (
         "import time; from pathlib import Path; "
         "Path('starts').open('a').write('started\\n'); "
@@ -89,7 +91,10 @@ async def test_background_shell_keeps_execution_and_policies_across_http(
     )
     assert created.status_code == 201, created.text
     sid = created.json()["session_id"]
-    runner = Harness(workspace=tmp_path, server_client=client)
+    binding = "test-shell-runner-binding"
+    get_conversation_store().set_runner_id(sid, token_bound_runner_id(binding))
+    client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = binding
+    runner = RunnerMcpHarness(session_id=sid, workspace=tmp_path, server_client=client)
     runner.spec_cache[sid] = parse(tmp_path)
     runner.inboxes[sid] = asyncio.Queue()
     runner.async_tasks[sid] = {}

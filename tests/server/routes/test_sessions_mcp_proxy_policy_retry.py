@@ -222,6 +222,49 @@ def _parse_rpc_error(response: Any) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["sys_os_read", "sys_os_shell"])
+async def test_deferred_flag_without_shell_context_still_checks_result_policy(
+    monkeypatch, approval_state, tool
+):
+    from unittest.mock import AsyncMock
+
+    store, _conv, engine = approval_state
+    evaluations = []
+
+    async def evaluate(ctx):
+        evaluations.append(ctx.phase)
+        return PolicyResult(
+            action=PolicyAction.DENY if ctx.phase == Phase.TOOL_RESULT else PolicyAction.ALLOW,
+            reason="private",
+        )
+
+    def runner_response(request):
+        assert "_omnigent_background_shell" not in json.loads(request.content)
+        return httpx.Response(200, json={"result": {"output": "private output", "deferred": True}})
+
+    monkeypatch.setattr(engine, "evaluate", evaluate)
+    monkeypatch.setattr(sessions_mod, "_load_agent_spec_for_session", lambda *args: "fake_spec")
+    monkeypatch.setattr(
+        sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner_response), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(sessions_mod, "_get_runner_client", AsyncMock(return_value=runner))
+        response = await _handle_mcp_tools_call(
+            rpc_id=1,
+            session_id=_SESSION_ID,
+            params={"name": tool, "arguments": {}},
+            conversation_store=store,
+            agent_store=_StubAgentStore(),
+            runner_router=None,
+        )
+    assert evaluations == [Phase.TOOL_CALL, Phase.TOOL_RESULT]
+    assert "Result suppressed by policy: private" in bytes(response.body).decode()
+    assert "private output" not in bytes(response.body).decode()
+
+
+@pytest.mark.asyncio
 async def test_forged_retry_with_deny_policy_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

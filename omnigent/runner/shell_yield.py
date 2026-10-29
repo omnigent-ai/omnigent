@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from collections.abc import Coroutine
 from typing import Any
 
@@ -20,6 +19,7 @@ async def execute_shell_with_yield(
     *,
     after: float,
     arguments: JsonObject,
+    result_context: JsonObject,
     inbox: asyncio.Queue[JsonObject],
     tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]],
 ) -> tuple[str, bool]:
@@ -28,6 +28,7 @@ async def execute_shell_with_yield(
     :param execution: Already-authorized shell execution, started once here.
     :param after: Seconds to wait for a foreground result.
     :param arguments: Policy-approved shell arguments for delayed result checks.
+    :param result_context: Server-sealed caller and execution binding.
     :param inbox: Owning session's completion queue.
     :param tasks: Owning session's cancellable background tasks.
     :returns: Output and whether its actual result is deferred to the inbox.
@@ -42,7 +43,7 @@ async def execute_shell_with_yield(
     if execution_task.done():
         return execution_task.result(), False
 
-    handle_id = f"async_{uuid.uuid4().hex[:12]}"
+    handle_id = str(result_context["handle_id"])
     cancel_event = asyncio.Event()
 
     async def _collect() -> str:
@@ -78,6 +79,7 @@ async def execute_shell_with_yield(
                     "status": status,
                     "output": output,
                     "request_data": {"name": "sys_os_shell", "arguments": arguments},
+                    "result_context": result_context,
                 }
             )
             tasks.pop(handle_id, None)
