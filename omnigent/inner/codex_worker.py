@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import shutil
+import sqlite3
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -11,15 +14,19 @@ from .datamodel import OSEnvSpec
 from .egress.controller import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .model_signer import SignerReadiness
 from .sandbox import (
+    SandboxPolicy,
     cleanup_private_tmpdir,
     create_exec_launcher,
     create_private_tmpdir,
     get_backend,
     resolve_sandbox,
     with_additional_read_roots,
+    with_additional_write_files,
     with_additional_write_roots,
     with_spawn_env_allowlist,
 )
+
+logger = logging.getLogger(__name__)
 
 _FRAMEWORK_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 _BROKERED_AUTH_SECRET_ENV = frozenset(
@@ -39,6 +46,7 @@ class CodexWorkerLaunch:
 
     launch_path: str
     sandboxed: bool
+    native_tools_allowed: bool = True
     _owned_launcher: Path | None = None
     _egress_handle: EgressProxyHandle | None = None
     _egress_tmpdir: Path | None = None
@@ -57,6 +65,54 @@ class CodexWorkerLaunch:
         tmpdir = self._egress_tmpdir
         self._egress_tmpdir = None
         cleanup_private_tmpdir(tmpdir)
+
+
+def _host_link_target(link: Path) -> Path | None:
+    """Return the regular host file a private-home link names, if any."""
+    if not link.is_symlink():
+        return None
+    target = link.parent / link.readlink()
+    target = target.parent.resolve() / target.name
+    # A sandboxed session may have replaced the host file with a link; never follow it.
+    if target.is_symlink() or not target.is_file():
+        return None
+    return target
+
+
+def _snapshot_sqlite(source: Path, target: Path) -> None:
+    try:
+        with (
+            contextlib.closing(sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)) as host,
+            contextlib.closing(sqlite3.connect(target)) as private,
+        ):
+            host.backup(private)
+    except sqlite3.Error:
+        # Hand Codex the same bytes the link would have shown it.
+        with contextlib.suppress(OSError):
+            shutil.copyfile(source, target)
+
+
+def _contain_host_codex_home_links(policy: SandboxPolicy, codex_home: Path) -> SandboxPolicy:
+    """Repair private-home links into the host Codex home, which the sandbox does not mount."""
+    # SQLite needs writable sidecars beside the database, so start from a private copy.
+    memories = codex_home / "memories_1.sqlite"
+    host_memories = _host_link_target(memories)
+    if memories.is_symlink():
+        memories.unlink()
+    if host_memories is not None:
+        _snapshot_sqlite(host_memories, memories)
+    login = codex_home / "auth.json"
+    host_login = _host_link_target(login)
+    if host_login is None:
+        return policy
+    granted = with_additional_write_files(policy, [host_login])
+    # The grant resolves the path again; drop it if the login was swapped for a link meanwhile.
+    if not set(granted.write_files) <= {*policy.write_files, host_login}:
+        return policy
+    # Codex refreshes the login in place; link straight to the granted file.
+    login.unlink()
+    login.symlink_to(host_login)
+    return granted
 
 
 def prepare_codex_catalog_probe(
@@ -109,7 +165,12 @@ def prepare_codex_worker(
     signer_readiness: SignerReadiness | None = None,
     worker_env: MutableMapping[str, str] | None = None,
 ) -> CodexWorkerLaunch:
-    """Prepare a contained worker or propagate the containment failure."""
+    """Prepare a contained worker or propagate the containment failure.
+
+    A network-denying sandbox with no signer and no ``egress_rules`` gives the
+    app-server no route to the model. The worker then keeps its filesystem
+    sandbox but shares the host network, with Codex's native tools disabled.
+    """
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
         if signer_readiness is not None:
             raise OSError("signer-backed Codex worker requires an active sandbox")
@@ -135,6 +196,16 @@ def prepare_codex_worker(
     )
     if egress_rules and worker_env is None:
         raise ValueError("egress-filtered Codex worker requires an owned worker environment")
+    native_tools_allowed = True
+    if signer_readiness is None and not egress_rules and not policy.allow_network:
+        # Tools then run only through the separately sandboxed sys_os_* tools.
+        logger.info(
+            "os_env.sandbox denies network and gives the Codex app-server no model "
+            "route; sharing the host network with the worker and disabling Codex's "
+            "native tools. Add egress_rules for the model host to filter its traffic."
+        )
+        policy = replace(policy, allow_network=True)
+        native_tools_allowed = False
 
     codex_dir = Path(codex_path).resolve(strict=False).parent
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])
@@ -145,6 +216,8 @@ def prepare_codex_worker(
         if signer_readiness.ca_bundle_path.parent != signer_readiness.socket_path.parent:
             raise ValueError("signer relay and public CA must share one public directory")
         policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
+    else:
+        policy = _contain_host_codex_home_links(policy, codex_home)
     staged_env = dict(worker_env) if worker_env is not None else None
     if signer_readiness is not None:
         assert staged_env is not None
@@ -226,6 +299,7 @@ def prepare_codex_worker(
         return CodexWorkerLaunch(
             launch_path=str(launcher),
             sandboxed=True,
+            native_tools_allowed=native_tools_allowed,
             _owned_launcher=launcher,
             _egress_handle=egress_handle,
             _egress_tmpdir=egress_tmpdir,

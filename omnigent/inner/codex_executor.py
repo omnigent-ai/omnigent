@@ -1111,6 +1111,30 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _strip_host_launched_config(codex_home: Path) -> None:
+    """Drop inherited config that would start user commands beside the app-server.
+
+    ``[mcp_servers.*]``, ``notify`` and the user ``hooks.json`` launch processes
+    that would share the worker's host network when its native tools are off.
+    """
+    import tomlkit
+
+    config_path = codex_home / "config.toml"
+    if config_path.is_file():
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if "mcp_servers" in document or "notify" in document:
+            document.pop("mcp_servers", None)
+            document.pop("notify", None)
+            if config_path.is_symlink():
+                # Never write through to the user's real config.toml.
+                config_path.unlink()
+            config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    # Staging symlinks the user's hooks but falls back to a copy; drop either.
+    hooks_path = codex_home / _CODEX_HOOKS_FILENAME
+    if hooks_path.is_symlink() or hooks_path.exists():
+        hooks_path.unlink()
+
+
 def _populate_codex_home_config(
     target_dir: Path,
     source_dir: Path,
@@ -2779,6 +2803,23 @@ class _PendingToolResult:
     duration_ms: float = 0.0
 
 
+# ``-c`` overrides that switch off every Codex-native capability beyond the
+# model call; shared with the runner's background title worker.
+CODEX_NATIVE_FEATURES_OFF = (
+    "features.unified_exec=false",
+    "features.shell_tool=false",
+    'web_search="disabled"',
+    "features.apps=false",
+    "features.browser_use=false",
+    "features.computer_use=false",
+    "features.image_generation=false",
+    "features.multi_agent=false",
+    "features.plugins=false",
+    "features.skill_mcp_dependency_install=false",
+    "features.tool_search=false",
+)
+
+
 class _CodexAppServerSession:
     def __init__(
         self,
@@ -3068,6 +3109,17 @@ class _CodexAppServerSession:
             argv = [self._worker_launch.launch_path, "app-server"]
             for override in self._codex_config_overrides:
                 argv.extend(["-c", override])
+            if not worker_launch.native_tools_allowed:
+                self._disable_native_tools = True
+                for override in CODEX_NATIVE_FEATURES_OFF:
+                    argv.extend(["-c", override])
+                _strip_host_launched_config(self._codex_home_dir)
+                if router_bridge_dir is not None:
+                    write_codex_router_hooks_file(
+                        self._codex_home_dir,
+                        router_bridge_dir,
+                        session_id=codex_router_session_id(self._env),
+                    )
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()
             liveness_read_fd: int | None = None

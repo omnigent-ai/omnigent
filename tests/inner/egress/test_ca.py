@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import ssl
+import threading
 from pathlib import Path
 
 from cryptography import x509
@@ -150,3 +151,33 @@ def test_system_ca_bundle_skips_non_pem_in_capath(tmp_path: Path, monkeypatch) -
 
     assert real_ca in bundle
     assert b"not a certificate" not in bundle
+
+
+def test_rewriting_ca_bundle_never_exposes_partial_bundle_to_concurrent_loader(
+    tmp_path: Path,
+) -> None:
+    cert_path, _ = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    first_load_done = threading.Event()
+    stop = threading.Event()
+    load_errors: list[str] = []
+
+    def load_bundle_until_stopped() -> None:
+        while not stop.is_set():
+            try:
+                ssl.create_default_context(cafile=str(bundle_path))
+            except (ssl.SSLError, OSError) as exc:
+                load_errors.append(str(exc))
+            first_load_done.set()
+
+    loader = threading.Thread(target=load_bundle_until_stopped, daemon=True)
+    loader.start()
+    try:
+        assert first_load_done.wait(timeout=30)
+        for _ in range(20):
+            ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    finally:
+        stop.set()
+        loader.join(timeout=30)
+
+    assert load_errors == []

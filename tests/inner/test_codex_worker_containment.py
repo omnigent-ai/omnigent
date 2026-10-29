@@ -3,26 +3,37 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import os
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from omnigent.inner.codex_executor import _CodexAppServerSession
+from omnigent.inner.codex_executor import _CodexAppServerSession, _populate_codex_home_config
+from omnigent.inner.codex_staging import CODEX_HOME_PREFIX, codex_home_staging_root
 from omnigent.inner.codex_worker import (
     _BROKERED_AUTH_SECRET_ENV,
+    CodexWorkerLaunch,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.model_signer import SignerReadiness
-from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
+from omnigent.inner.sandbox import (
+    SandboxPolicy,
+    with_additional_write_files,
+    with_additional_write_roots,
+)
 
 
 class _Pipe:
@@ -154,10 +165,130 @@ def test_successful_active_sandbox_returns_owned_launcher(
     assert codex.resolve().parent in read_roots
     assert captured["policy"].spawn_env_allowlist == ["CODEX_HOME", "PATH"]
     assert captured["policy"].allow_network
+    assert worker.native_tools_allowed
 
     worker.close()
     worker.close()
     assert not launcher.exists()
+
+
+def test_network_denied_worker_without_model_route_keeps_files_contained(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no signer or egress_rules, only the model route opens; native tools go off."""
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/bwrap", str(codex)]
+    create_launcher = Mock(return_value=str(tmp_path / "launcher"))
+    start_proxy = Mock()
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=replace(_active_policy(tmp_path), allow_network=False)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+    monkeypatch.setattr("omnigent.inner.codex_worker.start_egress_proxy", start_proxy)
+
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=False)
+        ),
+        spawn_env_names=["PATH", "CODEX_HOME"],
+    )
+    try:
+        assert worker.sandboxed
+        assert worker.native_tools_allowed is False
+        for policy in (
+            backend.wrap_launcher_argv.call_args.args[1],
+            create_launcher.call_args.args[1],
+        ):
+            assert policy.allow_network
+            assert policy.egress_relay_port is None
+            assert policy.write_roots == [codex_home.resolve()]
+        start_proxy.assert_not_called()
+    finally:
+        worker.close()
+
+
+@pytest.mark.parametrize(
+    "layout", ["plain", "linked_codex_home", "linked_login", "replaced_after_check"]
+)
+def test_worker_grants_plain_host_login_and_snapshots_host_memories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, layout: str
+) -> None:
+    """Only a plain host login file is granted; the memories DB becomes a private copy."""
+    host_codex = tmp_path / "host-codex"
+    host_codex.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"auth_mode": "chatgpt"}')
+    if layout == "linked_login":
+        (host_codex / "auth.json").symlink_to(outside)
+    else:
+        (host_codex / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    (host_codex / "memories_1.sqlite").write_bytes(b"host memories")
+    source = host_codex
+    if layout == "linked_codex_home":
+        source = tmp_path / "dotfiles-codex"
+        source.symlink_to(host_codex)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    _populate_codex_home_config(codex_home, source)
+    assert (codex_home / "memories_1.sqlite").is_symlink()
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    create_launcher = Mock(return_value=str(tmp_path / "launcher"))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=_active_policy(tmp_path)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+    if layout == "replaced_after_check":
+
+        def replace_login_then_grant(policy: SandboxPolicy, files: list[Path]) -> SandboxPolicy:
+            (host_codex / "auth.json").unlink()
+            (host_codex / "auth.json").symlink_to(outside)
+            return with_additional_write_files(policy, files)
+
+        monkeypatch.setattr(
+            "omnigent.inner.codex_worker.with_additional_write_files", replace_login_then_grant
+        )
+
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        spawn_env_names=["PATH", "CODEX_HOME"],
+    )
+    try:
+        login = host_codex.resolve() / "auth.json"
+        granted = [login] if layout in ("plain", "linked_codex_home") else []
+        for policy in (
+            backend.wrap_launcher_argv.call_args.args[1],
+            create_launcher.call_args.args[1],
+        ):
+            assert policy.write_files == granted
+            assert policy.write_roots == [codex_home.resolve()]
+        if granted:
+            assert os.readlink(codex_home / "auth.json") == str(login)
+        private_memories = codex_home / "memories_1.sqlite"
+        assert not private_memories.is_symlink()
+        assert private_memories.read_bytes() == b"host memories"
+        assert (host_codex / "memories_1.sqlite").read_bytes() == b"host memories"
+    finally:
+        worker.close()
 
 
 @pytest.mark.parametrize("grant_skills", [True, False])
@@ -330,6 +461,7 @@ def test_non_signer_egress_rules_route_only_through_owned_proxy(
     assert worker_env["HTTPS_PROXY"] == "http://127.0.0.1:43124"
     assert worker_env["SSL_CERT_FILE"] == str(handle.ca_bundle_path)
     assert {"HTTPS_PROXY", "SSL_CERT_FILE"} <= set(policy.spawn_env_allowlist or [])
+    assert worker.native_tools_allowed
     start_proxy.assert_called_once_with(
         rules=["POST api.example.com/v1/responses"],
         tmpdir=egress_tmpdir,
@@ -644,6 +776,73 @@ async def test_spawn_failure_releases_launcher_and_private_home(
     assert session._worker_launch is None
 
 
+@pytest.mark.parametrize("hooks_staged_as", ["symlink", "copy"])
+async def test_session_disables_native_tools_for_worker_without_model_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hooks_staged_as: str,
+) -> None:
+    """A worker sharing the host network keeps no native tools or inherited commands."""
+    process = Mock(stdin=None, stdout=_Pipe(), stderr=_Pipe(), returncode=0, pid=123)
+    process.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor.prepare_codex_worker",
+        Mock(
+            return_value=CodexWorkerLaunch(
+                "/private/sandbox-launcher", sandboxed=True, native_tools_allowed=False
+            )
+        ),
+    )
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr("omnigent.inner.codex_executor._create_subprocess_exec", spawn)
+    user_hooks = tmp_path / "user-hooks.json"
+    user_hooks.write_text("{}")
+
+    def _inherit_user_config(target_dir: Path, *_args: object, **_kwargs: object) -> None:
+        (target_dir / "config.toml").write_text(
+            'model = "gpt-5.4-mini"\nnotify = ["touch", "notified"]\n'
+            '[mcp_servers.probe]\ncommand = "touch"\nargs = ["mcp-started"]\n'
+        )
+        if hooks_staged_as == "symlink":
+            (target_dir / "hooks.json").symlink_to(user_hooks)
+        else:
+            shutil.copy2(user_hooks, target_dir / "hooks.json")
+
+    monkeypatch.setattr(
+        "omnigent.inner.codex_executor._populate_codex_home_config", _inherit_user_config
+    )
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd=str(tmp_path),
+        env={},
+        tool_executor=None,
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=False)
+        ),
+    )
+    session._request = AsyncMock(return_value={"result": {}})
+
+    await session.start()
+
+    assert session._disable_native_tools is True
+    assert session._codex_home_dir is not None
+    effective = (session._codex_home_dir / "config.toml").read_text()
+    assert "mcp_servers" not in effective and "notify" not in effective, effective
+    assert 'model = "gpt-5.4-mini"' in effective
+    assert not os.path.lexists(session._codex_home_dir / "hooks.json")
+    assert user_hooks.read_text() == "{}"
+    assert spawn.await_args is not None
+    overrides = set(itertools.pairwise(spawn.await_args.args))
+    for feature in (
+        "features.shell_tool=false",
+        "features.unified_exec=false",
+        "features.browser_use=false",
+        'web_search="disabled"',
+    ):
+        assert ("-c", feature) in overrides, spawn.await_args.args
+    await session.close()
+
+
 async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
@@ -686,6 +885,90 @@ async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> Non
 
     thread_params = session._request.await_args_list[0].args[1]
     assert thread_params["sandbox"] == "danger-full-access"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or shutil.which("bwrap") is None,
+    reason="requires Linux with bubblewrap",
+)
+async def test_real_bwrap_worker_without_model_route_refreshes_login_and_keeps_memories_private(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A network-denied worker reaches the model, refreshes the host login, and copies memories."""
+    host_home = tmp_path / "host-home"
+    host_codex = host_home / ".codex"
+    host_codex.mkdir(parents=True)
+    (host_codex / "auth.json").write_text('{"auth_mode": "chatgpt"}')
+    host_memories = sqlite3.connect(host_codex / "memories_1.sqlite")
+    host_memories.execute("PRAGMA journal_mode=WAL")
+    host_memories.execute("CREATE TABLE memory (note TEXT)")
+    host_memories.execute("INSERT INTO memory VALUES ('from the host')")
+    host_memories.commit()
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.setenv("CODEX_HOME", str(host_codex))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = socket.create_server(("127.0.0.1", 0))
+    model.settimeout(30)
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    # Like Codex: call the model, refresh the login in place, and open WAL memories.
+    codex.write_text(
+        "#!/usr/bin/python3\n"
+        "import json, os, pathlib, socket, sqlite3, sys\n"
+        "pathlib.Path('argv.json').write_text(json.dumps(sys.argv))\n"
+        "socket.create_connection(('127.0.0.1', int(os.environ['MODEL_PORT'])), 10).close()\n"
+        "home = pathlib.Path(os.environ['CODEX_HOME'])\n"
+        "login = home / 'auth.json'\n"
+        "login.write_text(json.dumps({**json.loads(login.read_text()), 'refreshed': True}))\n"
+        "memories = sqlite3.connect(home / 'memories_1.sqlite')\n"
+        "notes = [row[0] for row in memories.execute('SELECT note FROM memory')]\n"
+        "pathlib.Path('notes.json').write_text(json.dumps(notes))\n"
+        "memories.execute('PRAGMA journal_mode=WAL')\n"
+        "memories.execute(\"INSERT INTO memory VALUES ('from the session')\")\n"
+        "memories.commit()\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    if 'id' in request:\n"
+        "        print(json.dumps({'id': request['id'], 'result': {}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    session = _CodexAppServerSession(
+        codex_path=str(codex),
+        cwd=str(workspace),
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(host_home),
+            "MODEL_PORT": str(model.getsockname()[1]),
+        },
+        tool_executor=None,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=["."], allow_network=False),
+        ),
+    )
+    try:
+        await asyncio.wait_for(session.start(), timeout=60)
+        assert session._worker_launch is not None
+        assert session._worker_launch.sandboxed
+        connection, _ = await asyncio.to_thread(model.accept)
+        connection.close()
+    finally:
+        await session.close()
+        model.close()
+
+    argv = json.loads((workspace / "argv.json").read_text())
+    assert ("-c", "features.shell_tool=false") in set(itertools.pairwise(argv))
+    assert json.loads((workspace / "notes.json").read_text()) == ["from the host"]
+    assert json.loads((host_codex / "auth.json").read_text()) == {
+        "auth_mode": "chatgpt",
+        "refreshed": True,
+    }
+    host_notes = [row[0] for row in host_memories.execute("SELECT note FROM memory")]
+    host_memories.close()
+    assert host_notes == ["from the host"]
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
@@ -856,4 +1139,76 @@ def test_real_seatbelt_worker_reads_only_public_signer_state_and_relay_network(
         signer_public.rmdir()
         signer_private.rmdir()
 
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="requires Linux bubblewrap",
+)
+@pytest.mark.parametrize(
+    "egress_rules",
+    [None, ["* chatgpt.com/**"]],
+    ids=["network-denied", "egress-rules"],
+)
+def test_real_bwrap_worker_reads_bridged_codex_home_files(
+    tmp_path: Path,
+    egress_rules: list[str] | None,
+) -> None:
+    user_home = tmp_path / "home"
+    user_codex_home = user_home / ".codex"
+    user_codex_home.mkdir(parents=True)
+    (user_codex_home / "auth.json").write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+    (user_codex_home / "memories_1.sqlite").write_bytes(b"SQLite format 3\x00")
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    codex = tmp_path / "install" / "bin" / "codex"
+    codex.parent.mkdir(parents=True)
+    codex.write_text(
+        "#!/bin/sh\nfor name in auth.json memories_1.sqlite; do\n"
+        '  cat "$CODEX_HOME/$name" >/dev/null || exit 91\ndone\n',
+        encoding="utf-8",
+    )
+    codex.chmod(0o755)
+    codex_home = Path(tempfile.mkdtemp(prefix=CODEX_HOME_PREFIX, dir=codex_home_staging_root()))
+    _populate_codex_home_config(codex_home, user_codex_home, minimal_config=True)
+    worker_env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(user_home),
+        "CODEX_HOME": str(codex_home),
+    }
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=workspace,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(
+            cwd=str(workspace),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                write_paths=["."],
+                allow_network=False,
+                egress_rules=egress_rules,
+                egress_allow_private_destinations=egress_rules is not None,
+            ),
+        ),
+        spawn_env_names=list(worker_env),
+        worker_env=worker_env,
+    )
+
+    try:
+        completed = subprocess.run(
+            [worker.launch_path, "app-server"],
+            cwd=workspace,
+            env=worker_env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    finally:
+        worker.close()
+        shutil.rmtree(codex_home, ignore_errors=True)
+
+    assert worker.sandboxed
     assert completed.returncode == 0, completed.stderr

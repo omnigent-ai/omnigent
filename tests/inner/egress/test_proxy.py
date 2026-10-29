@@ -2967,6 +2967,240 @@ async def test_forwarded_request_is_single_shot_connection_close(
     assert captured[0].connection == ["close"], captured[0].connection
 
 
+def _mitm_client_upgrade_and_echo(
+    proxy_port: int,
+    connect_target: str,
+    server_hostname: str,
+    ca_bundle: Path,
+    upgrade_request: bytes,
+    payload: bytes,
+) -> tuple[bytes, bytes]:
+    """Open a MITM tunnel, send *upgrade_request*, and after a 101 send *payload*."""
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    with contextlib.closing(raw):
+        connect = f"CONNECT {connect_target} HTTP/1.1\r\nHost: {server_hostname}\r\n\r\n"
+        raw.sendall(connect.encode("latin-1"))
+        established = b""
+        while b"\r\n\r\n" not in established:
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            established += chunk
+        ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
+        with contextlib.closing(tls):
+            tls.sendall(upgrade_request)
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                received += chunk
+            head, _, after_head = received.partition(b"\r\n\r\n")
+            if not head.startswith(b"HTTP/1.1 101"):
+                return head, b""
+            tls.sendall(payload)
+            echoed = after_head
+            while len(echoed) < len(payload):
+                chunk = tls.recv(4096)
+                if not chunk:
+                    break
+                echoed += chunk
+            return head, echoed
+
+
+@pytest.mark.asyncio
+async def test_allowed_websocket_upgrade_relays_frames_both_ways(
+    ca_paths: tuple[Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    host = "chatgpt.com"
+    payload = b"websocket-frame"
+    upstream_connection_headers: list[str] = []
+
+    async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+        connection_values = [
+            line.split(":", 1)[1].strip()
+            for line in head.split("\r\n")
+            if line.lower().startswith("connection:")
+        ]
+        upstream_connection_headers.extend(connection_values)
+        tokens = {
+            token.strip().lower() for value in connection_values for token in value.split(",")
+        }
+        if "upgrade" not in tokens:
+            writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n")
+        else:
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            )
+            await writer.drain()
+            writer.write(await reader.readexactly(len(payload)))
+        await writer.drain()
+        writer.close()
+
+    upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context(host)
+    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules([f"* {host}/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+    upgrade_request = (
+        "GET /backend-api/codex/responses HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        "Connection: Upgrade\r\n"
+        "Upgrade: websocket\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "\r\n"
+    ).encode("latin-1")
+
+    try:
+        head, echoed = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_upgrade_and_echo,
+                proxy_port,
+                f"{host}:{upstream_port}",
+                host,
+                bundle_path,
+                upgrade_request,
+                payload,
+            ),
+            timeout=20,
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    assert head.startswith(b"HTTP/1.1 101"), (head, upstream_connection_headers)
+    assert echoed == payload
+
+
+def _mitm_client_read_until_close(
+    proxy_port: int, connect_target: str, server_hostname: str, ca_bundle: Path, request: bytes
+) -> bytes:
+    """Send *request* through a MITM tunnel and read until the proxy closes it."""
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=5)
+    with contextlib.closing(raw):
+        connect = f"CONNECT {connect_target} HTTP/1.1\r\nHost: {server_hostname}\r\n\r\n"
+        raw.sendall(connect.encode("latin-1"))
+        established = b""
+        while b"\r\n\r\n" not in established:
+            established += raw.recv(4096)
+        ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
+        with contextlib.closing(tls):
+            tls.sendall(request)
+            received = b""
+            try:
+                while chunk := tls.recv(4096):
+                    received += chunk
+            except TimeoutError:
+                return received + b"<tunnel open>"
+            return received
+
+
+@pytest.mark.parametrize(
+    ("path", "body", "status", "tail", "reaches_upstream"),
+    [
+        ("/other/socket", b"", b"HTTP/1.1 403", None, False),
+        ("/backend-api/declined", b"", b"HTTP/1.1 426", b"nope", True),
+        ("/backend-api/chunked", b"", b"HTTP/1.1 426", b"5\r\nnope!\r\n0\r\n\r\n", True),
+        ("/backend-api/bodyless", b"", b"HTTP/1.1 204", b"", True),
+        ("/backend-api/other-protocol", b"", b"HTTP/1.1 502", None, True),
+        ("/backend-api/declined", b"abc", b"HTTP/1.1 403", None, False),
+    ],
+    ids=["denied-path", "declined", "chunked", "bodyless", "other-protocol", "with-body"],
+)
+@pytest.mark.asyncio
+async def test_refused_websocket_upgrade_closes_the_tunnel(
+    ca_paths: tuple[Path, Path, Path],
+    path: str,
+    body: bytes,
+    status: bytes,
+    tail: bytes | None,
+    reaches_upstream: bool,
+) -> None:
+    """Only a 101 that selects websocket opens a raw relay; any refusal ends the tunnel."""
+    cert_path, key_path, bundle_path = ca_paths
+    upstream_requests: list[bytes] = []
+
+    async def _upstream(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Keep the connection alive so the proxy, not the upstream, must close the tunnel.
+        while request_line := await reader.readline():
+            upstream_requests.append(request_line)
+            while await reader.readline() not in (b"\r\n", b""):
+                pass
+            if b" /backend-api/bodyless " in request_line:
+                writer.write(b"HTTP/1.1 204 No Content\r\n\r\n")
+            elif b" /backend-api/other-protocol " in request_line:
+                writer.write(
+                    b"HTTP/1.1 101 Switching Protocols\r\n"
+                    b"Upgrade: h2c\r\nConnection: Upgrade\r\n\r\n"
+                )
+            elif b" /backend-api/chunked " in request_line:
+                writer.write(
+                    b"HTTP/1.1 426 Upgrade Required\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    b"5\r\nnope!\r\n0\r\n\r\n"
+                )
+            else:
+                writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4\r\n\r\nnope")
+            await writer.drain()
+        writer.close()
+
+    upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context("localhost")
+    upstream = await asyncio.start_server(_upstream, "127.0.0.1", 0, ssl=upstream_ctx)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["* localhost/backend-api/**"]),
+        cert_path,
+        key_path,
+        upstream_ca_bundle=bundle_path,
+        block_private_destinations=False,
+    )
+    proxy_port = await proxy.start_tcp()
+    framing = f"Content-Length: {len(body)}\r\n" if body else ""
+    request = (
+        f"GET {path} HTTP/1.1\r\nHost: localhost\r\n"
+        "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{framing}\r\n"
+    ).encode("latin-1") + body
+
+    try:
+        received = await asyncio.wait_for(
+            asyncio.to_thread(
+                _mitm_client_read_until_close,
+                proxy_port,
+                f"localhost:{upstream_port}",
+                "localhost",
+                bundle_path,
+                request,
+            ),
+            timeout=20,
+        )
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+    head, _, response_body = received.partition(b"\r\n\r\n")
+    assert head.startswith(status), received
+    assert not received.endswith(b"<tunnel open>"), received
+    if tail is not None:
+        assert response_body == tail, received
+    assert upstream_requests == ([f"GET {path} HTTP/1.1\r\n".encode()] if reaches_upstream else [])
+
+
 @pytest.mark.asyncio
 async def test_stop_cancels_in_flight_connection_handlers(
     ca_paths: tuple[Path, Path, Path],
