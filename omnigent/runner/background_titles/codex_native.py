@@ -23,13 +23,13 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     """Generate a title with an isolated native Codex exec process."""
     from omnigent.harnesses.codex_native.app_server import (
         build_codex_native_server,
+        prepare_codex_provider_config,
         resolve_native_codex_launch,
     )
     from omnigent.inner import _proc
     from omnigent.inner.codex_executor import (
         _codex_home_config_source_from_env,
         _populate_codex_home_config,
-        materialize_codex_provider_config,
     )
     from omnigent.runner.native.orchestration import _codex_native_model_from_spec
     from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
@@ -65,9 +65,12 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             bridge_dir=temp_root / "bridge",
             extra_config_overrides=launch.config_overrides,
         )
-        native_server.config_overrides = materialize_codex_provider_config(
+        native_server.config_overrides = await prepare_codex_provider_config(
             codex_home,
             native_server.config_overrides,
+            codex_path=native_server.codex_path,
+            cwd=title_workdir,
+            env=native_server.env,
             client_surface=context.spawn_env.get(CLIENT_SURFACE_ENV_VAR),
         )
         output_path = temp_root / "title.txt"

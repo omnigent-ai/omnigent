@@ -6,10 +6,12 @@ destination to a local recorder backed by the existing mock model server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,7 @@ from omnigent.harnesses.claude_native.main import (
     _provider_config_for_native_claude,
     build_native_claude_terminal_env,
 )
+from omnigent.harnesses.codex_native.app_server import prepare_codex_provider_config
 from omnigent.harnesses.opencode_native.provider import (
     OpenCodeGatewayResolution,
     build_opencode_provider_config,
@@ -32,7 +35,6 @@ from omnigent.harnesses.pi_native.credentials import PiProviderConfig
 from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
 from omnigent.inner.codex_executor import (
     _databricks_codex_config_overrides,
-    materialize_codex_provider_config,
 )
 from omnigent.inner.pi_executor import _build_models_json
 from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
@@ -122,6 +124,7 @@ def recording_gateway(
         for surface in ("desktop", "web", "ios", "android", "cli")
     ]
     + [
+        ("codex", "codex-inherited", "desktop"),
         ("claude", "claude-sdk", "desktop"),
         ("pi", "pi-native", "cli"),
         ("pi", "pi", "cli"),
@@ -170,20 +173,64 @@ def test_gateway_headers_reach_real_cli_requests(
     }
     if coding_cli == "codex":
         codex_home = Path(env["CODEX_HOME"])
-        overrides = materialize_codex_provider_config(
-            codex_home,
-            _databricks_codex_config_overrides(
+        command: tuple[str, ...] = ()
+        policy_path = tmp_path / "provider-policy.toml"
+        if config_source == "codex-inherited":
+            policy = tomlkit.inline_table()
+            policy.update(
+                {
+                    "name": "Inherited Gateway",
+                    "base_url": _ORIGIN + "/v1",
+                    "wire_api": "responses",
+                    "auth": {"command": "sh", "args": ["-c", "printf synthetic-key"]},
+                    "http_headers": {"User-Agent": "ucode/test codex/test"},
+                }
+            )
+            policy_path.write_text(policy.as_string())
+            wrapper = tmp_path / "configured-codex"
+            wrapper.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                f"policy = Path({str(policy_path)!r}).read_text()\n"
+                f"os.execv({executable!r}, [{executable!r}, '-c', 'model_provider=\"Inherited\"', "
+                "'-c', 'model_providers.Inherited=' + policy, *sys.argv[1:]])\n"
+            )
+            wrapper.chmod(0o700)
+            command = (str(wrapper),)
+            generated_overrides = [f"model={json.dumps(_MODEL)}"]
+        else:
+            generated_overrides = _databricks_codex_config_overrides(
                 model=_MODEL, base_url=_ORIGIN + "/v1", auth_command="printf synthetic-key"
-            ),
-            include_managed_config=False,
+            )
+        overrides = asyncio.run(
+            prepare_codex_provider_config(
+                codex_home,
+                generated_overrides,
+                codex_path=executable,
+                cwd=tmp_path,
+                env=env,
+                client_surface=client_surface,
+                app_server_command=command,
+            )
         )
         path = codex_home / "config.toml"
         config = tomlkit.parse(path.read_text())
-        config["model_providers"]["omnigent_databricks"]["base_url"] = destination
-        path.write_text(tomlkit.dumps(config))
-        args = ["exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only"]
+        if config_source == "codex-inherited":
+            inherited = config["model_providers"]["Inherited"]
+            assert "base_url" not in inherited
+            assert "auth" not in inherited
+            assert set(inherited["http_headers"]) == {_AGENT_HEADER, _SURFACES_HEADER}
+            policy["base_url"] = destination
+            policy_path.write_text(policy.as_string())
+            executable = command[0]
+        else:
+            config["model_providers"]["omnigent_databricks"]["base_url"] = destination
+            path.write_text(tomlkit.dumps(config))
+        args = []
         for override in overrides:
             args.extend(("-c", override))
+        args.extend(("exec", "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only"))
     elif coding_cli == "claude":
         entry = load_providers(
             {

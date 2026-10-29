@@ -61,10 +61,10 @@ from omnigent.native import _native_forwarder_health as native_forwarder_health
 
 
 @pytest.fixture(autouse=True)
-def _isolate_managed_codex_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_codex_config_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "omnigent.inner.codex_executor._CODEX_MANAGED_CONFIG_PATH",
-        tmp_path / "managed_config.toml",
+        "omnigent.harnesses.codex_native.app_server._start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no installed CLI in executor unit tests")),
     )
 
 
@@ -4605,20 +4605,18 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     assert "http_headers" not in providers["other"]
 
 
-@pytest.mark.parametrize("include_managed_config", [True, False])
+@pytest.mark.parametrize("include_effective_providers", [True, False])
 @pytest.mark.parametrize("inline_providers", [False, True])
-def test_materialize_attributes_managed_gateway_without_copying_credentials(
+def test_materialize_attributes_effective_gateway_without_copying_credentials(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    include_managed_config: bool,
+    include_effective_providers: bool,
     inline_providers: bool,
 ) -> None:
     import tomllib
 
     from omnigent.inner.codex_executor import materialize_codex_provider_config
 
-    managed_path = tmp_path / "managed_config.toml"
-    managed_config = (
+    resolved_config = (
         '[model_providers.Managed]\nname = "Managed Gateway"\n'
         'base_url = "https://ws.cloud.databricks.com/ai-gateway/codex/v1"\n'
         '[model_providers.Managed.auth]\ncommand = "secret-helper"\n'
@@ -4626,8 +4624,7 @@ def test_materialize_attributes_managed_gateway_without_copying_credentials(
         'user-agent = "ucode/1 codex/1"\nAuthorization = "Bearer machine-secret"\n'
         'Databricks-Custom-Client-Surfaces = "ug, inner"\n'
     )
-    managed_path.write_text(managed_config)
-    monkeypatch.setattr("omnigent.inner.codex_executor._CODEX_MANAGED_CONFIG_PATH", managed_path)
+    providers = tomllib.loads(resolved_config)["model_providers"]
     private_home = tmp_path / "codex-home"
     if inline_providers:
         private_home.mkdir()
@@ -4635,14 +4632,13 @@ def test_materialize_attributes_managed_gateway_without_copying_credentials(
             'model_providers = { other = { name = "Other", base_url = "https://example.test" } }\n'
         )
     materialize_codex_provider_config(
-        private_home, [], include_managed_config=include_managed_config
+        private_home, [], effective_providers=providers if include_effective_providers else None
     )
     config_path = private_home / "config.toml"
-    if include_managed_config:
+    if include_effective_providers:
         written = config_path.read_text()
         provider = tomllib.loads(written)["model_providers"]["Managed"]
         assert provider["http_headers"] == {
-            "user-agent": "ucode/1 codex/1",
             "Databricks-Custom-Coding-Agent": "codex",
             "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli, ug, inner",
         }
@@ -4653,21 +4649,25 @@ def test_materialize_attributes_managed_gateway_without_copying_credentials(
         assert "Managed" not in tomllib.loads(config_path.read_text())["model_providers"]
     else:
         assert not config_path.exists()
-    assert managed_path.read_text() == managed_config
+    assert providers == tomllib.loads(resolved_config)["model_providers"]
 
 
-def test_materialize_ignores_non_gateway_managed_providers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_materialize_ignores_non_gateway_effective_providers(
+    tmp_path: Path,
 ) -> None:
     from omnigent.inner.codex_executor import materialize_codex_provider_config
 
-    managed_path = tmp_path / "managed_config.toml"
-    managed_path.write_text(
-        '[model_providers.Other]\nbase_url = "https://ws.cloud.databricks.com/serving-endpoints"\n'
-    )
-    monkeypatch.setattr("omnigent.inner.codex_executor._CODEX_MANAGED_CONFIG_PATH", managed_path)
     private_home = tmp_path / "codex-home"
-    assert materialize_codex_provider_config(private_home, []) == []
+    assert (
+        materialize_codex_provider_config(
+            private_home,
+            [],
+            effective_providers={
+                "Other": {"base_url": "https://ws.cloud.databricks.com/serving-endpoints"}
+            },
+        )
+        == []
+    )
     assert not (private_home / "config.toml").exists()
 
 
