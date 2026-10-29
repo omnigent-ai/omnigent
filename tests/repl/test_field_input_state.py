@@ -319,21 +319,27 @@ def test_resolve_elsewhere_releases_only_its_own_prompt() -> None:
     other, mine, value = _run(_run_case())
     assert (other, mine, value) == (False, True, "")
     assert state.aborted and not state.pending
-    assert state.resolved_elsewhere_for("elicit_mine")
-    assert not state.resolved_elsewhere_for("elicit_other")
 
 
 def test_settle_resolved_elsewhere_releases_an_open_field_prompt() -> None:
+    from types import SimpleNamespace
+
     from omnigent.repl._repl import _ApprovalState, _settle_resolved_elsewhere
 
     state = _FieldInputState()
     approvals = _ApprovalState()
+    recorded: list[str] = []
+    session = SimpleNamespace(note_elicitation_resolved=recorded.append)
 
     async def _run_case() -> tuple[str | None, str | None]:
         state.begin("answer", "elicit_q")
-        unrelated = _settle_resolved_elsewhere(approvals, state, "elicit_x", "accept", None)
-        mine = _settle_resolved_elsewhere(approvals, state, "elicit_q", "accept", None)
+        unrelated = _settle_resolved_elsewhere(
+            session, approvals, state, "elicit_x", "accept", None
+        )
+        mine = _settle_resolved_elsewhere(session, approvals, state, "elicit_q", "accept", None)
         return unrelated, mine
 
     assert _run(_run_case()) == (None, "approved elsewhere")
-    assert state.resolved_elsewhere_for("elicit_q")
+    # Every resolution is recorded, even one with no prompt open here.
+    assert recorded == ["elicit_x", "elicit_q"]
+    assert not state.pending

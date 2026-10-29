@@ -19,9 +19,11 @@ import pytest
 from omnigent_client import StreamHooks
 
 from omnigent.repl._repl import (
+    _ApprovalState,
     _FieldInputState,
     _question_prompts,
     _SessionsChatReplAdapter,
+    _settle_resolved_elsewhere,
 )
 from tests._helpers.polling import poll_until_async
 
@@ -108,6 +110,11 @@ def _form_event(elicitation_id: str, schema: dict[str, Any]) -> Any:
     event.phase = "tool_call"
     del event.ask_user_question
     return event
+
+
+def _resolved_elsewhere(adapter: Any, fis: _FieldInputState, elicitation_id: str) -> None:
+    """Deliver another client's verdict the way run_repl's resolved-event branch does."""
+    _settle_resolved_elsewhere(adapter, _ApprovalState(), fis, elicitation_id, "accept", None)
 
 
 def _posted(client: Any) -> list[tuple[Any, ...]]:
@@ -344,11 +351,30 @@ def test_schema_form_answered_elsewhere_stops_without_posting() -> None:
     async def _run_case() -> None:
         task = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
         await _until(lambda: fis.pending, "the field prompt never opened")
-        assert fis.resolve_elsewhere("elicit_form")
+        _resolved_elsewhere(adapter, fis, "elicit_form")
         await task
 
     _run(_run_case())
     approval_hook.assert_awaited_once()
+    client.sessions.resolve_elicitation.assert_not_awaited()
+
+
+def test_schema_form_settled_between_fields_asks_nothing_more() -> None:
+    # The resolution lands after field one is submitted but before the form
+    # resumes, when no field is pending to release.
+    adapter, _, fis, client, _ = _adapter()
+    schema = {"properties": {"name": {"type": "string"}, "team": {"type": "string"}}}
+    form = _form_event("elicit_form", schema)
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
+        await _until(lambda: fis.pending, "the first field never opened")
+        fis.resolve("Ada")
+        _resolved_elsewhere(adapter, fis, "elicit_form")
+        await _until(lambda: task.done(), "the form kept asking after it was settled")
+        assert not fis.pending
+
+    _run(_run_case())
     client.sessions.resolve_elicitation.assert_not_awaited()
 
 
@@ -386,7 +412,7 @@ def test_a_release_elsewhere_does_not_swallow_the_next_verdict() -> None:
     async def _run_case() -> None:
         task = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
         await _until(lambda: fis.pending, "the field prompt never opened")
-        assert fis.resolve_elsewhere("elicit_form")
+        _resolved_elsewhere(adapter, fis, "elicit_form")
         await task
         bad = _form_event("elicit_next", {"properties": {"x": "not-a-property"}})
         await adapter._handle_elicitation("conv_abc", bad)
@@ -641,3 +667,45 @@ def test_approval_settled_elsewhere_posts_no_verdict() -> None:
     approval_hook.side_effect = _settled_elsewhere
     _run(adapter._handle_elicitation("conv_abc", _approval_event()))
     client.sessions.resolve_elicitation.assert_not_awaited()
+
+
+def test_queued_prompt_keeps_the_stream_it_arrived_on() -> None:
+    # B queues behind A on the parent stream; the user then views a child.
+    # When B opens, a child snapshot (which never lists parent prompts) must
+    # not read it as settled.
+    adapter, _, _, client, approval_hook = _adapter()
+    verdicts: list[asyncio.Future[bool]] = []
+
+    async def _wait_for_user(ctx: Any) -> bool:
+        verdicts.append(asyncio.get_running_loop().create_future())
+        return await verdicts[-1]
+
+    approval_hook.side_effect = _wait_for_user
+    client.sessions.get = AsyncMock(return_value=SimpleNamespace(pending_elicitations=[]))
+    released: list[Any] = []
+    adapter._on_event = released.append
+
+    async def _run_case() -> None:
+        first = asyncio.create_task(
+            adapter._handle_elicitation(
+                "conv_abc", _approval_event("elicit_a"), stream_session_id="conv_abc"
+            )
+        )
+        await _until(lambda: len(verdicts) == 1, "approval A never opened")
+        second = asyncio.create_task(
+            adapter._handle_elicitation(
+                "conv_abc", _approval_event("elicit_b"), stream_session_id="conv_abc"
+            )
+        )
+        adapter._session_id = "conv_child"
+        verdicts[0].set_result(True)
+        await first
+        await _until(lambda: len(verdicts) == 2, "approval B never opened")
+        await adapter._replay_pending_elicitations("conv_child")
+        assert not second.done(), "a child snapshot settled the queued parent prompt"
+        verdicts[1].set_result(True)
+        await second
+
+    _run(_run_case())
+    assert released == []
+    assert [args[1] for args in _posted(client)] == ["elicit_a", "elicit_b"]

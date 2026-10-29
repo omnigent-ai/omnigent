@@ -1010,7 +1010,6 @@ class _FieldInputState:
         # Elicitation the open prompt answers, so another client's verdict
         # for it can release the prompt; set when the abort came from there.
         self._elicitation_id: str | None = None
-        self._resolved_elsewhere_id: str | None = None
 
     @property
     def pending(self) -> bool:
@@ -1025,17 +1024,12 @@ class _FieldInputState:
         """:returns: ``True`` if collection was cancelled mid-prompt."""
         return self._aborted
 
-    def resolved_elsewhere_for(self, elicitation_id: str) -> bool:
-        """:returns: ``True`` if another client answered *elicitation_id*'s prompt."""
-        return bool(elicitation_id) and self._resolved_elsewhere_id == elicitation_id
-
     def begin(self, field_name: str, elicitation_id: str | None = None) -> asyncio.Future[str]:
         # A fresh prompt is never pre-aborted. Cleared here (not in the
         # collection loop) so the flag spans exactly one begin/await
         # cycle: the loop reads it the instant the await returns, and
         # the only await between fields IS this ``begin``.
         self._aborted = False
-        self._resolved_elsewhere_id = None
         if self._future is not None and not self._future.done():
             self._future.set_result("")
         self._field_name = field_name
@@ -1051,7 +1045,6 @@ class _FieldInputState:
         if not self.pending or not elicitation_id or elicitation_id != self._elicitation_id:
             return False
         self.cancel()
-        self._resolved_elsewhere_id = elicitation_id
         return True
 
     def resolve(self, text: str) -> bool:
@@ -1072,6 +1065,7 @@ class _FieldInputState:
 
 
 def _settle_resolved_elsewhere(
+    session: _SessionsChatReplAdapter,
     approval_state: _ApprovalState,
     field_input_state: _FieldInputState,
     elicitation_id: str,
@@ -1083,6 +1077,7 @@ def _settle_resolved_elsewhere(
     :returns: The transcript line, e.g. ``"approved elsewhere"``, or ``None``
         when no prompt here was waiting on *elicitation_id*.
     """
+    session.note_elicitation_resolved(elicitation_id)
     if approval_state.resolve_elsewhere(
         elicitation_id, action
     ) or field_input_state.resolve_elsewhere(elicitation_id):
@@ -2856,14 +2851,18 @@ class _SessionsChatReplAdapter:
         self,
         session_id: str,
         event: object,
+        stream_session_id: str | None = None,
     ) -> None:
         """
         Route an elicitation through the hook and POST the verdict.
 
         :param session_id: Session to post the approval to.
+        :param stream_session_id: Session whose stream delivered the event;
+            defaults to the session current when this starts.
         :param event: The translated :class:`ElicitationRequest`.
         """
         elicitation_id = getattr(event, "elicitation_id", "")
+        stream = stream_session_id if stream_session_id is not None else self._session_id
         if elicitation_id:
             if (
                 elicitation_id in self._seen_elicitation_ids
@@ -2878,7 +2877,7 @@ class _SessionsChatReplAdapter:
             self._open_elicitation_id = elicitation_id
             # Not ``session_id``: a mirrored child prompt resolves against the
             # child but is listed in the parent stream's snapshot.
-            self._open_elicitation_stream = self._session_id
+            self._open_elicitation_stream = stream
             try:
                 resolve_payload = await self._collect_verdict(event, elicitation_id)
             finally:
@@ -2952,7 +2951,6 @@ class _SessionsChatReplAdapter:
                 if not _is_recoverable_sse_transport_error(exc):
                     raise
                 if attempt == 2:
-                    # Details are logged at DEBUG.
                     _log.warning("Could not resolve elicitation after transport retries")
                     _log.debug("elicitation resolve failed", exc_info=exc)
                     # The elicitation is still parked server-side, so the
@@ -3078,9 +3076,8 @@ class _SessionsChatReplAdapter:
                     prompted = await self._prompt_schema_fields(schema, elicitation_id)
                 except Exception:  # noqa: BLE001
                     prompted = None
-                fis = self._field_input_state
-                if fis is not None and fis.resolved_elsewhere_for(elicitation_id):
-                    return None
+                if elicitation_id in self._resolved_elicitation_ids:
+                    return None  # settled elsewhere mid-form
                 if prompted is not None:
                     resolve_payload["content"] = prompted
                 else:
@@ -3159,6 +3156,8 @@ class _SessionsChatReplAdapter:
         for key, prop in properties.items():
             if not isinstance(prop, dict):
                 return None
+            if elicitation_id is not None and elicitation_id in self._resolved_elicitation_ids:
+                return None  # settled elsewhere between fields: ask nothing more
 
             prop_type = prop.get("type", "string")
             description = prop.get("description", "")
@@ -4083,9 +4082,13 @@ async def run_repl(
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            session.note_elicitation_resolved(event.elicitation_id)
             label = _settle_resolved_elsewhere(
-                approval_state, field_input_state, event.elicitation_id, event.action, event.reason
+                session,
+                approval_state,
+                field_input_state,
+                event.elicitation_id,
+                event.action,
+                event.reason,
             )
             if label is not None:
                 host.output(
@@ -4445,8 +4448,10 @@ async def run_repl(
             sid = _elicitation_resolve_session_id(
                 sdk_ev, getattr(session, "session_id", None) or ""
             )
+            # Capture the delivering stream now: a session switch may happen
+            # while this prompt waits for the prompt lock.
             elicit_task = asyncio.create_task(
-                session._handle_elicitation(sid, sdk_ev),
+                session._handle_elicitation(sid, sdk_ev, stream_session_id=session.session_id),
             )
             _background_event_tasks.add(elicit_task)
             elicit_task.add_done_callback(_background_event_tasks.discard)

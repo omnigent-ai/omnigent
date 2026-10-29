@@ -58,6 +58,7 @@ class QuestionPicker:
         self.answers: Answers = {}
         self.future: asyncio.Future[Answers | None] = asyncio.get_running_loop().create_future()
         self._scroll = 0
+        self._typed = ""
 
     @property
     def current(self) -> QuestionSpec:
@@ -99,8 +100,14 @@ class QuestionPicker:
 
     def note_typing(self, text: str) -> None:
         """Typing means a custom answer, so highlight its row (as the web form does)."""
+        self._typed = text
         if text and self.current.options and self.current.allow_custom:
             self.row = len(self.current.options)
+
+    def _typed_but_closed(self) -> bool:
+        """Text is typed on a question that only accepts its options."""
+        question = self.current
+        return bool(question.options) and not question.allow_custom and bool(self._typed.strip())
 
     def answer(self, text: str) -> bool:
         """Answer the current question from the highlight and the typed *text*.
@@ -134,6 +141,10 @@ class QuestionPicker:
                 return text  # editor: the exact text is the answer
             typed = text.strip()
             return typed if typed and question.allow_custom else None
+        if not question.allow_custom and text.strip():
+            # Never turn typed text into the highlighted option: typing "No"
+            # must not submit a "Yes" that happens to be highlighted.
+            return None
         typed = text.strip() if question.allow_custom else ""
         if question.multi_select:
             picked = [question.options[i][0] for i in sorted(self.checked)]
@@ -155,11 +166,18 @@ class QuestionPicker:
         lines: list[tuple[str, str]] = []
         title = f" ? question {self.index + 1} of {len(self.questions)}"
         if question.header:
-            title += f" · {question.header}"
+            title += f" · {_one_line(question.header)}"
         lines.append(("class:prompt-marker", title))
         for text_line in textwrap.wrap(question.question, max(width - 4, 20)) or [""]:
             lines.append(("", f"   {text_line}"))
         lines.extend(self._option_lines(width))
+        if self._typed_but_closed():
+            lines.append(
+                (
+                    "class:question-warning",
+                    "   typing isn't accepted here: clear it and choose with ↑↓",
+                )
+            )
         lines.append(("class:model-name", f" {self._hint()}"))
         return [(style, _truncate(text, width) + "\n") for style, text in lines]
 
@@ -181,7 +199,7 @@ class QuestionPicker:
             selected = row == self.row
             marker = "▸" if selected else " "
             if row < len(question.options):
-                label, description = question.options[row]
+                label, description = (_one_line(part) for part in question.options[row])
                 box = ("[x] " if row in self.checked else "[ ] ") if question.multi_select else ""
                 text = f" {marker} {box}{row + 1}. {label}"
                 if description:
@@ -200,6 +218,11 @@ class QuestionPicker:
         if question.multi_select:
             return "↑↓ move · space check · ⏎ send checked (or the highlighted one) · esc dismiss"
         return "↑↓ move · ⏎ choose · esc dismiss"
+
+
+def _one_line(text: str) -> str:
+    """Collapse newlines and runs of whitespace, so agent text stays on one row."""
+    return " ".join(text.split())
 
 
 def _truncate(text: str, width: int) -> str:

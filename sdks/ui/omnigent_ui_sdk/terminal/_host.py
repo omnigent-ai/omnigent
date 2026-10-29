@@ -1151,14 +1151,23 @@ class TerminalHost:
             if root is not None:
                 event.app.exit(result=_SUBAGENT_SELECT_SENTINEL + root)
 
-        # ── Inline question selector ──────────────────────────────
-        # While open it owns Up/Down (instead of history) when the question
-        # has rows, and Space on a multi-select option; Enter and Esc are
-        # handled above. An editor question keeps the arrows for its text.
+        # Selector: Up/Down move its rows, or the cursor of a row-less (editor)
+        # question but never history; Space checks; Enter and Esc are above.
         _picker_open = Condition(lambda: self._question_picker is not None)
         _picker_rows = Condition(
             lambda: self._question_picker is not None and self._question_picker.row_count() > 0
         )
+        _picker_text = Condition(
+            lambda: self._question_picker is not None and self._question_picker.row_count() == 0
+        )
+
+        @self._kb.add("up", filter=_picker_text)
+        def _picker_text_up(event: KeyPressEvent) -> None:
+            event.current_buffer.cursor_up(count=event.arg)
+
+        @self._kb.add("down", filter=_picker_text)
+        def _picker_text_down(event: KeyPressEvent) -> None:
+            event.current_buffer.cursor_down(count=event.arg)
 
         @self._kb.add("up", filter=_picker_rows)
         def _picker_prev(event: KeyPressEvent) -> None:
@@ -1413,6 +1422,7 @@ class TerminalHost:
                 # are de-emphasized vs live ones — mirroring the web Agents
                 # rail's SETTLED_STATE dimming — but kept in the list.
                 "subagent-settled": "fg:ansibrightblack",
+                "question-warning": self.theme.warning,
                 "bottom-toolbar.key": self._accent,
                 # Bottom toolbar background. ``noreverse`` prevents
                 # prompt-toolkit's default fg/bg swap (which would turn

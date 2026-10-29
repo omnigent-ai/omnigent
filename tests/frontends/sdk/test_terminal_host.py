@@ -1804,6 +1804,13 @@ async def test_question_picker_answers_follow_the_web_form() -> None:
     closed.note_typing("x")
     assert closed.row_count() == 3 and not closed.on_custom_row()
     assert "Type something" not in _picker_text(closed)
+    # Typed text is never turned into the highlighted option ("No" must not
+    # submit a highlighted "Yes"); the selector says why Enter did nothing.
+    assert closed.answer("No, stay in Plan mode") is False
+    assert "typing isn't accepted here" in _picker_text(closed)
+    closed.note_typing("")
+    assert closed.answer("") is True
+    assert await closed.future == {"Env?": "dev"}
 
     editor = QuestionPicker([_env_question(options=(), text_default="draft")])
     assert editor.answer("") is True, "an editor answer may be empty"
@@ -1837,6 +1844,13 @@ async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> 
     assert "▸ 12. opt11" in shown and "1. opt0" not in shown
     wide = QuestionPicker([_env_question(options=(("界" * 80, ""),))])
     assert all(get_cwidth(text.rstrip("\n")) <= 40 for _, text in wide.render(40))
+    # Agent text with newlines stays one row per option, so the height holds.
+    multiline = QuestionPicker(
+        [_env_question(header="Env\nironment", options=(("dev\nbox", "a\nb"), ("prod", "")))]
+    )
+    rendered = multiline.render(80)
+    assert all(text.count("\n") == 1 for _, text in rendered)
+    assert "1. dev box — a b" in _picker_text(multiline)
 
 
 @pytest.mark.asyncio
@@ -1942,13 +1956,14 @@ async def test_editor_question_leaves_the_arrows_to_its_text() -> None:
         host.ask_questions([_env_question(options=(), text_default="line one\nline two")])
     )
     await asyncio.sleep(0)
-    picker_keys = {"_picker_prev", "_picker_next"}
-    active = {
+    active = [
         b.handler.__name__
         for b in host._kb.bindings
         if [str(k) for k in b.keys] in (["Keys.Up"], ["Keys.Down"]) and b.filter()
-    }
-    assert not active & picker_keys
+    ]
+    # Cursor movement only: falling through to history would swap the answer
+    # for an old chat message.
+    assert active == ["_picker_text_up", "_picker_text_down"]
     host.dismiss_questions()
     await asking
 
