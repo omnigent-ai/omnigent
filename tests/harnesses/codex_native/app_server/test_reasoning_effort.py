@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -497,71 +498,41 @@ async def test_resume_effort_update_times_out_and_closes_client(
     client.close.assert_awaited_once()
 
 
-@pytest.mark.parametrize(
-    ("model", "effort", "expected"),
-    [("gpt-5.4", "minimal", "low"), ("glm-5-2", None, "medium")],
-)
-async def test_plan_mode_switch_keeps_codex_preset_and_resolves_effort(
-    monkeypatch: pytest.MonkeyPatch,
-    model: str,
-    effort: str | None,
-    expected: str,
+@pytest.mark.parametrize("rejected", [False, True])
+async def test_plan_mode_keeps_codex_preset_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch, rejected: bool
 ) -> None:
-    """The mode's own prompt stays in place and the effort fits the model."""
     client = AsyncMock(spec=app_server.CodexAppServerClient)
-    client.request.side_effect = lambda method, params: (
-        {
-            "result": {
-                "data": [
-                    {
-                        "id": "gpt-5.4",
-                        "supportedReasoningEfforts": [
-                            {"reasoningEffort": value} for value in ("low", "medium", "high")
-                        ],
-                    }
-                ]
-            }
-        }
-        if method == "model/list"
-        else {"result": {}}
+    if rejected:
+        client.request.side_effect = RuntimeError("thread not loaded")
+    resolve_effort = AsyncMock(return_value="low")
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    monkeypatch.setattr(app_server, "resolve_codex_effort_for_model", resolve_effort)
+
+    with (
+        pytest.raises(RuntimeError, match="thread not loaded")
+        if rejected
+        else contextlib.nullcontext()
+    ):
+        await app_server.apply_codex_thread_collaboration_mode(
+            "ws://127.0.0.1:1", "thread_new", "plan", model="gpt-5.4", effort="minimal"
+        )
+
+    resolve_effort.assert_awaited_once_with(
+        client, "minimal", "gpt-5.4", transport="ws://127.0.0.1:1"
     )
-    client_names: list[str] = []
-
-    def _client_for_transport(transport: str, *, client_name: str) -> AsyncMock:
-        client_names.append(client_name)
-        return client
-
-    monkeypatch.setattr(app_server, "client_for_transport", _client_for_transport)
-
-    await app_server.apply_codex_thread_collaboration_mode(
-        "ws://127.0.0.1:1", "thread_new", "plan", model=model, effort=effort
-    )
-
-    assert client_names == ["omnigent-codex-native-plan-mode"]
-    client.request.assert_awaited_with(
+    client.request.assert_awaited_once_with(
         "thread/settings/update",
         {
             "threadId": "thread_new",
             "collaborationMode": {
                 "mode": "plan",
                 "settings": {
-                    "model": model,
-                    "reasoning_effort": expected,
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "low",
                     "developer_instructions": None,
                 },
             },
         },
     )
-    client.close.assert_awaited_once()
-
-
-async def test_plan_mode_switch_failure_closes_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = AsyncMock(spec=app_server.CodexAppServerClient)
-    client.request.side_effect = RuntimeError("thread not loaded")
-    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
-
-    with pytest.raises(RuntimeError, match="thread not loaded"):
-        await app_server.apply_codex_thread_collaboration_mode(
-            "ws://127.0.0.1:1", "thread_new", "plan", model="glm-5-2"
-        )
     client.close.assert_awaited_once()

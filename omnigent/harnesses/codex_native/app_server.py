@@ -105,6 +105,7 @@ from omnigent.inner.databricks_executor import (
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.native import policy_allow_cache
 from omnigent.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
@@ -188,7 +189,7 @@ _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
 class CodexAppServerSilentStartTimeout(RuntimeError):
-    """Readiness timed out while the app-server process was alive but never listened.
+    """Readiness timed out while the app-server process was alive but never initialized.
 
     Carries the timeout message; ``start()`` respawns the process once and
     turns a second occurrence into a plain ``RuntimeError``.
@@ -202,6 +203,55 @@ class CodexAppServerSilentStartTimeout(RuntimeError):
         self.recent_stderr_bytes = recent_stderr_bytes
         # Class name of the last failed probe, e.g. ``"ConnectionRefusedError"``.
         self.last_error_type = last_error_type
+
+
+# Codex's whole stderr line when the selected model_provider has no table.
+_MISSING_MODEL_PROVIDER_LINE = re.compile(r"Error: Model provider `([^`]+)` not found")
+
+
+class CodexModelProviderMissingError(OmnigentError, RuntimeError):
+    """Codex's config selects a model provider that it does not define.
+
+    Coded ``HARNESS_NOT_CONFIGURED``: the ``[model_providers.X]`` table lives
+    in the person's own Codex config, so only they can restore it, and a
+    terminal start failure shows this message verbatim. Subclasses
+    :class:`RuntimeError`, the error ``start()`` raises for an early exit.
+    """
+
+    def __init__(self, provider: str, config_path: Path) -> None:
+        """
+        :param provider: Missing provider id, e.g. ``"Databricks"``.
+        :param config_path: Codex config the provider is bridged from, e.g.
+            ``Path.home() / ".codex" / "config.toml"``.
+        """
+        try:
+            shown_path = f"~/{config_path.relative_to(Path.home())}"
+        except ValueError:
+            shown_path = str(config_path)
+        super().__init__(
+            f"Codex config {shown_path} has no [model_providers.{provider}] table "
+            "for the selected model provider. Restore it, or pick another provider "
+            "with `omnigent setup`.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+        self.provider = provider
+
+
+def _missing_model_provider(stderr_lines: Sequence[str]) -> str | None:
+    """
+    Return the provider id Codex reported missing at startup, if any.
+
+    Only the bare form counts: ``error loading default config after config
+    error: ...`` is a legacy-profile failure with a different remedy.
+
+    :param stderr_lines: Recent app-server stderr lines, oldest first.
+    :returns: The provider id, e.g. ``"Databricks"``, or ``None``.
+    """
+    for line in reversed(stderr_lines):
+        match = _MISSING_MODEL_PROVIDER_LINE.fullmatch(line.strip())
+        if match is not None:
+            return match.group(1)
+    return None
 
 
 @dataclass(frozen=True)
@@ -1126,6 +1176,7 @@ class CodexAppServerClient:
         # ``None`` marks the end of the event stream (reader exited).
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
+        self._subscribed_thread_ids: set[str] = set()
 
     async def connect(self) -> None:
         """
@@ -1149,6 +1200,7 @@ class CodexAppServerClient:
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
         self._events = asyncio.Queue()
+        self._subscribed_thread_ids = set()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
@@ -1233,7 +1285,26 @@ class CodexAppServerClient:
             exc = CodexAppServerResponseError(error)
             exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
             raise exc
+        if method in {"thread/start", "thread/resume"}:
+            result = response.get("result")
+            thread = result.get("thread") if isinstance(result, dict) else None
+            thread_id = thread.get("id") if isinstance(thread, dict) else params.get("threadId")
+            if isinstance(thread_id, str) and thread_id:
+                self._subscribed_thread_ids.add(thread_id)
         return response
+
+    def is_subscribed_to_thread(self, thread_id: str) -> bool:
+        """
+        Return whether this connection already receives a thread's notifications.
+
+        Codex sends turn and item notifications only to connections that
+        started or resumed the thread.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+        :returns: ``True`` after a successful ``thread/start`` or
+            ``thread/resume`` for the thread on this connection.
+        """
+        return thread_id in self._subscribed_thread_ids
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
         """
@@ -1978,6 +2049,14 @@ async def codex_launch_catalog_is_stale(
     )
 
 
+def _configured_app_server_command() -> tuple[str, ...]:
+    """The configured app-server wrapper, ``harness.codex-native.app_server``, or ``()``."""
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import resolve_codex_app_server_command
+
+    return resolve_codex_app_server_command(load_effective_config())
+
+
 def _tagged_codex_argv0(codex_path: str, registry_tag: str) -> str:
     """Return the argv[0] carrying the crash-reap tag for a registered app-server."""
     return f"{Path(codex_path).name} {codex_native_session_tag_cmdline_arg(registry_tag)}"
@@ -1988,12 +2067,19 @@ def _build_native_codex_app_server_argv(
     tagged_argv0: str,
     listen_url: str,
     config_overrides: Sequence[str],
+    launch_args: Sequence[str] = (),
 ) -> list[str]:
-    """Build argv for the native Codex app-server subprocess."""
-    argv = [tagged_argv0, "app-server", "--listen", listen_url]
-    for override in config_overrides:
-        argv.extend(["-c", override])
-    return argv
+    """Build argv for the native Codex app-server subprocess.
+
+    The ``-c`` overrides go before ``app-server``: Codex ignores top-level ``-c``
+    once the subcommand has its own, so a wrapper that passes its own top-level
+    ``-c`` (e.g. ucode) keeps it only if these join that group.
+
+    :param launch_args: Args of a configured app-server wrapper, placed before
+        everything else (see :func:`_configured_app_server_command`).
+    """
+    overrides = [arg for override in config_overrides for arg in ("-c", override)]
+    return [tagged_argv0, *launch_args, *overrides, "app-server", "--listen", listen_url]
 
 
 @dataclass
@@ -2099,6 +2185,7 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
+    app_server_command: tuple[str, ...] = ()
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2113,10 +2200,12 @@ class CodexNativeAppServer:
         :returns: None.
         """
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
+        executable, *launch_args = self.app_server_command or (self.codex_path,)
         argv = _build_native_codex_app_server_argv(
-            tagged_argv0=_tagged_codex_argv0(self.codex_path, self.process_registry_tag),
+            tagged_argv0=_tagged_codex_argv0(executable, self.process_registry_tag),
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
+            launch_args=launch_args,
         )
         proc_env = codex_app_server_diagnostic_env(
             {**self.env, "CODEX_HOME": str(self.codex_home)}
@@ -2130,7 +2219,7 @@ class CodexNativeAppServer:
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
                 cwd=str(self.cwd),
-                executable=self.codex_path,
+                executable=executable,
                 **_proc.spawn_kwargs(),
             )
         except BaseException:
@@ -2342,12 +2431,12 @@ class CodexNativeAppServer:
             try:
                 startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
-                # A loaded host can leave a fresh app-server silent; a second spawn
-                # listens. It must reuse the transport: callers captured the listen
+                # A fresh app-server can stall before initialization; a second spawn
+                # can recover. Reuse the transport: callers captured the listen
                 # URL before start() and hand it to the TUI, forwarder and bridge.
                 with contextlib.suppress(Exception):  # diagnostics never block recovery
                     _logger.warning(
-                        "Codex app-server never listened and is still running "
+                        "Codex app-server never initialized and is still running "
                         "(recent_stderr_bytes=%d); respawning it once on the same transport",
                         silent.recent_stderr_bytes,
                         extra=self._startup_snapshot_event(
@@ -2645,20 +2734,28 @@ class CodexNativeAppServer:
         Wait until the app-server socket accepts an initialized
         client, and return that connection for startup RPCs.
 
-        The budget bounds the retry loop; a connect attempt already in
-        flight when it expires is not interrupted.
+        The budget bounds both connection retries and the initialize handshake.
 
         :returns: Connected app-server client. The caller owns it.
         :raises CodexAppServerSilentStartTimeout: If the budget expires while
-            the process is still alive and never listened; ``start()``
+            the process is still alive and never initialized; ``start()``
             respawns it once.
+        :raises CodexModelProviderMissingError: If the app-server exits because
+            its config selects an undefined model provider.
         :raises RuntimeError: If the app-server exits early.
         """
-        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
-        while asyncio.get_running_loop().time() < deadline:
+        while loop.time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
-                detail = " | ".join((self.recent_stderr or [])[-5:])
+                recent_stderr = self.recent_stderr or []
+                provider = _missing_model_provider(recent_stderr)
+                if provider is not None:
+                    raise CodexModelProviderMissingError(
+                        provider, _codex_home_config_source_from_env() / "config.toml"
+                    )
+                detail = " | ".join(recent_stderr[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
             client: CodexAppServerClient | None = None
             try:
@@ -2672,7 +2769,8 @@ class CodexNativeAppServer:
                         self.socket_path,
                         client_name="omnigent-probe",
                     )
-                await client.connect()
+                async with asyncio.timeout_at(deadline):
+                    await client.connect()
                 return client
             except asyncio.CancelledError:
                 if client is not None:
@@ -2684,7 +2782,9 @@ class CodexNativeAppServer:
                 if client is not None:
                     with contextlib.suppress(Exception):
                         await client.close()
-                await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(min(_CONNECT_RETRY_DELAY_SECONDS, remaining))
 
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
@@ -2692,7 +2792,7 @@ class CodexNativeAppServer:
             f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
-        # Still running but never listened: start() can respawn it once.
+        # Still running but never initialized: start() can respawn it once.
         if self.proc is not None and self.proc.returncode is None:
             recent_stderr_bytes = sum(
                 len(line.encode("utf-8")) for line in (self.recent_stderr or [])
@@ -2790,12 +2890,14 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
         via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
-    :returns: A shell-escaped command string, e.g.
-        ``"/path/python -I -m omnigent.harnesses.codex_native.hook evaluate-policy
-        --bridge-dir /home/u/.omnigent/codex-native/abc"``.
+    :returns: The shell command, the Python hook behind the allow-cache guard
+        (:func:`omnigent.native.policy_allow_cache.guarded_hook_command`).
+        The Python part is shell-escaped, e.g. ``"/path/python -I -m
+        omnigent.harnesses.codex_native.hook evaluate-policy --bridge-dir
+        /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
-    return shlex.join(
+    command = shlex.join(
         [
             python,
             "-I",
@@ -2806,6 +2908,7 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
             str(bridge_dir),
         ]
     )
+    return policy_allow_cache.guarded_hook_command(bridge_dir, command)
 
 
 def _turn_router_advertised(bridge_dir: Path) -> bool:
@@ -3401,22 +3504,27 @@ def _databricks_launch_materialization(
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
-    base_url, auth_command, auth_refresh_interval_ms = _databricks_codex_gateway(host, profile)
+    base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
+        host, profile
+    )
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
             base_url=base_url,
             auth_command=auth_command,
             auth_refresh_interval_ms=auth_refresh_interval_ms,
+            auth_config=auth_config,
         ),
         model=resolved_model,
         host=host,
     )
 
 
-def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | None]:
+def _databricks_codex_gateway(
+    host: str, profile: str
+) -> tuple[str, str, int | None, dict[str, object] | None]:
     """
-    Return the Codex gateway base URL, auth command and refresh cadence for *host*.
+    Return the Codex gateway URL, shell helper, cadence and structured auth for *host*.
 
     ucode state is the source of truth for the gateway and auth; the
     profile-derived gateway is the fallback.
@@ -3424,7 +3532,7 @@ def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | 
     :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
     :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
-        an auth command, else the profile-derived gateway with the default cadence.
+        an auth command, else the profile-derived gateway with default auth settings.
     """
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -3440,8 +3548,13 @@ def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | 
         workspace_state = None
     agent = workspace_state.agent("codex") if workspace_state is not None else None
     if agent is not None and agent.base_url and agent.auth_command:
-        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms
-    return _databricks_codex_base_url(host), _databricks_codex_auth_command(host, profile), None
+        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms, agent.auth
+    return (
+        _databricks_codex_base_url(host),
+        _databricks_codex_auth_command(host, profile),
+        None,
+        None,
+    )
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
@@ -3686,6 +3799,7 @@ def build_codex_native_server(
         trust_all_hooks=trust_all_hooks,
         reconcile_process_registry=reconcile_process_registry,
         writable_roots=tuple(codex_workspace_roots(terminal_launch_args, cwd)[1]),
+        app_server_command=_configured_app_server_command(),
     )
 
 

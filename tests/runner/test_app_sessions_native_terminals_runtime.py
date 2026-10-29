@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -487,7 +488,6 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
         "cancel_launch",
         "use_envelope",
         "provider_profile",
-        "plan_mode",
     ),
     [
         pytest.param(
@@ -497,7 +497,6 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
             cancel_launch,
             use_envelope,
             None,
-            False,
             id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
             f"{'envelope' if use_envelope else 'legacy'}",
         )
@@ -511,16 +510,8 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
     ]
     + [
         pytest.param(
-            (0, 154, 0),
-            [],
-            True,
-            False,
-            True,
-            "configured-workspace",
-            False,
-            id="configured-provider",
-        ),
-        pytest.param((0, 154, 0), [], True, False, True, None, True, id="plan-mode"),
+            (0, 154, 0), [], True, False, True, "configured-workspace", id="configured-provider"
+        )
     ],
 )
 @pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
@@ -534,7 +525,6 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     use_envelope: bool,
     rotated: bool,
     provider_profile: str | None,
-    plan_mode: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -581,6 +571,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     session_labels: dict[str, str] = (
         {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
     )
+    plan_mode = provider_profile is not None
     if plan_mode:
         session_labels[CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = "plan"
     launch_snapshot = RunnerSessionInitSnapshot(
@@ -744,7 +735,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     retained_client = _RetainedClient()
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -878,6 +869,20 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             config={"harness": "codex-native", "model": "gpt-5-default"},
         ),
     )
+    subagent_router, turn_router = object(), object()
+    monkeypatch.setattr(
+        orchestration,
+        "_start_subagent_router_for_native_session",
+        lambda *args, **kwargs: (None, subagent_router),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_start_turn_router_for_native_session",
+        lambda *args, **kwargs: turn_router,
+    )
+    stop_subagent_router, stop_turn_router = AsyncMock(), AsyncMock()
+    monkeypatch.setattr(orchestration, "_shutdown_session_router_async", stop_subagent_router)
+    monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", stop_turn_router)
 
     try:
         if cancel_launch:
@@ -894,6 +899,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert app_server.closed
             assert not forward_calls
             assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            stop_subagent_router.assert_awaited_once_with(session_id, subagent_router)
+            stop_turn_router.assert_awaited_once_with(session_id, turn_router)
             if rotated:
                 assert not session_dir.exists()
             return
@@ -1208,7 +1215,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1506,7 +1513,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1616,11 +1623,9 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("plan_mode", [False, True], ids=["default", "plan-mode"])
 async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    plan_mode: bool,
 ) -> None:
     """
     Codex-native launches in the session worktree, not the bundle dir.
@@ -1641,7 +1646,6 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
     :param tmp_path: Temporary directory for isolated bridge/workspace state.
     :param monkeypatch: Pytest monkeypatch fixture.
-    :param plan_mode: Whether the session carries the Codex Plan-mode label.
     :returns: None.
     """
     import omnigent.harness_startup_config as startup_config_mod
@@ -1706,9 +1710,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
                     "terminal_launch_args": None,
                     "model_override": None,
                     "external_session_id": None,
-                    "labels": {CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: "plan"}
-                    if plan_mode
-                    else {},
+                    "labels": {CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: "plan"},
                 },
                 request=httpx.Request("GET", url),
             )
@@ -1784,7 +1786,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
     launch_captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1918,34 +1920,11 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
         "--dangerously-bypass-hook-trust",
     ]
 
-    plan_calls: list[tuple[str, str, str, str | None, str | None]] = []
-
-    async def _fake_apply_collaboration_mode(
-        transport: str, loaded_thread_id: str, mode: str, *, model: str, effort: str | None
-    ) -> None:
-        plan_calls.append((transport, loaded_thread_id, mode, model, effort))
-
-    monkeypatch.setattr(
-        codex_app_mod, "apply_codex_thread_collaboration_mode", _fake_apply_collaboration_mode
-    )
-    apply_plan_mode = discover_kwargs["apply_plan_mode"]
-    if plan_mode:
-        assert apply_plan_mode is not None, "a Plan-labelled launch never switched Codex to Plan"
-        await apply_plan_mode("019e96aa-2222-7333-8444-555566667777")
-    else:
-        assert apply_plan_mode is None
-    assert plan_calls == (
-        [
-            (
-                discover_kwargs["codex_ws_url"],
-                "019e96aa-2222-7333-8444-555566667777",
-                "plan",
-                "gpt-5-default",
-                None,
-            )
-        ]
-        if plan_mode
-        else []
+    apply_mode = AsyncMock()
+    monkeypatch.setattr(codex_app_mod, "apply_codex_thread_collaboration_mode", apply_mode)
+    await discover_kwargs["apply_plan_mode"]("thread_new")
+    apply_mode.assert_awaited_once_with(
+        discover_kwargs["codex_ws_url"], "thread_new", "plan", model="gpt-5-default", effort=None
     )
 
 
@@ -2043,7 +2022,7 @@ async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
         async def close(self) -> None:
             """:returns: None."""
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that accepts the launched terminal."""
 
         async def launch_auxiliary_terminal(self, **kwargs: Any) -> SessionResourceView:
@@ -2291,7 +2270,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         async def close(self) -> None:
             """:returns: None."""
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry returning a fixed terminal view."""
 
         async def launch_auxiliary_terminal(
@@ -2416,6 +2395,9 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cold bridge does not block dispatch or strand a cancelled worker."""
+    from omnigent.runner.slow_io import run_slow_io
+    from tests._helpers.polling import poll_until_async
+
     session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
@@ -2473,7 +2455,16 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
+    slow_release = threading.Event()
+    slow_started = [threading.Event() for _ in range(4)]
+
+    def hold_slow_worker(started: threading.Event) -> None:
+        started.set()
+        slow_release.wait(budget(30))
+
+    slow_jobs = [asyncio.create_task(run_slow_io(hold_slow_worker, e)) for e in slow_started]
     try:
+        await poll_until_async(lambda: all(e.is_set() for e in slow_started), timeout_s=budget(5))
         async with _runner_client(app) as client:
             resp = await client.post(
                 f"/v1/sessions/{session_id}/events",
@@ -2522,6 +2513,8 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                 "cancelling the notification task left its readiness worker running"
             )
     finally:
+        slow_release.set()
+        await asyncio.gather(*slow_jobs)
         # Release a worker after a failed assertion, without masking a broken cancel path.
         if cancellation_event is not None:
             cancellation_event.set()
@@ -2686,7 +2679,7 @@ async def _run_antigravity_auto_create(
             patch_calls.append((url, json))
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the required-terminal launch."""
 
         terminal_registry = None
@@ -2886,7 +2879,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the required-terminal launch spec."""
 
         terminal_registry = None
@@ -3478,7 +3471,7 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -3607,7 +3600,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
             del json
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -3757,7 +3750,7 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
             del json
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -4700,9 +4693,11 @@ async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("plan_rejected", [False, True])
 async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cwd(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    plan_rejected: bool,
 ) -> None:
     """
     The fresh-session bridge state must carry the session workspace as ``cwd``.
@@ -4714,11 +4709,13 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     commands run from the wrong directory instead of the selected workspace.
     A Plan-armed launch must switch the thread before that state is published.
     """
+    from omnigent.harnesses.codex_native import app_server as codex_app_mod
     from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.runner.app import (
         _AUTO_CODEX_APP_SERVERS,
         _codex_discover_thread_and_forward,
     )
+    from omnigent.runner.native.orchestration import _apply_codex_launch_plan_mode
 
     thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
     workspace = tmp_path / "selected-workspace"
@@ -4740,10 +4737,21 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     async def _fake_supervise(**_kwargs: object) -> None:
         return None
 
-    plan_calls: list[tuple[str, object]] = []
+    apply_mode = AsyncMock(side_effect=RuntimeError("rejected") if plan_rejected else None)
+    monkeypatch.setattr(codex_app_mod, "apply_codex_thread_collaboration_mode", apply_mode)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model = "gpt-test"\n')
 
     async def _apply_plan_mode(discovered_thread_id: str) -> None:
-        plan_calls.append((discovered_thread_id, codex_native_bridge.read_bridge_state(tmp_path)))
+        assert codex_native_bridge.read_bridge_state(tmp_path) is None
+        await _apply_codex_launch_plan_mode(
+            discovered_thread_id,
+            bridge_dir=tmp_path,
+            codex_ws_url="ws://127.0.0.1:1",
+            model=None,
+            effort="high",
+        )
 
     class _Client:
         async def close(self) -> None:
@@ -4763,21 +4771,34 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     codex_native_bridge.write_bridge_startup_timeout(tmp_path, 120.0)
     _AUTO_CODEX_APP_SERVERS[session_id] = _AppServer()
     try:
-        await _codex_discover_thread_and_forward(
-            session_id=session_id,
-            bridge_dir=tmp_path,
-            codex_ws_url="ws://127.0.0.1:1",
-            codex_home=tmp_path / "codex-home",
-            workspace=str(workspace),
-            event_client=_Client(),  # type: ignore[arg-type]
-            routing_summary="provider 'test' (model=gpt-test)",
-            thread_start_timeout_seconds=120.0,
-            apply_plan_mode=_apply_plan_mode,
-        )
+        with (
+            pytest.raises(RuntimeError, match="Could not enable Codex Plan mode")
+            if plan_rejected
+            else contextlib.nullcontext()
+        ):
+            await _codex_discover_thread_and_forward(
+                session_id=session_id,
+                bridge_dir=tmp_path,
+                codex_ws_url="ws://127.0.0.1:1",
+                codex_home=tmp_path / "codex-home",
+                workspace=str(workspace),
+                event_client=_Client(),  # type: ignore[arg-type]
+                routing_summary="provider 'test' (model=gpt-test)",
+                thread_start_timeout_seconds=120.0,
+                apply_plan_mode=_apply_plan_mode,
+            )
     finally:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
-    assert plan_calls == [(thread_id, None)]
+    apply_mode.assert_awaited_once_with(
+        "ws://127.0.0.1:1", thread_id, "plan", model="gpt-test", effort="high"
+    )
+    if plan_rejected:
+        assert codex_native_bridge.read_bridge_state(tmp_path) is None
+        failure = codex_native_bridge.read_bridge_startup_failure(tmp_path)
+        assert failure is not None and failure.code == "codex_plan_mode_failed"
+        assert patch_requests == []
+        return
     assert len(patch_requests) == 1
     patch_request = patch_requests[0]
     assert patch_request.method == "PATCH"
@@ -4794,85 +4815,6 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     assert state.cwd == str(workspace)
     assert wait_calls == [{"timeout": 120.0}]
     assert codex_native_bridge.read_bridge_startup_timeout(tmp_path) == 120.0
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("model", "config_model", "apply_fails", "report_status", "expected_model"),
-    [
-        pytest.param("gpt-5.4-mini", "gpt-5.5", False, 202, "gpt-5.4-mini", id="launch-model"),
-        pytest.param(None, "gpt-5.5", False, 202, "gpt-5.5", id="config-model"),
-        pytest.param("gpt-5.4-mini", None, True, 202, "gpt-5.4-mini", id="apply-fails"),
-        pytest.param("gpt-5.4-mini", None, True, 503, "gpt-5.4-mini", id="report-fails"),
-        pytest.param(None, None, False, 202, None, id="no-model"),
-    ],
-)
-async def test_apply_codex_launch_plan_mode_switches_or_reports_default(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    model: str | None,
-    config_model: str | None,
-    apply_fails: bool,
-    report_status: int,
-    expected_model: str | None,
-) -> None:
-    """
-    A launch switches its Codex thread to Plan, or reports Default for the session.
-
-    The Plan label is already persisted, so leaving it would show Plan mode in
-    the composer while Codex runs Default. A failed report must not sink the launch.
-    """
-    import omnigent.harnesses.codex_native.app_server as codex_app_mod
-    from omnigent.runner.native import orchestration
-
-    session_id = "9f1f7f7bd7f24f80a621d9a3ba3fbc10"
-    thread_id = "019e96aa-abcd-7343-8d3b-6f914d60936b"
-    codex_home = tmp_path / "codex-home"
-    codex_home.mkdir()
-    if config_model is not None:
-        (codex_home / "config.toml").write_text(f'model = "{config_model}"\n')
-    apply_calls: list[tuple[str, str, str, str, str | None]] = []
-    posted: list[tuple[str, object]] = []
-
-    async def _fake_apply(
-        transport: str, loaded_thread_id: str, mode: str, *, model: str, effort: str | None
-    ) -> None:
-        apply_calls.append((transport, loaded_thread_id, mode, model, effort))
-        if apply_fails:
-            raise RuntimeError("thread/settings/update rejected")
-
-    def _handle(request: httpx.Request) -> httpx.Response:
-        posted.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(report_status, json={})
-
-    monkeypatch.setattr(codex_app_mod, "apply_codex_thread_collaboration_mode", _fake_apply)
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_handle), base_url="http://ap.example"
-    ) as server_client:
-        await orchestration._apply_codex_launch_plan_mode(
-            thread_id,
-            session_id=session_id,
-            server_client=server_client,
-            codex_ws_url="ws://127.0.0.1:1",
-            codex_home=codex_home,
-            model=model,
-            effort="high",
-        )
-
-    assert apply_calls == (
-        [("ws://127.0.0.1:1", thread_id, "plan", expected_model, "high")] if expected_model else []
-    )
-    switched = expected_model is not None and not apply_fails
-    assert posted == (
-        []
-        if switched
-        else [
-            (
-                f"/v1/sessions/{session_id}/events",
-                {"type": "external_codex_collaboration_mode_change", "data": {"mode": "default"}},
-            )
-        ]
-    )
 
 
 @pytest.mark.asyncio
@@ -5160,7 +5102,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         """
         del kwargs
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that accepts the terminal launch."""
 
         async def launch_auxiliary_terminal(
@@ -5390,7 +5332,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         """Accept the known-thread forwarder invocation."""
         del kwargs
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that accepts the terminal launch."""
 
         async def launch_auxiliary_terminal(

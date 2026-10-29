@@ -50,6 +50,7 @@ from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import filelock
 import httpx
@@ -91,6 +92,9 @@ from tests.helpers.ui_configuration import (
 )
 from tests.helpers.ui_configuration import (
     pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    pytest_unconfigure as pytest_unconfigure,
 )
 from tests.helpers.ui_configuration import (
     temp_omnigent_mock_config as _temp_omnigent_mock_config,
@@ -156,6 +160,24 @@ def open_right_rail(page: Page) -> None:
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+
+
+def stub_session_pull_requests(
+    page: Page, listed: Callable[[], list[dict[str, Any]]], unlink: Callable[[str], None]
+) -> None:
+    """Answer the server's stored PR list for tests that stub the PR resources.
+
+    :param page: Playwright page, before it navigates.
+    :param listed: Returns the session's linked PRs as the stub currently has them.
+    :param unlink: Receives each URL the panel unlinks with ``DELETE``.
+    """
+
+    def respond(route: Route) -> None:
+        if route.request.method == "DELETE":
+            unlink(parse_qs(urlsplit(route.request.url).query)["url"][0])
+        route.fulfill(json={"object": "list", "data": listed(), "synced": True})
+
+    page.route(re.compile(r"/v1/sessions/[^/]+/pull-requests(?:\?|$)"), respond)
 
 
 def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
@@ -2907,28 +2929,26 @@ def native_claude_mock_session(
         yield session
 
 
-@contextlib.contextmanager
-def native_codex_mock_session_context(
+@pytest.fixture
+def native_codex_mock_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-    *,
-    labels: dict[str, str] | None = None,
+    request: pytest.FixtureRequest,
 ) -> Iterator[tuple[str, str]]:
     """A real Codex CLI using an explicitly configured mock provider.
 
     Workflow-owned runners reuse their startup config; standalone tests install
-    a temporary mock provider regardless of ambient credentials. ``labels`` are
-    set on the session at create, before Codex launches.
+    a temporary mock provider regardless of ambient credentials. Indirect fixture
+    parameters supply session labels before Codex launches.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
         mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
-        # Keep the default create call unchanged; tests/test_ui_fixture_wiring.py pins it.
         session_id = _create_native_codex_session(
-            live_server, runner_id, **({} if labels is None else {"labels": labels})
+            live_server, runner_id, labels=getattr(request, "param", None)
         )
         try:
             yield (live_server, session_id)
@@ -2941,19 +2961,6 @@ def native_codex_mock_session_context(
                 except subprocess.TimeoutExpired:
                     respawned.kill()
                     respawned.wait(timeout=5)
-
-
-@pytest.fixture
-def native_codex_mock_session(
-    live_server: str,
-    mock_llm_server_url: str,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str]]:
-    """A real Codex CLI using an explicitly configured mock provider."""
-    with native_codex_mock_session_context(
-        live_server, mock_llm_server_url, tmp_path_factory
-    ) as session:
-        yield session
 
 
 @dataclass(frozen=True)

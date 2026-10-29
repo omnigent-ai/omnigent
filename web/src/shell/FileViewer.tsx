@@ -81,6 +81,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
+import { useInertRef } from "@/hooks/useInertRef";
 import {
   type Comment,
   useAddComment,
@@ -434,8 +435,11 @@ function FileViewerBody({
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
+  const onScreen = open && isActiveViewport && mediaActive;
   // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path);
+  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
+    visible: onScreen,
+  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -474,6 +478,7 @@ function FileViewerBody({
   const setViewerRoot = useCallback((el: HTMLElement | null) => {
     viewerRootRef.current = el;
   }, []);
+  const setFramedViewerRoot = useInertRef<HTMLElement>(!open, setViewerRoot);
   const [contentWidth, setContentWidth] = useState<number | null>(null);
   // Tracks the in-progress comment textarea body. Used by MarkdownCommentPlugin
   // to decide whether to preserve the pending mark when the user clicks away.
@@ -1278,12 +1283,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // A single "⋯" menu folds the view controls that were previously separate
-  // top-level icons: Find in file and Download (all views), plus the diff-only
-  // toggles (wrap lines, whitespace changes). Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
-  // diff-settings menu. The toggles keep the menu open; actions close it as they
-  // hand off.
+  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
+  // whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
@@ -1312,7 +1313,9 @@ function FileViewerBody({
       onSelect: downloadFile,
     });
   }
-  if (viewMode === "diff") {
+  // One wrap preference covers the source editor and the diff. Other views
+  // (rich Markdown, previews, the Shiki source view) already wrap.
+  if (isMonacoFindSurface && (diffViewActive || !isDeletedFile)) {
     settingsMenu.push({
       key: "wrap-lines",
       label: "Wrap lines",
@@ -1322,6 +1325,8 @@ function FileViewerBody({
       keepOpen: true,
       onSelect: () => setWrapLines((prev) => !prev),
     });
+  }
+  if (viewMode === "diff") {
     settingsMenu.push({
       key: "hide-whitespace",
       label: "Hide whitespace changes",
@@ -1726,6 +1731,19 @@ function FileViewerBody({
         </div>
       </div>
 
+      {fileQuery.isRefetchError && !isDeletedFile && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
+        >
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          <span>
+            Couldn&apos;t refresh this file (
+            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+            ). Showing the last loaded version.
+          </span>
+        </div>
+      )}
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}
@@ -1811,13 +1829,14 @@ function FileViewerBody({
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
               panelOpen={open}
-              mediaActive={open && isActiveViewport && mediaActive}
+              mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
               searchFocusNonce={searchFocusNonce}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
               markdownSourceFallback={markdownSourceFallback ?? false}
+              wrapLines={wrapLines}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
@@ -1948,7 +1967,7 @@ function FileViewerBody({
 
   return (
     <aside
-      ref={setViewerRoot}
+      ref={setFramedViewerRoot}
       data-testid="file-viewer"
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
@@ -1962,7 +1981,6 @@ function FileViewerBody({
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
-      inert={!open}
     >
       {/* Resize handle — desktop only (mobile is full-screen overlay) */}
       {isDesktop && (

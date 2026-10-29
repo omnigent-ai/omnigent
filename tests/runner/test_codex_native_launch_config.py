@@ -428,21 +428,6 @@ async def test_bypass_sandbox_defaults_off_unless_label_is_one(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "labels",
-    [
-        {},
-        {"omnigent.codex_native.collaboration_mode": "default"},
-        {"omnigent.codex_native.collaboration_mode": "Plan"},
-    ],
-)
-async def test_plan_mode_requires_plan_collaboration_mode_label(labels: dict[str, str]) -> None:
-    """Only the exact ``plan`` label starts the Codex thread in Plan mode."""
-    cfg = await _run(_Client(_Resp(200, {"workspace": "/tmp/repo", "labels": labels})))
-    assert cfg.plan_mode is False
-
-
-@pytest.mark.asyncio
 async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) -> None:
     """A first-attempt read timeout is retried, and a follow-up 200 succeeds.
 

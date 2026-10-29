@@ -210,9 +210,24 @@ def model_family_mismatch(harness: str, model: str) -> str | None:
 _MECHANICAL_VENDOR_ID_RE = re.compile(r"^(?:claude|gpt|glm|kimi)-[a-z0-9][a-z0-9.-]*$")
 
 _DATABRICKS_MODEL_PREFIX = "databricks-"
+_SYSTEM_AI_MODEL_PREFIX = "system.ai."
 
 # Provider kinds whose endpoints take bare canonical vendor ids.
 _VENDOR_DIRECT_PROVIDER_KINDS = frozenset({"key", "subscription"})
+
+
+def is_databricks_model_id(model: str) -> bool:
+    """
+    Whether *model* names a Databricks-served model.
+
+    :param model: A model id, e.g. ``"system.ai.gpt-5-4"``,
+        ``"databricks-gpt-5-4"`` or ``"databricks/databricks-gpt-5-4"``.
+    :returns: ``True`` for the Unity Catalog, legacy serving-endpoint and
+        ``databricks/`` provider-routed spellings, in any letter case.
+    """
+    return model.lower().startswith(
+        (_SYSTEM_AI_MODEL_PREFIX, _DATABRICKS_MODEL_PREFIX, "databricks/")
+    )
 
 
 def canonical_model_spelling(model: str) -> str:
@@ -236,9 +251,8 @@ def canonical_model_spelling(model: str) -> str:
         bare = model[len(_DATABRICKS_MODEL_PREFIX) :]
         if _MECHANICAL_VENDOR_ID_RE.fullmatch(bare):
             return bare
-    _SYSTEM_AI_PREFIX = "system.ai."
-    if model.startswith(_SYSTEM_AI_PREFIX):
-        bare = model[len(_SYSTEM_AI_PREFIX) :]
+    if model.startswith(_SYSTEM_AI_MODEL_PREFIX):
+        bare = model[len(_SYSTEM_AI_MODEL_PREFIX) :]
         if _MECHANICAL_VENDOR_ID_RE.fullmatch(bare):
             return bare
     return model
@@ -254,17 +268,18 @@ def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     order-independent — checking first keeps error text quoting exactly
     what the caller sent). Two transforms, both prefix-mechanical:
 
-    - Databricks-gateway child + a bare canonical id of a localizable
-      family (claude / gpt / glm / kimi) → prepend ``databricks-``
-      (``claude-opus-4-8`` → ``databricks-claude-opus-4-8``).
-    - Vendor-direct child (API key / CLI subscription) + a
-      ``databricks-``-prefixed id of one → strip the prefix
-      (``databricks-gpt-5-4`` → ``gpt-5-4``).
+    - Databricks-gateway child + a legacy ``databricks-`` id of ANY family
+      (e.g. ``databricks-meta-llama-...``) → replace that prefix with the
+      Unity Catalog ``system.ai.`` prefix. Bare canonical claude / gpt /
+      glm / kimi ids (:data:`_MECHANICAL_VENDOR_ID_RE`) gain that prefix too.
+    - Vendor-direct child (API key / CLI subscription) + a mechanically
+      prefixed Databricks id → strip the prefix.
 
-    Anything non-mechanical (slash/colon/bracket shapes, families outside
-    :data:`_MECHANICAL_VENDOR_ID_RE`, gateway/local/unknown provider kinds)
-    passes through unchanged — the existing fail-loud harness/gateway error
-    remains the safety net for genuinely unroutable ids.
+    Anything else passes through unchanged: other bare ids (slash/colon/
+    bracket shapes, families outside :data:`_MECHANICAL_VENDOR_ID_RE`) and
+    gateway/local/unknown provider kinds. The existing fail-loud
+    harness/gateway error remains the safety net for genuinely unroutable
+    ids.
 
     :param model: A model id that already passed
         :func:`validate_model_override`, e.g. ``"claude-sonnet-4-6"``.
@@ -274,8 +289,11 @@ def normalize_model_for_provider(model: str, provider_kind: str | None) -> str:
     :returns: The localized model id, or *model* unchanged.
     """
     if provider_kind == "databricks":
-        if _MECHANICAL_VENDOR_ID_RE.fullmatch(model):
-            return _DATABRICKS_MODEL_PREFIX + model
+        if model.startswith(_DATABRICKS_MODEL_PREFIX):
+            return _SYSTEM_AI_MODEL_PREFIX + model[len(_DATABRICKS_MODEL_PREFIX) :]
+        canonical = canonical_model_spelling(model)
+        if _MECHANICAL_VENDOR_ID_RE.fullmatch(canonical):
+            return _SYSTEM_AI_MODEL_PREFIX + canonical
         return model
     if provider_kind in _VENDOR_DIRECT_PROVIDER_KINDS:
         return canonical_model_spelling(model)

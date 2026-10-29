@@ -1,8 +1,4 @@
-"""Codex Plan mode turned on from the web composer must reach the model as Codex Plan Mode.
-
-A real Codex CLI runs against the mock model backend, so the request journal shows
-the collaboration-mode instructions Codex sent for the turn after Plan mode is on.
-"""
+"""Plan mode at creation and composer toggles reach the real Codex model request."""
 
 from __future__ import annotations
 
@@ -13,11 +9,13 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ASSISTANT,
     _WORKING,
     _ensure_chat_view,
+    _send,
 )
 from tests.e2e_ui.messages.test_native_codex_render_parity import (
     _CODEX_MOCK_MODEL,
@@ -27,41 +25,14 @@ from tests.e2e_ui.messages.test_native_codex_render_parity import (
 )
 
 
-def _run_turn(page: Page, mock_url: str, prompt_marker: str) -> list[dict]:
-    """Send one composer turn and return the model requests that carried it."""
-    reply = f"reply-{prompt_marker}"
-    reset_mock_llm(mock_url)
-    configure_mock_llm(mock_url, [{"text": reply}], key=prompt_marker, match=prompt_marker)
-    set_fallback_mock_llm(mock_url, _CODEX_MOCK_MODEL, "")
-    composer = page.get_by_label("Message the agent")
-    expect(composer).to_be_editable(timeout=30_000)
-    composer.fill(f"Add a hello.txt file with a greeting. Marker {prompt_marker}.")
-    page.get_by_role("button", name="Send", exact=True).click()
-    expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible(
-        timeout=_MOCK_TURN_TIMEOUT_MS
-    )
-    expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
-    captured = httpx.get(f"{mock_url}/mock/requests", timeout=10.0).json()["requests"]
-    return [request for request in captured if prompt_marker in json.dumps(request)]
-
-
-def _collaboration_mode_messages(request: dict) -> list[str]:
-    """Return the developer messages Codex wrapped in ``<collaboration_mode>``."""
-    messages = []
-    for item in request.get("input") or []:
-        if item.get("role") != "developer":
-            continue
-        content = item.get("content")
-        parts = content if isinstance(content, list) else [{"text": str(content)}]
-        text = "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
-        if "<collaboration_mode>" in text:
-            messages.append(text)
-    return messages
-
-
 @pytest.mark.nightly
 @pytest.mark.timeout(360)
-def test_codex_plan_mode_toggle_sends_plan_mode_instructions(
+@pytest.mark.parametrize(
+    "native_codex_mock_session",
+    [{CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY: "plan"}],
+    indirect=True,
+)
+def test_codex_plan_mode_creation_and_toggles_preserve_instructions(
     request: pytest.FixtureRequest,
     native_codex_mock_session: tuple[str, str],
     mock_llm_server_url: str,
@@ -72,27 +43,37 @@ def test_codex_plan_mode_toggle_sends_plan_mode_instructions(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
     _ensure_chat_view(page)
-    _run_turn(page, mock_llm_server_url, f"first-{uuid.uuid4().hex[:8]}")
 
-    page.locator("[data-composer-card]").get_by_role(
-        "button", name="Add", exact=True
-    ).first.click()
-    plan_action = page.get_by_test_id("composer-add-menu").get_by_test_id("composer-plan-action")
-    expect(plan_action).to_have_attribute("aria-label", "Enter Plan mode", timeout=30_000)
-    plan_action.click()
-    expect(page.get_by_test_id("composer-plan-mode")).to_contain_text("Plan mode", timeout=30_000)
+    for turn_index, mode in enumerate(("Plan", "Default", "Plan")):
+        if turn_index:
+            page.get_by_test_id("composer-attach").click()
+            plan_action = page.get_by_test_id("composer-plan-action")
+            action = "Enter" if mode == "Plan" else "Exit"
+            expect(plan_action).to_have_attribute("aria-label", f"{action} Plan mode")
+            plan_action.click()
+        expect(page.get_by_test_id("composer-plan-mode")).to_have_count(
+            int(mode == "Plan"), timeout=30_000
+        )
 
-    plan_requests = _run_turn(page, mock_llm_server_url, f"plan-{uuid.uuid4().hex[:8]}")
-    assert plan_requests, "no model request carried the Plan-mode turn"
-    collaboration_messages = _collaboration_mode_messages(plan_requests[0])
-    assert any("Plan Mode" in message for message in collaboration_messages), (
-        f"Plan-mode turn reached the model without Codex Plan Mode instructions: "
-        f"{collaboration_messages!r}"
-    )
-    developer_text = json.dumps(
-        [item for item in plan_requests[0].get("input") or [] if item.get("role") == "developer"]
-    )
-    # The wrapper agent's prompt, which Codex reads from its session config.toml.
-    assert "Codex is running in the session terminal" in developer_text, (
-        "Plan-mode turn dropped the agent's own instructions"
-    )
+        marker = f"plan-mode-{uuid.uuid4().hex[:8]}"
+        reply = f"reply-{marker}"
+        reset_mock_llm(mock_llm_server_url)
+        configure_mock_llm(mock_llm_server_url, [{"text": reply}], key=marker, match=marker)
+        set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
+        _send(page, f"Add a hello.txt file with a greeting. Marker {marker}.")
+        expect(page.locator(_ASSISTANT, has_text=reply).first).to_be_visible(
+            timeout=_MOCK_TURN_TIMEOUT_MS
+        )
+        expect(page.locator(_WORKING)).to_have_count(0, timeout=_MOCK_TURN_TIMEOUT_MS)
+
+        captured = httpx.get(f"{mock_llm_server_url}/mock/requests", timeout=10).json()["requests"]
+        model_request = next(item for item in captured if marker in json.dumps(item))
+        developer_messages = [
+            json.dumps(item) for item in model_request["input"] if item.get("role") == "developer"
+        ]
+        collaboration = [text for text in developer_messages if "<collaboration_mode>" in text]
+        heading = "# Plan Mode" if mode == "Plan" else "# Collaboration Mode: Default"
+        assert collaboration and heading in collaboration[-1], collaboration
+        assert any(
+            "Codex is running in the session terminal" in text for text in developer_messages
+        )

@@ -31,6 +31,7 @@ from fastapi import FastAPI
 
 from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
+    CAP_CODEX_PLAN_AT_LAUNCH,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostStatFrame,
@@ -49,7 +50,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.debug_log_helpers import capture_debug_rows
-from tests.server.helpers import build_agent_bundle
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -315,48 +316,55 @@ async def test_multipart_create_host_id_requires_workspace(
 
 
 @pytest.mark.parametrize(
-    ("readiness", "expected_status"),
+    ("bundle", "capable", "readiness", "expected_status"),
     [
-        pytest.param(None, 409, id="old-host"),
-        pytest.param({"codex": False}, 412, id="old-host-without-codex"),
+        (False, False, None, 409),
+        (True, False, None, 409),
+        (True, True, None, 201),
+        (False, False, {"codex": False}, 412),
     ],
 )
-async def test_multipart_plan_mode_create_refuses_a_host_that_would_start_codex_in_default(
+async def test_codex_plan_create_checks_host_before_persisting(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
+    app: FastAPI,
     conv_store: SqlAlchemyConversationStore,
     db_uri: str,
+    bundle: bool,
+    capable: bool,
     readiness: dict[str, HarnessAvailability] | None,
     expected_status: int,
 ) -> None:
-    """A bundled Plan create on a host without ``codex_plan_at_launch`` creates no row.
-
-    A host without Codex reports that before the older-host refusal.
-    """
     cap = register_host()
+    conn = app.state.host_registry.get(_HOST_ID)
+    conn.hello.capabilities = [CAP_CODEX_PLAN_AT_LAUNCH] if capable else []
     HostStore(db_uri).upsert_on_connect(
         _HOST_ID, "bundle-host", RESERVED_USER_LOCAL, configured_harnesses=readiness
     )
+    metadata = {
+        "host_id": _HOST_ID,
+        "workspace": _WORKSPACE,
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+    }
+    executor = {"type": "omnigent", "config": {"harness": "codex-native"}}
+    if not bundle:
+        agent = await create_test_agent(client, executor=executor)
+        metadata["agent_id"] = agent["id"]
     existing_ids = {conv.id for conv in conv_store.list_conversations().data}
-
-    resp = await _multipart_create(
-        client,
-        {
-            "host_id": _HOST_ID,
-            "workspace": _WORKSPACE,
-            "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
-        },
-        agent_name="bundle-host-plan-agent",
-        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
-    )
+    if bundle:
+        resp = await _multipart_create(client, metadata, executor=executor)
+    else:
+        resp = await client.post("/v1/sessions", json=metadata)
 
     assert resp.status_code == expected_status, resp.text
-    if expected_status == 409:
-        assert "too old to start a Codex session in Plan mode" in resp.text
+    if expected_status == 201:
+        assert len(cap.launch) == 1
     else:
-        assert resp.json()["error"]["code"] == "harness_not_configured"
-    assert {conv.id for conv in conv_store.list_conversations().data} == existing_ids
-    assert cap.launch == []
+        assert resp.json()["error"]["code"] == (
+            "conflict" if expected_status == 409 else "harness_not_configured"
+        )
+        assert {conv.id for conv in conv_store.list_conversations().data} == existing_ids
+        assert not cap.launch
 
 
 async def test_multipart_create_rejects_workspace_missing_on_host(

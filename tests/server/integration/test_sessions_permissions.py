@@ -51,6 +51,27 @@ from tests.server.helpers import (
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("suffix", ["", "/resources/environments/default/filesystem/README.md"])
+async def test_provisional_session_lookup_returns_404_before_store_parsing(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    """Session snapshots and file reads must reject optimistic route IDs."""
+
+    def reject_store_read(*args: object, **kwargs: object) -> None:
+        pytest.fail("A provisional route reached a store")
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "resolve_access", reject_store_read)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "get_conversation", reject_store_read)
+    response = await auth_client.get(
+        f"/v1/sessions/temp%3A0123456789abcdef0123456789abcdef{suffix}",
+        headers={"X-Forwarded-Email": "user-a"},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
 # ── Fixtures ─────────────────────────────────────────────────
 
 
@@ -2786,17 +2807,11 @@ async def test_fork_switch_denies_session_scoped_target_without_access(
 
 
 @pytest.mark.parametrize("bundle", [False, True], ids=["agent-id", "bundle"])
-@pytest.mark.parametrize(
-    "labels",
-    [{}, {"omnigent.codex_native.collaboration_mode": "plan"}],
-    ids=["default", "plan"],
-)
 async def test_create_session_rejects_other_users_host(
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,
     db_uri: str,
     bundle: bool,
-    labels: dict[str, str],
 ) -> None:
     """
     Creating a session that targets another user's host is rejected
@@ -2833,7 +2848,7 @@ async def test_create_session_rejects_other_users_host(
     metadata = {
         "host_id": "f54bb9272002938a3a934bfcb6bb228a",
         "workspace": "/tmp",
-        "labels": labels,
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
     }
     if bundle:
         resp = await host_perm_client.post(
