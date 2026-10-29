@@ -2393,9 +2393,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the global array head. The queue is one flat array across conversations,
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
-    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
-    if (waitsForHost(s.queuedMessages, s.conversationId)) return;
+    const head = sendableQueuedHead(s.queuedMessages, s.conversationId);
+    if (head === null) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     target.write({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -3891,6 +3890,16 @@ export function rejectBusyCompact(conversationId: string | null): boolean {
 /** Whether a conversation has a message waiting for its offline host; none of its queue sends early. */
 function waitsForHost(queuedMessages: QueuedMessage[], conversationId: string | null): boolean {
   return queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost);
+}
+
+/** The conversation's queued message that sends as soon as its session is free, if any. */
+export function sendableQueuedHead(
+  queuedMessages: QueuedMessage[],
+  conversationId: string | null | undefined,
+): QueuedMessage | null {
+  const head = queuedMessages.find((m) => m.conversationId === conversationId);
+  if (head === undefined || head.requiresRetry) return null;
+  return waitsForHost(queuedMessages, head.conversationId) ? null : head;
 }
 
 /**

@@ -40,7 +40,11 @@ from __future__ import annotations
 
 import re
 
+import httpx
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
+from tests.e2e_ui.conftest import configure_mock_llm
 
 # Unique sentinels per test so a user bubble is unambiguously locatable
 # and can't collide with the assistant's reply text. Worded so the model
@@ -50,7 +54,39 @@ _PROMOTE_MSG = "sentinel-promote-91b2 keep this bubble"
 _QUEUE_MSG_A = "sentinel-queue-a-4d1e first of two"
 _QUEUE_MSG_B = "sentinel-queue-b-8c6f second of two"
 
+# Equal-length tokens: the mock routes a request to the rightmost match, so B's
+# turn (whose history also carries A) gets B's queue.
+_FLUSH_TOKEN_A = "sentinel-flush-a-5c2d"
+_FLUSH_TOKEN_B = "sentinel-flush-b-9e4a"
+_FLUSH_MSG_A = f"{_FLUSH_TOKEN_A} hold this turn open"
+_FLUSH_MSG_B = f"{_FLUSH_TOKEN_B} queued behind it"
+_FLUSH_REPLY_A = "sentinel-flush-reply-3f7b"
+
 _COMPOSER_PLACEHOLDER = "Send a message…"
+
+# Records, once per painted frame, the opacity of the action row under the reply
+# that carries ``reply``. Sampled after layout, before paint.
+_TRACK_REPLY_ACTIONS = """
+(reply) => {
+  window.__replyActionOpacity = [];
+  const sample = () => {
+    const bubble = [...document.querySelectorAll(
+      '[data-testid="message-bubble"][data-role="assistant"]')].find(
+      (b) => (b.textContent || '').includes(reply));
+    const link = bubble && bubble.querySelector('[data-testid="copy-message-link"]');
+    if (link) {
+      window.__replyActionOpacity.push(
+        Number(getComputedStyle(link.parentElement.parentElement).opacity));
+    }
+  };
+  const frame = () => {
+    const observer = new ResizeObserver(() => { observer.disconnect(); sample(); });
+    observer.observe(document.documentElement);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+"""
 
 
 def _user_bubble(page: Page, text: str):
@@ -183,3 +219,44 @@ def test_second_message_queued_while_first_streams_both_render(
     expect(assistant).to_have_text(re.compile(r"\S"), timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_A)).to_have_count(1, timeout=60_000)
     expect(_user_bubble(page, _QUEUE_MSG_B)).to_have_count(1, timeout=60_000)
+
+
+def test_reply_actions_stay_hidden_while_a_queued_follow_up_sends(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """A reply whose follow-up is already queued never shows its action row.
+
+    The queue sends B as soon as A's turn ends. If the reply's actions became
+    persistent in the frame between, they flashed in and faded out again.
+    """
+    base_url, session_id = seeded_session
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _FLUSH_REPLY_A, "block": True}],
+        key="queued-flush-a",
+        match=_FLUSH_TOKEN_A,
+    )
+    configure_mock_llm(
+        mock_llm_server_url, [{"text": "done"}], key="queued-flush-b", match=_FLUSH_TOKEN_B
+    )
+    # No title generation, so turn A is the only request that can take the gate.
+    page.add_init_script("localStorage.setItem('omnigent:background-session-titles', 'off')")
+    page.goto(f"{base_url}/c/{session_id}")
+    try:
+        _send(page, _FLUSH_MSG_A)
+        poll_until(
+            lambda: httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0).json()["pending"]
+        )
+        _send(page, _FLUSH_MSG_B)
+        expect(page.get_by_test_id("composer-queued-strip")).to_contain_text(_FLUSH_MSG_B)
+        page.evaluate(_TRACK_REPLY_ACTIONS, _FLUSH_REPLY_A)
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
+
+    expect(_user_bubble(page, _FLUSH_MSG_B)).to_be_visible(timeout=30_000)
+    expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
+    opacities = page.evaluate("() => window.__replyActionOpacity")
+    assert opacities, "the reply to the first message never rendered"
+    assert max(opacities) < 0.5, f"the reply's action row showed: {opacities}"
