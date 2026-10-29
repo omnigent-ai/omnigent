@@ -260,9 +260,30 @@ export function installFootnoteReferenceTokenizer(marked: MarkdownManager["insta
 }
 
 /** Whether *state* has a footnote node selected as a whole. */
+/** Nodes that hold Markdown source verbatim and are only edited in Source mode. */
+const SOURCE_NODES = new Set(["footnoteReference", "footnoteDefinitions", "linkDefinitions"]);
+
+/** Whether *state* has a verbatim source node selected as a whole. */
 function footnoteSelected(state: EditorState): boolean {
   const { selection } = state;
-  return selection instanceof NodeSelection && selection.node.type.name.startsWith("footnote");
+  return selection instanceof NodeSelection && SOURCE_NODES.has(selection.node.type.name);
+}
+
+/**
+ * Serialise a verbatim source block.
+ *
+ * :param raw: The block's source, trailing newlines trimmed.
+ * :param context: The serialiser's render context.
+ * :returns: The source to write.
+ */
+export function renderSourceBlock(
+  raw: string,
+  context: { parentType?: string | null; index?: number } | undefined,
+): string {
+  // List items join later blocks with one newline, which would make the
+  // block a lazy continuation of the item's paragraph.
+  const nested = context?.parentType === "listItem" || context?.parentType === "taskItem";
+  return nested && (context?.index ?? 0) > 0 ? `\n${raw}` : raw;
 }
 
 /**
@@ -351,13 +372,8 @@ export const FootnoteDefinitions = Node.create({
   parseMarkdown: (token, helpers) =>
     helpers.createNode("footnoteDefinitions", { raw: (token.raw ?? "").replace(/\n+$/, "") }, []),
 
-  renderMarkdown: (node, _helpers, context) => {
-    const raw = (node.attrs?.raw as string | undefined) ?? "";
-    // List items join later blocks with one newline, which would make the
-    // definition a lazy continuation of the item's paragraph.
-    const nested = context?.parentType === "listItem" || context?.parentType === "taskItem";
-    return nested && (context?.index ?? 0) > 0 ? `\n${raw}` : raw;
-  },
+  renderMarkdown: (node, _helpers, context) =>
+    renderSourceBlock((node.attrs?.raw as string | undefined) ?? "", context),
 });
 
 export const FootnoteReference = Node.create({

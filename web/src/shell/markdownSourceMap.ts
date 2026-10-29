@@ -180,6 +180,7 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): TokenBlock[]
     switch (token.type) {
       case "def":
       case "footnoteDefinitions":
+      case "linkDefinitions":
       case "footnoteReference":
       case "space":
       case "hr":

@@ -2298,7 +2298,8 @@ html[data-electron-mac] .breadcrumb-folder {
   margin: 0.75em 0 0.25em;
 }
 /* Footnote definitions show their source, read-only (see TipTapFootnotes). */
-.tiptap-md-content .ProseMirror .md-footnote-definitions {
+.tiptap-md-content .ProseMirror .md-footnote-definitions,
+.tiptap-md-content .ProseMirror .md-link-definitions {
   color: var(--muted-foreground);
   font-size: 0.875em;
   white-space: pre-wrap;

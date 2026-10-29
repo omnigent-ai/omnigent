@@ -31,6 +31,13 @@ import {
   withFootnoteLabels,
 } from "./TipTapFootnotes";
 import { toBlockContent } from "./TipTapGitHubAlert";
+import {
+  documentLinkLabels,
+  escapeLinkReferences,
+  installLinkDefinitionTokenizer,
+  prepareReferenceLinks,
+  withLinkLabels,
+} from "./TipTapLinkReferences";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 import { installIterativeSetextHeadings } from "./markdownSetextHeading";
 
@@ -119,9 +126,15 @@ export function installMarkdownSerializerPatch(): void {
       ...rest: unknown[]
     ) {
       const joined = hasSoftBreakNode(this) ? joinSoftBreaks(content) : content;
-      // Literal `[^x]` text needs escaping only when `[^x]:` is defined.
+      // Literal `[^x]` or `[x]` text needs escaping only when the label is defined.
       return withFootnoteLabels(documentFootnoteLabels(joined), () =>
-        originalSerialize.call(this, prepareFootnoteReferences(joined), ...rest),
+        withLinkLabels(documentLinkLabels(joined), () =>
+          originalSerialize.call(
+            this,
+            prepareReferenceLinks(prepareFootnoteReferences(joined)),
+            ...rest,
+          ),
+        ),
       );
     };
   }
@@ -148,7 +161,7 @@ export function installMarkdownSerializerPatch(): void {
     const insideLink = (node.marks ?? []).some(
       (mark) => (typeof mark === "string" ? mark : mark.type) === "link",
     );
-    return insideLink ? encoded : escapeFootnoteReferences(encoded);
+    return insideLink ? encoded : escapeLinkReferences(escapeFootnoteReferences(encoded));
   };
 }
 
@@ -253,6 +266,7 @@ export function installMarkdownParserPatch(): void {
   proto.parse = function (this: MarkdownManager, markdown: string): JSONContent {
     installIterativeSetextHeadings(this.instance);
     installFootnoteReferenceTokenizer(this.instance);
+    installLinkDefinitionTokenizer(this.instance);
     // `[^x]` is a footnote reference only when the file defines `[^x]:`.
     const doc = withFootnoteLabels(definedFootnoteLabels(this.instance, markdown), () =>
       wrapLooseInlineRuns(originalParse.call(this, markdown)),

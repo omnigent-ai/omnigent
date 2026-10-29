@@ -240,6 +240,9 @@ instead of treating one comparison clip as complete feature verification.
   Backspace or Delete removes it. Saves keep footnotes and the final newline,
   except a reference inside bold or italic moves just outside those marks;
   reference syntax in link text stays literal, so the link is kept.
+- Reference-style links (`[text][label]`, `[text][]`, `[text]`) save in that
+  form while their URL, title and label still match a definition; otherwise
+  they save inline. Link definition lines show read-only, like footnotes.
 - Load measurements do not establish typing latency. Dirty detection compares
   immutable editor documents; autosave still serializes the whole document.
   Changes that serialize identically become clean when autosave checks them.
