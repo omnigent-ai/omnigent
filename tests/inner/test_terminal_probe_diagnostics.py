@@ -256,22 +256,28 @@ def test_socket_stat_failure_does_not_hide_probe_error(
 
 
 @pytest.mark.parametrize(
-    ("stderr", "keep_alive_after_exit", "closed_on_live_server"),
+    ("stderr", "keep_alive_after_exit", "killed_by_tmux"),
     [
         ("no current target", True, True),
         ("can't find session: main", True, True),
-        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, False),
+        # The socket outlived its server, e.g. after ``killall tmux``.
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, True),
+        (
+            "error connecting to /tmp/omnigent-terminal-x/tmux.sock (No such file or directory)",
+            True,
+            False,
+        ),
         ("no current target", False, False),
     ],
 )
-async def test_session_closed_on_live_server_reads_the_has_session_answer(
+async def test_session_killed_by_tmux_reads_the_has_session_answer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     stderr: str,
     keep_alive_after_exit: bool,
-    closed_on_live_server: bool,
+    killed_by_tmux: bool,
 ) -> None:
-    """Only a live tmux that lost a kept-alive session reads as a killed session."""
+    """A kept-alive session tmux lost, or whose server died, reads as killed by tmux."""
     instance = TerminalInstance(
         name="claude",
         session_key="main",
@@ -288,4 +294,4 @@ async def test_session_closed_on_live_server_reads_the_has_session_answer(
     await _run_watcher(instance, False, lambda: None)
 
     assert not instance.running
-    assert instance.session_closed_on_live_server() is closed_on_live_server
+    assert instance.session_killed_by_tmux() is killed_by_tmux

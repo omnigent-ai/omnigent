@@ -209,17 +209,19 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
 )
 
 
-# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX.
+# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
+# ``killall tmux`` run anywhere on the host stops that server too.
 TERMINAL_CLOSED_OUTSIDE_OMNIGENT = FailureDiagnosis(
     title="Claude Code's terminal was closed outside Omnigent",
     cause=(
-        "Claude Code's tmux session was ended while tmux was still running, and Omnigent "
-        "did not end it. A tmux command run inside the session, such as `tmux kill-session` "
-        "or `tmux kill-pane`, or another tool on the host closes it this way."
+        "Claude Code's tmux session, or the tmux server running it, was ended and Omnigent "
+        "did not end it. A tmux command such as `tmux kill-session`, `tmux kill-server` or "
+        "`killall tmux`, or another tool on the host, closes it this way."
     ),
     remediation=(
-        "Send your message again to relaunch Claude Code. Commands run in the agent's terminal "
-        "should not kill its own tmux session; give them their own server with `tmux -L <name>`."
+        "Send your message again to relaunch Claude Code. Don't use `killall tmux` or kill "
+        "tmux sessions you didn't start; give your own tmux its own server with "
+        "`tmux -L <name>` and stop it with `tmux -L <name> kill-server`."
     ),
     category=ErrorCategory.USER,
 )

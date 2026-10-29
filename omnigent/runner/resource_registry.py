@@ -187,9 +187,9 @@ class TerminalExitEvent:
     :param expected_close: ``True`` when Omnigent killed the pane itself to
         fail the turn (a delivery timeout). That turn reports its own error,
         so the exit is not a second failure.
-    :param closed_outside_omnigent: ``True`` when tmux, still running,
-        reported the Claude session gone and Omnigent had not killed it, e.g.
-        a ``tmux kill-session`` run from inside the pane.
+    :param closed_outside_omnigent: ``True`` when tmux reported the Claude
+        session or its server gone and Omnigent had not killed it, e.g. a
+        ``tmux kill-session`` or ``killall tmux`` run on the host.
     :param terminal_instance_id: Identity of the observed terminal instance.
     :param lifecycle_context: Content-free evidence captured before exit cleanup.
     """
@@ -1893,7 +1893,7 @@ class SessionResourceRegistry:
         closed_outside_omnigent = (
             instance is not None
             and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
-            and instance.session_closed_on_live_server()
+            and instance.session_killed_by_tmux()
             and not _pane_killed_by_omnigent(instance.private_dir)
         )
         lifecycle_context["terminal_closed_outside_omnigent"] = str(

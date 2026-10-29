@@ -1399,11 +1399,22 @@ async def test_required_terminal_exit_after_omnigent_reap_is_expected(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("omnigent_killed", "closed_outside"), [(False, True), (True, False)])
+@pytest.mark.parametrize(
+    ("probe_error", "omnigent_killed", "closed_outside"),
+    [
+        # A live tmux whose only session was killed.
+        ("no current target", False, True),
+        ("no current target", True, False),
+        # The tmux server itself was killed, e.g. by ``killall tmux``.
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", False, True),
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, False),
+    ],
+)
 async def test_required_terminal_exit_names_a_session_killed_outside_omnigent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    probe_error: str,
     omnigent_killed: bool,
     closed_outside: bool,
 ) -> None:
@@ -1412,6 +1423,7 @@ async def test_required_terminal_exit_names_a_session_killed_outside_omnigent(
     :param tmp_path: Temporary directory for fake terminal paths.
     :param monkeypatch: Pytest fixture that stubs the tmux subprocess.
     :param caplog: Captures the exit-observed telemetry row.
+    :param probe_error: The has-session failure tmux gave once the session was gone.
     :param omnigent_killed: Whether the stop path's ``kill_session`` ended the pane.
     :param closed_outside: Expected ``closed_outside_omnigent`` on the exit.
     """
@@ -1424,8 +1436,7 @@ async def test_required_terminal_exit_names_a_session_killed_outside_omnigent(
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     instance.private_dir.mkdir(parents=True)
     instance.keep_alive_after_exit = True
-    # The has-session answer a live tmux gives once its only session was killed.
-    instance._last_session_probe_error = "tmux command failed (rc=1): no current target"
+    instance._last_session_probe_error = f"tmux command failed (rc=1): {probe_error}"
     bridge_dir = tmp_path / "bridge"
     claude_bridge.write_tmux_target(
         bridge_dir, socket_path=instance.private_dir / "tmux.sock", tmux_target="main"
