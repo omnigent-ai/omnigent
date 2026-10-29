@@ -88,6 +88,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     // The panel reads every info payload through the real normalizer.
     normalizePullRequestInfo: original.normalizePullRequestInfo,
     usePullRequestCommentComposer: original.usePullRequestCommentComposer,
+    usePullRequestReviewThreadComposer: original.usePullRequestReviewThreadComposer,
     pullRequestCommentTooLong: original.pullRequestCommentTooLong,
     MAX_PULL_REQUEST_COMMENT_CHARACTERS: original.MAX_PULL_REQUEST_COMMENT_CHARACTERS,
     applyPullRequestLabelChange: original.applyPullRequestLabelChange,

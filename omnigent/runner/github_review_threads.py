@@ -321,3 +321,86 @@ def reply(root: str, reference: PullRequestRef, *, thread_id: str, body: str) ->
             "minimized": False,
         },
     }
+
+
+def create_thread(
+    root: str, reference: PullRequestRef, *, body: str, anchor: dict[str, Any]
+) -> dict[str, Any]:
+    """Submit exactly one new conversation, without modifying an existing draft review."""
+    uncertain = "Could not confirm comment posting. Check GitHub before retrying."
+    owner, name = reference.repository.split("/", 1)
+    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
+        response = _graphql(
+            root,
+            reference,
+            """query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) { id headRefOid baseRefOid }
+          }
+        }""",
+            owner=owner,
+            name=name,
+            number=reference.number,
+        )
+        pr = ((response.get("data") or {}).get("repository") or {}).get("pullRequest")
+        if response.get("errors") or not isinstance(pr, dict) or not pr.get("id"):
+            raise ValueError("GitHub could not load this pull request. Your comment was not sent.")
+        if (
+            pr.get("headRefOid") != anchor["head_sha"]
+            or pr.get("baseRefOid") != anchor["base_sha"]
+        ):
+            raise ValueError(
+                "The pull request changed. Refresh and reselect the lines before posting."
+            )
+        thread = {
+            "path": anchor["path"],
+            "line": anchor["line"],
+            "side": anchor["side"],
+            "body": body,
+        }
+        if anchor["start_line"] is not None:
+            thread.update(startLine=anchor["start_line"], startSide=anchor["side"])
+        fields = _THREAD_FIELDS.replace("comments(first: 20)", "comments(first: 1)")
+        query = f"""mutation($input: AddPullRequestReviewInput!) {{
+          addPullRequestReview(input: $input) {{ pullRequestReview {{
+            state comments(first: 1) {{ nodes {{ id }} }}
+            pullRequest {{ reviewThreads(last: 25) {{ nodes {{ {fields} }} }} }}
+          }} }}
+        }}"""
+        host, token = github._host_args(root, reference), github._pr_token(root, reference)
+        if github._gh_timed_out.get():
+            raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+        _, output, _ = github._pr_json_write(
+            root,
+            host=host,
+            token=token,
+            method="POST",
+            endpoint="graphql",
+            fields={
+                "query": query,
+                "variables": {
+                    "input": {
+                        "pullRequestId": pr["id"],
+                        "commitOID": anchor["head_sha"],
+                        "event": "COMMENT",
+                        "threads": [thread],
+                    }
+                },
+            },
+        )
+        try:
+            response = json.loads(output)
+        except ValueError as exc:
+            raise ValueError(uncertain) from exc
+        if not isinstance(response, dict):
+            raise ValueError(uncertain)
+        review = ((response.get("data") or {}).get("addPullRequestReview") or {}).get(
+            "pullRequestReview"
+        ) or {}
+        roots = _nodes(review.get("comments"))
+        if review.get("state") == "COMMENTED" and roots:
+            for raw in _nodes((review.get("pullRequest") or {}).get("reviewThreads")):
+                shaped = _thread(raw)
+                if shaped and shaped["comments"]["data"][0]["id"] == roots[0].get("id"):
+                    return {"object": "session.github.review_thread", "thread": shaped}
+        raise ValueError(uncertain)

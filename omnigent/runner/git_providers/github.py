@@ -35,6 +35,7 @@ _CAPABILITIES = ProviderCapabilities(
     comment_posting=True,
     review_threads=True,
     review_thread_replies=True,
+    review_thread_creation=True,
     details_editing=True,
     attachment_uploads=True,
 )
@@ -132,6 +133,14 @@ class GitHubPullRequests:
         from omnigent.runner import github_review_threads
 
         return github_review_threads.reply(root, reference, thread_id=thread_id, body=body)
+
+    def create_review_thread(
+        self, root: str, reference: PullRequestRef, *, body: str, anchor: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Publish a new line conversation as a submitted comment review."""
+        from omnigent.runner import github_review_threads
+
+        return github_review_threads.create_thread(root, reference, body=body, anchor=anchor)
 
     def pr_title(
         self, root: str, reference: PullRequestRef, deadline: float

@@ -1,4 +1,36 @@
-import type { DiffLineAnnotation, FileDiffMetadata } from "@pierre/diffs";
+import type { DiffLineAnnotation, FileDiffMetadata, SelectedLineRange } from "@pierre/diffs";
+
+export interface ReviewThreadAnchor {
+  path: string;
+  side: "LEFT" | "RIGHT";
+  line: number;
+  start_line: number | null;
+  head_sha: string;
+  base_sha: string;
+}
+
+/** GitHub ranges must stay on one side and within the displayed patch. */
+export function reviewSelection(
+  range: SelectedLineRange,
+  file: FileDiffMetadata,
+): Pick<ReviewThreadAnchor, "side" | "line" | "start_line"> | null {
+  if (!range.side || (range.endSide && range.endSide !== range.side)) return null;
+  const start = Math.min(range.start, range.end);
+  const end = Math.max(range.start, range.end);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1) return null;
+  const inHunk = file.hunks.some((hunk) => {
+    const offset = range.side === "deletions" ? hunk.deletionStart : hunk.additionStart;
+    const count = range.side === "deletions" ? hunk.deletionCount : hunk.additionCount;
+    return start >= offset && end < offset + count;
+  });
+  return inHunk
+    ? {
+        side: range.side === "deletions" ? "LEFT" : "RIGHT",
+        line: end,
+        start_line: start === end ? null : start,
+      }
+    : null;
+}
 
 export interface ReviewComment {
   id: string;

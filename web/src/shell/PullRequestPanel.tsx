@@ -26,10 +26,14 @@
 
 import { createPortal } from "react-dom";
 import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
-import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { PullRequestCommentComposer, PullRequestCommentForm } from "./PullRequestCommentComposer";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
-import { reviewThreadAnnotations, type ReviewThread } from "@/lib/pullRequestReviewThreads";
+import {
+  reviewThreadAnnotations,
+  reviewSelection,
+  type ReviewThread,
+} from "@/lib/pullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -71,7 +75,12 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { FileDiff } from "@pierre/diffs/react";
-import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
+import {
+  parsePatchFiles,
+  type FileDiffMetadata,
+  type DiffLineAnnotation,
+  type SelectedLineRange,
+} from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
@@ -125,6 +134,7 @@ import {
   usePullRequestChangedFiles,
   usePullRequestDiff,
   usePullRequestInfo,
+  usePullRequestReviewThreadComposer,
   useSetPullRequestPreference,
   useUpdateSessionPr,
   type NormalizedPullRequestInfo,
@@ -447,8 +457,12 @@ function splitPath(path: string): { dir: string; name: string } {
     : { dir: path.slice(0, i + 1), name: path.slice(i + 1) };
 }
 
-/** How @pierre/diffs' FileDiff is configured for this read-only stacked view. */
-type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewThread[]>>["options"];
+/** Conversations and a draft can share the same diff annotation. */
+interface ReviewAnnotation {
+  threads: ReviewThread[];
+  newThread?: boolean;
+}
+type DiffOptions = React.ComponentProps<typeof FileDiff<ReviewAnnotation>>["options"];
 
 /**
  * Files with more unified diff lines than this wait for "Show diff": FileDiff
@@ -488,6 +502,30 @@ function PullRequestFileSection({
   const ref = useRef<HTMLDivElement>(null);
   const [seen, setSeen] = useState(false);
   const [showLargeDiff, setShowLargeDiff] = useState(false);
+  const composer = usePullRequestReviewThreadComposer(
+    threadContext.conversationId,
+    threadContext.prUrl,
+    file.path,
+    threadContext.headSha ?? "",
+    threadContext.baseSha ?? "",
+  );
+  const revision = `${threadContext.baseSha}:${threadContext.headSha}`;
+  const [selection, setSelection] = useState<{
+    revision: string;
+    range: SelectedLineRange | null;
+  }>();
+  const selectedLines = selection?.revision === revision ? selection.range : null;
+  const [selectionError, setSelectionError] = useState<string>();
+  const startConversation = (range: SelectedLineRange) => {
+    if (!threadContext.canCreate || !fileDiff || composer.draft.pending) return;
+    const lines = reviewSelection(range, fileDiff);
+    if (!lines) {
+      setSelectionError("Select lines within one diff hunk, on the same side.");
+      return;
+    }
+    setSelectionError(undefined);
+    composer.selectLines(lines);
+  };
 
   useEffect(() => {
     registerRef(file.path, ref.current);
@@ -521,10 +559,66 @@ function PullRequestFileSection({
     !pureRename &&
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
-  const { annotations, unplaced } = reviewThreadAnnotations(
+  const { annotations: threadAnnotations, unplaced } = reviewThreadAnnotations(
     threads,
     renderingDiff ? fileDiff : undefined,
     matchingRevision,
+  );
+  const annotations: DiffLineAnnotation<ReviewAnnotation>[] = threadAnnotations.map(
+    (annotation) => ({ ...annotation, metadata: { threads: annotation.metadata } }),
+  );
+  const anchor = composer.draft.anchor;
+  const showDraftInline = !!anchor && !composer.stale && renderingDiff;
+  if (showDraftInline) {
+    const side = anchor.side === "LEFT" ? "deletions" : "additions";
+    const existing = annotations.find(
+      (item) => item.side === side && item.lineNumber === anchor.line,
+    );
+    if (existing) existing.metadata.newThread = true;
+    else
+      annotations.push({
+        side,
+        lineNumber: anchor.line,
+        metadata: { threads: [], newThread: true },
+      });
+  }
+  const newConversation = anchor && (
+    <section
+      aria-label="New review conversation"
+      className="my-2 min-w-0 rounded-md border bg-background text-foreground font-sans text-ui [white-space:normal]"
+    >
+      <div className="flex items-center justify-between gap-2 px-3 py-2">
+        <span>
+          New conversation · {anchor.side === "LEFT" ? "Old" : "New"}{" "}
+          {anchor.start_line ? `lines ${anchor.start_line}–${anchor.line}` : `line ${anchor.line}`}
+        </span>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={composer.draft.pending}
+          onClick={composer.cancel}
+        >
+          Cancel
+        </Button>
+      </div>
+      {composer.stale && (
+        <p role="status" className="px-3 pb-2">
+          The pull request changed. Your draft is saved; select its lines again before posting.
+        </p>
+      )}
+      {!threadContext.canCreate && (
+        <p role="status" className="px-3 pb-2">
+          Your draft is saved. Commenting is currently unavailable.
+        </p>
+      )}
+      <PullRequestCommentForm
+        {...composer}
+        account={threadContext.account}
+        inline
+        newThread
+        disabled={composer.stale || !threadContext.canCreate}
+      />
+    </section>
   );
 
   return (
@@ -566,6 +660,28 @@ function PullRequestFileSection({
           </span>
         )}
       </button>
+      {!collapsed && (
+        <>
+          {selectedLines && threadContext.canCreate && (
+            <div className="flex items-center gap-2 px-3 py-1">
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={composer.draft.pending}
+                onClick={() => startConversation(selectedLines)}
+              >
+                <PlusIcon className="size-3.5" /> Comment on selected lines
+              </Button>
+            </div>
+          )}
+          {selectionError && (
+            <p role="alert" className="px-3 py-2 text-ui">
+              {selectionError}
+            </p>
+          )}
+          {!showDraftInline && newConversation && <div className="px-3">{newConversation}</div>}
+        </>
+      )}
       {!collapsed && unplaced.length > 0 && (
         <div className="px-3">
           {unplaced.map((thread) => (
@@ -605,12 +721,60 @@ function PullRequestFileSection({
           >
             <FileDiff
               fileDiff={fileDiff}
-              options={options}
+              options={{
+                ...options,
+                enableLineSelection: !!threadContext.canCreate,
+                enableGutterUtility: !!threadContext.canCreate,
+                unsafeCSS: threadContext.canCreate
+                  ? `${options?.unsafeCSS ?? ""}
+                    [data-column-number] { padding-left: 28px; }
+                    [data-gutter-utility-slot] {
+                      left: 4px; right: auto; justify-content: flex-start;
+                    }`
+                  : options?.unsafeCSS,
+                onLineSelected: (range) => setSelection({ revision, range }),
+              }}
+              selectedLines={selectedLines}
               disableWorkerPool
+              renderGutterUtility={
+                threadContext.canCreate
+                  ? (getHoveredLine) => (
+                      <button
+                        type="button"
+                        aria-label="Start a new review conversation"
+                        title="Start a new review conversation"
+                        className="relative z-10 flex size-5 cursor-pointer items-center justify-center rounded bg-primary text-primary-foreground"
+                        disabled={composer.draft.pending}
+                        onClick={() => {
+                          const hovered = getHoveredLine();
+                          const withinSelection =
+                            hovered &&
+                            selectedLines &&
+                            selectedLines.side === hovered.side &&
+                            (!selectedLines.endSide || selectedLines.endSide === hovered.side) &&
+                            hovered.lineNumber >=
+                              Math.min(selectedLines.start, selectedLines.end) &&
+                            hovered.lineNumber <= Math.max(selectedLines.start, selectedLines.end);
+                          const range = withinSelection
+                            ? selectedLines
+                            : hovered && {
+                                start: hovered.lineNumber,
+                                end: hovered.lineNumber,
+                                side: hovered.side,
+                              };
+                          if (range) startConversation(range);
+                        }}
+                      >
+                        <PlusIcon className="size-4" />
+                      </button>
+                    )
+                  : undefined
+              }
               lineAnnotations={annotations}
               renderAnnotation={(annotation) => (
                 <div className="min-w-0 px-3">
-                  {annotation.metadata.map((thread) => (
+                  {annotation.metadata.newThread && newConversation}
+                  {annotation.metadata.threads.map((thread) => (
                     <PullRequestReviewThread
                       key={thread.id}
                       thread={thread}
@@ -2212,6 +2376,18 @@ function PullRequestPanelDetails({
     prUrl: data.selected_pr_url ?? pr.url,
     account: data.auth.selected_account,
     canReply: !!(canEdit && data.capabilities.review_thread_replies),
+    canCreate: !!(
+      canEdit &&
+      data.capabilities.review_thread_creation &&
+      pr.state === "OPEN" &&
+      pr.head_sha &&
+      pr.base_sha &&
+      pr.head_sha === prDiff.data?.head_sha &&
+      pr.base_sha === prDiff.data?.base_sha &&
+      reviews.page
+    ),
+    headSha: pr.head_sha,
+    baseSha: pr.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };

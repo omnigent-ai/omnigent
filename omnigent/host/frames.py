@@ -1134,8 +1134,8 @@ class HostFsWriteFrame:
     :param op: Write op name — ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_review_thread_reply"``, ``"github_attachment_upload"``, ``"github_merge"``, or
-        ``"github_disable_auto_merge"``.
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.

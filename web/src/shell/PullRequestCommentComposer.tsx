@@ -30,12 +30,16 @@ export function PullRequestCommentForm({
   post,
   account,
   inline = false,
+  newThread = false,
+  disabled = false,
 }: {
   draft: PullRequestCommentDraft;
   setBody: (body: string) => void;
   post: () => void;
   account: string | null;
   inline?: boolean;
+  newThread?: boolean;
+  disabled?: boolean;
 }) {
   const [tab, setTab] = useState("write");
   const tooLong = pullRequestCommentTooLong(draft.body);
@@ -48,7 +52,7 @@ export function PullRequestCommentForm({
       }
       onSubmit={(event) => {
         event.preventDefault();
-        post();
+        if (!disabled) post();
       }}
     >
       <Tabs value={tab} onValueChange={setTab} className="min-h-0">
@@ -58,13 +62,20 @@ export function PullRequestCommentForm({
         </TabsList>
         <TabsContent value="write" className="min-h-0 overflow-y-auto">
           <Textarea
-            aria-label={inline ? "Reply to review conversation" : "New PR comment"}
+            aria-label={
+              newThread
+                ? "New review comment"
+                : inline
+                  ? "Reply to review conversation"
+                  : "New PR comment"
+            }
             className="max-h-40 bg-transparent focus-visible:ring-0 dark:bg-transparent"
-            placeholder={inline ? "Write a reply…" : "Leave a comment..."}
+            placeholder={inline && !newThread ? "Write a reply…" : "Leave a comment..."}
+            autoFocus={newThread}
             value={draft.body}
             disabled={draft.pending}
             onChange={(event) => setBody(event.target.value)}
-            rows={4}
+            rows={inline ? 2 : 4}
           />
         </TabsContent>
         <TabsContent value="preview" className="min-h-0 overflow-y-auto">
@@ -95,9 +106,9 @@ export function PullRequestCommentForm({
           type="submit"
           size="sm"
           className="shrink-0"
-          disabled={draft.pending || !draft.body.trim() || tooLong}
+          disabled={disabled || draft.pending || !draft.body.trim() || tooLong}
         >
-          {draft.pending ? "Posting…" : inline ? "Reply" : "Post comment"}
+          {draft.pending ? "Posting…" : inline && !newThread ? "Reply" : "Post comment"}
         </Button>
         <p className="min-w-0 truncate text-ui text-muted-foreground" title={account ?? undefined}>
           {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}

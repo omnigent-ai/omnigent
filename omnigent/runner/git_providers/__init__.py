@@ -147,6 +147,7 @@ class ProviderCapabilities:
     comment_posting: bool = False
     review_threads: bool = False
     review_thread_replies: bool = False
+    review_thread_creation: bool = False
     details_editing: bool = False
     attachment_uploads: bool = False
 
@@ -177,6 +178,10 @@ class ReviewThreadsFacet(Protocol):
 
     def reply_to_review_thread(
         self, root: str, reference: PullRequestRef, *, thread_id: str, body: str
+    ) -> dict[str, Any]: ...
+
+    def create_review_thread(
+        self, root: str, reference: PullRequestRef, *, body: str, anchor: dict[str, Any]
     ) -> dict[str, Any]: ...
 
 

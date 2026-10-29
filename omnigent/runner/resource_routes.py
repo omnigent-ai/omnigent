@@ -1620,6 +1620,20 @@ def register_resource_routes(
             default_pr_url=default_pr_url,
         )
 
+    @app.post("/v1/sessions/{session_id}/resources/github/review-threads")
+    async def create_review_thread_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "create_pr_review_thread",
+            pr_url=body["pr_url"],
+            body=body.get("body"),
+            anchor=body.get("anchor"),
+            **_server_tracking_fields(body),
+        )
+
     @app.post("/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies")
     async def reply_to_review_thread_route(
         session_id: str, thread_id: str, request: Request

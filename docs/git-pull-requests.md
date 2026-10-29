@@ -144,7 +144,8 @@ servers the web reads only the live host.
 
 ### Inline GitHub conversations
 
-GitHub advertises `review_threads` and `review_thread_replies`. Both default to
+GitHub advertises `review_threads`, `review_thread_replies` and
+`review_thread_creation`. All default to
 false for other providers and older hosts. They use the optional `ReviewThreadsFacet`
 without changing the required methods of `PullRequestFacet`.
 
@@ -164,12 +165,23 @@ code context. Resolved threads start collapsed.
 
 `POST review-threads/{id}/replies` publishes immediately with the selected host
 account. The host validates thread membership and replies to its published root
-comment. Reads require session read permission; replies require edit permission.
+comment. Expanded conversations show the reply composer immediately.
+Reads require session read permission; writes require edit permission.
 Runner and host fallback use the same provider implementation. An uncertain
 write is never retried automatically. Drafts and pending/error state stay in
 memory per session, PR and thread, including through tab and layout switches.
 
-New gutter comments and resolving/reopening threads are follow-up work.
+Select a line number and use the gutter **+** or **Comment on selected lines**
+to start a separate conversation, even when that line already has a thread.
+Drag line numbers or Shift-click to select a range on the same side within one
+diff hunk. `POST review-threads` accepts `pr_url`, `body` and an `anchor` with
+`path`, `side`, `line`, optional `start_line`, `head_sha` and `base_sha`.
+The provider checks both revisions and publishes a one-thread GraphQL review
+with `event: COMMENT` and the displayed commit. Its response identifies the
+canonical thread. New drafts retain text and coordinates per session, PR and
+file; a revision change requires explicit reselection before posting.
+
+Resolving/reopening threads remains follow-up work.
 See the [browser verification recipe](../feature-map/pull-request-conversations.md).
 
 ### Provider regression checks

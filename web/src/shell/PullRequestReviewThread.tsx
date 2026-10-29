@@ -18,6 +18,9 @@ export interface ReviewThreadContext {
   prUrl: string;
   account: string | null;
   canReply: boolean;
+  canCreate?: boolean;
+  headSha?: string;
+  baseSha?: string;
   loadComments: (thread: ReviewThread) => void;
   loadingComments: string | null;
 }
@@ -35,8 +38,6 @@ export function PullRequestReviewThread({
   const [expanded, setExpanded] = useState(
     !thread.resolved || !!composer.draft.body || composer.draft.pending,
   );
-  const [replying, setReplying] = useState(false);
-  const showComposer = replying || !!composer.draft.body || composer.draft.pending;
   const open = expanded;
   const line = thread.outdated ? thread.original_line : thread.line;
   const lineLabel = line
@@ -134,20 +135,15 @@ export function PullRequestReviewThread({
               {context.loadingComments === thread.id ? "Loading…" : "Load more replies"}
             </Button>
           )}
-          {context.canReply &&
-            thread.can_reply &&
-            (showComposer ? (
-              <PullRequestCommentForm {...composer} account={context.account} inline />
-            ) : (
-              <Button variant="ghost" size="sm" className="m-2" onClick={() => setReplying(true)}>
-                Reply…
-              </Button>
-            ))}
-          {showComposer && (!context.canReply || !thread.can_reply) && (
-            <p role="status" className="p-3 text-muted-foreground">
-              Your reply draft is saved. Replying is unavailable with the current permissions.
-            </p>
+          {context.canReply && thread.can_reply && (
+            <PullRequestCommentForm {...composer} account={context.account} inline />
           )}
+          {(!!composer.draft.body || composer.draft.pending) &&
+            (!context.canReply || !thread.can_reply) && (
+              <p role="status" className="p-3 text-muted-foreground">
+                Your reply draft is saved. Replying is unavailable with the current permissions.
+              </p>
+            )}
         </>
       )}
     </section>

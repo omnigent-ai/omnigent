@@ -43,7 +43,8 @@ the patch snapshot gap a prerequisite.
 - R2: Show the author, Markdown body, timestamp, GitHub permalink, replies, and
   resolved/outdated state. Preserve independent threads at the same location.
 - R3: Reply directly below an existing thread, with Markdown preview and the
-  posting account visible. A reply publishes immediately to that GitHub thread.
+  posting account visible and no opener button. A reply publishes immediately
+  to that GitHub thread.
 - R4: Preserve drafts and pending/error state across tab, file-collapse, PR,
   layout, and session switches. Deduplicate submissions and retain text after
   failure. Page-reload persistence is not required.
@@ -55,8 +56,9 @@ the patch snapshot gap a prerequisite.
   partial/error states without a second periodic thread request.
 - R7: Use the selected PR, host, and GitHub account. Enforce session permissions,
   provider capabilities, and thread ownership of the selected PR at write time.
-- R8: Add a gutter “+” to create an immediately published, single-line review
-  comment on an eligible line of the displayed PR revision.
+- R8: Add a gutter “+” to create an immediately published review comment on an
+  eligible line or same-side range of the displayed PR revision. Keep new
+  conversations separate from existing threads at the same location.
 - R9: Allow resolve/reopen where GitHub reports that the selected account can do so.
 - R10: Keep controls usable by keyboard and touch and in the narrow mobile drawer.
   Retain the diff's lazy rendering and large-file protections.
@@ -64,9 +66,8 @@ the patch snapshot gap a prerequisite.
 ## Clarifications
 
 - Q1: What is the recommended delivery boundary?
-  A1: Ship R1–R7 and R10 first: existing threads with inline replies. Follow with
-  R8–R9: new single-line threads and resolve/reopen. The user authorized implementation after approving the plan. This change
-  delivers the first increment; the second remains follow-up work.
+  A1: Deliver R1–R8 and R10: existing threads with visible reply composers and
+  new line/range conversations. Resolve/reopen (R9) remains follow-up work.
 - Q2: Should “Changes” be renamed to “Diff”?
   A2: Retain the current label; this plan uses Changes to identify the existing
   subtab. A rename is not needed for inline conversations.
@@ -110,9 +111,10 @@ the patch snapshot gap a prerequisite.
 - AC9: GIVEN a PR push during loading or composing WHEN revisions disagree THEN
   stale inline placement is withheld and new-comment submission requires refresh
   and reselection while preserving the text. Replies still target their thread ID.
-- AC10: GIVEN an eligible line and edit access WHEN the gutter “+” comment posts
-  THEN GitHub receives the displayed commit, path, side, and line, and the new
-  conversation becomes visible without changing the top-level Comments feed.
+- AC10: GIVEN an eligible line or same-side range and edit access WHEN the gutter
+  “+” or selected-lines action posts THEN GitHub receives the displayed commit,
+  path, side and range, and a separate conversation becomes visible without
+  changing an existing thread or the top-level Comments feed.
 - AC11: GIVEN GitHub permits resolving or reopening WHEN the action succeeds THEN
   the thread state and relevant counts update without losing an unsent reply.
 - AC12: GIVEN any supported PR-panel entry point WHEN using keyboard or touch
@@ -259,15 +261,19 @@ before reconciliation. Keep the existing 10-second cadence and background/offlin
 gates; do not add a thread timer. Thread navigation expands the relevant file before scrolling/focusing; it also
 reaches fallback cards.
 
-**New conversations and resolution.** In the second increment, use the gutter
-utility hook to open the same composer beneath one eligible line. Publish via
-GitHub REST `POST /repos/{owner}/{repo}/pulls/{number}/comments`, passing `body`,
-`commit_id`, `path`, `side`, and `line`. Recheck the expected head before dispatch;
-send the displayed commit explicitly so a concurrent push cannot silently move
-the comment. Preserve text and request reselection if the revision is stale.
+**New conversations and resolution.** Use the gutter utility or selected-lines
+action to open the composer beneath an eligible line or same-side range within
+one diff hunk. Publish via GraphQL `addPullRequestReview` with `event: COMMENT`,
+the displayed `commitOID`, and one thread carrying `body`, `path`, `side`, `line`
+and optional `startLine`/`startSide`. Recheck both expected revisions before
+dispatch. Preserve text and request reselection if the revision is stale.
 An accepted comment may become outdated immediately after a concurrent push;
-show it as such on refresh. Reconcile the returned comment ID to its GraphQL
-thread on refresh without showing it twice. Resolve/reopen uses GitHub GraphQL
+show it as such on refresh. Match the submitted review's root comment ID to its
+canonical thread within the mutation response's last 25 threads and insert that
+thread into the revision-matching cache. A missing match or unconfirmed submission
+is an uncertain write, never retried automatically. Existing threads at the
+coordinate remain independent. New drafts are keyed by session, PR and file.
+Resolve/reopen remains deferred; it will use GitHub GraphQL
 `resolveReviewThread`/`unresolveReviewThread`, gated by viewer permissions.
 
 ### Affected Components
@@ -316,7 +322,7 @@ Proposed session resources under `/v1/sessions/{id}/resources/github`:
 | `GET /review-threads` | Load additional thread pages on demand for `pr_url`, cursor, and expected revisions; no interval poll. |
 | `GET /review-threads/{thread_id}/comments` | Page replies after verifying thread membership. |
 | `POST /review-threads/{thread_id}/replies` | Immediately publish a reply with `pr_url` and `body`. |
-| `POST /review-threads` | Create a single-line conversation with expected revision and coordinates. |
+| `POST /review-threads` | Create a line/range conversation with expected revisions and coordinates. |
 | `POST /review-threads/{thread_id}/resolution` | Set resolved state with `pr_url` and `resolved`. |
 | `GET /diff` (additive parameters/fields) | Accept expected base/head SHAs and return verified snapshot metadata. |
 
@@ -375,9 +381,9 @@ store. Render a targeted unavailable state if an older server lacks the routes.
 - [x] T7: Complete first-release browser/transport verification and document the
   GitHub entry points in the feature map. Covers AC1–AC9, AC12, AC13.
 
-### Phase 3 — Start and resolve conversations; second release
+### Phase 3 — Start conversations; resolution deferred
 
-- [ ] T8: Add single-line gutter composition, revision-aware creation, and
+- [x] T8: Add line/range gutter composition, revision-aware creation, and
   reconciliation to the canonical thread. Covers AC9, AC10, AC12.
 - [ ] T9: Add resolve/reopen mutations and controls with viewer permissions and
   draft-preserving collapse behavior. Covers AC8, AC11.
@@ -414,8 +420,9 @@ store. Render a targeted unavailable state if an older server lacks the routes.
 
 Implemented the first release on main `424e96b1c`. Published threads, inline
 replies, pagination, revision checks, shared polling and the four browser entry
-points are covered. New gutter comments and resolve/reopen remain in phase 3;
-hidden-context threads use the explicit original-snippet fallback.
+points are covered. The extension adds visible reply composers and new line/range
+conversations. Resolve/reopen remains deferred; hidden-context threads use the
+explicit original-snippet fallback.
 
 - Provider, runner, host fallback, permission, workspace and OpenAPI checks pass.
 - Frontend component/hook tests pass, including shared request counts, cursor
@@ -447,9 +454,11 @@ Human verification:
    outdated, and the existing reply draft survives.
 5. Repeat through the desktop composer PR link and mobile drawer. Use keyboard
    and touch, including a long Markdown preview and a short viewport.
-6. For the second release, create a comment with the gutter “+”, verify its line
-   on GitHub, resolve/reopen it, and check that an unsent new-line draft requires
-   reselection after the PR revision changes.
+6. Click a line number and its gutter “+” to create a separate conversation,
+   including on an already-commented line. Drag or Shift-click line numbers on
+   one side and choose **Comment on selected lines** to post a range. Verify the
+   coordinates on GitHub. Start another draft, push a commit, refresh, and check
+   that posting requires reselection while retaining the draft text.
 7. In browser DevTools, filter Network to `/resources/github`. While Changes is
    visible, confirm one regular info poll carrying thread inclusion and no
    periodic `/review-threads` request. Switch to Summary and confirm subsequent

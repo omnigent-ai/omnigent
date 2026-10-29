@@ -603,7 +603,7 @@ it.each(["unmount", "rerender"])(
     );
     const mount = (prUrl: string, current: ReviewThread) => render(tree(prUrl, current));
     const first = mount(PR_URL, thread);
-    fireEvent.click(screen.getByRole("button", { name: "Reply…" }));
+    expect(screen.queryByRole("button", { name: "Reply…" })).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "**Because**" } });
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("**Because**"));
     fireEvent.click(screen.getByRole("button", { expanded: true }));
@@ -623,8 +623,6 @@ it.each(["unmount", "rerender"])(
     } else {
       restored.rerender(tree("other-pr", { ...thread, id: "thread-2" }));
     }
-    const replyButton = screen.queryByRole("button", { name: "Reply…" });
-    if (replyButton) fireEvent.click(replyButton);
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "Other draft" } });
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("Other draft"));
     const comment = {

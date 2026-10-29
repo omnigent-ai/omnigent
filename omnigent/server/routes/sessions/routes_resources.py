@@ -3992,6 +3992,31 @@ def register_resources_routes(
         )
 
     @router.post(
+        "/sessions/{session_id}/resources/github/review-threads",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def create_session_review_thread(request: Request, session_id: str) -> dict[str, Any]:
+        """Publish a new line conversation with the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/review-threads",
+            host_op="github_review_thread_create",
+            non_idempotent=True,
+            params={
+                "pr_url": body["pr_url"],
+                "body": body.get("body"),
+                "anchor": body.get("anchor"),
+            },
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
+        )
+
+    @router.post(
         "/sessions/{session_id}/resources/github/review-threads/{thread_id}/replies",
         response_model=None,
         dependencies=[Depends(require_json_content_type)],

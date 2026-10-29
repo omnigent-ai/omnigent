@@ -18393,6 +18393,45 @@
         "tags": [
           "session_resources"
         ]
+      },
+      "post": {
+        "description": "Publish a new line conversation with the host's selected GitHub account.",
+        "operationId": "create_session_review_thread_v1_sessions__session_id__resources_github_review_threads_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Review Thread",
+        "tags": [
+          "session_resources"
+        ]
       }
     },
     "/v1/sessions/{session_id}/resources/github/review-threads/{thread_id}/comments": {

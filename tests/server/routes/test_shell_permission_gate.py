@@ -1067,7 +1067,7 @@ async def test_pr_merge_routes_require_edit(
     [("owner@example.com", 200), ("viewer@example.com", 403)],
     ids=["edit-allowed", "read-denied"],
 )
-@pytest.mark.parametrize("resource", ["details", "comment", "reply"])
+@pytest.mark.parametrize("resource", ["details", "comment", "reply", "thread"])
 async def test_pr_details_route_requires_edit(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
@@ -1077,10 +1077,15 @@ async def test_pr_details_route_requires_edit(
 ) -> None:
     """Writing PR text acts as the host's account, so viewers are refused."""
     comment = resource != "details"
-    path = {"details": _DETAILS_PATH, "comment": _COMMENTS_PATH, "reply": _REVIEW_REPLY_PATH}[
-        resource
-    ]
+    path = {
+        "details": _DETAILS_PATH,
+        "comment": _COMMENTS_PATH,
+        "reply": _REVIEW_REPLY_PATH,
+        "thread": _REVIEW_REPLY_PATH.removesuffix("/thread-1/replies"),
+    }[resource]
     fields = {"body": "Hello"} if comment else {"title": "Renamed"}
+    if resource == "thread":
+        fields["anchor"] = {"line": 2}
     forwarded = {**fields, **({"thread_id": "thread-1"} if resource == "reply" else {})}
     edited = await client.post(
         path,

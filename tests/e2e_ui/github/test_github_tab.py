@@ -642,7 +642,7 @@ def test_post_top_level_pr_comment(
 def test_reply_to_inline_review_conversation(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """Reply inside the real diff renderer through each shared-panel surface."""
+    """Reply and start line/range conversations through each shared-panel surface."""
     base_url, session_id = seeded_session
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
@@ -713,7 +713,11 @@ def test_reply_to_inline_review_conversation(
         "tracking_available": True,
         "selected_pr_url": pr_url,
         "selected_account": "octocat",
-        "capabilities": {"review_threads": True, "review_thread_replies": True},
+        "capabilities": {
+            "review_threads": True,
+            "review_thread_replies": True,
+            "review_thread_creation": True,
+        },
         "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
     }
     included_reads = []
@@ -741,12 +745,38 @@ def test_reply_to_inline_review_conversation(
         thread["comments"]["data"].append(comment)
         route.fulfill(json={"thread_id": thread["id"], "comment": comment})
 
+    new_posts = []
+
+    def create_thread(route: Route) -> None:
+        payload = route.request.post_data_json
+        new_posts.append(payload)
+        identity = f"new-thread-{len(new_posts)}"
+        created = {
+            **thread,
+            **payload["anchor"],
+            "id": identity,
+            "comments": {
+                **thread["comments"],
+                "data": [
+                    {
+                        **thread["comments"]["data"][0],
+                        "id": identity + "-root",
+                        "author": "octocat",
+                        "body": payload["body"],
+                    }
+                ],
+            },
+        }
+        threads["data"].append(created)
+        route.fulfill(json={"thread": created})
+
     page.route(re.compile(r"/resources/github(?:\?|$)"), read_info)
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
         lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
     )
     page.route(re.compile(r"/resources/github/review-threads/thread-1/replies$"), reply)
+    page.route(re.compile(r"/resources/github/review-threads$"), create_thread)
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1440, "height": 900})
     if entry == "canvas":
@@ -785,7 +815,6 @@ def test_reply_to_inline_review_conversation(
     panel.get_by_role("button", name="Next unresolved conversation", exact=True).click()
     expect(conversation).to_be_focused()
     expect(conversation.get_by_text("Why add this line?", exact=True)).to_be_visible()
-    conversation.get_by_role("button", name="Reply…", exact=True).click()
     textbox = conversation.get_by_role("textbox", name="Reply to review conversation")
     textbox.fill("**This handles empty input.**")
     tabs.get_by_role("tab", name="Summary", exact=True).click()
@@ -833,3 +862,71 @@ def test_reply_to_inline_review_conversation(
     expect(fallback.get_by_text("Original code context", exact=True)).to_be_visible()
     conversation.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
+
+    file = panel.locator('[data-github-file="src/app/main.py"]')
+    line = file.locator('[data-column-number="2"][data-line-type="change-addition"]')
+    line.locator("[data-line-number-content]").click()
+    file.get_by_role("button", name="Start a new review conversation", exact=True).click()
+    draft = file.get_by_role("region", name="New review conversation", exact=True)
+    expect(draft.get_by_text("New conversation · New line 2", exact=True)).to_be_visible()
+    draft.get_by_role("textbox", name="New review comment").fill("**Separate conversation.**")
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
+    tabs.get_by_role("tab", name="Changes", exact=False).click()
+    expect(draft.get_by_role("textbox", name="New review comment")).to_have_value(
+        "**Separate conversation.**"
+    )
+    draft.get_by_role("tab", name="Preview", exact=True).click()
+    expect(draft.get_by_text("Separate conversation.", exact=True)).to_be_visible()
+    draft.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-new-comment.png"))
+    draft.get_by_role("button", name="Post comment", exact=True).click()
+    created = file.locator('[data-review-thread="new-thread-1"]')
+    expect(created.get_by_text("Separate conversation.", exact=True)).to_be_visible()
+    expect(conversation.locator("li")).to_have_count(2)
+    assert (
+        created.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-additions-2"
+    )
+
+    split = panel.get_by_role("button", name="Switch to split view", exact=True)
+    if split.count():
+        split.click()
+    file.locator(
+        '[data-code][data-deletions] [data-column-number="1"] [data-line-number-content]'
+    ).click()
+    file.locator(
+        '[data-code][data-deletions] [data-column-number="2"] [data-line-number-content]'
+    ).click(modifiers=["Shift"])
+    file.get_by_role("button", name="Comment on selected lines", exact=True).click()
+    expect(draft.get_by_text("New conversation · Old lines 1–2", exact=True)).to_be_visible()
+    draft.get_by_role("textbox", name="New review comment").fill("Consider these lines together.")
+    draft.get_by_role("button", name="Post comment", exact=True).click()
+    ranged = file.locator('[data-review-thread="new-thread-2"]')
+    expect(ranged.get_by_text("Consider these lines together.", exact=True)).to_be_visible()
+    assert (
+        ranged.evaluate("element => element.closest('[slot]').getAttribute('slot')")
+        == "annotation-deletions-2"
+    )
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(created.locator("li")).to_have_count(1)
+    expect(ranged.locator("li")).to_have_count(1)
+    assert new_posts == [
+        {
+            "pr_url": pr_url,
+            "body": body,
+            "anchor": {
+                "path": "src/app/main.py",
+                "side": side,
+                "line": 2,
+                "start_line": start,
+                "head_sha": "head",
+                "base_sha": "base",
+            },
+        }
+        for body, side, start in [
+            ("**Separate conversation.**", "RIGHT", None),
+            ("Consider these lines together.", "LEFT", 1),
+        ]
+    ]
+    ranged.scroll_into_view_if_needed()
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-range-posted.png"))

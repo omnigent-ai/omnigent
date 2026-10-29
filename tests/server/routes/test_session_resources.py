@@ -10502,6 +10502,12 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     [
         ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
         (
+            "/review-threads",
+            {"body": "Hello", "anchor": {"line": 2}},
+            "github_review_thread_create",
+            {"body": "Hello", "anchor": {"line": 2}},
+        ),
+        (
             "/review-threads/thread-1/replies",
             {"body": "Hello"},
             "github_review_thread_reply",
@@ -11107,7 +11113,9 @@ async def test_environment_id_is_one_runner_url_segment(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource", ["comments", "review-threads/thread-1/replies"])
+@pytest.mark.parametrize(
+    "resource", ["comments", "review-threads", "review-threads/thread-1/replies"]
+)
 async def test_comment_transport_timeout_does_not_retry_on_host(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -11139,7 +11147,12 @@ async def test_comment_transport_timeout_does_not_retry_on_host(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "resource,expected",
-    [("comments", 502), ("review-threads/thread-1/replies", 502), ("details", 503)],
+    [
+        ("comments", 502),
+        ("review-threads", 502),
+        ("review-threads/thread-1/replies", 502),
+        ("details", 503),
+    ],
 )
 async def test_host_write_timeout_preserves_comment_uncertainty(
     offline_env_client: httpx.AsyncClient,

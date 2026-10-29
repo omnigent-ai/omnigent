@@ -4368,6 +4368,14 @@ class HostProcess:
                 add=params.get("add", []),
                 remove=params.get("remove", []),
             )
+        if op == "github_review_thread_create":
+            return pr_resource.create_pr_review_thread(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                body=params.get("body"),
+                anchor=params.get("anchor"),
+            )
         if op == "github_review_thread_reply":
             return pr_resource.reply_to_pr_review_thread(
                 workspace,

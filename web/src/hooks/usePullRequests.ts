@@ -48,6 +48,8 @@ import {
   appendReviewReply,
   type ReviewComment,
   type ReviewThreadsPage,
+  type ReviewThread,
+  type ReviewThreadAnchor,
 } from "@/lib/pullRequestReviewThreads";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
@@ -206,6 +208,7 @@ export interface PullRequestCapabilities {
   comment_posting?: boolean;
   review_threads?: boolean;
   review_thread_replies?: boolean;
+  review_thread_creation?: boolean;
   /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
   reviewer_editing?: boolean;
   /** The PR's title and description can be edited; absent from older hosts. */
@@ -841,6 +844,7 @@ async function fetchPullRequestEditResource<T>(
     | "reviewers"
     | "comments"
     | `review-threads/${string}/replies`
+    | "review-threads"
     | "details"
     | "attachments"
     | "merge-options"
@@ -1208,6 +1212,24 @@ export interface PullRequestCommentDraft {
   body: string;
   pending: boolean;
   error: string | null;
+  anchor?: ReviewThreadAnchor;
+}
+
+function usePullRequestCommentDraft(key: readonly string[]) {
+  const queryClient = useQueryClient();
+  const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
+  const { data: draft = initialDraft } = useQuery<PullRequestCommentDraft>({
+    queryKey: key,
+    queryFn: skipToken,
+    initialData: initialDraft,
+    enabled: false,
+    gcTime: 24 * 60 * 60 * 1000,
+  });
+  const updateDraft = (update: Partial<PullRequestCommentDraft>) =>
+    queryClient.setQueryData<PullRequestCommentDraft>(key, (current) =>
+      current ? { ...current, ...update } : current,
+    );
+  return { draft, updateDraft };
 }
 
 function commentDraftKey(conversationId: string, prUrl: string, threadId?: string) {
@@ -1229,18 +1251,7 @@ export function usePullRequestCommentComposer(
 ) {
   const queryClient = useQueryClient();
   const key = commentDraftKey(conversationId, prUrl, threadId);
-  const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
-  const { data: draft = initialDraft } = useQuery<PullRequestCommentDraft>({
-    queryKey: key,
-    queryFn: skipToken,
-    initialData: initialDraft,
-    enabled: false,
-    gcTime: 24 * 60 * 60 * 1000,
-  });
-  const updateDraft = (update: Partial<PullRequestCommentDraft>) =>
-    queryClient.setQueryData<PullRequestCommentDraft>(key, (current) =>
-      current ? { ...current, ...update } : current,
-    );
+  const { draft, updateDraft } = usePullRequestCommentDraft(key);
   const mutation = useMutation({
     mutationKey: ["github-comment-create", conversationId, prUrl, ...(threadId ? [threadId] : [])],
     retry: false,
@@ -1328,6 +1339,91 @@ export function usePullRequestCommentComposer(
         return;
       updateDraft({ pending: true, error: null });
       mutation.mutate({ body: current.body, conversationId, prUrl, threadId });
+    },
+  };
+}
+
+/** Keep a new conversation's text and coordinates together until the write settles. */
+export function usePullRequestReviewThreadComposer(
+  conversationId: string,
+  prUrl: string,
+  path: string,
+  headSha: string,
+  baseSha: string,
+) {
+  const queryClient = useQueryClient();
+  const key = ["github-new-review-thread", conversationId, prUrl, path];
+  const { draft, updateDraft } = usePullRequestCommentDraft(key);
+  const stale =
+    !!draft.anchor && (draft.anchor.head_sha !== headSha || draft.anchor.base_sha !== baseSha);
+  const mutation = useMutation({
+    retry: false,
+    mutationFn: (target: {
+      conversationId: string;
+      prUrl: string;
+      body: string;
+      anchor: ReviewThreadAnchor;
+      key: string[];
+    }) =>
+      fetchPullRequestEditResource<{ thread: ReviewThread }>(
+        target.conversationId,
+        "review-threads",
+        {
+          body: { pr_url: target.prUrl, body: target.body, anchor: target.anchor },
+        },
+      ),
+    onSuccess: async ({ thread }, target) => {
+      await queryClient.cancelQueries({ queryKey: ["github-info", target.conversationId] });
+      queryClient.setQueryData(target.key, { body: "", pending: false, error: null });
+      queryClient.setQueriesData<ReviewThreadsPage>(
+        { queryKey: ["github-review-threads", target.conversationId, target.prUrl] },
+        (page) =>
+          page &&
+          page.head_sha === target.anchor.head_sha &&
+          page.base_sha === target.anchor.base_sha
+            ? {
+                ...page,
+                data: [...page.data.filter((existing) => existing.id !== thread.id), thread],
+              }
+            : page,
+      );
+      void queryClient.invalidateQueries({ queryKey: ["github-info", target.conversationId] });
+    },
+    onError: (error: Error, target) =>
+      queryClient.setQueryData<PullRequestCommentDraft>(
+        target.key,
+        (current) => current && { ...current, pending: false, error: commentPostingError(error) },
+      ),
+  });
+  return {
+    draft,
+    stale,
+    setBody: (body: string) => updateDraft({ body, error: null }),
+    selectLines: (lines: Pick<ReviewThreadAnchor, "side" | "line" | "start_line">) => {
+      if (!draft.pending)
+        updateDraft({
+          anchor: { ...lines, path, head_sha: headSha, base_sha: baseSha },
+          error: null,
+        });
+    },
+    cancel: () => {
+      if (!draft.pending) updateDraft({ anchor: undefined, body: "", error: null });
+    },
+    post: () => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (
+        !current?.anchor ||
+        current.pending ||
+        !current.body.trim() ||
+        pullRequestCommentTooLong(current.body)
+      )
+        return;
+      if (current.anchor.head_sha !== headSha || current.anchor.base_sha !== baseSha) {
+        updateDraft({ error: "The pull request changed. Reselect the lines before posting." });
+        return;
+      }
+      updateDraft({ pending: true, error: null });
+      mutation.mutate({ conversationId, prUrl, body: current.body, anchor: current.anchor, key });
     },
   };
 }

@@ -153,7 +153,7 @@ async def write_workspace_from_host(
     of host-servable writes (currently ``"github_set_preference"``,
     ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
     ``"github_details_update"``, ``"github_comment_create"``,
-    ``"github_review_thread_reply"``,
+    ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
     ``"github_attachment_upload"``, ``"github_merge"``,
     and ``"github_disable_auto_merge"``) so a preference change, a PR attach/remove,
     a label, reviewer, title, or description edit, a comment, an attachment upload, or a merge
@@ -164,7 +164,7 @@ async def write_workspace_from_host(
     :param op: Write op name — currently ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
         ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
-        ``"github_review_thread_reply"``,
+        ``"github_review_thread_reply"``, ``"github_review_thread_create"``,
         ``"github_attachment_upload"``, ``"github_merge"``, or
         ``"github_disable_auto_merge"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.

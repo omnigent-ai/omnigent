@@ -3,6 +3,7 @@ import { parsePatchFiles } from "@pierre/diffs";
 import {
   mergeReviewComments,
   reviewThreadAnnotations,
+  reviewSelection,
   type ReviewThread,
 } from "./pullRequestReviewThreads";
 
@@ -28,6 +29,27 @@ function thread(overrides: Partial<ReviewThread> = {}): ReviewThread {
 }
 
 describe("review thread placement", () => {
+  it.each([
+    [
+      { start: 6, end: 6, side: "additions" },
+      { side: "RIGHT", line: 6, start_line: null },
+    ],
+    [
+      { start: 7, end: 5, side: "deletions" },
+      { side: "LEFT", line: 7, start_line: 5 },
+    ],
+    [
+      { start: 5, end: 7, side: "additions" },
+      { side: "RIGHT", line: 7, start_line: 5 },
+    ],
+    [{ start: 5, end: 7, side: "deletions", endSide: "additions" }, null],
+    [{ start: 4, end: 6, side: "additions" }, null],
+    [{ start: 6, end: 99, side: "additions" }, null],
+    [{ start: 0, end: 1, side: "additions" }, null],
+    [{ start: 5.5, end: 6, side: "additions" }, null],
+  ] as const)("maps or rejects a selected range: %j", (selection, expected) => {
+    expect(reviewSelection(selection, file)).toEqual(expected);
+  });
   it("uses file coordinates and the proper side, keeping conversations on the same line distinct", () => {
     const threads = [
       thread({ id: "old", side: "LEFT" }),

@@ -878,13 +878,17 @@ def _comment_body(body: object) -> str:
 
 
 def _review_target(
-    session_id: str | None, pr_url: str | None, *, replying: bool = False
+    session_id: str | None, pr_url: str | None, *, replying: bool = False, creating: bool = False
 ) -> tuple[ReviewThreadsFacet, SessionPullRequest]:
     facet, reference = _capable_target(
         session_id,
         pr_url,
         capable=lambda capabilities: (
-            capabilities.review_thread_replies if replying else capabilities.review_threads
+            capabilities.review_thread_creation
+            if creating
+            else capabilities.review_thread_replies
+            if replying
+            else capabilities.review_threads
         ),
         unselected="Select a pull request to read or reply to a conversation",
         unsupported="Review conversations on {kind} are not supported",
@@ -946,6 +950,50 @@ def reply_to_pr_review_thread(
     facet, reference = _review_target(session_id, pr_url, replying=True)
     return facet.reply_to_review_thread(
         root, reference, thread_id=_review_identifier(thread_id), body=comment_body
+    )
+
+
+def create_pr_review_thread(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    body: object = None,
+    anchor: object = None,
+) -> dict[str, Any]:
+    """Publish a new conversation on a line or same-side range at a known revision."""
+    comment_body = _comment_body(body)
+    facet, reference = _review_target(session_id, pr_url, creating=True)
+    if not isinstance(anchor, dict):
+        raise ValueError("Select lines in the diff before commenting")
+    path = anchor.get("path")
+    if (
+        not isinstance(path, str)
+        or not path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise ValueError("Expected a repository-relative file path")
+    if not isinstance(anchor.get("side"), str) or anchor["side"] not in {"LEFT", "RIGHT"}:
+        raise ValueError("Select lines on one side of the diff")
+    line, start = anchor.get("line"), anchor.get("start_line")
+    if (
+        type(line) is not int
+        or line < 1
+        or (start is not None and (type(start) is not int or start < 1 or start >= line))
+    ):
+        raise ValueError("Expected a positive line or increasing line range")
+    for field in ("head_sha", "base_sha"):
+        if not isinstance(anchor.get(field), str) or not _COMMIT_SHA.fullmatch(anchor[field]):
+            raise ValueError("Expected full head and base commit SHAs")
+    return facet.create_review_thread(
+        root,
+        reference,
+        body=comment_body,
+        anchor={
+            key: anchor.get(key)
+            for key in ("path", "side", "line", "start_line", "head_sha", "base_sha")
+        },
     )
 
 
