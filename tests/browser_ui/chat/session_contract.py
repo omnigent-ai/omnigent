@@ -462,6 +462,7 @@ def install_chat_session_routes(handle: ChatSessionContract) -> None:
             ]
         },
     )
+    contract.json(f"/v1/hosts/{handle.host_id}", {"ssh_target": None})
     contract.json(f"/v1/hosts/{handle.host_id}/worktrees", empty)
     contract.json(f"/v1/hosts/{handle.host_id}/mcp-servers", {"mcp_servers": []})
     contract.json("/v1/projects", empty)
