@@ -74,7 +74,7 @@
   "tests/server/integration/test_sessions_permission_request_hook.py": 24,
   "tests/server/routes/test_host_reconnect_wait.py": 1,
   "tests/server/test_background_session_titles.py": 1,
-  "tests/terminals/test_control_bridge.py": 7,
+  "tests/terminals/test_control_bridge.py": 6,
   "tests/test_cursor_native_permissions.py": 2,
   "tests/test_cursor_native_status.py": 2,
   "tests/test_cursor_native_usage.py": 2,
