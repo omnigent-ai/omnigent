@@ -6066,6 +6066,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_browser_tabs": {
+            "default": false,
+            "title": "Session Browser Tabs",
+            "type": "boolean"
+          },
           "session_event_types": {
             "default": [],
             "items": {
@@ -6159,6 +6164,7 @@
             "response.reasoning_text.delta": "#/components/schemas/ReasoningTextDeltaEvent",
             "response.retry": "#/components/schemas/RetryEvent",
             "session.agent_changed": "#/components/schemas/SessionAgentChangedEvent",
+            "session.browser_tabs.changed": "#/components/schemas/SessionBrowserTabsChangedEvent",
             "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
@@ -6264,6 +6270,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionChangedFilesInvalidatedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionBrowserTabsChangedEvent"
           },
           {
             "$ref": "#/components/schemas/SessionTerminalActivityEvent"
@@ -6408,6 +6417,138 @@
           "agent_name"
         ],
         "title": "SessionAgentChangedEvent",
+        "type": "object"
+      },
+      "SessionBrowserTab": {
+        "additionalProperties": false,
+        "description": "One open embedded-browser tab.",
+        "properties": {
+          "id": {
+            "description": "The client's tab id, e.g. `\"agent-browser\"` for the agent's tab or a UUID for a tab the user opened.",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "That page's title, or `None`.",
+            "title": "Title"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "pattern": "^https?://",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The tab's last http(s) page, or `None` before it loads one.",
+            "title": "Url"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "SessionBrowserTab",
+        "type": "object"
+      },
+      "SessionBrowserTabs": {
+        "description": "The caller's open embedded-browser tabs in a session, in display order.\n\nEach user in a shared session has their own tabs.",
+        "properties": {
+          "revision": {
+            "description": "`0` until the first save, then incremented by each save. Send it back as `base_revision` with the next save.",
+            "format": "int64",
+            "title": "Revision",
+            "type": "integer"
+          },
+          "tabs": {
+            "description": "The open tabs.",
+            "items": {
+              "$ref": "#/components/schemas/SessionBrowserTab"
+            },
+            "title": "Tabs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "SessionBrowserTabs",
+        "type": "object"
+      },
+      "SessionBrowserTabsChangedEvent": {
+        "description": "A viewer saved their browser tabs in this session \u2014 refetch your own.\n\nCarries no tab data: tabs are per user, and every viewer of the session\nreceives this event. Transient; the REST resource is the source of truth.",
+        "properties": {
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "session_id": {
+            "description": "Owning session/conversation id.",
+            "title": "Session Id",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.browser_tabs.changed",
+            "description": "Always `\"session.browser_tabs.changed\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "session_id"
+        ],
+        "title": "SessionBrowserTabsChangedEvent",
+        "type": "object"
+      },
+      "SessionBrowserTabsUpdate": {
+        "additionalProperties": false,
+        "description": "Replace the caller's tabs in a session.",
+        "properties": {
+          "base_revision": {
+            "description": "The `revision` the client last read or saved. A save based on an older revision is rejected with 409, so the client can adopt the newer tabs instead of overwriting them.",
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Base Revision",
+            "type": "integer"
+          },
+          "tabs": {
+            "description": "The complete new tab list, at most 20 tabs.",
+            "items": {
+              "$ref": "#/components/schemas/SessionBrowserTab"
+            },
+            "maxItems": 20,
+            "title": "Tabs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "base_revision",
+          "tabs"
+        ],
+        "title": "SessionBrowserTabsUpdate",
         "type": "object"
       },
       "SessionBtwSidechatEvent": {
@@ -14712,6 +14853,100 @@
           }
         },
         "summary": "Automatically Rename Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/browser-tabs": {
+      "get": {
+        "description": "Return the caller's saved browser tabs in the session.\n\nRequires session read access. A session the caller never saved tabs in\nreturns no tabs at revision 0.",
+        "operationId": "get_browser_tabs_v1_sessions__session_id__browser_tabs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionBrowserTabs"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Browser Tabs",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "put": {
+        "description": "Replace the caller's saved browser tabs in the session.\n\nRequires session read access, since the tabs belong to the caller rather\nthan the session. Returns 409 when `base_revision` is not the stored\nrevision; the client should fetch the tabs and adopt them. A save that\nchanges the tabs notifies the session's viewers to refetch theirs.",
+        "operationId": "put_browser_tabs_v1_sessions__session_id__browser_tabs_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionBrowserTabsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionBrowserTabs"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Browser Tabs",
         "tags": [
           "sessions"
         ]

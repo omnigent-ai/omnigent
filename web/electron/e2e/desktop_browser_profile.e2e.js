@@ -1,14 +1,13 @@
-// Desktop-shell recording lane: shared cookies within a conversation, isolated
-// cookies between conversations.
+// Desktop-shell recording lane: one persistent browser profile shared by every
+// conversation's browser views and kept across app restarts.
 //
 // Journey: boot the shell connected to a local server → conversation A opens a
-// browser view on a site and "signs in" (sets an identity cookie) → conversation
-// B opens its own view on the SAME site → B must start signed out (no cookie).
-// On the unfixed shell both views live on session.defaultSession, so B sees A's
-// cookie; with per-conversation partitions B's jar starts empty.
+// browser view on a site and "signs in" (sets identity cookies) → its tabs and
+// conversation B's view on the SAME site see that sign-in → quit and relaunch
+// on the same userData → a fresh view is still signed in.
 //
 // Run from web/electron after building the SPA:
-//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_cookie_isolation.e2e.js
+//   OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_browser_profile.e2e.js
 
 "use strict";
 
@@ -61,8 +60,7 @@ async function waitForIdentityCookie(window, conversationId, expected) {
 }
 
 // Poll until the view has actually LANDED on the target origin — an execute
-// against a view still on about:blank would read the wrong (empty) cookie jar
-// and could false-pass the isolation assertion. Each probe is raced with a
+// against a view still on about:blank would read the wrong (empty) cookie jar. Each probe is raced with a
 // short timeout: executeJavaScript against a mid-navigation view can hang
 // until (or past) the load, so a stuck probe is dropped and retried.
 async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 30_000) {
@@ -87,7 +85,7 @@ async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 3
 }
 
 // Paint a full-page banner into a view so the recording shows the identity
-// state a user would see ("signed in as A" vs "signed out").
+// state a user would see.
 function bannerJs(title, detail, color) {
   return `
     document.body.innerHTML = '<div style="font: 28px sans-serif; padding: 40px; background: ${color}; color: white; height: 100vh;">' +
@@ -98,7 +96,7 @@ function bannerJs(title, detail, color) {
 }
 
 describe(
-  "desktop shell — per-conversation browser cookie isolation",
+  "desktop shell — persistent shared browser profile",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}` },
   () => {
     let tmpDir;
@@ -198,119 +196,120 @@ describe(
     );
 
     it(
-      "tabs share login changes within conversation A while conversation B stays signed out",
-      { timeout: 180_000 },
+      "shares a sign-in across conversations and keeps it after a relaunch",
+      { timeout: 240_000 },
       async (t) => {
         t.diagnostic(`Desktop recordings: ${recordDir}`);
         // Launch on the bundled setup page and connect interactively (the same
         // proven journey as desktop_connect.e2e.js), then drive the browser APIs.
-        const { electronApp, window, userDataDir, stopDisplayCapture } = await launchDesktop({
-          recordDir,
-        });
+        const first = await launchDesktop({ recordDir });
+        const { userDataDir } = first;
+        const site = `${server.serverUrl}/health`;
         let saved;
         try {
-          const urlField = window.locator("#url");
-          await urlField.waitFor({ state: "visible", timeout: 15_000 });
-          await urlField.fill(server.serverUrl);
-          await window.locator("#connect").click();
-          await window
-            .getByText("What should we build?")
-            .waitFor({ state: "visible", timeout: 20_000 });
-          // The SPA is up — its preload bridge carries the browser APIs.
-          await window.waitForFunction(
-            () =>
-              !!window.omnigentDesktop &&
-              typeof window.omnigentDesktop.browserOpenOrNavigate === "function",
-            null,
-            { timeout: 20_000 },
-          );
-          const site = `${server.serverUrl}/health`;
+          try {
+            const { window } = first;
+            const urlField = window.locator("#url");
+            await urlField.waitFor({ state: "visible", timeout: 15_000 });
+            await urlField.fill(server.serverUrl);
+            await window.locator("#connect").click();
+            await window
+              .getByText("What should we build?")
+              .waitFor({ state: "visible", timeout: 20_000 });
+            // The SPA is up — its preload bridge carries the browser APIs.
+            await window.waitForFunction(
+              () =>
+                !!window.omnigentDesktop &&
+                typeof window.omnigentDesktop.browserOpenOrNavigate === "function",
+              null,
+              { timeout: 20_000 },
+            );
 
-          // Conversation A opens the site and "signs in" (sets an identity cookie).
-          const openedA = await openView(window, "conv_A", site);
-          assert.equal(openedA.ok, true, `conv_A open failed: ${openedA.error}`);
-          await setActive(window, "conv_A");
-          await waitForViewOnOrigin(window, "conv_A", server.serverUrl);
-          const signIn = await execInBrowserView(
-            window,
-            "conv_A",
-            `document.cookie = "agent_identity=alice; path=/";` +
-              bannerJs("Conversation A", "Signed in as alice (cookie set in THIS view)", "#1a7f37"),
-          );
-          assert.equal(signIn.ok, true, `conv_A execute failed: ${signIn.error}`);
-          assert.match(String(signIn.result), /agent_identity=alice/);
-          await window.waitForTimeout(2_500); // hold A's state on film
+            // Conversation A opens the site and "signs in". A max-age cookie is
+            // what a remembered login sets; a session cookie has no expiry.
+            const openedA = await openView(window, "conv_A", site);
+            assert.equal(openedA.ok, true, `conv_A open failed: ${openedA.error}`);
+            await setActive(window, "conv_A");
+            await waitForViewOnOrigin(window, "conv_A", server.serverUrl);
+            const signIn = await execInBrowserView(
+              window,
+              "conv_A",
+              `document.cookie = "agent_identity=alice; max-age=86400; path=/";` +
+                `document.cookie = "session_identity=alice; path=/";` +
+                bannerJs("Conversation A", "Signed in as alice", "#1a7f37"),
+            );
+            assert.equal(signIn.ok, true, `conv_A execute failed: ${signIn.error}`);
+            assert.match(String(signIn.result), /agent_identity=alice/);
+            await window.waitForTimeout(2_500); // hold A's state on film
 
-          const blocked = await window.evaluate(
-            (url) =>
-              window.omnigentDesktop.browserOpenOrNavigate("restricted-fixture", url, undefined, {
-                agent: false,
-              }),
-            server.serverUrl,
-          );
-          assert.equal(blocked.ok, false, "renderer navigation must enforce the URL policy");
-          const firstTab = "browser-tab:conv_A:first";
-          const secondTab = "browser-tab:conv_A:second";
-          for (const tab of [firstTab, secondTab]) {
-            // oxlint-disable-next-line no-await-in-loop -- Open each fixture before observing its cookies.
-            const opened = await openView(window, tab, site);
-            assert.equal(opened.ok, true, `${tab} open failed: ${opened.error}`);
-            // oxlint-disable-next-line no-await-in-loop -- Wait for this tab's navigation.
-            await waitForViewOnOrigin(window, tab, server.serverUrl);
-            // oxlint-disable-next-line no-await-in-loop -- Read this tab's actual cookie jar.
-            await waitForIdentityCookie(window, tab, "agent_identity=alice");
+            const blocked = await window.evaluate(
+              (url) =>
+                window.omnigentDesktop.browserOpenOrNavigate("restricted-fixture", url, undefined, {
+                  agent: false,
+                }),
+              server.serverUrl,
+            );
+            assert.equal(blocked.ok, false, "renderer navigation must enforce the URL policy");
+
+            // A user tab in A and conversation B's agent view share the sign-in,
+            // and a change in one is seen by the other.
+            const tabA = "browser-tab:conv_A:first";
+            for (const viewId of [tabA, "conv_B"]) {
+              // oxlint-disable-next-line no-await-in-loop -- Open each view before observing its cookies.
+              const opened = await openView(window, viewId, site);
+              assert.equal(opened.ok, true, `${viewId} open failed: ${opened.error}`);
+              // oxlint-disable-next-line no-await-in-loop -- Wait for this view's navigation.
+              await waitForViewOnOrigin(window, viewId, server.serverUrl);
+              // oxlint-disable-next-line no-await-in-loop -- Read this view's actual cookie jar.
+              await waitForIdentityCookie(window, viewId, "agent_identity=alice");
+            }
+            await setActive(window, "conv_B");
+            const changed = await execInBrowserView(
+              window,
+              "conv_B",
+              'document.cookie = "agent_identity=bob; max-age=86400; path=/";' +
+                bannerJs("Conversation B", "Same profile — switched to bob", "#0969da"),
+            );
+            assert.equal(changed.ok, true, `cookie update failed: ${changed.error}`);
+            await waitForIdentityCookie(window, tabA, "agent_identity=bob");
+            await window.waitForTimeout(2_500); // hold B's state on film
+          } finally {
+            await first.electronApp.close();
+            await first.stopDisplayCapture();
+            saveRecording(recordDir, "browser-profile-first-run");
           }
-          await setActive(window, secondTab);
-          const changed = await execInBrowserView(
-            window,
-            secondTab,
-            'document.cookie = "agent_identity=bob; path=/"; document.cookie',
-          );
-          assert.equal(changed.ok, true, `cookie update failed: ${changed.error}`);
-          await waitForIdentityCookie(window, "conv_A", "agent_identity=bob");
-          const closed = await window.evaluate(
-            (id) => window.omnigentDesktop.browserClose(id),
-            firstTab,
-          );
-          assert.equal(closed.ok, true, `tab close failed: ${closed.error}`);
-          const reopened = await openView(window, firstTab, site);
-          assert.equal(reopened.ok, true, `tab reopen failed: ${reopened.error}`);
-          await waitForViewOnOrigin(window, firstTab, server.serverUrl);
-          await waitForIdentityCookie(window, firstTab, "agent_identity=bob");
 
-          // Conversation B opens its own view on the same site.
-          const openedB = await openView(window, "conv_B", site);
-          assert.equal(openedB.ok, true, `conv_B open failed: ${openedB.error}`);
-          await setActive(window, "conv_B");
-          await waitForViewOnOrigin(window, "conv_B", server.serverUrl);
-          const readB = await execInBrowserView(
-            window,
-            "conv_B",
-            bannerJs(
-              "Conversation B",
-              "Fresh view on the same site — must start signed out",
-              "#0969da",
-            ),
-          );
-          assert.equal(readB.ok, true, `conv_B execute failed: ${readB.error}`);
-          await window.waitForTimeout(2_500); // hold B's state on film
-
-          // The proof: B's cookie jar does not contain A's identity.
-          assert.ok(
-            !String(readB.result).includes("agent_identity"),
-            `conv_B inherited conv_A's cookie — jars are shared: "${readB.result}"`,
-          );
-          const loggedOut = await execInBrowserView(
-            window,
-            secondTab,
-            'document.cookie = "agent_identity=; max-age=0; path=/"; document.cookie',
-          );
-          assert.equal(loggedOut.ok, true, `logout failed: ${loggedOut.error}`);
-          await waitForIdentityCookie(window, "conv_A", null);
+          // Relaunch on the same userData: the profile is on disk.
+          const second = await launchDesktop({
+            recordDir,
+            serverUrl: server.serverUrl,
+            userDataDir,
+          });
+          try {
+            const { window } = second;
+            await window
+              .getByText("What should we build?")
+              .waitFor({ state: "visible", timeout: 30_000 });
+            await window.waitForFunction(() => !!window.omnigentDesktop?.browserOpenOrNavigate);
+            const opened = await openView(window, "conv_C", site);
+            assert.equal(opened.ok, true, `conv_C open failed: ${opened.error}`);
+            await setActive(window, "conv_C");
+            await waitForViewOnOrigin(window, "conv_C", server.serverUrl);
+            await waitForIdentityCookie(window, "conv_C", "agent_identity=bob");
+            const relaunched = await execInBrowserView(
+              window,
+              "conv_C",
+              bannerJs("After relaunch", "Still signed in as bob", "#8250df"),
+            );
+            assert.equal(relaunched.ok, true, `conv_C execute failed: ${relaunched.error}`);
+            t.diagnostic(`cookies after relaunch: ${relaunched.result}`);
+            await window.waitForTimeout(2_500); // hold the relaunched state on film
+          } finally {
+            await second.electronApp.close();
+            await second.stopDisplayCapture();
+            saved = saveRecording(recordDir, "browser-profile-after-relaunch");
+          }
         } finally {
-          await electronApp.close();
-          await stopDisplayCapture();
-          saved = saveRecording(recordDir, "after-cookie-isolation");
           fs.rmSync(userDataDir, { recursive: true, force: true });
         }
         assert.ok(saved && saved.length > 0, "no desktop recording was produced");

@@ -37,6 +37,7 @@ import type {
   ResponseQueued,
   RetryEvent,
   SessionBtwSidechatEvent,
+  SessionBrowserTabsChangedEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
   SessionModelOptionsEvent,
@@ -934,6 +935,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       childSessionId,
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
+  }
+  if (eventType === "session.browser_tabs.changed") {
+    const sessionId = data.session_id;
+    if (typeof sessionId !== "string" || !sessionId) return null;
+    return {
+      type: "session_browser_tabs_changed",
+      sessionId,
+    } satisfies SessionBrowserTabsChangedEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;

@@ -20,6 +20,7 @@ from pydantic import (
     Field,
     SerializerFunctionWrapHandler,
     Strict,
+    StringConstraints,
     field_validator,
     model_serializer,
     model_validator,
@@ -2978,6 +2979,54 @@ class SessionPullRequest(SessionPullRequestSummary):
     last_seen_at: float
 
 
+class SessionBrowserTab(BaseModel):
+    """
+    One open embedded-browser tab.
+
+    :param id: The client's tab id, e.g. ``"agent-browser"`` for the agent's
+        tab or a UUID for a tab the user opened.
+    :param url: The tab's last http(s) page, or ``None`` before it loads one.
+    :param title: That page's title, or ``None``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    url: Annotated[str, StringConstraints(max_length=8192, pattern=r"^https?://")] | None = None
+    title: Annotated[str, StringConstraints(max_length=512)] | None = None
+
+
+class SessionBrowserTabs(BaseModel):
+    """
+    The caller's open embedded-browser tabs in a session, in display order.
+
+    Each user in a shared session has their own tabs.
+
+    :param revision: ``0`` until the first save, then incremented by each save.
+        Send it back as ``base_revision`` with the next save.
+    :param tabs: The open tabs.
+    """
+
+    revision: int
+    tabs: list[SessionBrowserTab] = Field(default_factory=list)
+
+
+class SessionBrowserTabsUpdate(BaseModel):
+    """
+    Replace the caller's tabs in a session.
+
+    :param base_revision: The ``revision`` the client last read or saved. A save
+        based on an older revision is rejected with 409, so the client can adopt
+        the newer tabs instead of overwriting them.
+    :param tabs: The complete new tab list, at most 20 tabs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_revision: int = Field(ge=0)
+    tabs: list[SessionBrowserTab] = Field(max_length=20)
+
+
 class SessionPullRequestList(BaseModel):
     """
     A page of a session's linked pull requests in display order, keyed by URL.
@@ -4933,6 +4982,21 @@ class SessionChildSessionUpdatedEvent(_SSEEventBase):
     child: dict[str, Any]
 
 
+class SessionBrowserTabsChangedEvent(_SSEEventBase):
+    """
+    A viewer saved their browser tabs in this session — refetch your own.
+
+    Carries no tab data: tabs are per user, and every viewer of the session
+    receives this event. Transient; the REST resource is the source of truth.
+
+    :param type: Always ``"session.browser_tabs.changed"``.
+    :param session_id: Owning session/conversation id.
+    """
+
+    type: Literal["session.browser_tabs.changed"]
+    session_id: str
+
+
 class SessionChangedFilesInvalidatedEvent(_SSEEventBase):
     """
     The session's changed-files list may have changed — refetch it.
@@ -5077,6 +5141,7 @@ ServerStreamEvent = Annotated[
     | SessionResourceDeletedEvent
     | SessionChildSessionUpdatedEvent
     | SessionChangedFilesInvalidatedEvent
+    | SessionBrowserTabsChangedEvent
     | SessionTerminalActivityEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
     | OutputTextDeltaEvent

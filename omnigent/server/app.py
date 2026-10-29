@@ -141,6 +141,7 @@ from omnigent.server.routes.sessions import (
     set_server_host_registry,
     set_server_runner_router,
 )
+from omnigent.server.routes.sessions.routes_browser_tabs import browser_tabs_supported
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
@@ -266,6 +267,9 @@ class ServerInfoResponse(BaseModel):
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
+    # GET/PUT /v1/sessions/{id}/browser-tabs; absent on older servers, which
+    # clients treat as unsupported and keep tabs only locally.
+    session_browser_tabs: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
@@ -3508,6 +3512,7 @@ def create_app(
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
+                "session_browser_tabs": browser_tabs_supported(conversation_store),
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,

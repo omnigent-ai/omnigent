@@ -41,6 +41,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { readBrowserTabPage } from "@/lib/browserTabPages";
 import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
 import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
@@ -85,7 +86,7 @@ interface BrowserPaneBridge {
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   /** Local Chrome profiles holding cookies for the current site (metadata only). */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
-  /** Copy the current site's Chrome cookies into this conversation's session. */
+  /** Copy the current site's Chrome cookies into the view's browser profile. */
   browserChromeCookieImport?: (
     conversationId: string,
     args: { profileId: string; expectedHost: string; scope?: string },
@@ -205,12 +206,28 @@ export function BrowserPane({
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && !viewChanged && r?.exists) {
+      if (cancelled || viewChanged || !r) return;
+      if (r.exists) {
         setHasView(true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
+        return;
       }
+      // A tab restored after a relaunch has no view yet; reopen its saved page.
+      const saved = readBrowserTabPage(conversationId);
+      if (!saved || !bridge.browserOpenOrNavigate) return;
+      if (!urlEditingRef.current) setCurrentUrl(saved.url);
+      void bridge
+        .browserOpenOrNavigate(conversationId, saved.url, undefined, undefined)
+        .then((result) => {
+          if (!cancelled && !result.ok) {
+            setNavigationError(result.error ?? "Unable to reopen this page.");
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setNavigationError("Unable to reopen this page.");
+        });
     });
 
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
@@ -697,9 +714,9 @@ export function BrowserPane({
           <DialogHeader>
             <DialogTitle>Import cookies from Chrome</DialogTitle>
             <DialogDescription>
-              Copies {activeCookieScope}'s cookies into this conversation's browser, so the site
+              Copies {activeCookieScope}'s cookies into Omnigent's browser profile, so the site
               reuses the sign-in you already have in Chrome. Nothing is written back to Chrome, and
-              the copy disappears when Omnigent quits.
+              the copy stays signed in across conversations and restarts.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3">
@@ -761,10 +778,10 @@ export function BrowserPane({
               not Always Allow: Always Allow lets any local process read the key.
             </p>
             <p className="text-destructive text-xs">
-              {/* Agent and user tabs share one jar per conversation: the agent can
-                  act as you on this site whether or not it drives this tab. */}
-              This conversation's tabs share one cookie jar, including any tab the agent controls,
-              so the agent can act as you on this site while these cookies are loaded.
+              {/* Every conversation's agent and user tabs share the profile: any agent
+                  can act as you on this site whether or not it drives this tab. */}
+              Every conversation's tabs share this cookie jar, including any tab the agent controls,
+              so agents can act as you on this site.
             </p>
           </div>
           <DialogFooter>

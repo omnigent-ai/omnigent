@@ -2646,11 +2646,13 @@ function createWindow(targetUrl, opts = {}) {
     databricksAuth?.reset(win);
     oidcAuth?.detach(win);
     // Destroy this window's embedded-browser views, else they leak webContents.
+    const browserRegistry = windows.get(win)?.browserRegistry;
     try {
-      windows.get(win)?.browserRegistry?.closeAll("window-closed");
+      browserRegistry?.closeAll("window-closed");
     } catch {
       /* registry already torn down */
     }
+    if (browserRegistry) releaseAgentRequestGuard(browserRegistry);
     awayWatches.get(win)?.dispose();
     awayWatches.delete(win);
     windows.delete(win);
@@ -3765,16 +3767,27 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
-// Electron keeps one webRequest listener per event per session, and a
-// conversation's tabs share one partition, so install once per session and let
-// the registry attribute each request to its view.
+// Electron keeps one webRequest listener per event per session, and views in
+// every window share a profile's session, so install once per session and ask
+// each window's registry; only the one owning the request's view answers.
 const guardedAgentSessions = new WeakSet();
+const agentGuardRegistries = new Set();
+
+/** Stop consulting a closed window's registry. */
+function releaseAgentRequestGuard(registry) {
+  agentGuardRegistries.delete(registry);
+}
 
 /** Enforce the agent navigation policy on document requests at the network layer. */
 function guardAgentPartitionRequests(partition, registry) {
+  agentGuardRegistries.add(registry);
   const ses = session.fromPartition(partition);
   if (guardedAgentSessions.has(ses)) return;
   guardedAgentSessions.add(ses);
+  const registries = () => [...agentGuardRegistries];
+  // A rejected check rejects the whole decision, which `answer` cancels.
+  const anyRegistryCancels = async (decide) =>
+    (await Promise.all(registries().map(decide))).some(Boolean);
   // Documents only: frames plus <object>/<embed> content, which also renders.
   const filter = {
     urls: ["http://*/*", "https://*/*"],
@@ -3786,13 +3799,23 @@ function guardAgentPartitionRequests(partition, registry) {
       () => callback({ cancel: true }),
     );
   ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
+    answer(
+      anyRegistryCancels((owner) => owner.shouldCancelAgentRequest(details)),
+      callback,
+    ),
   );
-  ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
-  );
+  ses.webRequest.onBeforeSendHeaders(filter, (details, callback) => {
+    for (const owner of registries()) {
+      const rewrite = owner.agentRequestHeaders(details);
+      if (rewrite.requestHeaders) return callback(rewrite);
+    }
+    return callback({});
+  });
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
+    answer(
+      anyRegistryCancels((owner) => owner.shouldCancelAgentResponse(details)),
+      callback,
+    ),
   );
 }
 

@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { readBrowserTabPage } from "@/lib/browserTabPages";
+import {
+  onBrowserTabsAdopted,
+  scheduleBrowserTabsPush,
+  syncBrowserTabsInBackground,
+} from "@/lib/browserTabSync";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -54,6 +60,7 @@ export function openBrowserTab(conversationId: string, tabId: string): BrowserTa
     openBrowsers: next.tabs,
     selectedBrowserId: next.selected,
   });
+  if (next.tabs !== current.tabs) scheduleBrowserTabsPush(conversationId);
   return next;
 }
 
@@ -68,8 +75,15 @@ export function useBrowserTabs(conversationId: string) {
   const viewIdsKey = JSON.stringify(
     state.tabs.map((tabId) => browserViewId(conversationId, tabId)),
   );
+  // Opening a session pulls its tabs from the user's other devices; a sync
+  // that replaces the local tabs refreshes this hook.
   useEffect(() => {
     setState(readBrowserTabsState(conversationId));
+    const unsubscribe = onBrowserTabsAdopted((adoptedId) => {
+      if (adoptedId === conversationId) setState(readBrowserTabsState(conversationId));
+    });
+    syncBrowserTabsInBackground(conversationId);
+    return unsubscribe;
   }, [conversationId]);
 
   useEffect(() => {
@@ -96,6 +110,7 @@ export function useBrowserTabs(conversationId: string) {
         const page = await bridge.browserHasView?.(viewId);
         // Live updates take precedence over an earlier restore snapshot.
         if (!active || updated.has(viewId) || !page) return;
+        // A tab without a live view (e.g. after a relaunch) shows its saved page.
         setPage(
           viewId,
           page.exists
@@ -103,7 +118,7 @@ export function useBrowserTabs(conversationId: string) {
                 url: page.url && page.url !== "about:blank" ? page.url : page.pendingUrl,
                 title: page.title,
               }
-            : {},
+            : (readBrowserTabPage(viewId) ?? {}),
         );
       } catch {
         // A closed view or an older shell can leave the default tab label.
@@ -142,11 +157,14 @@ export function useBrowserTabs(conversationId: string) {
 
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
-      const next = mutate(readBrowserTabsState(conversationId));
+      const current = readBrowserTabsState(conversationId);
+      const next = mutate(current);
       writeSessionWorkspaceState(conversationId, {
         openBrowsers: next.tabs,
         selectedBrowserId: next.selected,
       });
+      // Selection stays per device; only the tab list is saved to the server.
+      if (next.tabs !== current.tabs) scheduleBrowserTabsPush(conversationId);
       setState(next);
     },
     [conversationId],

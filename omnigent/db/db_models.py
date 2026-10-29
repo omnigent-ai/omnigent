@@ -617,6 +617,39 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+class SqlSessionBrowserTabs(OmnigentBase):
+    """
+    SQLAlchemy model for the ``session_browser_tabs`` table.
+
+    One user's open embedded-browser tabs in one session, so they reopen on
+    the user's other devices and logins. Each user in a shared session keeps
+    their own row. Rows are deleted with their session.
+
+    :param conversation_id: The session, e.g. ``"conv_e4f5a6b7..."``.
+    :param user_id: The tab owner, e.g. ``"alice@example.com"`` or ``"local"``.
+    :param revision: Incremented on every write; clients send the revision
+        they last saw so a stale write is rejected rather than applied.
+    :param tabs: JSON list of ``{id, url, title}`` in display order.
+    :param updated_at: Epoch microseconds of the last write.
+    """
+
+    __tablename__ = "session_browser_tabs"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    # Session before user so deleting a session's rows is a primary-key prefix scan.
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tabs: Mapped[str] = mapped_column(CompressedText, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 # MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
 # compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
 _MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")

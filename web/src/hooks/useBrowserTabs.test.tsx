@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
 import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
-import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
@@ -59,6 +59,18 @@ describe("browser tab titles", () => {
     });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     await waitFor(() => expect(result.current.labelFor("known", 1)).toBe(label));
+  });
+
+  it("labels a tab without a live view from its saved page", async () => {
+    openBrowserTab("session-a", "restored");
+    writeSessionWorkspaceState("session-a", {
+      browserTabPages: { restored: { url: "https://docs.example/guide", title: "Guide" } },
+    });
+    Object.assign(window, {
+      omnigentDesktop: { browserHasView: vi.fn().mockResolvedValue({ exists: false }) },
+    });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() => expect(result.current.labelFor("restored", 0)).toBe("Guide"));
   });
 
   it("updates a background title without changing selection or accepting an older probe", async () => {

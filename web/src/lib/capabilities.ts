@@ -254,6 +254,11 @@ export interface ServerInfo {
    */
   session_pull_requests?: boolean;
   /**
+   * True when the server saves each user's browser tabs per session
+   * (``/v1/sessions/{id}/browser-tabs``); absent on older servers (local only).
+   */
+  session_browser_tabs?: boolean;
+  /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
    */
@@ -463,6 +468,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
           session_pull_requests: data.session_pull_requests === true,
+          session_browser_tabs: data.session_browser_tabs === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           branding: parseBranding(data.branding),

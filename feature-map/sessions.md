@@ -880,13 +880,17 @@ plain `uv run pytest`, which starts a private server for the test.
   Control and press Tab to show the five most recent, cycle with Tab and
   Shift+Tab, release Control to switch, then reopen and press Escape to cancel.
 - **`browser-storage` (real Electron, own environment):**
-  `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
-  tab, open it in another tab and the agent browser, and confirm both are signed
-  in. Another session should be signed out. Log out and refresh the same-session
-  tabs; all should be signed out. Chrome cookie import needs a real Keychain and
-  Chrome profile, so it is manual: sign into a site in Chrome, open that site in
-  the pane, click the cookie button, confirm the native prompt, and check the
-  page is signed in while an unrelated site in the same session is not.
+  `web/electron/e2e/desktop_browser_profile.e2e.js`. Every session's tabs and
+  agent browser share one persistent profile. Sign into a site in one tab, open
+  it in another tab, the agent browser and another session, and confirm all are
+  signed in. Quit and relaunch the app, open the site again, and confirm it is
+  still signed in. Open tabs restore too
+  (`web/electron/e2e/desktop_browser_tab_restore.e2e.js`): after a relaunch a
+  session's tabs keep their page titles and reopen their pages when selected.
+  Chrome cookie import needs a real Keychain and Chrome
+  profile, so it is manual: sign into a site in Chrome, open that site in the
+  pane, click the cookie button, confirm the native prompt, and check the page
+  is signed in while an unrelated site is not.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide
