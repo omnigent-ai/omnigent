@@ -488,15 +488,18 @@ interface SidebarProps {
 }
 
 /**
- * Which top-level nav button (New session / Inbox) is active for the current
- * route.
+ * Which top-level nav button (New session / Inbox / Automations) is active for
+ * the current route.
  *
- * The inbox route has no param to key off, and the sidebar is basename-agnostic
- * (in embedded mode the routing seam rebases `to="/inbox"` → `${basename}/inbox`
- * behind its back), so `useMatch` / `NavLink` can't be used without knowing the
- * mount path. Instead compare the active route's last non-empty path segment,
- * which is `inbox` in both standalone and embedded modes. Conversation ids are
- * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
+ * The inbox/tasks routes have no `:conversationId` param to key off, and the
+ * sidebar is basename-agnostic (in embedded mode the routing seam rebases
+ * `to="/inbox"` → `${basename}/inbox` behind its back), so `useMatch` /
+ * `NavLink` can't be used without knowing the mount path. Instead compare path
+ * segments from the end:
+ *   - `/tasks` (leaf === "tasks")
+ *   - `/tasks/:taskId` (second-to-last segment === "tasks") — the detail route.
+ * Conversation ids are `conv_…`-prefixed, so a chat route's leaf can never
+ * collide with "inbox" or "tasks".
  */
 function useActiveNavItem(): {
   isNewChatPage: boolean;
@@ -515,12 +518,15 @@ function useActiveNavItem(): {
   const serverInfo = useServerInfo();
   const rebasePath = useRebasePath();
   const extensions = useExtensions();
-  const leaf = location.pathname.split("/").filter(Boolean).at(-1);
+  const segments = location.pathname.split("/").filter(Boolean);
+  const leaf = segments.at(-1);
   const isExtensionRoute = extensionPathParts(location.pathname) !== null;
   const isInboxPage = !isExtensionRoute && leaf === "inbox";
   const isCanvasPage =
     !isExtensionRoute && isCanvasPathname(location.pathname, rebasePath("/canvas"));
-  const isTasksPage = !isExtensionRoute && leaf === "tasks";
+  // True for both /tasks (list) and /tasks/:taskId (detail). Basename-agnostic:
+  // match the "tasks" segment by position from the end, not an absolute path.
+  const isTasksPage = !isExtensionRoute && (leaf === "tasks" || segments.at(-2) === "tasks");
   const isUsagePage = !isExtensionRoute && leaf === "usage";
   const activeExtensionPageId =
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;

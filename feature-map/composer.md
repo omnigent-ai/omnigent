@@ -1,12 +1,16 @@
 # Composer
 
 The composer is where a user writes a message and chooses how the agent runs
-it. It appears in two places that look alike but are separate surfaces: the
-in-session composer at the bottom of a chat, and the new-session composer on
+it. The main surfaces are the in-session composer at the bottom of a chat
+and the new-session composer on
 the landing page. Both show a model/effort pill with a hover tooltip, open a
 configuration menu for harness, model, reasoning effort, and permission mode,
 and accept attachments and slash commands. The in-session composer also queues
 and steers messages while the agent is busy.
+
+Side chats have their own composer. Supported generic side chats reuse the
+model/effort picker before their first message and for later turns; changes
+apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
@@ -38,9 +42,19 @@ and steers messages while the agent is busy.
   States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model),
   a managed sandbox launching before its host is bound (its provider's default catalog).
+  Equivalent model-ID spellings use the catalog's display name consistently,
+  including case, gateway-prefix, and version-punctuation differences; context
+  variants keep their own labels and checked rows, including in side chats.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
+- `side-chat-settings`: the side-chat model/effort pill uses the same catalog
+  and capability rules. Draft selections apply when the child is created;
+  live selections update that child's session. A live Claude picker follows
+  the runner's reported model if a requested change is refused. Native Codex
+  side chats show these controls after creation; selections apply to the next
+  turn without changing the parent;
+  older runners hide these controls.
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
@@ -333,7 +347,13 @@ pickers, seeded from the source session when its harness family is kept.
 collapsed labels.
 
 **Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, then click the microphone beside **Ask a side question...**.
+in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
+text. For native Codex, send the first message before using its model/effort
+pill; later selections apply on the next turn. For other supported harnesses,
+open the side-chat model pill to choose model/effort before or after its
+first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
+for draft persistence and parent-isolation checks. The microphone beside
+**Ask a side question...** starts dictation.
 
 ## Driving it with the repro environment
 

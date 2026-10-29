@@ -1,11 +1,14 @@
-// One-line outcome shown under a tool call's row, so a collapsed transcript
-// reads as "did X, got Y" and failures are visible without expanding.
+// One-line outcome for a tool call. Only successful results appear under the
+// collapsed row; failures stay inside the expanded card.
 
+import { stripAnsi } from "@/lib/ansi";
 import type { ToolState } from "@/lib/renderItems";
 import { type ShellToolOutput, parseShellToolOutput } from "@/lib/shellToolOutput";
-import { shellToolCall, toolCallCategory } from "@/lib/toolTitle";
+import { shellToolCall, stripOmnigentPrefix, toolCallCategory } from "@/lib/toolTitle";
 import {
   type ParsedToolOutput,
+  contentEnvelopeText,
+  editErrorMessage,
   firstLine,
   humanizeKey,
   isRecord,
@@ -17,6 +20,7 @@ import {
   toolErrorMessage,
 } from "@/lib/toolValue";
 import { absoluteTime } from "@/lib/relativeTime";
+import { getFileEditDiff } from "@/lib/toolEditDiff";
 
 /** A tool call as the transcript renders it. */
 export interface ToolCall {
@@ -30,8 +34,23 @@ export interface ToolCall {
 export interface ToolResultSummary {
   text: string;
   isError: boolean;
+  /** The same text split into styled parts; plain `text` when absent. */
+  segments?: readonly ToolResultSegment[];
 }
 
+export interface ToolResultSegment {
+  text: string;
+  /** Diff coloring for a line count; plain when absent. */
+  tone?: "added" | "removed";
+}
+
+// Codex patch output leads with its outcome. Output without that line does not
+// say whether the patch applied, so it gets no counts.
+const CODEX_PATCH_APPLIED = "File change applied.";
+// First lines of each harness's successful edit: Claude and Qwen, Claude
+// MultiEdit, Omnigent's built-in Edit, Pi, OpenCode, and a new Qwen file.
+const EDIT_APPLIED_RE =
+  /^(?:The file:? .+ has been updated|Applied \d+ edits? to |Replaced \d+ occurrence|Successfully replaced |Edit applied successfully|Created new file: )/;
 const SUMMARY_MAX_CHARS = 300;
 const FIELD_SUMMARY_PARTS = 2;
 const FILE_SEARCH_TOOLS = new Set(["Grep", "Glob", "grep", "glob"]);
@@ -67,6 +86,53 @@ export function summarizeToolResult(call: ToolCall): ToolResultSummary | null {
   if (category === "edit") return null;
   if (FILE_SEARCH_TOOLS.has(call.name)) return summarizeFileSearch(parsed);
   return summarizeGeneric(parsed);
+}
+
+/**
+ * A finished edit's added and removed line counts, e.g. "Updated with 2
+ * additions and 3 removals" with the numbers in diff colors; a replace-all edit
+ * counts each match. Failures return an error summary; running, cancelled and
+ * unchanged edits (including pure renames) show none, as do inexact counts.
+ */
+export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {
+  const generic = summarizeToolResult(call);
+  if (call.state !== "output-available" || call.output === null) return generic;
+  const error = editErrorMessage(call.output);
+  if (error !== null) return failure(firstLine(error));
+  if (!editApplied(call.name, call.output)) return generic;
+  const diff = getFileEditDiff(call.name, call.args);
+  if (diff === null || diff.countsAreInexact || diff.additions + diff.removals === 0) {
+    return generic;
+  }
+  const counts: ToolResultSegment[][] = [];
+  if (diff.additions > 0) counts.push(countSegments(diff.additions, "addition", "added"));
+  if (diff.removals > 0) counts.push(countSegments(diff.removals, "removal", "removed"));
+  let target = "Updated with ";
+  if (diff.countsArePerMatch) target = "Updated each match with ";
+  else if (diff.files.length > 1) target = `Updated ${plural(diff.files.length, "file")} with `;
+  const segments: ToolResultSegment[] = [{ text: target }];
+  counts.forEach((count, index) => {
+    if (index > 0) segments.push({ text: " and " });
+    segments.push(...count);
+  });
+  return { text: segments.map((segment) => segment.text).join(""), isError: false, segments };
+}
+
+/**
+ * Whether an edit's output says the change applied. Failures can lack a
+ * recognized error prefix, so counts need this positive evidence.
+ */
+export function editApplied(name: string, output: string): boolean {
+  const parsed = parseToolOutput(output);
+  const tool = stripOmnigentPrefix(name);
+  if (tool === "apply_patch") return firstLine(parsed.text) === CODEX_PATCH_APPLIED;
+  if (tool === "sys_os_edit") {
+    const record = parsed.kind === "json" && isRecord(parsed.value) ? parsed.value : null;
+    const replacements = record?.replacements;
+    return typeof replacements === "number" && replacements > 0;
+  }
+  const envelopeText = parsed.kind === "json" ? contentEnvelopeText(parsed.value) : null;
+  return EDIT_APPLIED_RE.test(stripAnsi(envelopeText ?? parsed.text).trim());
 }
 
 function summarizeShellResult(result: ShellToolOutput): ToolResultSummary | null {
@@ -141,5 +207,18 @@ function failure(text: string): ToolResultSummary {
 }
 
 function plural(count: number, noun: string): string {
-  return `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
+  return `${count.toLocaleString()} ${pluralNoun(count, noun)}`;
+}
+
+function pluralNoun(count: number, noun: string): string {
+  return count === 1 ? noun : `${noun}s`;
+}
+
+/** A count and its noun, with only the number in the diff color. */
+function countSegments(
+  count: number,
+  noun: string,
+  tone: ToolResultSegment["tone"],
+): ToolResultSegment[] {
+  return [{ text: count.toLocaleString(), tone }, { text: ` ${pluralNoun(count, noun)}` }];
 }

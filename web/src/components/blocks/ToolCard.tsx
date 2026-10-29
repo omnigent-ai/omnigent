@@ -2,28 +2,15 @@
 // and result fields with the raw payload one toggle away. Kept light so the
 // assistant's prose reads first; per-tool views plug in through `toolViews.ts`.
 
-import {
-  CheckIcon,
-  ChevronRightIcon,
-  CircleSlashIcon,
-  CopyIcon,
-  Loader2Icon,
-  Maximize2Icon,
-  Minimize2Icon,
-  WrapTextIcon,
-  XCircleIcon,
-} from "lucide-react";
+import { ChevronRightIcon, CircleSlashIcon, Loader2Icon, XCircleIcon } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
-  CodeBlock,
   CodeBlockActions,
   type CodeColorScheme,
   type CodeLanguage,
   CodeBlockContainer,
   CodeBlockContent,
-  CodeBlockHeader,
-  CodeBlockTitle,
 } from "@/components/ai-elements/code-block";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
@@ -31,7 +18,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
@@ -55,17 +41,25 @@ import {
 } from "@/lib/toolTitle";
 import {
   type ParsedToolOutput,
+  contentBlockText,
   isRecord,
   parseToolOutput,
   toolErrorMessage,
 } from "@/lib/toolValue";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
+import {
+  DIFF_TONE_CLASS,
+  CodePanel,
+  CopyTextButton,
+  OutputSection,
+  ToolErrorBox,
+  WrapTextButton,
+  getOutputPreview,
+} from "./ToolCodePanel";
 import { ToolValueView } from "./ToolValueView";
-import { type ToolBodyProps, toolViewFor } from "./toolViews";
+import { type ToolBodyProps, type ToolView, toolViewFor } from "./toolViews";
 
-const OUTPUT_PREVIEW_LINE_LIMIT = 80;
-const OUTPUT_PREVIEW_CHAR_LIMIT = 12_000;
 // Longer single-line results go in a wrapping code panel instead of prose.
 const INLINE_RESULT_MAX_CHARS = 500;
 
@@ -111,62 +105,6 @@ export function formatToolDuration(seconds: number): string {
   const hours = Math.floor(minutes / 60);
   const remainingMinutes = minutes % 60;
   return `${hours}h ${remainingMinutes}m`;
-}
-
-interface OutputPreview {
-  text: string;
-  isTruncated: boolean;
-  lineCount: number;
-  charCount: number;
-  shownLineCount: number;
-  shownCharCount: number;
-  hiddenLineCount: number;
-  hiddenCharCount: number;
-}
-
-export function getOutputPreview(output: string, expanded = false): OutputPreview {
-  const lines = output.length === 0 ? [] : output.split("\n");
-  const lineCount = lines.length;
-  const charCount = output.length;
-
-  if (
-    expanded ||
-    (lineCount <= OUTPUT_PREVIEW_LINE_LIMIT && charCount <= OUTPUT_PREVIEW_CHAR_LIMIT)
-  ) {
-    return {
-      text: output,
-      isTruncated: false,
-      lineCount,
-      charCount,
-      shownLineCount: lineCount,
-      shownCharCount: charCount,
-      hiddenLineCount: 0,
-      hiddenCharCount: 0,
-    };
-  }
-
-  let text =
-    lineCount > OUTPUT_PREVIEW_LINE_LIMIT
-      ? lines.slice(0, OUTPUT_PREVIEW_LINE_LIMIT).join("\n")
-      : output;
-
-  if (text.length > OUTPUT_PREVIEW_CHAR_LIMIT) {
-    text = text.slice(0, OUTPUT_PREVIEW_CHAR_LIMIT).trimEnd();
-  }
-
-  const shownLineCount = text.length === 0 ? 0 : text.split("\n").length;
-  const shownCharCount = text.length;
-
-  return {
-    text,
-    isTruncated: shownCharCount < charCount,
-    lineCount,
-    charCount,
-    shownLineCount,
-    shownCharCount,
-    hiddenLineCount: Math.max(0, lineCount - shownLineCount),
-    hiddenCharCount: Math.max(0, charCount - shownCharCount),
-  };
 }
 
 interface ToolCardProps {
@@ -221,7 +159,6 @@ export function ToolCard({
       ? null
       : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
   const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
-  const Body = view?.Body ?? DefaultToolBody;
 
   return (
     <Collapsible defaultOpen={false} className="group not-prose w-full">
@@ -236,16 +173,22 @@ export function ToolCard({
         onBodyClick={onBodyClick}
       />
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
-        <Body call={call} duration={displayDuration} />
+        <DefaultToolBody call={call} duration={displayDuration} view={view} />
       </CollapsibleContent>
     </Collapsible>
   );
 }
 
-/** Expanded content for tools without a registered view: shell or generic. */
-function DefaultToolBody({ call, duration }: ToolBodyProps) {
+interface ToolCardBodyProps extends ToolBodyProps {
+  view: ToolView | undefined;
+}
+
+/** Expanded content: a registered view's body, a shell panel, or generic fields. */
+function DefaultToolBody({ call, duration, view }: ToolCardBodyProps) {
   const shellCall = useMemo(() => shellToolCall(call.name, call.args), [call.name, call.args]);
-  if (shellCall === null) return <GenericToolBody call={call} duration={duration} />;
+  if (shellCall === null || view?.Body !== undefined) {
+    return <GenericToolBody call={call} duration={duration} view={view} />;
+  }
   const { cwd } = call.args;
   return (
     <ShellTerminalPanel
@@ -262,18 +205,22 @@ function DefaultToolBody({ call, duration }: ToolBodyProps) {
 type ToolBodyView = "fields" | "raw";
 
 /**
- * The input and result as labeled fields, with the exact JSON payloads behind
- * a Fields | Raw switch. The switch keeps its place so it keeps keyboard focus.
+ * The input and result as labeled fields, or a registered view's body, with
+ * the exact JSON payloads behind a Raw switch. The switch keeps its place so
+ * it keeps keyboard focus. The two field sections share one grid, so their
+ * values start at the same offset.
  */
-function GenericToolBody({ call, duration }: ToolBodyProps) {
+function GenericToolBody({ call, duration, view: toolView }: ToolCardBodyProps) {
   const { args, output, state } = call;
+  const ViewBody = toolView?.Body;
   const [view, setView] = useState<ToolBodyView>("fields");
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const hasInput = Object.keys(args).length > 0;
   // A completed call with no output (provider-native tools) has no result to show.
   const hasResult = output !== null || state !== "output-available";
   const result = <ToolResultView output={output} state={state} duration={duration} />;
-  if (!hasInput && output === null) return result;
+  if (ViewBody === undefined && !hasInput && output === null) return result;
+  const gridResult = <ToolResultView output={output} state={state} duration={duration} subgrid />;
   return (
     <Tabs
       value={view}
@@ -282,43 +229,61 @@ function GenericToolBody({ call, duration }: ToolBodyProps) {
       className="gap-1"
     >
       <div className="flex min-h-6 items-center gap-2">
-        {view === "fields" && <ToolSectionLabel>{hasInput ? "Input" : "Result"}</ToolSectionLabel>}
+        {view === "fields" && ViewBody === undefined && (
+          <ToolSectionLabel>{hasInput ? "Input" : "Result"}</ToolSectionLabel>
+        )}
         <TabsList
           aria-label="Tool call view"
           className="ml-auto p-0.5 group-data-horizontal/tabs:h-6"
         >
           <TabsTrigger value="fields" className="px-2 text-sm">
-            Fields
+            {toolView?.bodyLabel ?? "Fields"}
           </TabsTrigger>
           <TabsTrigger value="raw" className="px-2 text-sm">
             Raw
           </TabsTrigger>
         </TabsList>
       </div>
-      <TabsContent value="fields" className="space-y-2">
-        {hasInput ? <ToolValueView value={args} /> : result}
-        {hasInput && hasResult && (
-          <section className="space-y-1">
-            <ToolSectionLabel>Result</ToolSectionLabel>
-            {result}
-          </section>
+      <TabsContent
+        value="fields"
+        className={
+          ViewBody === undefined ? "grid grid-cols-[auto_minmax(0,1fr)] gap-y-2" : "space-y-2"
+        }
+      >
+        {ViewBody !== undefined ? (
+          <>
+            <ViewBody call={call} duration={duration} />
+            {/* Views render the output; without one, show the pending, cancelled or failed state. */}
+            {output === null && hasResult && result}
+          </>
+        ) : (
+          <>
+            {hasInput ? <ToolValueView value={args} subgrid /> : gridResult}
+            {hasInput && hasResult && (
+              <section className="col-span-2 grid grid-cols-subgrid gap-y-1">
+                <ToolSectionLabel className="col-span-2">Result</ToolSectionLabel>
+                {gridResult}
+              </section>
+            )}
+          </>
         )}
       </TabsContent>
       <TabsContent value="raw" className="space-y-2">
-        <CodePanel
-          title="Parameters"
-          text={inputJson}
-          copyText={inputJson}
-          copyLabel="Copy parameters"
-        />
-        {output === null ? result : <OutputSection output={prettyPrintIfJson(output)} />}
+        <CodePanel title="Input" text={inputJson} copyText={inputJson} copyLabel="Copy input" />
+        {output === null ? (
+          result
+        ) : (
+          <OutputSection title="Result" output={prettyPrintIfJson(output)} />
+        )}
       </TabsContent>
     </Tabs>
   );
 }
 
-function ToolSectionLabel({ children }: { children: ReactNode }) {
-  return <div className="font-medium text-muted-foreground text-sm">{children}</div>;
+function ToolSectionLabel({ children, className }: { children: ReactNode; className?: string }) {
+  return (
+    <div className={cn("font-medium text-muted-foreground text-sm", className)}>{children}</div>
+  );
 }
 
 type ResultPresentation =
@@ -335,7 +300,7 @@ type ResultPresentation =
 function presentToolResult(output: string): ResultPresentation {
   const parsed = parseToolOutput(output);
   const error = toolErrorMessage(parsed);
-  if (error !== null) return { kind: "error", message: error, fields: errorContext(parsed) };
+  if (error !== null) return { kind: "error", message: error, fields: errorContext(parsed, error) };
   if (parsed.kind === "json") {
     const pretty = prettyJson(parsed.value);
     if (pretty === null) return { kind: "panel", text: parsed.text, language: "text" };
@@ -351,11 +316,14 @@ function presentToolResult(output: string): ResultPresentation {
 }
 
 /** A failed record's other fields, shown under its error; `null` when it has none. */
-function errorContext(parsed: ParsedToolOutput): Record<string, unknown> | null {
+function errorContext(parsed: ParsedToolOutput, message: string): Record<string, unknown> | null {
   if (parsed.kind !== "json" || !isRecord(parsed.value)) return null;
   const record = parsed.value;
-  // `{"error": true, "message": ...}` already shows its message as the error.
+  // Leave out what the error already shows: `{"error": true, "message": ...}`'s
+  // message, and a `{"content": [...], "isError": true}` result's text.
   const shown = new Set(record.error === true ? ["error", "message"] : ["error"]);
+  if (record.isError === true) shown.add("isError");
+  if (contentBlockText(record.content)?.trim() === message) shown.add("content");
   const rest = Object.entries(record).filter(([key]) => !shown.has(key));
   return rest.length > 0 ? Object.fromEntries(rest) : null;
 }
@@ -369,46 +337,54 @@ function prettyJson(value: unknown): string | null {
   }
 }
 
+/** `subgrid` places the result in the fields grid shared with the input. */
 function ToolResultView({
   output,
   state,
   duration,
+  subgrid = false,
 }: {
   output: string | null;
   state: ToolState;
   duration: number | undefined;
+  subgrid?: boolean;
 }) {
   const presentation = useMemo(
     () => (output === null ? null : presentToolResult(output)),
     [output],
   );
+  // Results that are not labeled fields span both grid columns.
+  const spanned = (node: ReactNode) =>
+    subgrid ? <div className="col-span-2 min-w-0">{node}</div> : node;
   if (presentation === null) {
-    if (state === "input-available") return <ToolPendingOutput duration={duration} />;
+    if (state === "input-available") return spanned(<ToolPendingOutput duration={duration} />);
     if (state === "output-error" || state === "cancelled" || state === "no-output") {
-      return <EmptyOutputState state={state} />;
+      return spanned(<EmptyOutputState state={state} />);
     }
     return null;
   }
   switch (presentation.kind) {
     case "error":
       return (
-        <div className="space-y-2">
-          <div className="max-h-60 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-destructive text-sm">
-            {presentation.message}
-          </div>
-          {presentation.fields !== null && <ToolValueView value={presentation.fields} />}
+        <div className={subgrid ? "col-span-2 grid grid-cols-subgrid gap-y-2" : "space-y-2"}>
+          <ToolErrorBox className="col-span-2">{presentation.message}</ToolErrorBox>
+          {presentation.fields !== null && (
+            <ToolValueView value={presentation.fields} subgrid={subgrid} />
+          )}
         </div>
       );
     case "fields":
-      return <ToolValueView value={presentation.value} />;
+      return <ToolValueView value={presentation.value} subgrid={subgrid} />;
     case "inline":
-      return presentation.text.length === 0 ? (
-        <p className="text-muted-foreground text-sm">No output</p>
-      ) : (
-        <p className="break-words text-sm">{presentation.text}</p>
+      return spanned(
+        presentation.text.length === 0 ? (
+          <p className="text-muted-foreground text-sm">No output</p>
+        ) : (
+          <p className="break-words text-sm">{presentation.text}</p>
+        ),
       );
     case "panel":
-      return <OutputSection output={presentation.text} language={presentation.language} />;
+      return spanned(<OutputSection output={presentation.text} language={presentation.language} />);
   }
 }
 
@@ -545,13 +521,25 @@ function ToolTriggerRow({
         )}
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
       </span>
-      {summary !== null && <ToolResultLine summary={summary} />}
+      {summary !== null && !summary.isError && <ToolResultLine summary={summary} />}
     </CollapsibleTrigger>
   );
 }
 
 /** The result summary under a trigger row, indented to the title past the icon. */
 function ToolResultLine({ summary }: { summary: ToolResultSummary }) {
+  const content =
+    summary.segments === undefined
+      ? summary.text
+      : summary.segments.map((segment, index) => (
+          <span
+            // eslint-disable-next-line react/no-array-index-key
+            key={index}
+            className={segment.tone && DIFF_TONE_CLASS[segment.tone]}
+          >
+            {segment.text}
+          </span>
+        ));
   return (
     <span
       data-testid="tool-result-line"
@@ -560,7 +548,7 @@ function ToolResultLine({ summary }: { summary: ToolResultSummary }) {
         summary.isError && "text-destructive",
       )}
     >
-      {summary.text}
+      {content}
     </span>
   );
 }
@@ -754,14 +742,10 @@ function ShellTerminalPanel({
       </CodeBlockContainer>
       {showRaw && (
         <>
-          <CodePanel
-            title="Parameters"
-            text={inputJson}
-            copyText={inputJson}
-            copyLabel="Copy parameters"
-          />
+          <CodePanel title="Input" text={inputJson} copyText={inputJson} copyLabel="Copy input" />
           {rawOutput !== null && (
             <OutputSection
+              title="Result"
               output={rawOutput}
               language={outputFormat === "sys-os-json" ? "json" : "text"}
             />
@@ -854,131 +838,6 @@ function StatusIcon({
   return <Icon className="size-3.5 shrink-0" />;
 }
 
-function CodePanel({
-  title,
-  text,
-  copyText,
-  copyLabel,
-  language = "json",
-}: {
-  title: string;
-  text: string;
-  copyText: string;
-  copyLabel: string;
-  language?: CodeLanguage;
-}) {
-  // Soft-wrap long lines by default so the panel never needs horizontal
-  // scrolling to read; the toggle restores the scrolling view for when
-  // column alignment matters (same affordance as chat code blocks).
-  const [wrap, setWrap] = useState(true);
-  return (
-    <CodeBlock code={text} language={language} wrap={wrap}>
-      <CodeBlockHeader>
-        <CodeBlockTitle className="min-w-0">
-          <span className="truncate font-medium uppercase tracking-wide">{title}</span>
-        </CodeBlockTitle>
-        <CodeBlockActions>
-          <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
-          <CopyTextButton label={copyLabel} text={copyText} />
-        </CodeBlockActions>
-      </CodeBlockHeader>
-    </CodeBlock>
-  );
-}
-
-function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => void }) {
-  const label = wrap ? "Disable word wrap" : "Enable word wrap";
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          aria-label={label}
-          aria-pressed={wrap}
-          className={cn("size-6 text-muted-foreground", wrap && "text-foreground")}
-          onClick={onToggle}
-          size="icon-xs"
-          type="button"
-          variant="ghost"
-          componentId="diagnostics.tool.toggle_wrap"
-        >
-          <WrapTextIcon className="size-3.5" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
-  );
-}
-
-function OutputSection({
-  output,
-  renderPanel,
-  language,
-}: {
-  output: string;
-  /** Renders the (possibly truncated) text; defaults to a titled Output panel. */
-  renderPanel?: (text: string) => ReactNode;
-  /** Highlighting for the default Output panel; JSON unless set. */
-  language?: CodeLanguage;
-}) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  useEffect(() => setIsExpanded(false), [output]);
-
-  const collapsedPreview = useMemo(() => getOutputPreview(output), [output]);
-  const preview = useMemo(() => getOutputPreview(output, isExpanded), [output, isExpanded]);
-  const canExpand = collapsedPreview.isTruncated;
-
-  return (
-    <div className="space-y-2">
-      <div
-        className={cn(
-          "relative rounded-md",
-          canExpand && !isExpanded && "max-h-80 overflow-hidden",
-          // overflow-auto (vs overflow-y-auto) keeps long single-line output from blowing out the bubble width.
-          (!canExpand || isExpanded) && "max-h-[36rem] overflow-auto",
-        )}
-      >
-        {renderPanel ? (
-          renderPanel(preview.text)
-        ) : (
-          <CodePanel
-            title="Output"
-            text={preview.text}
-            copyText={output}
-            copyLabel="Copy output"
-            language={language}
-          />
-        )}
-        {canExpand && !isExpanded && (
-          <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-md bg-gradient-to-t from-background to-transparent" />
-        )}
-      </div>
-      {canExpand && (
-        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between">
-          <span className="min-w-0">
-            {isExpanded ? "Showing full output" : "Previewing output"} (
-            {formatOutputStats(isExpanded ? preview : collapsedPreview)})
-          </span>
-          <Button
-            className="w-fit"
-            onClick={() => setIsExpanded((value) => !value)}
-            size="xs"
-            type="button"
-            variant="outline"
-            componentId="diagnostics.tool.toggle_expanded"
-          >
-            {isExpanded ? (
-              <Minimize2Icon className="size-3" />
-            ) : (
-              <Maximize2Icon className="size-3" />
-            )}
-            {isExpanded ? "Collapse" : "Expand"}
-          </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function ToolPendingOutput({ duration }: { duration: number | undefined }) {
   return (
     <div className="rounded-md border border-dashed bg-muted/30 p-3">
@@ -1012,67 +871,6 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
   );
 }
 
-interface CopyTextButtonProps {
-  text: string;
-  label: string;
-  /** Visible text next to the icon, for when several copy buttons sit together. */
-  caption?: string;
-}
-
-function CopyTextButton({ text, label, caption }: CopyTextButtonProps) {
-  const [isCopied, setIsCopied] = useState(false);
-  const timeoutRef = useRef<number | null>(null);
-
-  const copyToClipboard = useCallback(async () => {
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
-      return;
-    }
-
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      return;
-    }
-
-    setIsCopied(true);
-    if (timeoutRef.current !== null) {
-      window.clearTimeout(timeoutRef.current);
-    }
-    timeoutRef.current = window.setTimeout(() => setIsCopied(false), 2000);
-  }, [text]);
-
-  useEffect(
-    () => () => {
-      if (timeoutRef.current !== null) {
-        window.clearTimeout(timeoutRef.current);
-      }
-    },
-    [],
-  );
-
-  const Icon = isCopied ? CheckIcon : CopyIcon;
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          aria-label={isCopied ? "Copied" : label}
-          className={cn("text-muted-foreground", caption ? "h-6 gap-1 px-1.5" : "size-6")}
-          onClick={copyToClipboard}
-          size={caption ? "xs" : "icon-xs"}
-          type="button"
-          variant="ghost"
-          componentId="diagnostics.tool.copy"
-        >
-          <Icon className="size-3.5" />
-          {caption}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{isCopied ? "Copied" : label}</TooltipContent>
-    </Tooltip>
-  );
-}
-
 function useElapsedDuration(startedAt: number | null | undefined): number | undefined {
   const [now, setNow] = useState(() => getNowSeconds());
 
@@ -1098,27 +896,4 @@ function getNowSeconds(): number {
     return performance.now() / 1000;
   }
   return Date.now() / 1000;
-}
-
-function formatOutputStats(preview: OutputPreview): string {
-  if (!preview.isTruncated) {
-    return `${formatCount(preview.lineCount, "line")} / ${formatCount(preview.charCount, "char")}`;
-  }
-
-  const hidden: string[] = [];
-  if (preview.hiddenLineCount > 0) {
-    hidden.push(`${formatCount(preview.hiddenLineCount, "line")} hidden`);
-  }
-  if (preview.hiddenCharCount > 0) {
-    hidden.push(`${formatCount(preview.hiddenCharCount, "char")} hidden`);
-  }
-
-  return `${formatCount(preview.shownLineCount, "line")} / ${formatCount(
-    preview.shownCharCount,
-    "char",
-  )} shown; ${hidden.join(", ")}`;
-}
-
-function formatCount(count: number, unit: string): string {
-  return `${count.toLocaleString()} ${unit}${count === 1 ? "" : "s"}`;
 }

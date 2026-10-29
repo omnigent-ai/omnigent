@@ -1,14 +1,16 @@
 import { createElement } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
-import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
+import { ToolCard, ToolGroupSummary, formatToolDuration } from "./ToolCard";
+import { getOutputPreview } from "./ToolCodePanel";
+import type * as ToolViewsModule from "./toolViews";
 import type { ToolView } from "./toolViews";
 
-// The registry ships empty; tests register views here to exercise the plug point.
+// Tests register the views they exercise here, in place of the real registry.
 const registeredViews = vi.hoisted(() => new Map<string, ToolView>());
 vi.mock("./toolViews", () => ({ toolViewFor: (name: string) => registeredViews.get(name) }));
 
@@ -23,8 +25,14 @@ function renderCard(props: Parameters<typeof ToolCard>[0]) {
   return render(createElement(TooltipProvider, null, createElement(ToolCard, props)));
 }
 
+/** Registers the tool's real view in the test registry. */
+async function registerRealView(name: string) {
+  const actualViews = await vi.importActual<typeof ToolViewsModule>("./toolViews");
+  registeredViews.set(name, actualViews.toolViewFor(name)!);
+}
+
 // Radix tabs switch on mouse down (or focus), not on a synthetic click.
-function showView(name: "Fields" | "Raw") {
+function showView(name: "Fields" | "Diff" | "Raw") {
   fireEvent.mouseDown(screen.getByRole("tab", { name }));
 }
 
@@ -127,8 +135,8 @@ describe("ToolCard rendering", () => {
     expect(screen.getByTestId("tool-result-line")).toHaveClass("text-sm");
   });
 
-  it("tags an MCP tool with its server and reports its failure on the result line", () => {
-    renderCard({
+  it("tags an MCP tool with its server and shows its failure only when expanded", () => {
+    const { container } = renderCard({
       name: "mcp__github__create_pull_request",
       arguments: { owner: "omnigent-ai", repo: "omnigent", draft: true },
       output: "Error: 422 Validation Failed: A pull request already exists",
@@ -138,9 +146,16 @@ describe("ToolCard rendering", () => {
     // A known server shows its brand spelling rather than the config name.
     expect(screen.getByText("GitHub")).toBeInTheDocument();
     expect(screen.queryByText("github")).toBeNull();
-    const line = screen.getByTestId("tool-result-line");
-    expect(line.textContent).toBe("Error: 422 Validation Failed: A pull request already exists");
-    expect(line.className).toContain("text-destructive");
+    const error = "Error: 422 Validation Failed: A pull request already exists";
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    expect(screen.queryByText(error)).toBeNull();
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+    fireEvent.click(trigger);
+    expect(screen.queryByText(error)).toBeNull();
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
   });
 
   it("expands to labeled Input and Result fields, with the raw JSON behind a Fields | Raw switch", () => {
@@ -170,9 +185,13 @@ describe("ToolCard rendering", () => {
     showView("Raw");
     expect(raw).toHaveAttribute("aria-selected", "true");
     expect(fields).toHaveAttribute("aria-selected", "false");
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
-    expect(screen.getByText("Output")).toBeInTheDocument();
-    expect(screen.queryByText("Input")).toBeNull();
+    // Raw panels keep the section names from the Fields view.
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy input" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
+    expect(screen.queryByText("Parameters")).toBeNull();
+    expect(screen.queryByText("Output")).toBeNull();
     expect(container.textContent).toContain('"includeComments": false');
     // The switch stays put, so keyboard focus survives switching views.
     expect(screen.getByRole("tab", { name: "Raw" })).toBe(raw);
@@ -212,17 +231,72 @@ describe("ToolCard rendering", () => {
     expect(screen.getByRole("button", { name: "Expand" })).toBeInTheDocument();
   });
 
-  it("shows a reported failure above the record's other fields", () => {
-    // WHY: a partial failure still returns data; hiding it behind Raw loses the useful part.
-    const { container } = renderCard({
+  it.each([{ mode: "visual" }, {}])(
+    "names a text result once in Fields and titles its panel in Raw, given input %o",
+    (args) => {
+      // WHY: the Result label already names the panel, so a title would repeat it.
+      const { container } = renderCard({
+        name: "component_audit",
+        arguments: args,
+        output: "line 1\nline 2",
+        state: "output-available",
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.getAllByText("Result")).toHaveLength(1);
+      expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
+      showView("Raw");
+      expect(screen.getAllByText("Result")).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    {
+      producer: "partial failure",
       name: "search_issues",
+      output: { error: "2 of 3 pages failed", results: ["OMNI-1"] },
+      error: "2 of 3 pages failed",
+      fields: "ResultsOMNI-1",
+    },
+    {
+      producer: "failed SDK Pi result",
+      name: "grep",
+      output: {
+        content: [{ type: "text", text: "Path not found: /repo/missing" }],
+        details: { path: "/repo/missing" },
+        isError: true,
+      },
+      error: "Path not found: /repo/missing",
+      fields: "DetailsPath/repo/missing",
+    },
+    {
+      producer: "failed SDK Pi result with no text",
+      name: "read",
+      output: { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }], isError: true },
+      error: "The tool reported an error.",
+      fields: "Content1TypeimageDataaGk=Mime typeimage/png",
+    },
+    {
+      producer: "failed result with its own error",
+      name: "fetch",
+      output: {
+        error: "Timed out",
+        content: [{ type: "text", text: "Partial page" }],
+        isError: true,
+      },
+      error: "Timed out",
+      fields: "Content1Partial pageType text",
+    },
+  ])("shows a $producer above the record's other fields", ({ name, output, error, fields }) => {
+    // WHY: a failure can still return data; hiding it behind Raw loses the useful part.
+    const { container } = renderCard({
+      name,
       arguments: {},
-      output: JSON.stringify({ error: "2 of 3 pages failed", results: ["OMNI-1"] }),
+      output: JSON.stringify(output),
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("2 of 3 pages failed")).toHaveLength(2);
-    expect(screen.getByTestId("tool-value-view").textContent).toBe("ResultsOMNI-1");
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+    expect(screen.getByTestId("tool-value-view").textContent).toBe(fields);
   });
 
   it("keeps a short result with a trailing newline inline", () => {
@@ -255,7 +329,7 @@ describe("ToolCard rendering", () => {
       });
       fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
       expect(screen.queryByTestId("tool-value-view")).toBeNull();
-      expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+      expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
     } finally {
       spy.mockRestore();
     }
@@ -269,7 +343,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("permission denied")).toHaveLength(2);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent("permission denied");
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
@@ -354,7 +428,7 @@ describe("ToolCard rendering", () => {
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     showView("Raw");
 
-    // Both the Parameters and Output panels default to wrapping.
+    // Both the Input and Result panels default to wrapping.
     const pres = Array.from(container.querySelectorAll("pre"));
     expect(pres.length).toBeGreaterThan(1);
     for (const pre of pres) {
@@ -375,7 +449,7 @@ describe("ToolCard rendering", () => {
     showView("Raw");
 
     const toggles = screen.getAllByRole("button", { name: "Disable word wrap" });
-    expect(toggles.length).toBe(2); // Parameters + Output
+    expect(toggles.length).toBe(2); // Input + Result
     fireEvent.click(toggles[0]);
 
     // Only the toggled panel unwraps; the other keeps the default.
@@ -407,7 +481,248 @@ describe("ToolCard registered views", () => {
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Checklist for fake_plan")).toBeInTheDocument();
     expect(screen.queryByText("Input")).toBeNull();
+    // The raw payload stays one switch away from a view's body.
+    showView("Raw");
+    expect(screen.getByText("Input")).toBeInTheDocument();
   });
+
+  it("shows an edit's line counts in diff colors and its diff behind a Diff | Raw switch", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: {
+        file_path: "/repo/config.py",
+        old_string: "TIMEOUT = 30\nRETRIES = 3",
+        new_string: "TIMEOUT = 60",
+      },
+      output: "The file /repo/config.py has been updated successfully.",
+      state: "output-available",
+    });
+    const line = screen.getByTestId("tool-result-line");
+    expect(line.textContent).toBe("Updated with 1 addition and 2 removals");
+    expect(within(line).getByText("1")).toHaveClass("text-green-600");
+    expect(within(line).getByText("2")).toHaveClass("text-red-600");
+    expect(within(line).getByText("addition")).not.toHaveClass("text-green-600");
+    expect(line).not.toHaveClass("text-destructive");
+
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+    // The Diff tab names the view; the panel is titled with the file and its counts instead.
+    expect(screen.getAllByText("Diff")).toHaveLength(1);
+    const added = screen.getByText("+1");
+    expect(added).toHaveClass("text-green-600");
+    expect(screen.getByText("-2")).toHaveClass("text-red-600");
+    expect(added.parentElement?.textContent).toBe("/repo/config.py+1-2");
+    expect(container.textContent).toContain("-TIMEOUT = 30");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(screen.queryByText("Input")).toBeNull();
+    showView("Raw");
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    showView("Diff");
+    expect(container.textContent).toContain("-RETRIES = 3");
+  });
+
+  it("labels a replace-all edit's counts as each match's", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "x", new_string: "y", replace_all: true },
+      output: "The file /repo/a.py has been updated. All occurrences were successfully replaced.",
+      state: "output-available",
+    });
+    expect(screen.getByTestId("tool-result-line").textContent).toBe(
+      "Updated each match with 1 addition and 1 removal",
+    );
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/a.py (each match)+1-1");
+  });
+
+  it.each([
+    {
+      producer: "Codex declined patch",
+      name: "apply_patch",
+      args: { changes: [{ path: "/repo/app.py", kind: { type: "update" }, diff: "@@\n-a\n+b\n" }] },
+      output: "Error: File change ended with status declined.\nupdate /repo/app.py",
+      error: "Error: File change ended with status declined.",
+      diffText: "+b",
+    },
+    {
+      producer: "OpenCode failed edit",
+      name: "edit",
+      args: { filePath: "a.py", oldString: "x", newString: "y" },
+      output: "[error] Error: oldString not found in content",
+      error: "Error: oldString not found in content",
+      diffText: "+y",
+    },
+    {
+      producer: "SDK Pi failed edit",
+      name: "edit",
+      args: { path: "a.py", oldText: "x", newText: "y" },
+      output: JSON.stringify({
+        content: [{ type: "text", text: "Could not find the exact text in a.py." }],
+        details: {},
+        isError: true,
+      }),
+      error: "Could not find the exact text in a.py.",
+      diffText: "+y",
+    },
+  ])(
+    "shows a $producer's error only inside its expanded diff",
+    async ({ name, args, output, error, diffText }) => {
+      await registerRealView(name);
+      const { container } = renderCard({
+        name,
+        arguments: args,
+        output,
+        state: "output-available",
+      });
+      expect(screen.queryByTestId("tool-result-line")).toBeNull();
+      expect(screen.queryByText(error)).toBeNull();
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      // The expanded body shows the error, then labels the diff as not applied.
+      expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+      expect(screen.getByText("Requested change, not applied:")).toBeInTheDocument();
+      expect(container.textContent).toContain(diffText);
+    },
+  );
+
+  it.each([
+    ["Permission denied: /repo/a.py", "Permission denied: /repo/a.py"],
+    ["  ", "The edit failed with no output."],
+  ])(
+    "shows a failed edit's unrecognized output %j as its error above the diff",
+    async (output, shown) => {
+      await registerRealView("Edit");
+      const { container } = renderCard({
+        name: "Edit",
+        arguments: { file_path: "/repo/a.py", old_string: "x", new_string: "y" },
+        output,
+        state: "output-error",
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.getByTestId("tool-error-box").textContent).toBe(shown);
+      expect(container.textContent).toContain("+y");
+    },
+  );
+
+  it("shows output that does not confirm the edit above its diff, with no counts", async () => {
+    await registerRealView("Edit");
+    const output = "Error reading /repo/missing.py: [Errno 2] No such file or directory";
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/missing.py", old_string: "x", new_string: "y" },
+      output,
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    const text = container.textContent ?? "";
+    expect(text).toContain(output);
+    expect(text.indexOf(output)).toBeLessThan(text.indexOf("+y"));
+    expect(
+      screen.getByText("Requested change; the output does not confirm it applied:"),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["input-available", "Waiting for output"],
+    ["cancelled", "Tool was cancelled before output arrived."],
+    ["output-error", "Tool did not return output before the response failed."],
+  ] as const)("keeps a %s edit's state under its diff", async (state, message) => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "a = 1", new_string: "a = 2" },
+      output: null,
+      state,
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(container.textContent).toContain("+a = 2");
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(screen.queryByText("No diff recorded for this edit.")).toBeNull();
+  });
+
+  it("shows a finished edit's output when its arguments give no diff", async () => {
+    await registerRealView("apply_patch");
+    const files = Array.from({ length: 100 }, (_, index) => `M src/file${index}.py`);
+    const { container } = renderCard({
+      name: "apply_patch",
+      arguments: {},
+      output: `Success. Updated the following files:\n${files.join("\n")}`,
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+    expect(container.textContent).toContain("M src/file0.py");
+    // Long output keeps the generic preview, with the rest behind Expand.
+    expect(container.textContent).not.toContain("M src/file99.py");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("M src/file99.py");
+  });
+
+  it.each([
+    ["output-available", "Error: String to replace not found in file."],
+    ["output-error", "Permission denied: /repo/a.py"],
+  ] as const)("shows a %s edit's error when its arguments give no diff", async (state, output) => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py" },
+      output,
+      state,
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByTestId("tool-error-box").textContent).toBe(output);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+    expect(screen.queryByText("Output")).toBeNull();
+  });
+
+  it("keeps a long diff behind the output preview until expanded", async () => {
+    await registerRealView("Edit");
+    const lines = Array.from({ length: 100 }, (_, index) => `line${index}`);
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "", new_string: lines.join("\n") },
+      output: "The file /repo/a.py has been updated successfully.",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(container.textContent).toContain("+line0");
+    expect(container.textContent).not.toContain("+line99");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("+line99");
+  });
+
+  it("says a finished edit without output or a diff has no diff", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py" },
+      output: null,
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["input-available", "Waiting for output"],
+    ["cancelled", "Tool was cancelled before output arrived."],
+  ] as const)(
+    "does not call a %s edit's incomplete arguments a missing diff",
+    async (state, shown) => {
+      await registerRealView("Edit");
+      const { container } = renderCard({
+        name: "Edit",
+        arguments: { file_path: "/repo/a.py" },
+        output: null,
+        state,
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.queryByText("No diff recorded for this edit.")).toBeNull();
+      expect(screen.getByText(shown)).toBeInTheDocument();
+    },
+  );
 
   it("falls back to the generic parts a view leaves out", () => {
     registeredViews.set("fake_plan", { summary: () => null });
@@ -421,6 +736,24 @@ describe("ToolCard registered views", () => {
     expect(screen.queryByTestId("tool-result-line")).toBeNull();
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Input")).toBeInTheDocument();
+  });
+
+  it("renders a result line whose segments repeat a text", () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+    const segments = [
+      { text: "2 additions", tone: "added" },
+      { text: " and " },
+      { text: "3 removals", tone: "removed" },
+      { text: " and " },
+      { text: "1 rename" },
+    ] as const;
+    const text = segments.map((segment) => segment.text).join("");
+    registeredViews.set("fake_plan", { summary: () => ({ text, isError: false, segments }) });
+    renderCard({ name: "fake_plan", arguments: {}, output: "ok", state: "output-available" });
+    expect(screen.getByTestId("tool-result-line")).toHaveTextContent(text);
+    const keyWarnings = errors.mock.calls.filter(([message]) => /same key/.test(String(message)));
+    expect(keyWarnings).toEqual([]);
   });
 });
 
@@ -449,7 +782,7 @@ describe("ToolCard shell terminal panel", () => {
     expect(terminal.textContent).toContain("pnpm install");
     expect(terminal.textContent).not.toContain("zsh -lc");
     expect(terminal.textContent).toContain("Done in 1.2s");
-    expect(screen.queryByText("Parameters")).toBeNull();
+    expect(screen.queryByText("Input")).toBeNull();
   });
 
   it("reveals the raw parameters and untouched output on demand", () => {
@@ -462,10 +795,42 @@ describe("ToolCard shell terminal panel", () => {
       state: "output-available",
     });
     expand(container);
+    // The terminal keeps its own copy control, named for the command's output.
+    expect(screen.getByRole("button", { name: "Copy output" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Raw" }));
-    expect(screen.getByText("Parameters")).toBeInTheDocument();
-    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy input" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
+    expect(screen.queryByText("Parameters")).toBeNull();
     expect(container.textContent).toContain("\\u001b[1ma.txt\\u001b[0m");
+  });
+
+  it.each([
+    { name: "shell", output: "missing\n[exit code: 1]", detail: "exit 1" },
+    {
+      name: "sys_os_shell",
+      output: JSON.stringify({ stdout: "", stderr: "", exit_code: null, timed_out: true }),
+      detail: "timed out",
+    },
+    {
+      name: "Bash",
+      output: "<tool_use_error>Permission to use Bash was denied.</tool_use_error>",
+      detail: "Permission to use Bash was denied.",
+    },
+  ])("shows a $name failure only inside the expanded terminal", ({ name, output, detail }) => {
+    const { container } = renderCard({
+      name,
+      arguments: { command: "make" },
+      output,
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    expect(container).not.toHaveTextContent(detail);
+    expand(container);
+    expect(screen.getByTestId("shell-tool-terminal")).toHaveTextContent(detail);
+    expand(container);
+    expect(container).not.toHaveTextContent(detail);
   });
 
   it("reads the exit code in the output format of the tool that ran", () => {

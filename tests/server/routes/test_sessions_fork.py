@@ -892,7 +892,8 @@ async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_session_run_config_overrides_pass_through() -> None:
+@pytest.mark.parametrize("side_chat", [False, True])
+async def test_fork_session_run_config_overrides_pass_through(side_chat: bool) -> None:
     """The dialog's model / effort / launch-args picks reach the store as
     explicit overrides with their set-flags on.
 
@@ -908,6 +909,7 @@ async def test_fork_session_run_config_overrides_pass_through() -> None:
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={
+            "side_chat": side_chat,
             "model_override": "opus",
             "reasoning_effort": "high",
             "terminal_launch_args": ["--permission-mode", "auto"],
