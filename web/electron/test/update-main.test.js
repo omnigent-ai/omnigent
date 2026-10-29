@@ -47,6 +47,7 @@ function loadMainHarness({
     cookieRemovals: [],
     reloads: 0,
     windowCloses: 0,
+    webContentsFocuses: 0,
   };
 
   const sender = {
@@ -59,6 +60,9 @@ function loadMainHarness({
       send: (channel, payload) => calls.sent.push({ channel, payload }),
       reload: () => {
         calls.reloads++;
+      },
+      focus: () => {
+        calls.webContentsFocuses++;
       },
     },
     isMinimized: () => false,
@@ -481,6 +485,7 @@ describe("application menu layout", () => {
       "separator",
       "new_terminal",
       "new_browser_tab",
+      "focus_address_bar",
       "separator",
       "close",
       "close_window",
@@ -518,6 +523,7 @@ describe("application menu layout", () => {
       "separator",
       "new_terminal",
       "new_browser_tab",
+      "focus_address_bar",
       "separator",
       "open_settings",
       "separator",
@@ -676,6 +682,45 @@ describe("desktop command menu items", () => {
     assert.deepEqual(pageHistory, ["back", "forward"]);
     assert.deepEqual(plain(harness.calls.sent), [
       { channel: "omnigent:desktop-command", payload: { command: "go-back" } },
+    ]);
+  });
+
+  it("reloads a focused web page, else asks the app, else reloads the window", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    let pageReloads = 0;
+    let viewFocused = true;
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({
+        view: {
+          webContents: {
+            isFocused: () => viewFocused,
+            reload: () => {
+              pageReloads += 1;
+            },
+          },
+        },
+      }),
+    };
+    harness.api.buildMenu();
+    findMenuItem(harness.calls.setApplicationMenu.at(-1), "reload").click();
+    assert.equal(harness.calls.reloads, 1, "an older page reloads the window as before");
+
+    const menu = reportState(harness, { commands: ["reload", "focus-address-bar"] });
+    findMenuItem(menu, "reload").click();
+    viewFocused = false;
+    findMenuItem(menu, "reload").click();
+    findMenuItem(menu, "focus_address_bar").click();
+
+    assert.equal(findMenuItem(menu, "reload").accelerator, "CmdOrCtrl+R");
+    assert.equal(findMenuItem(menu, "focus_address_bar").accelerator, "CmdOrCtrl+L");
+    assert.equal(pageReloads, 1);
+    assert.equal(harness.calls.reloads, 1);
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    assert.deepEqual(plain(harness.calls.sent), [
+      { channel: "omnigent:desktop-command", payload: { command: "reload" } },
+      { channel: "omnigent:desktop-command", payload: { command: "focus-address-bar" } },
     ]);
   });
 

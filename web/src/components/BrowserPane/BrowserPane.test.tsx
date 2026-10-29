@@ -1,12 +1,34 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { BrowserPane } from "./BrowserPane";
+
+// Desktop menu commands (Reload, Focus Address Bar); off unless a test turns them on.
+const desktop = vi.hoisted(() => ({
+  enabled: false,
+  send: (_event: { command: string; browserViewId: string | null }) => {},
+}));
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
 vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: () => true,
   supportsBrowser: () => true,
+  supportsDesktopCommands: () => desktop.enabled,
+  onDesktopCommand: (callback: typeof desktop.send) => {
+    desktop.send = callback;
+    return () => {};
+  },
+  setDesktopCommandState: () => {},
   // DialogContent sizes itself for the iOS keyboard and asks for the shell.
   isIOSShell: () => false,
   // Delegate to the per-test bridge stub so a test can assert the call.
@@ -69,6 +91,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetDesktopCommandsForTests();
+  desktop.enabled = false;
   vi.clearAllMocks();
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
@@ -374,6 +398,35 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /reload/i })).not.toBeDisabled());
     return { bridge, fireUrl: () => fireUrl, fireNav: () => fireNav };
   }
+
+  it("reloads the page for desktop Reload from its toolbar, and passes it on elsewhere", async () => {
+    desktop.enabled = true;
+    const appReload = vi.fn();
+    renderHook(() => useDesktopCommand("reload", appReload));
+    const { bridge } = await renderActive("conv_cmd_r");
+    const bar = screen.getByRole("textbox", { name: /address bar/i });
+    expect(bar).toHaveAttribute("title", "Address bar (Ctrl+L)");
+    expect(screen.getByRole("button", { name: /reload/i })).toHaveAttribute(
+      "title",
+      "Reload (Ctrl+R)",
+    );
+
+    act(() => bar.focus());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(bridge.browserReload).toHaveBeenCalledWith("conv_cmd_r");
+    expect(appReload).not.toHaveBeenCalled();
+
+    act(() => bar.blur());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(appReload).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses and selects the address for desktop Focus Address Bar", async () => {
+    desktop.enabled = true;
+    await renderActive("conv_cmd_l");
+    act(() => desktop.send({ command: "focus-address-bar", browserViewId: null }));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: /address bar/i }));
+  });
 
   it("reload button calls the reload IPC once a view is active", async () => {
     const { bridge } = await renderActive("conv_reload");

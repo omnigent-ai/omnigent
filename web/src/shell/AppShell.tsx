@@ -2055,6 +2055,8 @@ function AppShellImpl() {
     if (atNewSessionPage) setCloseWindowPrompt({ quits: event.closingQuits });
     else navigateTo("/");
   });
+  // Desktop Reload (⌘R) reloads the app unless a browser tab's toolbar took it.
+  useDesktopCommand("reload", () => window.location.reload());
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.

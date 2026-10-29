@@ -36,10 +36,17 @@ export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
 export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
 export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
 export const QUIT_KEYS = [MOD_KEY, "Q"] as const;
+export const RELOAD_KEYS = [MOD_KEY, "R"] as const;
+export const ADDRESS_BAR_KEYS = [MOD_KEY, "L"] as const;
 export const COMMAND_PALETTE_KEYS = [MOD_KEY, "K"] as const;
 export const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
 export const RIGHT_SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 export const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
+
+/** A chord as plain text for native `title` tooltips: "⌘R" on macOS, "Ctrl+R" elsewhere. */
+export function shortcutText(keys: readonly string[]): string {
+  return keys.join(IS_MAC ? "" : "+");
+}
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
   return native ? [MOD_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
