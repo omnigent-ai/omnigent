@@ -270,8 +270,6 @@ def test_pytest_playwright_teardown_retains_trace(tmp_path, tracing, fails):
             str(source),
             "-p",
             "pytest_playwright.pytest_playwright",
-            "-p",
-            "pytest_base_url.plugin",
             "-o",
             "addopts=",
             "--confcutdir",

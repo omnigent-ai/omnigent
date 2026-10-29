@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Flags PR changes to security-sensitive paths. Called by
-# .github/workflows/security-gate.yml after the trust gate opens.
+# .github/workflows/security-scan.yml after the trust gate opens.
 #
 # Two tiers:
 #   FAIL  -- paths that let a PR escalate privilege or rewrite the trust model:
@@ -26,12 +26,12 @@ fail=0
 while IFS= read -r path; do
   [[ -z "$path" ]] && continue
   case "$path" in
-    .github/workflows/*)
+    .github/workflows/* | .github/actions/*)
       if [[ "${DEPENDABOT_WORKFLOW_PINS:-false}" == "true" ]]; then
         echo "Validated Dependabot action-pin update: $path"
         continue
       fi
-      echo "::error file=$path::Untrusted PR edits a CI workflow. Workflow changes can exfiltrate secrets or weaken gates; a maintainer must review."
+      echo "::error file=$path::Untrusted PR edits a CI workflow or composite action. Workflow changes can exfiltrate secrets or weaken gates; a maintainer must review."
       fail=1
       ;;
     .github/MAINTAINER)

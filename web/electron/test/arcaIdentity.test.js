@@ -36,11 +36,29 @@ describe("Arca daemon identity", () => {
     );
   });
 
+  it("accepts a daemon the CLI matched to the selected workspace through another URL", () => {
+    const workspaceHost = "https://dbc-1.cloud.databricks.com/api/2.0/omnigent";
+    const sameWorkspace = {
+      ...daemon,
+      target: workspaceHost,
+      server_url: workspaceHost,
+      same_workspace_as: daemon.target,
+    };
+    assert.deepEqual(readArcaIdentity(output([sameWorkspace]), SERVER), identity);
+  });
+
   it("rejects unknown, ambiguous, mismatched, offline and failed status", () => {
     for (const rows of [
       [],
       [daemon, daemon],
       [{ ...daemon, target: "https://other.databricks.com/api/2.0/omnigent" }],
+      [
+        {
+          ...daemon,
+          target: "https://other.databricks.com/api/2.0/omnigent",
+          same_workspace_as: "https://another.databricks.com/api/2.0/omnigent",
+        },
+      ],
       [{ ...daemon, server_url: "https://other.databricks.com/api/2.0/omnigent" }],
       [{ ...daemon, process: "offline" }],
       [{ ...daemon, host_status: "offline" }],

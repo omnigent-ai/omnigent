@@ -38,18 +38,33 @@ _INITIAL_MODEL = "system.ai.claude-opus-4-8[1m]"
 _TARGET_MODEL = "system.ai.glm-5-3"
 
 
+def _capture_pane(socket_path: Path) -> str:
+    return subprocess.run(
+        ["tmux", "-S", str(socket_path), "capture-pane", "-p", "-t", "model-switch:0.0"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    ).stdout
+
+
+async def _wait_for_picker(socket_path: Path) -> str:
+    deadline = asyncio.get_running_loop().time() + 10
+    while asyncio.get_running_loop().time() < deadline:
+        pane = _capture_pane(socket_path)
+        if "use this session only" in pane:
+            return pane
+        await asyncio.sleep(0.1)
+    pytest.fail(f"Claude did not open its model picker:\n{_capture_pane(socket_path)[-3000:]}")
+
+
 async def _wait_for_model(bridge_dir: Path, expected: str, socket_path: Path) -> None:
     deadline = asyncio.get_running_loop().time() + 30
     while asyncio.get_running_loop().time() < deadline:
         if bridge.read_claude_status_model(bridge_dir) == expected:
             return
         await asyncio.sleep(0.1)
-    pane = subprocess.run(
-        ["tmux", "-S", str(socket_path), "capture-pane", "-p", "-t", "model-switch:0.0"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    ).stdout
+    pane = _capture_pane(socket_path)
     pytest.fail(f"Claude did not report {expected!r}; terminal contents:\n{pane[-3000:]}")
 
 
@@ -69,6 +84,9 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
             monkeypatch.delenv(key)
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "local-test-token")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+    launch_env = {"ANTHROPIC_DEFAULT_OPUS_MODEL": _INITIAL_MODEL}
+    for key, value in launch_env.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     monkeypatch.setenv("DISABLE_AUTOUPDATER", "1")
     monkeypatch.setenv("DISABLE_TELEMETRY", "1")
@@ -78,7 +96,7 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
 
     session_id = uuid.uuid4().hex
     bridge_dir = bridge.prepare_bridge_dir(
-        session_id, workspace=workspace, launch_model=_INITIAL_MODEL
+        session_id, workspace=workspace, launch_model=_INITIAL_MODEL, launch_env=launch_env
     )
     # This models an existing terminal whose launch predates picker metadata.
     assert bridge.read_model_picker_values(bridge_dir) == []
@@ -194,6 +212,13 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 "/v1/sessions", json={"session_id": session_id, "agent_id": "managed-switch"}
             )
             assert created.status_code == 201, created.text
+            for alias in ("opus", "opus[1m]"):
+                response = await client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json={"type": "model_change", "model": alias},
+                )
+                assert response.status_code == 204, response.text
+                await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
             catalog = await client.get(f"/v1/sessions/{session_id}/claude-model-options")
             assert catalog.status_code == 200, catalog.text
             assert _TARGET_MODEL in {row["id"] for row in catalog.json()["models"]}
@@ -204,6 +229,14 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
                 )
                 assert response.status_code == 204, response.text
                 await _wait_for_model(bridge_dir, model, socket_path)
+            await asyncio.to_thread(bridge.inject_slash_command, bridge_dir, command="/model")
+            (tmp_path / "open-model-picker.txt").write_text(await _wait_for_picker(socket_path))
+            recovered = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "model_change", "model": _TARGET_MODEL},
+            )
+            assert recovered.status_code == 204, recovered.text
+            await _wait_for_model(bridge_dir, _TARGET_MODEL, socket_path)
     finally:
         subprocess.run(
             ["tmux", "-S", str(socket_path), "kill-server"], capture_output=True, timeout=10

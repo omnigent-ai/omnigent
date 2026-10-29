@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 
@@ -13,6 +14,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import (
     OutboundFrame,
     TunnelDiagnosticAttrs,
     TunnelDiagnostics,
+    silence_source,
 )
 from tests.budgets import budget
 
@@ -204,11 +206,19 @@ async def test_failed_send_preserves_evidence_and_original_exception(cancel: boo
     snapshot = diagnostics.snapshot()
     assert snapshot["send_duration_max_s"] == 4.0
     assert snapshot["last_send_outcome"] == ("cancelled" if cancel else "error")
+    assert snapshot["last_send_error_type"] == (None if cancel else "ConnectionError")
+    assert "send failed" not in str(snapshot)
     assert snapshot["send_cancellations"] == int(cancel)
     assert snapshot["send_errors"] == int(not cancel)
     assert snapshot["last_sent_frame_age_s"] is None
     assert snapshot["last_app_ping_sent_age_s"] is None
     assert snapshot["sends_in_flight"] == 0
+
+    async def next_send(_data: str) -> None:
+        pass
+
+    await diagnostics.send(next_send, "next frame")
+    assert diagnostics.snapshot()["last_send_error_type"] is None
 
 
 async def test_concurrent_sends_freeze_before_cleanup_and_reset_on_reconnect() -> None:
@@ -314,3 +324,23 @@ async def test_concurrent_send_sampling_is_bounded(monkeypatch: pytest.MonkeyPat
         await asyncio.gather(*tasks, return_exceptions=True)
     assert diagnostics.snapshot()["sends_in_flight"] == 0
     assert diagnostics.snapshot()["oldest_tracked_send_age_s"] is None
+
+
+@pytest.mark.parametrize(
+    ("silent_s", "loop_lag_s", "expected"),
+    [
+        # This process froze for ~5 min and woke to find its peer "silent".
+        (312.0, 307.0, "local_event_loop"),
+        # The peer's last frame predates the stall by up to one ping interval.
+        (97.0, 64.0, "local_event_loop"),
+        # A sleeping laptop: this loop was healthy the whole time.
+        (105.0, 0.2, "peer"),
+        (105.0, None, "peer"),
+    ],
+)
+def test_silence_source_blames_a_local_stall_only_when_it_covers_the_silence(
+    silent_s: float, loop_lag_s: float | None, expected: str
+) -> None:
+    """A tunnel timeout is a local fault only when this loop was stalled for it."""
+    attrs = cast(TunnelDiagnosticAttrs, {"loop_lag_s": loop_lag_s})
+    assert silence_source(silent_s, attrs) == expected

@@ -94,7 +94,7 @@ def main() -> int:
     parser.add_argument(
         "--today",
         type=datetime.date.fromisoformat,
-        default=datetime.datetime.now(datetime.timezone.utc).astimezone().date(),
+        default=datetime.datetime.now(datetime.UTC).astimezone().date(),
         help="override today's date (ISO), for testing",
     )
     args = parser.parse_args()

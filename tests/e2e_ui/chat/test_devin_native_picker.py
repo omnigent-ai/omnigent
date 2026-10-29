@@ -28,6 +28,7 @@ import re
 import pytest
 from playwright.async_api import Route, async_playwright, expect
 
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.test_start_session import (
     _HOST_ID,
     _agents_body,
@@ -36,7 +37,6 @@ from tests.e2e_ui.start_session.test_start_session import (
     _open_entry_models,
     _register_common_routes,
     _run_in_fresh_loop,
-    _wait_until,
 )
 
 _DEVIN_AGENT_ID = "ag_devin_e2e"
@@ -266,7 +266,7 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
             assert devin_requests
             requests_before = len(devin_requests)
             await page.clock.fast_forward(30_000)
-            await _wait_until(lambda: len(devin_requests) > requests_before)
+            await poll_until_async(lambda: len(devin_requests) > requests_before)
 
             # The Effort ladder renders, carrying only the DEFAULT model's rungs.
             # Devin has no --effort flag, so this is the only way to express effort
@@ -388,7 +388,7 @@ async def _drive_fusion(base_url: str, session_id: str) -> None:
 
             await page.get_by_test_id("new-chat-landing-input").fill("build it with fusion")
             await page.get_by_test_id("new-chat-landing-submit").click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             expected_uid = "fusion-claude-fable-5-1-medium-sidekick-swe-2-high"
             assert body["model_override"] == expected_uid, body

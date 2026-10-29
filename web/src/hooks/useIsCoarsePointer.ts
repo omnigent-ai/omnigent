@@ -4,7 +4,7 @@
 // the standard signal for "there is no practical Shift+Enter": the on-screen
 // keyboard's Enter is the only newline key such devices have. Used to keep
 // Enter an inserting key (rather than a submitting one) in text inputs where
-// submission already has an explicit button.
+// submission already has an explicit button, and to gate desktop-only grids.
 
 import { useSyncExternalStore } from "react";
 

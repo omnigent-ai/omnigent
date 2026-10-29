@@ -47,6 +47,7 @@ from typing import Any
 from playwright.async_api import Route, async_playwright
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.polling import poll_until_async
 
 _COMPOSER_PLACEHOLDER = "Send a message…"
 # Unique sentinels so each POST body is unambiguously identifiable.
@@ -55,22 +56,6 @@ _MSG2 = "sentinel-xsess-msg2-9c2e second message into B"
 _MSG3 = "sentinel-xsess-msg3-5d1b message into A while B is stalled"
 
 _EVENTS_RE = re.compile(r"/v1/sessions/([^/]+)/events$")
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    """Poll ``predicate`` on the event loop until true or timeout.
-
-    :param predicate: Zero-arg callable returning truthy when satisfied.
-    :param timeout_s: Max seconds to wait before failing the test.
-    :raises AssertionError: If the predicate never becomes truthy.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def test_queued_message_stays_bound_to_origin_session(
@@ -171,7 +156,7 @@ async def _drive_stalled_send_isolation(base_url: str, session_a: str, session_b
             # B's POST goes out and is never answered — the stalled send.
             await composer.fill(_MSG1)
             await send_button.click()
-            await _wait_until(lambda: b_post_held)
+            await poll_until_async(lambda: b_post_held)
 
             # Switch to A via the sidebar (client-side nav — a reload would
             # reset the JS module state holding the chain, dissolving the bug).
@@ -187,7 +172,7 @@ async def _drive_stalled_send_isolation(base_url: str, session_a: str, session_b
             # stalled. Before the fix it never POSTed at all.
             await page.get_by_label("Message the agent").fill(_MSG3)
             await page.get_by_role("button", name="Send", exact=True).click()
-            await _wait_until(lambda: any(text == _MSG3 for _, text in event_posts))
+            await poll_until_async(lambda: any(text == _MSG3 for _, text in event_posts))
             assert [sid for sid, text in event_posts if text == _MSG3] == [session_a], (
                 f"msg3 must be delivered to the active session A, got {event_posts}"
             )
@@ -267,7 +252,7 @@ async def _drive_cross_session_image_flush(base_url: str, session_a: str, sessio
             # msg1 → POST to B, held open by the route handler → B stays busy.
             await composer.fill(_MSG1)
             await send_button.click()
-            await _wait_until(lambda: first_b_post_held)
+            await poll_until_async(lambda: first_b_post_held)
 
             # Attach an image + text while B is busy → held in B's client-side
             # queue. Set the hidden file input directly (the attach button just
@@ -299,7 +284,7 @@ async def _drive_cross_session_image_flush(base_url: str, session_a: str, sessio
                     for _, content in event_posts
                 )
 
-            await _wait_until(_msg2_posted)
+            await poll_until_async(_msg2_posted)
             msg2 = next(
                 content
                 for sid, content in event_posts
@@ -377,7 +362,7 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
             # msg1 → POST to B, held open by the route handler → B stays busy.
             await composer.fill(_MSG1)
             await send_button.click()
-            await _wait_until(lambda: first_b_post_held)
+            await poll_until_async(lambda: first_b_post_held)
 
             # msg2 → typed while B is busy → held in B's client-side queue,
             # shown in the docked strip, NOT POSTed.
@@ -402,7 +387,7 @@ async def _drive_cross_session_routing(base_url: str, session_a: str, session_b:
             # Background flush now delivers the queued msg2 to B (its origin),
             # even though A is the active session — the key guarantee. It must
             # go to B, never to A.
-            await _wait_until(lambda: any(text == _MSG2 for _, text in event_posts))
+            await poll_until_async(lambda: any(text == _MSG2 for _, text in event_posts))
             msg2_targets = [sid for sid, text in event_posts if text == _MSG2]
             assert msg2_targets == [session_b], (
                 f"msg2 was composed in session B ({session_b}) and must be "

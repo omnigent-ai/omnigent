@@ -14,6 +14,7 @@ from omnigent.errors import OmnigentError
 from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.server.routes._sessions import orchestration as orch
 from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
+from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture(autouse=True)
@@ -269,8 +270,7 @@ def test_model_validation_applies_inherited_acp_harness_to_nested_worker(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A nested worker without its own harness still applies its provider's ACP catalog."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump(
             {

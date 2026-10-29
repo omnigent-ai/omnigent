@@ -208,7 +208,7 @@ async def _read_tmux_buffer(
     except asyncio.CancelledError:
         await _kill_and_reap()
         raise
-    except (asyncio.TimeoutError, OSError):
+    except (TimeoutError, OSError):
         await _kill_and_reap()
         return None
     if oversized or proc.returncode != 0:

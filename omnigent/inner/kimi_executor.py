@@ -818,7 +818,7 @@ class KimiExecutor(Executor):
             if process is not None:
                 try:
                     await asyncio.wait_for(process.wait(), timeout=2.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     with contextlib.suppress(ProcessLookupError):
                         process.kill()
                     with contextlib.suppress(Exception):

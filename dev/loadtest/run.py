@@ -96,7 +96,7 @@ def _resolve_out_dir(out_dir: str | None) -> Path:
     if out_dir:
         out = Path(out_dir)
     else:
-        stamp = datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.datetime.now(datetime.UTC).astimezone().strftime("%Y%m%d-%H%M%S")
         out = _RESULTS_ROOT / f"omnigent_load_test-{stamp}"
     out.mkdir(parents=True, exist_ok=True)
     return out
@@ -191,7 +191,7 @@ def _write_run_config(
         "model": "mock (zero-latency)",
         "locust_argv": argv,
         "exit_code": exit_code,
-        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "generated_at": datetime.datetime.now(datetime.UTC).isoformat(),
     }
     (out_dir / "run_config.json").write_text(json.dumps(config, indent=2))
 

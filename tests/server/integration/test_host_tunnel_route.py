@@ -468,6 +468,13 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
             if getattr(r, "event_name", None) == "host_ping_timeout"
         ]
         assert timeout["connection_id"] == "host-silent"
+        # A sleeping or offline host is expected; only a local stall warns.
+        assert timeout["silence_source"] == "peer"
+        assert all(
+            r.levelno == logging.INFO
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        )
         assert timeout["app_silence_timeout_s"] == 0.06
         assert timeout["last_app_ping_sent_age_s"] is not None
         assert timeout["last_app_pong_received_age_s"] is None
@@ -1714,6 +1721,8 @@ class _FakeSenderWebSocket:
         record the frame instead.
     :param application_state: Post-raise state, mimicking Starlette's
         synchronous state flip when a concurrent close wins the race.
+    :param client_state: Receive-side state; ``DISCONNECTED`` once the
+        peer's close was received.
     """
 
     def __init__(
@@ -1721,6 +1730,7 @@ class _FakeSenderWebSocket:
         *,
         raises: Exception | None = None,
         application_state: object = None,
+        client_state: object = None,
     ) -> None:
         from starlette.websockets import WebSocketState
 
@@ -1728,6 +1738,7 @@ class _FakeSenderWebSocket:
         self.application_state = (
             application_state if application_state is not None else WebSocketState.CONNECTED
         )
+        self.client_state = client_state if client_state is not None else WebSocketState.CONNECTED
         self.sent: list[str] = []
 
     async def send_text(self, data: str) -> None:
@@ -1754,6 +1765,31 @@ async def test_host_sender_loop_swallows_send_after_close_race() -> None:
     )
     conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await host_tunnel._sender_loop(ws, conn)  # returns without raising
+
+
+async def test_host_sender_loop_ends_quietly_when_the_peer_close_was_received() -> None:
+    """uvicorn rejects a send once the peer's close was received, even though
+    the server never sent its own close; the receive helper owns that disconnect."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError(
+            "Unexpected ASGI message 'websocket.send', after sending "
+            "'websocket.close' or response already completed."
+        ),
+        application_state=WebSocketState.CONNECTED,
+        client_state=WebSocketState.DISCONNECTED,
+    )
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    await host_tunnel._sender_loop(ws, conn)  # returns without raising
+    assert conn.sender_end_reason == "send_after_close"
 
 
 async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
