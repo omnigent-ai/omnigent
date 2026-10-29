@@ -872,9 +872,11 @@ async def _stop_host_runner_intentionally(
             if handle is not None and handle.runner_id != runner_id:
                 continue
             live_status = _session_status_cache.get(related_id, persisted_status)
-            # Completed work and earlier task failures keep their existing outcome.
+            # Earlier task failures keep their outcome. An idle session without a
+            # relay is covered too: the exiting runner can still publish its activity.
             if related_id != session_id and live_status not in (*_MID_TURN_STATUSES, None):
-                continue
+                if live_status != "idle" or handle is not None:
+                    continue
             stop_targets.add(related_id)
             if _intentional_stop_sessions.get(related_id) != runner_id:
                 marked.add(related_id)

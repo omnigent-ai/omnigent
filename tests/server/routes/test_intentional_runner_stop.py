@@ -114,7 +114,7 @@ async def test_stop_marks_only_affected_active_sessions_and_rolls_back(
     outcome: str,
 ) -> None:
     store, ids = family
-    expected = {ids[name] for name in ("parent", "active", "cold", "grandchild")}
+    expected = {ids[name] for name in ("parent", "active", "cold", "finished", "grandchild")}
 
     async def teardown(*_args, **_kwargs):
         assert set(sessions._intentional_stop_sessions) == expected
@@ -196,7 +196,9 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
         else:
             assert await asyncio.wait_for(stop, timeout=10) is (outcome == "stopped")
         expected_stop = outcome in {"cancelled", "timeout", "stopped"}
-        expected_markers = {ids[name] for name in ("parent", "active", "cold", "grandchild")}
+        expected_markers = {
+            ids[name] for name in ("parent", "active", "cold", "finished", "grandchild")
+        }
         assert set(sessions._intentional_stop_sessions) == (
             expected_markers if expected_stop else set()
         )
@@ -312,7 +314,7 @@ async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
     cursors: list[str | None] = []
     expected = {ids["parent"], ids["cold"]}
     if first_page_succeeds:
-        expected.add(ids["active"])
+        expected |= {ids["active"], ids["finished"]}
 
     def unavailable(_runner_id, *, after=None, **_kwargs):
         cursors.append(after)
@@ -338,11 +340,11 @@ async def test_stop_uses_live_relay_binding_when_row_lookup_fails(
         await task
 
 
-async def test_child_turn_started_during_teardown_remains_a_reported_failure(
+async def test_idle_child_activity_during_teardown_settles_as_stopped(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """New child work is outside the stop's snapshot of already active turns."""
+    """The exiting runner can still mirror activity into a child that was idle."""
     store, ids = family
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -368,9 +370,10 @@ async def test_child_turn_started_during_teardown_remains_a_reported_failure(
             store.list_conversations_by_runner_id(_RUNNER), error, store
         )
         assert sessions._session_status_cache[ids["active"]] == "idle"
-        assert sessions._session_status_cache[child_id] == "failed"
-        persisted = sessions._last_task_error_from_labels(store.get_conversation(child_id).labels)
-        assert persisted is not None and persisted["code"] == "runner_disconnected"
+        assert sessions._session_status_cache[child_id] == "idle"
+        assert (
+            sessions._last_task_error_from_labels(store.get_conversation(child_id).labels) is None
+        )
     finally:
         release.set()
         stop.cancel()
@@ -386,7 +389,7 @@ async def test_stop_burst_does_not_evict_other_pending_stops(
     pending = {f"pending-stop-{i}": "runner-previous-stop" for i in range(16384)}
     sessions._intentional_stop_sessions.update(pending)
     expected = pending | {
-        ids[name]: _RUNNER for name in ("parent", "active", "cold", "grandchild")
+        ids[name]: _RUNNER for name in ("parent", "active", "cold", "finished", "grandchild")
     }
 
     async def teardown(*_args, **_kwargs):
