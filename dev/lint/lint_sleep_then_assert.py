@@ -77,6 +77,9 @@ def _is_empty_literal(node: ast.AST) -> bool:
 
 
 def _checks_absence(test: ast.expr) -> bool:
+    # `a and b` checks absence only when every operand does.
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        return all(_checks_absence(value) for value in test.values)
     if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
         return True
     if isinstance(test, ast.Compare) and len(test.ops) == 1:

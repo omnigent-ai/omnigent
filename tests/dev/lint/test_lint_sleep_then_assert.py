@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
+import yaml
+
 import dev.lint.lint_sleep_then_assert as lint
 
 _SOURCE = """\
@@ -53,13 +58,18 @@ async def test_keywords_and_mixed_checks(page, task, worker, failed):
     await asyncio.sleep(0.1)
     result = await asyncio.to_thread(worker.result)
     assert result
+    time.sleep(1)
+    assert not task.done() and failed == []
+    time.sleep(1)
+    assert not task.done() and worker.done
 """
 
 
 def test_flags_fixed_sleeps_that_an_instant_presence_assert_relies_on() -> None:
     # Flagged: positional and keyword sleeps, a presence check after an absence check,
-    # and a check after an unrelated `to_*` call that is not Playwright's expect().
-    assert lint.sleep_then_assert_lines(_SOURCE) == [6, 11, 36, 40, 46]
+    # a check after an unrelated `to_*` call that is not Playwright's expect(), and an
+    # `and` mixing absence with presence. An all-absence `and` is not flagged.
+    assert lint.sleep_then_assert_lines(_SOURCE) == [6, 11, 36, 40, 46, 51]
 
 
 def test_baseline_rejects_new_cases_and_asks_to_lower_fixed_ones() -> None:
@@ -72,3 +82,11 @@ def test_baseline_rejects_new_cases_and_asks_to_lower_fixed_ones() -> None:
     ]
     assert "0 grandfathered" in violations[0]
     assert "lower its count" in violations[1]
+
+
+def test_precommit_hook_runs_when_only_the_baseline_changes() -> None:
+    config = yaml.safe_load(Path(".pre-commit-config.yaml").read_text())
+    hook = next(
+        hook for repo in config["repos"] for hook in repo["hooks"] if hook["id"] == "custom-lint"
+    )
+    assert re.search(hook["files"], lint.BASELINE.relative_to(Path.cwd()).as_posix())
