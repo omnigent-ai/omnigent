@@ -31,11 +31,15 @@ __all__ = [
     "diagnose_client_update_required",
     "diagnose_codex_compaction_model_failure",
     "diagnose_codex_model_rejection",
+    "diagnose_codex_provider_auth_failure",
     "diagnose_model_unavailable",
+    "is_codex_provider_auth_failure",
 ]
 
 # A Codex turn failed while compacting on the thread's previous model, not the selected one.
 CODEX_COMPACTION_MODEL_FAILED = "codex_compaction_model_failed"
+# A Codex turn failed because the model provider's token command gave Codex no token.
+CODEX_PROVIDER_AUTH_FAILED = "codex_provider_auth_failed"
 
 
 @dataclass(frozen=True)
@@ -268,6 +272,18 @@ _CLIENT_UPDATE_REQUIRED = re.compile(
     r"\s+version\s+(?P<required>\S+)\s+or newer is required",
     re.IGNORECASE,
 )
+# Codex's report that a model provider's ``auth.command`` gave it no token, e.g.
+# "provider auth command `isaac` exited with status exit status: 1: <helper stderr>".
+_CODEX_PROVIDER_AUTH_FAILURE = re.compile(
+    r"provider auth command `(?P<command>[^`\n]+)` (?P<outcome>exited with status"
+    r"|produced an empty token|timed out|failed to start|wrote non-UTF-8)"
+)
+_EXIT_STATUS_PREFIX = re.compile(r"^\s*(?:exit status: -?\d+|signal: \d+[^:\n]*):?\s*")
+_STORAGE_EXHAUSTED_FRAGMENTS = ("no space left on device", "disk quota exceeded")
+# Shells that wrap a token helper; the helper to run is in their arguments.
+_SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash"})
+# Persisted error labels hold 256 characters.
+_LABEL_LIMIT = 256
 
 
 def classify_native_turn_error(code: str, message: str) -> str:
@@ -280,7 +296,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
     deployment's byte cap before the model sees it). Also corrects
     ``codex_reauth_required`` when the message reveals that the real
     cause is a budget/usage-limit exhaustion (older runners misclassify the
-    gateway's 403 as auth; the server fixes it on deploy).
+    gateway's 403 as auth; the server fixes it on deploy), or a failed model
+    provider token command, which ``codex login`` cannot renew.
 
     :param code: Existing error code; specific diagnoses are preserved.
     :param message: Native harness error text, from its status or transcript.
@@ -289,6 +306,10 @@ def classify_native_turn_error(code: str, message: str) -> str:
     if code == CODEX_COMPACTION_MODEL_FAILED:
         # Its budget text names the previous model's limit; the card explains it.
         return code
+    if code in {"codex_turn_error", "codex_reauth_required"} and is_codex_provider_auth_failure(
+        message
+    ):
+        return CODEX_PROVIDER_AUTH_FAILED
     lowered = message.lower()
     if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
         return "budget_exhausted"
@@ -335,6 +356,92 @@ def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
             f"version {match.group('required')} or newer is required."
         ),
         remediation="Run `claude update` on the host, then start a new session.",
+    )
+
+
+def is_codex_provider_auth_failure(message: str) -> bool:
+    """Report whether *message* is Codex failing to run a model provider's token command."""
+    return _CODEX_PROVIDER_AUTH_FAILURE.search(message) is not None
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else f"{text[: max(limit - 1, 0)].rstrip()}…"
+
+
+def _provider_auth_helper_output(remainder: str) -> str | None:
+    """Return the token command's last output line from the text after Codex's outcome."""
+    lines = [
+        line.strip()
+        for line in _EXIT_STATUS_PREFIX.sub("", remainder.lstrip(": "), count=1).splitlines()
+        # Older runners append a `codex login` hint after the helper's output.
+        if line.strip() and "`codex login`" not in line
+    ]
+    return lines[-1] if lines else None
+
+
+def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | None:
+    """Explain a model provider token command that failed, naming the command to run.
+
+    A custom Codex model provider can set ``auth.command`` (for example
+    ``isaac``) to print a bearer token. Its output can identify an expired
+    login or exhausted host storage, which need different recovery steps.
+
+    :param message: Codex's turn error, e.g. ``"provider auth command `isaac`
+        exited with status exit status: 1: ... Run `isaac` to log in and try again."``.
+    :returns: A diagnosis whose fields each fit a persisted label, or ``None``
+        when *message* is not that failure.
+    """
+    match = _CODEX_PROVIDER_AUTH_FAILURE.search(message)
+    if match is None:
+        return None
+    command = _clip(match.group("command").strip(), 80)
+    shell_wrapped = command.rsplit("/", 1)[-1] in _SHELL_PROGRAMS
+    outcome = match.group("outcome")
+    helper_output = _provider_auth_helper_output(message[match.end() :])
+    if outcome == "exited with status":
+        result = "failed on the host"
+    elif outcome == "failed to start":
+        result = "couldn't be started on the host"
+    elif outcome == "timed out":
+        result, helper_output = "timed out on the host", None
+    else:
+        result, helper_output = "returned no usable token", None
+    subject = "The model provider's token command" + ("" if shell_wrapped else f" `{command}`")
+    cause = f"{subject} {result}"
+    cause = (
+        f"{cause}: {_clip(helper_output, _LABEL_LIMIT - len(cause) - 2)}"
+        if helper_output
+        else f"{cause}."
+    )
+    if helper_output and any(
+        fragment in helper_output.lower() for fragment in _STORAGE_EXHAUSTED_FRAGMENTS
+    ):
+        return FailureDiagnosis(
+            title="Host storage is full",
+            cause=cause,
+            remediation=(
+                "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+                "then send your message again."
+            ),
+            category=ErrorCategory.HOST,
+        )
+    if outcome == "failed to start":
+        remediation = (
+            f"Check that `{command}` is installed and on PATH on the host, "
+            "then send your message again."
+        )
+    elif shell_wrapped:
+        remediation = (
+            "Sign in to the model provider again on the host, then send your message again."
+        )
+    else:
+        remediation = (
+            f"Run `{command}` on the host to sign in again, then send your message again."
+        )
+    return FailureDiagnosis(
+        title="Codex couldn't get a model provider token",
+        cause=cause,
+        remediation=remediation,
     )
 
 
@@ -491,6 +598,9 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "codex_turn_error": "Codex ran into an error during this turn.",
     CODEX_COMPACTION_MODEL_FAILED: (
         "Codex couldn't compact the conversation on the previous model, so this turn didn't run."
+    ),
+    CODEX_PROVIDER_AUTH_FAILED: (
+        "Codex couldn't get a token from the model provider's sign-in command on the host."
     ),
     "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
     "agent_startup_pending": "The agent is still starting in the session terminal.",

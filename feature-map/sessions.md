@@ -24,7 +24,8 @@ the header menu), and each place is a separate entry point.
 - `search`: the sidebar's Search or ⌘K / Ctrl+K opens the command palette.
   Sessions whose title matches list under **Sessions**, then sessions matching
   only in chat content under **In messages** with a snippet; each group has its
-  own Show more.
+  own Show more. Archived sessions match too, marked **Archived**; the recent
+  sessions shown before typing leave them out.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to

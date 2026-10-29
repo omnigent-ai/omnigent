@@ -178,15 +178,16 @@ async def test_claude_program_status_real_launch_and_fallback(
         assert reader.status.state == "working"
         # A contradictory file and a quiet screen must not override live OSC.
         status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
-        await asyncio.sleep(1.4)  # Real elapsed time, longer than the pane idle threshold.
+        # Real elapsed time, longer than the pane idle threshold.
+        # custom-lint: disable-next=sleep-then-assert -- the fixed window is what's tested
+        await asyncio.sleep(1.4)
         assert statuses == [("running", None)]
-        for key in ("x", "o", "a", "y"):
+        # Child and other-app reports are ignored. The permission report arrives on the
+        # same stream after them, so once it is published they have all been read.
+        for key in ("x", "o", "a", "y", "b"):
             await instance.send(keys=key)
-        await asyncio.sleep(0.3)
-        assert reader.status is not None and reader.status.state == "working"
-        assert statuses == [("running", None)]
-        await instance.send(keys="b")
         await wait_status("running", "permission prompt")
+        assert statuses == [("running", None), ("running", "permission prompt")]
         for source in ("reconnect", "forwarded_idle"):
             before = len(statuses)
             if source == "reconnect":
