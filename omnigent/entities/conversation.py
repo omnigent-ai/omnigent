@@ -268,10 +268,13 @@ class Conversation:
     # outstanding approval-prompt count (None = never written);
     # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
     # seconds, None = no live stamp) — carried on the row so a session list
-    # can judge runner liveness without a second connectivity query.
+    # can judge runner liveness without a second connectivity query;
+    # ``background_work_running`` is whether a background shell outlives the
+    # ended turn (None = never written).
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    background_work_running: bool | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.

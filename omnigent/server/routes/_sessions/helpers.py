@@ -339,6 +339,8 @@ from omnigent.util.session_lifecycle import (
 )
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
+
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 
@@ -1375,16 +1377,45 @@ def _session_status_with_child_rollup(
     own_status = _session_status_from_cache(conversation_id, db_status)
     if own_status == "running":
         return "running"
-    # Background shells outliving a turn do NOT make the row running: the
-    # session takes a new message immediately, and the tally only refreshes on
-    # the next ``Stop`` hook, so a spinner keyed off it can outlive the shells.
-    # The in-chat indicator still reports them from the count.
+    # Background shells outliving a turn do NOT make the row's status running:
+    # the session takes a new message immediately. The row reports them in its
+    # separate ``background_work_running`` field instead.
     if any(
         _session_status_cache.get(child_id) in ("running", "waiting")
         for child_id in child_session_ids
     ):
         return "running"
     return own_status
+
+
+def _set_background_work_running(
+    session_id: str,
+    running: bool,
+    *,
+    runner_id: str | None = None,
+    handoffs: int | None = None,
+    reported_at: int | None = None,
+) -> Future[Any] | None:
+    """
+    Record whether a session's background shells outlive its ended turn.
+
+    The runner reports this from Claude's status file. The session list shows
+    such a session as working; its turn status is left alone, so a new message
+    still sends immediately. Every replica's list reads the stored row.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param running: ``True`` while a background shell outlives the turn.
+    :param runner_id: The reporting runner, when known; the stored flag is
+        written only while the session is still bound to it.
+    :param handoffs: ``session_live_state.handoff_count`` when the report arrived;
+        the stored write is skipped if the session was handed off since.
+    :param reported_at: When the runner decided *running*, in its epoch
+        nanoseconds; a report older than the stored one is not written.
+    :returns: Future of ``True`` once the write ran, or ``None`` without a store.
+    """
+    return session_live_state.persist_background_work_running(
+        session_id, running, runner_id=runner_id, handoffs=handoffs, reported_at=reported_at
+    )
 
 
 async def _collect_descendant_conversation_ids(
@@ -1501,6 +1532,9 @@ async def _apply_liveness_to_items(
         # runner reconnects (see ``_on_runner_connect``'s pending resync).
         if not result.runner_online:
             item.pending_elicitations_count = 0
+            # Background shells end with their runner, which may die without
+            # reporting it; the runner re-reports on reconnect.
+            item.background_work_running = False
 
 
 def _targeted_elicitation_event(
@@ -12493,6 +12527,7 @@ __all__ = [
     "_seed_missing_title_from_user_message",
     "_session_status_from_cache",
     "_session_status_with_child_rollup",
+    "_set_background_work_running",
     "_set_read_state",
     "_signal_harness_elicitation_resolved_by_id",
     "_signal_terminal_resolved_harness_elicitation",

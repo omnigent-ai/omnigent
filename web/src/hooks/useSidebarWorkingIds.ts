@@ -15,10 +15,10 @@ export function useSidebarWorkingIds(
     const now = Date.now();
     const deadlines = new Map<string, number>();
     for (const conversation of enabled ? conversations : []) {
-      const { id, status, pending_elicitations_count } = conversation;
+      const { id, status, pending_elicitations_count, background_work_running } = conversation;
       if (status === "failed" || (pending_elicitations_count ?? 0) > 0) continue;
       let until = workingUntil.current.get(id) ?? 0;
-      if (status === "running" || id === startingId) until = Infinity;
+      if (status === "running" || background_work_running || id === startingId) until = Infinity;
       else if (until === Infinity) until = now + 10_000;
       if (until > now) deadlines.set(id, until);
     }

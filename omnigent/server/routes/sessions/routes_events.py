@@ -134,6 +134,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_ACP_SUBAGENT_START_TYPE,
     _EXTERNAL_ANTIGRAVITY_SUBAGENT_START_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
+    _EXTERNAL_BACKGROUND_WORK_TYPE,
     _EXTERNAL_BTW_DISMISS_TYPE,
     _EXTERNAL_BTW_SIDECHAT_TYPE,
     _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
@@ -240,6 +241,7 @@ from omnigent.server.routes._sessions.helpers import (
     _resolve_harness,
     _response_agent_name_from_store,
     _session_status_from_cache,
+    _set_background_work_running,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
     _stream_live_events,
@@ -292,7 +294,7 @@ from omnigent.server.schemas import (
     McpServerStartup,
     SessionEventInput,
 )
-from omnigent.server.session_live_state import last_liveness_stamp
+from omnigent.server.session_live_state import handoff_count, last_liveness_stamp
 from omnigent.server.session_metadata_logging import log_session_metadata
 from omnigent.server.session_orchestration import require_orchestration_source
 from omnigent.server.startup_inputs import StartupDispatch, StartupInputContext
@@ -862,6 +864,15 @@ def register_events_routes(
         runner_id = getattr(conv, "runner_id", None)
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
+    def _reporting_runner_id(
+        request: Request | _RunnerEventContext | StartupInputContext,
+    ) -> str | None:
+        """Return the runner that sent *request*, or ``None`` for a non-runner caller."""
+        if isinstance(request, _RunnerEventContext):
+            return request.runner_id
+        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
+        return token_bound_runner_id(token) if token else None
+
     def _has_runner_created_by_authority(
         request: Request | _RunnerEventContext | StartupInputContext, conv: Any
     ) -> bool:
@@ -1120,6 +1131,9 @@ def register_events_routes(
         - ``"external_session_status"`` publishes a terminal-observed
           ``session.status`` edge without persisting an item or
           starting/steering a task.
+        - ``"external_background_work"`` records whether work outlives the
+          ended turn (``data.running`` boolean) for the sidebar only; it
+          publishes no status edge.
         - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
           for transcript inactivity without forwarding a completion
           to the runner.
@@ -1172,6 +1186,8 @@ def register_events_routes(
             control and internal transient events.
         :raises OmnigentError: 404 if no session exists.
         """
+        # A report must not land on a replica that hands the session off before it is written.
+        handoffs_at_request = handoff_count(session_id)
         user_id, conv = await _authorized_conversation(
             request,
             session_id,
@@ -1311,6 +1327,7 @@ def register_events_routes(
             _EXTERNAL_BTW_DISMISS_TYPE,
             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
             _EXTERNAL_SESSION_STATUS_TYPE,
+            _EXTERNAL_BACKGROUND_WORK_TYPE,
             _SUBAGENT_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
             _EXTERNAL_PULL_REQUESTS_TYPE,
@@ -2550,6 +2567,52 @@ def register_events_routes(
                     session_id,
                     status,
                     runner_result,
+                )
+            return {"queued": False}
+        if body.type == _EXTERNAL_BACKGROUND_WORK_TYPE:
+            # Sidebar-only flag: no status edge, so the turn status stays as reported.
+            running = body.data.get("running")
+            if not isinstance(running, bool):
+                raise OmnigentError(
+                    f"external_background_work requires data.running to be a boolean; "
+                    f"got {running!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            reported_at = body.data.get("reported_at")
+            if reported_at is not None and (
+                not isinstance(reported_at, int)
+                or isinstance(reported_at, bool)
+                or reported_at < 0
+            ):
+                raise OmnigentError(
+                    f"external_background_work requires data.reported_at to be a non-negative "
+                    f"integer; got {reported_at!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            reporter = _reporting_runner_id(request)
+            if reporter is not None and conv.runner_id != reporter:
+                # A late report from a runner the session left must not overwrite its replacement.
+                raise OmnigentError(
+                    "session is not bound to this runner", code=ErrorCode.FORBIDDEN
+                )
+            if handoff_count(session_id) != handoffs_at_request:
+                # Handed to another replica mid-request: the runner retries there.
+                raise OmnigentError(
+                    "the session moved to another server replica; retry the report",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            written = _set_background_work_running(
+                session_id,
+                running,
+                runner_id=reporter,
+                handoffs=handoffs_at_request,
+                reported_at=reported_at,
+            )
+            # Acknowledge only a stored report, so the runner retries one that was not.
+            if written is not None and await asyncio.wrap_future(written) is not True:
+                raise OmnigentError(
+                    "the background-work report was not stored; retry it",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             return {"queued": False}
         if body.type == _EXTERNAL_COMPACTION_STATUS_TYPE:

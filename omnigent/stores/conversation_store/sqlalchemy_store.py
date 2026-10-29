@@ -28,6 +28,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
@@ -226,6 +227,26 @@ class _RowCountResult(Protocol):
     rowcount: int
 
 
+def _bind_runner(meta: SqlConversationMetadata, runner_id: str | None) -> None:
+    """
+    Set a session's runner, resetting its background flag when the runner changes.
+
+    Only the bound runner reports the flag, so the old runner's value would stay
+    on a moved or unbound session, and report times from two runners' clocks
+    would be compared. The reset is written even when the row was read with no
+    flag, since the old runner may have stored one after that read.
+
+    :param meta: The session's metadata row, inside the write transaction.
+    :param runner_id: The runner to bind, e.g. ``"runner_abc123"``, or ``None``.
+    """
+    if meta.runner_id != runner_id:
+        meta.background_work_running = None
+        meta.background_work_reported_at = None
+        flag_modified(meta, "background_work_running")
+        flag_modified(meta, "background_work_reported_at")
+    meta.runner_id = runner_id
+
+
 def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
@@ -311,6 +332,7 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
+        background_work_running=meta.background_work_running if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -3995,7 +4017,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
-                .values(runner_id=runner_id)
+                # A flag written while unbound is not the new runner's to report.
+                .values(
+                    runner_id=runner_id,
+                    background_work_running=None,
+                    background_work_reported_at=None,
+                )
             )
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
@@ -4171,6 +4198,59 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
+    def set_background_work_running(
+        self,
+        conversation_id: str,
+        running: bool,
+        *,
+        runner_id: str | None = None,
+        unseen_since: int | None = None,
+        reported_at: int | None = None,
+    ) -> None:
+        """
+        Persist whether a session's background shells outlive its ended turn.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param running: ``True`` while a background shell outlives the turn.
+        :param runner_id: When set, write only while the session is bound to it.
+        :param unseen_since: When set, write only while the runner was last seen
+            before this epoch second, or never.
+        :param reported_at: When set, write only if no newer report is stored.
+        """
+        from sqlalchemy import or_, update
+
+        conditions = [
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.id == conversation_id,
+        ]
+        if runner_id is not None:
+            conditions.append(SqlConversationMetadata.runner_id == runner_id)
+        if unseen_since is not None:
+            conditions.append(
+                or_(
+                    SqlConversationMetadata.runner_last_seen.is_(None),
+                    SqlConversationMetadata.runner_last_seen < unseen_since,
+                )
+            )
+
+        values: dict[str, object] = {"background_work_running": running}
+        if reported_at is not None:
+            conditions.append(
+                or_(
+                    SqlConversationMetadata.background_work_reported_at.is_(None),
+                    SqlConversationMetadata.background_work_reported_at < reported_at,
+                )
+            )
+            values["background_work_reported_at"] = reported_at
+
+        def write(session: Session) -> None:
+            session.execute(update(SqlConversationMetadata).where(*conditions).values(**values))
+
+        run_write_transaction(self._session_immediate, "set_background_work_running", write)
+
     def replace_runner_id(
         self,
         conversation_id: str,
@@ -4211,8 +4291,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             ):
                 raise ValueError("The session binding changed; retry the request")
             if expected_runner_id is None:
-                meta.runner_id = runner_id
+                _bind_runner(meta, runner_id)
             else:
+                # The old runner's background work is not the new runner's to report.
+                reset = (
+                    {"background_work_running": None, "background_work_reported_at": None}
+                    if runner_id != expected_runner_id
+                    else {}
+                )
                 session.execute(
                     update(SqlConversationMetadata)
                     .where(
@@ -4220,7 +4306,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationMetadata.id == conversation_id,
                         SqlConversationMetadata.runner_id == expected_runner_id,
                     )
-                    .values(runner_id=runner_id)
+                    .values(runner_id=runner_id, **reset)
                 )
                 session.refresh(meta)
             return meta
@@ -4263,7 +4349,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 or meta.host_id != expected_binding.host_id
             ):
                 raise ValueError("The session binding changed; retry the request")
-            meta.runner_id = None
+            _bind_runner(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_runner_id", write)
@@ -4326,7 +4412,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
-            meta.runner_id = None
+            _bind_runner(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)
@@ -4541,7 +4627,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     source.workspace,
                     source.git_branch,
                 )
-            meta.runner_id = runner_id
+            _bind_runner(meta, runner_id)
 
         run_write_transaction(self._session_immediate, "rotate_profiled_runner", write)
 
@@ -4618,7 +4704,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.git_branch = git_branch
             meta.host_id, meta.workspace = host_id, workspace
             if runner_id is not None:
-                meta.runner_id = runner_id
+                _bind_runner(meta, runner_id)
                 meta.runner_last_seen = None
             return previous
 
@@ -4644,12 +4730,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     previous.git_branch,
                     previous.runner_id,
                 )
-            meta.host_id, meta.workspace, meta.git_branch, meta.runner_id = (
+            meta.host_id, meta.workspace, meta.git_branch = (
                 previous.host_id,
                 previous.workspace,
                 previous.git_branch,
-                previous.runner_id,
             )
+            _bind_runner(meta, previous.runner_id)
             # Split databases retain the accepted reference if metadata rolls back;
             # deleting it first could leave a live binding without its profile.
             if previous.profile_snapshot is None and self._conv_engine is self._engine:
@@ -4698,7 +4784,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 meta.host_id = previous.host_id
                 meta.workspace = previous.workspace
                 meta.git_branch = previous.git_branch
-            meta.runner_id = previous.runner_id
+            _bind_runner(meta, previous.runner_id)
             return True
 
         return run_write_transaction(self._session_immediate, "rollback_profiled_runner", write)
