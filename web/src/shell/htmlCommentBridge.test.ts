@@ -202,6 +202,43 @@ describe("bridge runtime zoom shortcuts", () => {
   });
 
   it.each([
+    [["resize"], true],
+    [["selectionchange"], false],
+    [["resize", "selectionchange"], false],
+  ])("re-reports the selection after %o with reflow %s", (events, reflow) => {
+    vi.useFakeTimers();
+    try {
+      const port = startRuntime();
+      document.body.innerHTML = "<p>Quarterly revenue</p>";
+      // jsdom has no layout, so give the selected range a rect.
+      Range.prototype.getClientRects = () =>
+        [{ left: 1, top: 2, right: 3, bottom: 4 }] as unknown as DOMRectList;
+      document.getSelection()?.selectAllChildren(document.body);
+      vi.runAllTimers();
+      port.postMessage.mockClear();
+
+      for (const type of events) {
+        (type === "resize" ? window : document).dispatchEvent(new Event(type));
+      }
+      vi.advanceTimersByTime(150);
+      expect(port.postMessage.mock.calls).toEqual([
+        [
+          expect.objectContaining({
+            type: BRIDGE_MSG.selection,
+            text: "Quarterly revenue",
+            reflow,
+          }),
+        ],
+      ]);
+    } finally {
+      delete (Range.prototype as Partial<Range>).getClientRects;
+      document.getSelection()?.removeAllRanges();
+      document.body.innerHTML = "";
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
     ["document", () => document],
     ["window", () => window],
   ])("leaves the shortcut to an artifact %s listener that handles it", (_, target) => {
@@ -238,7 +275,16 @@ describe("parseBridgeMessage", () => {
       text: "Design Goals",
       occ: 2,
       rect: { left: 1, top: 2, right: 3, bottom: 4 },
+      reflow: false,
     });
+  });
+
+  it("marks a selection re-reported after the frame resized", () => {
+    const rect = { left: 0, top: 0, right: 0, bottom: 0 };
+    const parse = (reflow: unknown) =>
+      parseBridgeMessage({ ...base, type: BRIDGE_MSG.selection, text: "x", rect, reflow }, NONCE);
+    expect(parse(true)).toMatchObject({ reflow: true });
+    expect(parse("true")).toMatchObject({ reflow: false });
   });
 
   it("defaults occ to 0 when a selection message omits it (older frame)", () => {

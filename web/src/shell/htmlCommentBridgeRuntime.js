@@ -253,7 +253,7 @@
     return { range: sel.getRangeAt(0), text: text };
   }
 
-  function emitSelection() {
+  function emitSelection(reflow) {
     const s = currentSelection();
     if (s) {
       send({
@@ -261,6 +261,7 @@
         text: s.text,
         occ: selectionOccurrence(s.range, s.text),
         rect: rectOf(s.range),
+        reflow: reflow,
       });
     }
   }
@@ -309,13 +310,25 @@
   // React to programmatic and keyboard selection too; mouseup misses these.
   // Debounced and only emits non-empty selections; mouseup owns clearing.
   let selTimer = null;
-  function scheduleSelection() {
+  let reflowOnly = true;
+  function scheduleSelection(reflow) {
+    if (!reflow) reflowOnly = false;
     if (selTimer) clearTimeout(selTimer);
-    selTimer = setTimeout(emitSelection, 150);
+    selTimer = setTimeout(function () {
+      const onlyReflowed = reflowOnly;
+      selTimer = null;
+      reflowOnly = true;
+      emitSelection(onlyReflowed);
+    }, 150);
   }
-  document.addEventListener("selectionchange", scheduleSelection);
-  // Zooming the preview resizes this frame and reflows the selection.
-  window.addEventListener("resize", scheduleSelection);
+  document.addEventListener("selectionchange", function () {
+    scheduleSelection(false);
+  });
+  // A resize (such as a preview zoom) moves the selection without changing it;
+  // flag the report so the parent only repositions a button it still shows.
+  window.addEventListener("resize", function () {
+    scheduleSelection(true);
+  });
 
   function zoomAction(e) {
     if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;

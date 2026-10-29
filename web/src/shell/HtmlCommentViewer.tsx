@@ -59,6 +59,8 @@ interface FloatingAnchor {
   start_index: number;
   end_index: number;
   anchor_content: string;
+  /** Hidden until the frame re-reports the selection after a zoom reflow. */
+  awaitingReflow: boolean;
 }
 
 function genNonce(): string {
@@ -192,6 +194,7 @@ export function HtmlCommentViewer({
       // Selecting a range that already has a comment activates it (which
       // scrolls the panel to its card) rather than offering to add a new one.
       const existing =
+        !msg.reflow &&
         offsets &&
         commentsRef.current.find(
           (c) =>
@@ -214,13 +217,16 @@ export function HtmlCommentViewer({
       const rect = iframe.getBoundingClientRect();
       // The frame reports unscaled coordinates; the zoom wrapper scales them.
       const scale = zoomRef.current;
-      setFloating({
+      const anchor: FloatingAnchor = {
         x: rect.left + msg.rect.left * scale,
         y: rect.top + msg.rect.top * scale - 6,
         start_index: offsets?.start_index ?? 0,
         end_index: offsets?.end_index ?? 0,
         anchor_content: msg.text,
-      });
+        awaitingReflow: false,
+      };
+      // A reflow only moves a button that is still offered, never a dismissed one.
+      setFloating((current) => (msg.reflow && !current ? null : anchor));
     } else if (msg.type === BRIDGE_MSG.commentClick) {
       const c = commentsRef.current.find((x) => x.id === msg.id);
       if (c) {
@@ -241,7 +247,7 @@ export function HtmlCommentViewer({
         zoomRef.current = next;
         setZoom(next);
         // The frame resizes and re-reports the selection at its new position.
-        setFloating(null);
+        setFloating((current) => current && { ...current, awaitingReflow: true });
       }
       setZoomBadgeVisible(true);
       if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
@@ -343,6 +349,7 @@ export function HtmlCommentViewer({
         </div>
       </div>
       {floating &&
+        !floating.awaitingReflow &&
         canEdit &&
         createPortal(
           <button

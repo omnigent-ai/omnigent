@@ -71,6 +71,8 @@ export interface BridgeSelection {
    * parent anchors to the copy the user picked rather than the first match. */
   occ: number;
   rect: BridgeRect;
+  /** The frame resized and re-reported an unchanged selection at its new position. */
+  reflow: boolean;
 }
 
 export interface BridgeCommentClick {
@@ -131,7 +133,13 @@ export function parseBridgeMessage(data: unknown, nonce: string): InboundBridgeM
         // occ is optional for resilience against older frames — default to the
         // first occurrence, which is the pre-occurrence behavior.
         const occ = typeof d.occ === "number" && d.occ >= 0 ? d.occ : 0;
-        return { type: BRIDGE_MSG.selection, text: d.text, occ, rect: d.rect };
+        return {
+          type: BRIDGE_MSG.selection,
+          text: d.text,
+          occ,
+          rect: d.rect,
+          reflow: d.reflow === true,
+        };
       }
       return null;
     case BRIDGE_MSG.commentClick:

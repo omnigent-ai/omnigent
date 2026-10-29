@@ -285,12 +285,13 @@ describe("HtmlCommentViewer zoom", () => {
     renderViewer("<body><p>Quarterly revenue</p></body>");
     const { iframe, zoomBox } = previewParts();
     const { port, send } = await connectBridge(iframe);
-    const selectRevenue = () =>
+    const selectRevenue = (reflow = false) =>
       send({
         type: BRIDGE_MSG.selection,
         text: "revenue",
         occ: 0,
         rect: { left: 40, top: 30, right: 90, bottom: 45 },
+        reflow,
       });
     selectRevenue();
     await screen.findByRole("button", { name: "Add comment" });
@@ -302,16 +303,30 @@ describe("HtmlCommentViewer zoom", () => {
     );
     expect(screen.getByRole("button", { name: "Add comment" })).toBeTruthy();
 
-    // A real change drops it until the frame reports the reflowed selection.
+    // A real change hides it until the frame reports the reflowed selection.
     for (let step = 0; step < 5; step++) send({ type: BRIDGE_MSG.zoom, action: "in" });
     await waitFor(() => expect(zoomBox.style.transform).toBe("scale(2)"));
     expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
 
-    selectRevenue();
+    selectRevenue(true);
     const button = await screen.findByRole("button", { name: "Add comment" });
     // jsdom puts the frame at the origin, so the button sits at the scaled rect.
     expect(button.style.left).toBe("80px");
     expect(button.style.top).toBe("54px");
+
+    // Once dismissed, a later resize of the frame does not bring it back.
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
+    const stateFlushed = new Promise((resolve) => {
+      port.onmessage = (event: MessageEvent<{ type: string }>) => {
+        if (event.data.type === BRIDGE_MSG.setComments) resolve(null);
+      };
+    });
+    selectRevenue(true);
+    // The viewer answers ready with its state, after handling the earlier report.
+    send({ type: BRIDGE_MSG.ready });
+    await act(() => stateFlushed);
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
     port.close();
   });
 });
