@@ -41,13 +41,20 @@ _READY_SCREEN = "─" * 16 + "\n❯ \n" + "─" * 16 + "\n"
 _STABLE_ID = "0123456789abcdef0123456789abcdef"
 
 
-def _sign_in_refusal(*, undelivered: bool = True) -> str:
+_OWN_SIGN_IN_MESSAGE = (
+    "Claude Code is waiting for a sign-in in this session's terminal, "
+    "so the message was not delivered."
+)
+_ANOTHER_SESSION_SIGN_IN_MESSAGE = (
+    "Claude Code is waiting for a sign-in that another session started, "
+    "so the message was not delivered."
+)
+
+
+def _sign_in_refusal(*, undelivered: bool = True, message: str = _OWN_SIGN_IN_MESSAGE) -> str:
     error: dict[str, Any] = {
         "code": "databricks_sign_in_pending",
-        "message": (
-            "Claude Code is waiting for a sign-in in this session's terminal, "
-            "so the message was not delivered."
-        ),
+        "message": message,
         "title": "Claude Code can't start until you sign in to Databricks",
         "remediation": _SIGN_IN_STEP,
     }
@@ -289,9 +296,20 @@ def _quiet_pane(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in() -> None:
+@pytest.mark.parametrize(
+    "refusal_message",
+    [_OWN_SIGN_IN_MESSAGE, _ANOTHER_SESSION_SIGN_IN_MESSAGE],
+    ids=["own-prompt", "another-session-lock"],
+)
+async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in(
+    refusal_message: str,
+) -> None:
     """The refused message is neither failed nor lost; it goes out once the sign-in is done."""
-    app, harness, server = _build_app([_REFUSED, _DELIVERED])
+    refused = [
+        _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+        _sign_in_refusal(message=refusal_message),
+    ]
+    app, harness, server = _build_app([refused, _DELIVERED])
     sid = uuid.uuid4().hex
     async with _runner_client(app) as client:
         await _create_session(client, sid)
