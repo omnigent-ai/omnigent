@@ -63,6 +63,7 @@ class ScheduledTaskStore(ABC):
         project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
+        delegation_ref: str | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -94,6 +95,8 @@ class ScheduledTaskStore(ABC):
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``. Persistent dispatch sets ``completed``
             once a schedule has no remaining occurrences.
+        :param delegation_ref: Names the authorization grant a deployment uses to
+            act as the owner when the task fires; never a credential.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """

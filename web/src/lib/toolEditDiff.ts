@@ -1,17 +1,19 @@
 // The change a file-edit tool call made, as a unified diff with its added and
 // removed line counts. Edit tools carry exact old/new replacement pairs; Codex's
-// `apply_patch` carries a per-file diff from the harness.
+// `apply_patch` carries a per-file diff from the harness; a full-file write
+// carries only the new content.
 
 import { stripOmnigentPrefix } from "@/lib/toolTitle";
-import { isRecord } from "@/lib/toolValue";
+import { firstLine, isRecord, parseToolOutput } from "@/lib/toolValue";
 
 /** One file's part of an edit. */
 export interface FileDiffSection {
   path: string;
   /** Where a rename moved the file; absent when it stays put. */
   newPath?: string;
-  kind: "update" | "add" | "delete";
-  /** Diff lines: `+`, `-` and ` ` (context), with `@@` between hunks. */
+  /** `write`: a whole file written over one whose previous content is not recorded. */
+  kind: "update" | "add" | "delete" | "write";
+  /** Diff lines: `+`, `-` and ` ` (context), with `@@` between hunks; a `write` is the plain content. */
   text: string;
   additions: number;
   removals: number;
@@ -54,18 +56,68 @@ const MAX_LINE_DIFF_CELLS = 250_000;
 /** Claude `Edit`/`MultiEdit`, Omnigent `sys_os_edit`, Pi and OpenCode `edit`. */
 const EDIT_PAIR_TOOLS = new Set(["Edit", "MultiEdit", "sys_os_edit", "edit"]);
 
+/** Claude `Write`, Omnigent `sys_os_write`, Pi and OpenCode `write`. */
+const WRITE_TOOLS = new Set(["Write", "sys_os_write", "write"]);
+
+// Outputs that say a write created its file: Claude, and OpenCode's newer write
+// tool. Pi's and OpenCode's released writes do not say.
+const WRITE_CREATED_RE = /^(?:File created successfully at|Created file successfully): /;
+
 /** Tool names whose calls `getFileEditDiff` understands. */
-export const FILE_EDIT_TOOL_NAMES: readonly string[] = [...EDIT_PAIR_TOOLS, "apply_patch"];
+export const FILE_EDIT_TOOL_NAMES: readonly string[] = [
+  ...EDIT_PAIR_TOOLS,
+  "apply_patch",
+  ...WRITE_TOOLS,
+];
 
 /**
  * The diff an edit call describes, or `null` when its arguments carry no change.
  * A batch's counts add up each edit's own change, which can exceed the file's net change.
+ * A write is all added lines once its `output` says it created the file, and a
+ * `write` section otherwise, since what it replaced is not recorded.
  */
-export function getFileEditDiff(name: string, args: Record<string, unknown>): FileEditDiff | null {
+export function getFileEditDiff(
+  name: string,
+  args: Record<string, unknown>,
+  output: string | null = null,
+): FileEditDiff | null {
   const tool = stripOmnigentPrefix(name);
   if (EDIT_PAIR_TOOLS.has(tool)) return pairsDiff(editPairs(args), editPath(args));
   if (tool === "apply_patch") return patchChangesDiff(args.changes);
+  if (WRITE_TOOLS.has(tool)) {
+    return writeDiff(args, output !== null && writeCreatedFile(tool, output));
+  }
   return null;
+}
+
+/** Whether a write's output says the file did not exist before. */
+function writeCreatedFile(tool: string, output: string): boolean {
+  const parsed = parseToolOutput(output);
+  if (tool === "sys_os_write") {
+    return parsed.kind === "json" && isRecord(parsed.value) && parsed.value.created === true;
+  }
+  return WRITE_CREATED_RE.test(firstLine(parsed.text));
+}
+
+function writeDiff(args: Record<string, unknown>, created: boolean): FileEditDiff | null {
+  if (typeof args.content !== "string") return null;
+  const lines = splitLines(args.content);
+  const file: FileDiffSection = created
+    ? {
+        path: editPath(args),
+        kind: "add",
+        text: lines.map((line) => `+${line}`).join("\n"),
+        additions: lines.length,
+        removals: 0,
+      }
+    : { path: editPath(args), kind: "write", text: lines.join("\n"), additions: 0, removals: 0 };
+  return {
+    files: [file],
+    additions: file.additions,
+    removals: 0,
+    countsArePerMatch: false,
+    countsAreInexact: false,
+  };
 }
 
 /** Read one old/new pair, accepting each harness's key style. */

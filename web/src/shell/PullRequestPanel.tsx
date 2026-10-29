@@ -16,7 +16,7 @@
 // Data comes from the runner's read-only PR resource API (see
 // hooks/usePullRequests.ts), which shells out to the provider CLI + `git`.
 // While the runner and host are offline, the server's stored PRs
-// (hooks/useSessionPullRequests.ts) keep the picker and the selected PR's last
+// (hooks/useSessionPullRequests.ts) keep the list and the selected PR's last
 // summary.
 // `derivePullRequestPanelState` is the single switch that turns the info query
 // into what the panel shows: an outdated host, a non-git workspace, an
@@ -24,10 +24,15 @@
 // PR each render their own empty state, and an associated PR falls through to
 // the header + stacked diff.
 
+import { createPortal } from "react-dom";
+import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  ArrowLeftIcon,
+  CopyIcon,
+  EllipsisIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   ChevronsDownUpIcon,
@@ -63,6 +68,15 @@ import {
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
+import { toast } from "sonner";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -79,7 +93,6 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import {
@@ -88,6 +101,8 @@ import {
   useWorkspaceServeable,
 } from "@/hooks/useWorkspaceChangedFiles";
 import {
+  sessionPullRequestsKey,
+  type StoredPullRequests,
   storedListToShow,
   storesSessionPullRequests,
   useSessionPullRequests,
@@ -120,7 +135,7 @@ import {
   PullRequestTitle,
 } from "./PullRequestDetails";
 import { PullRequestLabels } from "./PullRequestLabels";
-import { PullRequestMerge } from "./PullRequestMerge";
+import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -164,15 +179,12 @@ function PullRequestEmptyState({
   );
 }
 
-/** The provider icon with the panel title, or icon-only (provider named for screen
- *  readers) where the PR picker needs the room. */
-function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
-  const Icon = copy.Icon;
+/** The panel's heading, hidden from sight (not from screen readers) where the PR
+ *  list and its controls need the room. The provider stays out of it: it belongs to
+ *  each request, so {@link PullRequestProviderIcon} carries it beside the title. */
+function PanelTitle({ showTitle = false }: { showTitle?: boolean }) {
   return (
-    <h2 className="flex shrink-0 items-center gap-2 font-medium text-ui" title={copy.label}>
-      <Icon size={14} className="shrink-0" aria-hidden />
-      {showTitle ? "Pull Requests" : <span className="sr-only">{copy.label}</span>}
-    </h2>
+    <h2 className={cn("shrink-0 font-medium text-ui", !showTitle && "sr-only")}>Pull Requests</h2>
   );
 }
 
@@ -337,6 +349,18 @@ function IconButton({
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** The request's provider, shown beside its title: a glyph, named on hover and for
+ *  screen readers. A session rarely spans providers, so it stays this quiet. */
+function PullRequestProviderIcon({ copy }: { copy: GitProviderCopy }) {
+  const Icon = copy.Icon;
+  return (
+    <span className="flex shrink-0 items-center text-muted-foreground" title={copy.label}>
+      <Icon size={14} className="shrink-0" aria-hidden />
+      <span className="sr-only">{copy.label}</span>
+    </span>
   );
 }
 
@@ -566,7 +590,9 @@ function CheckPill({
   runs,
   icon,
   className,
+  compact = false,
 }: {
+  compact?: boolean;
   label: string;
   count: number;
   /** All checks; filtered to this pill's bucket for the hover list. */
@@ -583,13 +609,14 @@ function CheckPill({
       <HoverCardTrigger asChild>
         <button
           type="button"
+          aria-label={`${count} ${label}`}
           className={cn(
             "inline-flex cursor-pointer items-center gap-0.5 rounded-full border px-1.5 py-px text-xs tabular-nums",
             className,
           )}
         >
           {icon}
-          {count} {label}
+          {count} {!compact && label}
         </button>
       </HoverCardTrigger>
       <HoverCardContent
@@ -725,6 +752,59 @@ function PullRequestCommentCard({
   );
 }
 
+function PullRequestCheckCounts({
+  checks,
+  compact = false,
+}: {
+  checks: PullRequestChecks;
+  compact?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <CheckPill
+        compact={compact}
+        label="passed"
+        count={checks.passing}
+        runs={checks.runs.filter((r) => r.bucket === "passing")}
+        icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+        className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="pending"
+        count={checks.pending}
+        runs={checks.runs.filter((r) => r.bucket === "pending")}
+        icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+        className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="failed"
+        count={checks.failing}
+        runs={checks.runs.filter((r) => r.bucket === "failing")}
+        icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+        className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="cancelled"
+        count={compact ? 0 : (checks.cancelled ?? 0)}
+        runs={checks.runs.filter((r) => r.bucket === "cancelled")}
+        icon={<BanIcon className="size-2.5 text-muted-foreground" />}
+        className="border-border bg-muted text-muted-foreground"
+      />
+      <CheckPill
+        compact={compact}
+        label="skipped"
+        count={compact ? 0 : (checks.skipped ?? 0)}
+        runs={checks.runs.filter((r) => r.bucket === "skipped")}
+        icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
+        className="border-border bg-muted text-muted-foreground"
+      />
+    </div>
+  );
+}
+
 /** The Summary tab body: reviewers beside labels, then CI checks with the Merge button, then
  *  the PR description, with dividers between. When the token can't read check runs, the
  *  Checks area says so instead of counts. */
@@ -778,43 +858,7 @@ function PullRequestSummaryTab({
                   </p>
                 )
               )}
-              <div className="flex flex-wrap items-center gap-1.5">
-                <CheckPill
-                  label="passed"
-                  count={checks.passing}
-                  runs={checks.runs.filter((r) => r.bucket === "passing")}
-                  icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
-                  className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-                />
-                <CheckPill
-                  label="pending"
-                  count={checks.pending}
-                  runs={checks.runs.filter((r) => r.bucket === "pending")}
-                  icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-                  className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                />
-                <CheckPill
-                  label="failed"
-                  count={checks.failing}
-                  runs={checks.runs.filter((r) => r.bucket === "failing")}
-                  icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-                  className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-                />
-                <CheckPill
-                  label="cancelled"
-                  count={checks.cancelled ?? 0}
-                  runs={checks.runs.filter((r) => r.bucket === "cancelled")}
-                  icon={<BanIcon className="size-2.5 text-muted-foreground" />}
-                  className="border-border bg-muted text-muted-foreground"
-                />
-                <CheckPill
-                  label="skipped"
-                  count={checks.skipped ?? 0}
-                  runs={checks.runs.filter((r) => r.bucket === "skipped")}
-                  icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
-                  className="border-border bg-muted text-muted-foreground"
-                />
-              </div>
+              <PullRequestCheckCounts checks={checks} />
             </section>
           )}
           {merge}
@@ -1039,6 +1083,190 @@ type Associations = Pick<
   "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
 >;
 
+function PullRequestListRow({
+  conversationId,
+  active,
+  association,
+  onSelect,
+  onUnlink,
+  unlinkPending,
+  hostOffline,
+  sandboxAsleep,
+}: {
+  conversationId: string;
+  active: boolean;
+  association: PullRequestAssociation;
+  onSelect: () => void;
+  onUnlink?: () => void;
+  unlinkPending: boolean;
+  hostOffline: boolean;
+  sandboxAsleep: boolean;
+}) {
+  const info = usePullRequestInfo(conversationId, {
+    poll: active ? "list" : false,
+    prUrl: association.url,
+  });
+  const canEdit = useCanEdit(conversationId);
+  const data = info.data ? normalizePullRequestInfo(info.data) : undefined;
+  const offline = hostOffline || info.error instanceof RunnerOfflineError;
+  const cachedPr = data?.pr?.url === association.url ? data.pr : undefined;
+  const pr = !offline ? cachedPr : undefined;
+  const summary = pr ?? association;
+  const checks = pr?.checks;
+  const mergeState = pr ? mergeButtonState(pr) : undefined;
+  const ready =
+    canEdit &&
+    !info.error &&
+    data?.capabilities.merging &&
+    pr?.state === "OPEN" &&
+    !pr.is_draft &&
+    mergeState?.kind === "ready";
+  const checksUnavailable = checks?.partial || pr?.checks_supported === false;
+  const checkStatus = (
+    <>
+      {checks && <PullRequestCheckCounts checks={checks} compact />}
+      {checksUnavailable && <span title="Some checks could not be loaded">Incomplete checks</span>}
+    </>
+  );
+  const title = (pr?.title ?? association.title)?.trim();
+  const identity = pullRequestLabel({ ...association, title: null });
+  const label = title ? `${identity} — ${title}` : identity;
+  const providerCopy = gitProviderCopy(
+    association.provider,
+    undefined,
+    association.provider_display,
+  );
+  const href = /^https:\/\//.test(association.url)
+    ? parseHttpUrl(association.url)?.href
+    : undefined;
+  return (
+    <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
+      <button
+        type="button"
+        onClick={onSelect}
+        title={label}
+        aria-label={label}
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-2 text-left text-ui focus-visible:outline-ring"
+      >
+        <GitPullRequestIcon
+          aria-hidden
+          className={cn(
+            "size-4 shrink-0",
+            !summary.state || summary.is_draft
+              ? "text-muted-foreground"
+              : summary.state === "OPEN"
+                ? "text-green-600"
+                : summary.state === "MERGED"
+                  ? "text-purple-500"
+                  : "text-red-500",
+          )}
+        />
+        <span className="truncate">
+          <span className="text-muted-foreground">{identity}</span>
+          {title && (
+            <>
+              {" "}
+              · <span className="font-medium">{title}</span>
+            </>
+          )}
+        </span>
+      </button>
+      <div className="flex max-w-[45%] shrink-0 flex-wrap items-center justify-end gap-1 text-xs text-muted-foreground">
+        {offline ? (
+          <>
+            {association.state && (
+              <PullRequestStatus
+                state={association.state}
+                isDraft={association.is_draft === true}
+              />
+            )}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span tabIndex={0} role="status" className="inline-flex items-center gap-1">
+                    <ServerOffIcon aria-hidden className="size-3" />
+                    {sandboxAsleep ? "Sandbox asleep" : "Host offline"}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-xs">
+                  {storedPullRequestHint(association, sandboxAsleep)}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </>
+        ) : ready && pr ? (
+          (checksUnavailable || !!checks?.failing || !!checks?.pending) && checkStatus
+        ) : info.error ? (
+          <span title={String(info.error)}>Status unavailable</span>
+        ) : !pr ? (
+          <span>{info.isLoading ? "Loading…" : "Status unavailable"}</span>
+        ) : pr.state !== "OPEN" ? (
+          <PullRequestStatus state={pr.state} />
+        ) : (
+          <>
+            {pr.is_draft && <span>Draft</span>}
+            {checkStatus}
+            {!checksUnavailable && checks?.total === 0 && !pr.is_draft && (
+              <span title={mergeState && "hint" in mergeState ? mergeState.hint : undefined}>
+                No checks
+              </span>
+            )}
+          </>
+        )}
+        {cachedPr && (
+          <PullRequestMerge
+            compact
+            showTrigger={!!ready}
+            unavailable={offline || !!info.error || !canEdit || !data?.capabilities.merging}
+            conversationId={conversationId}
+            prUrl={association.url}
+            pr={cachedPr}
+          />
+        )}
+      </div>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Actions for ${identity}`}
+            className="shrink-0"
+          >
+            <EllipsisIcon aria-hidden className="size-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {canEdit && onUnlink && (
+            <>
+              <DropdownMenuItem disabled={unlinkPending} onSelect={onUnlink}>
+                <Trash2Icon aria-hidden /> Unlink PR
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
+          {href && (
+            <DropdownMenuItem asChild>
+              <a href={href} target="_blank" rel="noreferrer">
+                <ExternalLinkIcon aria-hidden /> Open in {providerCopy.label}
+              </a>
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            onSelect={() => {
+              void copyText(association.url).then(
+                () => toast.success("PR link copied"),
+                () => toast.error("Couldn’t copy PR link"),
+              );
+            }}
+          >
+            <CopyIcon aria-hidden /> Copy PR link
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>
+  );
+}
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1047,16 +1275,18 @@ export function PullRequestPanel({
   /** False while the panel is mounted but hidden (collapsed rail); pauses the poll. */
   active?: boolean;
 }) {
-  const isMobileViewport = useIsMobileViewport();
+  const mobileHeaderTarget = useMobilePanelHeaderTarget();
+  const inMobileDrawer = mobileHeaderTarget !== undefined;
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [prPickerOpen, setPrPickerOpen] = useState(false);
-  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
-  // Select focuses rows on both pointer hover and keyboard navigation.
-  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
+  const [detailsSession, setDetailsSession] = useState<string>();
+  const showingDetails = detailsSession === conversationId;
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const info = usePullRequestInfo(conversationId, { poll: active, prUrl: selected });
+  const info = usePullRequestInfo(conversationId, {
+    poll: active ? (selected && !showingDetails ? "list" : true) : false,
+    prUrl: selected,
+  });
   const queryClient = useQueryClient();
   // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
   const wasActive = useRef(active);
@@ -1143,14 +1373,27 @@ export function PullRequestPanel({
   const update = useUpdateSessionPr(conversationId);
   const unlink = useUnlinkSessionPr(conversationId);
   useEffect(() => {
-    if (!selected && associations?.selected_pr_url) {
+    if (linked !== undefined && selected && !linked.some((pr) => pr.url === selected)) {
+      setSelection({ sessionId: conversationId, url: associations?.selected_pr_url });
+    } else if (!selected && associations?.selected_pr_url) {
       setSelection({ sessionId: conversationId, url: associations.selected_pr_url });
     }
-  }, [conversationId, selected, associations?.selected_pr_url]);
+  }, [conversationId, selected, associations?.selected_pr_url, linked]);
   const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
-  const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
+  const detailsInfo =
+    linked?.length === 0 && info.data
+      ? { ...info, data: { ...info.data, pr: null, selected_pr_url: undefined } }
+      : info;
+  const linkInEmptyState =
+    prs.length === 0 && derivePullRequestPanelState(detailsInfo).kind === "no-pr";
+  const unlinkPr = (prUrl: string) =>
+    unlink.mutate(prUrl, {
+      onSuccess: (remaining) => {
+        if (prUrl === selected) changeSelection(remaining.prs[0]?.url);
+      },
+    });
   const linkControls = (
     <>
       {linking && (
@@ -1165,10 +1408,22 @@ export function PullRequestPanel({
           }}
           onSubmit={(event) => {
             event.preventDefault();
+            if (linkNeedsHost) return;
             update.mutate(
               { url, action: "attach" },
               {
-                onSuccess: (data) => {
+                onSuccess: async (data) => {
+                  if (storesPrs && data.prs) {
+                    const key = sessionPullRequestsKey(conversationId);
+                    await queryClient.cancelQueries({ queryKey: key });
+                    queryClient.setQueryData<StoredPullRequests>(key, (previous) => ({
+                      prs: data.prs!.map((pr) => ({
+                        ...previous?.prs.find((storedPr) => storedPr.url === pr.url),
+                        ...pr,
+                      })),
+                      synced: previous?.synced ?? false,
+                    }));
+                  }
                   changeSelection(data.selected_pr_url);
                   setLinking(false);
                   setUrl("");
@@ -1182,12 +1437,13 @@ export function PullRequestPanel({
             autoFocus
             type="url"
             required
+            disabled={linkNeedsHost}
             value={url}
             onChange={(event) => setUrl(event.target.value)}
             placeholder={copy.prUrlPlaceholder}
             className="flex-1 focus-visible:ring-0"
           />
-          <Button type="submit" disabled={update.isPending}>
+          <Button type="submit" disabled={update.isPending || linkNeedsHost}>
             Link
           </Button>
           <Button type="button" variant="outline" onClick={() => setLinking(false)}>
@@ -1222,111 +1478,70 @@ export function PullRequestPanel({
       </div>
     ) : undefined;
   const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
+  const headerActions = (
+    <TooltipProvider delayDuration={0}>
+      <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+        {refreshIcon}
+      </IconButton>
+      {showTrackingControls && (
+        <IconButton
+          label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
+          disabled={linkNeedsHost}
+          onClick={() => setLinking(!linking)}
+        >
+          <PlusIcon className="size-3.5" aria-hidden="true" />
+        </IconButton>
+      )}
+      {showTrackingControls && selectedPr && showingDetails && (
+        <IconButton
+          label="Unlink PR"
+          disabled={unlink.isPending}
+          onClick={() => unlinkPr(selectedPr.url)}
+        >
+          <Trash2Icon className="size-3.5" aria-hidden="true" />
+        </IconButton>
+      )}
+    </TooltipProvider>
+  );
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {mobileHeaderTarget?.actions && createPortal(headerActions, mobileHeaderTarget.actions)}
+      {mobileHeaderTarget?.title &&
+        showingDetails &&
+        prs.length > 0 &&
+        createPortal(
+          <div data-mobile-panel-title>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-2"
+              aria-label={`All pull requests (${prs.length})`}
+              onClick={() => setDetailsSession(undefined)}
+            >
+              <ArrowLeftIcon className="size-3.5" /> All pull requests
+            </Button>
+          </div>,
+          mobileHeaderTarget.title,
+        )}
       {showTrackingControls ? (
-        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle={prs.length === 0} />
-          <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-            {prs.length > 0 && (
-              <TooltipProvider>
-                <Select
-                  open={prPickerOpen}
-                  onOpenChange={(open) => {
-                    setPrPickerOpen(open);
-                    setPrPickerTooltipOpen(false);
-                    setFocusedPrUrl(undefined);
-                  }}
-                  value={selected ?? associations.selected_pr_url ?? ""}
-                  onValueChange={changeSelection}
-                >
-                  <Tooltip
-                    open={prPickerTooltipOpen && !prPickerOpen}
-                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
-                  >
-                    <TooltipTrigger asChild>
-                      <SelectTrigger
-                        aria-label="Session pull request"
-                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                    </TooltipTrigger>
-                    {selectedPr && (
-                      <TooltipContent className="wrap-anywhere">
-                        {pullRequestLabel(selectedPr, associations.provider)}
-                      </TooltipContent>
-                    )}
-                  </Tooltip>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width)"
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") setPrPickerOpen(false);
-                    }}
-                  >
-                    {prs.map((pr) => (
-                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
-                        <TooltipTrigger asChild>
-                          <SelectItem
-                            value={pr.url}
-                            onFocus={() => setFocusedPrUrl(pr.url)}
-                            onBlur={() =>
-                              setFocusedPrUrl((current) =>
-                                current === pr.url ? undefined : current,
-                              )
-                            }
-                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
-                          >
-                            {pullRequestLabel(pr, associations.provider)}
-                          </SelectItem>
-                        </TooltipTrigger>
-                        <TooltipContent
-                          side={isMobileViewport ? "bottom" : "left"}
-                          className="wrap-anywhere"
-                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
-                        >
-                          {pullRequestLabel(pr, associations.provider)}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </TooltipProvider>
-            )}
-            <div className="ml-auto flex shrink-0 items-center gap-1">
-              <TooltipProvider delayDuration={0}>
-                <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
-                  {refreshIcon}
-                </IconButton>
-                <IconButton
-                  label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
-                  disabled={linkNeedsHost}
-                  onClick={() => setLinking(!linking)}
-                >
-                  <PlusIcon className="size-3.5" aria-hidden="true" />
-                </IconButton>
-                {selectedPr && (
-                  <IconButton
-                    label="Unlink PR"
-                    disabled={unlink.isPending}
-                    onClick={() =>
-                      unlink.mutate(selectedPr.url, {
-                        onSuccess: (remaining) => changeSelection(remaining.prs[0]?.url),
-                      })
-                    }
-                  >
-                    <Trash2Icon className="size-3.5" aria-hidden="true" />
-                  </IconButton>
-                )}
-              </TooltipProvider>
+        !inMobileDrawer && (
+          <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
+            <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
+              {prs.length > 0 && showingDetails && (
+                <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
+                  <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
+                </Button>
+              )}
+              <div className="ml-auto flex shrink-0 items-center gap-1">
+                {!inMobileDrawer && headerActions}
+              </div>
             </div>
           </div>
-        </div>
-      ) : panelState.kind !== "ready" ? (
+        )
+      ) : !inMobileDrawer && panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle />
+          <PanelTitle showTitle />
           {refreshButton}
         </div>
       ) : null}
@@ -1349,35 +1564,61 @@ export function PullRequestPanel({
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
-        <PullRequestPanelDetails
-          key={`${conversationId}:${selected ?? ""}`}
-          conversationId={conversationId}
-          info={info}
-          storedPr={storesPrs && hostOffline ? selectedPr : undefined}
-          notSynced={notSynced && !selectedPr}
-          showProviderIcon={!showTrackingControls}
-          refreshButton={!showTrackingControls ? refreshButton : undefined}
-          emptyStateAction={
-            associations?.tracking_available && linkInEmptyState ? (
-              <div className="mt-2 w-full max-w-sm">
-                {linkNeedsHost ? (
-                  <p role="status" className="text-ui text-muted-foreground">
-                    {sandboxAsleep
-                      ? "To link a PR, send a message to start the session’s sandbox."
-                      : "To link a PR, please reconnect the session’s host."}
-                  </p>
-                ) : (
-                  <>
-                    {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
-                    {linkControls}
-                  </>
-                )}
-              </div>
-            ) : (
-              openPrFallback
-            )
-          }
-        />
+        {prs.length > 0 && !showingDetails ? (
+          <ul aria-label="Pull requests" className="h-full overflow-y-auto">
+            {prs.map((pr) => (
+              <PullRequestListRow
+                key={pr.url}
+                conversationId={conversationId}
+                active={active}
+                association={{
+                  ...pr,
+                  provider: pr.provider ?? associations?.provider ?? undefined,
+                  provider_display:
+                    pr.provider_display ?? associations?.provider_display ?? undefined,
+                }}
+                hostOffline={hostOffline}
+                sandboxAsleep={sandboxAsleep}
+                unlinkPending={unlink.isPending}
+                onUnlink={associations?.tracking_available ? () => unlinkPr(pr.url) : undefined}
+                onSelect={() => {
+                  changeSelection(pr.url);
+                  setDetailsSession(conversationId);
+                }}
+              />
+            ))}
+          </ul>
+        ) : (
+          <PullRequestPanelDetails
+            key={`${conversationId}:${selected ?? ""}`}
+            conversationId={conversationId}
+            info={detailsInfo}
+            storedPr={storesPrs && hostOffline ? selectedPr : undefined}
+            notSynced={notSynced && !selectedPr}
+            showHeading={!inMobileDrawer && !showTrackingControls}
+            refreshButton={!inMobileDrawer && !showTrackingControls ? refreshButton : undefined}
+            emptyStateAction={
+              associations?.tracking_available && linkInEmptyState ? (
+                <div className="mt-2 w-full max-w-sm">
+                  {linkNeedsHost ? (
+                    <p role="status" className="text-ui text-muted-foreground">
+                      {sandboxAsleep
+                        ? "To link a PR, send a message to start the session’s sandbox."
+                        : "To link a PR, please reconnect the session’s host."}
+                    </p>
+                  ) : (
+                    <>
+                      {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
+                      {linkControls}
+                    </>
+                  )}
+                </div>
+              ) : (
+                openPrFallback
+              )
+            }
+          />
+        )}
       </div>
     </div>
   );
@@ -1397,6 +1638,18 @@ function useHostOffline(
   return serveable === false || sandboxAsleep || info.error instanceof RunnerOfflineError;
 }
 
+function storedPullRequestHint(pr: PullRequestAssociation, sandboxAsleep: boolean): string {
+  const lastSync = pr.state_checked_at
+    ? `Last sync time: ${absoluteTime(pr.state_checked_at * 1000)}. `
+    : "";
+  return (
+    lastSync +
+    (sandboxAsleep
+      ? "To load the PR details, send a message to start the session’s sandbox."
+      : "To load the PR details, please reconnect the session’s host.")
+  );
+}
+
 /**
  * The selected PR as the server last stored it, while the runner and host are
  * offline: its title, link and state. Everything else stays on the host, so the
@@ -1406,17 +1659,16 @@ function StoredPullRequestDetails({
   pr,
   copy,
   sandboxAsleep,
-  showProviderIcon,
+  showHeading,
   refreshButton,
 }: {
   pr: PullRequestAssociation;
   copy: GitProviderCopy;
   sandboxAsleep: boolean;
-  showProviderIcon: boolean;
+  showHeading: boolean;
   refreshButton?: React.ReactNode;
 }) {
   const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
-  const lastSync = pr.state_checked_at ? absoluteTime(pr.state_checked_at * 1000) : "";
   const href = /^https:\/\//.test(pr.url) ? pr.url : undefined;
   const label = (
     <>
@@ -1432,13 +1684,14 @@ function StoredPullRequestDetails({
       <div className="flex h-full min-h-0 flex-col" data-testid="github-stored-pr">
         <div className="shrink-0 border-b border-border px-3 pt-2 pb-2">
           <div className="flex items-center gap-2">
-            {showProviderIcon && <PanelTitle copy={copy} />}
+            {showHeading && <PanelTitle />}
             <span className="block min-w-0 truncate text-xs text-muted-foreground">
               {pr.repository}
             </span>
             <div className="ml-auto shrink-0">{refreshButton}</div>
           </div>
           <div className="mt-1 flex flex-nowrap items-center gap-2">
+            <PullRequestProviderIcon copy={copy} />
             {href ? (
               <a
                 href={href}
@@ -1456,10 +1709,7 @@ function StoredPullRequestDetails({
           </div>
         </div>
         <p role="status" className="p-3 text-ui text-muted-foreground">
-          {lastSync && `Last sync time: ${lastSync}. `}
-          {sandboxAsleep
-            ? "To load the PR details, send a message to start the session’s sandbox."
-            : "To load the PR details, please reconnect the session’s host."}
+          {storedPullRequestHint(pr, sandboxAsleep)}
         </p>
       </div>
     </TooltipProvider>
@@ -1471,7 +1721,7 @@ function PullRequestPanelDetails({
   info,
   storedPr,
   notSynced,
-  showProviderIcon,
+  showHeading,
   refreshButton,
   emptyStateAction,
 }: {
@@ -1481,7 +1731,7 @@ function PullRequestPanelDetails({
   storedPr?: PullRequestAssociation;
   /** Offline, and the server hasn't imported the session's PRs yet. */
   notSynced?: boolean;
-  showProviderIcon: boolean;
+  showHeading: boolean;
   refreshButton?: React.ReactNode;
   emptyStateAction?: React.ReactNode;
 }) {
@@ -1676,7 +1926,7 @@ function PullRequestPanelDetails({
         pr={storedPr}
         copy={gitProviderCopy(storedPr.provider, undefined, storedPr.provider_display)}
         sandboxAsleep={sandboxAsleep}
-        showProviderIcon={showProviderIcon}
+        showHeading={showHeading}
         refreshButton={refreshButton}
       />
     );
@@ -1859,7 +2109,7 @@ function PullRequestPanelDetails({
         <div className="shrink-0 border-b border-border pb-0.5">
           <div className="px-3 pt-2">
             <div className="flex items-center gap-2">
-              {showProviderIcon && <PanelTitle copy={copy} />}
+              {showHeading && <PanelTitle />}
               <span className="block min-w-0 truncate text-xs text-muted-foreground">
                 {data.repo?.name_with_owner ?? copy.label}
                 {data.branch && (
@@ -1873,6 +2123,7 @@ function PullRequestPanelDetails({
               <div className="ml-auto shrink-0">{refreshButton}</div>
             </div>
             <div className="mt-1 flex flex-nowrap items-center gap-2">
+              <PullRequestProviderIcon copy={copy} />
               <PullRequestTitle
                 // A different PR starts fresh, so an open title edit can't outlive its PR.
                 key={data.selected_pr_url ?? pr.url}

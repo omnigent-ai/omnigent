@@ -159,7 +159,10 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
         else page.get_by_role("complementary", name="Workspace")
     )
 
-    expect(rail.get_by_role("heading", name="Azure DevOps")).to_be_visible(timeout=30_000)
+    rail.get_by_role(
+        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
+    ).click()
+    expect(rail.get_by_title("Azure DevOps")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text("contoso/web/app", exact=False).first).to_be_visible()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text("!7", exact=True)).to_be_visible()
@@ -224,6 +227,9 @@ def test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Pull Requests").click()
 
+    rail.get_by_role(
+        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
+    ).click()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
     page.screenshot(path=tmp_path / "azure-partial-summary.png", animations="disabled")
@@ -332,8 +338,9 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(_SECOND_URL)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
+    panel.get_by_role(
+        "button", name="dev.azure.com/contoso/web/other !12 — Another repository", exact=True
+    ).click()
     expect(panel.get_by_text("Another repository", exact=True)).to_be_visible()
     panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     expect(
@@ -342,13 +349,17 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
         )
     ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-outside-workspace.png", animations="disabled")
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/app !7").click()
+    panel.get_by_role("button", name="All pull requests (2)").click()
+    panel.get_by_role(
+        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
+    ).click()
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/other !12").click()
+    panel.get_by_role("button", name="All pull requests (2)").click()
+    panel.get_by_role(
+        "button", name="dev.azure.com/contoso/web/other !12 — Another repository", exact=True
+    ).click()
     panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(page.get_by_test_id("composer-pr-link")).to_have_text("!7")
     page.screenshot(path=tmp_path / "azure-selection.png", animations="disabled")
 

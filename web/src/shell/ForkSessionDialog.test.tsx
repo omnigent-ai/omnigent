@@ -2,7 +2,8 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -12,7 +13,8 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
-import { ForkSessionDialog } from "./ForkSessionDialog";
+import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
+import { beginClone, cloneKey, pendingClones } from "./cloneRequests";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import {
   useAvailableAgents,
@@ -29,6 +31,7 @@ import {
   hostDirectoryMissing,
   useHostFilesystem,
 } from "@/hooks/useHostFilesystem";
+import { toast } from "sonner";
 
 const navigateMock = vi.fn();
 vi.mock("react-router-dom", async (importOriginal) => {
@@ -36,6 +39,12 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("sonner", () => ({
+  toast: Object.assign(
+    vi.fn(() => "cloning"),
+    { success: vi.fn(), error: vi.fn(), dismiss: vi.fn() },
+  ),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -83,6 +92,7 @@ const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const checkHostDirectoryMock = vi.mocked(checkHostDirectory);
 const hostDirectoryMissingMock = vi.mocked(hostDirectoryMissing);
 const prefetchAvailableAgentDetailsMock = vi.mocked(prefetchAvailableAgentDetails);
+const toastMock = vi.mocked(toast);
 
 function host(overrides: Partial<Host> = {}): Host {
   return {
@@ -135,10 +145,27 @@ function renderDialog(
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
     info?: Partial<ServerInfo>;
+    // Renders the form without its dialog, so hiding it keeps it mounted
+    // (as the dialog's close animation does).
+    bareForm?: boolean;
+    strict?: boolean;
   } = { sourceTitle: "My session" },
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+  const onClose = vi.fn();
+  const form = { visible: true, upToResponseId: props.upToResponseId };
+  const bareForm = () => (
+    <ForkSessionForm
+      sourceSessionId="conv_src"
+      sourceTitle={props.sourceTitle}
+      sourceWorkspace={props.sourceWorkspace}
+      sourceHostId={props.sourceHostId}
+      upToResponseId={form.upToResponseId}
+      visible={form.visible}
+      onClose={onClose}
+    />
+  );
   const dialog = () => (
     <ForkSessionDialog
       sourceSessionId="conv_src"
@@ -152,24 +179,58 @@ function renderDialog(
       onOpenChange={vi.fn()}
     />
   );
+  const shown = () => (props.bareForm ? bareForm() : dialog());
   const content = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
         <MemoryRouter>
           {props.info === undefined ? (
-            dialog()
+            shown()
           ) : (
             <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...props.info }}>
-              {dialog()}
+              {shown()}
             </CapabilitiesProvider>
           )}
         </MemoryRouter>
       </TooltipProvider>
     </QueryClientProvider>
   );
-  const utils = render(content());
-  return { ...utils, invalidateSpy, refresh: () => utils.rerender(content()) };
+  const strict = () => (props.strict ? <StrictMode>{content()}</StrictMode> : content());
+  const utils = render(strict());
+  const update = (next: Partial<typeof form>) => {
+    Object.assign(form, next);
+    utils.rerender(strict());
+  };
+  return { ...utils, invalidateSpy, onClose, update, refresh: () => utils.rerender(strict()) };
 }
+
+type ForkResponse = Awaited<ReturnType<typeof forkSession>>;
+
+/** Holds the next fork call open until the test settles it. */
+function pendingFork(): { succeed: () => void; fail: (message: string) => void } {
+  let succeed = () => {};
+  let fail = (_message: string) => {};
+  forkSessionMock.mockReturnValue(
+    new Promise<ForkResponse>((resolve, reject) => {
+      succeed = () => resolve({ id: "conv_fork" } as ForkResponse);
+      fail = (message) => reject(new Error(message));
+    }),
+  );
+  return { succeed: () => succeed(), fail: (message) => fail(message) };
+}
+
+/** Holds the directory pre-flight open until the test settles it with `problem`. */
+function pendingPreflight(problem: string | null = null): () => void {
+  let pass = () => {};
+  checkHostDirectoryMock.mockReturnValue(
+    new Promise<string | null>((resolve) => {
+      pass = () => resolve(problem);
+    }),
+  );
+  return () => pass();
+}
+
+const IDLE_LISTENER = { onSuccess: () => {}, onError: () => {} };
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
 function openHostSelect(): void {
@@ -200,6 +261,11 @@ beforeEach(() => {
   hostDirectoryMissingMock.mockReset();
   checkHostDirectoryMock.mockResolvedValue(null);
   prefetchAvailableAgentDetailsMock.mockReset();
+  pendingClones.clear();
+  toastMock.mockClear();
+  toastMock.success.mockClear();
+  toastMock.error.mockClear();
+  toastMock.dismiss.mockClear();
   setAgents(AVAILABLE_AGENTS, "claude-sdk");
   // The run-config section reads the source snapshot (to seed a same-harness
   // fork) and, for a native target, the host model catalog. Default both to
@@ -360,6 +426,8 @@ describe("ForkSessionDialog", () => {
     // refetch too — otherwise a filed fork stays missing from its folder.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["project-sessions"] });
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    expect(toastMock).not.toHaveBeenCalled();
+    expect(toastMock.success).not.toHaveBeenCalled();
   });
 
   it("spins the submit button while the fork is in flight", async () => {
@@ -459,6 +527,212 @@ describe("ForkSessionDialog", () => {
     );
     // A failed fork must not navigate the user away from the source session.
     expect(navigateMock).not.toHaveBeenCalled();
+    expect(toastMock.error).not.toHaveBeenCalled();
+    expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy");
+  });
+
+  describe("clone outliving its form", () => {
+    const CODING = {
+      sourceTitle: "My session",
+      sourceWorkspace: "/Users/a/repo",
+      sourceHostId: "host_1",
+      bareForm: true,
+    };
+
+    it("cancels a directory preflight when the form hides before it resolves", async () => {
+      const pass = pendingPreflight();
+      const { update } = renderDialog(CODING);
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      update({ visible: false });
+      pass();
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy"),
+      );
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(toastMock).not.toHaveBeenCalled();
+    });
+
+    it("keeps a closed directory preflight cancelled if the form reopens before it resolves", async () => {
+      const pass = pendingPreflight();
+      const { update } = renderDialog(CODING);
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      update({ visible: false });
+      update({ visible: true });
+      pass();
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy"),
+      );
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(toastMock).not.toHaveBeenCalled();
+    });
+
+    it("keeps a cancelled directory preflight's problem off the reopened form", async () => {
+      const fail = pendingPreflight("Directory not found");
+      const { update } = renderDialog(CODING);
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      update({ visible: false });
+      update({ visible: true });
+      fail();
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy"),
+      );
+      expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
+    });
+
+    it("reports a clone that succeeds after its form hides with an Open toast", async () => {
+      const fork = pendingFork();
+      const { update, onClose } = renderDialog({ bareForm: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      update({ visible: false });
+      await waitFor(() =>
+        expect(toastMock).toHaveBeenCalledWith(
+          "Creating session…",
+          expect.objectContaining({ duration: Infinity, closeButton: true }),
+        ),
+      );
+      fork.succeed();
+      await waitFor(() => expect(toastMock.success).toHaveBeenCalledTimes(1));
+      const [title, options] = toastMock.success.mock.calls[0];
+      expect(title).toBe("Session created");
+      expect(options).toMatchObject({ id: "cloning", duration: 10_000 });
+      expect(onClose).not.toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
+      (options as unknown as { action: { onClick: () => void } }).action.onClick();
+      expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+    });
+
+    it("reports a clone that fails after its form hides with a persistent error toast", async () => {
+      const fork = pendingFork();
+      const { update } = renderDialog({ bareForm: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      update({ visible: false });
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+      fork.fail("disk full");
+      await waitFor(() =>
+        expect(toastMock.error).toHaveBeenCalledWith("Couldn't create the session", {
+          id: "cloning",
+          description: "disk full",
+          duration: Infinity,
+          closeButton: true,
+        }),
+      );
+      expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
+    });
+
+    it("keeps a clone running after its dialog unmounts", async () => {
+      const fork = pendingFork();
+      const { unmount } = renderDialog();
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      unmount();
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+      fork.succeed();
+      await waitFor(() => expect(toastMock.success).toHaveBeenCalledTimes(1));
+      expect(navigateMock).not.toHaveBeenCalled();
+    });
+
+    it("takes a running clone back inline when the form shows again", async () => {
+      const fork = pendingFork();
+      const { update } = renderDialog({ bareForm: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      update({ visible: false });
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+      update({ visible: true });
+      expect(toastMock.dismiss).toHaveBeenCalledWith("cloning");
+      fork.fail("disk full");
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-error")).toHaveTextContent("disk full"),
+      );
+      expect(toastMock.error).not.toHaveBeenCalled();
+    });
+
+    it("shows a running clone on a new form instead of starting another", async () => {
+      const fork = pendingFork();
+      renderDialog();
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      cleanup();
+      renderDialog();
+      const submit = screen.getByTestId("fork-session-submit");
+      expect(submit).toHaveAttribute("aria-busy", "true");
+      expect(screen.getByText("Close", { selector: "button" })).toBeEnabled();
+      expect(screen.getByText(/You can close this, and it continues/)).toBeInTheDocument();
+      fireEvent.click(submit);
+      openAdvanced();
+      fireEvent.keyDown(screen.getByTestId("fork-session-title-input"), { key: "Enter" });
+      expect(forkSessionMock).toHaveBeenCalledTimes(1);
+      fork.fail("disk full");
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-error")).toHaveTextContent("disk full"),
+      );
+    });
+
+    it("does not reattach a clone that settled while the closing form remained mounted", async () => {
+      const fork = pendingFork();
+      const { update } = renderDialog({ bareForm: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      update({ visible: false });
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+      fork.succeed();
+      await waitFor(() => expect(toastMock.success).toHaveBeenCalledTimes(1));
+      update({ visible: true });
+      expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy");
+      expect(screen.getByRole("button", { name: "Cancel" })).toBeInTheDocument();
+      expect(toastMock.dismiss).not.toHaveBeenCalled();
+      expect(navigateMock).not.toHaveBeenCalled();
+    });
+
+    it("shows no loading toast when a StrictMode form mounts over a running clone", async () => {
+      beginClone(cloneKey("conv_src"), IDLE_LISTENER, vi.fn());
+      renderDialog({ bareForm: true, strict: true });
+      await Promise.resolve();
+      expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-busy", "true");
+      expect(toastMock).not.toHaveBeenCalled();
+    });
+
+    it("follows the running clone for the current cutoff and kind", () => {
+      beginClone(cloneKey("conv_src", "resp_cut"), IDLE_LISTENER, vi.fn());
+      beginClone(cloneKey("conv_src", null, true), IDLE_LISTENER, vi.fn());
+      const { update } = renderDialog({ bareForm: true });
+      expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy");
+      update({ upToResponseId: "resp_cut" });
+      expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-busy", "true");
+    });
+
+    it("allows a new clone once the user dismisses the running one's toast", async () => {
+      pendingFork();
+      const { update } = renderDialog({ bareForm: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      update({ visible: false });
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+      act(() => (toastMock.mock.calls[0][1] as { onDismiss: () => void }).onDismiss());
+      update({ visible: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(2));
+    });
+
+    it("reports the outcome once after the form hides and shows twice", async () => {
+      const fork = pendingFork();
+      const { update, onClose } = renderDialog({ bareForm: true });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      update({ visible: false });
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(1));
+      update({ visible: true });
+      update({ visible: false });
+      await waitFor(() => expect(toastMock).toHaveBeenCalledTimes(2));
+      update({ visible: true });
+      fork.succeed();
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledTimes(1));
+      expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(toastMock.success).not.toHaveBeenCalled();
+    });
   });
 
   it("offers history-preserving targets including cross-family codex-native", () => {
@@ -1434,6 +1708,35 @@ describe("ForkSessionDialog", () => {
       // Forked exactly once; the dialog showed no inline error (it handed off).
       expect(forkSessionMock).toHaveBeenCalledTimes(1);
       expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
+    });
+
+    it("selects a machine the desktop app connects over SSH", async () => {
+      setHosts([host({ host_id: "host_1" }), host({ host_id: "host_2", name: "devbox" })]);
+      const desktop = {
+        kind: "electron",
+        connectSshHost: vi.fn().mockResolvedValue({
+          ok: true,
+          identity: { serverUrl: "https://example.com", hostId: "host_2" },
+          shownInConsole: true,
+        }),
+      };
+      (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+      try {
+        renderDialog(CODING);
+        fireEvent.click(screen.getByTestId("fork-session-connect-host-toggle"));
+        fireEvent.change(await screen.findByTestId("ssh-connect-destination"), {
+          target: { value: "devbox" },
+        });
+        fireEvent.click(screen.getByTestId("ssh-connect-submit"));
+
+        await waitFor(() =>
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("devbox"),
+        );
+        expect(desktop.connectSshHost).toHaveBeenCalledWith("devbox");
+        expect(screen.queryByTestId("ssh-connect-form")).not.toBeInTheDocument();
+      } finally {
+        delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+      }
     });
 
     it("reveals connect-host instructions via the collapsible toggle when a host is online", () => {

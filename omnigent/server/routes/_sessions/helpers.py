@@ -978,55 +978,11 @@ def _structured_ask_user_question(
         questions, malformed options, etc.) — caller falls back to
         the binary preview-only render.
     """
-    if not isinstance(tool_input, dict):
-        return None
-    questions_raw = tool_input.get("questions")
-    if not isinstance(questions_raw, list) or not questions_raw:
-        return None
-    questions: list[dict[str, Any]] = []
-    for entry in questions_raw:
-        if not isinstance(entry, dict):
-            continue
-        question_text = entry.get("question")
-        if not isinstance(question_text, str) or not question_text:
-            continue
-        options_raw = entry.get("options")
-        if not isinstance(options_raw, list):
-            continue
-        options: list[dict[str, Any]] = []
-        for opt in options_raw:
-            if isinstance(opt, dict):
-                label = opt.get("label")
-                if not isinstance(label, str) or not label:
-                    continue
-                option: dict[str, Any] = {"label": label}
-                description = opt.get("description")
-                if isinstance(description, str) and description:
-                    option["description"] = description
-                # ``preview`` is an optional richer snippet some
-                # Claude builds attach to an option (rendered as a
-                # <pre> below the option list when selected). Ride
-                # it through verbatim so the UI can surface it.
-                preview = opt.get("preview")
-                if isinstance(preview, str) and preview:
-                    option["preview"] = preview
-                options.append(option)
-            elif isinstance(opt, str) and opt:
-                options.append({"label": opt})
-        if not options:
-            continue
-        question: dict[str, Any] = {
-            "question": question_text,
-            "options": options,
-            "multiSelect": entry.get("multiSelect") is True,
-        }
-        header = entry.get("header")
-        if isinstance(header, str) and header:
-            question["header"] = header
-        questions.append(question)
-    if not questions:
-        return None
-    return {"questions": questions}
+    # Shared with the claude-sdk elicitation bridge, which can't import
+    # server-route code; imported lazily to keep this module's import graph.
+    from omnigent.server.ask_user_question import structured_ask_user_question
+
+    return structured_ask_user_question(tool_input)
 
 
 def _canonical_tool_input(tool_input: dict[str, Any] | None) -> dict[str, Any]:
@@ -5241,22 +5197,23 @@ def _truncate_label(value: str, limit: int = _LABEL_VALUE_MAX_LEN) -> str:
     return value[: limit - 1] + "…"
 
 
-# Marks the log lines dropped between a runner exit's summary and its last line.
+# Marks the log lines dropped between a runner exit's summary and its cause.
 _ELIDED_LOG_LINES_MARKER = "\n…\n"
 # Shortest summary kept ahead of that line, e.g. "runner process exited with code 1".
 _RUNNER_EXIT_SUMMARY_MIN_CHARS = 40
+_RUNNER_NON_ERROR_LOG_LINE_RE = re.compile(
+    r"^(?:DEBUG|INFO|WARN(?:ING)?)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s"
+)
 
 
 def _truncate_error_message_label(message: str) -> str:
     """Fit a failure message into one label, keeping a runner exit's cause.
 
     A host's runner-exit report is a summary, then the runner's log tail under
-    :data:`RUNNER_LOG_TAIL_HEADING`. The tail's last line names the cause, e.g.
-    ``"error: runner tunnel rejected by server (HTTP 401 ...)"``, but head
-    truncation keeps only the summary and the start of a traceback, so a
-    reloaded session would no longer show why the runner died. For such a
-    report, keep the start of the summary and the whole last line. Any other
-    message is head-truncated by :func:`_truncate_label`.
+    :data:`RUNNER_LOG_TAIL_HEADING`. Keep the last failure line ahead of
+    trailing upload or cleanup diagnostics, falling back to the final log
+    line when no cause is available. Any other message is head-truncated by
+    :func:`_truncate_label`.
 
     :param message: The failure message, e.g. ``"runner process exited with
         code 1 (log on host: ~/x.log)\\n--- runner log tail ---\\n...\\nerror: boom"``.
@@ -5266,14 +5223,18 @@ def _truncate_error_message_label(message: str) -> str:
     if len(message) <= _LABEL_VALUE_MAX_LEN:
         return message
     summary, heading, tail = message.partition(f"\n{RUNNER_LOG_TAIL_HEADING}\n")
-    tail_lines = tail.strip().splitlines()
+    tail_lines = [line.strip() for line in tail.splitlines() if line.strip()]
     if not heading or not tail_lines:
         return _truncate_label(message)
+    cause_line = next(
+        (line for line in reversed(tail_lines) if not _RUNNER_NON_ERROR_LOG_LINE_RE.match(line)),
+        tail_lines[-1],
+    )
     budget = _LABEL_VALUE_MAX_LEN - len(_ELIDED_LOG_LINES_MARKER)
     summary_reserve = min(len(summary), _RUNNER_EXIT_SUMMARY_MIN_CHARS)
-    last_line = _truncate_label(tail_lines[-1].strip(), budget - summary_reserve)
-    summary = _truncate_label(summary, budget - len(last_line))
-    return f"{summary}{_ELIDED_LOG_LINES_MARKER}{last_line}"
+    cause_line = _truncate_label(cause_line, budget - summary_reserve)
+    summary = _truncate_label(summary, budget - len(cause_line))
+    return f"{summary}{_ELIDED_LOG_LINES_MARKER}{cause_line}"
 
 
 async def _persist_session_status_error_labels(

@@ -46,10 +46,12 @@ vi.mock("./ForkSessionDialog", () => ({
     sourceWorkspace?: string | null;
     sourceHostId?: string | null;
     sourceGitBranch?: string | null;
+    visible: boolean;
     onClose: () => void;
   }) => (
     <div
       data-testid="fork-session-form-stub"
+      data-visible={String(props.visible)}
       data-source-session-id={props.sourceSessionId}
       data-source-title={props.sourceTitle ?? ""}
       data-source-workspace={props.sourceWorkspace ?? ""}
@@ -462,6 +464,15 @@ describe("<ReconnectSessionDialog />", () => {
     expect(form).toHaveAttribute("data-source-workspace", "/Users/me/repo");
     expect(form).toHaveAttribute("data-source-host-id", "host_1");
     expect(form).toHaveAttribute("data-source-git-branch", "main");
+  });
+
+  it("shows the force-mounted fork form only while the Clone tab is active", () => {
+    renderDialog();
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "false");
+    switchToTab("reconnect-session-tab-clone");
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "true");
+    switchToTab("reconnect-session-tab-reconnect");
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "false");
   });
 
   it("the fork form's onClose closes the dialog", () => {

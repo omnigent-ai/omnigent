@@ -66,6 +66,7 @@ from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
 )
+from omnigent.host.launch_audit import request_client_audit_attributes
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -2501,6 +2502,8 @@ def create_app(
         operation, audit_route, audit_session_id = _resolve_audit_route(request)
         set_current_session_id(audit_session_id)
         reset_request_audit_attrs()
+        client_audit = request_client_audit_attributes(request.headers)
+        add_audit_attrs(**client_audit)
         if operation == "create_session":
             _logger.info(
                 "Session creation requested",
@@ -2518,6 +2521,7 @@ def create_app(
                 route=audit_route,
                 method=request.method,
                 request_id=request_id,
+                **client_audit,
             )
 
         failed = False
