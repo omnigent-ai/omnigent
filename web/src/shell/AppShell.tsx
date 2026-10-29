@@ -48,6 +48,7 @@ import {
   updateBridge,
 } from "@/lib/nativeBridge";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { startBrowserTabPagePersistence } from "@/lib/browserTabPages";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
@@ -1021,6 +1022,10 @@ function AppShellImpl() {
   useEffect(() => {
     resyncBrowserSuppression();
   }, []);
+
+  // Remember every browser tab's page (background sessions included) so tabs
+  // reopen where they were after a relaunch.
+  useEffect(() => startBrowserTabPagePersistence(), []);
 
   // Design-mode submit routing. Lives here (with the hoisted relay) because the
   // in-page popup posts back via preload IPC delivered to the always-mounted

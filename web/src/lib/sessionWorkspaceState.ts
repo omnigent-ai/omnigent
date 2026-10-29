@@ -42,6 +42,8 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
+  /** Last page of each open browser tab, keyed by tab id, so tabs reopen after a relaunch. */
+  browserTabPages?: Record<string, BrowserTabPage>;
   /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
    *  by design: side chats are ephemeral and vanish when the app is closed. */
   openSideChats?: string[];
@@ -53,6 +55,12 @@ export interface SessionWorkspaceState {
   terminalSplit?: TerminalSplitState;
 }
 
+/** A browser tab's last http(s) page. */
+export interface BrowserTabPage {
+  url: string;
+  title?: string;
+}
+
 export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
@@ -62,6 +70,8 @@ const MAX_SESSIONS = 100;
 // through many files can't bloat the store. Tabs are appended in open order, so
 // the most-recent (tail) entries are kept.
 const MAX_OPEN_FILES = 20;
+const MAX_BROWSER_URL_LENGTH = 8192;
+const MAX_BROWSER_TITLE_LENGTH = 512;
 
 function isValidWidth(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value > 0;
@@ -92,6 +102,34 @@ function uniqueIds(values: unknown[]): string[] {
       values.filter((value): value is string => typeof value === "string" && value !== ""),
     ),
   ];
+}
+
+/** A restorable tab page, or null for non-http(s), oversized or malformed input. */
+export function sanitizeBrowserTabPage(value: unknown): BrowserTabPage | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { url, title } = value as Record<string, unknown>;
+  if (typeof url !== "string" || url.length > MAX_BROWSER_URL_LENGTH) return null;
+  try {
+    const { protocol } = new URL(url);
+    if (protocol !== "http:" && protocol !== "https:") return null;
+  } catch {
+    return null;
+  }
+  const page: BrowserTabPage = { url };
+  if (typeof title === "string" && title.trim() !== "") {
+    page.title = title.slice(0, MAX_BROWSER_TITLE_LENGTH);
+  }
+  return page;
+}
+
+function sanitizeBrowserTabPages(value: unknown): Record<string, BrowserTabPage> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const pages: Record<string, BrowserTabPage> = {};
+  for (const [tabId, raw] of Object.entries(value)) {
+    const page = sanitizeBrowserTabPage(raw);
+    if (tabId !== "" && page) pages[tabId] = page;
+  }
+  return pages;
 }
 
 function sanitize(entry: unknown): SessionWorkspaceState {
@@ -131,6 +169,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
   }
+  const browserTabPages = sanitizeBrowserTabPages(record.browserTabPages);
+  if (browserTabPages) state.browserTabPages = browserTabPages;
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
   if (Array.isArray(record.openSubagentTabs))
     state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
@@ -201,6 +241,13 @@ export function saveSessionWorkspaceState(
   // runtime cap; this keeps the persisted rail from growing without bound.
   if (next.openBrowsers && next.openBrowsers.length > MAX_OPEN_FILES) {
     next.openBrowsers = next.openBrowsers.slice(-MAX_OPEN_FILES);
+  }
+  // A closed tab forgets its page.
+  if (next.browserTabPages) {
+    const open = new Set(next.openBrowsers ?? []);
+    next.browserTabPages = Object.fromEntries(
+      Object.entries(next.browserTabPages).filter(([tabId]) => open.has(tabId)),
+    );
   }
   // Same bound for side-chat tabs (also appended in open order).
   if (next.openSideChats && next.openSideChats.length > MAX_OPEN_FILES) {

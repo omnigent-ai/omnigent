@@ -130,6 +130,9 @@ the header menu), and each place is a separate entry point.
   cookies from a local Chrome profile into that same session jar (Site scope
   picks the host or a parent domain); the copy is in-memory and never written
   back to Chrome.
+- `browser-tab-restore`: a session's open browser tabs, including the agent's,
+  come back after the desktop app relaunches. Each is listed under its last
+  page's title and reopens that page when selected; a closed tab stays closed.
 - `canvas-workspace`: Main and project boards show only your sessions, including
   cached previews and reloads. Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps
@@ -889,6 +892,11 @@ plain `uv run pytest`, which starts a private server for the test.
   Chrome profile, so it is manual: sign into a site in Chrome, open that site in
   the pane, click the cookie button, confirm the native prompt, and check the
   page is signed in while an unrelated site in the same session is not.
+- **`browser-tab-restore` (real Electron, own environment):**
+  `web/electron/e2e/desktop_browser_tab_restore.e2e.js`. Open two Browser tabs
+  on different sites, quit and relaunch, and return to the session: both tabs
+  should be listed by title and each should load its page when clicked. Close
+  one, relaunch again, and confirm it stays closed.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide

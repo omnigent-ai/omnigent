@@ -41,6 +41,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { readBrowserTabPage } from "@/lib/browserTabPages";
 import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
 import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
@@ -205,12 +206,28 @@ export function BrowserPane({
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
-      if (!cancelled && !viewChanged && r?.exists) {
+      if (cancelled || viewChanged || !r) return;
+      if (r.exists) {
         setHasView(true);
         if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
+        return;
       }
+      // A tab restored after a relaunch has no view yet; reopen its saved page.
+      const saved = readBrowserTabPage(conversationId);
+      if (!saved || !bridge.browserOpenOrNavigate) return;
+      if (!urlEditingRef.current) setCurrentUrl(saved.url);
+      void bridge
+        .browserOpenOrNavigate(conversationId, saved.url, undefined, undefined)
+        .then((result) => {
+          if (!cancelled && !result.ok) {
+            setNavigationError(result.error ?? "Unable to reopen this page.");
+          }
+        })
+        .catch(() => {
+          if (!cancelled) setNavigationError("Unable to reopen this page.");
+        });
     });
 
     const unsubCreated = bridge.onBrowserViewCreated?.((payload) => {
