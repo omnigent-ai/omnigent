@@ -63,6 +63,10 @@ const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
+const TaskDetailPage = withPageView(
+  "tasks.detail",
+  lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -195,6 +199,14 @@ function AppRoutes({ basename }: AppProps) {
             }
           />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          <Route
+            path={`${prefix}/tasks/:taskId`}
+            element={
+              <FeatureGatedPage feature="automations_v2">
+                <TaskDetailPage />
+              </FeatureGatedPage>
+            }
+          />
           <Route
             path={`${prefix}/usage`}
             element={

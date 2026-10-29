@@ -51,6 +51,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -2126,6 +2127,47 @@ async def test_delete_reaped_managed_session_removes_durable_host(
     assert env.host_store.get_host(host.host_id) is None
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_capture"), [("?capture_logs=true", True), ("", False)]
+)
+async def test_delete_managed_session_forwards_capture_logs(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+    query: str,
+    expected_capture: bool,
+) -> None:
+    """``DELETE ?capture_logs=true`` asks managed teardown for the sandbox logs."""
+    from omnigent.server import managed_hosts
+
+    env = managed_session_env
+    host = env.host_store.register_managed_host(
+        host_id="3c4d5e6f7a8b49203a15c6d7e8f9a0b1",
+        name="managed-capture-delete",
+        user_id=RESERVED_USER_LOCAL,
+        token="managed-capture-delete-token",
+        provider="modal",
+        sandbox_id="sb-capture-delete",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    agent = await create_test_agent(env.client, name="managed-capture-delete-agent")
+    conversation = env.conv_store.create_conversation(
+        agent_id=agent["id"],
+        host_id=host.host_id,
+        workspace="/tmp/managed-capture-delete",
+    )
+    teardowns: list[bool] = []
+
+    async def record_teardown(*args: object, capture_logs: bool = False) -> None:
+        teardowns.append(capture_logs)
+
+    monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
+
+    response = await env.client.delete(f"/v1/sessions/{conversation.id}{query}")
+
+    assert response.status_code == 200, response.text
+    assert teardowns == [expected_capture]
+
+
 def _runner_exited_app(db_uri: str, tmp_path: Path) -> tuple[FastAPI, SqlAlchemyConversationStore]:
     """Build the full server app so ``host.runner_exited`` hits ``_on_runner_exited``.
 
@@ -2200,9 +2242,7 @@ async def test_runner_exited_logs_one_event_per_bound_session(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_crashed")
-    async with asyncio.timeout(5.0):
-        while len(_runner_exited_events(caplog)) < 2:
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: len(_runner_exited_events(caplog)) >= 2)
 
     events = _runner_exited_events(caplog)
     assert sorted(getattr(r, "session_id", None) for r in events) == sorted([parent.id, child.id])
@@ -2222,9 +2262,7 @@ async def test_runner_exited_without_bound_sessions_logs_sessionless_event(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_orphan")
-    async with asyncio.timeout(5.0):
-        while not _runner_exited_events(caplog):
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: _runner_exited_events(caplog))
     # Let any (incorrect) extra rows from the same frame land before counting.
     await asyncio.sleep(0.05)
 
@@ -2260,9 +2298,7 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     def _callback_failures() -> list[logging.LogRecord]:
         return [r for r in caplog.records if "on_runner_exited callback failed" in r.getMessage()]
 
-    async with asyncio.timeout(5.0):
-        while not _callback_failures():
-            await asyncio.sleep(0.01)
+    await poll_until_async(_callback_failures)
 
     events = _runner_exited_events(caplog)
     assert len(events) == 1

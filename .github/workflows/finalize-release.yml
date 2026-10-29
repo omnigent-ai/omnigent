@@ -42,7 +42,7 @@ jobs:
   # Maintainer-only, same gate as release.yml.
   authorize:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require admin/maintain role
@@ -62,7 +62,7 @@ jobs:
 
   checks:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       release_id: ${{ steps.draft.outputs.release_id }}
@@ -208,7 +208,7 @@ jobs:
   publish:
     needs: [authorize, checks]
     if: needs.checks.outputs.already_published != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: publish-release
     steps:

@@ -8,6 +8,7 @@ import {
   harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  missingHarnessCredentialCopy,
   resolveSetupSteps,
   skillInvocationPrefix,
 } from "./harnessSetup";
@@ -31,6 +32,19 @@ const info = (overrides: Partial<ServerInfo> = {}): ServerInfo =>
     installable_harnesses: ["codex", "codex-native", "pi", "pi-native"],
     ...overrides,
   }) as ServerInfo;
+
+describe("missingHarnessCredentialCopy", () => {
+  it.each([
+    ["codex-native", "Codex", "No ChatGPT account or API key on laptop"],
+    ["native-claude", "Claude Code", "No Claude subscription or API key on laptop"],
+    ["pi-native", "Pi", "No API key or gateway credential on laptop"],
+    ["cursor-native", "Cursor", "No credentials on laptop"],
+  ])("uses the credential wording for %s", (harness, harnessName, expectedStart) => {
+    expect(missingHarnessCredentialCopy(harness, harnessName, "laptop")).toBe(
+      `${expectedStart}, so new sessions can’t use ${harnessName}.`,
+    );
+  });
+});
 
 // A codex-shaped server descriptor: one-click install, then a UI-authable auth
 // step (the form lists subscription / API key / gateway; `command` is the
