@@ -820,17 +820,29 @@ def test_reconnect_renames_known_host_unless_another_host_holds_the_name(
 ) -> None:
     """A reconnect renames in place unless another of the owner's hosts holds the name."""
     owner = "grace@example.com"
-    earlier_box, current_box = "11" * 16, "22" * 16
+    earlier_box, current_box, deleted_box = "11" * 16, "22" * 16, "33" * 16
     host_store.upsert_on_connect(earlier_box, "ip-10-90-37-46", owner)
     host_store.set_offline(earlier_box)
+    host_store.register_managed_host(
+        host_id=deleted_box,
+        name="ip-10-90-50-7",
+        user_id=owner,
+        token="raw-launch-token",
+        provider="modal",
+        sandbox_id="sb-pending-cleanup",
+        token_expires_at=now_epoch() + 3600,
+    )
+    assert host_store.delete_host(deleted_box) is not None
     host_store.upsert_on_connect(current_box, "ip-10-90-45-193", owner)
 
     renamed = host_store.upsert_on_connect(current_box, "ip-10-90-18-185", owner)
     collided = host_store.upsert_on_connect(current_box, "ip-10-90-37-46", owner)
+    behind_tombstone = host_store.upsert_on_connect(current_box, "ip-10-90-50-7", owner)
 
     assert renamed.name == "ip-10-90-18-185"
     assert collided.name == "ip-10-90-18-185"
     assert collided.status == "online"
+    assert behind_tombstone.name == "ip-10-90-18-185"
     hosts = {host.host_id: host for host in host_store.list_hosts(owner)}
     assert hosts[current_box].name == "ip-10-90-18-185"
     assert hosts[earlier_box].name == "ip-10-90-37-46"

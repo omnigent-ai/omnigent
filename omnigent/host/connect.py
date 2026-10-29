@@ -5541,6 +5541,14 @@ class HostProcess:
     def _raise_connection_error(self, frame: HostConnectionErrorFrame) -> None:
         """Raise the lifecycle exception requested by a server error frame."""
         message = f"Host connection failed during {frame.stage}: {frame.error}"
+        fallback_name = self._identity.fallback_name
+        if frame.stage == "registration" and fallback_name is not None:
+            # Older servers fail registration when another host already holds the new name.
+            _print_host_status(
+                f"⚠ Registering as {self._identity.name!r} failed; retrying as {fallback_name!r}.",
+                stderr=True,
+            )
+            self._identity = HostIdentity(host_id=self._identity.host_id, name=fallback_name)
         if frame.retryable:
             raise HostRetryableConnectionError(message)
         raise HostConnectError(message)

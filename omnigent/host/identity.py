@@ -40,7 +40,8 @@ HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 MANAGED_HOST_TOKEN_HEADER = "X-Omnigent-Host-Token"
 
 # Records the hostname a generated ``name`` came from. While ``name`` still
-# equals it, ``name`` follows later hostname changes; a user-edited name is kept.
+# equals it, the host registers under the current hostname; a user-edited name is
+# kept. Writers of an explicitly chosen name set it to null.
 NAME_FROM_HOSTNAME_KEY = "name_from_hostname"
 
 # EC2's private-IP hostname, e.g. ``ip-10-90-37-46``. In a config saved before
@@ -57,10 +58,14 @@ class HostIdentity:
         Format: bare 32-char uuid4 hex.
     :param name: Human-readable name displayed in the Web UI
         host picker, e.g. ``"corey-laptop"``.
+    :param fallback_name: The name stored in config.yaml when *name* replaced
+        it with a newer hostname, e.g. ``"ip-10-90-45-193"``; registration
+        retries with it if the server refuses *name*. ``None`` otherwise.
     """
 
     host_id: str
     name: str
+    fallback_name: str | None = None
 
 
 HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
@@ -146,13 +151,11 @@ def _write_config(path: Path, cfg: dict[str, object]) -> None:
         raise
 
 
-def _name_is_stale_hostname(host_section: dict[object, object], name: str, hostname: str) -> bool:
-    """Whether *name* was generated from a hostname this machine no longer has."""
-    if name == hostname:
-        return False
+def _name_is_generated(host_section: dict[object, object], name: str, hostname: str) -> bool:
+    """Whether the stored *name* was generated from a hostname rather than chosen."""
     if NAME_FROM_HOSTNAME_KEY in host_section:
         return name == host_section[NAME_FROM_HOSTNAME_KEY]
-    return _EC2_PRIVATE_IP_HOSTNAME.fullmatch(name) is not None
+    return name == hostname or _EC2_PRIVATE_IP_HOSTNAME.fullmatch(name) is not None
 
 
 def load_or_create_host_identity(
@@ -167,7 +170,8 @@ def load_or_create_host_identity(
 
     A name generated from the hostname follows later hostname changes
     (e.g. a VM re-provisioned with a new IP-based hostname while its
-    home directory persists), keeping the same ``host_id``.
+    home directory persists), keeping the same ``host_id``. The stored
+    name is left in place and returned as ``fallback_name``.
 
     A *partial* host section is completed rather than discarded: a
     config.yaml that names the host (``host: {name: my-box}``) but
@@ -218,8 +222,13 @@ def load_or_create_host_identity(
     host_id = host_section.get("host_id")
     name = host_section.get("name")
     hostname = socket.gethostname()
-    if isinstance(name, str) and _name_is_stale_hostname(host_section, name, hostname):
-        name = None
+    fallback_name: str | None = None
+    record_provenance = False
+    if isinstance(name, str) and _name_is_generated(host_section, name, hostname):
+        record_provenance = NAME_FROM_HOSTNAME_KEY not in host_section
+        host_section[NAME_FROM_HOSTNAME_KEY] = name
+        if name != hostname:
+            name, fallback_name = hostname, name
 
     # A host_id read from config.yaml must be a valid (UUID-shaped) id, same
     # as the env override — an invalid one would only fail later, remotely, as
@@ -229,14 +238,20 @@ def load_or_create_host_identity(
         "to have one generated automatically."
     )
 
-    # Fully specified: honor the config as-is, nothing to persist.
+    # Fully specified: honor the config as-is, persisting only a legacy name's provenance.
     if host_id and name:
-        return HostIdentity(
+        identity = HostIdentity(
             host_id=_validated_host_id(
                 host_id, source=f"host_id in {path}", remedy=config_host_id_remedy
             ),
             name=name,
+            fallback_name=fallback_name,
         )
+        if record_provenance:
+            # Best effort: an unwritable config only repeats this on the next start.
+            with contextlib.suppress(OSError):
+                _write_config(path, cfg)
+        return identity
 
     # Otherwise complete the section, preserving any provided value and
     # generating only what's missing, then persist so the identity is
@@ -247,12 +262,10 @@ def load_or_create_host_identity(
         else uuid.uuid4().hex
     )
     if not name:
-        name = hostname
-        host_section[NAME_FROM_HOSTNAME_KEY] = hostname
-    identity = HostIdentity(host_id=host_id, name=name)
+        name = host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = hostname
+    identity = HostIdentity(host_id=host_id, name=name, fallback_name=fallback_name)
 
     host_section["host_id"] = identity.host_id
-    host_section["name"] = identity.name
     cfg["host"] = host_section
     _write_config(path, cfg)
 

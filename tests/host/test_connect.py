@@ -8319,6 +8319,30 @@ async def test_retryable_connection_error_escapes_live_receive_path() -> None:
     assert host._frame_tasks == set()
 
 
+async def test_registration_error_retries_with_stored_name_after_hostname_refresh() -> None:
+    """A server that refuses a refreshed name gets the stored name on the next hello."""
+    identity = HostIdentity(
+        host_id="host_test_connect", name="ip-10-90-37-46", fallback_name="ip-10-90-45-193"
+    )
+    host = HostProcess(identity, "https://app.example.databricks.com")
+    refusal = HostConnectionErrorFrame(
+        stage="registration",
+        error="UNIQUE constraint failed: hosts.workspace_id, hosts.user_id, hosts.name",
+        retryable=True,
+    )
+    tunnels = [_ConnectionErrorTunnel(refusal), _ConnectionErrorTunnel(refusal)]
+
+    for tunnel in tunnels:
+        with pytest.raises(HostRetryableConnectionError):
+            await host._serve_frames(tunnel)  # type: ignore[arg-type]
+
+    hellos = [decode_host_frame(tunnel.sent[0]) for tunnel in tunnels]
+    assert [hello.name for hello in hellos if isinstance(hello, HostHelloFrame)] == [
+        "ip-10-90-37-46",
+        "ip-10-90-45-193",
+    ]
+
+
 async def test_capabilities_are_initialized_once_across_reconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

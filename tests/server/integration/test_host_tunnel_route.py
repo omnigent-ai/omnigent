@@ -893,6 +893,27 @@ async def test_host_tunnel_reports_registration_failure(
     assert registry.get(_HOST_ID) is None
 
 
+async def test_renaming_to_a_held_name_without_the_check_is_a_retryable_registration_error(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server without the held-name check refuses it with a retryable registration error."""
+    app, registry, store = host_app
+    store.upsert_on_connect(
+        host_id="2555c28ab2a433488edd86d08ade2ce3", name="ip-10-90-37-46", user_id="local"
+    )
+    store.upsert_on_connect(host_id=_HOST_ID, name="ip-10-90-45-193", user_id="local")
+    monkeypatch.setattr(HostStore, "_name_held_by_other_host", lambda *_args, **_kwargs: False)
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await comm.send_input({"type": "websocket.receive", "text": _make_hello("ip-10-90-37-46")})
+
+    sent = await comm.receive_output(timeout=budget(1.0))
+    error = decode_host_frame(sent["text"])
+    assert isinstance(error, HostConnectionErrorFrame)
+    assert (error.stage, error.retryable) == ("registration", True)
+    assert registry.get(_HOST_ID) is None
+
+
 async def test_registry_failure_marks_persisted_host_offline(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,

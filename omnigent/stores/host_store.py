@@ -367,10 +367,8 @@ class HostStore:
                         params={"host_id": host_id, "user_id": user_id},
                         orig=Exception("UNIQUE constraint failed: hosts.host_id"),
                     )
-                # Known host_id (same user_id, or reown opted in): update
-                # user_id/name in case they changed, then refresh status and timestamp.
-                # A name another of the owner's hosts holds (e.g. an IP-based
-                # hostname reused by an earlier machine) is unavailable; keep ours.
+                # Known host_id (same user_id, or reown opted in): refresh owner, status and
+                # timestamp; rename unless another owner row (even a tombstone) holds the name.
                 if name != row.name and not self._name_held_by_other_host(
                     session, host_id=host_id, user_id=user_id, name=name
                 ):
