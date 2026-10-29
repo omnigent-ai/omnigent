@@ -797,6 +797,33 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_restoring_a_removed_entry_preserves_its_missing_record_disposition(
+    hold: bool, uncertain: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eviction or non-held drain must not turn an ambiguous receipt into a loss."""
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    if uncertain:
+        pending_inputs.mark_uncertain("conv_a")
+    drained = pending_inputs.resolve_oldest("conv_a", hold=hold)
+    assert drained is not None
+    if hold:
+        now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+    pending_inputs.restore("conv_a", drained)
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_a", "later")
+
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert [entry.pending_id for entry in matched.uncertain] == ([first] if uncertain else [])
+    assert [entry.pending_id for entry in matched.skipped] == ([] if uncertain else [first])
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
 def test_pending_ids_lists_queued_unheld_entries_in_queue_order() -> None:
     """The interrupt route reads the queue before it forwards the Stop."""
     first = pending_inputs.record("conv_a", [_text_block("first")])

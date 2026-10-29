@@ -108,6 +108,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    SessionActivity,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -195,6 +196,9 @@ def _like_contains_pattern(query: str) -> str:
 # read size (row payloads vary) while the default 100-row page stays the
 # single statement it always was.
 _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
+
+# Max stable ids bound per idempotency-probe statement; each can match a full row.
+_APPEND_STABLE_ID_PROBE_BATCH = _LIST_ITEMS_MAX_ROWS_PER_STATEMENT
 
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
@@ -1379,6 +1383,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in meta_rows
         }
+
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
+        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        if not conversation_ids:
+            return {}
+        unique_ids = list(set(conversation_ids))
+        with self._conv_session("get_session_activity") as session:
+            updated = session.execute(
+                select(SqlConversation.id, SqlConversation.updated_at).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
+                )
+            ).all()
+        if not updated:
+            return {}
+        with self._session("get_session_activity") as session:
+            meta_rows = session.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_([row.id for row in updated]),
+                )
+            ).all()
+        statuses = {row.id: row.live_status for row in meta_rows}
+        activity: dict[str, SessionActivity] = {}
+        for row in updated:
+            status = statuses.get(row.id)
+            try:
+                live_status = decode_session_live_status(status) if status is not None else None
+            except ValueError:
+                # A newer replica's status must not drop the rest of the batch.
+                live_status = None
+            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+        return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
         """
@@ -2590,26 +2627,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
-            # Idempotent-append probe: one query for the whole batch. Rows
-            # already persisted under a stable id ARE those items' append
-            # result; running under the lock just taken serializes with a
-            # concurrent retry (READ COMMITTED gives this statement a fresh
-            # snapshot after the lock wait), so it cannot double-insert.
-            stable_ids = [item.stable_id for item in items if item.stable_id is not None]
+            # Idempotent-append probe: rows already stored under a stable id are
+            # those items' result. Each id is a bind parameter, so probe in bounded
+            # batches; the lock just taken serializes concurrent retries.
+            stable_ids = list(
+                dict.fromkeys(item.stable_id for item in items if item.stable_id is not None)
+            )
             existing_by_id: dict[str, SqlConversationItem] = {}
             deduped_by_id: dict[str, ConversationItem] = {}
             if stable_ids:
-                existing_rows = (
-                    session.execute(
-                        select(SqlConversationItem).where(
-                            SqlConversationItem.workspace_id == current_workspace_id(),
-                            SqlConversationItem.conversation_id == conversation_id,
-                            SqlConversationItem.id.in_(stable_ids),
+                existing_rows: list[SqlConversationItem] = []
+                for start in range(0, len(stable_ids), _APPEND_STABLE_ID_PROBE_BATCH):
+                    batch = stable_ids[start : start + _APPEND_STABLE_ID_PROBE_BATCH]
+                    existing_rows.extend(
+                        session.execute(
+                            select(SqlConversationItem).where(
+                                SqlConversationItem.workspace_id == current_workspace_id(),
+                                SqlConversationItem.conversation_id == conversation_id,
+                                SqlConversationItem.id.in_(batch),
+                            )
                         )
+                        .scalars()
+                        .all()
                     )
-                    .scalars()
-                    .all()
-                )
                 replaced_ids = {item.replaces_pending_id for item in items}
                 existing_rows = [
                     row
@@ -3528,6 +3568,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: dict[str, str] | None = None,
     ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
@@ -3573,6 +3614,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             append). JSON-encoded into the column.
         :param archived: New archived state. ``True`` archives,
             ``False`` unarchives, ``None`` leaves unchanged.
+        :param label_updates: Labels to merge in the same transaction as model
+            and effort settings. Omitted labels remain unchanged.
         :returns: The updated conversation and requested model-setting change
             flags, or ``None`` if the conversation does not exist.
         """
@@ -3669,6 +3712,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 row.archived = archived
+                ap_changed = True
+            if label_updates:
+                _upsert_labels(ap_sess, conversation_id, label_updates, now)
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now

@@ -56,7 +56,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Private-owner session messaging and independent worker creation",
         owner="server",
         review_by_release="0.22.0",
-        frontend_visible=False,
+        # The Automations page offers trigger templates only when managers can
+        # start workers.
         default_enabled=True,
     ),
     FeatureDefinition(
@@ -162,16 +163,23 @@ class FeatureFlags:
         return tuple(sorted(feature.value for feature in self.enabled_features))
 
 
-HarnessInstallGate = bool | Callable[[], bool]
+# A deployment's per-request gate: a static bool, or a callable read on each request.
+DeploymentGate = bool | Callable[[], bool]
+HarnessInstallGate = DeploymentGate
+
+
+def deployment_gate_enabled(gate: DeploymentGate, name: str) -> bool:
+    """Resolve a deployment gate for the current request; a failing gate is off."""
+    try:
+        return bool(gate() if callable(gate) else gate)
+    except Exception:  # deployment gates fail closed
+        _logger.warning("%s gate failed; disabling it", name, exc_info=True)
+        return False
 
 
 def harness_install_enabled(gate: HarnessInstallGate) -> bool:
     """Resolve the harness-install gate for the current request."""
-    try:
-        return bool(gate() if callable(gate) else gate)
-    except Exception:  # deployment gates fail closed
-        _logger.warning("harness_install gate failed; disabling harness setup", exc_info=True)
-        return False
+    return deployment_gate_enabled(gate, "harness_install")
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:

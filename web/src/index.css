@@ -1930,14 +1930,16 @@ html[data-electron-mac] .breadcrumb-folder {
  * static-state declarations (class specificity beats * for those visible
  * properties); this universal rule collapses every other transition-* and
  * animate-* timer so users who request reduced motion don't see any
- * sweeping change we forgot to scope. */
+ * sweeping change we forgot to scope. Transitions get 0s, not a tiny
+ * duration: `transition-property` defaults to `all`, so any nonzero duration
+ * lands every style change on every element a frame late. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition-duration: 0s !important;
     scroll-behavior: auto !important;
   }
 }
@@ -2294,6 +2296,18 @@ html[data-electron-mac] .breadcrumb-folder {
   color: var(--muted-foreground);
   font-weight: 500;
   margin: 0.75em 0 0.25em;
+}
+/* Footnote definitions show their source, read-only (see TipTapFootnotes). */
+.tiptap-md-content .ProseMirror .md-footnote-definitions,
+.tiptap-md-content .ProseMirror .md-link-definitions {
+  color: var(--muted-foreground);
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0.75em 0;
+}
+.tiptap-md-content .ProseMirror .md-footnote-reference {
+  color: var(--muted-foreground);
 }
 /* GitHub-style images: never overflow the editor column. Explicit <img
    width/height> are applied as inline styles by the node view (see

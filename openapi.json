@@ -320,6 +320,58 @@
         "title": "AgentDetailObject",
         "type": "object"
       },
+      "AgentList": {
+        "description": "The built-in agent list, plus the packaged names this deployment hides.",
+        "properties": {
+          "data": {
+            "items": {},
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          },
+          "suppressed_agent_names": {
+            "description": "Packaged built-ins `OMNIGENT_SEEDED_AGENTS` trimmed from `data`. The web picker also discovers agents from a user's recent sessions, so it needs these names to keep a hidden built-in with prior sessions from resurfacing as a custom agent.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Suppressed Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "AgentList",
+        "type": "object"
+      },
       "AgentMCPConfig": {
         "description": "Editable MCP projection without credential values.",
         "properties": {
@@ -3310,6 +3362,11 @@
       "ImportSessionRequest": {
         "description": "Request body for importing one local harness session.\n\n`project_id` files the imported session into a first-class project the\ncaller owns, with the same ownership, default-fill, and mismatch-warning\nsemantics as `POST /v1/sessions`.",
         "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
           "external_session_id": {
             "maxLength": 128,
             "minLength": 1,
@@ -5878,6 +5935,11 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automations_enabled": {
+            "default": false,
+            "title": "Automations Enabled",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -5994,6 +6056,16 @@
             },
             "title": "Sandbox Providers",
             "type": "array"
+          },
+          "scheduled_task_projects": {
+            "default": false,
+            "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_session_modes": {
+            "default": true,
+            "title": "Scheduled Task Session Modes",
+            "type": "boolean"
           },
           "server_version": {
             "title": "Server Version",
@@ -8553,6 +8625,11 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "side_chat_settings_supported": {
+            "default": false,
+            "title": "Side Chat Settings Supported",
+            "type": "boolean"
+          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -9490,6 +9567,13 @@
               "$ref": "#/components/schemas/SkillSummary"
             },
             "title": "Skills",
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Warnings",
             "type": "array"
           }
         },
@@ -10765,7 +10849,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\n**Returns:** A `PaginatedList` of agents.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS` are filtered out after the store page is\nread, so `first_id`, `last_id` and `has_more` describe the rows\nread, not the rows returned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -10851,7 +10935,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/AgentList"
                 }
               }
             },
@@ -13879,7 +13963,7 @@
             }
           },
           {
-            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
             "in": "query",
             "name": "visibility",
             "required": false,
@@ -18754,7 +18838,7 @@
     },
     "/v1/skills": {
       "get": {
-        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined.",
+        "description": "Discover skills using a session or an explicit host, harness, and directory.\n\n`session_id` requires session edit access and uses the saved host,\nworkspace, and agent bundle, including its filters and sub-agent scope.\nOtherwise, supply `host_id`, `harness`, and `path`; host ownership\nis required. Optional `agent_id` applies the selected agent's filter\nand bundled skills, with the same access check as session creation.\nThe two forms cannot be combined. `warnings` names sources the host\ncould not read, so an incomplete catalog is distinguishable from an\nempty one.",
         "operationId": "get_skills_v1_skills_get",
         "parameters": [
           {

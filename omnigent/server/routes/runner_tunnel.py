@@ -28,7 +28,7 @@ from typing import cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
@@ -350,6 +350,7 @@ def create_runner_tunnel_router(
             and session.owner != user_id
         ):
             online = False
+        add_audit_attrs(runner_id=runner_id, runner_online=online)
         result: dict[str, str | bool] = {"runner_id": runner_id, "online": online}
         if not online and runner_exit_reports is not None:
             # Host-daemon report that the runner process died (exit code
@@ -519,10 +520,15 @@ def create_runner_tunnel_router(
                 await ws.close(code=RUNNER_ID_MISMATCH_CLOSE_CODE, reason="unauthenticated")
                 return
 
+        # Attribute debug-log records for this tunnel to its owner, as the host
+        # tunnel does. The handler task is per-connection, so this cannot bleed
+        # across concurrent runners.
+        set_current_user_id(tunnel_owner)
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
         peer_close_code: int | None = None
+        receive_task: asyncio.Task[None] | None = None
         owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
@@ -747,6 +753,14 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                # A sender failure can win exception handling while receive has the
+                # actual peer close. Preserve it for lifecycle reconciliation.
+                if receive_task is not None and not receive_task.cancelled():
+                    receive_error = receive_task.exception()
+                    if isinstance(receive_error, WebSocketDisconnect):
+                        peer_close_code = receive_error.code
+                        session.peer_close_reason = receive_error.reason or None
+                        shutdown_state.note_tunnel_close_code(peer_close_code)
                 # Snapshot before deregister records its own cleanup close on the session.
                 session.ended = TunnelEnd(
                     at=ended_at,

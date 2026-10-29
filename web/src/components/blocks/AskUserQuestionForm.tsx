@@ -1,10 +1,19 @@
 // Question carousel for structured elicitation, with single- or multi-select answers.
 // isOther controls custom input; submit requires an answer to every question.
+//
+// Unsent answers are restored on remount (see ``@/lib/askUserQuestionDrafts``).
 
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, XIcon } from "lucide-react";
-import { type ChangeEvent, useState } from "react";
+import { type ChangeEvent, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import {
+  type AskUserQuestionDraft,
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 
 /**
  * Map from question id/text → either a single selected label
@@ -13,6 +22,8 @@ import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 export type AskUserQuestionAnswers = Record<string, string | string[]>;
 
 interface AskUserQuestionFormProps {
+  /** Pending elicitation the questions belong to; keys the unsent draft. */
+  elicitationId: string;
   questions: ClaudeQuestion[];
   onSubmit: (answers: AskUserQuestionAnswers) => void;
   onReject: () => void;
@@ -55,34 +66,80 @@ function questionKey(question: ClaudeQuestion): string {
   return question.id && question.id.length > 0 ? question.id : question.question;
 }
 
-export function AskUserQuestionForm({ questions, onSubmit, onReject }: AskUserQuestionFormProps) {
+/** Answers on a freshly opened card, before the user touches it. */
+function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft, "currentIndex"> {
+  const answers: Omit<AskUserQuestionDraft, "currentIndex"> = {
+    selections: {},
+    customSelected: {},
+    customInputs: {},
+  };
+  for (const q of questions) {
+    const key = questionKey(q);
+    answers.selections[key] = q.multiSelect ? [] : "";
+    answers.customSelected[key] = q.textInput !== undefined;
+    answers.customInputs[key] = q.textInput?.default ?? "";
+  }
+  return answers;
+}
+
+export function AskUserQuestionForm({
+  elicitationId,
+  questions,
+  onSubmit,
+  onReject,
+}: AskUserQuestionFormProps) {
+  // Form state belongs to the first questions; ApprovalCard remounts the form for new ones.
+  const [draftQuestions] = useState(questions);
+  const [signature] = useState(() => askUserQuestionSignature(questions));
+  const [draft] = useState(() => getAskUserQuestionDraft(elicitationId, signature));
+  const [initial] = useState(() => initialAnswers(questions));
+
   // Currently-visible question (carousel index).
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(draft?.currentIndex ?? 0);
 
   // Per-question option selection. Single-select stores a string;
   // multi-select stores a deduped array.
-  const [selections, setSelections] = useState<Record<string, string | string[]>>(() => {
-    const initial: Record<string, string | string[]> = {};
-    for (const q of questions) {
-      initial[questionKey(q)] = q.multiSelect ? [] : "";
-    }
-    return initial;
-  });
+  const [selections, setSelections] = useState(draft?.selections ?? initial.selections);
 
-  // Per-question custom-input state. ``text`` is what the user
-  // typed; ``selected`` is whether the custom row's radio/checkbox
+  // Per-question custom-input state. ``customInputs`` is what the user
+  // typed; ``customSelected`` is whether the custom row's radio/checkbox
   // is checked (which determines whether the typed text is part of
   // the answer).
-  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>(() => {
-    const initial: Record<string, boolean> = {};
-    for (const q of questions) initial[questionKey(q)] = q.textInput !== undefined;
-    return initial;
-  });
-  const [customInputs, setCustomInputs] = useState<Record<string, string>>(() => {
-    const initial: Record<string, string> = {};
-    for (const q of questions) initial[questionKey(q)] = q.textInput?.default ?? "";
-    return initial;
-  });
+  const [customSelected, setCustomSelected] = useState(
+    draft?.customSelected ?? initial.customSelected,
+  );
+  const [customInputs, setCustomInputs] = useState(draft?.customInputs ?? initial.customInputs);
+
+  useEffect(() => {
+    const answers = {
+      selections: { ...selections },
+      customSelected: { ...customSelected },
+      customInputs: { ...customInputs },
+    };
+    // Answers to a secret question are never kept past this mount.
+    for (const q of draftQuestions) {
+      if (!q.isSecret) continue;
+      const key = questionKey(q);
+      answers.selections[key] = initial.selections[key]!;
+      answers.customSelected[key] = initial.customSelected[key]!;
+      answers.customInputs[key] = initial.customInputs[key]!;
+    }
+    // Untouched cards keep no draft, so they cannot evict real ones.
+    if (currentIndex === 0 && JSON.stringify(answers) === JSON.stringify(initial)) {
+      clearAskUserQuestionDraft(elicitationId, signature);
+      return;
+    }
+    saveAskUserQuestionDraft(elicitationId, signature, { currentIndex, ...answers });
+  }, [
+    elicitationId,
+    draftQuestions,
+    signature,
+    initial,
+    currentIndex,
+    selections,
+    customSelected,
+    customInputs,
+  ]);
 
   const handleSingleSelect = (key: string, label: string) => {
     // Single-select mutex: clicking a real option clears the

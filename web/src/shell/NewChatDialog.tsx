@@ -80,7 +80,6 @@ import {
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
@@ -129,6 +128,8 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { HarnessFixDialog } from "@/pages/settings/HarnessFixDialog";
+import { applyHarnessFixResult, harnessFixMode, harnessStatus } from "@/lib/harnessFix";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
   harnessReadinessOnHost,
@@ -177,12 +178,18 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  onProjectLaunchDefaultsCleared,
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
@@ -278,7 +285,7 @@ import {
 } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
-import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
@@ -290,6 +297,7 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
+import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
 import {
   fetchUserAgents,
   USER_AGENTS_QUERY_KEY,
@@ -521,9 +529,12 @@ function ConnectingText({ className }: { className?: string }) {
 export function ConnectHostInstructions({
   serverUrl,
   label,
+  onSshConnected,
 }: {
   serverUrl: string;
   label?: string;
+  /** After the desktop shell connects a machine over SSH, with its host id. */
+  onSshConnected?: (hostId: string) => void;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -533,6 +544,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
+  const sshConnectAvailable = useSshConnectAvailable();
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -569,6 +581,7 @@ export function ConnectHostInstructions({
           testIdPrefix="connect-host"
         />
       )}
+      {sshConnectAvailable && <SshConnectForm onConnected={onSshConnected} />}
     </div>
   );
 }
@@ -867,7 +880,8 @@ function harnessWarningMessage(
  *
  * Gated on the setup feature: when OFF, renders the original "run omnigent
  * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
- * <agent>" action that opens the shared {@link HarnessSetupDialog}.
+ * <agent>" action that repairs native agents on user hosts in place, or opens
+ * the setup checklist for other agents and managed hosts.
  */
 function HarnessSetupNotice({
   agentName,
@@ -2251,7 +2265,7 @@ export function NewChatLandingScreen() {
     [pickerCacheKey],
   );
   // Project prefill source: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
+  // project's stored defaults, overlaid with its last start (localStorage).
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
   // has no config to read. Resolved before the agent catalog below so the
@@ -2266,6 +2280,33 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
+  // The project's last start wins until its stored defaults are saved after it;
+  // a Project settings save clears it, so re-read it then.
+  const [launchClears, setLaunchClears] = useState(0);
+  useEffect(() => onProjectLaunchDefaultsCleared(() => setLaunchClears((count) => count + 1)), []);
+  const projectLaunch = useMemo(() => {
+    void launchClears;
+    return configProjectId === null || projectConfigLoading
+      ? null
+      : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {});
+  }, [configProjectId, projectConfigLoading, storedProjectConfig, launchClears]);
+  // Option keys picked per harness during this visit. A pick also updates the
+  // app-global memory, so those keys keep coming from there.
+  const pickedOptionKeysRef = useRef(new Map<string, Set<string>>());
+  // The options the last start's harness launched with outrank the app-global
+  // per-harness memory for that harness, except keys picked during this visit.
+  const readRememberedHarnessOptions = useCallback(
+    (harness: string | null | undefined): HarnessOptions => {
+      const remembered = readHarnessOptions(harness);
+      if (harness == null || projectLaunch?.harness !== harness) return remembered;
+      const picked = pickedOptionKeysRef.current.get(harness);
+      const launched = Object.entries(projectLaunch.harnessOptions ?? {}).filter(
+        ([key]) => !picked?.has(key),
+      );
+      return { ...remembered, ...Object.fromEntries(launched) };
+    },
+    [projectLaunch],
+  );
   // Normalize into the machine's shape. `undefined` = still loading (the machine
   // waits so a generic default can't win the race); `{}` = nothing to wait for
   // (plain visit / label-only folder / genuinely empty config), so it settles
@@ -2277,21 +2318,24 @@ export function NewChatLandingScreen() {
     if (projectParam !== "" && projectListLoading) return undefined;
     if (configProjectId !== null && projectConfigLoading) return undefined;
     const c = storedProjectConfig;
-    if (!c) return {};
-    return {
-      hostId: c.host_id,
-      workspace: c.workspace,
-      agentId: c.agent_id,
-      useWorktree: c.use_worktree,
-      model: c.model,
-      effort: c.effort,
-    };
+    const stored: ProjectPrefillConfig = c
+      ? {
+          hostId: c.host_id,
+          workspace: c.workspace,
+          agentId: c.agent_id,
+          useWorktree: c.use_worktree,
+          model: c.model,
+          effort: c.effort,
+        }
+      : {};
+    return withProjectLaunchDefaults(stored, projectLaunch);
   }, [
     projectParam,
     projectListLoading,
     configProjectId,
     projectConfigLoading,
     storedProjectConfig,
+    projectLaunch,
   ]);
 
   // Preserve a configured agent through name deduplication when it is in the
@@ -2302,7 +2346,9 @@ export function NewChatLandingScreen() {
     isError: agentsError,
     isPlaceholderData: agentsArePlaceholder,
   } = useAvailableAgents({
-    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+    pinnedAgentIds: [prefillConfig?.agentId, prefillConfig?.launchAgentId].filter(
+      (id): id is string => id != null,
+    ),
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
@@ -2757,9 +2803,27 @@ export function NewChatLandingScreen() {
   // row; null when closed. One dialog serves every entry point.
   const [setupTarget, setSetupTarget] = useState<{
     agentName: string | undefined;
+    nativeAgent: ReturnType<typeof nativeCodingAgentForAvailableAgent>;
     harness: string | null;
     host: Host | undefined | null;
   } | null>(null);
+
+  const fixStatus = setupTarget?.nativeAgent
+    ? harnessStatus(setupTarget.nativeAgent.harness, setupTarget.host ?? null)
+    : null;
+  const fixTarget =
+    harnessInstallEnabled &&
+    setupTarget?.host &&
+    !setupTarget.host.sandbox_provider &&
+    setupTarget.nativeAgent &&
+    fixStatus?.needsSetup
+      ? {
+          host: setupTarget.host,
+          harness: setupTarget.nativeAgent.harness,
+          label: setupTarget.nativeAgent.displayName,
+          mode: harnessFixMode(fixStatus.reason),
+        }
+      : null;
 
   // Ctrl+Shift+M opens the agent/model picker here, the keyboard equivalent of the
   // existing-chat model-picker shortcut. The picker owns model selection on the
@@ -2934,6 +2998,7 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     setPickerEdits(null);
+    pickedOptionKeysRef.current.clear();
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project, prefillConfigSig]);
@@ -3693,7 +3758,6 @@ export function NewChatLandingScreen() {
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
             : [];
-  const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
     (!sandboxSelected &&
@@ -3832,7 +3896,6 @@ export function NewChatLandingScreen() {
   }, [pickerCacheKey, pickerLoading, permissionPreview]);
   const visiblePermissionRow =
     pickerLoading && !interactiveWhileLoading ? cachedPermission?.row : permissionConfigRow;
-  useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = sandboxDefaultModelsEnabled
     ? codexEffortLevelsForModel(pickerModelOptions, pickedModel).map((value) => ({
         value,
@@ -3858,6 +3921,9 @@ export function NewChatLandingScreen() {
               ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
             : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
+    const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
+    for (const key of Object.keys(options)) picked.add(key);
+    pickedOptionKeysRef.current.set(harness, picked);
     const previous = pickerEdits;
     setPickerEdits({
       agentId: effectiveAgentId,
@@ -3995,16 +4061,6 @@ export function NewChatLandingScreen() {
                     {sandboxModels.data.provider_label}
                   </div>
                 )}
-              {selectedNativeHarness === "pi-native" && (
-                <Input
-                  aria-label="Search models"
-                  placeholder="Search models…"
-                  value={pickerModelSearch}
-                  onChange={(event) => setPickerModelSearch(event.target.value)}
-                  onKeyDown={(event) => event.stopPropagation()}
-                  data-testid="new-chat-landing-agent-model-search"
-                />
-              )}
               {pickerModelsLoading && pickerModelOptions.length === 0 && (
                 <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
               )}
@@ -4049,6 +4105,7 @@ export function NewChatLandingScreen() {
               testId: `new-chat-landing-agent-model-${option.id}`,
               title: nativeModelTooltip(option),
               className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+              modelOption: option,
             })),
           ],
         }
@@ -4103,7 +4160,11 @@ export function NewChatLandingScreen() {
           <>
             <DropdownMenuCheckboxItem
               checked={routingOn}
-              onCheckedChange={() => selectPickerModel(MODEL_SELECT_SMART)}
+              // Unchecking returns to the harness default, so the pick stays
+              // reversible even when the Models list below has no row to click.
+              onCheckedChange={(checked) =>
+                selectPickerModel(checked ? MODEL_SELECT_SMART : MODEL_SELECT_DEFAULT)
+              }
               onSelect={(event) => event.preventDefault()}
               data-testid="new-chat-landing-agent-model-smart-routing"
             >
@@ -4155,20 +4216,7 @@ export function NewChatLandingScreen() {
                 }
               : undefined
           }
-          models={
-            modelSection && {
-              ...modelSection,
-              choices: modelSection.choices.filter(
-                (choice) =>
-                  choice.key === "__default__" ||
-                  pickerModelSearch
-                    .toLowerCase()
-                    .trim()
-                    .split(/\s+/)
-                    .every((term) => `${choice.key} ${choice.label}`.toLowerCase().includes(term)),
-              ),
-            }
-          }
+          models={modelSection}
           efforts={effortSection}
           extra={fusionSections}
         />
@@ -4187,7 +4235,7 @@ export function NewChatLandingScreen() {
         const harness = agent.id === effectiveAgentId ? pickedHarness : readLastHarness(agent.id);
         return [agent.id, brainHarnessLabelsAll[harness ?? agent.harness ?? ""] ?? "Default"];
       }
-      const saved = readHarnessOptions(native.harness);
+      const saved = readRememberedHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
       const catalogSuppressed = sandboxHasModelCatalog && native.harness !== previewHarness;
       const catalog = catalogSuppressed
@@ -4339,7 +4387,7 @@ export function NewChatLandingScreen() {
         ? pickerEdits.options
         : {};
     const stored = {
-      ...readHarnessOptions(selectedNativeHarness),
+      ...readRememberedHarnessOptions(selectedNativeHarness),
       ...editedOptions,
     };
     // Resolve the mode to the stored value when it's still valid for this
@@ -4466,8 +4514,8 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
-    // Reseed on harness, host-catalog, and async project model/effort changes;
-    // capability flags derive from the harness.
+    // Reseed on harness, host-catalog, and async project model/effort or
+    // last-start changes; capability flags derive from the harness.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4477,6 +4525,7 @@ export function NewChatLandingScreen() {
     piModelOptions,
     projectDefaultModel,
     projectDefaultEffort,
+    readRememberedHarnessOptions,
   ]);
   useEffect(() => {
     if (!sandboxDefaultModelsEnabled || !previewHarness) return;
@@ -4484,7 +4533,7 @@ export function NewChatLandingScreen() {
       pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === previewHarness
         ? pickerEdits.options
         : {};
-    const saved = { ...readHarnessOptions(previewHarness), ...edited };
+    const saved = { ...readRememberedHarnessOptions(previewHarness), ...edited };
     const candidate =
       !userPickedModelRef.current && projectDefaultModel != null
         ? projectDefaultModel
@@ -4509,6 +4558,7 @@ export function NewChatLandingScreen() {
     pickerEdits,
     projectDefaultModel,
     projectDefaultEffort,
+    readRememberedHarnessOptions,
     setPickedModel,
   ]);
   useEffect(() => {
@@ -4544,7 +4594,7 @@ export function NewChatLandingScreen() {
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
-        : undefined) ?? readHarnessOptions(selectedNativeHarness).routing;
+        : undefined) ?? readRememberedHarnessOptions(selectedNativeHarness).routing;
     if (storedRouting === undefined) return;
     setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
   }, [
@@ -4556,6 +4606,7 @@ export function NewChatLandingScreen() {
     projectDefaultEffortValid,
     setCostControlMode,
     pickerEdits,
+    readRememberedHarnessOptions,
   ]);
   // Top-level Smart Routing pins permissions to Default (no override sent), so
   // entering it resets the mode rather than restoring one: nothing is remembered
@@ -4851,7 +4902,13 @@ export function NewChatLandingScreen() {
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
       if (pickedAgentId === null) {
-        setPickedHarness(readLastHarness(writes.agentId));
+        // The last start's own harness pick (e.g. Smart Routing) outranks the
+        // app-global one, which another project's start may have changed.
+        setPickedHarness(
+          writes.agentId === projectLaunch?.agentId && projectLaunch.pickedHarness !== undefined
+            ? projectLaunch.pickedHarness
+            : readLastHarness(writes.agentId),
+        );
         // Config-sourced seed into an empty slot (as opposed to the last-agent
         // fallback): the create omits the field until any other write flips this.
         agentFromConfigRef.current = writes.agentId === prefillConfig?.agentId;
@@ -4879,6 +4936,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    projectLaunch,
     defaultSandboxProvider,
   ]);
 
@@ -4939,36 +4997,56 @@ export function NewChatLandingScreen() {
   const skillsHarness = autoRoutingSelected
     ? null
     : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
-  const skillsUnavailableMessage = sandboxSelected
-    ? "Host skills will be available after the sandbox starts."
-    : selectedAgent?.id === PENDING_AGENT_ID
-      ? "Skills will be available after this session starts."
-      : !selectedHostId
-        ? "Choose a host to discover skills."
-        : selectedHost?.status !== "online"
-          ? "Skills unavailable while the host is offline."
-          : !workspaceValid
-            ? "Choose a working directory to discover skills."
-            : !skillsHarness
-              ? "Choose a harness to discover host skills."
-              : undefined;
+  // Native prompts stay plain text; SDK skill invocations require the sandbox's catalog.
+  const arcletSkills =
+    sandboxSelected && effectiveSandboxProvider === "arclet" && isNativeTerminalAgent;
+  function getSkillsHost() {
+    if (!sandboxSelected) return selectedHost;
+    if (arcletSkills) return findConnectedArcaHost(allHosts, readArcaHostId());
+    return undefined;
+  }
+  const skillsHost = getSkillsHost();
+  const skillsHostId = sandboxSelected ? skillsHost?.host_id : selectedHostId;
+  const skillsPath = sandboxSelected ? "~" : workspaceTrimmed;
+  function getSkillsUnavailableMessage() {
+    if (sandboxSelected && !arcletSkills) {
+      return "Host skills will be available after the sandbox starts.";
+    }
+    if (selectedAgent?.id === PENDING_AGENT_ID) {
+      return "Skills will be available after this session starts.";
+    }
+    if (!skillsHostId) {
+      if (arcletSkills) return "Connect your Arca to discover skills before the sandbox starts.";
+      return "Choose a host to discover skills.";
+    }
+    if (!sandboxSelected && skillsHost?.status !== "online") {
+      return "Skills unavailable while the host is offline.";
+    }
+    if (!sandboxSelected && !workspaceValid) {
+      return "Choose a working directory to discover skills.";
+    }
+    if (!skillsHarness) return "Choose a harness to discover host skills.";
+    return undefined;
+  }
+  const skillsUnavailableMessage = getSkillsUnavailableMessage();
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
+    skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
     target:
-      selectedHostId && skillsHarness && workspaceTrimmed
+      skillsHostId && skillsHarness && skillsPath
         ? {
-            hostId: selectedHostId,
+            hostId: skillsHostId,
             harness: skillsHarness,
-            path: workspaceTrimmed,
+            path: skillsPath,
             agentId: selectedAgent?.id,
           }
         : null,
     enabled: canDiscoverHostSkills,
-    starting: !sandboxSelected && (hostsLoading || agentsLoading),
+    starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
   const availableSkills = useMemo(
     () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
@@ -5799,17 +5877,17 @@ export function NewChatLandingScreen() {
       // from the config. Any user interaction — even re-picking the exact
       // config value — cleared the ref, so an explicit choice is always SENT
       // (the server treats it as authoritative and only warns on mismatch).
-      // The value-equality guard covers seeds later displaced without a write.
+      // The value-equality guard checks the server's config, so it also sends last-start seeds.
       const agentFromProjectConfig =
         createProjectId !== null &&
         agentFromConfigRef.current &&
-        prefillConfig?.agentId != null &&
-        effectiveAgentId === prefillConfig.agentId;
+        storedProjectConfig?.agent_id != null &&
+        effectiveAgentId === storedProjectConfig.agent_id;
       const workspaceFromProjectConfig =
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
-        prefillConfig?.workspace != null &&
-        workspaceTrimmed === prefillConfig.workspace;
+        storedProjectConfig?.workspace != null &&
+        workspaceTrimmed === storedProjectConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -5843,6 +5921,8 @@ export function NewChatLandingScreen() {
               data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
             };
       let data: { id: string };
+      // The agent the create ran; a custom agent's id comes back from its create.
+      let launchedAgentId = effectiveAgentId;
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agents upload their bundle with the session, then launch on the host below.
@@ -5867,6 +5947,7 @@ export function NewChatLandingScreen() {
           metadata as Parameters<typeof createBundledSession>[1],
         );
         data = { id: bundled.id };
+        launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -6096,8 +6177,9 @@ export function NewChatLandingScreen() {
       // storage eagerly so an immediate Send cannot observe stale state; this
       // successful-create snapshot also covers restored drafts and every
       // harness-specific creation path.
+      let launchedOptions: HarnessOptions | null = null;
       if (!smartRoutingHarnessSelected) {
-        const launchedOptions = createdHarnessOptions({
+        launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
           supportsDevinMode,
@@ -6122,6 +6204,7 @@ export function NewChatLandingScreen() {
           writeHarnessOption(selectedNativeHarness, launchedOptions);
         }
       }
+      let launchProjectId = createProjectId;
       if (createProjectId !== null) {
         // The create filed the session atomically via first-class
         // `project_id` — no follow-up move. Still refresh the project lists:
@@ -6142,7 +6225,10 @@ export function NewChatLandingScreen() {
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
           const filed = await moveConversationToProject(data.id, selectedProject);
-          if (filed?.project_id) createdCanvasId = filed.project_id;
+          if (filed?.project_id) {
+            createdCanvasId = filed.project_id;
+            launchProjectId = filed.project_id;
+          }
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -6154,6 +6240,29 @@ export function NewChatLandingScreen() {
           // `project_id` promotion fails — the sidebar's dual-read grouping
           // still shows it under the project.
         }
+      }
+      // This start becomes the project's default for its next session.
+      if (launchProjectId !== null) {
+        writeProjectLaunchDefaults(
+          launchProjectId,
+          {
+            ...(launchedAgentId !== null && launchedAgentId !== PENDING_AGENT_ID
+              ? {
+                  agentId: launchedAgentId,
+                  pickedHarness,
+                  ...(launchedOptions !== null
+                    ? {
+                        harness: selectedNativeHarness ?? undefined,
+                        harnessOptions: launchedOptions,
+                      }
+                    : {}),
+                }
+              : {}),
+            hostId: sandboxSelected ? SANDBOX_HOST_CHOICE : (selectedHostId ?? undefined),
+            workspace: sandboxSelected ? undefined : workspaceTrimmed,
+          },
+          storedProjectConfig ?? {},
+        );
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
@@ -6937,6 +7046,7 @@ export function NewChatLandingScreen() {
                         builtinNames={slashCompletion.builtinNames}
                         labels={slashCompletion.labels}
                         skillsStatus={skillsStatus}
+                        skillsWarnings={skillsWarnings}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
                       />
@@ -7522,6 +7632,7 @@ export function NewChatLandingScreen() {
               onSetup={() =>
                 setSetupTarget({
                   agentName: selectedAgent?.display_name,
+                  nativeAgent: nativeCodingAgentForAvailableAgent(selectedAgent),
                   harness: selectedAgent?.harness ?? null,
                   host: harnessWarningHost,
                 })
@@ -7685,22 +7796,35 @@ export function NewChatLandingScreen() {
           <ConnectHostInstructions
             serverUrl={serverUrl}
             label="Run this on the machine you want to use, then pick it from the host menu:"
+            onSshConnected={(hostId) => {
+              setConnectOpen(false);
+              selectHost(hostId);
+            }}
           />
         </DialogContent>
       </Dialog>
 
-      {/* Harness "Set up" dialog — the single home for install/login (and later
-          API key / gateway) setup, opened from the composer notice or a picker
-          row's "Set up →". */}
-      <HarnessSetupDialog
-        open={setupTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) setSetupTarget(null);
-        }}
-        agentName={setupTarget?.agentName}
-        harness={setupTarget?.harness ?? null}
-        host={setupTarget?.host}
-      />
+      {fixTarget ? (
+        <HarnessFixDialog
+          open
+          onOpenChange={(open) => !open && setSetupTarget(null)}
+          mode={fixTarget.mode}
+          host={fixTarget.host}
+          harness={fixTarget.harness}
+          harnessLabel={fixTarget.label}
+          onFixed={(result) => applyHarnessFixResult(queryClient, fixTarget.host.host_id, result)}
+        />
+      ) : (
+        <HarnessSetupDialog
+          open={setupTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setSetupTarget(null);
+          }}
+          agentName={setupTarget?.agentName}
+          harness={setupTarget?.harness ?? null}
+          host={setupTarget?.host}
+        />
+      )}
 
       {/* Create custom agent dialog — opened from the agent picker dropdown. */}
       <CreateAgentDialog

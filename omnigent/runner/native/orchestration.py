@@ -97,6 +97,7 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    redacted_terminal_output,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
@@ -425,10 +426,13 @@ async def _observe_terminal_interactive(
     """Emit one semantic event when a native TUI can accept a message."""
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_s
+    last_screen: str | None = None
     try:
         while True:
             result = await instance.read()
             screen = result.get("screen")
+            if isinstance(screen, str):
+                last_screen = screen
             if isinstance(screen, str) and is_interactive(screen):
                 _logger.info(
                     "Native terminal became interactive: session=%s harness=%s terminal_id=%s",
@@ -468,6 +472,9 @@ async def _observe_terminal_interactive(
                 terminal_instance_id=instance.diagnostic_id,
                 readiness_signal=readiness_signal,
                 reason=type(exc).__name__,
+                # What held the TUI back (a dialog, an auth error) is otherwise
+                # only on the pane.
+                terminal_last_output=redacted_terminal_output(last_screen),
             ),
         )
 
@@ -2810,6 +2817,11 @@ async def _auto_create_pi_terminal(
         agent_dir=agent_dir,
     )
     pi_args.extend(provider_args)
+    from omnigent.harnesses.pi_native.auth_command import AUTH_DIR_ENV, refresh_model_auth
+
+    model_auth_dir = Path(pi_env[AUTH_DIR_ENV]) if AUTH_DIR_ENV in pi_env else None
+    if model_auth_dir is not None:
+        await refresh_model_auth(model_auth_dir, workspace=launch_config.workspace)
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -2904,13 +2916,19 @@ async def _auto_create_pi_terminal(
         )
     # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
     # transcript forwarder, so its slot owns this task until relaunch/teardown.
-    if auth_token:
-        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_auth_refresh
+    if auth_token or model_auth_dir is not None:
+        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_credentials
 
         _register_auto_forwarder_task(
             session_id,
             asyncio.create_task(
-                supervise_pi_auth_refresh(bridge_dir, launch_config.server_url),
+                supervise_pi_credentials(
+                    bridge_dir,
+                    launch_config.server_url,
+                    auth_dir=model_auth_dir,
+                    workspace=launch_config.workspace,
+                    refresh_bridge=bool(auth_token),
+                ),
                 name=f"pi-auth-refresh-{session_id}",
             ),
         )
@@ -5660,6 +5678,7 @@ async def _auto_create_codex_terminal(
     # Routing session (pinned or auto) gets the extended catalog. A plain
     # session keeps codex's bundled catalog and never pays the probe.
     app_server.env.update(codex_extended_catalog_env(launch_config.routing_enabled))
+    app_server.env.update(resource_registry.client_surface_env(session_id))
     # First-message model routing. Advertised in the same bridge dir the
     # ``UserPromptSubmit`` hook is pointed at (so the hook needs no env of
     # its own), and live before the app-server starts because the hook can
@@ -8809,7 +8828,8 @@ async def _auto_create_claude_terminal(
         agent ships a ``skills/`` directory, resolved by the caller
         (which has the runner's spec resolver). Threaded to
         :func:`augment_claude_args` so Claude Code discovers bundled
-        skills via ``--plugin-dir``. ``None`` adds no plugin args.
+        skills via ``--plugin-dir``. ``None`` uses a bridge-owned bundle
+        for the built-in skill.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -9533,6 +9553,11 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    if bundle_dir is None:
+        # Reuse the bridge's owned directory across retries and terminal transfers.
+        # Its dead-owner cleanup also reclaims these generated skill links.
+        bundle_dir = bridge_dir / "skill-bundle"
+        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -10325,18 +10350,37 @@ async def _launch_kimi(ctx: NativeLaunchContext) -> SessionResourceView:
 
 
 async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
-    """Adapter: build the codex-native terminal from a launch context."""
-    return await _auto_create_codex_terminal(
-        ctx.session_id,
-        ctx.resource_registry,
-        ctx.publish_event,
-        bundle_dir=ctx.bundle_dir,
-        skills_filter=ctx.skills_filter,
-        agent_spec=ctx.agent_spec,
-        server_client=ctx.server_client,
-        session_init=ctx.session_init,
-        ensure_comment_relay=ctx.ensure_comment_relay,
-    )
+    """Adapter: build the codex-native terminal from a launch context.
+
+    A resume refused because another app-server still writes the thread (a
+    replaced runner's launch racing this one) is retried once: the retry's
+    same-session cleanup reaps that app-server before resuming again.
+    """
+    from omnigent.harnesses.codex_native.app_server import is_active_writer_error
+
+    async def launch() -> SessionResourceView:
+        return await _auto_create_codex_terminal(
+            ctx.session_id,
+            ctx.resource_registry,
+            ctx.publish_event,
+            bundle_dir=ctx.bundle_dir,
+            skills_filter=ctx.skills_filter,
+            agent_spec=ctx.agent_spec,
+            server_client=ctx.server_client,
+            session_init=ctx.session_init,
+            ensure_comment_relay=ctx.ensure_comment_relay,
+        )
+
+    try:
+        return await launch()
+    except Exception as exc:
+        if not is_active_writer_error(exc):
+            raise
+        _logger.warning(
+            "Codex thread for session=%s still has another writer; reaping it and retrying",
+            ctx.session_id,
+        )
+        return await launch()
 
 
 async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:

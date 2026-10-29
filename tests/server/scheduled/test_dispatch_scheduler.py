@@ -225,14 +225,28 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
     loop = asyncio.get_running_loop()
 
     failed_once = False
+    renewing = asyncio.Event()
+    clock_advanced = threading.Event()
 
     def renew(run_id, *, now, lease_seconds):
-        nonlocal failed_once
-        if transient_failure and not failed_once and now() == task.next_run_at + 30:
-            failed_once = True
-            raise RuntimeError("temporary database outage")
-        result = original_renew(run_id, now=now, lease_seconds=lease_seconds)
-        if now() == task.next_run_at + 30:
+        def renewal_time():
+            nonlocal failed_once
+            timestamp = now()
+            if transient_failure and not failed_once and timestamp == task.next_run_at + 30:
+                failed_once = True
+                raise RuntimeError("temporary database outage")
+            return timestamp
+
+        # Advance the clock while a heartbeat is already in flight.
+        if started.is_set() and not clock_advanced.is_set():
+            loop.call_soon_threadsafe(renewing.set)
+            assert clock_advanced.wait(10)
+        result = original_renew(run_id, now=renewal_time, lease_seconds=lease_seconds)
+        if (
+            result is not None
+            and result.lease_expires_at == task.next_run_at + 150
+            and (failed_once or not transient_failure)
+        ):
             loop.call_soon_threadsafe(renewed.set)
         return result
 
@@ -250,7 +264,9 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
+        await asyncio.wait_for(renewing.wait(), 10)
         clock.advance(30)
+        clock_advanced.set()
         await asyncio.wait_for(renewed.wait(), 10)
         assert store.list_runs(task.id)[0][0].lease_expires_at == task.next_run_at + 150
         release.set()
@@ -262,6 +278,7 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
         await scheduler.poll_once()
         assert store.list_runs(task.id)[0][0].status == "running"
     finally:
+        clock_advanced.set()
         await scheduler.stop()
 
 
@@ -2148,6 +2165,47 @@ async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) 
     [(snapshot, lease)] = [call.args for call in fired["new"].await_args_list]
     assert snapshot.execution_target == "managed_sandbox"
     assert (lease.run.id, lease.run.host_id) == (run.id, new_host)
+
+
+async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
+    store,
+) -> None:
+    """Replica A holds the session's host and B owns the workspace key. Once the
+    first run records the session, its host is pinned, so A claims every run."""
+    task = _task(store, "continue_unpinned", session_mode="continue")
+    assert task.host_id is None
+    session_host = uuid.uuid4().hex
+    assert (
+        store.adopt_session(task.id, uuid.uuid4().hex, snapshot=task, host_id=session_host)
+        == "adopted"
+    )
+    task = store.get(task.id)
+    clock = FakeClock(task.created_at + 60)
+    fired = {"a": AsyncMock(), "b": AsyncMock()}
+
+    def replica(name, owns):
+        async def owned_hosts(keys):
+            return [key for key in keys if owns(key)]
+
+        return PersistentTaskScheduler(
+            store, fired[name], AsyncMock(), owned_hosts=owned_hosts, now=clock.now
+        )
+
+    a = replica("a", lambda key: key == session_host)
+    b = replica("b", lambda key: key == str(task.workspace_id))
+    run = await b.run_now(task)
+    await b.poll_once()
+    await _drain(b)
+    await a.poll_once()
+    await _drain(a)
+
+    fired["b"].assert_not_awaited()
+    [(snapshot, lease)] = [call.args for call in fired["a"].await_args_list]
+    assert (snapshot.session_id, lease.run.id, lease.run.host_id) == (
+        task.session_id,
+        run.id,
+        session_host,
+    )
 
 
 async def test_claim_checks_ownership_once_per_page_with_workspace_fallback(store) -> None:
