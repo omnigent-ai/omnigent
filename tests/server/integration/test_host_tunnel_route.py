@@ -1139,6 +1139,37 @@ async def test_host_tunnel_routes_launch_result_to_future(
     assert result["error"] is None
 
 
+@pytest.mark.parametrize("remaining", [None, 60.0])
+async def test_host_tunnel_routes_runner_status_budget_to_future(host_app, remaining) -> None:
+    from omnigent.host.frames import HostRunnerStatusResultFrame
+
+    app, registry, _store = host_app
+    comm = await _connect_route(app, _TUNNEL_PATH)
+    await _send_hello_and_wait(comm, registry)
+    conn = registry.get(_HOST_ID)
+    assert conn is not None
+    future = asyncio.get_running_loop().create_future()
+    conn.pending_runner_status["req_status"] = future
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostRunnerStatusResultFrame(
+                    request_id="req_status",
+                    status="credential_pending" if remaining is not None else "alive",
+                    credential_wait_remaining_s=remaining,
+                )
+            ),
+        }
+    )
+    result = await asyncio.wait_for(future, budget(2))
+    assert result == {
+        "status": "credential_pending" if remaining is not None else "alive",
+        "credential_wait_remaining_s": remaining,
+    }
+    assert conn.pending_runner_status == {}
+
+
 async def test_host_tunnel_reassembles_chunked_import_session(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,

@@ -4342,14 +4342,14 @@ async def _wait_for_host_bound_runner_client(
     host_registry: HostRegistry,
     conversation_store: ConversationStore | None = None,
 ) -> httpx.AsyncClient | None:
-    """Wait for this runner, extending startup only for an explicit pending sign-in.
+    """Wait for this runner, extending startup only for a bounded authentication wait.
 
     Host liveness can end the ordinary grace early for a dead or untracked
-    process. A bounded sign-in wait keeps the same binding and input until
+    process. A bounded credential wait keeps the same binding and input until
     authentication finishes; old hosts retain the ordinary startup budget.
     Stop, rebind, cancellation and process exit still end the wait promptly.
 
-    :param conversation_store: Optional binding check while sign-in is pending.
+    :param conversation_store: Optional binding check while authentication is pending.
     """
     from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
 
@@ -4365,41 +4365,54 @@ async def _wait_for_host_bound_runner_client(
             )
         )
 
-    async def query_status(*, pause: bool = False) -> str | None:
+    async def query_status(*, pause: bool = False) -> tuple[str | None, float | None]:
         if pause:
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
-        return await _query_host_runner_status(host_conn, host_registry, runner_id)
+        credential_deadline = None
+
+        def record_credential_wait(deadline: float) -> None:
+            nonlocal credential_deadline
+            credential_deadline = deadline
+
+        status = await _query_host_runner_status(
+            host_conn, host_registry, runner_id, on_credential_wait=record_credential_wait
+        )
+        return status, credential_deadline
 
     async def check_pending_owner() -> None:
         if _intentional_stop_sessions.get(session_id) == runner_id:
             raise OmnigentError(
-                "The session was stopped while waiting for host sign-in; send the message again.",
+                "The session was stopped while waiting for runner authentication; "
+                "send the message again.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         if conversation_store is not None:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is None or current.runner_id != runner_id:
                 raise OmnigentError(
-                    "session runner binding changed while waiting for host sign-in; retry",
+                    "session runner binding changed while waiting for runner "
+                    "authentication; retry",
                     code=ErrorCode.WRONG_REPLICA,
                 )
 
     connect_task = wait_for_connection(timeout_s)
     status_task = asyncio.create_task(query_status())
-    sign_in_deadline: float | None = None
-    waiting_for_sign_in = False
+    startup_deadline: float | None = None
+    waiting_for_credentials = False
     try:
         while True:
             done, _pending = await asyncio.wait(
                 {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if sign_in_deadline is not None:
+            if startup_deadline is not None:
                 await check_pending_owner()
+                if time.monotonic() >= startup_deadline:
+                    return None
             if connect_task in done:
                 client = connect_task.result()
                 if client is not None:
                     return client
-                if waiting_for_sign_in:
+                if waiting_for_credentials:
                     return None
                 if (
                     runner_exit_reports is not None
@@ -4414,34 +4427,52 @@ async def _wait_for_host_bound_runner_client(
                     await asyncio.gather(status_task, return_exceptions=True)
                     status_task = asyncio.create_task(query_status())
                     await status_task
-                if status_task.result() != "sign_in_pending":
+                if status_task.result()[0] not in {"sign_in_pending", "credential_pending"}:
                     return None
-            status = status_task.result()
+            status, credential_deadline = status_task.result()
             if status in ("dead", "unknown"):
                 return None
-            if sign_in_deadline is None and status not in {"alive", "sign_in_pending"}:
+            if startup_deadline is None and status not in {
+                "alive",
+                "sign_in_pending",
+                "credential_pending",
+            }:
                 return await connect_task
-            if status == "sign_in_pending" and not waiting_for_sign_in:
-                if sign_in_deadline is None:
-                    sign_in_deadline = time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
-                await check_pending_owner()
-                budget_s = sign_in_deadline - time.monotonic()
-                if budget_s <= 0:
-                    return None
+            if status in {"sign_in_pending", "credential_pending"}:
+                if status == "credential_pending":
+                    if credential_deadline is None:
+                        return await connect_task
+                    next_deadline = (
+                        min(startup_deadline, credential_deadline)
+                        if startup_deadline is not None
+                        else credential_deadline
+                    )
+                else:
+                    next_deadline = (
+                        startup_deadline
+                        if startup_deadline is not None
+                        else time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
+                    )
+                if not waiting_for_credentials or next_deadline != startup_deadline:
+                    startup_deadline = next_deadline
+                    await check_pending_owner()
+                    budget_s = startup_deadline - time.monotonic()
+                    if budget_s <= 0:
+                        return None
+                    connect_task.cancel()
+                    await asyncio.gather(connect_task, return_exceptions=True)
+                    connect_task = wait_for_connection(budget_s)
+                    waiting_for_credentials = True
+            elif status == "alive" and waiting_for_credentials:
+                # Authentication resumed; normal startup must now make progress.
+                assert startup_deadline is not None
+                budget_s = min(timeout_s, max(0.0, startup_deadline - time.monotonic()))
                 connect_task.cancel()
                 await asyncio.gather(connect_task, return_exceptions=True)
                 connect_task = wait_for_connection(budget_s)
-                waiting_for_sign_in = True
-            elif status == "alive" and waiting_for_sign_in:
-                # Sign-in finished; normal startup must now make progress.
-                assert sign_in_deadline is not None
-                budget_s = min(timeout_s, max(0.0, sign_in_deadline - time.monotonic()))
-                connect_task.cancel()
-                await asyncio.gather(connect_task, return_exceptions=True)
-                connect_task = wait_for_connection(budget_s)
-                waiting_for_sign_in = False
+                waiting_for_credentials = False
             if (
-                sign_in_deadline is not None
+                startup_deadline is not None
                 and host_registry.get(host_conn.host_id) is not host_conn
             ):
                 return None

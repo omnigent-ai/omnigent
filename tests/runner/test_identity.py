@@ -178,25 +178,37 @@ def test_touch_connect_marker_survives_unwritable_path(tmp_path) -> None:
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("pending_status", ["sign_in_pending", "credential_pending"])
 @pytest.mark.parametrize(
     "state", ["valid", "other_runner", "expired", "future", "malformed", "boolean", "connected"]
 )
-def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypatch, state) -> None:
+def test_pending_sign_in_marker_is_launch_scoped_and_bounded(
+    tmp_path, monkeypatch, state, pending_status
+) -> None:
     import json
     import time
 
     from omnigent.runner.identity import (
+        mark_credential_pending,
         mark_sign_in_pending,
+        runner_credential_wait_remaining,
         runner_sign_in_is_pending,
         sign_in_pending_marker_path,
     )
 
     connected = tmp_path / "runner.connected"
     monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(connected))
-    mark_sign_in_pending("runner-owned", time.monotonic() + 20)
-    marker = sign_in_pending_marker_path(connected)
+    mark_wait = (
+        mark_sign_in_pending if pending_status == "sign_in_pending" else mark_credential_pending
+    )
+    mark_wait("runner-owned", time.monotonic() + 20)
+    marker = (
+        sign_in_pending_marker_path(connected)
+        if pending_status == "sign_in_pending"
+        else connected.with_suffix(".credential-pending")
+    )
     if state == "other_runner":
-        mark_sign_in_pending("runner-other", time.monotonic() + 20)
+        mark_wait("runner-other", time.monotonic() + 20)
     elif state in {"expired", "future", "boolean"}:
         deadline = (
             True if state == "boolean" else time.monotonic() + (-1 if state == "expired" else 1000)
@@ -206,6 +218,11 @@ def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypat
         marker.write_text("{invalid")
     elif state == "connected":
         connected.touch()
-    assert runner_sign_in_is_pending(connected, "runner-owned") is (state == "valid")
-    mark_sign_in_pending("runner-owned", None)
+    pending = (
+        runner_sign_in_is_pending(connected, "runner-owned")
+        if pending_status == "sign_in_pending"
+        else runner_credential_wait_remaining(connected, "runner-owned") is not None
+    )
+    assert pending is (state == "valid")
+    mark_wait("runner-owned", None)
     assert not marker.exists()

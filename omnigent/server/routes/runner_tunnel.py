@@ -37,18 +37,22 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import (
 )
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
+    TUNNEL_RENEWAL_CAPABILITY,
+    TUNNEL_RENEWAL_REJECTED_CLOSE_CODE,
     EventAckFrame,
     EventBatchFrame,
     EventReadyFrame,
     HelloFrame,
     PingFrame,
     PongFrame,
+    RenewalReadyFrame,
     WSCloseFrame,
     WSFrame,
     decode_frame,
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.registry import (
+    InvalidRenewalPermit,
     RunnerSession,
     TunnelEnd,
     TunnelRegistry,
@@ -425,6 +429,7 @@ def create_runner_tunnel_router(
         }
 
     @router.websocket("/runners/{runner_id}/tunnel")
+    @router.websocket("/runners/{runner_id}/tunnel/renewal")
     async def tunnel(ws: WebSocket, runner_id: str) -> None:
         """Accept a runner's outbound WebSocket tunnel.
 
@@ -575,6 +580,13 @@ def create_runner_tunnel_router(
                 await ws.close(code=4001, reason="expected hello frame")
                 return
 
+            if bool(frame.renewal_permit) != ws.url.path.endswith("/tunnel/renewal"):
+                await ws.close(
+                    code=TUNNEL_RENEWAL_REJECTED_CLOSE_CODE,
+                    reason="planned renewal requires its dedicated route and permit",
+                )
+                return
+
             # 4. Version-skew check (strict-major).
             remote_major = frame.frame_protocol_version
             if remote_major != SUPPORTED_FRAME_PROTOCOL_MAJOR:
@@ -592,7 +604,14 @@ def create_runner_tunnel_router(
             #    (and an unauthenticated non-loopback peer already
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
-            session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            try:
+                session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            except InvalidRenewalPermit:
+                await ws.close(
+                    code=TUNNEL_RENEWAL_REJECTED_CLOSE_CODE,
+                    reason="renewal predecessor not current on this replica",
+                )
+                return
             session.diagnostics.settings.update(
                 tunnel_side="server",
                 app_ping_interval_s=PING_INTERVAL_S,
@@ -643,6 +662,14 @@ def create_runner_tunnel_router(
                 )
 
                 owned.extend((sender_task, ping_task, keepalive_task, receive_task))
+
+                if TUNNEL_RENEWAL_CAPABILITY in frame.capabilities:
+                    owned.append(
+                        asyncio.create_task(
+                            _send_renewal_ready(registry, session),
+                            name=f"tunnel-renewal-ready:{runner_id}",
+                        )
+                    )
 
                 if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
                     getattr(ws.app.state, "runner_event_ingest", None)
@@ -776,6 +803,18 @@ def create_runner_tunnel_router(
                         _logger.exception("on_runner_disconnect callback failed for %s", runner_id)
 
     return router
+
+
+async def _send_renewal_ready(registry: TunnelRegistry, session: RunnerSession) -> None:
+    token = session.continuity_token
+    if token is None or session.renewal_ready is None:
+        return
+    permit = session.renewal_permit
+    with contextlib.suppress(ConnectionError):
+        await registry.send_text(session, encode_frame(RenewalReadyFrame(permit, token)))
+        if permit is None:
+            permit = await session.renewal_ready
+            await registry.send_text(session, encode_frame(RenewalReadyFrame(permit, token)))
 
 
 async def _run_connect_hook(
@@ -915,12 +954,12 @@ async def _receive_loop(
 
     async def process(batch: EventBatchFrame) -> None:
         try:
-            if registry.get(runner_id) is not session or not callable(ingest):
+            if not registry.accepts_frames(session) or not callable(ingest):
                 return
             # A malicious/buggy runner may send multiple frames for the same
             # session despite the client-side FIFO. Preserve apply order here.
             async with session_locks.setdefault(batch.session_id, asyncio.Lock()):
-                if registry.get(runner_id) is not session:
+                if not registry.accepts_frames(session):
                     return
                 ack = await ingest(
                     app=ws.app,
@@ -946,7 +985,7 @@ async def _receive_loop(
                 ),
             )
             ack = EventAckFrame(batch.id, 0, "ingest failed", retryable=True)
-        if registry.get(runner_id) is session:
+        if registry.accepts_frames(session):
             # A replacement tunnel can register between the check and enqueue.
             with contextlib.suppress(ConnectionError):
                 await registry.send_text(session, encode_frame(ack))
