@@ -176,6 +176,7 @@ it("opens agent-requested files only in the active workspace and respects naviga
 });
 
 it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+  writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
   render(
     <MemoryRouter>
       <TooltipProvider>
@@ -190,6 +191,8 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
   fireEvent.click(first.getByText("Block navigation"));
   fireEvent.click(first.getByText("Open folder"));
   expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("data-tab", "subagents");
+  expect(screen.getByTestId("workspace-first")).toHaveAttribute("aria-hidden", "true");
 
   fireEvent.click(within(screen.getByRole("region", { name: "second" })).getByText("Open folder"));
 

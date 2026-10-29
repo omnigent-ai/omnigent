@@ -694,6 +694,21 @@ describe("links to folders", () => {
     expect(screen.getByText("mobile-touch-targets")).toBeInTheDocument();
     expect(toastMock).not.toHaveBeenCalled();
   });
+
+  it("keeps an inline-code folder path as plain code", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(
+      "`experimental/data/summary.md` and `experimental/data/mobile-touch-targets`",
+      [],
+      FOLDER_VIEWER,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "experimental/data/summary.md" }));
+    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
+    expect(screen.getByText("experimental/data/mobile-touch-targets").tagName).toBe("CODE");
+    expect(openFolder).not.toHaveBeenCalled();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
 });
 
 // A file link carries no href, so neither the browser nor the desktop shell
