@@ -69,7 +69,11 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
-from omnigent.harnesses.claude_native import delivery_diagnostics
+from omnigent.harnesses.claude_native import (
+    PEER_MESSAGE_WAKE_KIND,
+    PEER_MESSAGE_WAKE_TEXT,
+    delivery_diagnostics,
+)
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -3348,6 +3352,8 @@ def read_transcript_items_since_with_position(
     agent_name: str,
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items from a line cursor and return byte position.
@@ -3368,6 +3374,9 @@ def read_transcript_items_since_with_position(
     :param settled_response_id: Response id whose turn already ended
         (its ``Stop`` edge posted) — assistant output inheriting it is
         a scheduled/automatic wake and opens a new marked turn.
+    :param pending_settled_response_id: Stopped turn awaiting transcript
+        quiescence; used only to identify peer inputs that wake a new turn.
+    :param pending_settled_at: Stop timestamp; earlier peer input belongs to the stopped turn.
     :returns: Parsed items plus line and byte cursors.
     """
     read_result = _read_complete_jsonl_records(
@@ -3379,6 +3388,7 @@ def read_transcript_items_since_with_position(
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
+    active_pending_settled_id = pending_settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
@@ -3409,6 +3419,8 @@ def read_transcript_items_since_with_position(
             agent_name=agent_name,
             current_response_id=active_response_id,
             settled_response_id=active_settled_id,
+            pending_settled_response_id=active_pending_settled_id,
+            pending_settled_at=pending_settled_at,
         )
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
@@ -3416,6 +3428,7 @@ def read_transcript_items_since_with_position(
         # resume against a still-armed settle (spurious wake marker).
         if any(item.is_compact_summary for item in parsed):
             active_settled_id = None
+            active_pending_settled_id = None
         usage = _usage_from_transcript_entry(entry)
         if usage is not None:
             latest_usage = usage
@@ -3460,6 +3473,8 @@ def read_transcript_items_from_offset(
     agent_name: str,
     current_response_id: str | None = None,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
     include_sidechains: bool = False,
     legacy_agent_messages: bool = False,
 ) -> TranscriptReadResult:
@@ -3484,6 +3499,9 @@ def read_transcript_items_from_offset(
     :param settled_response_id: Response id whose turn already ended
         (its ``Stop`` edge posted) — assistant output inheriting it is
         a scheduled/automatic wake and opens a new marked turn.
+    :param pending_settled_response_id: Stopped turn awaiting transcript
+        quiescence; used only to identify peer inputs that wake a new turn.
+    :param pending_settled_at: Stop timestamp; earlier peer input belongs to the stopped turn.
     :param include_sidechains: Pass ``True`` when reading a
         sub-agent's own ``agent-<id>.jsonl`` — every record there is
         a sidechain by Claude's definition, and dropping them would
@@ -3502,6 +3520,7 @@ def read_transcript_items_from_offset(
     items: list[ClaudeTranscriptItem] = []
     active_response_id = current_response_id
     active_settled_id = settled_response_id
+    active_pending_settled_id = pending_settled_response_id
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
@@ -3533,6 +3552,8 @@ def read_transcript_items_from_offset(
             agent_name=agent_name,
             current_response_id=active_response_id,
             settled_response_id=active_settled_id,
+            pending_settled_response_id=active_pending_settled_id,
+            pending_settled_at=pending_settled_at,
             include_sidechains=include_sidechains,
         )
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
@@ -3543,6 +3564,7 @@ def read_transcript_items_from_offset(
         # resume against a still-armed settle (spurious wake marker).
         if any(item.is_compact_summary for item in parsed):
             active_settled_id = None
+            active_pending_settled_id = None
         usage = _usage_from_transcript_entry(entry)
         if usage is not None:
             latest_usage = usage
@@ -8934,6 +8956,8 @@ def _transcript_items_from_entry(
     agent_name: str,
     current_response_id: str | None,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
+    pending_settled_at: float | None = None,
     include_sidechains: bool = False,
 ) -> tuple[str | None, list[ClaudeTranscriptItem]]:
     """
@@ -8962,12 +8986,22 @@ def _transcript_items_from_entry(
     if not include_sidechains and entry.get("isSidechain") is True:
         return current_response_id, []
     if entry.get("type") == "attachment":
-        return _attachment_transcript_items_from_entry(
+        response_id, items = _attachment_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
             current_response_id=current_response_id,
         )
+        marker = _peer_message_wake_marker(
+            entry,
+            line_number,
+            record_offset,
+            current_response_id,
+            settled_response_id,
+            pending_settled_response_id,
+            pending_settled_at,
+        )
+        return (marker.response_id, [marker, *items]) if marker else (response_id, items)
     if entry.get("subtype") == "local_command":
         return _local_command_transcript_items_from_entry(
             entry,
@@ -8987,13 +9021,23 @@ def _transcript_items_from_entry(
         return current_response_id, []
     role = message.get("role")
     if role == "user":
-        return _user_transcript_items_from_entry(
+        response_id, items = _user_transcript_items_from_entry(
             entry,
             line_number=line_number,
             record_offset=record_offset,
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+        marker = _peer_message_wake_marker(
+            entry,
+            line_number,
+            record_offset,
+            current_response_id,
+            settled_response_id,
+            pending_settled_response_id,
+            pending_settled_at,
+        )
+        return (marker.response_id, [marker, *items]) if marker else (response_id, items)
     if role == "assistant":
         return _assistant_transcript_items_from_entry(
             entry,
@@ -9507,6 +9551,78 @@ def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> 
     stripped = text.lstrip()
     return stripped.startswith("<task-notification>") and all(
         marker in stripped for marker in _TASK_NOTIFICATION_REQUIRED_MARKERS
+    )
+
+
+def _peer_message_wake_marker(
+    entry: _JsonObject,
+    line_number: int,
+    record_offset: int | None,
+    current_response_id: str | None,
+    settled_response_id: str | None,
+    pending_settled_response_id: str | None,
+    pending_settled_at: float | None,
+) -> ClaudeTranscriptItem | None:
+    """Label a peer input after a stopped turn without exposing its hidden context."""
+    if current_response_id is None or current_response_id not in (
+        settled_response_id,
+        pending_settled_response_id,
+    ):
+        return None
+    if current_response_id != settled_response_id:
+        timestamp = _transcript_timestamp(entry.get("timestamp"))
+        if pending_settled_at is None or timestamp is None or timestamp <= pending_settled_at:
+            return None
+    if entry.get("isCompactSummary") is True:
+        return None
+    if entry.get("type") == "attachment":
+        metadata = entry.get("attachment")
+        if not isinstance(metadata, dict) or metadata.get("type") != "queued_command":
+            return None
+        content = metadata.get("prompt")
+        if not isinstance(content, str) or (
+            metadata.get("commandMode") != "prompt"
+            and _subagent_handback_id(metadata.get("origin")) is None
+            and not _is_task_completion_text(content)
+        ):
+            return None
+    else:
+        metadata = entry
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+    texts = (
+        [content]
+        if isinstance(content, str)
+        else [
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ]
+        if isinstance(content, list)
+        else []
+    )
+    if not texts or not any(text.strip() for text in texts):
+        return None
+    origin = metadata.get("origin")
+    peer_origin = isinstance(origin, dict) and origin.get("kind") == "peer"
+    meta_peer_envelope = metadata.get("isMeta") is True and all(
+        not text.lstrip().startswith("<task-notification>") and _is_agent_notification_text(text)
+        for text in texts
+    )
+    if not peer_origin and not meta_peer_envelope:
+        return None
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, PEER_MESSAGE_WAKE_KIND),
+        item_type="message",
+        data={
+            "role": "user",
+            "is_meta": True,
+            "content": [{"type": "input_text", "text": PEER_MESSAGE_WAKE_TEXT}],
+        },
+        response_id=_response_id_from_source(source_key),
     )
 
 

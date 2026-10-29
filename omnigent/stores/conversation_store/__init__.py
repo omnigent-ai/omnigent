@@ -79,6 +79,10 @@ FORK_CARRY_HISTORY_LABEL_KEY = "omnigent.fork.carry_history"
 # normal approval/sandbox stance.
 CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypass_sandbox"
 
+# Codex collaboration mode of a codex-native session (``"plan"`` / ``"default"``),
+# persisted by the in-session Plan toggle or seeded by the New Session screen.
+CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY = "omnigent.codex_native.collaboration_mode"
+
 # Reserved label key that stores a session's sidebar "project" membership
 # (implicit collections — a project exists while ≥1 session carries this key).
 # Namespaced so it never collides with the user-facing "project" term or other

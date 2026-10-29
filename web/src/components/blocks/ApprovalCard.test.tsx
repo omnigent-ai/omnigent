@@ -1065,16 +1065,44 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
-  it("labels Cursor structured input prompts as Cursor prompts", () => {
-    // Cursor's AskQuestion reuses the same AskUserQuestion renderer (the
-    // runner translates it into the preview shape), so the title must reflect
-    // the producer rather than defaulting to "Claude has questions".
+  it.each([
+    {
+      name: "Cursor policy",
+      policyName: "cursor_native_permission",
+      phase: "pre_tool_use",
+      title: "Cursor has questions",
+    },
+    {
+      name: "Devin policy",
+      policyName: "devin_native_ask_question",
+      phase: "pre_tool_use",
+      title: "Devin needs your input",
+    },
+    {
+      name: "Devin phase without a policy",
+      policyName: "",
+      phase: "devin_ask_question",
+      title: "Devin needs your input",
+    },
+    {
+      name: "Antigravity phase ahead of Cursor policy",
+      policyName: "cursor_native_permission",
+      phase: "agy_ask_question",
+      title: "Antigravity needs your input",
+    },
+    {
+      name: "the legacy default for unknown prefixes",
+      policyName: "question_policy",
+      phase: "pre_tool_use",
+      title: "Claude has questions",
+    },
+  ])("labels structured input prompts using $name", ({ policyName, phase, title }) => {
     render(
       <ApprovalCard
-        elicitationId="elic_cursor_label"
+        elicitationId="elic_question_label"
         message="AskQuestion Demo"
-        phase="pre_tool_use"
-        policyName="cursor_native_permission"
+        phase={phase}
+        policyName={policyName}
         contentPreview=""
         requestedSchema={{}}
         status="pending"
@@ -1092,8 +1120,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    expect(screen.getByText("Cursor has questions")).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
+    expect(screen.getByText(title)).toBeDefined();
   });
 
   it.each([
