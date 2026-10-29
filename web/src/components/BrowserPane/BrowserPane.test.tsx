@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { BrowserPane } from "./BrowserPane";
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
@@ -101,6 +102,57 @@ describe("BrowserPane cold-start (no view yet)", () => {
     );
     cleanup();
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
+  });
+
+  describe("tabs restored after a relaunch", () => {
+    beforeEach(() => {
+      writeSessionWorkspaceState("conv_a", {
+        openBrowsers: ["two"],
+        browserTabPages: { two: { url: "https://example.com/saved", title: "Saved" } },
+      });
+    });
+    afterEach(() => localStorage.clear());
+
+    it("reopens a tab's saved page when it has no native view", async () => {
+      const bridge = installBridge();
+      render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+          "browser-tab:conv_a:two",
+          "https://example.com/saved",
+          undefined,
+          undefined,
+        ),
+      );
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+        "https://example.com/saved",
+      );
+    });
+
+    it("keeps a live view's page instead of reloading the saved one", async () => {
+      const bridge = installBridge({
+        browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/now" }),
+      });
+      render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+      await waitFor(() =>
+        expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+          "https://example.com/now",
+        ),
+      );
+      expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+    });
+
+    it("reports a saved page the shell refuses to reopen", async () => {
+      installBridge({
+        browserOpenOrNavigate: vi
+          .fn()
+          .mockResolvedValue({ ok: false, error: "browser view cap reached — close one" }),
+      });
+      render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "browser view cap reached — close one",
+      );
+    });
   });
 
   it("reattaches the retained page without navigating when its rail is reopened", async () => {

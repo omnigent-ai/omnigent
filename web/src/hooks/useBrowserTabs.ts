@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { readBrowserTabPage } from "@/lib/browserTabPages";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
@@ -96,6 +97,7 @@ export function useBrowserTabs(conversationId: string) {
         const page = await bridge.browserHasView?.(viewId);
         // Live updates take precedence over an earlier restore snapshot.
         if (!active || updated.has(viewId) || !page) return;
+        // A tab without a live view (e.g. after a relaunch) shows its saved page.
         setPage(
           viewId,
           page.exists
@@ -103,7 +105,7 @@ export function useBrowserTabs(conversationId: string) {
                 url: page.url && page.url !== "about:blank" ? page.url : page.pendingUrl,
                 title: page.title,
               }
-            : {},
+            : (readBrowserTabPage(viewId) ?? {}),
         );
       } catch {
         // A closed view or an older shell can leave the default tab label.
