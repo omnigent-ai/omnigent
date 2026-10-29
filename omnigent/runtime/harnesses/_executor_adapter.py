@@ -55,6 +55,7 @@ from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
+from omnigent.server.ask_user_question import structured_ask_user_question
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
@@ -283,6 +284,15 @@ class ExecutorAdapter(HarnessApp):
         ):
             executor._form_elicitation_handler = (  # type: ignore[attr-defined]
                 self._stable_form_elicitation_handler
+            )
+        # The claude-sdk executor also accepts an AskUserQuestion bridge that
+        # renders the question as a clickable form and feeds selections back;
+        # other executors don't define the attribute.
+        if (
+            hasattr(executor, "_ask_question_handler") and executor._ask_question_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._ask_question_handler = (  # type: ignore[attr-defined]
+                self._stable_ask_question_handler
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
@@ -867,11 +877,14 @@ class ExecutorAdapter(HarnessApp):
         tool_input: dict[str, Any],
         *,
         requested_schema: dict[str, Any] | None = None,
+        ask_user_question: dict[str, Any] | None = None,
+        phase: str = "tool_call",
     ) -> ElicitationRequestParams:
         """Build the approval-card params for a tool-permission elicitation.
 
         With *requested_schema* the card renders one button per choice instead of
-        Approve/Reject; without it, the usual binary card.
+        Approve/Reject; with *ask_user_question* it renders that question form;
+        without either, the usual binary card.
         """
         # Build a concise preview: truncate long args so the UI widget
         # stays readable. 300 chars matches AP's policy-engine preview.
@@ -882,14 +895,19 @@ class ExecutorAdapter(HarnessApp):
         preview = preview[:300]
 
         label = self._harness_label
+        # Extra field, stamped only when present so other cards serialize unchanged.
+        extras: dict[str, Any] = (
+            {"ask_user_question": ask_user_question} if ask_user_question else {}
+        )
         return ElicitationRequestParams(
             mode="form",
             message=f"{label} wants to use **{tool_name}**",
             requestedSchema=requested_schema,
             url=None,
-            phase="tool_call",
+            phase=phase,
             policy_name=f"{label.lower()}_sdk_permission",
             content_preview=f"{tool_name}({preview})",
+            **extras,
         )
 
     async def _stable_elicitation_choice_handler(
@@ -952,6 +970,52 @@ class ExecutorAdapter(HarnessApp):
             return ElicitationResult(action="cancel")
 
         return await ctx.elicit(elicitation_id, params)
+
+    async def _stable_ask_question_handler(
+        self,
+        tool_input: dict[str, Any],
+    ) -> dict[str, Any] | str:
+        """Stable bridge for a claude-sdk ``AskUserQuestion`` tool call.
+
+        Renders the tool's questions as the clickable ``ask_user_question``
+        form. On accept, returns the tool input with the user's selections
+        merged under ``answers`` — the shape Claude Code reads to skip its own
+        picker and report those selections as the tool result. Otherwise
+        returns the reason the model should see for the call being denied.
+
+        Reads ``_current_ctx`` at call time, mirroring
+        :meth:`_stable_elicitation_handler`.
+        """
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error("ask-question callback fired with no active turn context; denying")
+            return "AskUserQuestion is unavailable outside an active Omnigent turn."
+        ask_payload = structured_ask_user_question(tool_input)
+        if ask_payload is None:
+            return (
+                "AskUserQuestion input had no question with selectable options, so "
+                "nothing was shown to the user. Fix the input or ask in plain text."
+            )
+        elicitation_id = f"elicit_{secrets.token_hex(16)}"
+        # Own phase so the REPL's "approve always" cache for tool calls never
+        # auto-accepts a question (an accept with no answers).
+        params = self._permission_card(
+            "AskUserQuestion", tool_input, ask_user_question=ask_payload, phase="pre_tool_use"
+        )
+        result = await ctx.elicit(elicitation_id, params)
+        # ``result.content`` is MCP-shaped (question -> selection), the same
+        # shape the claude-native permission hook feeds back as ``answers``.
+        if result.action == "accept" and isinstance(result.content, dict) and result.content:
+            return {**tool_input, "answers": result.content}
+        if result.action == "accept":
+            # A client without the question form (e.g. the terminal REPL) can
+            # only approve; the user agreed to answer but picked nothing.
+            return (
+                "The user's client could not show these options and no answer came "
+                "back. Ask the question again in plain text."
+            )
+        # Dismissing a question is an answer, not a cancel: the turn continues.
+        return "The user dismissed the question without answering."
 
     async def _stable_policy_evaluator(
         self,

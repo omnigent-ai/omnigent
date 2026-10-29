@@ -1221,6 +1221,8 @@ class HostSkillsResultFrame:
     error_code: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
+    # Sources the host could not read; non-empty means ``skills`` is incomplete.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1328,6 +1330,8 @@ class HostImportedLocalSession:
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
         per session so an "all harnesses" request can mix sources in one batch.
+    :param archived: Whether the harness had archived this session; the server
+        archives the imported conversation too. Absent from older hosts.
     """
 
     external_session_id: str
@@ -1335,6 +1339,7 @@ class HostImportedLocalSession:
     items: list[_JsonObject]
     title: str | None = None
     source: str = ""
+    archived: bool = False
 
 
 @dataclass
@@ -2022,6 +2027,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
                 "agent_id": frame.agent_id,
+                "warnings": frame.warnings,
             }
         )
     if isinstance(frame, HostPluginsFrame):
@@ -2173,6 +2179,7 @@ def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonO
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -3206,6 +3213,8 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+        # Absent from older hosts, which never reported partial catalogs.
+        warnings=_optional_str_list(msg, "warnings"),
     )
 
 
@@ -3413,6 +3422,7 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
         items=items,
         title=title,
         source=source,
+        archived=_required_bool(raw, "archived") if "archived" in raw else False,
     )
 
 

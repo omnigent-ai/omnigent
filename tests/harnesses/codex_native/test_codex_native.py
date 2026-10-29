@@ -924,6 +924,35 @@ def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     [
         (
             codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "thread 019e already has an active writer"}
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32603, "message": "thread 019e already has an active writer"}
+            ),
+            False,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "no rollout found for thread id 019e"}
+            ),
+            False,
+        ),
+        (RuntimeError("thread 019e already has an active writer"), False),
+    ],
+)
+def test_is_active_writer_error(exc: BaseException, expected: bool) -> None:
+    """Only codex's ``-32600`` writer refusal counts as another app-server holding the thread."""
+    assert codex_native_app_server.is_active_writer_error(exc) is expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            codex_native_app_server.CodexAppServerResponseError(
                 {
                     "code": -32600,
                     "message": (

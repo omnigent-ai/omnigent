@@ -1259,6 +1259,7 @@ function setupLandingMocks() {
           useAvailableAgentsMock().data?.find(
             (agent: AvailableAgent) => agent.id === target?.agentId,
           )?.skills ?? [],
+        skillsWarnings: [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
@@ -6509,6 +6510,29 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
+  const sshDesktop = { kind: "electron", connectSshHost: vi.fn() };
+  it.each([
+    ["the browser", undefined, null, false],
+    ["a desktop app without SSH connect", { kind: "electron" }, null, false],
+    ["a window that offers Run on Arca", sshDesktop, { databricksInternalFeatures: true }, false],
+    ["a desktop app with SSH connect", sshDesktop, null, true],
+  ])("offers SSH connect in %s only when it can", async (_name, desktop, features, shown) => {
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+    vi.mocked(getDesktopFeatures).mockResolvedValue(features);
+    try {
+      renderLanding();
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+      // Let the shell's feature answer land before judging.
+      await act(async () => {});
+
+      expect(screen.queryByTestId("ssh-connect-form") !== null).toBe(shown);
+    } finally {
+      vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    }
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
@@ -8649,6 +8673,7 @@ describe("NewChatLandingScreen skills menu", () => {
       ({ target, enabled = true, starting = false }) =>
         ({
           skills: [],
+          skillsWarnings: [],
           skillsStatus: "ready",
           refetch: vi.fn(),
           ...state,
@@ -8871,6 +8896,23 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("No matching skills")).toBeInTheDocument();
     typeMessage("/");
     expect(screen.getByText("No skills available")).toBeInTheDocument();
+  });
+
+  it("explains an incomplete catalog with Retry while listing the skills it read", () => {
+    const retry = vi.fn();
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1";
+    mockSkills({
+      skills: [{ name: "host-review", description: "Host-only skill" }],
+      skillsWarnings: [warning],
+      refetch: retry,
+    });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
+    expect(screen.queryByText("No skills available")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
   });
 
   it("dismisses a loading-only menu with Escape", () => {
