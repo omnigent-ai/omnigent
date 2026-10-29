@@ -20,7 +20,7 @@
 // changes the serialiser so this no longer composes, those tests fail loudly.
 
 import { MarkdownManager } from "@tiptap/markdown";
-import { marksEqual, type JSONContent } from "@tiptap/core";
+import { marksEqual, type Editor, type JSONContent } from "@tiptap/core";
 
 import {
   definedFootnoteLabels,
@@ -40,6 +40,7 @@ import {
 } from "./TipTapLinkReferences";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 import { installIterativeSetextHeadings } from "./markdownSetextHeading";
+import { recordParse, sourceBlockPlan, trackTopLevelTokens } from "./markdownSourceBlocks";
 
 /** Ampersands that would parse as an entity reference on the way back in. */
 const ENTITY_AMP = /&(?=[a-zA-Z][a-zA-Z0-9]{1,31};|#\d{1,7};|#[xX][0-9a-fA-F]{1,6};)/g;
@@ -105,6 +106,81 @@ function joinSoftBreaks(node: JSONContent): JSONContent {
   return { ...node, content };
 }
 
+/**
+ * Run *callback* on *content* prepared for serialising, with the document's
+ * defined footnote and link labels in scope.
+ */
+function withSerializeContext<T>(
+  manager: MarkdownManager,
+  content: JSONContent,
+  callback: (prepared: JSONContent) => T,
+): T {
+  const joined = hasSoftBreakNode(manager) ? joinSoftBreaks(content) : content;
+  // Literal `[^x]` or `[x]` text needs escaping only when the label is defined.
+  return withFootnoteLabels(documentFootnoteLabels(joined), () =>
+    withLinkLabels(documentLinkLabels(joined), () =>
+      callback(prepareReferenceLinks(prepareFootnoteReferences(joined))),
+    ),
+  );
+}
+
+/** The private renderer `serialize` uses for each block. */
+interface RendererInternals {
+  renderNodeToMarkdown: (
+    node: JSONContent,
+    parentNode: JSONContent,
+    index: number,
+    level: number,
+  ) => string;
+}
+
+/**
+ * Serialise the top-level blocks at *indexes* as `serialize` writes them in *content*.
+ *
+ * :returns: Markdown by block index, or null if the renderer is unavailable.
+ */
+function serializeTopLevelBlocks(
+  manager: MarkdownManager,
+  content: JSONContent,
+  indexes: number[],
+): Map<number, string> | null {
+  const { renderNodeToMarkdown } = manager as unknown as Partial<RendererInternals>;
+  if (!renderNodeToMarkdown) return null;
+  return withSerializeContext(manager, content, (prepared) => {
+    const blocks = prepared.content ?? [];
+    if (blocks.length !== (content.content?.length ?? 0)) return null;
+    return new Map(
+      indexes.map((index) => [
+        index,
+        renderNodeToMarkdown.call(manager, blocks[index], prepared, index, 0),
+      ]),
+    );
+  });
+}
+
+/**
+ * The editor's Markdown, with top-level blocks the user did not change written
+ * as their original source (see markdownSourceBlocks.ts).
+ *
+ * :param editor: The Markdown editor.
+ * :returns: The document's Markdown; `editor.getMarkdown()` when no source is recorded.
+ */
+export function markdownKeepingSource(editor: Editor): string {
+  const plan = sourceBlockPlan(editor);
+  const manager = editor.markdown;
+  if (!plan || !manager) return editor.getMarkdown();
+  const indexes = plan.filter((step): step is number => typeof step === "number");
+  const rendered = indexes.length
+    ? serializeTopLevelBlocks(manager, editor.getJSON(), indexes)
+    : new Map<number, string>();
+  if (!rendered) return editor.getMarkdown();
+  // `serialize` joins top-level blocks with a blank line.
+  const markdown = plan
+    .map((step) => (typeof step === "number" ? (rendered.get(step) ?? "") : step))
+    .join("\n\n");
+  return markdown.replace(/&nbsp;|\u00A0/g, "").trim() ? markdown : "";
+}
+
 let serializeWrapped = false;
 
 /**
@@ -125,16 +201,8 @@ export function installMarkdownSerializerPatch(): void {
       content: JSONContent,
       ...rest: unknown[]
     ) {
-      const joined = hasSoftBreakNode(this) ? joinSoftBreaks(content) : content;
-      // Literal `[^x]` or `[x]` text needs escaping only when the label is defined.
-      return withFootnoteLabels(documentFootnoteLabels(joined), () =>
-        withLinkLabels(documentLinkLabels(joined), () =>
-          originalSerialize.call(
-            this,
-            prepareReferenceLinks(prepareFootnoteReferences(joined)),
-            ...rest,
-          ),
-        ),
+      return withSerializeContext(this, content, (prepared) =>
+        originalSerialize.call(this, prepared, ...rest),
       );
     };
   }
@@ -268,13 +336,17 @@ export function installMarkdownParserPatch(): void {
     installFootnoteReferenceTokenizer(this.instance);
     installLinkDefinitionTokenizer(this.instance);
     // `[^x]` is a footnote reference only when the file defines `[^x]:`.
-    const doc = withFootnoteLabels(definedFootnoteLabels(this.instance, markdown), () =>
-      wrapLooseInlineRuns(originalParse.call(this, markdown)),
+    const { doc: parsed, groups } = trackTopLevelTokens(this, () =>
+      withFootnoteLabels(definedFootnoteLabels(this.instance, markdown), () =>
+        originalParse.call(this, markdown),
+      ),
     );
-    if (!hasSoftBreakNode(this)) return doc;
+    let doc = wrapLooseInlineRuns(parsed);
     // Without the manager's code-type registry no node can be proven verbatim,
     // so leave the newlines as text rather than risk splitting code content.
     const { codeTypes } = this as unknown as Partial<SerializerInternals>;
-    return codeTypes ? splitSoftBreaks(doc, codeTypes) : doc;
+    if (hasSoftBreakNode(this) && codeTypes) doc = splitSoftBreaks(doc, codeTypes);
+    recordParse(markdown, parsed, doc, groups);
+    return doc;
   };
 }
