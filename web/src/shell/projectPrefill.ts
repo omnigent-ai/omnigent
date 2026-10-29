@@ -25,6 +25,9 @@ export interface ProjectPrefillConfig {
    *  machine — the composer's harness-seed effect consumes it directly (it owns
    *  the model slot and would otherwise clobber a machine write). */
   model?: string;
+  /** Default reasoning effort for the configured agent; consumed by the same
+   *  harness-seed effect as `model`. */
+  effort?: string;
 }
 
 export interface ProjectPrefillState {

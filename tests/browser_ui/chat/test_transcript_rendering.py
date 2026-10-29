@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import re
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
-from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    message_item,
+    tool_call_items,
+)
 
 _CODE_BODY = '[data-streamdown="code-block-body"]'
 _LONG_WORD = "horizontalScrolling" * 14
@@ -396,3 +403,372 @@ def test_virtualized_transcript_returns_after_losing_layout(
         transcript.evaluate("element => { element.style.display = ''; }")
         page.wait_for_timeout(150)  # Let restored layout observers settle.
         expect(newest_reply).to_be_visible(timeout=5_000)
+
+
+def _tall_topped_history() -> list[dict[str, object]]:
+    """A short session whose two tallest messages sit just past the overscan at the bottom."""
+    log = "\n".join(
+        f"[ERROR] step {i}: cherry-pick conflict in build settings for dbr-branch-{i}"
+        for i in range(48)
+    )
+    answer = "\n\n".join(
+        f"Paragraph {i}: the backport needs the build-settings change from master "
+        "before the 19.x job can pass, so both targets get the same fix."
+        for i in range(13)
+    )
+    chronological = [
+        message_item("tall-log", "user", log, response_id="tall-0"),
+        message_item("tall-ack", "assistant", "Looking at that log now.", response_id="tall-0"),
+        message_item("tall-ask", "user", "What does it say?", response_id="tall-1"),
+        message_item("tall-answer", "assistant", answer, response_id="tall-1"),
+    ]
+    for n in range(6):
+        response_id = f"short-{n}"
+        reply = "Done." if n % 2 else "Checked both branches; the master audit still passes."
+        chronological += [
+            message_item(
+                f"{response_id}-ask",
+                "user",
+                f"Follow-up {n}: keep going.",
+                response_id=response_id,
+            ),
+            message_item(f"{response_id}-reply", "assistant", reply, response_id=response_id),
+        ]
+    return list(reversed(chronological))
+
+
+def _wheel(page: Page, total: float, steps: int = 40) -> None:
+    """A trackpad-like fling: front-loaded wheel deltas that taper off."""
+    for i in range(steps):
+        page.mouse.wheel(0, total / steps * 2.0 * (steps - i) / steps)
+        page.wait_for_timeout(8)
+
+
+def test_reduced_motion_transcript_holds_still_at_the_bottom(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """With reduced motion, the bottom of a live turn doesn't flip between rows every frame."""
+    page.emulate_media(reduced_motion="reduce")
+    chat = chat_session_contract
+    chat.set_items(_tall_topped_history())
+    chat.update_session(status="running")
+    open_live(page, chat, {"width": 1240, "height": 1051})
+    chat.emit_busy("tall-live")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible(timeout=20_000)
+
+    transcript = page.locator("[data-virtualized-transcript]")
+    # Rows mount and unmount at once, so the padding that stands in for them must too.
+    applied = transcript.evaluate(
+        """el => {
+          const list = el.querySelector('[data-index]').parentElement;
+          const before = list.style.paddingTop;
+          list.style.paddingTop = '123px';
+          const value = getComputedStyle(list).paddingTop;
+          list.style.paddingTop = before;
+          return value;
+        }"""
+    )
+    assert applied == "123px"
+
+    box = transcript.bounding_box()
+    assert box
+    page.mouse.move(box["x"] + box["width"] * 0.85, box["y"] + box["height"] * 0.7)
+    _wheel(page, -1200)
+    page.wait_for_timeout(300)
+    _wheel(page, 3000)
+    page.mouse.move(box["x"] + 5, box["y"] + 5)
+    heights = transcript.evaluate(
+        """el => new Promise((resolve) => {
+          const heights = [];
+          const tick = () => {
+            heights.push(el.scrollHeight);
+            if (heights.length < 90) requestAnimationFrame(tick);
+            else resolve(heights);
+          };
+          requestAnimationFrame(tick);
+        })"""
+    )
+    changes = sum(1 for before, after in pairwise(heights) if before != after)
+    assert changes <= 2, heights
+
+
+_ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"
+_PR_ERROR = "Error: 422 Validation Failed: A pull request already exists"
+_ISSUE_DESCRIPTION = (
+    "## Context\n\n"
+    "Follow-up to [#11607](<https://github.com/omnigent-ai/omnigent/pull/11607>).\n\n"
+    "1. Show added and removed line counts.\n2. Show display names for MCP servers."
+)
+
+
+def _seed_tool_calls(chat: ChatSessionContract) -> None:
+    """One settled turn: a plan update, an MCP lookup, and a failing MCP call."""
+    response_id = "tool-rows-response"
+    issue = {
+        "id": "OMNI-12243",
+        "title": _ISSUE_TITLE,
+        "state": "In Review",
+        "description": _ISSUE_DESCRIPTION,
+    }
+    todo_list = [
+        {"id": 1, "title": "Find review workflow", "status": "completed"},
+        {"id": 2, "title": "Fetch open PRs", "status": "in-progress"},
+    ]
+    chronological = [
+        message_item("tool-rows-user", "user", "Plan, then open the PR.", response_id=response_id),
+        *tool_call_items(
+            "call-plan",
+            "manage_todo_list",
+            {"operation": "write", "todoList": todo_list},
+            "Task plan updated (2 tasks).",
+            response_id=response_id,
+        ),
+        # Claude-native stores MCP results as content blocks around the server's JSON.
+        *tool_call_items(
+            "call-issue",
+            "mcp__linear__get_issue",
+            {
+                "id": "OMNI-12243",
+                "includeComments": False,
+                "fields": ["id", "title", "description", "state", "labels"],
+            },
+            json.dumps([{"type": "text", "text": json.dumps(issue)}]),
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-pr",
+            "mcp__github__create_pull_request",
+            {"owner": "omnigent-ai", "repo": "omnigent", "draft": True},
+            _PR_ERROR,
+            response_id=response_id,
+        ),
+        message_item(
+            "tool-rows-assistant", "assistant", "The PR already exists.", response_id=response_id
+        ),
+    ]
+    chat.set_items(list(reversed(chronological)))
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_tool_rows_read_as_actions_with_their_outcome(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """Tool rows show a humanized title and MCP server, with details behind the expand."""
+    chat = chat_session_contract
+    _seed_tool_calls(chat)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+
+    expect(page.get_by_text("The PR already exists.")).to_be_visible(timeout=20_000)
+    worked = page.get_by_role("button", name=re.compile(r"^Worked"))
+    expect(worked).to_have_attribute("aria-expanded", "false")
+    worked.click()
+    page.get_by_text("Called 3 tools", exact=True).click()
+
+    plan = page.get_by_role("button", name=re.compile(r"^Manage todo list"))
+    expect(plan).to_contain_text("write · 2 items")
+    expect(plan).not_to_contain_text("Task plan updated")
+    issue = page.get_by_role("button", name=re.compile(r"^Get issue"))
+    # Known MCP servers carry their brand spelling, not the config name.
+    expect(issue.get_by_text("Linear", exact=True)).to_be_visible()
+    # The list of fields to return is not the subject of the call.
+    expect(issue).not_to_contain_text("items")
+    expect(issue).not_to_contain_text(_ISSUE_TITLE)
+    failure = page.get_by_role("button", name=re.compile(r"^Create pull request"))
+    expect(failure.get_by_text("GitHub", exact=True)).to_be_visible()
+    expect(page.get_by_text(_PR_ERROR, exact=True)).not_to_be_visible()
+    failure.click()
+    expect(failure.locator("xpath=..").get_by_test_id("tool-error-box")).to_have_text(_PR_ERROR)
+    failure.click()
+    expect(page.get_by_text(_PR_ERROR, exact=True)).not_to_be_visible()
+
+    transcript = page.locator('[role="log"]')
+    expect(transcript).not_to_contain_text("mcp__linear__")
+    expect(transcript).not_to_contain_text('{"operation"')
+    # Each row is one line, and long rows truncate rather than wrap or widen the page.
+    height = "el => el.getBoundingClientRect().height"
+    heights = [row.evaluate(height) for row in (plan, issue, failure)]
+    assert max(heights) - min(heights) < 1, heights
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+    # Rows fill the reply's width even though its text is one short line.
+    reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
+    right_edge = "el => el.getBoundingClientRect().right"
+    assert reply.evaluate(right_edge) - plan.evaluate(right_edge) < 2
+
+    issue.click()
+    card = issue.locator("xpath=..")
+    fields = card.get_by_test_id("tool-value-view")
+    expect(fields.last).to_contain_text(f"Title{_ISSUE_TITLE}")
+    # Input and Result share one label column, so their values start at the same offset.
+    value_left = (
+        "views => views.map(view => view.querySelector('dd').getBoundingClientRect().left)"
+    )
+    input_left, result_left = fields.evaluate_all(value_left)
+    assert abs(input_left - result_left) < 1
+    # A markdown description reads as prose with working links, not as source.
+    description = card.get_by_test_id("tool-prose-value")
+    expect(description.get_by_role("link", name="#11607")).to_be_visible()
+    expect(description).not_to_contain_text("](")
+    font = description.locator("p").first.evaluate("el => getComputedStyle(el).fontFamily")
+    assert "mono" not in font.lower()
+    # A description's heading stays near body size instead of the chat's 1.4em.
+    sizes = description.evaluate(
+        "el => ['h2', 'p'].map("
+        "tag => parseFloat(getComputedStyle(el.querySelector(tag)).fontSize))"
+    )
+    assert sizes[0] <= sizes[1] * 1.1, sizes
+    font_size = "el => getComputedStyle(el).fontSize"
+    label_size = fields.last.locator("dt").first.evaluate(font_size)
+    raw = page.get_by_role("tab", name="Raw")
+    expect(page.get_by_role("tab", name="Fields")).to_have_attribute("aria-selected", "true")
+    raw.click()
+    expect(raw).to_have_attribute("aria-selected", "true")
+    expect(transcript).to_contain_text('"includeComments": false')
+    # Raw names its panels like the Fields view's sections.
+    expect(card.get_by_text("Input", exact=True)).to_be_visible()
+    expect(card.get_by_text("Result", exact=True)).to_be_visible()
+    expect(card).not_to_contain_text("Parameters")
+    # Labels and code share one Interface font step, so the card reads as one size.
+    code_sizes = card.locator("pre code").evaluate_all(
+        "codes => codes.map(code => getComputedStyle(code).fontSize)"
+    )
+    assert set(code_sizes) == {label_size}, (label_size, code_sizes)
+
+
+_PATCH_CHANGES = [
+    {
+        "path": "/repo/src/greet.py",
+        "kind": {"type": "update"},
+        "diff": (
+            "@@ -1,3 +1,3 @@\n def greet(name):\n"
+            "-    print('Hello ' + name)\n+    print(f'Hello {name}')\n     return name\n"
+        ),
+    },
+    {
+        "path": "/repo/src/farewell.py",
+        "kind": {"type": "add"},
+        "diff": "def farewell(name):\n    print(f'Bye {name}')\n",
+    },
+    {"path": "/repo/src/legacy.py", "kind": {"type": "delete"}, "diff": "LEGACY = True\n"},
+]
+_DECLINED_CHANGES = [
+    {
+        "path": "/repo/src/config.py",
+        "kind": {"type": "update"},
+        "diff": "@@ -1 +1 @@\n-DEBUG = False\n+DEBUG = True\n",
+    }
+]
+# How the runner stores a Codex patch's output: its outcome, then one line per file.
+_PATCH_OUTPUT = (
+    "File change applied.\nupdate /repo/src/greet.py\nadd /repo/src/farewell.py\n"
+    "delete /repo/src/legacy.py"
+)
+_DECLINED_OUTPUT = "Error: File change ended with status declined.\nupdate /repo/src/config.py"
+_EDIT_ERROR = "<tool_use_error>String to replace not found in file.</tool_use_error>"
+
+
+def _seed_edit_calls(chat: ChatSessionContract) -> None:
+    """One settled turn: a Codex patch over three files, a missed Claude edit, a declined patch."""
+    response_id = "edit-rows-response"
+    chronological = [
+        message_item("edit-rows-user", "user", "Rename the greeting.", response_id=response_id),
+        *tool_call_items(
+            "call-patch",
+            "apply_patch",
+            {"changes": _PATCH_CHANGES},
+            _PATCH_OUTPUT,
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-edit",
+            "Edit",
+            {"file_path": "/repo/README.md", "old_string": "Hi", "new_string": "Hello"},
+            _EDIT_ERROR,
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-declined",
+            "apply_patch",
+            {"changes": _DECLINED_CHANGES},
+            _DECLINED_OUTPUT,
+            response_id=response_id,
+        ),
+        message_item(
+            "edit-rows-assistant", "assistant", "Greeting renamed.", response_id=response_id
+        ),
+    ]
+    chat.set_items(list(reversed(chronological)))
+
+
+def _open_edit_rows(page: Page, chat: ChatSessionContract) -> None:
+    _seed_edit_calls(chat)
+    page.goto(chat.url)
+    expect(page.get_by_text("Greeting renamed.")).to_be_visible(timeout=20_000)
+    page.get_by_role("button", name=re.compile(r"^Worked")).click()
+    page.get_by_text(re.compile(r"^Edited \d files$")).click()
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.browser_context_args(record_video_size={"width": 1280, "height": 720})
+def test_patch_row_counts_lines_across_its_files(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """A Codex patch row shows its files' summed line counts and expands to per-file diffs."""
+    page.set_viewport_size({"width": width, "height": 720})
+    _open_edit_rows(page, chat_session_contract)
+
+    patch = page.get_by_role("button", name=re.compile(r"^Edit 3 files"))
+    expect(patch.get_by_test_id("tool-line-counts")).to_have_text("+3 -2")
+
+    patch.click()
+    expect(page.get_by_role("tab", name="Diff")).to_have_attribute("aria-selected", "true")
+    # Each file is its own panel, named with its change kind and counts.
+    body = patch.locator("xpath=..")
+    diffs = body.locator('[data-language="diff"]')
+    expect(diffs).to_have_count(3)
+    expect(body.get_by_text("/repo/src/farewell.py (new file)")).to_be_visible()
+    expect(body.get_by_text("/repo/src/legacy.py (deleted)")).to_be_visible()
+    expect(diffs.nth(1)).to_contain_text("+    print(f'Bye {name}')")
+    expect(diffs.nth(2)).to_contain_text("-LEGACY = True")
+    expect(body).not_to_contain_text("--- /repo/src")
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+
+@pytest.mark.browser_context_args(record_video_size={"width": 1280, "height": 720})
+def test_failed_edit_rows_show_their_error(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Missed and declined edits show no counts, and their errors only after expansion."""
+    _open_edit_rows(page, chat_session_contract)
+
+    missed = page.get_by_role("button", name=re.compile(r"^Edit .*README\.md"))
+    missed_error = page.get_by_text("String to replace not found in file.", exact=True)
+    expect(missed_error).not_to_be_visible()
+    missed.click()
+    expect(missed.locator("xpath=..").get_by_test_id("tool-error-box")).to_have_text(
+        "String to replace not found in file."
+    )
+    missed.click()
+    expect(missed_error).not_to_be_visible()
+    declined = page.get_by_role("button", name=re.compile(r"^Edit .*config\.py"))
+    expect(
+        page.get_by_text("Error: File change ended with status declined.", exact=True)
+    ).not_to_be_visible()
+    for row in (missed, declined):
+        expect(row.get_by_test_id("tool-line-counts")).to_have_count(0)
+
+    declined.click()
+    body = declined.locator("xpath=..")
+    expect(body.get_by_test_id("tool-error-box")).to_contain_text(
+        "File change ended with status declined."
+    )
+    expect(body.get_by_text("Requested change, not applied:")).to_be_visible()
+    expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")
+    declined.click()
+    expect(body.get_by_test_id("tool-error-box")).not_to_be_visible()

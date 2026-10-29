@@ -30,6 +30,8 @@ import {
 } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
+import { useDesktopHostId } from "./RevealInFileManager";
+import type * as RevealInFileManagerModule from "./RevealInFileManager";
 import {
   WORKTREE_RADIO_SPACIOUS_INPUT_CLASS,
   WORKTREE_RADIO_SPACIOUS_ROW_CLASS,
@@ -52,9 +54,15 @@ vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
   })),
 }));
 
+vi.mock("./RevealInFileManager", async (importOriginal) => ({
+  ...(await importOriginal<typeof RevealInFileManagerModule>()),
+  useDesktopHostId: vi.fn(() => null),
+}));
+
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const useCreateHostDirectoryMock = vi.mocked(useCreateHostDirectory);
 const useHostWorktreesMock = vi.mocked(useHostWorktrees);
+const useDesktopHostIdMock = vi.mocked(useDesktopHostId);
 
 function dir(name: string, path: string): HostFilesystemEntry {
   return { name, path, type: "directory", bytes: null, modified_at: 0 };
@@ -664,6 +672,301 @@ describe("WorkspacePicker listing filter", () => {
     fireEvent.click(screen.getByTestId("workspace-picker-entry-src"));
 
     expect(search.value).toBe("");
+  });
+});
+
+describe("WorkspacePicker keyboard and sorting", () => {
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [
+            { ...file("app.py", "/x/app.py"), modified_at: 300 },
+            { ...dir("src", "/x/src"), modified_at: 100 },
+            { ...dir("docs", "/x/docs"), modified_at: 200 },
+            { ...dir("scripts", "/x/scripts"), modified_at: 50 },
+          ],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+  });
+
+  afterEach(() => {
+    cleanup();
+    window.localStorage.clear();
+  });
+
+  function rowNames(): string[] {
+    return Array.from(
+      screen.getByTestId("workspace-picker-listing").querySelectorAll("[data-testid]"),
+    ).map((row) => row.getAttribute("data-testid")!.replace("workspace-picker-entry-", ""));
+  }
+
+  it("moves over folders with the arrow keys and opens the highlighted one on Enter", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    // Clamped at the last folder; the file below it is never highlighted.
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByTestId("workspace-picker-entry-src")).toHaveAttribute("data-active");
+    expect(search).toHaveAttribute(
+      "aria-activedescendant",
+      screen.getByTestId("workspace-picker-entry-src").id,
+    );
+    fireEvent.keyDown(search, { key: "ArrowUp" });
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
+  });
+
+  it("opens the first search match on Enter", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.change(search, { target: { value: "s" } });
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
+  });
+
+  it("opens the match for a path into this folder, and jumps to a path elsewhere", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input") as HTMLInputElement;
+
+    // A path into the current folder filters it like a fragment, so Enter
+    // opens the folder shown rather than the literal (missing) "/x/d".
+    fireEvent.change(search, { target: { value: "/x/d" } });
+    expect(rowNames()).toEqual(["docs"]);
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/docs");
+
+    fireEvent.change(search, { target: { value: "/Users/corey/work//" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/work");
+    expect(search.value).toBe("");
+  });
+
+  it("opens the exact folder over a newer one sharing its prefix", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: {
+          entries: [
+            { ...dir("work", "/x/work"), modified_at: 100 },
+            { ...dir("work-old", "/x/work-old"), modified_at: 200 },
+          ],
+          truncated: false,
+        },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+    fireEvent.click(screen.getByTestId("workspace-picker-sort"));
+    expect(rowNames()).toEqual(["work-old", "work"]);
+
+    fireEvent.change(search, { target: { value: "/x/work" } });
+    expect(screen.getByTestId("workspace-picker-entry-work")).toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/work");
+
+    fireEvent.change(search, { target: { value: "work" } });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/work");
+
+    // An explicit arrow-key choice still wins over the exact match.
+    fireEvent.change(search, { target: { value: "work" } });
+    fireEvent.keyDown(search, { key: "ArrowUp" });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/work-old");
+  });
+
+  it("lets a typed path win over a folder highlighted before typing", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).toHaveAttribute("data-active");
+    // A path elsewhere leaves the listing unfiltered, so docs is still shown.
+    fireEvent.change(search, { target: { value: "/Users/corey/work" } });
+    expect(screen.getByTestId("workspace-picker-entry-docs")).not.toHaveAttribute("data-active");
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/work");
+  });
+
+  it("ignores Enter and arrows while an IME is composing", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.change(search, { target: { value: "s" } });
+    fireEvent.keyDown(search, { key: "ArrowDown", isComposing: true });
+    fireEvent.keyDown(search, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(search, { key: "Enter", keyCode: 229 });
+    // Composition events cover browsers that clear isComposing on the final keydown.
+    fireEvent.compositionStart(search);
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).not.toHaveBeenCalledWith("/x/scripts");
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute("data-active");
+    fireEvent.compositionEnd(search);
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
+  });
+
+  it("keeps the highlighted folder when the rows reorder", () => {
+    const onNavigate = vi.fn();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" onNavigate={onNavigate} />);
+    const search = screen.getByTestId("workspace-picker-search-input");
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute("data-active");
+    // scripts moves from the second row to the last.
+    fireEvent.click(screen.getByTestId("workspace-picker-sort"));
+    expect(screen.getByTestId("workspace-picker-entry-scripts")).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    fireEvent.keyDown(search, { key: "Enter" });
+
+    expect(onNavigate).toHaveBeenLastCalledWith("/x/scripts");
+  });
+
+  it("sorts folders by date modified and remembers the choice", () => {
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    expect(rowNames()).toEqual(["docs", "scripts", "src", "app.py"]);
+
+    fireEvent.click(screen.getByTestId("workspace-picker-sort"));
+    // Newest folder first; files still follow every folder.
+    expect(rowNames()).toEqual(["docs", "src", "scripts", "app.py"]);
+    expect(screen.getByRole("button", { name: "Sort by name" })).toBeTruthy();
+
+    cleanup();
+    render(<WorkspacePicker hostId="host_1" initialPath="/x" />);
+    expect(rowNames()).toEqual(["docs", "src", "scripts", "app.py"]);
+  });
+});
+
+describe("WorkspacePicker on this machine", () => {
+  const chooseDirectory = vi.fn<(defaultPath?: string) => Promise<string | null>>();
+  const getPathForFile = vi.fn<(file: File) => Promise<string>>();
+
+  beforeEach(() => {
+    useHostFilesystemMock.mockReset();
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/Users/corey/repo/src")], truncated: false },
+        isLoading: false,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+    useDesktopHostIdMock.mockReturnValue("host_local");
+    chooseDirectory.mockReset();
+    getPathForFile.mockReset();
+    vi.stubGlobal("omnigentDesktop", { kind: "electron", chooseDirectory, getPathForFile });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    useDesktopHostIdMock.mockReturnValue(null);
+  });
+
+  function drop(path: string, isDirectory: boolean) {
+    getPathForFile.mockResolvedValue(path);
+    return fireEvent.drop(screen.getByTestId("workspace-picker"), {
+      dataTransfer: {
+        types: ["Files"],
+        files: [new File([], "dropped")],
+        // Finder can list a URI string ahead of the file itself.
+        items: [
+          { kind: "string", webkitGetAsEntry: () => null },
+          { kind: "file", webkitGetAsEntry: () => ({ isDirectory }) },
+        ],
+      },
+    });
+  }
+
+  it("confirms the folder chosen in the OS chooser", async () => {
+    const onSelect = vi.fn();
+    chooseDirectory.mockResolvedValueOnce(null).mockResolvedValueOnce("/Users/corey/other");
+    render(
+      <WorkspacePicker hostId="host_local" initialPath="/Users/corey/repo" onSelect={onSelect} />,
+    );
+    const choose = screen.getByTestId("workspace-picker-choose-native");
+
+    // Cancelling the OS chooser leaves the picker open with nothing chosen.
+    fireEvent.click(choose);
+    await waitFor(() => expect(chooseDirectory).toHaveBeenCalledWith("/Users/corey/repo"));
+    expect(onSelect).not.toHaveBeenCalled();
+
+    fireEvent.click(choose);
+    await waitFor(() => expect(onSelect).toHaveBeenCalledWith("/Users/corey/other"));
+  });
+
+  it("opens a dropped folder, or the folder of a dropped file", async () => {
+    const onNavigate = vi.fn();
+    render(
+      <WorkspacePicker
+        hostId="host_local"
+        initialPath="/Users/corey/repo"
+        onNavigate={onNavigate}
+      />,
+    );
+
+    drop("/Users/corey/projects/app", true);
+    await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/Users/corey/projects/app"));
+    drop("/tmp/notes/todo.txt", false);
+    await waitFor(() => expect(onNavigate).toHaveBeenLastCalledWith("/tmp/notes"));
+  });
+
+  it("offers neither on another host or an older shell", () => {
+    const onNavigate = vi.fn();
+    const { rerender } = render(
+      <WorkspacePicker
+        hostId="host_remote"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onNavigate={onNavigate}
+      />,
+    );
+    expect(screen.queryByTestId("workspace-picker-choose-native")).toBeNull();
+    // Not default-prevented: the picker didn't claim the drop.
+    expect(drop("/Users/corey/projects/app", true)).toBe(true);
+
+    vi.stubGlobal("omnigentDesktop", { kind: "electron" });
+    rerender(
+      <WorkspacePicker
+        hostId="host_local"
+        initialPath="/Users/corey/repo"
+        onSelect={vi.fn()}
+        onNavigate={onNavigate}
+      />,
+    );
+    expect(screen.queryByTestId("workspace-picker-choose-native")).toBeNull();
+    expect(drop("/Users/corey/projects/app", true)).toBe(true);
+    expect(onNavigate).not.toHaveBeenCalledWith("/Users/corey/projects/app");
   });
 });
 
@@ -1476,9 +1779,9 @@ describe("WorkspacePicker back-to-workspace", () => {
   });
 });
 
-// The picker opens inside popovers and dialogs, which focus their first
-// tabbable child — the header's Up button. Auto-focus must not add transient
-// chrome over the search and listing.
+// The picker opens inside popovers and dialogs. Focus lands in the search
+// field so typing and arrow keys work at once, without transient chrome
+// (the Up tooltip) over the search and listing.
 describe("WorkspacePicker initial focus", () => {
   beforeEach(() => {
     useHostFilesystemMock.mockReset();
@@ -1495,7 +1798,7 @@ describe("WorkspacePicker initial focus", () => {
     cleanup();
   });
 
-  it("focuses Up without rendering an overlay", async () => {
+  it("focuses search without rendering an overlay", async () => {
     render(
       <Popover>
         <PopoverTrigger data-testid="open-picker">Working folder</PopoverTrigger>
@@ -1506,9 +1809,7 @@ describe("WorkspacePicker initial focus", () => {
     );
 
     fireEvent.click(screen.getByTestId("open-picker"));
-    const up = await screen.findByTestId("workspace-picker-up");
-    // Assert Radix autofocus still lands predictably for keyboard users.
-    expect(up).toHaveFocus();
+    expect(await screen.findByTestId("workspace-picker-search-input")).toHaveFocus();
     expect(screen.queryByRole("tooltip")).toBeNull();
   });
 });

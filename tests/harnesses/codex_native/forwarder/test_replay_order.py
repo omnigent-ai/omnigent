@@ -115,6 +115,9 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
     """A live completion cannot overtake replay while resume metadata sync waits."""
 
     class _ResumeClient:
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return True
+
         async def request(self, _method: str, _params: dict) -> dict:
             return {
                 "result": {
@@ -207,8 +210,10 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resume_status", [None, "inProgress"])
 async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
     tmp_path: Path,
+    resume_status: str | None,
 ) -> None:
     """A blocked replay keeps the crash journal until its item is acknowledged."""
 
@@ -217,6 +222,8 @@ async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
             super().__init__()
             self.entered = asyncio.Event()
             self.release = asyncio.Event()
+            self.status_entered = asyncio.Event()
+            self.release_status = asyncio.Event()
 
         async def post(
             self,
@@ -228,6 +235,9 @@ async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
             if not self.posts:
                 self.entered.set()
                 await self.release.wait()
+            if json["type"] == "external_session_status" and json["data"]["status"] == "running":
+                self.status_entered.set()
+                await self.release_status.wait()
             return await super().post(url, json=json, timeout=timeout)
 
     write_bridge_state(
@@ -257,6 +267,7 @@ async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
                             "turns": [
                                 {
                                     "id": "turn_1",
+                                    "status": resume_status,
                                     "items": [
                                         {
                                             "type": "agentMessage",
@@ -293,6 +304,11 @@ async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
         assert read_bridge_state(tmp_path).active_turn_id == "turn_1"  # type: ignore[union-attr]
 
         client.release.set()
+        if resume_status == "inProgress":
+            await asyncio.wait_for(client.status_entered.wait(), timeout=5.0)
+            assert not terminal.done()
+            assert read_bridge_state(tmp_path).active_turn_id == "turn_1"  # type: ignore[union-attr]
+            client.release_status.set()
         await asyncio.gather(replay, terminal)
     finally:
         fwd._conversation_item_locks.reset(locks_token)
@@ -300,6 +316,13 @@ async def test_terminal_boundary_waits_for_replay_before_clearing_active_turn(
         await tracker.close()
 
     assert read_bridge_state(tmp_path).active_turn_id is None  # type: ignore[union-attr]
+
+    statuses = [
+        body["data"]["status"]
+        for _url, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert statuses == (["running", "idle"] if resume_status == "inProgress" else ["idle"])
 
 
 @pytest.mark.asyncio

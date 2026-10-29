@@ -128,6 +128,14 @@ const MonacoDiffViewer = lazy(() =>
 // Helpers
 // ---------------------------------------------------------------------------
 
+function isFormattedMarkdownAnchor(comment: Comment): boolean {
+  return (
+    !!comment.anchor_content &&
+    detectLang(comment.path) === "markdown" &&
+    comment.end_index - comment.start_index !== comment.anchor_content.length
+  );
+}
+
 /**
  * Classify comments into open/addressed and remap open draft comments to
  * their correct absolute offsets when the file content has changed.
@@ -136,10 +144,13 @@ const MonacoDiffViewer = lazy(() =>
  *   moved, or at stored offsets if the anchor is no longer present
  *   (never silently dropped).
  * - **addressed**: handled by the agent or user (status "addressed").
+ *
+ * Markdown formatting/entity spans use the source map to avoid unrelated literal copies.
  */
 export function classifyAndRemapComments(
   comments: Comment[],
   fileContent: string,
+  remapFormatted?: ((comment: Comment, content: string) => Comment) | null,
 ): { open: Comment[]; addressed: Comment[] } {
   const open: Comment[] = [];
   const addressed: Comment[] = [];
@@ -163,6 +174,11 @@ export function classifyAndRemapComments(
     // File not yet loaded — keep at stored offsets rather than dropping.
     if (!fileContent) {
       open.push(c);
+      continue;
+    }
+    // Keep raw spans while loading; a failed import (null) uses legacy search.
+    if (isFormattedMarkdownAnchor(c) && remapFormatted !== null) {
+      open.push(remapFormatted?.(c, fileContent) ?? c);
       continue;
     }
     // Search near the stored offset first to handle the common case of a
@@ -418,8 +434,11 @@ function FileViewerBody({
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
+  const onScreen = open && isActiveViewport && mediaActive;
   // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path);
+  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
+    visible: onScreen,
+  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -606,9 +625,32 @@ function FileViewerBody({
 
   const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
+  const [remapFormatted, setRemapFormatted] = useState<
+    ((comment: Comment, content: string) => Comment) | null
+  >();
+  const needsMarkdownRemap = allComments.some(
+    (comment) => comment.status !== "addressed" && isFormattedMarkdownAnchor(comment),
+  );
+  useEffect(() => {
+    if (!needsMarkdownRemap || remapFormatted !== undefined) return;
+    let cancelled = false;
+    import("./markdownCommentRemap").then(
+      ({ remapFormattedMarkdownComment }) => {
+        if (!cancelled) setRemapFormatted(() => remapFormattedMarkdownComment);
+      },
+      (error) => {
+        if (cancelled) return;
+        console.warn("Unable to load Markdown comment remapping; using legacy search", error);
+        setRemapFormatted(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [needsMarkdownRemap, remapFormatted]);
   const { open: openComments, addressed: addressedComments } = useMemo(
-    () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent],
+    () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
+    [allComments, fileContent, remapFormatted],
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
@@ -1687,6 +1729,19 @@ function FileViewerBody({
         </div>
       </div>
 
+      {fileQuery.isRefetchError && !isDeletedFile && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
+        >
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          <span>
+            Couldn&apos;t refresh this file (
+            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+            ). Showing the last loaded version.
+          </span>
+        </div>
+      )}
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}
@@ -1772,7 +1827,7 @@ function FileViewerBody({
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
               panelOpen={open}
-              mediaActive={open && isActiveViewport && mediaActive}
+              mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
               searchFocusNonce={searchFocusNonce}

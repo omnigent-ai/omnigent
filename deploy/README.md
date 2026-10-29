@@ -296,6 +296,10 @@ and a signed ID token with `auth_time` at or after the reauthentication request.
 Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
 missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
 but still requires ticket-specific browser sign-in and approval.
+For an IdP that cannot supply a fresh `auth_time` (for example, Cloudflare
+Access), set `OMNIGENT_OIDC_REQUIRE_REAUTH=0`. The server still sends
+`prompt=login` and requires PKCE, ticket-specific sign-in, and approval, but it
+no longer verifies that the IdP asked for credentials again.
 Polling responses forbid caching, including successful credential responses.
 CLI and Slack display a comparison code; native mobile apps currently rely
 on explicit browser approval without displaying that code in the app. Include
