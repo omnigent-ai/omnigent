@@ -531,7 +531,7 @@ describe("InboxPage approval items", () => {
 
     it("shows the terminal card when a chat answer is refused", async () => {
       pendingElicitations = [chatPrompt];
-      vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("409 Conflict"));
+      vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("423 Locked"));
       renderPage(queryClient);
 
       const accept = await screen.findByRole("button", { name: "Stub Accept" });

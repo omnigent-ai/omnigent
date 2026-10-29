@@ -13,7 +13,7 @@
 import type { ConversationItem } from "./conversationItems";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
-import { TERMINAL_FALLBACK_CLIENT_HEADERS, type McpServerStartup } from "./events";
+import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
@@ -1547,7 +1547,7 @@ export async function approve(
       `${encodeURIComponent(elicitationId)}/resolve`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...TERMINAL_FALLBACK_CLIENT_HEADERS },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(result),
     },
   );

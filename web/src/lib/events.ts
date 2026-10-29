@@ -187,9 +187,6 @@ export interface ElicitationTerminalFallback {
   answerUndelivered: boolean;
 }
 
-/** Resolve headers telling the server this client shows a held prompt read-only. */
-export const TERMINAL_FALLBACK_CLIENT_HEADERS = { "X-Omnigent-Terminal-Fallback": "on" } as const;
-
 export interface ElicitationRequest {
   nativeDelivery?: NativePermissionDelivery;
   terminalFallback?: ElicitationTerminalFallback;

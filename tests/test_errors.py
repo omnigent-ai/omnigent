@@ -88,6 +88,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.UPSTREAM_CANCELLED, 499),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, 403),
         (ErrorCode.STALE_CURSOR, 400),
+        (ErrorCode.PROMPT_IN_TERMINAL, 423),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:

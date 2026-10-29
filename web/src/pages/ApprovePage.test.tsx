@@ -119,7 +119,6 @@ describe("ApprovePage states", () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]![0]).toBe("/v1/sessions/sess_1/elicitations/eli_1/resolve");
     expect(JSON.parse(posts[0]![1]!.body as string)).toEqual(verdict);
-    expect(new Headers(posts[0]![1]!.headers).get("X-Omnigent-Terminal-Fallback")).toBe("on");
     expect(
       await screen.findByText(verdict.action === "accept" ? "Approved" : "Rejected"),
     ).toBeInTheDocument();
@@ -292,9 +291,9 @@ describe("ApprovePage submission", () => {
     expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "decline" });
   });
 
-  it.each([500, 409])("shows a resolve error when the POST returns %i", async (status) => {
+  it.each([500, 409, 423])("shows a resolve error when the POST returns %i", async (status) => {
     // WHY: a failed resolve POST routes to the `error` branch with the status.
-    // A 409 whose reload still offers chat answers is some other conflict.
+    // A 423 whose reload offers chat answers again still wasn't delivered.
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
       .mockResolvedValueOnce(jsonResponse(null, { ok: false, status }));
@@ -307,7 +306,7 @@ describe("ApprovePage submission", () => {
   it("reloads into the terminal card when the server refuses a prompt that moved there", async () => {
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }))
+      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 423 }))
       .mockResolvedValue(
         jsonResponse({
           status: "pending",
@@ -325,7 +324,7 @@ describe("ApprovePage submission", () => {
   it("doesn't carry a refused answer's error to the next approval link", async () => {
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }))
+      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 423 }))
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
       .mockResolvedValue(jsonResponse({ status: "pending", message: "Deploy the release?" }));
     function OpenNextApproval() {
@@ -345,7 +344,7 @@ describe("ApprovePage submission", () => {
       </MemoryRouter>,
     );
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
-    expect(await screen.findByText("Resolve failed: 409")).toBeInTheDocument();
+    expect(await screen.findByText("Resolve failed: 423")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Next link" }));
     expect(await screen.findByText("Deploy the release?")).toBeInTheDocument();
@@ -363,7 +362,7 @@ describe("ApprovePage submission", () => {
   });
 });
 
-it("reports a 409 even when a stale poll fires before the reload", async () => {
+it("keeps checking a native prompt whose answer was refused", async () => {
   vi.useFakeTimers();
   const waiting = {
     status: "pending",
@@ -372,6 +371,7 @@ it("reports a 409 even when a stale poll fires before the reload", async () => {
     native_delivery: { state: "unconfirmed", attempt: "retry-2", action: "accept" },
   };
   let finishSubmit!: (response: Response) => void;
+  let reads = 0;
   const fetch = vi.mocked(identity.authenticatedFetch);
   fetch.mockImplementation(async (_url, init) => {
     if (init?.method === "POST") {
@@ -379,7 +379,9 @@ it("reports a 409 even when a stale poll fires before the reload", async () => {
         finishSubmit = resolve;
       });
     }
-    return jsonResponse(waiting);
+    reads += 1;
+    // A re-parking native request reads as resolved without a confirmation.
+    return jsonResponse(reads === 1 ? waiting : { status: "resolved" });
   });
   try {
     await act(async () => {
@@ -390,7 +392,8 @@ it("reports a 409 even when a stale poll fires before the reload", async () => {
       finishSubmit(jsonResponse(null, { ok: false, status: 409 }));
       await vi.advanceTimersByTimeAsync(1000);
     });
-    expect(screen.getByText("Resolve failed: 409")).toBeInTheDocument();
+    expect(screen.getByText("Delivery unconfirmed")).toBeInTheDocument();
+    expect(screen.queryByText("Elicitation resolved")).not.toBeInTheDocument();
   } finally {
     cleanup();
     vi.useRealTimers();

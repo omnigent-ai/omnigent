@@ -93,7 +93,6 @@ async def _post_approval(
     action: str,
     content: dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
-    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     """
     Resolve a published elicitation through the session event API.
@@ -107,7 +106,6 @@ async def _post_approval(
     :param content: Optional MCP ``ElicitResult.content`` payload.
     :param meta: Optional MCP ``_meta`` payload, e.g. a persistence
         choice ``{"persist": "always"}``.
-    :param headers: Optional request headers, e.g. a client capability.
     :returns: The HTTP response from the session event route.
     """
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
@@ -121,7 +119,6 @@ async def _post_approval(
             "type": "approval",
             "data": data,
         },
-        headers=headers,
     )
 
 
@@ -2638,22 +2635,16 @@ async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
         )
         assert approval_page.json()["terminal_fallback"] == {"answer_undelivered": False}
 
-        # No live hook can carry a chat answer to Claude now.
-        terminal_fallback_client = {sessions_orchestration.TERMINAL_FALLBACK_CLIENT_HEADER: "on"}
-        refused = await _post_approval(
-            client,
-            session_id,
-            _REATTACH_ELICITATION_ID,
-            "accept",
-            headers=terminal_fallback_client,
-        )
-        assert refused.status_code == 409, refused.text
+        # No live hook can carry a chat answer to Claude now. 423 isn't a status
+        # older clients read as delivered or already resolved.
+        refused = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
         refused_by_url = await client.post(
             f"/v1/sessions/{session_id}/elicitations/{_REATTACH_ELICITATION_ID}/resolve",
             json={"action": "accept"},
-            headers=terminal_fallback_client,
         )
-        assert refused_by_url.status_code == 409, refused_by_url.text
+        for response in (refused, refused_by_url):
+            assert response.status_code == 423, response.text
+            assert response.json()["error"]["code"] == "prompt_in_terminal"
         assert pending_elicitations.count_for(session_id) == 1
         assert _REATTACH_ELICITATION_ID not in _harness_pre_resolved_elicitations
 
@@ -2668,44 +2659,6 @@ async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
         await _finish_deferred_clears()
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
         assert failed_mirrors == ([_REATTACH_ELICITATION_ID] if ancestor_mirror_fails else [])
-    finally:
-        await collector.stop()
-        pending_elicitations.reset_for_tests()
-
-
-async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_retry(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A client without the terminal-fallback header keeps the old answer contract.
-
-    It shows the held card as an ordinary prompt, so its answer is accepted
-    and kept for a late hook retry, as for any prompt with no parked hook.
-    """
-    from omnigent.runtime import pending_elicitations
-
-    session_id, payload, collector = await _sever_hook_mid_turn(
-        client, monkeypatch, "test-terminal-fallback-older-client"
-    )
-    try:
-        waiting = await _next_elicitation_event(collector)
-        assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
-
-        answer = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
-        assert answer.status_code == 202, answer.text
-        cleared = await _next_elicitation_event(collector)
-        assert cleared["type"] == "response.elicitation_resolved"
-        assert cleared["action"] == "accept"
-        assert pending_elicitations.count_for(session_id) == 0
-        await _finish_deferred_clears()
-        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
-
-        retry = await client.post(
-            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
-        )
-        assert retry.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
-        assert _REATTACH_ELICITATION_ID not in _harness_pre_resolved_elicitations
     finally:
         await collector.stop()
         pending_elicitations.reset_for_tests()

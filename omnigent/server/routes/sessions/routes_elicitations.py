@@ -43,7 +43,6 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
-    _client_supports_terminal_fallback,
     _resolve_elicitation,
 )
 from omnigent.server.schemas import (
@@ -110,7 +109,7 @@ def register_elicitations_routes(
         :func:`_resolve_elicitation`.
 
         :param request: The inbound request, used for identity
-            extraction and the terminal-fallback client header.
+            extraction.
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param elicitation_id: Correlation id of the elicitation to
@@ -121,7 +120,8 @@ def register_elicitations_routes(
             optional form ``content``.
         :returns: ``{"queued": False}`` — resolution is synchronous
             and persists no conversation item.
-        :raises OmnigentError: 404 if no session exists.
+        :raises OmnigentError: 404 if no session exists; 423 if the prompt
+            waits in the agent's terminal.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -133,13 +133,7 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(
-            session_id,
-            _resolve_data,
-            runner_router,
-            conversation_store,
-            client_supports_terminal_fallback=_client_supports_terminal_fallback(request.headers),
-        )
+        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

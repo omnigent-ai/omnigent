@@ -22,7 +22,7 @@ import {
   type NativePermissionDelivery,
 } from "@/lib/nativePermissionDelivery";
 import { parseTerminalFallback } from "@/lib/sse";
-import { TERMINAL_FALLBACK_CLIENT_HEADERS, type ElicitationTerminalFallback } from "@/lib/events";
+import type { ElicitationTerminalFallback } from "@/lib/events";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { CheckIcon, MessageCircleQuestionMark, XIcon } from "lucide-react";
@@ -45,6 +45,9 @@ interface ElicitationData {
   ask_user_question?: Record<string, unknown> | null;
   exit_plan_mode?: Record<string, unknown> | null;
 }
+
+// The server refuses an answer with 423 once its prompt waits in the agent's terminal.
+const PROMPT_IN_TERMINAL_STATUS = 423;
 
 type PageState =
   | { kind: "loading" }
@@ -109,7 +112,7 @@ export function ApprovePage() {
           submission.current = { revision: submission.current.revision + 1, pending: false };
           setState({ kind: polling ? "recovering" : "resolved" });
         } else if (refusedStatus !== undefined && !data.terminal_fallback) {
-          // Without a terminal hold, the 409 is some other conflict rather than a hand-off.
+          // The prompt left the terminal before the reload; the answer still wasn't delivered.
           setState({ kind: "error", message: `Resolve failed: ${refusedStatus}` });
         } else if (revision === submission.current.revision) {
           // A new server attempt supersedes the POST still waiting on its response.
@@ -166,7 +169,7 @@ export function ApprovePage() {
           `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/resolve`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json", ...TERMINAL_FALLBACK_CLIENT_HEADERS },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               action,
               ...(content ? { content } : {}),
@@ -175,8 +178,8 @@ export function ApprovePage() {
           },
         );
         if (!res.ok && submission.current === submitted) {
-          if (res.status === 409) {
-            // The prompt may have moved to the agent's terminal; reload to check.
+          if (res.status === PROMPT_IN_TERMINAL_STATUS) {
+            // Reload to show the prompt waiting in the terminal.
             refusedResolveStatus.current = res.status;
             setState({ kind: "loading" });
             setReloadCount((count) => count + 1);

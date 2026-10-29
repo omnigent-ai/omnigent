@@ -236,6 +236,9 @@ class ErrorCode:
         indistinguishable from a completed enumeration, so the caller
         silently loses the remaining rows. The caller's remedy is to
         restart the enumeration without the cursor.
+    :cvar PROMPT_IN_TERMINAL: An answer to a prompt that now waits in the
+        agent's own terminal, where no hook can deliver it (HTTP 423). Distinct
+        from ``CONFLICT``, which existing clients read as "already resolved".
     """
 
     UNAUTHORIZED = "unauthorized"
@@ -260,6 +263,7 @@ class ErrorCode:
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
+    PROMPT_IN_TERMINAL = "prompt_in_terminal"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -320,6 +324,9 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    # 423, not 409: clients treat 409 as "already resolved" and would report
+    # the undelivered answer as sent.
+    ErrorCode.PROMPT_IN_TERMINAL: 423,
 }
 
 
@@ -364,6 +371,8 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    # The user answered from chat after the agent moved the prompt to its terminal.
+    ErrorCode.PROMPT_IN_TERMINAL: ErrorCategory.USER,
 }
 
 
@@ -410,6 +419,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.LOGIN_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    ErrorCode.PROMPT_IN_TERMINAL: ErrorImpact.BENIGN,
 }
 
 
@@ -452,6 +462,7 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.PROMPT_IN_TERMINAL: ErrorPhase.REQUEST,
 }
 
 
