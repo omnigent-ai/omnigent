@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     read_unmirrored_codex_settings,
+    record_turn_input_stable_id,
     update_active_turn_id,
 )
 from omnigent.inner.codex_goal_command import (
@@ -76,6 +77,7 @@ from omnigent.inner.native_attachments import (
     uses_filesystem_delivery,
 )
 from omnigent.native.input_diagnostics import (
+    current_input_attributes,
     log_input_event,
     with_input_attributes,
 )
@@ -415,6 +417,9 @@ async def _start_codex_turn(
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
+        input_stable_id = current_input_attributes().get("input_stable_id")
+        if isinstance(input_stable_id, str):
+            record_turn_input_stable_id(bridge_dir, turn_id, input_stable_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
 
 

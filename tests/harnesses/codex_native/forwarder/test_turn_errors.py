@@ -19,6 +19,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    record_turn_input_stable_id,
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
@@ -915,6 +916,54 @@ def test_terminal_turn_status_edge_empty_turn_idle_and_warns(
         "empty turn" in record.getMessage() and record.levelname == "WARNING"
         for record in caplog.records
     ), "expected a WARN log for the empty (zero-item) turn"
+
+
+def test_empty_turn_reports_the_web_input_it_was_started_with(tmp_path: Path) -> None:
+    """A zero-item turn names the web input its turn/start carried.
+
+    Codex dropped that input, so the edge carries its stable id and the server
+    can settle it as undelivered now instead of at the next mirrored message.
+    """
+    _seed_active_turn(tmp_path, "turn_123")
+    stable_id = "a" * 32
+    record_turn_input_stable_id(tmp_path, "turn_123", stable_id)
+    params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.status == "idle"
+    assert edge.undelivered_input_stable_id == stable_id
+
+
+def test_empty_turn_for_another_turn_reports_no_input(tmp_path: Path) -> None:
+    """The recorded input belongs to its own turn id only."""
+    _seed_active_turn(tmp_path, "turn_123")
+    record_turn_input_stable_id(tmp_path, "turn_old", "a" * 32)
+    params = {"turn": {"id": "turn_123", "status": "completed", "items": []}}
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.undelivered_input_stable_id is None
+
+
+def test_turn_with_items_never_reports_its_input_undelivered(tmp_path: Path) -> None:
+    """A turn Codex recorded items for has delivered its input."""
+    _seed_active_turn(tmp_path, "turn_123")
+    record_turn_input_stable_id(tmp_path, "turn_123", "a" * 32)
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "completed",
+            "items": [{"type": "agentMessage", "id": "a", "text": "done"}],
+        }
+    }
+
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+
+    assert edge is not None
+    assert edge.undelivered_input_stable_id is None
 
 
 def test_omnigent_status_from_resume_turn_error_parity() -> None:

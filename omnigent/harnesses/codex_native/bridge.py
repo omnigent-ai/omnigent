@@ -59,6 +59,8 @@ _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
 _EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
+# Web input id a turn/start carried, so an empty turn can report it undelivered.
+_TURN_INPUT_FILE = "turn_input.json"
 # Applied model/effort that config.toml failed to record, for every reader of it.
 _UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
 _UNMIRRORED_SETTINGS_LOCK_FILE = "unmirrored_settings.lock"
@@ -1166,6 +1168,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
             _EGRESS_CERTIFICATE_FILE,
+            _TURN_INPUT_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
@@ -1422,6 +1425,45 @@ def read_certificate_failure(bridge_dir: Path) -> CertificateFailure | None:
     if not isinstance(evidence, str) or not evidence:
         return None
     return CertificateFailure(evidence=evidence, expired=raw.get("expired") is True)
+
+
+def record_turn_input_stable_id(bridge_dir: Path, turn_id: str, input_stable_id: str) -> None:
+    """
+    Record which web input a started Codex turn carried.
+
+    The forwarder reads it when that turn completes with no items: Codex
+    dropped the input, and the server must settle it as undelivered.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param turn_id: Codex turn id returned by ``turn/start``, e.g. ``"turn_abc123"``.
+    :param input_stable_id: The web client's 32-char hex stable message id.
+    :returns: None.
+    """
+    _write_bridge_record(
+        bridge_dir,
+        _TURN_INPUT_FILE,
+        {"turn_id": turn_id, "input_stable_id": input_stable_id},
+    )
+
+
+def read_turn_input_stable_id(bridge_dir: Path, turn_id: str | None) -> str | None:
+    """
+    Return the web input id recorded for one Codex turn, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param turn_id: Terminal turn id, e.g. ``"turn_abc123"``; ``None`` never matches.
+    :returns: The stable id, or ``None`` when no input was recorded for this turn.
+    """
+    if turn_id is None:
+        return None
+    try:
+        raw = json.loads((bridge_dir / _TURN_INPUT_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("turn_id") != turn_id:
+        return None
+    input_stable_id = raw.get("input_stable_id")
+    return input_stable_id if isinstance(input_stable_id, str) and input_stable_id else None
 
 
 def clear_certificate_failure(bridge_dir: Path) -> None:
