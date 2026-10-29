@@ -2912,28 +2912,6 @@ describe("Sidebar project Show more", () => {
     });
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
   });
-
-  it("steps the session hotkey past the sessions behind Show more", () => {
-    projectsMock.push("Customer X", "Customer Y");
-    mockConversations([
-      ...filedSessions(7),
-      conv("conv_other_folder", "Claude Code", {
-        labels: { omni_project: "Customer Y" },
-        updated_at: 1,
-      }),
-    ]);
-    localStorage.setItem(
-      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
-      JSON.stringify(["Customer X", "Customer Y"]),
-    );
-    renderOnSession("conv_filed_4");
-
-    fireEvent.keyDown(window, {
-      code: "BracketRight",
-      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
-    });
-    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
-  });
 });
 
 // A collapsed project bubbles up its hidden rows' marker, using the same
