@@ -67,6 +67,7 @@ from omnigent.runner.resource_registry import (
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
+from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -1167,7 +1168,7 @@ def register_resource_routes(
                     # files. Consult one rooted where the search actually runs.
                     registry = _search_registry_for_root(env_root)
             if registry is not None:
-                indexed = await _asyncio.to_thread(
+                indexed = await run_slow_io(
                     index_search,
                     registry,
                     fs._resolve(path),
@@ -1202,21 +1203,16 @@ def register_resource_routes(
         session_id: str,
         environment_id: str,  # noqa: ARG001
     ) -> JSONResponse:
-        import asyncio as _asyncio
-
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
-            # ``list_changed_files`` shells out to ``git status`` synchronously,
-            # which on a large repo (cold untracked cache) can take seconds.
-            # Offload to a thread so it never blocks the event loop — a blocked
-            # loop can't answer the server's runner-stream relay probe and the
-            # session's first turn 503s with runner_unavailable.
+            # git status can take seconds; keep it off the loop (relay probes)
+            # and off the default pool (native message delivery).
             raw_changes = (
-                await _asyncio.to_thread(
+                await run_slow_io(
                     session_registry.list_changed_files,
                     session_id,
                     limit=10_000,
@@ -1286,17 +1282,13 @@ def register_resource_routes(
                 },
             )
 
-        import asyncio as _asyncio
-
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
         try:
             # Offloaded like list_filesystem_changes: get_changed_file shells out
             # to git (status + show) synchronously, so keep it off the loop.
             record = (
-                await _asyncio.to_thread(
-                    session_registry.get_changed_file, session_id, relative_path
-                )
+                await run_slow_io(session_registry.get_changed_file, session_id, relative_path)
                 if session_registry is not None
                 else None
             )
@@ -1321,7 +1313,7 @@ def register_resource_routes(
         is_deleted = record.get("status") == "deleted"
 
         before: str | None = (
-            await _asyncio.to_thread(session_registry.get_baseline, relative_path)
+            await run_slow_io(session_registry.get_baseline, relative_path)
             if session_registry is not None
             else None
         )
@@ -1377,7 +1369,7 @@ def register_resource_routes(
                 return function(root, session_id=session_id, **kwargs)
 
         try:
-            result = await asyncio.to_thread(call)
+            result = await run_provider_cli(call)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(status_code=200, content=result)

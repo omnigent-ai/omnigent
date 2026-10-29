@@ -1048,14 +1048,17 @@ def build_native_controls(
             bridge_dir_for_session_id,
             enqueue_model_change,
         )
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        effort = _session_reasoning_effort.get(conv_id)
         try:
             await asyncio.to_thread(
                 enqueue_model_change,
                 bridge_dir_for_session_id(conv_id),
                 model.strip(),
+                thinking_level=to_pi_thinking_level(effort) if effort else None,
             )
         except OSError as exc:
             _logger.warning(

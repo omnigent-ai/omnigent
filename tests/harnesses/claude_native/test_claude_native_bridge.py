@@ -78,7 +78,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
-from omnigent.native import native_cost_popup
+from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 
@@ -7597,6 +7597,50 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
 
 
 @pytest.mark.asyncio
+async def test_observe_tool_relay_refuses_bodies_over_one_mib(tmp_path: Path) -> None:
+    """The relay is the only size limit on the curl observer hook."""
+    observed: list[object] = []
+
+    async def _observer(payload: dict[str, object]) -> None:
+        observed.append(payload)
+
+    bridge_dir = claude_native_bridge.prepare_bridge_dir("conv_limit", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=None,
+        loop=asyncio.get_running_loop(),
+        session_id="conv_limit",
+        file_change_observer=_observer,
+    )
+    try:
+        info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        url = httpx.URL(info["url"])
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_input": {}}
+        async with httpx.AsyncClient(timeout=10) as client:
+            accepted = await client.post(
+                f"{info['url']}/hook/observe-tool",
+                json=payload,
+                headers={"Authorization": f"Bearer {info['token']}"},
+            )
+        # Announce one byte over the limit; the relay must refuse without reading a body.
+        reader, writer = await asyncio.open_connection(url.host, url.port)
+        writer.write(
+            f"POST /hook/observe-tool HTTP/1.1\r\nHost: {url.host}\r\n"
+            f"Authorization: Bearer {info['token']}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 1048577\r\n\r\n".encode()
+        )
+        status_line = await asyncio.wait_for(reader.readline(), timeout=10)
+        writer.close()
+    finally:
+        relay.close()
+
+    assert accepted.status_code == 200
+    assert status_line.split()[1] == b"400"
+    assert observed == [payload]
+
+
+@pytest.mark.asyncio
 async def test_start_tool_relay_accepts_antigravity_native_bridge_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -9794,6 +9838,33 @@ def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
         ]
     )
     assert _claude_prompt_rendered(pane) is True
+
+
+@pytest.mark.parametrize("needle", ["to", "a", "edit queued"])
+def test_queued_message_hint_is_not_a_draft_for_submit_verification(needle: str) -> None:
+    """
+    A queued message leaves Claude's empty input box showing its hint, not a draft.
+
+    The hint's words are substrings of short messages, so a one-word
+    message matched the hint and its submit was reported as rejected.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            rule,
+            "❯ Press up to edit queued messages",
+            rule,
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is False
+
+
+def test_typed_draft_is_still_seen_beside_the_queued_message_hint() -> None:
+    """A real draft in the box is still detected when the same words appear in it."""
+    rule = "─" * 40
+    pane = "\n".join([rule, "❯ to fix the bug", rule, "  Opus 4.8 (1M context) | effort:high"])
+    assert claude_native_bridge._draft_in_input_box(pane, "to") is True
 
 
 def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
@@ -14131,6 +14202,164 @@ async def test_hook_evaluate_endpoint_allows(
         assert "OMNIGENT_RELAY_URL=" in env_text and "OMNIGENT_RELAY_TOKEN=" in env_text
     finally:
         relay.close()
+
+
+_NO_POLICY_ALLOW: dict[str, object] = {
+    "result": "POLICY_ACTION_ALLOW",
+    "allow_cache_seconds": 60.0,
+}
+
+
+async def _run_shell_hook(command: str, payload: dict[str, object]) -> str:
+    """Run a hook command through /bin/sh off-loop and return its stdout."""
+    result = await asyncio.to_thread(
+        subprocess.run,
+        ["/bin/sh", "-c", command],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+@pytest.mark.asyncio
+async def test_policy_hook_command_answers_inside_no_policy_allow_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The installed hook command skips the relay while the relay's window is open.
+
+    The relay records the window from its own upstream call, and the first
+    hook after the agent adds a policy reaches the relay again. Which events
+    the shell may answer is covered in ``tests/native/test_policy_allow_cache.py``.
+    """
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        args = augment_claude_args((), bridge_dir=bridge_dir, ap_server_url="http://127.0.0.1:9")
+        settings = _load_invocation_settings(args)
+        pre_entries = [
+            entry for entry in settings["hooks"]["PreToolUse"] if "matcher" not in entry
+        ]
+        command = pre_entries[0]["hooks"][0]["command"]
+
+        assert await _run_shell_hook(command, _PRE_TOOL_USE_PAYLOAD) == ""
+        assert client.calls == 1
+        assert await _run_shell_hook(command, _PRE_TOOL_USE_PAYLOAD) == ""
+        assert client.calls == 1, "a hook inside the window must not reach the server"
+
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/tool", {"name": "sys_add_policy", "arguments": {}}
+        )
+        await _run_shell_hook(command, _PRE_TOOL_USE_PAYLOAD)
+        assert client.calls == 2, "the first hook after sys_add_policy must ask the server"
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+async def test_relay_answer_for_a_switched_bridge_opens_no_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The relay evaluates its own session, so a bridge that moved on gets no window."""
+    client = _ScriptedPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        config_path = bridge_dir / claude_native_bridge._CONFIG_FILE
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        config_path.write_text(json.dumps({**config, "active_session_id": "conv_switched"}))
+
+        body = await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", _PRE_TOOL_USE_PAYLOAD
+        )
+
+        assert body == ""
+        assert client.calls == 1
+        assert policy_allow_cache._read_state(bridge_dir)[0] == 0
+    finally:
+        relay.close()
+
+
+class _HeldPolicyClient(_ScriptedPolicyClient):
+    """Scripted policy client whose first answer waits for the test to release it."""
+
+    def __init__(self, verdict: dict[str, object]) -> None:
+        super().__init__(verdict)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
+        """Hold the first POST until :attr:`release` is set, then answer it."""
+        if self.calls == 0:
+            self.entered.set()
+            await asyncio.to_thread(self.release.wait, 30)
+        return await super().post(url, json=json)
+
+
+@pytest.mark.asyncio
+async def test_late_no_policy_allow_cannot_reopen_window_after_sys_add_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ALLOW the server sent before the agent added a policy is never reused.
+
+    The relay serves requests concurrently, so a hook evaluation can still be
+    waiting on the server when ``sys_add_policy`` finishes.
+    """
+    client = _HeldPolicyClient(_NO_POLICY_ALLOW)
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        pending = asyncio.ensure_future(
+            asyncio.to_thread(
+                _relay_request_raw,
+                bridge_dir,
+                "/hook/claude/evaluate-policy",
+                _PRE_TOOL_USE_PAYLOAD,
+            )
+        )
+        assert await asyncio.to_thread(client.entered.wait, 30)
+        await asyncio.to_thread(
+            _relay_request_raw, bridge_dir, "/tool", {"name": "sys_add_policy", "arguments": {}}
+        )
+        client.release.set()
+        assert await pending == ""
+
+        probe = policy_allow_cache.guarded_hook_command(
+            bridge_dir, "cat > /dev/null; echo asked-server"
+        )
+        assert (await _run_shell_hook(probe, _PRE_TOOL_USE_PAYLOAD)).strip() == "asked-server"
+    finally:
+        client.release.set()
+        relay.close()
+
+
+@pytest.mark.parametrize(
+    "switch",
+    ["write_active_session_id", "prepare_bridge_dir"],
+    ids=["rotation", "re_preparation"],
+)
+def test_active_session_switch_closes_allow_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, switch: str
+) -> None:
+    """Every path that changes the bridge's session closes its window.
+
+    The new session's policies were never checked. Re-preparing the bridge for
+    the session it already serves keeps the window.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_rotation", workspace=tmp_path)
+    generation = policy_allow_cache.generation(bridge_dir)
+    policy_allow_cache.record(bridge_dir, generation, _NO_POLICY_ALLOW, requested_at=time.time())
+    prepare_bridge_dir("conv_old", bridge_id="bridge_rotation", workspace=tmp_path)
+    assert policy_allow_cache._read_state(bridge_dir)[0] > 0
+
+    if switch == "write_active_session_id":
+        claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+    else:
+        prepare_bridge_dir("conv_new", bridge_id="bridge_rotation", workspace=tmp_path)
+
+    assert policy_allow_cache._read_state(bridge_dir)[0] == 0
 
 
 @pytest.mark.asyncio
