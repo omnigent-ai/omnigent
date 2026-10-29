@@ -176,15 +176,26 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Claude Code exits at startup on ``--mcp-config`` when ``managed-mcp.json`` exists."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
     monkeypatch.chdir(tmp_path)
     _install_managed_mcp_config(tmp_path, monkeypatch)
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    captured_warnings: list[str] = []
+    monkeypatch.setattr(
+        claude_native_bridge._logger,
+        "warning",
+        lambda message, *args, **kwargs: captured_warnings.append(
+            message % args if args else message
+        ),
+    )
 
     body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
 
     args = body["spec"]["args"]
     assert "--mcp-config" not in args
     assert "--strict-mcp-config" not in args
+    assert any("managed-mcp.json" in message for message in captured_warnings)
     # The runner recovers the bridge from the settings path, and hooks still load.
     assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
     assert "SessionStart" in _load_invocation_settings(args)["hooks"]
