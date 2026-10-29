@@ -1100,6 +1100,7 @@ _ITEM_TYPES: frozenset[str] = frozenset(
         "slash_command",
         "terminal_command",
         "routing_decision",
+        "code_run",
     }
 )
 
@@ -1368,6 +1369,10 @@ def delete_fts_by_conversation_ids(session: Session, conv_ids: list[str]) -> Non
 # ── Search text extraction ─────────────────────────────
 
 
+# Leading output characters indexed for a finished ``code_run`` item.
+_CODE_RUN_SEARCH_CHARS = 1_000
+
+
 def extract_search_text(item: NewConversationItem) -> str:
     """
     Extract plain text for FTS from an item's data, per DBSPEC.
@@ -1384,8 +1389,8 @@ def extract_search_text(item: NewConversationItem) -> str:
         ``type`` is one of ``"message"``, ``"function_call"``,
         ``"function_call_output"``, ``"reasoning"``,
         ``"compaction"``, ``"native_tool"``, ``"resource_event"``,
-        ``"slash_command"``, ``"terminal_command"``, or
-        ``"routing_decision"``.
+        ``"slash_command"``, ``"terminal_command"``,
+        ``"routing_decision"``, or ``"code_run"``.
     :returns: A single plain-text string suitable for FTS indexing.
     :raises ValueError: If *item.type* is not a recognised type.
     """
@@ -1444,6 +1449,12 @@ def extract_search_text(item: NewConversationItem) -> str:
         # Index model + rationale so FTS can find a router verdict by
         # the model it picked or its one-line explanation.
         return " ".join(part for part in (data.get("model"), data.get("rationale")) if part)
+    if item.type == "code_run":
+        # A run's started item carries the command and its finished item the
+        # output, so the pair indexes the command plus the start of the output.
+        if data["command"]:
+            return data["command"]
+        return "".join(segment["text"] for segment in data["output"])[:_CODE_RUN_SEARCH_CHARS]
     raise ValueError(f"unknown item type: {item.type!r}")
 
 

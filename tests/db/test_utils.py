@@ -1047,6 +1047,50 @@ def test_extract_search_text_routing_decision() -> None:
     assert extract_search_text(item) == "databricks-claude-opus-4-8 Deep design work."
 
 
+def test_extract_search_text_code_run_started_indexes_command() -> None:
+    item = NewConversationItem.model_validate(
+        {
+            "type": "code_run",
+            "response_id": "resp_x",
+            "data": {
+                "run_id": "run_1",
+                "phase": "started",
+                "message_id": "msg_1",
+                "block_hash": "abc",
+                "language": "bash",
+                "command": "echo hello",
+                "timeout": 60,
+                "started_at": 1753900000,
+            },
+        }
+    )
+    assert extract_search_text(item) == "echo hello"
+
+
+def test_extract_search_text_code_run_finished_indexes_output_start() -> None:
+    item = NewConversationItem.model_validate(
+        {
+            "type": "code_run",
+            "response_id": "resp_x",
+            "data": {
+                "run_id": "run_1",
+                "phase": "finished",
+                "status": "exited",
+                "exit_code": 0,
+                "duration_ms": 5,
+                "output": [
+                    {"stream": "stdout", "text": "hello "},
+                    {"stream": "stderr", "text": "x" * 5000},
+                ],
+                "truncated": False,
+            },
+        }
+    )
+    text = extract_search_text(item)
+    assert text.startswith("hello xxx")
+    assert len(text) == 1000
+
+
 def test_build_search_snippet_short_text_returned_whole() -> None:
     """A match within a short line yields the whole (collapsed) line, no ellipsis."""
     assert (
