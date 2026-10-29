@@ -15,10 +15,12 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+# Seeded files land in the server's cwd, the repo root (<repo>/tests/e2e_ui/files/...).
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _FILE_PATH = "ProxyHandler.scala"
 _TAIL_MARKER = "endOfTheLongComment"
+_EDIT_MARKER = "typedBeforeWrapping"
 _LONG_COMMENT = (
     "  // Forwards each MCP request to the upstream service, retrying idempotent calls "
     "with exponential backoff, and records latency, status, and the caller's workspace "
@@ -89,9 +91,20 @@ def test_wrap_lines_soft_wraps_a_long_code_line(
     page = _open_long_line_file(request, *seeded_long_line_file)
     assert not _tail_fits_in_editor(page), "the long line should run past the pane by default"
 
+    editor = _editor(page)
+    editor.locator(".view-line", has_text="def handle").click()
+    page.keyboard.press("End")
+    page.keyboard.type(f" // {_EDIT_MARKER}")
+    expect(editor.locator(".selected-text")).to_have_count(0)
+    page.keyboard.press("Shift+Home")
+    expect(editor.locator(".selected-text").first).to_be_attached()
+
     _toggle_wrap_lines(page)
     poll_until(lambda: _tail_fits_in_editor(page), timeout_s=10)
-    expect(_editor(page).locator(".view-line", has_text=_TAIL_MARKER)).to_be_visible()
+    expect(editor.locator(".view-line", has_text=_TAIL_MARKER)).to_be_visible()
+    # A remounted editor would drop the selection; the options update keeps it.
+    expect(editor.locator(".view-line", has_text=_EDIT_MARKER)).to_be_visible()
+    expect(editor.locator(".selected-text").first).to_be_attached()
 
     _toggle_wrap_lines(page)
     poll_until(lambda: not _tail_fits_in_editor(page), timeout_s=10)

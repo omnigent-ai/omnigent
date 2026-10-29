@@ -142,7 +142,6 @@ function setupHooks(
 function renderEditor(
   props: {
     truncated?: boolean;
-    wrapLines?: boolean;
     onSaveStatusChange?: (s: SaveStatus) => void;
   } = {},
 ) {

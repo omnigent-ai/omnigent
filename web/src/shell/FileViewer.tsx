@@ -1283,12 +1283,8 @@ function FileViewerBody({
       onSelect: () => setDiffLayout((l) => (l === "unified" ? "split" : "unified")),
     });
   }
-  // A single "⋯" menu folds the view controls that were previously separate
-  // top-level icons: Find in file and Download (all views), wrap lines (Monaco
-  // views), and the diff-only whitespace toggle. Grouping them frees toolbar width
-  // — handy when the viewer runs in a narrow pane — and mirrors GitHub's
-  // diff-settings menu. The toggles keep the menu open; actions close it as they
-  // hand off.
+  // One "⋯" menu holds Find, Download, Wrap lines (Monaco views) and the diff-only
+  // whitespace toggle to save toolbar width; toggles keep the menu open.
   const settingsMenu: ToolbarOption[] = [
     {
       key: "search",
