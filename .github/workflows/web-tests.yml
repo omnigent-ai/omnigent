@@ -166,6 +166,8 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ui-coverage-summary-${{ github.run_id }}
+          # The coverage status consumes the latest attempt under this name.
+          overwrite: true
           path: web/ui-coverage-summary/
           retention-days: 14
 

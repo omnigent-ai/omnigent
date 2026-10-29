@@ -241,7 +241,7 @@ runs:
       if: ${{ failure() || cancelled() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
-        name: e2e-server-logs-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
+        name: e2e-server-logs-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: |
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/server.log
           /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/**/runner.log
@@ -256,7 +256,7 @@ runs:
       if: ${{ always() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
-        name: e2e-tokens-${{ github.run_id }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
+        name: e2e-tokens-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ inputs.shard_id }}${{ inputs.artifact_suffix }}
         path: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/tokens*.json
         retention-days: 14
         if-no-files-found: warn
