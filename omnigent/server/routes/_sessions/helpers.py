@@ -1659,6 +1659,8 @@ def _publish_elicitation_resolved_to_ancestors(
     elicitation_id: str,
     action: str | None = None,
     reason: str | None = None,
+    *,
+    ancestor_ids: list[str] | None = None,
 ) -> None:
     """
     Mirror an elicitation-resolved event into each ancestor stream.
@@ -1672,8 +1674,11 @@ def _publish_elicitation_resolved_to_ancestors(
         mirrors; see :func:`_publish_elicitation_resolved`.
     :param reason: Optional no-verdict reason carried through to the
         mirrors; see :func:`_publish_elicitation_resolved`.
+    :param ancestor_ids: Ancestors read before the session was deleted;
+        ``None`` reads them from ``conv_store``.
     """
-    ancestor_ids = _ancestor_session_ids(conv_store, session_id)
+    if ancestor_ids is None:
+        ancestor_ids = _ancestor_session_ids(conv_store, session_id)
     with _ancestor_elicitation_mirror_lock:
         if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None:
             return  # The child re-asked under this id; its request mirror owns the card.

@@ -3007,18 +3007,32 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("delete_fails", [False, True])
 async def test_deleting_session_releases_prompt_whose_hook_still_waits(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    delete_fails: bool,
 ) -> None:
-    """A hook that outlives its session's delete cannot leave a hold when it disconnects."""
+    """
+    A hook that outlives its session's delete cannot leave a hold when it disconnects.
+
+    A failed delete leaves the prompt, its parent's mirror, and the hook's wait in place.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
     from omnigent.runtime import pending_elicitations
+    from omnigent.server import _elicitation_registry
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     disconnect = asyncio.Event()
 
     async def _wait_for_disconnect(_request: Any) -> None:
         await disconnect.wait()
 
+    async def _fail_delete(_store: Any, _conversation_id: str) -> bool:
+        raise OmnigentError("The database is unavailable.", code=ErrorCode.INTERNAL_ERROR)
+
+    if delete_fails:
+        monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", _fail_delete)
     monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _wait_for_disconnect)
     monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
     monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_POLL_S", 0.02)
@@ -3046,6 +3060,24 @@ async def test_deleting_session_releases_prompt_whose_hook_still_waits(
         assert mirrored["type"] == "response.elicitation_request"
 
         deleted = await client.delete(f"/v1/sessions/{session_id}")
+        if delete_fails:
+            assert deleted.status_code == 500, deleted.text
+            assert _elicitation_registry._harness_deleting_sessions.items() == []
+            assert not sessions_route._harness_parked_elicitations[
+                _REATTACH_ELICITATION_ID
+            ].released
+            assert pending_elicitations.count_for(session_id) == 1
+            assert pending_elicitations.count_for(parent_id) == 1
+            verdict = await client.post(
+                f"/v1/sessions/{session_id}/elicitations/{_REATTACH_ELICITATION_ID}/resolve",
+                json={"action": "accept"},
+            )
+            assert verdict.status_code == 202, verdict.text
+            hook = await asyncio.wait_for(hook_task, timeout=5.0)
+            assert hook.status_code == 200, hook.text
+            assert hook.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+            assert pending_elicitations.count_for(parent_id) == 0
+            return
         assert deleted.status_code == 200, deleted.text
         expired = await _next_elicitation_event(parent_collector)
         assert expired["type"] == "response.elicitation_resolved"
@@ -3162,52 +3194,52 @@ async def test_hook_registering_around_session_delete_leaves_no_prompt(
         pending_elicitations.reset_for_tests()
 
 
-@pytest.mark.parametrize("held_again", [False, True])
-async def test_deleting_session_expires_only_prompts_still_held(
+@pytest.mark.parametrize("delete_fails", [False, True])
+async def test_deleting_session_expires_held_prompts_only_after_delete(
     monkeypatch: pytest.MonkeyPatch,
-    held_again: bool,
+    delete_fails: bool,
 ) -> None:
-    """A prompt cleared while an earlier one is released gets no second resolution."""
+    """Held prompts expire with the ancestors read before the delete, and only if it succeeds."""
+    held = _UnparkedHarnessElicitation(
+        session_id="conv_deleted",
+        tool_name="AskUserQuestion",
+        tool_input=None,
+        event_payload={},
+        request_fingerprint=None,
+        resolved_elsewhere=asyncio.Event(),
+    )
+    ancestors_read: list[str] = []
+    expired: list[tuple[str, list[str] | None]] = []
 
-    def held_prompt() -> _UnparkedHarnessElicitation:
-        return _UnparkedHarnessElicitation(
-            session_id="conv_deleted",
-            tool_name="AskUserQuestion",
-            tool_input=None,
-            event_payload={},
-            request_fingerprint=None,
-            resolved_elsewhere=asyncio.Event(),
-        )
+    def read_ancestors(_store: Any, session_id: str) -> list[str]:
+        ancestors_read.append(session_id)
+        return ["conv_parent"]
 
-    expired: list[str] = []
+    def expire_mirrors(_store: Any, _session_id: str, elicitation_id: str, **kwargs: Any) -> None:
+        expired.append((elicitation_id, kwargs.get("ancestor_ids")))
 
-    def clear_second_prompt(
-        _store: Any, _session_id: str, elicitation_id: str, **_kwargs: Any
-    ) -> None:
-        if elicitation_id == "elicit_first":
-            _harness_unparked_elicitations.pop("elicit_second")
-            if held_again:
-                _harness_unparked_elicitations["elicit_second"] = held_prompt()
-
+    monkeypatch.setattr(sessions_orchestration, "_ancestor_session_ids", read_ancestors)
     monkeypatch.setattr(
-        sessions_orchestration,
-        "_publish_elicitation_resolved",
-        lambda _session_id, elicitation_id, **_kwargs: expired.append(elicitation_id),
+        sessions_orchestration, "_publish_elicitation_resolved", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(
-        sessions_orchestration,
-        "_publish_elicitation_resolved_to_ancestors",
-        clear_second_prompt,
+        sessions_orchestration, "_publish_elicitation_resolved_to_ancestors", expire_mirrors
     )
-    _harness_unparked_elicitations["elicit_first"] = held_prompt()
-    _harness_unparked_elicitations["elicit_second"] = held_prompt()
+    _harness_unparked_elicitations["elicit_held"] = held
     try:
-        async with sessions_orchestration._release_deleted_session_prompts(
-            ["conv_deleted"], cast(Any, None)
-        ):
-            pass
-        assert expired == (["elicit_first", "elicit_second"] if held_again else ["elicit_first"])
-        assert _harness_unparked_elicitations.items() == []
+        with contextlib.suppress(RuntimeError):
+            async with sessions_orchestration._release_deleted_session_prompts(
+                ["conv_deleted"], cast(Any, None)
+            ):
+                assert ancestors_read == ["conv_deleted"]
+                if delete_fails:
+                    raise RuntimeError("delete failed")
+        if delete_fails:
+            assert expired == []
+            assert _harness_unparked_elicitations.get("elicit_held") is held
+        else:
+            assert expired == [("elicit_held", ["conv_parent"])]
+            assert _harness_unparked_elicitations.items() == []
     finally:
         _harness_unparked_elicitations.clear()
 

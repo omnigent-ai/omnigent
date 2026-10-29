@@ -253,6 +253,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
+    _ancestor_session_ids,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
@@ -963,34 +964,47 @@ async def _release_deleted_session_prompts(
     session_ids: list[str],
     conversation_store: ConversationStore,
 ) -> AsyncIterator[None]:
-    """Expire the harness prompts of sessions being deleted; run the delete inside this block.
+    """Fence the harness prompts of sessions being deleted; run the delete inside this block.
 
     A deleted session's status may never leave mid-turn, so a terminal hold would poll forever.
-    Expiring before the delete still reaches surviving ancestors' mirrors.
+    The prompts expire only once the block exits cleanly; a failed delete leaves them waiting.
     """
     deleted = set(session_ids)
     # Fence before any await so a hook arriving during the delete cannot park.
     for session_id in deleted:
         _harness_deleting_sessions[session_id] = _harness_deleting_sessions.get(session_id, 0) + 1
     try:
-        released: list[tuple[str, str]] = []
+        prompts = [
+            (entry.session_id, elicitation_id)
+            for registry in (_harness_parked_elicitations, _harness_unparked_elicitations)
+            for elicitation_id, entry in registry.items()
+            if entry.session_id in deleted
+        ]
+        # Parent links are gone after the delete, so read the mirrors' targets now.
+        ancestor_ids: dict[str, list[str]] = {}
+        for session_id in {prompt_session_id for prompt_session_id, _ in prompts}:
+            try:
+                ancestor_ids[session_id] = await asyncio.to_thread(
+                    _ancestor_session_ids, conversation_store, session_id
+                )
+            except Exception:  # noqa: BLE001 — the delete must still go through
+                _logger.warning(
+                    "Could not read ancestors of deleted session %s", session_id, exc_info=True
+                )
+        yield
         # Mark parked hooks before any await so a later disconnect cannot open a hold.
-        for elicitation_id, parked in _harness_parked_elicitations.items():
+        for parked in _harness_parked_elicitations.values():
             if parked.session_id in deleted and not parked.released:
                 parked.released = True
                 parked.resolved_elsewhere.set()
-                released.append((parked.session_id, elicitation_id))
-        for session_id, elicitation_id in released:
-            await _expire_deleted_session_prompt(session_id, elicitation_id, conversation_store)
         for elicitation_id, unparked in _harness_unparked_elicitations.items():
-            if unparked.session_id not in deleted:
-                continue
-            if _harness_unparked_elicitations.pop(elicitation_id, None) is None:
-                continue  # Cleared or re-parked while an earlier prompt was being released.
+            if unparked.session_id in deleted:
+                _harness_unparked_elicitations.pop(elicitation_id, None)
+        # Prompts whose hooks exited during the delete may still have cards up.
+        for session_id, elicitation_id in prompts:
             await _expire_deleted_session_prompt(
-                unparked.session_id, elicitation_id, conversation_store
+                session_id, elicitation_id, conversation_store, ancestor_ids.get(session_id, [])
             )
-        yield
     finally:
         for session_id in deleted:
             remaining = _harness_deleting_sessions.get(session_id, 1) - 1
@@ -1004,6 +1018,7 @@ async def _expire_deleted_session_prompt(
     session_id: str,
     elicitation_id: str,
     conversation_store: ConversationStore,
+    ancestor_ids: list[str],
 ) -> None:
     """Publish an unanswered resolution for a deleted session's prompt and its mirrors."""
     _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
@@ -1014,6 +1029,7 @@ async def _expire_deleted_session_prompt(
             session_id,
             elicitation_id,
             reason="unanswered",
+            ancestor_ids=ancestor_ids,
         )
     except Exception:  # noqa: BLE001 — the delete must still go through
         _logger.warning(
