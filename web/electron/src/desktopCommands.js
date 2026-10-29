@@ -18,6 +18,9 @@ const DESKTOP_COMMANDS = Object.freeze([
   "go-forward",
   "reload",
   "focus-address-bar",
+  "reopen-closed-tab",
+  "previous-tab",
+  "next-tab",
 ]);
 
 /**

@@ -3531,7 +3531,14 @@ function buildMenu() {
         label: "Focus Address Bar",
         accelerator: "CmdOrCtrl+L",
         enabled: canRun("focus-address-bar"),
-        click: () => focusAddressBar(),
+        click: () => focusAppAndSend("focus-address-bar"),
+      },
+      {
+        id: "reopen_closed_tab",
+        label: "Reopen Closed Tab",
+        accelerator: "CmdOrCtrl+Shift+T",
+        enabled: canRun("reopen-closed-tab"),
+        click: () => focusAppAndSend("reopen-closed-tab"),
       },
       { type: "separator" },
       // Windows and Linux have no app menu, so Settings and Quit live here.
@@ -3620,6 +3627,21 @@ function buildMenu() {
         accelerator: "CmdOrCtrl+]",
         enabled: canRun("go-forward"),
         click: () => goInHistory(desktopCommandTarget("go-forward"), "go-forward"),
+      },
+      { type: "separator" },
+      {
+        id: "previous_tab",
+        label: "Previous Tab",
+        accelerator: "CmdOrCtrl+Shift+[",
+        enabled: canRun("previous-tab"),
+        click: () => focusAppAndSend("previous-tab"),
+      },
+      {
+        id: "next_tab",
+        label: "Next Tab",
+        accelerator: "CmdOrCtrl+Shift+]",
+        enabled: canRun("next-tab"),
+        click: () => focusAppAndSend("next-tab"),
       },
     ],
   });
@@ -5409,12 +5431,12 @@ function reloadFocused() {
   else focused.webContents.reload();
 }
 
-/** Focus Address Bar (⌘L): take focus back from an embedded page, then let the page focus its address bar. */
-function focusAddressBar() {
-  const target = desktopCommandTarget("focus-address-bar");
+/** Take keyboard focus back from an embedded page, then hand `command` to the app. */
+function focusAppAndSend(command) {
+  const target = desktopCommandTarget(command);
   if (!target) return;
   target.webContents.focus();
-  sendDesktopCommand(target, "focus-address-bar");
+  sendDesktopCommand(target, command);
 }
 
 /**

@@ -17,6 +17,12 @@ interface BrowserPage {
 }
 
 interface BrowserTabsBridge {
+  browserOpenOrNavigate?: (
+    viewId: string,
+    url: string,
+    bounds: undefined,
+    opts: { force: boolean },
+  ) => Promise<{ ok: boolean }>;
   browserHasView?: (
     viewId: string,
   ) => Promise<BrowserPage & { exists: boolean; pendingUrl?: string }>;
@@ -174,8 +180,17 @@ export function useBrowserTabs(conversationId: string) {
     };
   }, [conversationId]);
 
-  const add = () => {
+  /** Open a tab, optionally loading `url` into its view before the pane mounts. */
+  const add = (url?: string) => {
     const selected = crypto.randomUUID();
+    if (url) {
+      const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+      void bridge
+        ?.browserOpenOrNavigate?.(browserViewId(conversationId, selected), url, undefined, {
+          force: true,
+        })
+        .catch(() => undefined);
+    }
     update((current) => ({ tabs: [...current.tabs, selected], selected }));
   };
 
@@ -214,6 +229,7 @@ export function useBrowserTabs(conversationId: string) {
   return {
     ...state,
     labelFor,
+    urlFor: (tabId: string) => pages[browserViewId(conversationId, tabId)]?.url,
     add,
     close,
     select,

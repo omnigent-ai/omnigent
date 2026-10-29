@@ -260,6 +260,8 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T", "Ctrl", "Alt", "B"]);
     expect(keysFor("Reload the browser tab")).toEqual(["Ctrl", "R"]);
     expect(keysFor("Focus the browser address bar")).toEqual(["Ctrl", "L"]);
+    expect(keysFor("Show the next workspace tab")).toEqual(["Ctrl", "⇧", "]"]);
+    expect(keysFor("Reopen the last closed tab")).toEqual(["Ctrl", "⇧", "T"]);
   });
 });
 
