@@ -539,7 +539,19 @@ def test_codex_config_custom_provider_detected(clean_env) -> None:
     assert detect_providers() == [_ISAAC_STYLE_DETECTION]
 
 
-def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> None:
+@pytest.mark.parametrize(
+    ("settings", "refresh_interval", "timeout"),
+    [
+        ("timeout_ms = 5000\nrefresh_interval_ms = 1500000", 1_500_000, 5_000),
+        ("", 0, 20_000),
+        ("timeout_ms = 0\nrefresh_interval_ms = -1", 0, 20_000),
+        ('timeout_ms = "slow"\nrefresh_interval_ms = "often"', 0, 20_000),
+        ("timeout_ms = true\nrefresh_interval_ms = true", 0, 20_000),
+    ],
+)
+def test_codex_config_provider_transport_reads_base_url_and_auth(
+    clean_env, settings: str, refresh_interval: int, timeout: int
+) -> None:
     """``codex_config_provider_transport`` returns base_url + a shell auth command.
 
     The runtime-routing counterpart of the detection: pi-native reads this to
@@ -551,13 +563,20 @@ def test_codex_config_provider_transport_reads_base_url_and_auth(clean_env) -> N
         codex_config_provider_transport,
     )
 
-    _write_codex_config(clean_env, _ISAAC_STYLE_CODEX_CONFIG)
+    _write_codex_config(
+        clean_env,
+        _ISAAC_STYLE_CODEX_CONFIG.replace(
+            "timeout_ms = 5000\nrefresh_interval_ms = 1500000", settings
+        ),
+    )
     transport = codex_config_provider_transport(_codex_config_path(), "Databricks")
     assert transport is not None
     assert transport.base_url == "https://example.ai-gateway.cloud.databricks.com/codex/v1"
     assert transport.auth_command == (
         "jq -r .access_token /home/user/.databricks/model-serving-token.json"
     )
+    assert transport.auth_refresh_interval_ms == refresh_interval
+    assert transport.auth_timeout_ms == timeout
 
 
 def test_codex_config_provider_transport_missing_table_returns_none(clean_env) -> None:

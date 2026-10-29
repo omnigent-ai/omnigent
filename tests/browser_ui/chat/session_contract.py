@@ -72,6 +72,36 @@ def message_item(
     }
 
 
+def tool_call_items(
+    call_id: str,
+    name: str,
+    arguments: Mapping[str, Any],
+    output: str,
+    *,
+    response_id: str,
+) -> list[dict[str, Any]]:
+    """Build one persisted tool call and its output, oldest first."""
+    return [
+        {
+            "id": f"{call_id}-call",
+            "response_id": response_id,
+            "type": "function_call",
+            "status": "completed",
+            "name": name,
+            "arguments": json.dumps(dict(arguments)),
+            "call_id": call_id,
+        },
+        {
+            "id": f"{call_id}-output",
+            "response_id": response_id,
+            "type": "function_call_output",
+            "status": "completed",
+            "call_id": call_id,
+            "output": output,
+        },
+    ]
+
+
 def transcript_items(turns: int) -> list[dict[str, Any]]:
     """Build newest-first history with markdown and fenced code in every turn."""
     chronological: list[dict[str, Any]] = []

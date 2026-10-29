@@ -80,7 +80,7 @@ jobs:
       github.repository == 'omnigent-ai/omnigent' &&
       (github.event_name == 'workflow_dispatch' ||
        github.event.workflow_run.conclusion == 'success')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       # --- Resolve the tag and decide whether to proceed (no code run yet) ---
