@@ -2957,6 +2957,8 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
 
 # Claude Code's print mode answers once and exits instead of opening the TUI.
 _CLAUDE_PRINT_MODE_FLAGS = frozenset({"-p", "--print"})
+# Print-mode I/O formats; ``--input-format stream-json`` exits at startup without ``--print``.
+_CLAUDE_PRINT_FORMAT_FLAGS = frozenset({"--input-format", "--output-format"})
 
 
 def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> list[str]:
@@ -2966,10 +2968,12 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
     A session replays its stored launch args on every relaunch, so one bad arg
     leaves it unable to start. ``--print`` runs Claude headless, which a
     terminal session can't use, and Claude refuses to start when an
-    ``--mcp-config`` file has since been deleted. Tokens after an option
-    terminator ``--`` are positional text and are kept as they are. Options
-    that exist only in print mode (``--no-session-persistence`` and the like)
-    are left alone: a session stored with them never started.
+    ``--mcp-config`` file has since been deleted. Print mode's
+    ``--input-format``/``--output-format`` go with it: a stream-json input
+    format alone also stops Claude at startup. Tokens after an option
+    terminator ``--`` are positional text and are kept as they are. Other
+    print-only options (``--no-session-persistence`` and the like) are left
+    alone: a session stored with them never started.
 
     :param args: The session's Claude Code launch args, e.g. ``["--print"]``.
     :param workspace: Directory Claude runs in, which relative config paths
@@ -2987,6 +2991,15 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
         if arg in _CLAUDE_PRINT_MODE_FLAGS:
             _logger.warning(
                 "Dropped %s from the Claude launch args; the session needs its TUI", arg
+            )
+            continue
+        format_flag = arg.partition("=")[0]
+        if format_flag in _CLAUDE_PRINT_FORMAT_FLAGS:
+            if "=" not in arg and index < len(args) and not args[index].startswith("-"):
+                index += 1
+            _logger.warning(
+                "Dropped %s from the Claude launch args; it applies only to print mode",
+                format_flag,
             )
             continue
         if arg.startswith("--mcp-config="):

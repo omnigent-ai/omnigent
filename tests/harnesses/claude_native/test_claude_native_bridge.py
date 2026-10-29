@@ -3932,6 +3932,23 @@ def test_drop_startup_fatal_claude_args_drops_print_mode(tmp_path: Path) -> None
     assert args == ["fix the bug", "--model", "opus"]
 
 
+def test_drop_startup_fatal_claude_args_drops_print_mode_formats(tmp_path: Path) -> None:
+    """A stored stream-json input format alone stops Claude at startup."""
+    args = drop_startup_fatal_claude_args(
+        [
+            "--input-format",
+            "stream-json",
+            "--output-format=stream-json",
+            "--verbose",
+            "--input-format=stream-json",
+            "--output-format",
+        ],
+        workspace=tmp_path,
+    )
+
+    assert args == ["--verbose"]
+
+
 def test_drop_startup_fatal_claude_args_keeps_text_after_option_terminator(
     tmp_path: Path,
 ) -> None:

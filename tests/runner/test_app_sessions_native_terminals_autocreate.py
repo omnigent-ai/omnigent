@@ -3306,8 +3306,9 @@ async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start
     launch_dir = workspace / "sub" if env_chdir else workspace
     launch_dir.mkdir(parents=True)
     if env_chdir:
-        (workspace / ".omnigent").mkdir()
-        (workspace / ".omnigent" / "config.yaml").write_text(
+        # Launch overrides are honoured only from the user config.
+        (tmp_path / "config-home").mkdir()
+        (tmp_path / "config-home" / "config.yaml").write_text(
             "harness:\n  claude-native:\n    command: env\n    args: ['--chdir=sub', 'claude']\n"
         )
     (launch_dir / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")
