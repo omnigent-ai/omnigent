@@ -271,7 +271,7 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
-import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
   sandboxModelOptionsKey,
@@ -293,7 +293,6 @@ import {
   type HostIdentity,
 } from "@/lib/nativeBridge";
 import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
-import { waitForNewOnlineHost } from "./waitForNewOnlineHost";
 import {
   fetchUserAgents,
   USER_AGENTS_QUERY_KEY,
@@ -5583,13 +5582,27 @@ export function NewChatLandingScreen() {
         showToast("Arca is already connected to this server — pick its host from the list.");
         return;
       }
-      const fresh = await waitForNewOnlineHost(queryClient, onlineBefore);
-      if (fresh) {
-        // Remember which host is the Arca box so the picker can tag it.
-        writeArcaHostId(fresh);
-        selectHost(fresh);
-        return;
+      // Sequential by design: each poll must see the previous one's result.
+      /* oxlint-disable no-await-in-loop */
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const hostList = await queryClient.fetchQuery({
+          queryKey: ["hosts", { includeSandbox: false }],
+          queryFn: () => fetchHosts(false),
+          staleTime: 0,
+        });
+        const fresh = hostList.find((h) => h.status === "online" && !onlineBefore.has(h.host_id));
+        if (fresh) {
+          // Remember which host is the Arca box so the picker can tag it.
+          writeArcaHostId(fresh.host_id);
+          selectHost(fresh.host_id);
+          return;
+        }
+        await new Promise((resolve) => {
+          setTimeout(resolve, 1500);
+        });
       }
+      /* oxlint-enable no-await-in-loop */
       // The daemon started but its registration hasn't landed — soft-fail so
       // the user knows to look at the host list rather than re-running.
       setArcaError(

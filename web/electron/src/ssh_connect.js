@@ -59,6 +59,8 @@ const ANSI_RE = /\u001b\[[0-9;?]*[A-Za-z]/g;
  */
 class SshConnectError extends Error {}
 
+const canceledResult = () => ({ ok: false, canceled: true, error: "Connecting was canceled." });
+
 /**
  * @param {unknown} raw
  * @returns {string} The trimmed destination.
@@ -328,6 +330,7 @@ function createSshSession(options) {
   const children = new Set();
   let master = null;
   let masterExited = false;
+  let aborted = false;
 
   /**
    * Spawn one ssh client over the shared connection. `stdin` is written and
@@ -337,6 +340,12 @@ function createSshSession(options) {
     args,
     { stdin = null, holdStdin = false, timeoutMs, onStdout, onStderr, baseArgs = sshArgs } = {},
   ) {
+    // Nothing new starts after abort: with the master gone, ssh would quietly open
+    // a fresh connection of its own and carry on.
+    if (aborted) {
+      const result = { code: null, stdout: "", stderr: "", timedOut: false };
+      return { promise: Promise.resolve(result), cancel: () => {} };
+    }
     let child;
     let timedOut = false;
     let stdout = "";
@@ -523,8 +532,9 @@ function createSshSession(options) {
       master.stderr?.destroy?.();
     },
 
-    /** Kill every ssh process this session started. */
+    /** Kill every ssh process this session started, and start no more. */
     abort() {
+      aborted = true;
       for (const child of children) {
         try {
           child.kill();
@@ -562,6 +572,7 @@ async function signIn(ctx) {
   // remote listeners to this computer (Arca Companion, VS Code) would grab it first.
   const expected = ports.find((_, index) => free[index]);
   let forwarded = (await session.forwardLocal(expected)).code === 0 ? expected : null;
+  if (ctx.isCanceled()) return canceledResult();
 
   onStatus({ step: "signing-in" });
   const notes = [];
@@ -570,7 +581,7 @@ async function signIn(ctx) {
   let queue = Promise.resolve();
   let run = null;
   const handleLine = async (line) => {
-    if (problem) return;
+    if (problem || ctx.isCanceled()) return;
     // The OIDC code and any error come after the link, so only the link stops counting.
     const link = opened ? null : parseSignInLink(line);
     if (!link) {
@@ -631,7 +642,7 @@ async function signIn(ctx) {
   await Promise.all(held.map((port) => session.releaseRemote(port)));
 
   if (problem) return { ok: false, error: problem };
-  if (ctx.isCanceled()) return { ok: false, canceled: true, error: "Connecting was canceled." };
+  if (ctx.isCanceled()) return canceledResult();
   if (result.timedOut)
     return { ok: false, error: "Sign-in timed out. Try again to get a new link." };
   if (result.code === 0) return { ok: true };
@@ -692,6 +703,7 @@ async function runSshConnect(ctx) {
       if (!(await full.askInstall())) {
         return { ok: false, canceled: true, error: `Omnigent isn't installed on ${destination}.` };
       }
+      if (full.isCanceled()) return canceledResult();
       const installer = full.readInstallScript();
       if (!installer)
         return { ok: false, error: "This build doesn't include the Omnigent installer." };
@@ -717,13 +729,14 @@ async function runSshConnect(ctx) {
         : login;
     }
 
+    if (full.isCanceled()) return canceledResult();
     onStatus({ step: "starting-host" });
     const host = await session.exec(hostScript(serverUrl), {
       timeoutMs: full.timeouts?.host ?? HOST_TIMEOUT_MS,
       onStdout: onOutput,
       onStderr: onOutput,
     }).promise;
-    if (full.isCanceled()) return { ok: false, canceled: true, error: "Connecting was canceled." };
+    if (full.isCanceled()) return canceledResult();
     if (host.code !== 0) {
       const detail = failureDetail(host.stderr || host.stdout);
       return {
@@ -791,7 +804,7 @@ function startSshConnect(serverUrl, destination, deps) {
         env: { ...process.env, ...askpass.env },
         onOutput: hooks.onOutput,
       });
-      if (canceled) return { ok: false, canceled: true, error: "Connecting was canceled." };
+      if (canceled) return canceledResult();
       return await runSshConnect({
         serverUrl: url,
         destination: target,
@@ -806,7 +819,7 @@ function startSshConnect(serverUrl, destination, deps) {
         onIdentityUnavailable: (reason) => log(`ssh connect: host identity unavailable: ${reason}`),
       });
     } catch (error) {
-      if (canceled) return { ok: false, canceled: true, error: "Connecting was canceled." };
+      if (canceled) return canceledResult();
       if (error instanceof SshConnectError) return { ok: false, error: error.message };
       log(`ssh connect: unexpected failure: ${error?.stack ?? error}`);
       return {

@@ -371,11 +371,7 @@ const arcaConnectFlow = createArcaConnectFlow({
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
-/**
- * Connect a machine the user reaches over SSH (any server, any OS but Windows):
- * the shell-owned console asks consent, then ssh_connect.js signs the machine in
- * through a forwarded port and starts its host. See ssh_connect.js.
- */
+/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
 const sshConnectFlow = createSshConnectFlow({
   BrowserWindow,
   ipcMain,
@@ -4874,10 +4870,8 @@ function registerIpc() {
     };
   });
 
-  // SPA → connect a machine the user reaches over SSH to the window's server
-  // as a host. Gated by the pinned-origin sender and by consent in the
-  // shell-owned console, which shows the exact commands (ssh_connect_window.js).
-  // The destination is re-validated here; the renderer is not trusted.
+  // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
+  // and revalidates the destination before the shell-owned console asks consent.
   ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("ssh-connect is only available to a connected server page");

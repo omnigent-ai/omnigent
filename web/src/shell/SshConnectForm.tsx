@@ -3,7 +3,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { connectSshHost, getDesktopFeatures, supportsSshConnect } from "@/lib/nativeBridge";
-import { fetchOnlineHostIds, waitForNewOnlineHost } from "./waitForNewOnlineHost";
 
 /**
  * Whether to offer the SSH connect form: the desktop shell can connect over SSH,
@@ -48,8 +47,6 @@ export function SshConnectForm({
     if (!target || connecting) return;
     setConnecting(true);
     setMessage(null);
-    // Taken before the host can register, to find it if the shell can't read its id.
-    const onlineBefore = fetchOnlineHostIds(queryClient).catch(() => null);
     try {
       const res = await connectSshHost(target);
       if (!res.ok) {
@@ -64,26 +61,13 @@ export function SshConnectForm({
         onConnected?.(res.identity.hostId);
         return;
       }
-      // Stay open whenever the host isn't known: closing would keep the previous host
-      // selected, so the next session would run there.
-      if (res.alreadyRunning) {
-        setMessage({
-          kind: "info",
-          text: `${target} was already connected to this server. Pick it from the host list.`,
-        });
-        return;
-      }
-      const before = await onlineBefore;
-      const hostId = before
-        ? await waitForNewOnlineHost(queryClient, before).catch(() => null)
-        : null;
-      if (hostId) {
-        onConnected?.(hostId);
-        return;
-      }
+      // Without a confirmed id, stay open and let the user pick: closing would keep the
+      // previous host selected, and guessing could pick another machine that came online.
       setMessage({
         kind: "info",
-        text: `${target} is connected, but its host hasn't appeared yet. Pick it from the host list when it does.`,
+        text: res.alreadyRunning
+          ? `${target} was already connected to this server. Pick it from the host list.`
+          : `${target} is connected. Pick it from the host list.`,
       });
     } finally {
       setConnecting(false);

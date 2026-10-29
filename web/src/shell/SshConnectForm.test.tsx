@@ -41,7 +41,6 @@ function connect(destination: string) {
 
 afterEach(() => {
   cleanup();
-  vi.useRealTimers();
   vi.mocked(fetchHosts).mockReset().mockResolvedValue([]);
   delete (window as unknown as { omnigentDesktop?: Desktop }).omnigentDesktop;
 });
@@ -76,38 +75,18 @@ describe("SshConnectForm", () => {
     }
   });
 
-  it("keeps the dialog open to say a machine was already connected", async () => {
-    const { onConnected } = renderForm({ ok: true, alreadyRunning: true, identity: null });
-
-    connect("my-ec2");
-
-    expect(await screen.findByTestId("ssh-connect-message")).toHaveTextContent(
-      "my-ec2 was already connected to this server.",
-    );
-    expect(onConnected).not.toHaveBeenCalled();
-  });
-
-  it("selects the host that came online when the shell couldn't read its id", async () => {
-    // Before the connect, then once the new machine registered.
+  // Without a confirmed id the form never guesses, even when another machine comes online.
+  it.each([
+    ["was already connected", true, "my-ec2 was already connected to this server."],
+    ["connected but its id couldn't be read", false, "my-ec2 is connected. Pick it from"],
+  ])("stays open for the user to pick when a machine %s", async (_name, alreadyRunning, text) => {
+    // An unrelated machine reconnects while this one connects.
     vi.mocked(fetchHosts).mockResolvedValueOnce(online("h1")).mockResolvedValue(online("h1", "h2"));
-    const { onConnected } = renderForm({ ok: true, alreadyRunning: false, identity: null });
+    const { onConnected } = renderForm({ ok: true, alreadyRunning, identity: null });
 
     connect("my-ec2");
 
-    await waitFor(() => expect(onConnected).toHaveBeenCalledWith("h2"));
-  });
-
-  it("stays open, keeping the previous host, when the new one never appears", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.mocked(fetchHosts).mockResolvedValue(online("h1"));
-    const { onConnected } = renderForm({ ok: true, alreadyRunning: false, identity: null });
-
-    connect("my-ec2");
-    await vi.advanceTimersByTimeAsync(31_000);
-
-    expect(await screen.findByTestId("ssh-connect-message")).toHaveTextContent(
-      "my-ec2 is connected, but its host hasn't appeared yet.",
-    );
+    expect(await screen.findByTestId("ssh-connect-message")).toHaveTextContent(text);
     expect(onConnected).not.toHaveBeenCalled();
   });
 

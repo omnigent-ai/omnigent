@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -84,12 +85,16 @@ def _write_executable(path: Path, text: str) -> Path:
     return path
 
 
-def _serve_sshd(socket_path: Path, config: Path, log: Path) -> socket.socket:
-    """Run `sshd -i` (the box's sshd) for each connection on a Unix socket."""
+def _serve_sshd(socket_path: Path, config: Path, log: Path) -> Callable[[], None]:
+    """Run `sshd -i` (the box's sshd) for each connection on a Unix socket.
+
+    :returns: A function that stops listening and ends every sshd it started.
+    """
     server = socket.socket(socket.AF_UNIX)
     server.bind(str(socket_path))
     server.listen()
     log_file = log.open("ab")
+    children: list[subprocess.Popen[bytes]] = []
 
     def accept() -> None:
         while True:
@@ -98,16 +103,30 @@ def _serve_sshd(socket_path: Path, config: Path, log: Path) -> socket.socket:
             except OSError:
                 log_file.close()
                 return
-            subprocess.Popen(
-                [_SSHD, "-i", "-e", "-f", str(config)],
-                stdin=conn.fileno(),
-                stdout=conn.fileno(),
-                stderr=log_file,
+            children.append(
+                subprocess.Popen(
+                    [_SSHD, "-i", "-e", "-f", str(config)],
+                    stdin=conn.fileno(),
+                    stdout=conn.fileno(),
+                    stderr=log_file,
+                )
             )
             conn.close()
 
     threading.Thread(target=accept, daemon=True).start()
-    return server
+
+    def stop() -> None:
+        server.close()
+        for child in children:
+            child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+    return stop
 
 
 def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) -> None:
@@ -171,7 +190,7 @@ def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) ->
             "ChallengeResponseAuthentication no\nAllowTcpForwarding yes\nLogLevel VERBOSE\n"
             f"ForceCommand {force_command}\n"
         )
-        sshd = _serve_sshd(box / "sshd.sock", sshd_config, tmp_path / "sshd.log")
+        stop_sshd = _serve_sshd(box / "sshd.sock", sshd_config, tmp_path / "sshd.log")
 
         workspace_port = workspace.url.rsplit(":", 1)[1]
         relay = laptop / "relay.py"
@@ -265,4 +284,4 @@ def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) ->
                 timeout=60,
                 check=False,
             )
-            sshd.close()
+            stop_sshd()

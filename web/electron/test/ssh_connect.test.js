@@ -621,6 +621,46 @@ describe("startSshConnect", () => {
     assert.equal(aborted, true);
     assert.equal(fs.existsSync(dir), false);
   });
+
+  it("starts no sign-in and opens no browser once canceled after connecting", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-connect-test-"));
+    const session = fakeSession({ logins: [{ lines: [`${SERVER}/auth/cli?t=1`], code: 0 }] });
+    const opened = [];
+    let probing;
+    const probed = new Promise((resolve) => {
+      probing = resolve;
+    });
+    let releaseProbe;
+    const probeGate = new Promise((resolve) => {
+      releaseProbe = resolve;
+    });
+    const connect = startSshConnect(SERVER, "my-ec2", {
+      hooks: { onOutput: () => {}, onStatus: () => {}, prompt: async () => null },
+      openExternal: (url) => opened.push(url),
+      readInstallScript: () => null,
+      makeTempDir: () => dir,
+      createAskpass: async () => ({ env: {}, close: () => {} }),
+      createSession: () => session,
+      // The connection is up; the window closes while the sign-in ports are checked.
+      isPortFree: async () => {
+        probing();
+        await probeGate;
+        return true;
+      },
+    });
+
+    await probed;
+    connect.cancel();
+    releaseProbe();
+
+    assert.deepEqual(await connect.promise, {
+      ok: false,
+      canceled: true,
+      error: "Connecting was canceled.",
+    });
+    assert.ok(!session.calls.includes("exec login"), session.calls.join(", "));
+    assert.deepEqual(opened, []);
+  });
 });
 
 describe("isPortFree", () => {
@@ -666,6 +706,33 @@ describe("createSshSession", () => {
       name: "Error",
       message: "Couldn't find ssh on this computer.",
     });
+  });
+
+  it("starts no ssh once aborted, so nothing reconnects on its own", async () => {
+    const spawned = [];
+    const spawn = (command, args) => {
+      const child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => child.emit("close", null);
+      spawned.push(args.includes("-M") ? "master" : args.join(" "));
+      if (!args.includes("-M")) setImmediate(() => child.emit("close", 0));
+      return child;
+    };
+    const session = createSshSession({
+      destination: "my-ec2",
+      socketPath: "/tmp/s/m",
+      spawn,
+      pathExists: () => true,
+    });
+    await session.open();
+    const before = spawned.length;
+
+    session.abort();
+
+    assert.equal((await session.forwardLocal(8020)).code, null);
+    assert.equal((await session.exec("true").promise).code, null);
+    assert.equal(spawned.length, before);
   });
 
   it("opens one shared connection and sends forwards over it", async () => {
