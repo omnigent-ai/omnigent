@@ -21,6 +21,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from fastapi import Response
@@ -62,7 +63,7 @@ from omnigent.runtime.harnesses._scaffold import (
     TurnContext,
 )
 from omnigent.runtime.prompt import dedupe_tool_output_images
-from omnigent.runtime.requester import InputRequester, ToolRequester
+from omnigent.runtime.requester import DelegationPolicy, InputRequester, ToolRequester
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CreateResponseRequest,
@@ -196,6 +197,32 @@ class _ToolExecutionBinding:
     agent: str | None
 
 
+def _executor_delegation_policy(executor: Executor) -> DelegationPolicy:
+    """Select the fallback from the actual producer, never mutable session configuration."""
+    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.inner.antigravity_executor import AntigravityExecutor
+    from omnigent.inner.copilot_executor import CopilotExecutor
+    from omnigent.inner.cursor_executor import CursorExecutor
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.pi_executor import PiExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+
+    if isinstance(
+        executor,
+        (
+            AcpExecutor,
+            AntigravityExecutor,
+            CopilotExecutor,
+            CursorExecutor,
+            GooseExecutor,
+            PiExecutor,
+            QwenExecutor,
+        ),
+    ):
+        return "no_edit_sharing"
+    return "requester"
+
+
 class ExecutorAdapter(HarnessApp):
     """
     :class:`HarnessApp` subclass that drives any inner :class:`Executor`.
@@ -287,7 +314,11 @@ class ExecutorAdapter(HarnessApp):
         # Install stable bridges once on first use — the SDK closure-captures them from the first
         # turn; per-turn rebinding would leave later tool calls dispatching into a dead ctx.
         if getattr(executor, "_tool_executor", None) is None:
-            executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
+            executor._tool_executor = partial(  # type: ignore[attr-defined]
+                self._stable_tool_executor,
+                _executor=executor,
+                _delegation_policy=_executor_delegation_policy(executor),
+            )
         if getattr(executor, "_elicitation_handler", None) is None:
             executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
         # ACP-shaped executors also accept a choice bridge, to offer the agent's own
@@ -880,6 +911,8 @@ class ExecutorAdapter(HarnessApp):
         *,
         call_id: str | None = None,
         requester: ToolRequester | None = None,
+        _executor: Executor | None = None,
+        _delegation_policy: DelegationPolicy = "requester",
     ) -> dict[str, Any]:
         """Route a producer-bound call to its execution, never to a newer requester.
 
@@ -892,15 +925,15 @@ class ExecutorAdapter(HarnessApp):
         Codex SDK binds dynamic calls to the exact turn/start reply, independently
         of display event correlation. Currently unbound paths are Pi tool callbacks,
         Cursor/Copilot/Antigravity custom tools, and the generic ACP/Goose/Qwen Omnigent
-        MCP relay. Their callbacks dispatch with explicit unknown authority. Ordinary
-        tools still route through policies, but owner-verified cross-session messages
-        and independent session creation are denied even from private sessions: an
-        explicit unknown envelope cannot establish owner authority.
+        MCP relay. Their callbacks retain unknown origin and require no edit sharing
+        at the server. The producing executor fixes this policy for its callback.
 
         Restoring authority requires trusted producer execution/call metadata and a
         typed binding to this context. Native Codex uses ``native_tool_requester``
         separately; native relay paths outside this callback have their own contracts.
         """
+        if _executor is not None and _executor is not self._executor:
+            return {"error": "tool callback belongs to a retired executor"}
         task_binding = self._task_tool_execution.get()
         if requester is None and task_binding is not None:
             requester = task_binding.ctx.requester.snapshot()
@@ -924,6 +957,7 @@ class ExecutorAdapter(HarnessApp):
         else:
             ctx, agent = self._current_ctx, self._current_agent
             requester = ToolRequester(execution_id=uuid.uuid4().hex, origin=InputRequester())
+        requester = requester.model_copy(update={"delegation_policy": _delegation_policy})
         if ctx is None or agent is None:
             # Orphaned callback — safe-fail to avoid parking a Future on a dead ctx.
             # Host-tool orphans are the deterministic respawn-desync signature, so force

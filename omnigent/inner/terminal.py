@@ -25,6 +25,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
@@ -80,6 +81,11 @@ from .terminal_lifecycle import (
 TerminalResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 logger = logging.getLogger(__name__)
+
+# Native launcher attestation: harness, executable and exact arguments; never spec metadata.
+current_native_terminal_launch: ContextVar[tuple[str, str, tuple[str, ...]] | None] = ContextVar(
+    "current_native_terminal_launch", default=None
+)
 
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
@@ -1125,6 +1131,7 @@ class TerminalInstance:
     keep_alive_after_exit: bool = False
     running: bool = False
     launch_cwd: str | None = None
+    native_harness: str | None = field(default=None, init=False, repr=False)
     # Runtime-owned observation; never part of the portable terminal spec.
     program_status_app: str | None = None
     program_status: ProgramStatusReader | None = field(default=None, init=False, repr=False)
@@ -1630,17 +1637,27 @@ class TerminalInstance:
 
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
+        previous_evidence = self.writer_evidence
         try:
             await self._launch_impl(cwd=cwd)
         except BaseException:
             self._stop_network_brokers()
             raise
+        launch = current_native_terminal_launch.get()
+        if (
+            self.writer_evidence is not previous_evidence
+            and launch is not None
+            and self.command == launch[1]
+            and tuple(self.args) == launch[2]
+        ):
+            self.native_harness = launch[0]
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
         from omnigent.terminals import program_status
 
         if self.running:
             return
+        self.native_harness = None
         self.writer_evidence = TerminalWriterEvidence(
             uuid.uuid4().hex, complete_observation=self.complete_writer_observation
         )

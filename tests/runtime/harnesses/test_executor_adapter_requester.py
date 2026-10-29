@@ -9,6 +9,8 @@ The OpenAI scenario runs the actual SDK in-process with a mocked HTTP model tran
 Claude coverage includes an unbound reader and the real Client/Query/control tasks
 with a scripted CLI transport. Codex uses a real JSONL subprocess with a scripted
 app-server. These do not validate live providers or SDK/home/sandbox startup.
+The producer-policy matrix is component coverage with vendor iteration mocked;
+it uses actual executor classes and the real callback registration and SSE path.
 """
 
 from __future__ import annotations
@@ -29,7 +31,16 @@ import pytest
 from openai import AsyncOpenAI
 from starlette.responses import StreamingResponse
 
-from omnigent.inner.claude_sdk_executor import _build_mcp_tools, _tool_call_metadata
+from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
+from omnigent.inner.antigravity_executor import AntigravityExecutor
+from omnigent.inner.claude_sdk_executor import (
+    ClaudeSDKExecutor,
+    _build_mcp_tools,
+    _tool_call_metadata,
+)
+from omnigent.inner.codex_executor import CodexExecutor
+from omnigent.inner.copilot_executor import CopilotExecutor
+from omnigent.inner.cursor_executor import CursorExecutor
 from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
@@ -37,10 +48,15 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnComplete,
 )
+from omnigent.inner.goose_executor import GooseExecutor
+from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+from omnigent.inner.pi_executor import PiExecutor
+from omnigent.inner.qwen_executor import QwenExecutor
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.runtime.harnesses._scaffold import MessageEvent, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.requester import (
     REQUESTER_FIELD,
+    DelegationPolicy,
     InputRequester,
     ToolRequester,
     current_tool_requester,
@@ -58,7 +74,7 @@ class _CallbackExecutor(Executor):
         self.finish_injection = asyncio.Event()
         self.injection_outcome: bool | BaseException = True
 
-    async def run_turn(self, messages, tools, system_prompt, config=None):
+    async def run_turn(self, messages, tools, system_prompt, config=None, **_kwargs):
         assert config is not None
         self.configs.put_nowait(config)
         await self.finish.wait()
@@ -121,6 +137,145 @@ async def _next_call(events: asyncio.Queue[dict[str, Any]]) -> dict[str, Any]:
             item = event.get("item", {})
             if item.get("type") == "function_call" and item.get("status") == "action_required":
                 return item
+
+
+@pytest.mark.parametrize(
+    ("executor_type", "executor_options", "expected_policy"),
+    [
+        (
+            AcpExecutor,
+            {"config": AcpAgentConfig(command="unused", name="test")},
+            "no_edit_sharing",
+        ),
+        (PiExecutor, {"pi_path": "unused", "context_files": False}, "no_edit_sharing"),
+        (CursorExecutor, {"api_key": "test-key"}, "no_edit_sharing"),
+        (
+            CopilotExecutor,
+            {"github_token": "test-token", "github_host": "github.test"},
+            "no_edit_sharing",
+        ),
+        (AntigravityExecutor, {"api_key": "test-key"}, "no_edit_sharing"),
+        (GooseExecutor, {"goose_path": "unused"}, "no_edit_sharing"),
+        (QwenExecutor, {"qwen_path": "unused"}, "no_edit_sharing"),
+        (OpenAIAgentsSDKExecutor, {"client": Mock(spec=AsyncOpenAI)}, "requester"),
+        (ClaudeSDKExecutor, {}, "requester"),
+        (CodexExecutor, {"codex_path": "unused"}, "requester"),
+    ],
+    ids=[
+        "acp",
+        "pi",
+        "cursor",
+        "copilot",
+        "antigravity",
+        "goose",
+        "qwen",
+        "openai",
+        "claude",
+        "codex",
+    ],
+)
+async def test_registered_sdk_producer_fixes_delegation_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    executor_type: type[Executor],
+    executor_options: dict[str, Any],
+    expected_policy: DelegationPolicy,
+) -> None:
+    """Component path: real constructors/registration/SSE, controlled vendor iteration."""
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    monkeypatch.setattr("omnigent.harnesses.pi_native.main.pi_version", lambda _: (0, 80, 4))
+    controller = _CallbackExecutor()
+    executor = executor_type(**executor_options)
+    monkeypatch.setattr(executor, "run_turn", controller.run_turn)
+    claimed_policy = "requester" if expected_policy == "no_edit_sharing" else "no_edit_sharing"
+    claimed_harness = "claude-sdk" if expected_policy == "no_edit_sharing" else "pi"
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, harness_label=claimed_harness)
+    callback = None
+
+    for user in ("owner", "collaborator"):
+        origin = InputRequester(user_id=user, account_generation=f"{user}-generation")
+        async with _turn(adapter, controller, origin) as (ctx, events, config):
+            registered = executor._tool_executor
+            if callback is not None:
+                assert registered is callback
+            callback = registered
+            config.model = claimed_harness
+            config.extra.update(harness=claimed_harness, delegation_policy=claimed_policy)
+            claimed = ctx.requester.snapshot().model_copy(
+                update={"delegation_policy": claimed_policy}
+            )
+            arguments = {
+                REQUESTER_FIELD: claimed.model_dump(),
+                "source": claimed_harness,
+                "delegation_policy": claimed_policy,
+            }
+            token = current_tool_requester.set(claimed)
+            try:
+                dispatch = asyncio.create_task(callback("echo", arguments))
+            finally:
+                current_tool_requester.reset(token)
+            item = await _next_call(events)
+            bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+            assert bound.delegation_policy == expected_policy
+            assert bound.origin.user_id is None
+            assert bound.origin.account_generation is None
+            assert bound.execution_id != ctx.requester.execution_id
+            assert ctx._complete_tool(item["call_id"], "{}")
+            assert await dispatch == {}
+
+            dispatch = asyncio.create_task(callback("echo", arguments, requester=claimed))
+            item = await _next_call(events)
+            bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+            assert bound.delegation_policy == expected_policy
+            assert bound.origin == origin
+            assert bound.execution_id == ctx.requester.execution_id
+            assert claimed.delegation_policy == claimed_policy
+            assert ctx._complete_tool(item["call_id"], "{}")
+            assert await dispatch == {}
+
+
+@pytest.mark.parametrize("unsupported_first", [True, False])
+async def test_retired_sdk_callback_cannot_adopt_replacement_producer(
+    monkeypatch: pytest.MonkeyPatch, unsupported_first: bool
+) -> None:
+    controller = _CallbackExecutor()
+    executors = [QwenExecutor(qwen_path="unused"), CodexExecutor(codex_path="unused")]
+    if not unsupported_first:
+        executors.reverse()
+    retired, replacement = executors
+    for executor in executors:
+        monkeypatch.setattr(executor, "run_turn", controller.run_turn)
+    current = retired
+    adapter = ExecutorAdapter(executor_factory=lambda: current)
+    async with _turn(adapter, controller, InputRequester(user_id="owner")):
+        callback = retired._tool_executor
+
+    current = replacement
+    adapter._executor = None
+    async with _turn(adapter, controller, InputRequester(user_id="collaborator")) as (
+        ctx,
+        events,
+        _,
+    ):
+        adapter._translate_event(ToolCallRequest(name="echo", metadata={"call_id": "reused"}), ctx)
+        for requester in (None, ctx.requester.snapshot()):
+            result = await asyncio.wait_for(
+                callback("echo", {}, call_id="reused", requester=requester), timeout=3
+            )
+            assert result == {"error": "tool callback belongs to a retired executor"}
+            assert not ctx._pending_tool_calls
+            assert list(adapter._pending_mcp_call_ids) == ["reused"]
+            assert adapter._executor is replacement
+        dispatch = asyncio.create_task(
+            replacement._tool_executor("echo", {}, requester=ctx.requester.snapshot())
+        )
+        item = await _next_call(events)
+        bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+        assert bound.delegation_policy == ("requester" if unsupported_first else "no_edit_sharing")
+        assert bound.origin.user_id == "collaborator"
+        assert bound.execution_id == ctx.requester.execution_id
+        assert item["call_id"] == "reused"
+        assert ctx._complete_tool("reused", "{}")
+        assert await dispatch == {}
 
 
 async def test_persistent_claude_callback_cannot_inherit_either_turns_requester() -> None:
@@ -415,6 +570,7 @@ for line in sys.stdin:
                     if item.get("status") != "action_required":
                         continue
                     bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+                    assert bound.delegation_policy == "requester"
                     assert bound.execution_id == ctx.requester.execution_id
                     expected_user = None if index == 2 and dispatched else user
                     assert bound.origin.user_id == expected_user
@@ -746,6 +902,7 @@ async def test_real_openai_sdk_cached_tools_use_each_runs_execution() -> None:
                 assert terminal == "response.completed"
                 [item] = dispatched
                 requester = ToolRequester.model_validate(item[REQUESTER_FIELD])
+                assert requester.delegation_policy == "requester"
                 assert requester.origin.user_id == user
                 assert requester.execution_id == ctx.requester.execution_id
                 execution_ids.add(requester.execution_id)
@@ -953,6 +1110,7 @@ async def test_claude_sdk_raw_transport_binds_calls_before_query_drops_metadata(
                 assert not dispatched.empty(), json.dumps(await replies.get())
                 item = await asyncio.wait_for(dispatched.get(), timeout=3)
                 bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+                assert bound.delegation_policy == "requester"
                 assert bound == ctx.requester.snapshot()
                 assert item["call_id"] == root_id
                 bindings.append(bound)

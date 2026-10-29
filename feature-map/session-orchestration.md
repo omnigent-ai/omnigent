@@ -8,10 +8,12 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 Shared-source support remains under review. OpenAI Agents SDK, Codex-native
 Chat and authenticated host-managed Codex terminal input have process evidence.
 Claude SDK requester binding also has isolated pinned-process evidence.
-Native Claude delegation is a documented limitation of this release; adding
-edit sharing does not enable owner-only delegation on that path. Chat and
-terminal typing remain available. Native Claude requester support is deferred,
-not a release prerequisite. Provider-created helper delegation remains a
+Native Claude, Pi, Cursor, Copilot, Antigravity, ACP, Goose and Qwen use a
+current-sharing fallback: delegation requires no edit sharing anywhere in the
+sender source chain. Read-only sharing is allowed. Removing the last editor
+reauthorizes retained work, including earlier collaborator input. Native Claude
+per-message requester support remains deferred; Chat and terminal typing remain
+available. Provider-created helper delegation remains a
 separate compatibility gap. Do not infer support from another harness's passing journey.
 
 ## Sub-features
@@ -31,18 +33,26 @@ separate compatibility gap. Do not infer support from another harness's passing 
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
-- `sharing`: a verified owner execution may delegate from a shared sender.
+- `sharing`: on requester-aware harnesses, a verified owner execution may delegate from a shared sender.
   Collaborators may chat, but cannot authorize peer sends or independent workers.
   Consumed collaborator steering blocks further delegation in that execution;
   only a fresh owner execution restores it. Revoking or reducing a collaborator's
   access does not change queued input's requester. Side chats and children must
   preserve this restriction. Already accepted worker work continues.
+  For the eight fallback harnesses listed below, the producing runner instead
+  attests `delegation_policy="no_edit_sharing"` in the protected tool envelope.
+  The server checks every source/parent/side-chat grant at admission, including
+  public and manage access. Removing/downgrading the last editor reauthorizes
+  earlier work; this does not prove the owner read it. Original requester
+  metadata remains unchanged, and unknown origins remain unknown. A strict
+  receiver therefore cannot use this fallback as proof of an owner execution.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers.
-- `refusal`: disabled flag, another owner, unverified requester or wrong runner binding
-  refuses the operation, even from a private sender. Missing requester metadata
-  never becomes owner authority. Unsupported servers reject independent creation without
+- `refusal`: disabled flag, another owner or wrong runner binding refuses the
+  operation. Requester-aware harnesses also refuse unverified executions; fallback
+  harnesses refuse edit sharing. Missing policy envelopes remain strict. Unknown
+  requester metadata never becomes owner identity. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
   acknowledgements are uncertain and must not auto-retry. After uncertain
   creation, inspect existing sessions before creating another worker.
@@ -149,14 +159,14 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   | Codex native web Chat | Implemented | Pinned CLI consumption IDs, authenticated harness lookup, browser actions and destination history. |
   | Claude SDK Chat/API | Implemented | Raw provider UUID echoes and exact SDK control tasks retain input/tool lineage before typed parsing. Isolated pinned-process rows cover owner/editor/recovery, worker creation and kill switch; component tests cover delayed callbacks. |
   | Codex SDK dynamic tools | Implemented | Match callbacks to the exact `turn/start` reply and originating execution. `tests/runtime/harnesses/test_executor_adapter_requester.py` drives the real stdio reader; `tests/inner/test_codex_executor.py` covers callback forwarding. These are scripted-producer checks, not live-provider evidence. |
-  | Pi SDK tool bridge | Refused; unresolved | Call IDs do not yet bind a tool-server callback to a consumed execution. `tests/inner/test_pi_executor.py` is the producer entry point; owner/editor/delayed-turn attribution coverage is still required. |
-  | Cursor SDK custom tools | Refused; unresolved | `tests/inner/test_cursor_executor.py` covers the producer; callback-to-execution attribution is still required before owner delegation can work. |
-  | Copilot SDK custom tools | Refused; unresolved | `tests/inner/test_copilot_executor.py` covers the producer; persistent callbacks need originating-execution attribution. |
-  | Antigravity SDK custom tools | Refused; unresolved | `tests/inner/test_antigravity_executor.py` covers the producer; shared tool callbacks lack a verified turn binding. |
-  | Generic ACP MCP relay | Refused; unresolved | `tests/inner/test_acp_executor.py` covers the session-scoped relay; call/display IDs alone do not establish the originating execution. |
-  | Goose ACP MCP relay | Refused; unresolved | `tests/inner/test_goose_executor.py` plus the generic ACP relay checks; inherits the same missing requester binding. |
-  | Qwen ACP MCP relay | Refused; unresolved | `tests/inner/test_qwen_executor.py` plus the generic ACP relay checks; inherits the same missing requester binding. |
-  | Claude native Chat/terminal | Unavailable; deferred | Edit sharing and typing remain available. Peer sends and independent worker creation refuse without verified requester binding, including from private sources. Native Claude requester support is not a release prerequisite. |
+  | Pi SDK tool bridge | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Cursor SDK custom tools | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Copilot SDK custom tools | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Antigravity SDK custom tools | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Generic ACP MCP relay | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Goose ACP MCP relay | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Qwen ACP MCP relay | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
+  | Claude native Chat/terminal | Current-sharing gate | Runner-managed Claude terminals may delegate without edit sharing. Edit sharing blocks owner and collaborator delegation alike. Per-message attribution remains deferred; process evidence must be recorded separately. |
   | Codex host-managed terminal / default CLI attach | Implemented | Authenticated relay captures writers; the TUI proxy registers input before submission. Real terminal WebSocket send/create passes. A separate public CLI drive proves typed owner send with a preconnected host and local single-user auth; first-time onboarding and multi-user CLI auth remain unverified. |
   | Legacy internal Codex standalone launcher | Delegation blocked | No in-tree production caller found; the public CLI uses host-managed preparation. Direct internal calls lack trusted input registration. |
   | Provider-native children/helpers | Incomplete | Preserve each input's requester through child creation, steering, queue consumption and wakes. Ordinary helper visibility is not proof. |
@@ -170,7 +180,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   process evidence.
   `tests/server/integration/test_session_orchestration.py` checks owner/editor/
   missing requester across child startup, peer delivery, sharing changes and
-  durable queues. `tests/inner/test_acp_executor.py` and
+  durable queues. The same scenarios cover the no-edit-sharing policy, retained
+  collaborator work after revocation, all grants beyond a page, and source chains. `tests/inner/test_acp_executor.py` and
   `tests/test_sessions_native_messages.py` cover other affected consumers of
   shared dispatch metadata. Run these as ordinary pytest targets, with retries
   disabled; they do not replace process or terminal evidence.
@@ -242,11 +253,12 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   session on the same runner can be named as the source. Stable-ID runner pools
   using allow-listed tunnel tokens are unsupported;
   this gate requires token-derived runner IDs and refuses other bindings.
-- Side chats require an owned, available source chain. Verified owner executions
-  may delegate through shared chains; missing requester identity refuses even
-  when every source is private. Nested side chats and children inherit the checks. Missing or cyclic
-  chains are refused. Sharing changes never rehabilitate a known collaborator's
-  queued input or consumed steering.
+- Side chats require an owned, available source chain. Nested side chats and
+  children inherit its checks even when a side-chat display marker is cleared.
+  Missing or cyclic chains are refused. Requester-aware harnesses require verified
+  owner execution even when every source is private; sharing changes do not restore
+  restricted work. Fallback harnesses instead recheck current edit grants and
+  deliberately reauthorize retained work once no editors remain.
 - Peer messages carry task text, display attribution, and protected requester
   metadata on authenticated transport. They do not forward
   per-event model/tool overrides or a caller-supplied delivery ID.
@@ -276,7 +288,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   retains its existing `spawn` advertisement gate. No schema migration or
   per-owner settings page is needed.
   V1 treated eligible private agents as delegates across the owner's sessions;
-  this change additionally requires a verified owner execution.
+  this change uses verified owner executions where supported and the explicit
+  no-edit-sharing policy on the listed fallback harnesses.
   Unlike sharing, messaging does not grant another user access, but untrusted
   content can still influence an agent to steer other owned sessions. Enabling
   the flag accepts that broader trust; hiding a tool is not authorization.

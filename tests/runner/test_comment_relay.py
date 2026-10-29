@@ -1276,6 +1276,140 @@ async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "live",
+        "unobserved",
+        "generic_bridge",
+        "other_bridge",
+        "missing",
+        "stopped",
+        "replace",
+        "relaunch",
+        "refresh",
+        "strict_refresh",
+        "early_same_spec",
+        "restart",
+    ],
+)
+async def test_native_relay_fallback_keeps_terminal_incarnation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """Real relay HTTP preserves producer policy across tool refresh and terminal replacement."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runtime.requester import REQUESTER_HEADER, ToolRequester
+    from omnigent.terminals.writer import TerminalWriterEvidence
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    terminal = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal.args = ["--settings", str(bridge_dir / "claude-settings.json")]
+    if scenario != "generic_bridge":
+        terminal.native_harness = "claude-native"
+    terminals = TerminalRegistry()
+    if scenario not in {"missing", "early_same_spec"}:
+        terminals._by_conversation[session_id] = {("claude", "main"): terminal}
+    roles = SessionResourceRegistry(terminals)
+    if scenario not in {"unobserved", "strict_refresh"}:
+        roles._terminal_roles[(session_id, terminal_resource_id("claude", "main"))] = (
+            "claude-native"
+        )
+    if scenario == "other_bridge":
+        terminal.args = ["--settings", str(tmp_path / "claude-settings.json")]
+    resources = _StubResourceRegistry(tmp_path)
+    monkeypatch.setattr(resources, "terminal_registry", terminals)
+    monkeypatch.setattr(
+        resources, "terminal_resource_role", roles.terminal_resource_role, raising=False
+    )
+    requests: list[dict[str, Any]] = []
+    callbacks = []
+    start_relay = bridge.start_tool_relay
+
+    def capture_relay(**kwargs: Any) -> bridge.ClaudeNativeToolRelay:
+        callbacks.append(kwargs["tool_executor"])
+        return start_relay(**kwargs)
+
+    monkeypatch.setattr(bridge, "start_tool_relay", capture_relay)
+
+    class RecordingServer(_SwitchableServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if kwargs.get("json", {}).get("method") == "tools/call":
+                requests.append(kwargs)
+                return httpx.Response(
+                    200,
+                    json={"result": {"content": [{"type": "text", "text": "{}"}]}},
+                    request=httpx.Request("POST", f"http://server{url}"),
+                )
+            return await super().post(url, **kwargs)
+
+    server = RecordingServer("before")
+    specs = {
+        "before": AgentSpec(spec_version=1, executor=ExecutorSpec(type="codex-native")),
+        "after": AgentSpec(spec_version=1, executor=ExecutorSpec(type="claude-native")),
+    }
+    app = _switch_app(tmp_path, server, specs, resource_registry=resources)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                relay = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+                if scenario in {"refresh", "strict_refresh"}:
+                    server.agent_id = "after"
+                    reset = await client.post(f"/v1/sessions/{session_id}/agent-cache/reset")
+                    assert reset.status_code == 200
+                    await _launch_bridged(client, session_id)
+                    refreshed = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+                    assert (refreshed["url"], refreshed["token"]) == (relay["url"], relay["token"])
+                elif scenario in {"early_same_spec", "restart"}:
+                    terminals._by_conversation[session_id] = {("claude", "main"): terminal}
+                    if scenario == "restart":
+                        terminal.writer_evidence = TerminalWriterEvidence(uuid.uuid4().hex)
+                    await _launch_bridged(client, session_id)
+                    refreshed = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+                    assert refreshed["token"] != relay["token"]
+                    assert "no longer active" in (await callbacks[0]("list_comments", {}))["error"]
+                    assert not requests
+                    relay = refreshed
+                elif scenario == "stopped":
+                    terminal.running = False
+                elif scenario == "replace":
+                    terminals._by_conversation[session_id][("claude", "main")] = (
+                        make_test_terminal_instance("claude", "main", tmp_path)
+                    )
+                elif scenario == "relaunch":
+                    terminal.writer_evidence = TerminalWriterEvidence(uuid.uuid4().hex)
+                async with httpx.AsyncClient() as relay_client:
+                    response = await relay_client.post(
+                        f"{relay['url']}/tool",
+                        headers={"Authorization": f"Bearer {relay['token']}"},
+                        json={"name": "list_comments", "arguments": {}},
+                    )
+                assert response.status_code == 200, response.text
+                if scenario in {"stopped", "replace", "relaunch"}:
+                    assert "terminal incarnation is no longer active" in response.text
+                    assert not requests
+                else:
+                    assert len(requests) == 1
+                    raw = requests[0]["headers"].get(REQUESTER_HEADER)
+                    requester = ToolRequester.model_validate_json(raw) if raw else None
+                    if scenario in {"live", "refresh", "early_same_spec", "restart"}:
+                        assert requester is not None
+                        assert requester.delegation_policy == "no_edit_sharing"
+                        assert requester.origin.user_id is None
+                        assert requester.origin.account_generation is None
+                    else:
+                        assert requester is None or requester.delegation_policy == "requester"
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["registry", "http"])
 @pytest.mark.parametrize("fail_once", [False, True])
 async def test_native_relay_discovers_session_mcp_tools_through_gateway(

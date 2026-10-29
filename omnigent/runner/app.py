@@ -23,6 +23,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
+from weakref import WeakKeyDictionary
 
 if TYPE_CHECKING:
     # Type-only import: the runner keeps codex deps out of its runtime import
@@ -30,8 +31,10 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
+    from omnigent.terminals.writer import TerminalWriterEvidence
 
 import httpx
 from fastapi import FastAPI, Query, Request
@@ -1369,6 +1372,9 @@ def create_runner_app(
     _session_tool_schemas: dict[str, list[_JsonObject]] = {}  # session_id → cached tool schemas
     _session_mcp_spec_hash: dict[str, str] = {}  # session_id → last MCP spec hash
     _session_comment_relays: dict[str, _CommentRelayBinding] = {}
+    _relay_claude_incarnations: WeakKeyDictionary[
+        ClaudeNativeToolRelay, tuple[TerminalInstance, TerminalWriterEvidence] | None
+    ] = WeakKeyDictionary()
 
     # Process-lifetime monotonic fill-generation counter per session id.
     # Incremented (never popped) at delete_session so a fill parked across a
@@ -4755,6 +4761,7 @@ def create_runner_app(
         from omnigent.harnesses.claude_native.bridge import (
             BRIDGE_ID_LABEL_KEY,
             bridge_dir_for_bridge_id,
+            bridge_dir_from_launch_args,
             post_tools_changed,
             start_tool_relay,
         )
@@ -4771,6 +4778,41 @@ def create_runner_app(
             if session_id in _session_comment_relays:
                 return
             spec_entry = None
+
+        terminal_registry = resource_registry.terminal_registry
+
+        def _claude_incarnation(
+            directory: Path,
+        ) -> tuple[TerminalInstance, TerminalWriterEvidence] | None:
+            """Match the launched terminal to this relay without consulting agent config."""
+            terminal = (
+                terminal_registry.get(session_id, "claude", "main")
+                if terminal_registry is not None
+                else None
+            )
+            if (
+                terminal is not None
+                and terminal.running
+                and terminal.native_harness == "claude-native"
+                and resource_registry.terminal_resource_role(
+                    session_id, terminal_resource_id("claude", "main")
+                )
+                == "claude-native"
+                and bridge_dir_from_launch_args(terminal.args) == directory
+            ):
+                return terminal, terminal.writer_evidence
+            return None
+
+        def _same_producer(binding: _CommentRelayBinding) -> bool:
+            """Keep tool refreshes on one producer; rotate relays after launch/restart."""
+            captured = _relay_claude_incarnations.get(binding.relay)
+            live = _claude_incarnation(binding.bridge_dir)
+            return (captured is None and live is None) or (
+                captured is not None
+                and live is not None
+                and captured[0] is live[0]
+                and captured[1] is live[1]
+            )
 
         # The bridge dir, when the caller pinned it down or handed over the
         # labels it comes from. Deriving it any other way costs a server
@@ -4793,7 +4835,12 @@ def create_runner_app(
         # can reassign it independently — the terminal-launch and per-harness
         # startup paths — all pass a bridge hint and take the branch below.
         current = _session_comment_relays.get(session_id)
-        if current is not None and current.spec_entry is spec_entry and known_bridge_dir is None:
+        if (
+            current is not None
+            and current.spec_entry is spec_entry
+            and known_bridge_dir is None
+            and _same_producer(current)
+        ):
             return
 
         bridge_dir = known_bridge_dir
@@ -4814,6 +4861,7 @@ def create_runner_app(
             current is not None
             and current.spec_entry is spec_entry
             and current.bridge_dir == bridge_dir
+            and _same_producer(current)
         ):
             return
 
@@ -4837,10 +4885,12 @@ def create_runner_app(
                 current is not None
                 and current.spec_entry is spec_entry
                 and current.bridge_dir == bridge_dir
+                and _same_producer(current)
             ):
                 return
 
         _captured_session_id = session_id
+        claude_incarnation = _claude_incarnation(bridge_dir)
 
         async def _relay_tool_executor(
             name: str,
@@ -4849,13 +4899,36 @@ def create_runner_app(
             from omnigent.harnesses.codex_native.execution import current_codex_execution
             from omnigent.runner.native_requester import resolve_codex_requester
 
+            binding = _session_comment_relays.get(_captured_session_id)
+            if binding is None or binding.relay is not relay:
+                return {"error": "Native relay binding is no longer active"}
+            if claude_incarnation is not None:
+                terminal, evidence = claude_incarnation
+                if (
+                    terminal_registry is None
+                    or terminal_registry.get(_captured_session_id, "claude", "main")
+                    is not terminal
+                    or terminal.writer_evidence is not evidence
+                    or not terminal.running
+                    or terminal.native_harness != "claude-native"
+                ):
+                    return {"error": "Native relay terminal incarnation is no longer active"}
             execution = current_codex_execution.get()
             requester = (
                 await resolve_codex_requester(process_manager, _captured_session_id, execution)
                 if execution is not None
                 else None
             )
-            if requester is None and _session_harness_name(_captured_session_id) == "codex-native":
+            if requester is None and claude_incarnation is not None and execution is None:
+                requester = ToolRequester(
+                    execution_id=uuid.uuid4().hex,
+                    origin=InputRequester(),
+                    delegation_policy="no_edit_sharing",
+                )
+            elif requester is None and (
+                execution is not None
+                or _session_harness_name(_captured_session_id) == "codex-native"
+            ):
                 requester = ExecutionRequester(InputRequester()).snapshot()
             requester_token = current_tool_requester.set(requester)
             try:
@@ -4918,7 +4991,11 @@ def create_runner_app(
                 )
 
         try:
-            if current is not None and current.bridge_dir == bridge_dir:
+            if (
+                current is not None
+                and current.bridge_dir == bridge_dir
+                and _same_producer(current)
+            ):
                 # Native policy hooks can cache the relay URL/token at startup.
                 relay = current.relay
                 relay.update_tools(relay_schemas, _relay_tool_executor)
@@ -4941,6 +5018,7 @@ def create_runner_app(
             )
             return
         superseded = _session_comment_relays.get(session_id)
+        _relay_claude_incarnations[relay] = claude_incarnation
         _session_comment_relays[session_id] = _CommentRelayBinding(
             relay=relay,
             spec_entry=spec_entry,

@@ -69,7 +69,11 @@ from omnigent.errors import (
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
-from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
+from omnigent.inner.terminal import (
+    build_terminal_os_env_spec,
+    current_native_terminal_launch,
+    terminal_pane_environment,
+)
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -9710,6 +9714,9 @@ async def _auto_create_claude_terminal(
         env_spec.scrollback,
         extra={"session_id": session_id},
     )
+    launch_token = current_native_terminal_launch.set(
+        ("claude-native", launch_command, tuple(launch_args))
+    )
     try:
         terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
@@ -9735,6 +9742,8 @@ async def _auto_create_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+    finally:
+        current_native_terminal_launch.reset(launch_token)
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected

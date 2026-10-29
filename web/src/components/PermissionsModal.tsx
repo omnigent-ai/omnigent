@@ -369,6 +369,11 @@ export function PermissionsModal({
           </Button>
         </form>
 
+        <p className="text-sm text-muted-foreground">
+          Some harnesses can delegate only while no one else has edit access. Removing the last
+          editor can re-enable delegation of previously submitted work.
+        </p>
+
         {error && <p className="text-sm text-destructive">{error}</p>}
 
         {/* Keep the default stacking below sm: one row of Copy link + QR +

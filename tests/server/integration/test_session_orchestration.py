@@ -7,12 +7,18 @@ import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
-from omnigent.runtime.requester import REQUESTER_HEADER, ExecutionRequester, InputRequester
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
+from omnigent.runtime.requester import (
+    REQUESTER_FIELD,
+    REQUESTER_HEADER,
+    ExecutionRequester,
+    InputRequester,
+)
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -51,8 +57,12 @@ async def peers(auth_client, auth_app, db_uri, monkeypatch):
     return source, target, captured
 
 
-def _requester(user_id="alice"):
-    return ExecutionRequester(InputRequester(user_id=user_id)).snapshot()
+def _requester(user_id="alice", *, delegation_policy="requester"):
+    return (
+        ExecutionRequester(InputRequester(user_id=user_id))
+        .snapshot()
+        .model_copy(update={"delegation_policy": delegation_policy})
+    )
 
 
 async def _send(client, source, target, message="Please inspect the PR", *, requester="owner"):
@@ -70,13 +80,20 @@ async def _send(client, source, target, message="Please inspect the PR", *, requ
 
 
 @pytest.mark.parametrize("policy_denied", [False, True])
+@pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
 @pytest.mark.parametrize(
     "orchestration_environment",
     [None, "", "usage_page", "-session_orchestration"],
     indirect=True,
 )
 async def test_private_sender_can_message_shared_receiver(
-    auth_client, peers, db_uri, monkeypatch, policy_denied, orchestration_environment
+    auth_client,
+    peers,
+    db_uri,
+    monkeypatch,
+    policy_denied,
+    orchestration_environment,
+    delegation_policy,
 ):
     from omnigent.server.routes.sessions import routes_events
 
@@ -90,7 +107,13 @@ async def test_private_sender_can_message_shared_receiver(
             return {"verdict": "deny", "reason": "Task needs approval"}
 
         monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
-    result = await _send(auth_client, source, target)
+    permissions.ensure_user("__public__")
+    permissions.grant("__public__", source["id"], LEVEL_READ)
+    requester = _requester(
+        None if delegation_policy == "no_edit_sharing" else "alice",
+        delegation_policy=delegation_policy,
+    )
+    result = await _send(auth_client, source, target, requester=requester)
     if orchestration_environment == "-session_orchestration":
         assert "Session orchestration is disabled" in result["detail"]
         assert not captured.get("posts")
@@ -101,6 +124,9 @@ async def test_private_sender_can_message_shared_receiver(
         assert not captured.get("posts")
         return
     assert result.get("queued") is True, result
+    assert InputRequester.from_body(captured["body"]) == requester.origin.model_copy(
+        update={"input_id": result["item_id"]}
+    )
     assert "Please inspect the PR" in json.dumps(captured)
     items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
     assert f"[Message from session {source['id']}]" in items.text
@@ -112,10 +138,13 @@ async def test_private_sender_can_message_shared_receiver(
 
 @pytest.mark.parametrize("actor", ["alice", "bob"])
 @pytest.mark.parametrize("sharing_after_input", [LEVEL_EDIT, LEVEL_READ, None])
+@pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
+@pytest.mark.parametrize("unknown_requester", [False, True])
 async def test_shared_input_keeps_requester_when_permissions_change(
-    auth_client, peers, db_uri, actor, sharing_after_input
+    auth_client, peers, db_uri, actor, sharing_after_input, delegation_policy, unknown_requester
 ):
     source, target, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     for session in (source, target):
@@ -134,8 +163,22 @@ async def test_shared_input_keeps_requester_when_permissions_change(
     assert accepted.status_code == 202, accepted.text
     origin = InputRequester.from_body(captured["body"])
     assert origin.user_id == actor
-    requester = ExecutionRequester(origin).snapshot()
+    requester = (
+        ExecutionRequester(InputRequester() if unknown_requester else origin)
+        .snapshot()
+        .model_copy(update={"delegation_policy": delegation_policy})
+    )
     auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = runner_token
+    # A changed stored harness cannot relax the captured execution policy.
+    store.update_conversation(source["id"], harness_override="claude-native")
+    if delegation_policy == "no_edit_sharing":
+        captured.clear()
+        assert (
+            "no edit sharing"
+            in (await _send(auth_client, source, target, requester=requester))["detail"]
+        )
+        assert not captured.get("posts")
+        assert store.list_pending_inputs(target["id"]) == []
     if sharing_after_input is None:
         permissions.revoke("bob", source["id"])
     else:
@@ -143,12 +186,25 @@ async def test_shared_input_keeps_requester_when_permissions_change(
 
     captured.clear()
     result = await _send(auth_client, source, target, requester=requester)
-    if actor == "bob":
-        assert "verified owner execution" in result["detail"], result
+    denied = (
+        sharing_after_input == LEVEL_EDIT
+        if delegation_policy == "no_edit_sharing"
+        else actor == "bob" or unknown_requester
+    )
+    if denied:
+        expected = (
+            "no edit sharing"
+            if delegation_policy == "no_edit_sharing"
+            else "verified owner execution"
+        )
+        assert expected in result["detail"], result
         assert not captured.get("posts")
+        assert store.list_pending_inputs(target["id"]) == []
     else:
         assert result.get("queued") is True, result
-        assert InputRequester.from_body(captured["body"]).user_id == "alice"
+        assert InputRequester.from_body(captured["body"]) == requester.origin.model_copy(
+            update={"input_id": result["item_id"]}
+        )
 
 
 async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, peers, db_uri):
@@ -200,6 +256,8 @@ async def test_peer_message_tracks_runner_startup(auth_client, peers, monkeypatc
         "shared_read",
         "shared_edit",
         "public",
+        "public_edit",
+        "manage",
         "other_owner",
         "admin",
         "missing_binding",
@@ -210,20 +268,36 @@ async def test_peer_message_tracks_runner_startup(auth_client, peers, monkeypatc
         "missing_source",
         "missing_requester",
         "unknown_requester",
+        "unknown_strict_requester",
         "stale_account",
         "invalid_requester",
+        "invalid_policy",
+        "closed_source",
+        "closed_target",
     ],
 )
-async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, db_uri):
+@pytest.mark.parametrize("harness", ["claude-sdk", "claude-native"])
+async def test_dispatch_checks_before_delivery(
+    condition, auth_client, auth_app, peers, db_uri, harness
+):
     source, target, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    store.update_conversation(source["id"], harness_override=harness)
+    delegation_policy = "no_edit_sharing" if harness == "claude-native" else "requester"
     permissions = SqlAlchemyPermissionStore(db_uri)
     if condition == "flag_off":
         auth_app.state.feature_flags = FeatureFlags()
-    if condition in {"shared_read", "shared_edit", "public"}:
-        user = "__public__" if condition == "public" else "bob"
+    if condition in {"shared_read", "shared_edit", "public", "public_edit", "manage"}:
+        user = "__public__" if condition.startswith("public") else "bob"
         permissions.ensure_user(user)
         permissions.grant(
-            user, source["id"], LEVEL_EDIT if condition == "shared_edit" else LEVEL_READ
+            user,
+            source["id"],
+            LEVEL_MANAGE
+            if condition == "manage"
+            else LEVEL_EDIT
+            if condition in {"shared_edit", "public_edit"}
+            else LEVEL_READ,
         )
     if condition in {"other_owner", "admin"}:
         other = await _create_session_as(auth_client, "", "bob")
@@ -237,12 +311,26 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
     if condition == "self":
         target = source
+    if condition in {"closed_source", "closed_target"}:
+        store.set_labels(
+            (source if condition == "closed_source" else target)["id"],
+            {"omnigent.closed": "true"},
+        )
     headers = {ORCHESTRATION_SOURCE_HEADER: source["id"]}
     if condition == "missing_source":
         headers.clear()
-    if condition not in {"shared_read", "shared_edit", "public", "missing_requester"}:
-        headers[REQUESTER_HEADER] = _requester().model_dump_json()
-    if condition in {"unknown_requester", "stale_account", "invalid_requester"}:
+    if condition not in {"shared_read", "public", "missing_requester"}:
+        headers[REQUESTER_HEADER] = _requester(
+            "bob" if condition in {"shared_edit", "public_edit", "manage"} else "alice",
+            delegation_policy=delegation_policy,
+        ).model_dump_json()
+    if condition in {
+        "unknown_requester",
+        "unknown_strict_requester",
+        "stale_account",
+        "invalid_requester",
+        "invalid_policy",
+    }:
         origin = InputRequester(
             user_id="alice" if condition == "stale_account" else None,
             account_generation="previous-generation" if condition == "stale_account" else None,
@@ -250,9 +338,21 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
         headers[REQUESTER_HEADER] = (
             "invalid"
             if condition == "invalid_requester"
-            else ExecutionRequester(origin).snapshot().model_dump_json()
+            else ExecutionRequester(origin)
+            .snapshot()
+            .model_copy(
+                update={
+                    "delegation_policy": "invalid"
+                    if condition == "invalid_policy"
+                    else "requester"
+                    if condition == "unknown_strict_requester"
+                    else delegation_policy,
+                }
+            )
+            .model_dump_json()
         )
     captured.clear()
+    before_items = store.list_items(target["id"]).data
     response = await auth_client.post(
         f"/v1/sessions/{target['id']}/events",
         headers=headers,
@@ -266,8 +366,19 @@ async def test_refusal_before_delivery(condition, auth_client, auth_app, peers, 
             },
         },
     )
+    if harness == "claude-native" and condition == "unknown_requester":
+        assert response.status_code == 202, response.text
+        assert REQUESTER_FIELD in captured["body"]
+        assert InputRequester.from_body(captured["body"]).user_id is None
+        return
     assert response.status_code in {400, 403}, response.text
+    if harness == "claude-native" and condition == "stale_account":
+        assert "Requester account is no longer current" in response.text
+    if condition in {"invalid_requester", "invalid_policy"}:
+        assert "Invalid requester metadata" in response.text
     assert not captured.get("posts")
+    assert store.list_pending_inputs(target["id"]) == []
+    assert store.list_items(target["id"]).data == before_items
 
 
 async def test_sharing_during_receiver_startup_preserves_owner_delivery(
@@ -377,8 +488,9 @@ async def test_child_inherits_source_requester(auth_client, peers, db_uri, reque
 
 @pytest.mark.parametrize("descendant", ["side_chat", "nested_side_chat", "child"])
 @pytest.mark.parametrize("share", ["source", "side_chat"])
+@pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
 async def test_side_chat_inherits_sharing_for_new_controls(
-    auth_client, peers, db_uri, descendant, share
+    auth_client, peers, db_uri, descendant, share, delegation_policy
 ):
     source, target, captured = peers
     response = await auth_client.post(
@@ -402,43 +514,64 @@ async def test_side_chat_inherits_sharing_for_new_controls(
         if descendant == "nested_side_chat":
             _bind_runner(db_uri, manager["id"])
     assert (await _send(auth_client, manager, target)).get("queued") is True
+    requester = _requester("bob", delegation_policy=delegation_policy)
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     shared_id = source["id"] if share == "source" else side["id"]
-    permissions.grant("bob", shared_id, LEVEL_READ)
+    permissions.grant(
+        "bob", shared_id, LEVEL_EDIT if delegation_policy == "no_edit_sharing" else LEVEL_READ
+    )
+    if delegation_policy == "no_edit_sharing" and descendant == "child" and share == "source":
+        for index in range(100):
+            reader = f"a-reader-{index:03d}"
+            permissions.ensure_user(reader)
+            permissions.grant(reader, shared_id, LEVEL_READ)
+        first_page, cursor = permissions.list_for_session(shared_id)
+        assert cursor is not None and all(grant.user_id != "bob" for grant in first_page)
     store = SqlAlchemyConversationStore(db_uri)
     before_sessions = {s.id for s in store.list_conversations().data}
     before_grants = permissions.list_for_user("alice")
     captured.clear()
-    assert (
-        "verified owner execution"
-        in (await _send(auth_client, manager, target, requester=_requester("bob")))["detail"]
+    expected = (
+        "no edit sharing" if delegation_policy == "no_edit_sharing" else "verified owner execution"
     )
+    assert expected in (await _send(auth_client, manager, target, requester=requester))["detail"]
     for placement in ("same_host", "managed"):
         result = json.loads(
             await execute_tool(
-                requester=_requester("bob"),
+                requester=requester,
                 tool_name="sys_session_create",
                 arguments=json.dumps({"agent_id": side["agent_id"], "placement": placement}),
                 server_client=auth_client,
                 conversation_id=manager["id"],
             )
         )
-        assert "verified owner execution" in result["detail"], result
+        assert expected in result["detail"], result
     assert not captured.get("posts")
     assert {s.id for s in store.list_conversations().data} == before_sessions
     assert permissions.list_for_user("alice") == before_grants
+    assert store.list_pending_inputs(target["id"]) == []
     # Collaborator work is restricted; owner reads and new owner work still succeed.
     history = await auth_client.get(f"/v1/sessions/{manager['id']}/items")
     assert history.status_code == 200, history.text
     _bind_runner(db_uri, target["id"])
     assert (await _send(auth_client, target, manager)).get("queued") is True
     permissions.revoke("bob", shared_id)
-    assert (await _send(auth_client, manager, target)).get("queued") is True
+    if delegation_policy == "no_edit_sharing":
+        result = await _send(auth_client, manager, target, requester=requester)
+        assert result.get("queued") is True, result
+        assert InputRequester.from_body(captured["body"]) == requester.origin.model_copy(
+            update={"input_id": result["item_id"]}
+        )
+    else:
+        assert (await _send(auth_client, manager, target)).get("queued") is True
 
 
-@pytest.mark.parametrize("source_link", ["missing", "cycle"])
-async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, source_link):
+@pytest.mark.parametrize("source_link", ["missing", "cycle", "closed", "shared_without_marker"])
+@pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
+async def test_side_chat_requires_resolvable_source(
+    auth_client, peers, db_uri, source_link, delegation_policy
+):
     source, target, captured = peers
     response = await auth_client.post(
         f"/v1/sessions/{source['id']}/fork", json={"side_chat": True}
@@ -449,12 +582,41 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
     store = SqlAlchemyConversationStore(db_uri)
     store.set_labels(
         side["id"],
-        {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
+        {
+            SIDE_CHAT_SOURCE_LABEL_KEY: {
+                "missing": uuid4().hex,
+                "cycle": side["id"],
+            }.get(source_link, source["id"])
+        },
     )
+    expected = "Session is not owned or available"
+    if source_link == "closed":
+        store.set_labels(source["id"], {"omnigent.closed": "true"})
+    elif source_link == "shared_without_marker":
+        response = await auth_client.patch(
+            f"/v1/sessions/{side['id']}", json={"labels": {SIDE_CHAT_LABEL_KEY: ""}}
+        )
+        assert response.status_code == 200, response.text
+        assert store.get_conversation(side["id"]).labels[SIDE_CHAT_LABEL_KEY] == ""
+        permissions = SqlAlchemyPermissionStore(db_uri)
+        permissions.ensure_user("bob")
+        permissions.grant("bob", source["id"], LEVEL_EDIT)
+        expected = (
+            "no edit sharing"
+            if delegation_policy == "no_edit_sharing"
+            else "verified owner execution"
+        )
     captured.clear()
-    assert (
-        "Session is not owned or available" in (await _send(auth_client, side, target))["detail"]
+    result = await _send(
+        auth_client,
+        side,
+        target,
+        requester=_requester(
+            "bob" if source_link == "shared_without_marker" else "alice",
+            delegation_policy=delegation_policy,
+        ),
     )
+    assert expected in result["detail"], result
     assert not captured.get("posts")
 
 
@@ -604,6 +766,7 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
 @pytest.mark.parametrize(
     "condition,orchestration_environment",
     [
@@ -615,7 +778,7 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
     indirect=["orchestration_environment"],
 )
 async def test_creation_refuses_before_launch(
-    auth_client, auth_app, peers, db_uri, placement, condition
+    auth_client, auth_app, peers, db_uri, placement, condition, delegation_policy
 ):
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
@@ -627,7 +790,11 @@ async def test_creation_refuses_before_launch(
     if condition == "shared":
         permissions = SqlAlchemyPermissionStore(db_uri)
         permissions.ensure_user("bob")
-        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.grant(
+            "bob",
+            source["id"],
+            LEVEL_EDIT if delegation_policy == "no_edit_sharing" else LEVEL_READ,
+        )
     elif condition == "binding":
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
     store = SqlAlchemyConversationStore(db_uri)
@@ -638,7 +805,9 @@ async def test_creation_refuses_before_launch(
         await execute_tool(
             requester=None
             if condition == "legacy"
-            else _requester("bob" if condition == "shared" else "alice"),
+            else _requester(
+                "bob" if condition == "shared" else "alice", delegation_policy=delegation_policy
+            ),
             tool_name="sys_session_create",
             arguments=json.dumps({"agent_id": source["agent_id"], "placement": placement}),
             server_client=auth_client,
@@ -647,7 +816,9 @@ async def test_creation_refuses_before_launch(
     )
     expected = {
         "flag_off": "Session orchestration is disabled",
-        "shared": "verified owner execution",
+        "shared": "no edit sharing"
+        if delegation_policy == "no_edit_sharing"
+        else "verified owner execution",
         "legacy": "verified owner execution",
         "binding": "requires the sender's bound runner",
     }[condition]
@@ -699,13 +870,16 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
 
 
 @pytest.mark.parametrize(
-    "child_manager,move_before_recheck,policy_denied",
+    "child_manager,move_before_recheck,policy_denied,delegation_policy,requester_user",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (True, True, False),
-        (False, False, True),
+        (False, False, False, "requester", "alice"),
+        (True, False, False, "requester", "alice"),
+        (False, True, False, "requester", "alice"),
+        (True, True, False, "requester", "alice"),
+        (False, False, True, "requester", "alice"),
+        (False, False, False, "no_edit_sharing", "bob"),
+        (True, False, False, "no_edit_sharing", None),
+        (False, False, True, "no_edit_sharing", None),
     ],
 )
 async def test_same_host_creation_uses_current_source_and_stays_private(
@@ -717,6 +891,8 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     move_before_recheck,
     child_manager,
     policy_denied,
+    delegation_policy,
+    requester_user,
 ):
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
     from omnigent.server.routes.sessions import routes_core, routes_events
@@ -724,6 +900,7 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
     source, _, captured = peers
+    requester = _requester(requester_user, delegation_policy=delegation_policy)
     hosts = [uuid4().hex for _ in range(3)]
     for host_id, owner in zip(hosts, ("alice", "alice", "bob"), strict=True):
         _register_online_host(auth_app, host_id, owner)
@@ -772,10 +949,11 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
             return {"verdict": "deny", "reason": "Task needs approval"}
 
         monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
+    if policy_denied or delegation_policy == "no_edit_sharing":
         before = {s.id for s in store.list_conversations().data}
         result = json.loads(
             await execute_tool(
-                requester=_requester(),
+                requester=requester,
                 tool_name="sys_session_create",
                 arguments=json.dumps(
                     {
@@ -788,10 +966,21 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
                 conversation_id=manager["id"],
             )
         )
-        assert result["status"] == "created_initial_message_failed", result
-        assert "Task needs approval" in result["error"]
-        assert result["initial_message"]["denied"] is True
-        assert all(path == "/v1/sessions" for path, _ in captured.get("posts", []))
+        if policy_denied:
+            assert result["status"] == "created_initial_message_failed", result
+            assert "Task needs approval" in result["error"]
+            assert result["initial_message"]["denied"] is True
+            assert all(path == "/v1/sessions" for path, _ in captured.get("posts", []))
+        else:
+            assert "error" not in result, result
+            assert result["initial_message"]["queued"] is True
+            [initial_message] = [
+                body for path, body in captured["posts"] if path.endswith("/events")
+            ]
+            assert InputRequester.from_body(initial_message) == requester.origin.model_copy(
+                update={"input_id": result["initial_message"]["item_id"]}
+            )
+            assert f"[Message from session {manager['id']}]" in json.dumps(initial_message)
         created_id = result["conversation_id"]
         assert {s.id for s in store.list_conversations().data} - before == {created_id}
     else:
@@ -820,7 +1009,12 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
 
     assert CREATED_BY_SESSION_LABEL_KEY not in store.get_conversation(manager["id"]).labels
     # Discovery and label-write rules are independent of the routing variants above.
-    if child_manager or move_before_recheck or policy_denied:
+    if (
+        child_manager
+        or move_before_recheck
+        or policy_denied
+        or delegation_policy == "no_edit_sharing"
+    ):
         return
 
     info = json.loads(
@@ -910,9 +1104,18 @@ async def test_independent_creation_rejects_child_or_bundle_shape(auth_client, p
     assert expected in response.text
 
 
-@pytest.mark.parametrize("provider", ["modal", "daytona", "embedding"])
+@pytest.mark.parametrize(
+    "provider,delegation_policy,requester_user",
+    [
+        ("modal", "requester", "alice"),
+        ("daytona", "requester", "alice"),
+        ("embedding", "requester", "alice"),
+        ("modal", "no_edit_sharing", "bob"),
+        ("modal", "no_edit_sharing", None),
+    ],
+)
 async def test_managed_creation_uses_default_provider_and_saves_private_first_task(
-    auth_client, auth_app, peers, db_uri, monkeypatch, provider
+    auth_client, auth_app, peers, db_uri, monkeypatch, provider, delegation_policy, requester_user
 ):
     import asyncio
     from dataclasses import replace
@@ -922,6 +1125,7 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
     from omnigent.server.sharing_settings import DefaultPublicSessions
 
     source, _, _ = peers
+    requester = _requester(requester_user, delegation_policy=delegation_policy)
     deployment = parse_sandbox_config(
         {
             "server_url": "https://managed-test.example.com",
@@ -949,7 +1153,7 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
     try:
         result = json.loads(
             await execute_tool(
-                requester=_requester(),
+                requester=requester,
                 tool_name="sys_session_create",
                 arguments=json.dumps(
                     {
@@ -974,6 +1178,10 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
             store.get_conversation(session_id).labels[CREATED_BY_SESSION_LABEL_KEY] == source["id"]
         )
         assert "First task" in str(store.list_pending_inputs(session_id))
+        [pending] = store.list_pending_inputs(session_id)
+        assert pending.data.startup_options.requester == requester.origin.model_copy(
+            update={"input_id": pending.id}
+        )
         assert f"[Message from session {source['id']}]" in str(
             store.list_pending_inputs(session_id)
         )
@@ -1032,8 +1240,9 @@ async def test_orchestrated_endpoint_requires_source(auth_client, peers, monkeyp
 
 
 @pytest.mark.parametrize("requester_user", ["alice", "bob", None])
+@pytest.mark.parametrize("delegation_policy", ["requester", "no_edit_sharing"])
 async def test_startup_queue_admission_and_replay(
-    auth_client, auth_app, peers, db_uri, requester_user
+    auth_client, auth_app, peers, db_uri, requester_user, delegation_policy
 ):
     from omnigent.server.startup_inputs import STARTUP_LABEL
 
@@ -1043,10 +1252,11 @@ async def test_startup_queue_admission_and_replay(
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     startup = auth_app.state.startup_inputs
-    result = await _send(auth_client, source, target, requester=_requester(requester_user))
+    requester = _requester(requester_user, delegation_policy=delegation_policy)
+    result = await _send(auth_client, source, target, requester=requester)
     pending = store.list_pending_inputs(target["id"])
     assert not captured.get("posts")
-    if requester_user != "alice":
+    if requester_user != "alice" and delegation_policy == "requester":
         assert "verified owner execution" in result["detail"]
         assert pending == []
     else:
@@ -1057,6 +1267,9 @@ async def test_startup_queue_admission_and_replay(
         await startup._deliver(auth_app, target["id"], pending[0])
         delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
         assert len(delivered) == 1
+        assert InputRequester.from_body(delivered[0]) == requester.origin.model_copy(
+            update={"input_id": pending[0].id}
+        )
         assert f"[Message from session {source['id']}]" in json.dumps(delivered)
         assert store.list_pending_inputs(target["id"]) == []
         assert (

@@ -1,4 +1,4 @@
-"""Owner-authorized orchestration using execution-bound requester identity."""
+"""Owner-authorized orchestration with requester or current-sharing checks."""
 
 from fastapi import Request
 
@@ -11,7 +11,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.requester import tool_requester
 from omnigent.server.schemas import SessionStartupInput
@@ -33,15 +33,31 @@ def require_owned_session(
     check_source: bool = False,
 ) -> Conversation:
     """Resolve ownership and inherited source chains without administrator bypass."""
+    return _owned_session_chain(
+        identifier, user_id, conversations, permissions, check_source=check_source
+    )[0]
+
+
+def _owned_session_chain(
+    identifier: str,
+    user_id: str,
+    conversations: ConversationStore,
+    permissions: PermissionStore,
+    *,
+    check_source: bool = False,
+) -> list[Conversation]:
+    """Return the validated source/parent chain, including side-chat sources."""
     session_id = normalize_uuid(identifier)
     session = conversations.get_conversation(session_id) if session_id else None
     current, seen = session, set()
+    chain = []
     while current is not None:
         if current.id in seen or len(seen) >= 32 or current.archived:
             break
         if is_session_closed(current.labels, current.title):
             break
         seen.add(current.id)
+        chain.append(current)
         if current.parent_conversation_id is not None:
             current = conversations.get_conversation(current.parent_conversation_id)
             continue
@@ -49,13 +65,12 @@ def require_owned_session(
         if grant is None or grant.level != LEVEL_OWNER:
             break
         if check_source:
-            if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
-                # Side chats keep their own grants but inherit source restrictions.
-                source_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            source_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if source_id or current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+                # The protected source link governs access, not the display marker.
                 current = conversations.get_conversation(source_id) if source_id else None
                 continue
-        assert session is not None
-        return session
+        return chain
     raise OmnigentError("Session is not owned or available", code=ErrorCode.FORBIDDEN)
 
 
@@ -72,20 +87,39 @@ def require_orchestration_source(
         raise OmnigentError("Session orchestration is disabled", code=ErrorCode.FORBIDDEN)
     if not user_id or permissions is None:
         raise OmnigentError("Session orchestration requires ownership", code=ErrorCode.FORBIDDEN)
-    source = require_owned_session(
+    chain = _owned_session_chain(
         request.headers.get(ORCHESTRATION_SOURCE_HEADER, ""),
         user_id,
         conversations,
         permissions,
         check_source=True,
     )
+    source = chain[0]
     token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
     if not token or not source.runner_id or token_bound_runner_id(token) != source.runner_id:
         raise OmnigentError(
             "Session orchestration requires the sender's bound runner", code=ErrorCode.FORBIDDEN
         )
     requester = tool_requester(request, source)
-    if (
+    if requester is not None and requester.delegation_policy == "no_edit_sharing":
+        grants = permissions.list_for_sessions([session.id for session in chain])
+        if any(
+            grant.user_id != user_id and grant.level >= LEVEL_EDIT
+            for session_grants in grants.values()
+            for grant in session_grants
+        ):
+            raise OmnigentError(
+                "This harness can delegate only while the sending session and its source chain "
+                "have no edit sharing. Read-only sharing is allowed.",
+                code=ErrorCode.FORBIDDEN,
+            )
+        # Removing edit access reauthorizes retained work, without rewriting its origin.
+        if (
+            requester.origin.user_id == user_id
+            and requester.origin.account_generation != account_generation(user_id)
+        ):
+            raise OmnigentError("Requester account is no longer current", code=ErrorCode.FORBIDDEN)
+    elif (
         requester is None
         or requester.origin.user_id != user_id
         or requester.origin.account_generation != account_generation(user_id)

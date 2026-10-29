@@ -6,13 +6,14 @@ from collections.abc import Callable, Coroutine, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, Literal, ParamSpec, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 REQUESTER_FIELD = "_omnigent_requester"
 REQUESTER_HEADER = "X-Omnigent-Requester"
+DelegationPolicy = Literal["requester", "no_edit_sharing"]
 
 
 class InputRequester(BaseModel):
@@ -45,12 +46,13 @@ class InputRequester(BaseModel):
 
 
 class ToolRequester(BaseModel):
-    """Immutable authority captured when an execution issues a tool call."""
+    """Origin and delegation policy captured by the producing harness, not tool arguments."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     execution_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     origin: InputRequester
+    delegation_policy: DelegationPolicy = "requester"
 
 
 current_tool_requester: ContextVar[ToolRequester | None] = ContextVar(
