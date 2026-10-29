@@ -290,23 +290,26 @@ def test_private_manager_launch_send_read_and_sharing(
                     listed = client.get(f"/v1/sessions/{session}/resources/terminals").json()
                     assert "direct_attach_url" not in json.dumps(listed)
 
-                    def pane():
+                    def terminal_output(command, *args):
                         metadata = terminal["metadata"]
                         return subprocess.run(
                             [
                                 "tmux",
                                 "-S",
                                 metadata["tmux_socket"],
-                                "capture-pane",
-                                "-p",
+                                command,
                                 "-t",
                                 metadata["tmux_target"],
+                                *args,
                             ],
                             capture_output=True,
                             text=True,
                             check=True,
                             timeout=10,
                         ).stdout
+
+                    def pane():
+                        return terminal_output("capture-pane", "-p")
 
                     poll_until(
                         lambda: any(
@@ -318,8 +321,25 @@ def test_private_manager_launch_send_read_and_sharing(
                     url += f"/v1/sessions/{session}/resources/terminals/{terminal['id']}/attach"
                     # This authenticates through the explicit OSS single-user provider.
                     # Raw tmux send-keys would bypass the writer boundary under test.
+                    rows = (
+                        39
+                        if terminal_output("display-message", "-p", "#{pane_height}").strip()
+                        != "39"
+                        else 40
+                    )
                     with connect(url, open_timeout=15) as terminal_ws:
-                        terminal_ws.send(json.dumps({"type": "resize", "cols": 120, "rows": 40}))
+                        terminal_ws.send(json.dumps({"type": "resize", "cols": 120, "rows": rows}))
+                        # The server accepts before the runner attaches. Observe this
+                        # connection's resize before typing into the native terminal.
+                        poll_until(
+                            lambda: (
+                                terminal_output(
+                                    "display-message", "-p", "#{pane_width}x#{pane_height}"
+                                ).strip()
+                                == f"120x{rows}"
+                            ),
+                            timeout_s=15,
+                        )
                         terminal_ws.send(text.encode())
                         try:
                             poll_until(lambda: text in pane(), timeout_s=10)
