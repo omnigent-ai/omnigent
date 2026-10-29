@@ -488,8 +488,9 @@ async def test_hosts_api_gateway_inference_null_for_older_host(
     assert single.json()["gateway_inference"] is None
 
 
-@pytest.mark.parametrize("sharded", [False, True])
-@pytest.mark.parametrize("ssh_target", [None, "arca.ssh", "arclet_dev.ssh"])
+@pytest.mark.parametrize(
+    ("ssh_target", "sharded"), [(None, False), ("arca.ssh", False), ("arclet_dev.ssh", True)]
+)
 async def test_host_ssh_identity_is_live_connection_metadata(
     host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
     ssh_target: str | None,

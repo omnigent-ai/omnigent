@@ -1410,13 +1410,11 @@ function FileViewerBody({
                   <Button
                     type="button"
                     variant="ghost"
-                    size={action.textLabel ? "sm" : "icon-sm"}
+                    size="icon-sm"
                     aria-label={action.label}
                     tabIndex={interactive ? undefined : -1}
                   >
                     {action.icon}
-                    {action.textLabel}
-                    {action.textLabel && <ChevronDownIcon />}
                   </Button>
                 </DropdownMenuTrigger>
               </TooltipTrigger>

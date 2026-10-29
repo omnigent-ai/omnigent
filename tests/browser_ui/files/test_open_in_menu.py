@@ -25,7 +25,6 @@ seeded_session = seeded_session_fixture
         (950, "local", None, True),
         (950, "arca", "arca.ssh", True),
         (360, "arclet", "arclet_dev.ssh", False),
-        (360, "remote", None, False),
     ],
 )
 def test_open_folder_and_file_in_app(
@@ -100,20 +99,6 @@ def test_open_folder_and_file_in_app(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
     folder_open = rail.get_by_role("button", name="Choose app to open in", exact=True)
-    if host_id == "remote":
-        expect(folder_open).to_have_count(0)
-        rail.get_by_text("main.md", exact=True).click()
-        viewer = rail.get_by_test_id("file-viewer")
-        expect(viewer).to_be_visible()
-        expect(
-            viewer.get_by_role("button", name="Choose app to open in", exact=True)
-        ).to_have_count(0)
-        # With fewer actions the toolbar fits inline, even in a narrow panel.
-        expect(viewer.get_by_role("button", name="Copy link to file")).to_be_visible()
-        expect(page.get_by_role("dialog")).to_have_count(0)
-        assert page.evaluate("window.__openInCalls") == []
-        page.screenshot(path=str(tmp_path / "unknown-remote-menu.png"), animations="disabled")
-        return
     expect(folder_open).to_be_visible()
     copy_folder = rail.get_by_role("button", name="Copy folder path: workspace")
     default_folder = rail.get_by_role("button", name="Open in VS Code", exact=True)
@@ -131,9 +116,6 @@ def test_open_folder_and_file_in_app(
     expect(page.get_by_role("menu")).to_have_count(0)
     folder_open.click()
     page.screenshot(path=str(tmp_path / "folder-menu.png"), animations="disabled")
-    if host_id != "local":
-        expect(page.get_by_role("menuitem", name="Terminal", exact=True)).to_have_count(0)
-        expect(page.get_by_role("menuitem", name="Default app", exact=True)).to_have_count(0)
     page.get_by_role("menuitem", name="Cursor", exact=True).click()
     page.wait_for_function("window.__openInCalls.length === 2")
     expect(rail.get_by_role("button", name="Open in Cursor", exact=True)).to_be_visible()

@@ -14,6 +14,7 @@ Hosts advertise their SSH destination when they connect. Standard Arca and
 Arclet images automatically report `arca.ssh` and `arclet_<name>.ssh`, using the
 image markers and Arclet name file. The corresponding alias must exist in your
 local SSH configuration; Arca Companion creates these aliases for Arclets.
+Remote links currently support POSIX paths, including Arca and Arclet workspaces.
 
 For another remote host, or a custom alias, set this in the host machine's
 `~/.omnigent/config.yaml` (or the config under `OMNIGENT_CONFIG_HOME`):
