@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import dataclasses
 import errno
+import functools
 import json
 import logging
 import math
@@ -637,6 +638,10 @@ class _CodexNativeLaunchConfig:
         ``--dangerously-bypass-approvals-and-sandbox`` and aligns the
         app-server threads (no approval prompts, no command sandbox). Default
         ``False``. See issue #657.
+    :param plan_mode: ``True`` when the session's
+        ``omnigent.codex_native.collaboration_mode`` label is ``"plan"``, e.g.
+        armed on the New Session screen. The launched thread is then switched
+        into Plan mode before web turns can reach it. Default ``False``.
     :param auto_harness: ``True`` when the session started in Smart Routing's
         auto-harness mode (``omnigent.routing.auto_harness`` label or a
         ``harness_override`` of ``"auto"``), so the router may re-route its
@@ -674,6 +679,7 @@ class _CodexNativeLaunchConfig:
     fork_source_external_id: str | None
     fork_carry_history: bool
     bypass_sandbox: bool
+    plan_mode: bool = False
     auto_harness: bool = False
     routing_enabled: bool = False
     turn_routing: bool = False
@@ -1444,6 +1450,7 @@ async def _codex_native_launch_config(
     from omnigent.runner.subagent_routing import routing_class_from_snapshot
     from omnigent.stores.conversation_store import (
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
         FORK_CARRY_HISTORY_LABEL_KEY,
         FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
         FORK_SOURCE_LABEL_KEY,
@@ -1459,6 +1466,7 @@ async def _codex_native_launch_config(
     # conversation label ("1" to enable). Read here so the runner applies
     # it at launch; any other value (incl. absent) leaves the normal stance.
     bypass_sandbox = False
+    plan_mode = False
     labels = snapshot.get("labels")
     if isinstance(labels, dict):
         _fsi = labels.get(FORK_SOURCE_LABEL_KEY)
@@ -1469,6 +1477,7 @@ async def _codex_native_launch_config(
             fork_source_external_id = _fse
         fork_carry_history = labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
         bypass_sandbox = labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
+        plan_mode = labels.get(CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY) == "plan"
         # The executor reads this label's bridge directory, so launch into it too.
         _bid = labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY)
         if isinstance(_bid, str) and _bid:
@@ -1490,6 +1499,7 @@ async def _codex_native_launch_config(
         fork_source_external_id=fork_source_external_id,
         fork_carry_history=fork_carry_history,
         bypass_sandbox=bypass_sandbox,
+        plan_mode=plan_mode,
         auto_harness=routing_class.auto_harness,
         routing_enabled=routing_class.routing_enabled,
         turn_routing=routing_class.turn_routing,
@@ -5774,6 +5784,18 @@ async def _auto_create_codex_terminal(
             _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             raise
 
+    apply_plan_mode = (
+        functools.partial(
+            _apply_codex_launch_plan_mode,
+            bridge_dir=bridge_dir,
+            codex_ws_url=codex_ws_url,
+            model=_codex_launch.model,
+            effort=launch_config.reasoning_effort,
+        )
+        if launch_config.plan_mode
+        else None
+    )
+
     # Register the Codex TUI as a streamable terminal resource attached to
     # the app-server started above (``--remote`` over its loopback ws
     # endpoint). Without this the session can have a working chat path
@@ -5815,6 +5837,9 @@ async def _auto_create_codex_terminal(
                         exc_info=True,
                         extra={"session_id": session_id},
                     )
+            if apply_plan_mode is not None:
+                # A resumed thread comes back in Default mode, like its effort.
+                await apply_plan_mode(launch_config.external_session_id)
             # Publish after resume repair so live settings cannot interleave it.
             write_bridge_state(
                 bridge_dir,
@@ -5848,6 +5873,8 @@ async def _auto_create_codex_terminal(
         with contextlib.suppress(Exception):
             await app_server.close()
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        await _shutdown_session_router_async(session_id, _codex_router)
+        await _shutdown_session_turn_router_async(session_id, _codex_turn_router)
         raise
 
     # Known-thread resumes publish bridge state before the terminal starts;
@@ -5887,6 +5914,7 @@ async def _auto_create_codex_terminal(
                 routing_summary=_codex_launch.summary,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
+                apply_plan_mode=apply_plan_mode,
                 subagent_router=_codex_router,
                 turn_router=_codex_turn_router,
             )
@@ -6116,6 +6144,39 @@ async def _record_agent_startup_pending(
     )
 
 
+async def _apply_codex_launch_plan_mode(
+    thread_id: str,
+    *,
+    bridge_dir: Path,
+    codex_ws_url: str,
+    model: str | None,
+    effort: str | None,
+) -> None:
+    """Enable Plan before exposing the bridge, or stop queued turns with the cause."""
+    from omnigent.harnesses.codex_native.app_server import apply_codex_thread_collaboration_mode
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_model,
+        write_bridge_startup_error,
+    )
+
+    try:
+        model = model or await asyncio.to_thread(read_codex_config_model, bridge_dir)
+        if not model:
+            raise RuntimeError("no model is known for the thread")
+        await apply_codex_thread_collaboration_mode(
+            codex_ws_url, thread_id, "plan", model=model, effort=effort
+        )
+    except Exception as exc:
+        # Never execute a queued implementation request after its Plan switch failed.
+        message = (
+            "Could not enable Codex Plan mode. Restart the session and send the message again."
+        )
+        write_bridge_startup_error(
+            bridge_dir, message, code="codex_plan_mode_failed", title="Plan mode could not start"
+        )
+        raise RuntimeError(message) from exc
+
+
 async def _codex_discover_thread_and_forward(
     *,
     session_id: str,
@@ -6129,6 +6190,7 @@ async def _codex_discover_thread_and_forward(
     terminal_instance: TerminalInstance | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
+    apply_plan_mode: Callable[[str], Awaitable[None]] | None = None,
     subagent_router: SubagentRouter | None = None,
     turn_router: TurnRouter | None = None,
 ) -> None:
@@ -6176,6 +6238,9 @@ async def _codex_discover_thread_and_forward(
         cause (see :func:`_record_agent_startup_pending`) and the wait
         continues without a deadline; only a pane exit or an ended event
         stream tears down.
+    :param apply_plan_mode: Switches the discovered thread into Plan mode, or
+        ``None``. Awaited before the bridge state is written, because the
+        executor gates the first queued web turn on that state.
     :param subagent_router: Router this terminal launch started, torn down
         in the ``finally``. Passed so a late teardown cannot close the
         endpoint a re-created terminal has since installed.
@@ -6422,6 +6487,8 @@ async def _codex_discover_thread_and_forward(
             # The user signed in (or the TUI otherwise started a thread):
             # the pre-recorded fail-fast cause no longer applies.
             clear_bridge_startup_error(bridge_dir)
+        if apply_plan_mode is not None:
+            await apply_plan_mode(thread_id)
         write_bridge_state(
             bridge_dir,
             CodexNativeBridgeState(
