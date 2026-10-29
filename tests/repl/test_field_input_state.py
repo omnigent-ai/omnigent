@@ -408,7 +408,8 @@ def test_question_prompts_follow_web_form_rules() -> None:
             "questions": [
                 {"question": "Env?", "options": [{"label": "dev", "description": "d"}, "prod"]},
                 {"id": "0", "question": "Pick", "options": ["a"], "isOther": False},
-                {"question": "Name?", "options": [], "isOther": False},
+                {"question": "Name?", "options": []},
+                {"question": "Forbidden?", "options": [], "isOther": False},
                 {"question": "Broken?", "options": 1},
                 {"question": "", "options": ["x"]},
                 "not-a-question",
@@ -418,7 +419,8 @@ def test_question_prompts_follow_web_form_rules() -> None:
     assert [(p.key, p.options, p.allow_custom) for p in prompts] == [
         ("Env?", (("dev", "d"), ("prod", "")), True),
         ("0", (("a", ""),), False),
-        # With no options a typed answer is the only way to reply.
+        # With no options a typed answer is the only way to reply; a question
+        # that also forbids typing is unanswerable and dropped.
         ("Name?", (), True),
     ]
     assert _question_prompts({"questions": "nope"}) == []
@@ -655,6 +657,8 @@ def test_concurrent_prompts_are_asked_one_at_a_time() -> None:
         client.sessions.resolve_elicitation.assert_not_awaited()
         fis.resolve("2")
         await _until(lambda: fis.pending and first.done(), "the second question never opened")
+        # Enter keeps the prefill, so it is shown.
+        assert "prefilled: draft" in _outputs_text(adapter._host)  # type: ignore[arg-type]
         fis.resolve("my notes")
         await asyncio.gather(first, second)
 
@@ -804,16 +808,24 @@ def test_esc_on_a_question_posts_a_decline() -> None:
 
 def test_malformed_questions_decline_without_the_approval_prompt() -> None:
     # Nothing usable to ask: decline rather than accept with no answers.
-    adapter, _, client, approval_hook = _question_adapter()
-    event = _question_event()
-    event.ask_user_question = {"questions": [{"question": "Q?", "options": 1}]}
+    unusable = [
+        {"question": "Q?", "options": 1},
+        {"question": "Q?", "options": [], "isOther": False},
+    ]
+    for question in unusable:
+        adapter, _, client, approval_hook = _question_adapter()
+        event = _question_event()
+        event.ask_user_question = {"questions": [question]}
 
-    _run(adapter._handle_elicitation("conv_abc", event))
+        async def _run_case(adapter: Any = adapter, event: Any = event) -> None:
+            task = asyncio.create_task(adapter._handle_elicitation("conv_abc", event))
+            await _until(lambda: task.done(), "an unanswerable question opened a picker")
 
-    approval_hook.assert_not_awaited()
-    client.sessions.resolve_elicitation.assert_awaited_once_with(
-        "conv_abc", "elicit_q", {"action": "decline"}
-    )
+        _run(_run_case())
+        approval_hook.assert_not_awaited()
+        client.sessions.resolve_elicitation.assert_awaited_once_with(
+            "conv_abc", "elicit_q", {"action": "decline"}
+        )
 
 
 def test_replay_after_switching_sessions_is_dropped() -> None:
@@ -921,22 +933,3 @@ def test_form_accepted_elsewhere_during_its_approval_opens_no_fields() -> None:
 
     _run(_run_case())
     assert [c.args[1] for c in client.sessions.resolve_elicitation.await_args_list] == ["elicit_q"]
-
-
-def test_editor_question_shows_its_prefill() -> None:
-    from omnigent.repl._repl import _question_prompts
-
-    questions = _question_prompts(
-        {
-            "questions": [
-                {"id": "0", "question": "Notes?", "options": [], "textInput": {"default": "draft"}}
-            ]
-        }
-    )
-    fis = _FieldInputState()
-    host = _FakeHost()
-    adapter = _prompt_adapter(fis, host)
-    assert _run(_feed_answers(fis, adapter._prompt_questions("e", questions), [""])) == {
-        "0": "draft"
-    }
-    assert "prefilled: draft" in _outputs_text(host)

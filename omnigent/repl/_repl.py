@@ -1148,6 +1148,9 @@ def _question_prompts(payload: object) -> list[_QuestionPrompt]:
         header = raw.get("header")
         text_input = raw.get("textInput")
         default = text_input.get("default") if isinstance(text_input, dict) else None
+        allow_custom = raw.get("isOther") is not False
+        if not options and not allow_custom and not isinstance(default, str):
+            continue  # nothing to pick and typing is forbidden: unanswerable
         prompts.append(
             _QuestionPrompt(
                 key=question_id if isinstance(question_id, str) and question_id else text,
@@ -1156,8 +1159,8 @@ def _question_prompts(payload: object) -> list[_QuestionPrompt]:
                 options=tuple(options),
                 multi_select=raw.get("multiSelect") is True,
                 # Matches the web form: a typed answer is allowed unless the
-                # producer says otherwise, and always when there are no options.
-                allow_custom=raw.get("isOther") is not False or not options,
+                # producer sets ``isOther: false``.
+                allow_custom=allow_custom,
                 text_default=default if isinstance(default, str) else None,
                 secret=raw.get("isSecret") is True,
             )
