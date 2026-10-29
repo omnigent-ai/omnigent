@@ -33,6 +33,7 @@ describe("installAgentBundle", () => {
     expect(url).toBe("/v1/agents");
     expect(init?.method).toBe("POST");
     expect((init!.body as FormData).get("bundle")).toBeInstanceOf(File);
+    expect((init!.body as FormData).get("allow_server_name_collision")).toBe("true");
   });
 
   it("surfaces the server's structured rejection", async () => {

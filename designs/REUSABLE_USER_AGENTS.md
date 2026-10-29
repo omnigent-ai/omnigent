@@ -73,8 +73,8 @@ the user's 30 most recent sessions.
 - Preserve workers, skills, guardrails, and supporting files exactly as bundled.
 - Keep server and user agents in their respective groups; use the same current identities in Settings and the picker.
 - Remove an installed agent explicitly, with a warning when sessions still use it.
-- One agent row per owner and exact name: uploads, imports, child agents and installs update it, with no
-  deletion of agents that other sessions use.
+- One agent row per owner and exact name across uploads, imports, children and installs.
+  Child creation reuses identical files or conflicts; explicit installs and top-level uploads update it.
 - Every new or changed query is bounded and index-backed; changes to existing behavior are additive
   unless a decision below explicitly says otherwise.
 
@@ -110,7 +110,7 @@ the user's 30 most recent sessions.
 | 1 | Installs are kind-2 rows with `created_by` = installer. No new kind, no constraint change. | Kind 2 already means user-provided; sessions already bind to it directly. |
 | 2 | Rename the Python codec names `template` to `server` and `session` to `user`. Stored integers unchanged. | Names match meaning; no migration. |
 | 3 | All user-agent creation paths use `sha256("installed:" + (owner or "") + "\0" + name)[:32]` in the current workspace. Pre-fix upload IDs remain separate; existing installs already use this shared ID. | One primary key prevents concurrent first-time uploads, installs and copies from creating duplicate identities. |
-| 4 | A user may own an agent with the same name as a server agent; their owners and IDs differ. Both catalogs remain visible in their respective groups. | Server agents never get overwritten or hide a user agent. |
+| 4 | A user may own an agent with the same name as a server agent; their owners and IDs differ. Install clients opt in with `allow_server_name_collision=true`; older requests retain 409. Both catalogs remain visible in their respective groups. | Server agents never get overwritten or hide a user agent; older clients cannot select both IDs. |
 | 5 | Install bundles over 100 MiB are rejected before being read (413). Bundles are validated like any tenant upload and never executed at install. | Trust boundary. |
 | 6 | Sessions bind directly to the installed row. Reinstall therefore updates running sessions from their next turn, through any server process (6.18). A native terminal session keeps its launch configuration until it relaunches. | One agent, many sessions. |
 | 7 | Forking your own session reuses its row. Copying another user's agent creates or reuses your owner/name identity with its own blob. If your existing same-named agent has different files, return 409 and ask you to select it or rename the source. | Repeated forks do not create duplicates, and a foreign source cannot overwrite code in your existing sessions. |
@@ -129,7 +129,7 @@ the user's 30 most recent sessions.
 | 20 | Starting a new session (not a fork) from another user's kind-2 agent, when allowed by the existing READ rule, copies the agent for the caller exactly as a fork does. A child session stays on its tree's agent only when it names its parent's agent; a scheduled task takes its copy when created or switched to the agent (a task saved earlier moves to its owner's copy at its next run). | Another user can never change code that runs in your sessions, on any creation path. |
 | 21 | The runner's existing missing-agent text is unified to the new guidance ("This agent no longer exists. Fork this session into another agent to continue."). Text-only change; tests updated. | One message for one condition. |
 | 22 | The picker follows the owner-scoped cursor to completion, as Settings can through Load more. | Neither a 50-name cap nor a five-page cap should hide an agent available in Settings. Each request remains bounded. |
-| 23 | Top-level and child uploads use the same save operation as installation. Changed files replace the current bundle; identical extracted files are a no-op. Bundled child sessions keep their parent, kind, metadata and permissive display titles. | Old sessions use the new revision without rebinding, regardless of how the agent was created. Bundle content determines revisions, never identity. |
+| 23 | Top-level and child uploads use the same identity as installation. Explicit installs and top-level uploads replace changed files; child creation reuses identical files or returns 409. Bundled child sessions keep their parent, kind, metadata and permissive display titles. | Explicit updates reach old sessions without rebinding. Permission to create a child does not authorize rewriting an agent used by unrelated sessions. |
 
 ## 6. Design
 
@@ -276,7 +276,8 @@ whose sessions were all deleted stays a user agent.
 3. Derive the shared owner/name ID (decision 3) and look it up by primary key.
    Pre-fix uploads under other IDs are not adopted. Store the blob at `"<id>/<files hash>"`; create on first use, otherwise
    compare and update the existing revision. Other processes follow the revision (6.18).
-4. Reinstalling the same files is a no-op, however the client tarred them.
+4. Reinstalling the same files is a no-op, however the client tarred them. Child creation uses the
+   same identity but returns 409 if the files differ; it cannot replace an existing agent.
 5. Single-user local servers stamp owner `"local"` (the auth layer's local identity).
 
 ### 6.7 "My agents" listing algorithm
@@ -500,8 +501,8 @@ For each of: kind-1 row; kind-2 row used by a session; kind-2 row with NULL owne
   process replaced; the runner bundle cache keeps an agent added again off the old directory.
 - Fork: own session reuses row; other user's session copies with new blob and owner; ownerless source
   copies; target owned by other user copies; copy unaffected by later reinstall of the original.
-- Uploads: re-tarred uploads of the same files bind one row; changed files and child uploads
-  update that row; another owner is isolated. Runs after an MCP edit replace the same row;
+- Uploads: re-tarred uploads of the same files bind one row; changed top-level uploads
+  update that row; changed child uploads return 409; another owner is isolated. Runs after an MCP edit replace the same row;
   reinstalling re-tarred files is a no-op; the files hash ignores archive metadata and follows
   extraction for a repeated path.
 - Switch removal: the reserved route returns 410 with the fork guidance, the store method is gone,

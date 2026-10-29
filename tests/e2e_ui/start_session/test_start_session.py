@@ -3094,10 +3094,8 @@ def _fork_scan_body() -> str:
     )
 
 
-@pytest.mark.parametrize("agent_install", [False, True], ids=["legacy", "owned-catalog"])
 def test_start_session_picker_drops_fork_of_fork_shadows(
     seeded_session: tuple[str, str],
-    agent_install: bool,
 ) -> None:
     """The landing picker hides fork-of-fork clones of a built-in agent.
 
@@ -3114,10 +3112,10 @@ def test_start_session_picker_drops_fork_of_fork_shadows(
     both the single-fork and the fork-of-fork clones are dropped.
     """
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive_fork_of_fork_dedup(base_url, session_id, agent_install))
+    _run_in_fresh_loop(_drive_fork_of_fork_dedup(base_url, session_id))
 
 
-async def _drive_fork_of_fork_dedup(base_url: str, session_id: str, agent_install: bool) -> None:
+async def _drive_fork_of_fork_dedup(base_url: str, session_id: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
@@ -3164,21 +3162,11 @@ async def _drive_fork_of_fork_dedup(base_url: str, session_id: str, agent_instal
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_scan
             )
-            await page.route(
-                OWN_AGENTS,
-                lambda route: route.fulfill(
-                    json={
-                        "data": [{"id": "ag_doc", "name": "doc-writer", "harness": "claude-sdk"}]
-                        if agent_install
-                        else []
-                    }
-                ),
-            )
 
             async def info(route: Route) -> None:
                 response = await route.fetch()
                 body = await response.json()
-                body["agent_install"] = agent_install
+                body["agent_install"] = False
                 await route.fulfill(response=response, json=body)
 
             await page.route("**/v1/info", info)

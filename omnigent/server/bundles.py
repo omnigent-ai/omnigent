@@ -319,8 +319,8 @@ def save_user_agent(
 
     New identities share a deterministic primary key, including concurrent
     requests from different creation paths. Legacy upload IDs remain separate.
-    Copying another user's agent may reuse identical files, but never replace
-    the recipient's configuration. Explicit uploads replace the whole bundle.
+    Copies and child creation may reuse identical files, but never replace an
+    existing configuration. Installs and top-level uploads replace the whole bundle.
     """
     agent_id = installed_agent_id(owner, name)
     existing = agent_store.get(agent_id)
@@ -347,8 +347,8 @@ def save_user_agent(
                 current_location = existing.bundle_location
         if not replace_existing and current_location != existing.bundle_location:
             raise OmnigentError(
-                f"You already have an agent named {name!r}. Select your agent or rename "
-                "the source before copying it.",
+                f"You already have an agent named {name!r}. Select your agent or use a "
+                "different name. Explicitly reinstall it to replace its configuration.",
                 code=ErrorCode.CONFLICT,
             )
         if current_location != existing.bundle_location or not artifact_store.exists(
@@ -387,8 +387,9 @@ def uploaded_agent_for(
     owner: str | None,
     spec: AgentSpec,
     bundle_bytes: bytes,
+    replace_existing: bool = True,
 ) -> Agent | None:
-    """Create or update the uploader's named agent, including child uploads."""
+    """Save the uploader's named agent; child creation cannot replace existing files."""
     if spec.name is None or not agent_store.supports_user_agents:
         return None
     return save_user_agent(
@@ -398,4 +399,5 @@ def uploaded_agent_for(
         name=spec.name,
         bundle_bytes=bundle_bytes,
         description=spec.description,
+        replace_existing=replace_existing,
     )

@@ -12387,6 +12387,7 @@ def _clone_github_source(clone_url: str, ref: str | None, dest: Path) -> None:
 def _upload_agent(client: Any, bundle_bytes: bytes) -> None:  # type: ignore[explicit-any]  # httpx.Client
     resp = client.post(
         "/v1/agents",
+        data={"allow_server_name_collision": "true"},
         files={"bundle": ("bundle.tar.gz", bundle_bytes, "application/gzip")},
     )
     _raise_for_agent_api(resp)

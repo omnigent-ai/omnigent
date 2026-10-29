@@ -555,13 +555,22 @@ async def test_same_name_for_another_user_is_a_separate_agent(client, agent_stor
     assert agent_store.get(alice["id"]).version == 1, "Bob's install touched Alice's agent"
 
 
-async def test_user_names_do_not_replace_same_named_server_agents(client, agent_store) -> None:
+@pytest.mark.parametrize("collision_aware", [False, True], ids=["legacy", "current"])
+async def test_user_names_do_not_replace_same_named_server_agents(
+    client, agent_store, collision_aware: bool
+) -> None:
     shared = agent_store.create(generate_agent_id(), "orion", "server/bundle")
-    installed = await _install(client, ALICE, "orion")
-    assert installed.status_code == 200, installed.text
-    assert installed.json()["id"] != shared.id
+    installed = await client.post(
+        "/v1/agents",
+        headers=ALICE,
+        data={"allow_server_name_collision": "true"} if collision_aware else {},
+        files={"bundle": ("bundle.tar.gz", build_agent_bundle("orion"), "application/gzip")},
+    )
+    assert installed.status_code == (200 if collision_aware else 409), installed.text
     assert agent_store.get(shared.id).bundle_location == "server/bundle"
-    assert [row["id"] for row in (await _mine(client, ALICE))["data"]] == [installed.json()["id"]]
+    expected = [installed.json()["id"]] if collision_aware else []
+    assert shared.id not in expected
+    assert [row["id"] for row in (await _mine(client, ALICE))["data"]] == expected
 
 
 async def test_oversized_bundle_is_413(client, monkeypatch) -> None:
@@ -970,7 +979,30 @@ async def test_all_creation_paths_update_one_owner_name(
     unchanged = await _install(c, ALICE, "orion", "v1")
     assert unchanged.status_code == 200, unchanged.text
     assert (unchanged.json()["id"], unchanged.json()["version"]) == (agent_id, 1)
-    if first == "install":
+    if first == "child":
+        conflict = await c.post(
+            "/v1/sessions",
+            headers=ALICE,
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle("orion", description="v2"),
+                    "application/gzip",
+                )
+            },
+        )
+        assert conflict.status_code == 409, conflict.text
+        unchanged_agent = SqlAlchemyAgentStore(db_uri).get(agent_id)
+        assert (unchanged_agent.bundle_location, unchanged_agent.version) == (
+            original.bundle_location,
+            original.version,
+        )
+        assert all(
+            SqlAlchemyConversationStore(db_uri).get_conversation(sid).agent_id == agent_id
+            for sid in session_ids
+        )
+    if first in ("install", "child"):
         updated = await _install(c, ALICE, "orion", "v2")
         assert (updated.json()["id"], updated.json()["version"]) == (agent_id, 2)
     else:
@@ -978,7 +1010,6 @@ async def test_all_creation_paths_update_one_owner_name(
             c,
             ALICE,
             build_agent_bundle("orion", description="v2"),
-            metadata if first == "child" else None,
         )
         assert updated_session["agent_id"] == agent_id
     persisted = SqlAlchemyAgentStore(db_uri).get(agent_id)
@@ -1235,7 +1266,7 @@ async def test_mcp_edits_change_the_agent_for_every_session_using_it(
     assert "read-only" in refused.text
 
 
-@pytest.mark.parametrize("edit", ["reinstall", "patch", "upload", "child"])
+@pytest.mark.parametrize("edit", ["reinstall", "patch", "upload"])
 async def test_reinstall_reaches_every_session_on_its_next_turn(
     multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, edit: str
 ) -> None:
@@ -1275,10 +1306,18 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
             (await c.post("/v1/sessions", json=kickoff, headers=ALICE)).json(),
             (await c.post("/v1/sessions", json={"agent_id": orion["id"]}, headers=ALICE)).json(),
         ]
-        sent = await c.post(
-            f"/v1/sessions/{sessions[1]['id']}/events", json=message, headers=ALICE
+        child = await _upload(
+            c,
+            ALICE,
+            build_agent_bundle("orion", description="v1"),
+            {"parent_session_id": sessions[0]["id"]},
         )
-        assert sent.status_code == 202, sent.text
+        sessions.append({"id": child["session_id"]})
+        for session in sessions[1:]:
+            sent = await c.post(
+                f"/v1/sessions/{session['id']}/events", json=message, headers=ALICE
+            )
+            assert sent.status_code == 202, sent.text
         if edit == "patch":
             config = await c.get(f"/v1/agents/{orion['id']}/config", headers=ALICE)
             updated = await c.patch(
@@ -1287,12 +1326,11 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
                 json={"description": "v2"},
             )
             assert updated.status_code == 200, updated.text
-        elif edit in ("upload", "child"):
+        elif edit == "upload":
             await _upload(
                 c,
                 ALICE,
                 build_agent_bundle("orion", description="v2"),
-                {"parent_session_id": sessions[0]["id"]} if edit == "child" else None,
             )
         else:
             await _install(c, ALICE, "orion", "v2")

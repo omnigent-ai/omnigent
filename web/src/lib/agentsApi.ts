@@ -19,6 +19,7 @@ export interface InstalledAgent {
 export async function installAgentBundle(bundle: File): Promise<InstalledAgent> {
   const form = new FormData();
   form.append("bundle", bundle, bundle.name);
+  form.append("allow_server_name_collision", "true");
   const res = await authenticatedFetch("/v1/agents", { method: "POST", body: form });
   if (!res.ok) throw await apiErrorFromResponse(res);
   const body = (await res.json().catch(() => null)) as Partial<InstalledAgent> | null;

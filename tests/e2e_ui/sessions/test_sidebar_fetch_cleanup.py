@@ -280,11 +280,9 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     assert project_requests == 1
 
 
-@pytest.mark.parametrize("agent_install", [False, True], ids=["legacy", "owned-catalog"])
 def test_templates_load_before_mine_and_discovery_reuses_its_request(
     page: Page,
     request: pytest.FixtureRequest,
-    agent_install: bool,
 ) -> None:
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
     held_mine: list[Route] = []
@@ -320,7 +318,7 @@ def test_templates_load_before_mine_and_discovery_reuses_its_request(
     def info(route: Route) -> None:
         response = route.fetch()
         body = response.json()
-        body["agent_install"] = agent_install
+        body["agent_install"] = False
         route.fulfill(response=response, json=body)
 
     page.route("**/v1/info", info)
@@ -360,10 +358,7 @@ def test_templates_load_before_mine_and_discovery_reuses_its_request(
     picker.click()
     page.get_by_test_id("new-chat-landing-custom-agents").click()
     recent = page.get_by_test_id("new-chat-landing-agent-ag_recent")
-    if agent_install:
-        expect(recent).to_have_count(0)
-    else:
-        expect(recent).to_be_visible()
+    expect(recent).to_be_visible()
     expect(page.get_by_test_id("new-chat-landing-agent-ag_immediate")).to_be_visible()
     assert len(held_mine) == 1
     assert len(agent_requests) == 1

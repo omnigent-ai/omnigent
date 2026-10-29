@@ -242,6 +242,7 @@ def install_user_agent(
     name: str,
     bundle_bytes: bytes,
     description: str | None = None,
+    allow_server_name_collision: bool = False,
 ) -> Agent:
     """
     Create or update *owner*'s user agent named *name* from a validated bundle.
@@ -254,8 +255,15 @@ def install_user_agent(
     :param name: Agent name from the bundle's spec, e.g. ``"orion"``.
     :param bundle_bytes: Gzipped tarball already checked by
         :func:`validate_agent_bundle`.
+    :param allow_server_name_collision: Caller can select distinct server and owned IDs;
+        older clients retain the server-name conflict response.
     :returns: The created or updated agent.
     """
+    if not allow_server_name_collision and agent_store.get_by_name(name) is not None:
+        raise OmnigentError(
+            f"{name!r} is a server agent. Update your client or use a different name.",
+            code=ErrorCode.CONFLICT,
+        )
     agent = save_user_agent(
         agent_store,
         artifact_store,
@@ -511,6 +519,8 @@ def create_builtin_agents_router(
         Multipart form with one ``bundle`` part: a gzipped tarball, the same
         shape multipart ``POST /v1/sessions`` accepts. The bundle is validated
         like any tenant upload and never executed here.
+        Clients that distinguish owned and server names send the form field
+        ``allow_server_name_collision=true``; older clients retain a 409 on collision.
 
         :param request: The incoming request carrying the ``bundle`` part.
         :returns: The installed agent as an :class:`AgentObject`.
@@ -522,7 +532,8 @@ def create_builtin_agents_router(
         length = request.headers.get("content-length", "")
         if length.isdigit() and int(length) > MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES:
             raise _too_large()
-        bundle = (await _body_capped(request).form()).get("bundle")
+        form = await _body_capped(request).form()
+        bundle = form.get("bundle")
         if not isinstance(bundle, UploadFile):
             raise HTTPException(status_code=422, detail="multipart part 'bundle' is required")
         if bundle.size is not None and bundle.size > MAX_INSTALL_BUNDLE_BYTES:
@@ -544,6 +555,7 @@ def create_builtin_agents_router(
             name=spec.name,
             bundle_bytes=bundle_bytes,
             description=spec.description,
+            allow_server_name_collision=form.get("allow_server_name_collision") == "true",
         )
         # Loads (extracts) the just-written bundle; keep it off the event loop.
         return await asyncio.to_thread(_to_agent_object, agent, agent_cache)

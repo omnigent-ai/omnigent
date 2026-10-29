@@ -894,9 +894,9 @@ class SysSessionCreateTool(Tool):
       agent config YAML, agent directory, or pre-built ``.tar.gz``
       bundle inside the caller's working directory (e.g. one authored
       with ``sys_os_write``). The runner bundles the source and
-      proxies the multipart ``POST /v1/sessions`` create. Reusing the
-      owner's agent name updates that agent for all its sessions;
-      independent configurations need different names.
+      proxies the multipart ``POST /v1/sessions`` create. An existing name
+      reuses identical files or returns a conflict; different configurations
+      need different names. Child creation never replaces an existing agent.
 
     An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
@@ -927,12 +927,13 @@ class SysSessionCreateTool(Tool):
             "visible session. Two modes — provide "
             "exactly one: agent_id launches an existing agent (any "
             "agent_id from sys_agent_list's builtins or session_agents, "
-            "or from sys_agent_get); config_path creates or updates your named agent "
+            "or from sys_agent_get); config_path creates or reuses your named agent "
             "from a local agent config YAML, agent directory, or "
             ".tar.gz bundle in your working directory (e.g. authored "
-            "with sys_os_write) and launches it. Uploading the same name replaces "
-            "that agent for all its sessions, including children; use a different "
-            "name for independent configurations. Always use agent_id "
+            "with sys_os_write) and launches it. An existing name reuses identical "
+            "files or returns a conflict; child creation cannot replace the agent "
+            "used by other sessions. Use different names for different configurations. "
+            "Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
             "message. By default the new session is a child of the caller. "
@@ -997,10 +998,10 @@ class SysSessionCreateTool(Tool):
                                 ".tar.gz bundle, relative to your "
                                 "working directory, e.g. "
                                 "'.omnigent/agent-configs/helper.yaml'. "
-                                "Creates or updates your agent with that name and "
-                                "launches the child from it. Reusing a name updates "
-                                "all sessions on that agent; use a different name "
-                                "for a separate configuration. Use "
+                                "Creates your named agent or reuses its identical files "
+                                "and launches the child from it. Different files under "
+                                "an existing name return a conflict; use a different "
+                                "name for a separate configuration. Use "
                                 "instead of agent_id."
                             ),
                         },

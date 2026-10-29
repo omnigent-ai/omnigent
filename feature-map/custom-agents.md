@@ -73,8 +73,9 @@ requires `user_owned: true` and `agent_config_edit: true`.
   Settings and the agent picker, with the same ID and v1. Change instructions and run
   `agent add` again: one ID at v2. Send another turn to the original child and a second
   existing session; both use v2. Repeat the install unchanged: still v2. Reversing the
-  order (install, then upload or child create) must give the same result. A different
-  owner can use the same name independently.
+  order (install, then upload or child create) must reuse the same ID. A child upload with
+  different files must return 409 and leave existing sessions unchanged; an explicit install
+  can update those files. A different owner can use the same name independently.
 - Copy: fork another user's shared session twice. Identical copies reuse your one
   owner/name ID. If you already own different files under that name, the copy fails
   with a conflict and leaves your existing sessions unchanged. Scheduling and JSON
@@ -103,7 +104,10 @@ requires `user_owned: true` and `agent_config_edit: true`.
   button opens the settings navigation; the form's Custom agents button returns
   to the agent list and confirms unsaved changes.
 - Saving an existing owned name replaces its entire configuration and affects
-  sessions using it. Use a unique name when creating a separate agent.
+  sessions using it. Child creation and cross-user copies reuse identical files or return
+  a conflict. Use a unique name when creating a separate agent.
+- Current install clients opt in to server-name collisions so both IDs remain selectable.
+  Older install requests retain the 409 response for a name already used by a server agent.
 - Owned previews load the configuration endpoint and ETag; summaries never prefill it.
   Missing revision headers allow saving without a stale-draft check; the last
   successful save of a field wins. Unchanged fields are omitted from PATCH.
