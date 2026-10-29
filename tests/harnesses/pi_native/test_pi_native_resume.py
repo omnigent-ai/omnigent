@@ -794,6 +794,23 @@ def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None)
     assert [b["id"] for b in calls] == (["orphan"] if replayed else [])
 
 
+def test_call_reusing_an_interrupted_call_id_keeps_its_result() -> None:
+    messages = _rebuilt_messages(
+        [
+            _call("c1", "cancelled"),
+            {**_assistant_item("partial", response_id="cancelled"), "interrupted": True},
+            _user_item("Try again.", response_id="retry"),
+            _call("c1", "retry", name="read"),
+            _output("c1", "contents"),
+        ]
+    )
+    _assert_results_follow_calls(messages)
+    assert [m["role"] for m in messages] == ["user", "assistant", "toolResult"]
+    assert messages[2]["toolName"] == "read"
+    assert messages[2]["content"][0]["text"] == "contents"
+    assert "Recovered tool output" not in json.dumps(messages)
+
+
 def test_missing_result_is_left_for_pi_to_mark_interrupted() -> None:
     messages = _rebuilt_messages([_call("missing"), _assistant_item("Done.", response_id="")])
     assert [m["role"] for m in messages] == ["assistant", "assistant"]

@@ -204,19 +204,6 @@ def _interrupted_response_ids(items: list[_JsonObject]) -> set[str]:
     return response_ids
 
 
-def _function_call_names(items: list[_JsonObject]) -> dict[str, str]:
-    """Index named tool calls so rebuilt results retain their tool name."""
-    names: dict[str, str] = {}
-    for item in items:
-        if item.get("type") != "function_call":
-            continue
-        name = item.get("name")
-        call_id = item.get("call_id")
-        if isinstance(name, str) and name and isinstance(call_id, str) and call_id:
-            names.setdefault(call_id, name)
-    return names
-
-
 def pi_session_records_from_session_items(
     items: list[_JsonObject],
     *,
@@ -332,7 +319,8 @@ def pi_session_records_from_session_items(
         items = [*snapshot, *items[tail_start:]]
         break
     skip_response_ids = _interrupted_response_ids(items)
-    tool_names = _function_call_names(items)
+    # A result pairs with the latest replayed call with its id, so it takes that name.
+    tool_names: dict[str, str] = {}
     replayed_call_ids: set[str] = set()
     # A reused id must not pair a skipped call's output with an older call.
     skipped_call_ids: set[str] = set()
@@ -367,8 +355,9 @@ def pi_session_records_from_session_items(
                 skipped_call_ids.add(item_call_id)
             continue
         blocks = _pi_assistant_blocks_from_item(item)
-        if blocks:
+        if blocks and item_call_id:
             skipped_call_ids.discard(item_call_id)
+            tool_names[item_call_id] = cast(str, blocks[0]["name"])
         if blocks is None:
             if item_call_id:
                 # Replay one result per call: a repeated output would make the
@@ -592,8 +581,8 @@ def _pi_non_assistant_entry(
     :param external_session_id: Pi session id (for synthetic ids).
     :param index: Zero-based index of *item* in the source list.
     :param timestamp: ISO timestamp to stamp on the entry.
-    :param tool_names: Tool name of each ``function_call`` by ``call_id``. A
-        result whose call is absent keeps an empty ``toolName``.
+    :param tool_names: Tool name of the latest replayed ``function_call`` by
+        ``call_id``. A result whose call is absent keeps an empty ``toolName``.
     :returns: Pi entry dict (without ``parentId``, which the caller links), or
         ``None`` for items with no Pi representation.
     """
