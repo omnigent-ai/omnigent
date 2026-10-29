@@ -235,7 +235,10 @@ export type StatusBucket = (typeof STATUS_BUCKETS)[number];
 
 /** What a session needs from the viewer. `unseen` / `hasDraft` come from client stores. */
 export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean): StatusBucket {
-  if ((c.pending_elicitations_count ?? 0) > 0 || c.status === "failed") return "Needs attention";
+  const parkedInTerminal = c.status === "running" && Boolean(c.blocked_on);
+  if ((c.pending_elicitations_count ?? 0) > 0 || c.status === "failed" || parkedInTerminal) {
+    return "Needs attention";
+  }
   if (c.status === "running" || c.background_work_running) return "Working";
   if (unseen) return "Unread";
   if (hasDraft) return "Draft";

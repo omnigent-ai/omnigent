@@ -24,8 +24,11 @@ interface Visual {
 function describe(state: SessionState): Visual {
   switch (state.kind) {
     case "awaiting": {
-      const tooltip =
-        state.count === 1 ? "1 approval prompt waiting" : `${state.count} approval prompts waiting`;
+      const tooltip = state.terminalReason
+        ? `Waiting for you in the agent's terminal (${state.terminalReason})`
+        : state.count === 1
+          ? "1 approval prompt waiting"
+          : `${state.count} approval prompts waiting`;
       return {
         kind: state.kind,
         ariaLabel: tooltip,
