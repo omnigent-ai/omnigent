@@ -184,7 +184,7 @@ export function ApprovePage() {
         );
         if (!res.ok && submission.current === submitted) {
           if (res.status === PROMPT_IN_TERMINAL_STATUS) {
-            // Reload to show the prompt waiting in the terminal.
+            // The prompt moved to the terminal; its reloaded copy carries the hold.
             refusedResolveStatus.current = res.status;
             setState({ kind: "loading" });
             setReloadCount((count) => count + 1);

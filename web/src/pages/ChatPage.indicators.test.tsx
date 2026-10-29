@@ -256,6 +256,19 @@ describe("WorkingIndicator", () => {
       );
     });
 
+    it("sends the user to the Terminal view when the pending card waits in the terminal", () => {
+      useChatStore.setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, terminalFallback: { answerUndelivered: false } }],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+      );
+    });
+
     it("still points at the terminal when the only pending card is a sub-agent's", () => {
       useChatStore.setState({
         conversationId: "conv_root",

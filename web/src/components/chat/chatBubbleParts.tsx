@@ -63,6 +63,7 @@ import {
   imagePreview,
   isTextBlock,
   keyedAttachments,
+  pendingOwnElicitationsInTerminal,
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -420,6 +421,14 @@ function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
   return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
 }
 
+/** Whether a pending own card takes its answer in chat rather than in the terminal. */
+function hasChatAnswerablePrompt(blocks: readonly AnyBlock[], sessionId: string | null): boolean {
+  return (
+    hasPendingOwnElicitation(blocks, sessionId) &&
+    !pendingOwnElicitationsInTerminal(blocks, sessionId)
+  );
+}
+
 /**
  * The label shown next to the working shimmer. When the agent is parked on a
  * dialog (`blockedOn`) it says so; otherwise it rotates through
@@ -454,16 +463,16 @@ export function WorkingIndicator() {
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
-  const rootHasOwnPendingElicitation = useChatStore((s) =>
-    hasPendingOwnElicitation(s.blocks, s.conversationId),
+  const rootAnswerableInChat = useChatStore((s) =>
+    hasChatAnswerablePrompt(s.blocks, s.conversationId),
   );
   const rootAgentWorking = useAgentTurnActive();
   const terminalFirst = useTerminalFirst();
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
-  const hasOwnPendingElicitation = scopedConversationId
-    ? hasPendingOwnElicitation(scopedState.blocks, scopedConversationId)
-    : rootHasOwnPendingElicitation;
+  const answerableInChat = scopedConversationId
+    ? hasChatAnswerablePrompt(scopedState.blocks, scopedConversationId)
+    : rootAnswerableInChat;
   const agentWorking = scopedConversationId
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
@@ -473,7 +482,7 @@ export function WorkingIndicator() {
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
   const label = workingIndicatorLabel(tick, blockedOn, {
-    answerableInChat: hasOwnPendingElicitation,
+    answerableInChat,
     // The toggle switches to the root session's terminal, not a side chat's.
     terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
   });

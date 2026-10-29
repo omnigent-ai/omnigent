@@ -4583,12 +4583,12 @@ async function reconcilePendingElicitations(
     let changed = false;
     const blocks = s.blocks.map((b) => {
       if (b.type !== "elicitation") return b;
+      // A live event that changed or added the card during the fetch is newer than the snapshot.
+      if (cardsBeforeFetch.get(b.elicitationId) !== b) return b;
       const current = snapshotPending.find(
         (candidate): candidate is ElicitationBlock =>
           candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
       );
-      // A live event that changed or added the card during the fetch is newer than the snapshot.
-      if (cardsBeforeFetch.get(b.elicitationId) !== b) return b;
       if (current && !b.nativeDeliveryResolved && terminalHoldChanged(current, b)) {
         changed = true;
         return { ...current, ctx: b.ctx };
