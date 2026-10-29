@@ -58,6 +58,12 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import {
+  SandboxProfilePicker,
+  useSandboxProfileCatalog,
+  type SandboxProfileSelection,
+} from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -144,7 +150,12 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+  sandboxProfilesEnabled,
+} from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -2191,6 +2202,7 @@ interface LandingDraft {
   selectedHostId: string | null;
   sandboxSelected: boolean;
   sandboxProvider: string | null;
+  sandboxProfile: SandboxProfileSelection | null;
   sandboxRepoSelections: LastSandboxRepo[];
   workspace: string;
   branchName: string;
@@ -2426,6 +2438,7 @@ export function NewChatLandingScreen() {
           selectedHostId: null,
           sandboxSelected: false,
           sandboxProvider: null,
+          sandboxProfile: null,
           // The repo inputs compose the managed create's workspace string, so
           // they are location state too — keeping them would clone another
           // project's repository into this project's sandbox.
@@ -2497,6 +2510,7 @@ export function NewChatLandingScreen() {
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (option hidden) until the boot probe resolves.
   const info = useServerInfo();
+  const profilesEnabled = sandboxProfilesEnabled(info);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
@@ -2579,6 +2593,12 @@ export function NewChatLandingScreen() {
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(
     () => restoredDraft?.sandboxProvider ?? null,
   );
+  const [sandboxProfile, setSandboxProfile] = useState<SandboxProfileSelection | null>(
+    () => restoredDraft?.sandboxProfile ?? null,
+  );
+  useEffect(() => {
+    if (info !== "loading" && !profilesEnabled) setSandboxProfile(null);
+  }, [info, profilesEnabled]);
   const hostSelected = !sandboxSelected && selectedHostId !== null;
   const rememberedHostChoice = readLastHostChoice();
   const executionTargetSelectionPending =
@@ -2636,6 +2656,8 @@ export function NewChatLandingScreen() {
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const { launchError: sandboxProfileError, selection: selectedSandboxProfile } =
+    useSandboxProfileCatalog(sandboxSelected ? effectiveSandboxProvider : null, sandboxProfile);
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -2859,6 +2881,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     sandboxSelected,
     sandboxProvider,
+    sandboxProfile,
     sandboxRepoSelections,
     workspace,
     branchName,
@@ -2992,6 +3015,7 @@ export function NewChatLandingScreen() {
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setSandboxProfile(null);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
@@ -5320,6 +5344,7 @@ export function NewChatLandingScreen() {
     !pendingSkillCompletion &&
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
+    sandboxProfileError === null &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
@@ -5333,8 +5358,8 @@ export function NewChatLandingScreen() {
         ? "Loading skills…"
         : pickerLoading || workspaceStartLoading || worktreeRequestPending
           ? "Loading session configuration…"
-          : pickerSelectionError || sandboxCatalogError
-            ? (pickerSelectionError ?? sandboxCatalogError)
+          : pickerSelectionError || sandboxCatalogError || sandboxProfileError
+            ? (pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError)
             : sandboxSelected && sandboxRepoOverCap
               ? `This sandbox provider clones at most ${maxSandboxRepos} ${
                   maxSandboxRepos === 1 ? "repository" : "repositories"
@@ -5545,6 +5570,7 @@ export function NewChatLandingScreen() {
   }
 
   function selectSandbox(provider: string | null = null) {
+    if (provider !== sandboxProvider) setSandboxProfile(null);
     // Persist the explicit sandbox pick (as the reserved sentinel) even when
     // it's already selected, mirroring selectHost — so the sandbox becomes the
     // sticky default for the next visit, on the provider just picked.
@@ -6051,6 +6077,12 @@ export function NewChatLandingScreen() {
                 ...(createProjectId !== null ? { workspace: null, git: null } : {}),
                 // Omitted when null so a default create is unchanged.
                 ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                ...(selectedSandboxProfile !== null
+                  ? {
+                      sandbox_profile_id: selectedSandboxProfile.id,
+                      sandbox_profile_revision: selectedSandboxProfile.revision,
+                    }
+                  : {}),
                 // The new sandbox host's id, in the server's minted shape;
                 // keys the create and the session's requests until it binds.
                 ...(info !== "loading" && info.request_managed_sandbox_host_id
@@ -6147,6 +6179,9 @@ export function NewChatLandingScreen() {
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
+            if (sandboxSelected) {
+              void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+            }
             if (sandboxPreviewEnabled && response.status === 409) {
               void queryClient.invalidateQueries({
                 queryKey: sandboxModelOptionsKey(
@@ -6736,6 +6771,11 @@ export function NewChatLandingScreen() {
                   </div>
                 </PopoverContent>
               </Popover>
+              <SandboxProfilePicker
+                provider={effectiveSandboxProvider}
+                value={sandboxProfile}
+                onChange={setSandboxProfile}
+              />
             </ComposerWorkspaceBar>
           )}
           {!sandboxSelected && (
@@ -7738,6 +7778,11 @@ export function NewChatLandingScreen() {
                   Go to Integrations
                 </button>
               )}
+            </p>
+          )}
+          {sandboxProfileError && (
+            <p className="text-sm text-muted-foreground" role="status">
+              {sandboxProfileError}
             </p>
           )}
           {pickerSelectionError && (

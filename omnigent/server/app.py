@@ -2220,6 +2220,46 @@ def create_app(
     host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    sandbox_profiles = (
+        SandboxProfileCatalog(conversation_store, sandbox_config, host_store)
+        if host_store is not None and resolved_feature_flags.enabled(Feature.SANDBOX_PROFILES)
+        else None
+    )
+    app.state.sandbox_profiles = sandbox_profiles
+    if host_store is not None and sandbox_profiles is not None:
+
+        def admit_profiled_launch(
+            host_id: str,
+            session_id: str,
+            owner: str | None,
+            generation: str | None,
+            allow_unbound: bool = False,
+            transfer_from_host_id: str | None = None,
+        ) -> None:
+            _admit_host_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+            host = host_store.get_host(host_id)
+            sandbox_profiles.require_session_host(
+                session_id,
+                host_id,
+                bind=False,
+                sandbox_provider=host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
+            )
+            # Unbound or transfer launches defer profile binding;
+            # already host-bound creates adopt during admission.
+            if not allow_unbound and transfer_from_host_id is None:
+                sandbox_profiles.require_session_host(session_id, host_id)
+
+        host_registry.launch_authorizer = admit_profiled_launch
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
@@ -3723,6 +3763,13 @@ def create_app(
         tags=["extensions"],
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+    from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+
+    app.include_router(
+        create_sandbox_profiles_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["sandbox profiles"],
+    )
 
     app.include_router(
         create_sandbox_inference_router(

@@ -120,6 +120,22 @@ def _injected_config(
     )
 
 
+async def test_direct_launch_without_catalog_rejects_missing_selection_before_prepare(
+    db_uri: str,
+) -> None:
+    class ProfileLauncher(FakeSandboxLauncher):
+        manages_profiles: ClassVar[bool] = True
+
+        def prepare(self) -> None:
+            pytest.fail("Unselected provider must not prepare")
+
+    with pytest.raises(HTTPException) as caught:
+        await launch_managed_host(
+            config=_injected_config(ProfileLauncher()), owner=_OWNER, host_store=HostStore(db_uri)
+        )
+    assert caught.value.status_code == 422
+
+
 class _ClassifyingFakeSandboxLauncher(FakeSandboxLauncher):
     """
     A fake that declares ``classifies_runner_by_agent`` and records the

@@ -164,6 +164,13 @@ jobs:
           kubernetes._ensure_sdk()
           PYTHON
 
+      - name: Test installed sandbox profile example
+        if: matrix.group == 'server-rest'
+        run: |
+          uv pip install --python .venv/bin/python --no-deps -e examples/sandbox-profile-provider
+          uv run --no-sync pytest examples/sandbox-profile-provider/tests -q --reruns 0
+          uv pip uninstall --python .venv/bin/python omnigent-sandbox-profile-example
+
       - name: Run pytest
         shell: bash
         env:

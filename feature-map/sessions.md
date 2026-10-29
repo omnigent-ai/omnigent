@@ -90,6 +90,8 @@ the header menu), and each place is a separate entry point.
 - `fork-arclet`: an Arclet session forks only onto a new Arclet, the dialog's
   single host choice. Without one on the server, Fork stays disabled.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
+  Participating sandbox providers require a [profile selection](sandbox-profiles.md)
+  before submission, including branch clones.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
   itself, and starts an Arca host recognized by its saved ID or CLI-seeded name

@@ -155,6 +155,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   recording links, file previews, and download fallbacks.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
+- [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
+  desktop and mobile profile selection, and the boundary between browser
+  request proof and live resource/network enforcement.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -234,7 +237,8 @@ interruptions for claude-native are tracked as scenario rows in
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
-budgets, MCP servers, sandbox providers, and smart routing.
+budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
+and smart routing.
 
 ## Keeping the map current
 
