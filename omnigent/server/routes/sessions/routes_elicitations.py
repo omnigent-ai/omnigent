@@ -41,6 +41,7 @@ from omnigent.server.routes._sessions.common import (
 )
 from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
+    _client_supports_terminal_fallback,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
@@ -121,7 +122,7 @@ def register_elicitations_routes(
         :returns: ``{"queued": False}`` — resolution is synchronous
             and persists no conversation item.
         :raises OmnigentError: 404 if no session exists; 423 if the prompt
-            waits in the agent's terminal.
+            waits in the agent's terminal and the client knows such prompts.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -133,7 +134,13 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        await _resolve_elicitation(
+            session_id,
+            _resolve_data,
+            runner_router,
+            conversation_store,
+            client_supports_terminal_fallback=_client_supports_terminal_fallback(request.headers),
+        )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(
@@ -195,6 +202,10 @@ def register_elicitations_routes(
         params = params_value if isinstance(params_value, dict) else {}
         if params.get("target_session_id") not in (None, session_id):
             return {"status": "resolved"}
+        if "terminal_fallback" in params and not _client_supports_terminal_fallback(
+            request.headers
+        ):
+            return {"status": "resolved"}  # An older page saw a held prompt expire.
         return {
             "status": "pending",
             "message": params.get("message", "Approval required"),

@@ -1395,6 +1395,11 @@ export const HOST_OFFLINE_CODE = "host_offline";
 /** The server's ErrorCode.PROMPT_IN_TERMINAL: an answer to a prompt held in the terminal. */
 export const PROMPT_IN_TERMINAL_CODE = "prompt_in_terminal";
 
+/** Tells the server this client shows prompts held in the agent's terminal. */
+export const TERMINAL_FALLBACK_HEADERS: Readonly<Record<string, string>> = {
+  "x-omnigent-terminal-fallback": "on",
+};
+
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
 
@@ -1457,7 +1462,7 @@ export function openSessionStream(
 ): Promise<Response> {
   const query = opts?.idle ? "?idle=true" : "";
   return authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/stream${query}`, {
-    headers: { Accept: "text/event-stream" },
+    headers: { Accept: "text/event-stream", ...TERMINAL_FALLBACK_HEADERS },
     signal,
   });
 }
@@ -1550,7 +1555,7 @@ export async function approve(
       `${encodeURIComponent(elicitationId)}/resolve`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...TERMINAL_FALLBACK_HEADERS },
       body: JSON.stringify(result),
     },
   );

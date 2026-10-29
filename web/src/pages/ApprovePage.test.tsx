@@ -330,6 +330,16 @@ describe("ApprovePage submission", () => {
     expect(await screen.findByText("Answer in the terminal")).toBeInTheDocument();
     expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
+    // The server holds a prompt, and refuses answers to it, only for clients that show the hold.
+    const calls = vi.mocked(identity.authenticatedFetch).mock.calls;
+    expect(calls.map(([, init]) => init?.method ?? "GET").slice(0, 3)).toEqual([
+      "GET",
+      "POST",
+      "GET",
+    ]);
+    for (const [, init] of calls) {
+      expect(new Headers(init?.headers).get("x-omnigent-terminal-fallback")).toBe("on");
+    }
   });
 
   it("doesn't carry a refused answer's error to the next approval link", async () => {

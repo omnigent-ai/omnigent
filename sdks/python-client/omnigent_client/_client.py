@@ -19,6 +19,8 @@ from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
 
+TERMINAL_FALLBACK_HEADER = "X-Omnigent-Terminal-Fallback"
+
 
 def _port_or_default(url: httpx.URL) -> int | None:
     """The URL's explicit port, or its scheme's default (80/443)."""
@@ -133,7 +135,11 @@ class OmnigentClient:
         # requires a trusted Origin; the SDK sends none of its own, so the
         # sentinel is what lets it through. Caller-supplied headers win on
         # conflict (so an explicit Origin override is still honored).
-        default_headers = {"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+        default_headers = {
+            "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+            # Ask for prompts held in the agent's terminal; send() skips them.
+            TERMINAL_FALLBACK_HEADER: "on",
+        }
         if headers:
             default_headers.update(headers)
         self._http = httpx.AsyncClient(

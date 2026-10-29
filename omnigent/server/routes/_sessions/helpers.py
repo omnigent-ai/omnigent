@@ -9817,6 +9817,32 @@ async def _evaluate_output_policy(
     }
 
 
+# A client that shows prompts held in the agent's terminal sets this header;
+# older clients keep seeing such a prompt expire and their late answers saved.
+TERMINAL_FALLBACK_CLIENT_HEADER = "x-omnigent-terminal-fallback"
+
+
+def _client_supports_terminal_fallback(headers: Mapping[str, str]) -> bool:
+    """Return whether the client knows prompts held in the agent's terminal."""
+    return headers.get(TERMINAL_FALLBACK_CLIENT_HEADER, "").lower() == "on"
+
+
+def _expire_held_prompt_for_older_client(event: dict[str, Any]) -> dict[str, Any]:
+    """Show an older client a prompt held in the terminal as expired, as it was before holds."""
+    params = event.get("params")
+    if (
+        event.get("type") != "response.elicitation_request"
+        or not isinstance(params, dict)
+        or "terminal_fallback" not in params
+    ):
+        return event
+    return {
+        "type": "response.elicitation_resolved",
+        "elicitation_id": event.get("elicitation_id"),
+        "reason": "unanswered",
+    }
+
+
 async def _stream_live_events(
     request: Request,
     session_id: str,
@@ -9824,6 +9850,7 @@ async def _stream_live_events(
     viewer_user_id: str | None = None,
     viewer_idle: bool = False,
     presence_root_id: str | None = None,
+    client_supports_terminal_fallback: bool = True,
 ) -> AsyncIterator[str]:
     """
     Yield SSE-formatted events from the conversation's live stream.
@@ -9887,6 +9914,9 @@ async def _stream_live_events(
         viewers of different agents/sub-agents in one session see
         each other. Required when *viewer_user_id* is set; ignored
         otherwise.
+    :param client_supports_terminal_fallback: ``False`` for a client that
+        predates prompts held in the agent's terminal; it sees such a
+        prompt expire unanswered instead of being asked it again.
     :returns: An async iterator of SSE message strings.
     :raises ValueError: If *viewer_user_id* is set without
         *presence_root_id* — a per-conversation presence scope would
@@ -9923,6 +9953,8 @@ async def _stream_live_events(
             async for event in live_events:
                 if await request.is_disconnected():
                     break
+                if not client_supports_terminal_fallback:
+                    event = _expire_held_prompt_for_older_client(event)
                 event_type = event.get("type")
                 if not isinstance(event_type, str):
                     raise ValueError(
@@ -12340,6 +12372,7 @@ async def _load_model_options_from_host(session_id: str, host_id: str) -> None:
 
 __all__ = [
     "FILE_CONTENT_CACHE_CONTROL",
+    "TERMINAL_FALLBACK_CLIENT_HEADER",
     "SessionLiveness",
     "_HostLaunchAttempt",
     "_NativeTerminalEnsureOutcome",
@@ -12375,6 +12408,7 @@ __all__ = [
     "_claude_native_remember_host",
     "_claude_subagent_display_tool",
     "_client_supplied_hook_elicitation_id",
+    "_client_supports_terminal_fallback",
     "_codex_plan_mode_enabled",
     "_codex_subagent_display_tool",
     "_codex_subagent_labels_from_body",
@@ -12395,6 +12429,7 @@ __all__ = [
     "_emit_server_routing_decision",
     "_error_item_from_sse",
     "_evaluate_output_policy",
+    "_expire_held_prompt_for_older_client",
     "_extract_assistant_text_from_event",
     "_extract_claude_native_runner_failure",
     "_extract_persistent_item_from_sse",

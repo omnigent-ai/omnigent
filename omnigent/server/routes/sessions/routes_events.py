@@ -186,6 +186,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _client_supports_terminal_fallback,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _extract_user_text_from_event,
@@ -1935,7 +1936,15 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                client_supports_terminal_fallback=_client_supports_terminal_fallback(
+                    request.headers
+                ),
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
@@ -3635,6 +3644,9 @@ def register_events_routes(
                 # the CHILD conversation's stream, and per-conversation
                 # scoping would hide co-viewers on other agents.
                 presence_root_id=conv.root_conversation_id,
+                client_supports_terminal_fallback=_client_supports_terminal_fallback(
+                    request.headers
+                ),
             ),
             media_type="text/event-stream",
             headers={

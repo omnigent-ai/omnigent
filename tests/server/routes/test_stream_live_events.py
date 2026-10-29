@@ -8,6 +8,7 @@ normal stream completion — never during ``aclose`` / ``GeneratorExit``.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -128,3 +129,50 @@ async def test_normal_completion_emits_done_and_cleans_up(
             break
         await asyncio.sleep(0.02)
     assert presence.snapshot(SESSION_ID, SESSION_ID)["viewers"] == []
+
+
+@pytest.mark.parametrize("client_supports_terminal_fallback", [True, False])
+async def test_older_client_sees_prompt_held_in_terminal_expire(
+    client_supports_terminal_fallback: bool,
+) -> None:
+    """A client that predates held prompts would take the re-publish as a new prompt.
+
+    Its callback would answer again and its turn would end on the refused answer.
+    """
+    request = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_held",
+        "params": {"message": "Run ls?"},
+    }
+    held = {
+        **request,
+        "params": {"message": "Run ls?", "terminal_fallback": {"answer_undelivered": False}},
+    }
+    gen = _stream_live_events(
+        _ConnectedRequest(),  # type: ignore[arg-type]
+        SESSION_ID,
+        client_supports_terminal_fallback=client_supports_terminal_fallback,
+    )
+    assert "session.heartbeat" in await asyncio.wait_for(gen.__anext__(), timeout=2.0)
+
+    session_stream.publish(SESSION_ID, request)
+    session_stream.publish(SESSION_ID, held)
+    session_stream.close(SESSION_ID)
+    chunks = [chunk async for chunk in gen]
+
+    assert chunks[-1] == "data: [DONE]\n\n"
+    events = [json.loads(chunk.split("data: ", 1)[1]) for chunk in chunks[:-1]]
+    assert [(event["type"], event["elicitation_id"]) for event in events] == [
+        ("response.elicitation_request", "elicit_held"),
+        (
+            "response.elicitation_request"
+            if client_supports_terminal_fallback
+            else "response.elicitation_resolved",
+            "elicit_held",
+        ),
+    ]
+    assert events[0]["params"].get("terminal_fallback") is None
+    if client_supports_terminal_fallback:
+        assert events[1]["params"]["terminal_fallback"] == {"answer_undelivered": False}
+    else:
+        assert events[1]["reason"] == "unanswered"

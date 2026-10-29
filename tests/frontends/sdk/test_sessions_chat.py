@@ -737,6 +737,25 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
 
 
 @pytest.mark.asyncio
+async def test_client_asks_for_prompts_held_in_terminal() -> None:
+    """The client opts into held prompts, which ``send()`` skips; older clients see them expire."""
+    from omnigent_client._client import OmnigentClient
+
+    from omnigent.server.routes._sessions.helpers import _client_supports_terminal_fallback
+
+    client = OmnigentClient("http://example.invalid", headers={"Authorization": "Bearer token"})
+    try:
+        request = client._http.build_request(
+            "POST", "http://example.invalid/v1/sessions/conv_abc/elicitations/elicit_1/resolve"
+        )
+    finally:
+        await client.close()
+
+    assert _client_supports_terminal_fallback(request.headers)
+    assert request.headers["authorization"] == "Bearer token"
+
+
+@pytest.mark.asyncio
 async def test_send_raises_on_failed_status_with_error_message() -> None:
     """A terminal ``session.status: failed`` raises with its error message.
 

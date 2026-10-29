@@ -2615,6 +2615,8 @@ async def _resolve_elicitation(
     data: dict[str, Any],
     runner_router: RunnerRouter | None,
     conversation_store: ConversationStore | None = None,
+    *,
+    client_supports_terminal_fallback: bool = True,
 ) -> None:
     """
     Resolve one outstanding elicitation from an approval payload.
@@ -2659,6 +2661,11 @@ async def _resolve_elicitation(
     :param conversation_store: Optional store used to mirror the
         resolved signal into ancestor streams when ``session_id`` is
         a child session. ``None`` keeps the signal scoped locally.
+    :param client_supports_terminal_fallback: ``False`` for a client that
+        predates prompts held in the agent's terminal. Its answer to one
+        keeps the old contract: accepted and saved for a hook retry.
+    :raises OmnigentError: ``prompt_in_terminal`` (423) when a client that
+        knows held prompts answers one.
     """
     # Empty-string default is intentional, NOT a fail-loud miss: the
     # resolve-URL caller always supplies the id (it comes from the URL
@@ -2672,7 +2679,10 @@ async def _resolve_elicitation(
     ):
         return
     unparked = _harness_unparked_elicitations.get(elicitation_id)
-    if unparked is not None and unparked.in_terminal and unparked.session_id == session_id:
+    held = unparked if unparked is not None and unparked.in_terminal else None
+    if held is not None and held.session_id != session_id:
+        held = None
+    if held is not None and client_supports_terminal_fallback:
         # Nothing can deliver the answer; accepting it would strand it again.
         raise OmnigentError(
             "This prompt is waiting in the agent's terminal. Answer it there.",
@@ -2736,7 +2746,10 @@ async def _resolve_elicitation(
             # question that reuses this id must not inherit the verdict.
             gap_fingerprint: str | None = None
             pending_entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
-            if pending_entry is not None:
+            if held is not None:
+                # A held card's params gained terminal_fallback; match the original request.
+                gap_fingerprint = held.request_fingerprint
+            elif pending_entry is not None:
                 try:
                     gap_fingerprint = _harness_elicitation_request_fingerprint(
                         ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
@@ -2765,7 +2778,8 @@ async def _resolve_elicitation(
     # finally / harness hook finally — those also publish for the id.
     # The verdict rides along so the parent-side resolution notice
     # states how the gate was answered instead of a bare "resolved".
-    if isinstance(elicitation_id, str) and elicitation_id:
+    # An older client's answer to a held prompt leaves its card up for the clients that show it.
+    if isinstance(elicitation_id, str) and elicitation_id and held is None:
         _publish_elicitation_resolved(session_id, elicitation_id, action=data.get("action"))
         if conversation_store is not None:
             await asyncio.to_thread(

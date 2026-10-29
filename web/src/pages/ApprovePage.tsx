@@ -30,6 +30,7 @@ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
+import { TERMINAL_FALLBACK_HEADERS } from "@/lib/sessionsApi";
 import { formatPreview } from "@/lib/previewFormat";
 
 interface ElicitationData {
@@ -96,6 +97,7 @@ export function ApprovePage() {
       try {
         const res = await authenticatedFetch(
           `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}`,
+          { headers: TERMINAL_FALLBACK_HEADERS },
         );
         if (cancelled) return;
         if (!res.ok) {
@@ -174,7 +176,7 @@ export function ApprovePage() {
           `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/resolve`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...TERMINAL_FALLBACK_HEADERS },
             body: JSON.stringify({
               action,
               ...(content ? { content } : {}),

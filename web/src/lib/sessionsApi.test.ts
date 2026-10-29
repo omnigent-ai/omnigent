@@ -1591,6 +1591,8 @@ describe("openSessionStream", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/stream");
     expect(new Headers(init.headers).get("Accept")).toBe("text/event-stream");
+    // Without it the server shows a prompt held in the terminal as expired.
+    expect(new Headers(init.headers).get("x-omnigent-terminal-fallback")).toBe("on");
     expect(init.signal).toBe(signal);
   });
 });
@@ -1774,6 +1776,8 @@ describe("approve", () => {
       action: "accept",
       content: { confirm: true },
     });
+    // The card shows the server's refusal of an answer to a prompt held in the terminal.
+    expect(new Headers(init.headers).get("x-omnigent-terminal-fallback")).toBe("on");
   });
 
   it("omits content when not supplied", async () => {
