@@ -8,9 +8,11 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 Shared-source support remains under review. OpenAI Agents SDK, Codex-native
 Chat and authenticated host-managed Codex terminal input have process evidence.
 Claude SDK requester binding also has isolated pinned-process evidence.
-Native Claude and provider-created helper delegation remain unresolved
-compatibility limits; typing and ordinary helper work remain
-available. Do not infer support from another harness's passing journey.
+Native Claude delegation is a documented limitation of this release; adding
+edit sharing does not enable owner-only delegation on that path. Chat and
+terminal typing remain available. Native Claude requester support is deferred,
+not a release prerequisite. Provider-created helper delegation remains a
+separate compatibility gap. Do not infer support from another harness's passing journey.
 
 ## Sub-features
 
@@ -146,7 +148,7 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   | OpenAI Agents SDK Chat/API | Implemented | Real process send/create, editor refusal, fresh owner recovery and kill switch. |
   | Codex native web Chat | Implemented | Pinned CLI consumption IDs, authenticated harness lookup, browser actions and destination history. |
   | Claude SDK Chat/API | Implemented | Raw provider UUID echoes and exact SDK control tasks retain input/tool lineage before typed parsing. Isolated pinned-process rows cover owner/editor/recovery, worker creation and kill switch; component tests cover delayed callbacks. |
-  | Claude native Chat/terminal | Blocked | PTY input must bind its actual requester to consumed execution and retained calls. Typing remains available. |
+  | Claude native Chat/terminal | Unavailable; deferred | Edit sharing and typing remain available. Peer sends and independent worker creation refuse without verified requester binding, including from private sources. Native Claude requester support is not a release prerequisite. |
   | Codex host-managed terminal / default CLI attach | Implemented | Authenticated relay captures writers; the TUI proxy registers input before submission. Real terminal WebSocket send/create passes. A separate public CLI drive proves typed owner send with a preconnected host and local single-user auth; first-time onboarding and multi-user CLI auth remain unverified. |
   | Legacy internal Codex standalone launcher | Delegation blocked | No in-tree production caller found; the public CLI uses host-managed preparation. Direct internal calls lack trusted input registration. |
   | Provider-native children/helpers | Incomplete | Preserve each input's requester through child creation, steering, queue consumption and wakes. Ordinary helper visibility is not proof. |
