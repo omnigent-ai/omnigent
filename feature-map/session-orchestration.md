@@ -108,6 +108,10 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   at `d3b563fd6` with a scripted provider, no external network and no host mounts.
   A workstation skip is not Claude process validation; the SDK proof does not
   cover native Claude terminals or provider-created helpers.
+  Native Claude now has separate process rows in this same scenario for private/
+  read-only sends and creation, editor refusal, restoration after downgrade, and
+  the kill switch. These drive API Chat through its real PTY/MCP transport, not
+  direct keyboard input; keep their evidence separate from Claude SDK.
   After a runner restart, repeat typed input in the existing Codex session.
   `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_codex_resume_clamps_persisted_effort`
   and `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_terminal_only_work_survives_runner_inactivity`
@@ -151,27 +155,55 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   transcript. Do not substitute an HTTP prompt, direct terminal WebSocket write,
   or initial `-p` argument for the interactive public entry point. This case
   does not prove first-time onboarding, independent creation or multi-user CLI auth.
-- Requester compatibility matrix (implementation limits, not test results):
+- Harness capability matrix (peer sends and independent top-level workers):
 
-  | Entry point | Owner delegation | Required verification |
-  | --- | --- | --- |
-  | OpenAI Agents SDK Chat/API | Implemented | Real process send/create, editor refusal, fresh owner recovery and kill switch. |
-  | Codex native web Chat | Implemented | Pinned CLI consumption IDs, authenticated harness lookup, browser actions and destination history. |
-  | Claude SDK Chat/API | Implemented | Raw provider UUID echoes and exact SDK control tasks retain input/tool lineage before typed parsing. Isolated pinned-process rows cover owner/editor/recovery, worker creation and kill switch; component tests cover delayed callbacks. |
-  | Codex SDK dynamic tools | Implemented | Match callbacks to the exact `turn/start` reply and originating execution. `tests/runtime/harnesses/test_executor_adapter_requester.py` drives the real stdio reader; `tests/inner/test_codex_executor.py` covers callback forwarding. These are scripted-producer checks, not live-provider evidence. |
-  | Pi SDK tool bridge | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Cursor SDK custom tools | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Copilot SDK custom tools | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Antigravity SDK custom tools | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Generic ACP MCP relay | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Goose ACP MCP relay | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Qwen ACP MCP relay | Current-sharing gate | Producer-bound fallback; private/read-only senders allowed, edit sharing blocks. Per-message attribution and live provider validation remain incomplete. |
-  | Claude native Chat/terminal | Current-sharing gate | Runner-managed Claude terminals may delegate without edit sharing. Edit sharing blocks owner and collaborator delegation alike. Per-message attribution remains deferred; process evidence must be recorded separately. |
-  | Codex host-managed terminal / default CLI attach | Implemented | Authenticated relay captures writers; the TUI proxy registers input before submission. Real terminal WebSocket send/create passes. A separate public CLI drive proves typed owner send with a preconnected host and local single-user auth; first-time onboarding and multi-user CLI auth remain unverified. |
-  | Legacy internal Codex standalone launcher | Delegation blocked | No in-tree production caller found; the public CLI uses host-managed preparation. Direct internal calls lack trusted input registration. |
-  | Provider-native children/helpers | Incomplete | Preserve each input's requester through child creation, steering, queue consumption and wakes. Ordinary helper visibility is not proof. |
-  | Legacy runner → updated server | Refused without requester | Private/shared sends and creates leave no new task or worker; ordinary child work keeps unknown origin. |
-  | Updated runner → older/mixed server replicas | Refuses unsupported receiving routes | Mutations require `/v1/requester/sessions` and its events route, with no legacy fallback. ASGI route-absence tests include servers that already have the older orchestrated endpoint; no released-binary mixed-replica process run. |
+  This table covers **sending to another owned session and creating independent top-level workers**. Both sessions must belong to the same owner; the sender's source chain, bound runner and release flag are still checked. Tool availability and host/provider setup remain prerequisites.
+
+  | Harness | Private / read-only sender | Sender has an editor | Evidence and main limitation |
+  | --- | --- | --- | --- |
+  | OpenAI Agents SDK | Verified owner execution | Verified owner execution | Real process checks; collaborator steering restricts the execution. |
+  | Claude SDK (`claude`, `claude-sdk`) | Verified owner execution | Verified owner execution | Pinned CLI/SDK process checks; provider-created helper attribution remains incomplete. |
+  | Codex SDK (`codex`) | Verified owner execution | Verified owner execution | Scripted app-server/producer checks; full SDK startup and live-provider journey not verified. |
+  | Codex native | Verified owner execution | Verified owner execution | Chat and authenticated terminal process checks; unknown/mixed terminal writers restrict delegation until restart. |
+  | Claude native | Allowed | **Blocked for everyone** | Pinned CLI process checks; no per-message requester binding. |
+  | Pi SDK | Allowed | **Blocked for everyone** | Producer/component checks; full provider journey not verified. |
+  | Cursor SDK | Allowed | **Blocked for everyone** | Producer/component checks; full provider journey not verified. |
+  | Copilot SDK | Allowed | **Blocked for everyone** | Producer/component checks; full provider journey not verified. |
+  | Antigravity SDK | Allowed | **Blocked for everyone** | Producer/component checks; full provider journey not verified. |
+  | Generic ACP | Allowed | **Blocked for everyone** | Producer/component checks; custom ACP-agent journeys not verified. |
+  | Grok (ACP) | Allowed | **Blocked for everyone** | Uses the ACP fallback; Grok-specific startup/provider journey not verified. |
+  | Jcode (ACP) | Unavailable by default | Unavailable by default | Catalog disables Omnigent MCP exposure; enabling a bridge is a separate prerequisite. |
+  | Goose ACP | Allowed | **Blocked for everyone** | Producer/component checks; full provider journey not verified. |
+  | Qwen ACP | Allowed | **Blocked for everyone** | Producer/component checks; full provider journey not verified. |
+  | Hermes (`hermes`) | Blocked | Blocked | No requester/fallback integration in this PR. |
+  | Kimi (`kimi`, `kimi-code`) | Unavailable | Unavailable | No Omnigent tool-injection bridge in this path. |
+  | Antigravity native | Blocked | Blocked | SDK fallback does not extend to the native harness. |
+  | Cursor native | Blocked | Blocked | SDK fallback does not extend to the native harness. |
+  | Devin native | Blocked | Blocked | No requester/fallback integration in this PR. |
+  | Goose native | Blocked | Blocked | ACP fallback does not extend to the native harness. |
+  | Hermes native | Blocked | Blocked | No requester/fallback integration in this PR. |
+  | Kimi native | Blocked | Blocked | No requester/fallback integration in this PR. |
+  | Kiro native | Blocked | Blocked | No requester/fallback integration in this PR. |
+  | OpenCode native | Blocked | Blocked | No requester/fallback integration in this PR. |
+  | Pi native | Blocked | Blocked | SDK fallback does not extend to the native harness. |
+  | Qwen native | Blocked | Blocked | ACP fallback does not extend to the native harness. |
+  | OpenResponses | Unavailable | Unavailable | Executor exists, but no built-in session-tool producer/runner integration; custom embedding is outside this table. |
+
+  **Two recovery rules:** requester-aware harnesses need a fresh owner execution; revoking Pat's access does not authorize his queued input. On the no-edit-sharing fallback paths, removing/downgrading the last editor immediately re-enables retained work, even unread collaborator input. Original requester metadata is preserved; unknown origin cannot authorize another hop through a strict receiving harness.
+
+  “Editor” includes any non-owner edit/manage/public-write grant anywhere in the sender's source chain. Read-only sharing is allowed. These are implementation capabilities, not live-provider or Universe acceptance claims. Existing session reads and ordinary Chat remain separate; provider-native helpers and custom executor paths need separate validation. Independent worker creation does not establish parentage or add automatic completion replies; ordinary child creation/send follow their separate parent-bound path.
+
+  **These limits apply to the sending harness.** An owned session can receive peer work even when its harness cannot initiate orchestration.
+
+  Additional entry-point and upgrade limits:
+
+  | Entry point | Limitation |
+  | --- | --- |
+  | Public Codex CLI | Uses host-managed preparation. Typed owner send has historical local single-user process evidence; first-time onboarding and multi-user CLI auth remain unverified. |
+  | Legacy internal Codex standalone launcher | No trusted input registration; delegation blocked. No in-tree production caller found. |
+  | Provider-native children/helpers | Input-to-child execution lineage remains incomplete. Do not infer authorization from ordinary helper visibility. |
+  | Legacy runner → updated server | Peer sends/top-level creates refuse without requester metadata; ordinary child work retains unknown origin. |
+  | Updated runner → older/mixed server replicas | Requester-specific mutation routes refuse when unsupported; no ordinary-route fallback. Released-version pair checks do not prove a mixed-replica deployment. |
 
 - Component compatibility checks: `tests/runtime/harnesses/test_executor_adapter_requester.py`
   exercises retained callbacks with the real SDK parser/dispatcher. The Claude

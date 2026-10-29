@@ -321,25 +321,9 @@ def test_private_manager_launch_send_read_and_sharing(
                     url += f"/v1/sessions/{session}/resources/terminals/{terminal['id']}/attach"
                     # This authenticates through the explicit OSS single-user provider.
                     # Raw tmux send-keys would bypass the writer boundary under test.
-                    rows = (
-                        39
-                        if terminal_output("display-message", "-p", "#{pane_height}").strip()
-                        != "39"
-                        else 40
-                    )
+                    # Codex can strand input when SIGWINCH and TTY readiness coincide.
+                    # Keep this input/provenance check at the existing pane size.
                     with connect(url, open_timeout=15) as terminal_ws:
-                        terminal_ws.send(json.dumps({"type": "resize", "cols": 120, "rows": rows}))
-                        # The server accepts before the runner attaches. Observe this
-                        # connection's resize before typing into the native terminal.
-                        poll_until(
-                            lambda: (
-                                terminal_output(
-                                    "display-message", "-p", "#{pane_width}x#{pane_height}"
-                                ).strip()
-                                == f"120x{rows}"
-                            ),
-                            timeout_s=15,
-                        )
                         terminal_ws.send(text.encode())
                         try:
                             poll_until(lambda: text in pane(), timeout_s=10)
