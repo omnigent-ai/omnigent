@@ -7,10 +7,9 @@ export const CODE_EDITORS = [
 export type CodeEditor = (typeof CODE_EDITORS)[number]["id"];
 
 export function normalizeSshTarget(value: unknown): string | null {
-  return typeof value === "string" &&
-    value.length <= 255 &&
-    value === value.trim() &&
-    /^(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)
+  if (typeof value !== "string" || value.length > 255 || value !== value.trim()) return null;
+  const parts = value.split("@");
+  return parts.length <= 2 && parts.every((part) => /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(part))
     ? value
     : null;
 }

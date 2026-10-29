@@ -2607,14 +2607,19 @@ def _decode_known_host_frame(
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
-_SSH_TARGET_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*")
+_SSH_TARGET_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def normalize_ssh_target(value: object) -> str | None:
     """Accept a bounded SSH alias or user@host that fits inside an editor URL."""
     if not isinstance(value, str) or len(value) > 255:
         return None
-    return value if _SSH_TARGET_RE.fullmatch(value) else None
+    parts = value.split("@")
+    return (
+        value
+        if len(parts) <= 2 and all(_SSH_TARGET_PART_RE.fullmatch(part) for part in parts)
+        else None
+    )
 
 
 def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:

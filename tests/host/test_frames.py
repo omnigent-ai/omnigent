@@ -860,7 +860,22 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
 
 
 @pytest.mark.parametrize(
-    "target", [None, "", "bad target", "box/path", "box?x", "-box", 1, [], "x" * 256]
+    "target",
+    [
+        None,
+        "",
+        "bad target",
+        "box/path",
+        "box?x",
+        "-box",
+        "@dev",
+        "me@",
+        "me@@dev",
+        "me@box@dev",
+        1,
+        [],
+        "x" * 256,
+    ],
 )
 def test_hello_ignores_invalid_ssh_target(target: object) -> None:
     message = json.loads(
