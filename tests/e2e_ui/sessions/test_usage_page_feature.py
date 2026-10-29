@@ -5,14 +5,21 @@ from __future__ import annotations
 import json
 import time
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Page, Request, Response, Route, expect
 
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.e2e_ui.chat.test_session_usage_loading import _session_read_matcher
 from tests.e2e_ui.conftest import _server_state
+
+
+def _usage_report_matcher(read: str | Request | Response) -> bool:
+    """Match ``/v1/usage`` regardless of the ``since``/``until`` query string."""
+    url = read if isinstance(read, str) else read.url
+    return urlparse(url).path == "/v1/usage"
 
 
 def _stub_server_info(page: Page, *, usage_page: bool) -> None:
@@ -71,7 +78,7 @@ def test_usage_page_route_and_navigation_are_available_when_feature_is_on(
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route(_usage_report_matcher, handle_usage)
     page.goto(f"{live_server}/usage")
 
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
@@ -113,7 +120,7 @@ def test_session_table_shows_other_harnesses_badge(
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route(_usage_report_matcher, handle_usage)
     page.goto(f"{live_server}/usage")
 
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
@@ -166,7 +173,7 @@ def test_usage_report_link_and_chat_reload_keep_complete_subtree_usage(
     usage_read = _session_read_matcher(session_url, include_usage=True)
     try:
         # Seeded storage has no usage SSE events: chat must hydrate over HTTP.
-        with page.expect_response(f"{base_url}/v1/usage") as report_response:
+        with page.expect_response(_usage_report_matcher) as report_response:
             page.goto(f"{base_url}/usage")
         assert report_response.value.ok
         report = report_response.value.json()
@@ -246,7 +253,7 @@ def _setup_usage_page(page: Page, live_server: str) -> None:
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route(_usage_report_matcher, handle_usage)
     page.goto(f"{live_server}/usage")
     expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
 
