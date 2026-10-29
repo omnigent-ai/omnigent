@@ -51,7 +51,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
-from omnigent_ui_sdk.terminal import StreamLive
+from omnigent_ui_sdk.terminal import QuestionSpec, StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -1090,33 +1090,12 @@ def _settle_resolved_elsewhere(
     return None
 
 
-@dataclass(frozen=True)
-class _QuestionPrompt:
-    """One question from an ``ask_user_question`` elicitation extra.
+def _question_prompts(payload: object) -> list[QuestionSpec]:
+    """Parse an ``ask_user_question`` extra into selector questions; ``[]`` when unusable.
 
-    :param key: Answer key the web form uses: the question ``id``, else its text.
-    :param question: Question text, e.g. ``"Which environment?"``.
-    :param header: Short badge, e.g. ``"Environment"``; empty when absent.
-    :param options: ``(label, description)`` pairs in display order.
-    :param multi_select: Whether several options may be chosen.
-    :param allow_custom: Whether a typed answer outside the options is accepted.
-    :param text_default: Prefilled text for editor-style questions, whose
-        exact text (empty allowed) is the answer; ``None`` otherwise.
-    :param secret: The producer marked the answer secret (``isSecret``).
-    """
-
-    key: str
-    question: str
-    header: str
-    options: tuple[tuple[str, str], ...]
-    multi_select: bool
-    allow_custom: bool
-    text_default: str | None = None
-    secret: bool = False
-
-
-def _question_prompts(payload: object) -> list[_QuestionPrompt]:
-    """Parse an ``ask_user_question`` extra into prompts; ``[]`` when unusable.
+    Follows the web form: a typed answer is allowed unless ``isOther`` is
+    ``false``. Every question must be answerable, so one that isn't (no
+    options and no typing, or malformed) rejects the whole batch.
 
     :param payload: The extra, e.g. ``{"questions": [{"question": "Env?", ...}]}``.
     """
@@ -1125,16 +1104,14 @@ def _question_prompts(payload: object) -> list[_QuestionPrompt]:
     raw_questions = payload.get("questions")
     if not isinstance(raw_questions, list):
         return []
-    prompts: list[_QuestionPrompt] = []
+    questions: list[QuestionSpec] = []
     for raw in raw_questions:
         if not isinstance(raw, dict):
-            continue
+            return []
         text = raw.get("question")
-        if not isinstance(text, str) or not text:
-            continue
         raw_options = raw.get("options") or []
-        if not isinstance(raw_options, list):
-            continue  # unusable, as in the web form; the y/a/n path takes over
+        if not isinstance(text, str) or not text or not isinstance(raw_options, list):
+            return []
         options: list[tuple[str, str]] = []
         for option in raw_options:
             if isinstance(option, str) and option:
@@ -1144,78 +1121,33 @@ def _question_prompts(payload: object) -> list[_QuestionPrompt]:
                 options.append(
                     (option["label"], description if isinstance(description, str) else "")
                 )
-        question_id = raw.get("id")
-        header = raw.get("header")
         text_input = raw.get("textInput")
         default = text_input.get("default") if isinstance(text_input, dict) else None
         allow_custom = raw.get("isOther") is not False
         if not options and not allow_custom and not isinstance(default, str):
-            continue  # nothing to pick and typing is forbidden: unanswerable
-        prompts.append(
-            _QuestionPrompt(
+            return []  # nothing to pick and typing is forbidden: unanswerable
+        question_id = raw.get("id")
+        header = raw.get("header")
+        questions.append(
+            QuestionSpec(
                 key=question_id if isinstance(question_id, str) and question_id else text,
                 question=text,
                 header=header if isinstance(header, str) else "",
                 options=tuple(options),
                 multi_select=raw.get("multiSelect") is True,
-                # Matches the web form: a typed answer is allowed unless the
-                # producer sets ``isOther: false``.
                 allow_custom=allow_custom,
                 text_default=default if isinstance(default, str) else None,
-                secret=raw.get("isSecret") is True,
             )
         )
-    return prompts
+    return questions
 
 
-def _parse_question_answer(text: str, question: _QuestionPrompt) -> str | list[str] | None:
-    """Turn one typed line into an answer, or ``None`` to re-prompt.
-
-    Accepts option numbers (``"2"``, or ``"1,3"`` for multi-select), an exact
-    option label, or free text when the question allows a custom answer.
-    """
-    if question.text_default is not None:
-        # Only a bare Enter keeps the prefill; typed whitespace is an answer.
-        return text if text else question.text_default
-    stripped = text.strip()
-    if not stripped:
-        return None
-    labels = [label for label, _ in question.options]
-    if len(stripped) >= 2 and stripped[0] == stripped[-1] == '"':
-        # Quoted input is always literal text, e.g. ``"2"`` for the answer 2.
-        literal = stripped[1:-1]
-        if not literal or not question.allow_custom:
-            return None
-        return [literal] if question.multi_select else literal
-    tokens = [token for token in re.split(r"[,\s]+", stripped) if token]
-    # Numbers pick by the position shown, even when a label is itself a number.
-    if labels and all(token.isdecimal() and 1 <= int(token) <= len(labels) for token in tokens):
-        picked: list[str] = []
-        for token in tokens:
-            if labels[int(token) - 1] not in picked:
-                picked.append(labels[int(token) - 1])
-        if question.multi_select:
-            return picked
-        return picked[0] if len(picked) == 1 else None
-    by_label = {label.casefold(): label for label in labels}
-    if stripped.casefold() in by_label:
-        label = by_label[stripped.casefold()]
-        return [label] if question.multi_select else label
-    if not question.allow_custom:
-        return None
-    return [stripped] if question.multi_select else stripped
-
-
-def _question_hint(question: _QuestionPrompt) -> str:
-    """Input hint shown under a question, e.g. ``"enter a number · Esc cancels"``."""
-    if question.text_default is not None:
-        return "type your answer · Enter keeps the prefilled text · Esc cancels"
-    if not question.options:
-        return "type your answer · Esc cancels"
-    hint = "enter one or more numbers, e.g. 1,3" if question.multi_select else "enter a number"
-    if question.allow_custom:
-        hint += ', or type your own answer ("…" sends it as typed)'
-    return f"{hint} · Esc cancels"
+def _asks_for_secret(payload: object) -> bool:
+    """Whether any question in an ``ask_user_question`` extra is marked ``isSecret``."""
+    raw_questions = payload.get("questions") if isinstance(payload, dict) else None
+    return isinstance(raw_questions, list) and any(
+        isinstance(raw, dict) and raw.get("isSecret") is True for raw in raw_questions
+    )
 
 
 def _build_elicitation_content_from_schema(
@@ -1627,6 +1559,8 @@ class _SessionsChatReplAdapter:
         # One terminal prompt at a time: they share the input line, and a
         # second prompt would otherwise take it from the first.
         self._prompt_lock = asyncio.Lock()
+        # Elicitation whose prompt holds ``_prompt_lock`` (shown to the user).
+        self._open_elicitation_id: str | None = None
         self._replay_task: asyncio.Task[None] | None = None
         self._host = host
         self._fmt = fmt
@@ -2941,18 +2875,11 @@ class _SessionsChatReplAdapter:
             # Another client may have settled it while this waited its turn.
             if elicitation_id in self._resolved_elicitation_ids:
                 return
-            # Question prompts get a numbered picker instead of y/a/n: an
-            # accept without answers would reach the agent as an empty reply.
-            ask_user_question = getattr(event, "ask_user_question", None)
-            questions = _question_prompts(ask_user_question)
-            resolve_payload: dict[str, object] | None
-            if isinstance(ask_user_question, dict) and not questions:
-                # Nothing usable to ask; an approval would accept with no answers.
-                resolve_payload = {"action": "decline"}
-            elif questions and self._field_input_state is not None:
-                resolve_payload = await self._question_payload(elicitation_id, questions)
-            else:
-                resolve_payload = await self._approval_payload(event, elicitation_id)
+            self._open_elicitation_id = elicitation_id
+            try:
+                resolve_payload = await self._collect_verdict(event, elicitation_id)
+            finally:
+                self._open_elicitation_id = None
         if resolve_payload is None:
             return  # another client answered it
         delivered = False
@@ -2965,10 +2892,29 @@ class _SessionsChatReplAdapter:
                 # Still parked server-side: let a later snapshot replay offer it again.
                 self._seen_elicitation_ids.discard(elicitation_id)
 
+    async def _collect_verdict(
+        self, event: object, elicitation_id: str
+    ) -> dict[str, object] | None:
+        """Prompt for *event* and build its resolve payload (``None``: post nothing)."""
+        ask_user_question = getattr(event, "ask_user_question", None)
+        questions = _question_prompts(ask_user_question)
+        if isinstance(ask_user_question, dict) and not questions:
+            # Nothing usable to ask; an approval would accept with no answers.
+            return {"action": "decline"}
+        if questions and self._host is not None:
+            # Questions get the selector: a y/a/n accept would carry no answers.
+            return await self._question_payload(
+                elicitation_id, questions, secret=_asks_for_secret(ask_user_question)
+            )
+        return await self._approval_payload(event, elicitation_id)
+
     def note_elicitation_resolved(self, elicitation_id: str) -> None:
         """Record that a client settled *elicitation_id* so it is never prompted again."""
-        if elicitation_id:
-            self._resolved_elicitation_ids.add(elicitation_id)
+        if not elicitation_id:
+            return
+        self._resolved_elicitation_ids.add(elicitation_id)
+        if elicitation_id == self._open_elicitation_id and self._host is not None:
+            self._host.dismiss_questions()
 
     async def _post_elicitation_verdict(
         self,
@@ -3035,8 +2981,11 @@ class _SessionsChatReplAdapter:
         """
         from omnigent_client._sessions import _SERVER_STREAM_EVENT_ADAPTER
 
+        from omnigent.server.schemas import ElicitationResolvedEvent
+
         if self._on_event is None:
             return
+        open_before = self._open_elicitation_id
         try:
             snapshot = await self._client.sessions.get(session_id)
         except Exception:  # noqa: BLE001
@@ -3044,6 +2993,19 @@ class _SessionsChatReplAdapter:
             return
         if self._session_id != session_id:
             return
+        pending_ids = {raw.get("elicitation_id") for raw in snapshot.pending_elicitations}
+        if (
+            open_before is not None
+            and open_before == self._open_elicitation_id
+            and open_before not in pending_ids
+        ):
+            # Settled while the stream was down, so its resolved event never
+            # arrived; release it the same way, or it holds the prompt lock.
+            self._on_event(
+                ElicitationResolvedEvent(
+                    type="response.elicitation_resolved", elicitation_id=open_before
+                )
+            )
         for raw in snapshot.pending_elicitations:
             try:
                 event = _SERVER_STREAM_EVENT_ADAPTER.validate_python(raw)
@@ -3122,86 +3084,44 @@ class _SessionsChatReplAdapter:
     async def _question_payload(
         self,
         elicitation_id: str,
-        questions: list[_QuestionPrompt],
+        questions: list[QuestionSpec],
+        *,
+        secret: bool,
     ) -> dict[str, object] | None:
-        """Ask each question in the terminal and build the resolve payload.
+        """Ask the questions in the terminal's selector and build the resolve payload.
 
         :param elicitation_id: Id of the elicitation being answered.
         :param questions: Parsed questions from the ``ask_user_question`` extra.
+        :param secret: Whether a question is marked secret.
         :returns: An accept carrying the web form's answer shape, a decline
-            when the user aborts, or ``None`` to post nothing (another client
-            answered, or the question is secret and must be answered there).
+            when the user dismisses it, or ``None`` to post nothing (another
+            client answered, or a secret question must be answered there).
         """
-        if any(question.secret for question in questions):
-            # Terminal input is echoed and saved to history; leave it pending.
-            if self._host is not None and self._fmt is not None:
-                from rich.text import Text
+        host = self._host
+        if host is None:
+            return None
+        if secret:
+            # Typed terminal input is visible on screen; leave it pending.
+            from rich.text import Text
 
-                self._host.output(
-                    Text(
-                        "   ? This question asks for a secret, which the terminal can't take "
-                        "safely. Answer it in the web UI.",
-                        style=self._fmt.warning,
-                    )
+            host.output(
+                Text(
+                    "   ? This question asks for a secret, which the terminal can't take "
+                    "safely. Answer it in the web UI.",
+                    style=self._fmt.warning if self._fmt is not None else "",
                 )
+            )
             return None
         try:
-            answers = await self._prompt_questions(elicitation_id, questions)
+            answers = await host.ask_questions(questions)
         except Exception:  # noqa: BLE001
             # Never leave the elicitation unresolved: a failed prompt declines.
             answers = None
-        fis = self._field_input_state
-        if fis is not None and fis.resolved_elsewhere_for(elicitation_id):
-            return None
+        if elicitation_id in self._resolved_elicitation_ids:
+            return None  # answered in another client while the selector was open
         if answers is None:
             return {"action": "decline"}
         return {"action": "accept", "content": answers}
-
-    async def _prompt_questions(
-        self,
-        elicitation_id: str,
-        questions: list[_QuestionPrompt],
-    ) -> dict[str, str | list[str]] | None:
-        """Show each question with numbered options and read the answers.
-
-        :returns: Answers keyed by question id (or text), or ``None`` on abort.
-        """
-        from rich.text import Text
-
-        fis = self._field_input_state
-        host = self._host
-        fmt = self._fmt
-        if fis is None or host is None or fmt is None:
-            return None
-
-        answers: dict[str, str | list[str]] = {}
-        for number, question in enumerate(questions, start=1):
-            # Plain styled text: question and option text come from the model
-            # and must not be parsed as Rich markup.
-            title = f"\n ? question {number} of {len(questions)}"
-            if question.header:
-                title += f" · {question.header}"
-            host.output(Text(title, style=fmt.warning))
-            host.output(Text(f"   {question.question}"))
-            for index, (label, description) in enumerate(question.options, start=1):
-                line = f"     {index}. {label}"
-                if description:
-                    line += f" — {description}"
-                host.output(Text(line))
-            if question.text_default is not None:
-                host.output(Text(f"     prefilled: {question.text_default}", style=fmt.muted))
-            hint = _question_hint(question)
-            host.output(Text(f"   {hint}", style=fmt.accent))
-            while True:
-                raw = await fis.begin(question.header or "answer", elicitation_id)
-                if fis.aborted:
-                    return None
-                answer = _parse_question_answer(raw, question)
-                if answer is not None:
-                    break
-                host.output(Text(f"     ↳ {hint}", style=fmt.warning))
-            answers[question.key] = answer
-        return answers
 
     async def _prompt_schema_fields(
         self,
@@ -4593,9 +4513,6 @@ async def run_repl(
         # Pending schema field input: consume this line as the
         # current field's value before any other routing.
         if field_input_state.pending:
-            if text.strip() == "/cancel":
-                field_input_state.cancel()
-                return
             field_name = field_input_state.field_name or "field"
             # Plain styled text: ``field_name`` (server schema) and
             # ``text`` (user input) must not be parsed as Rich markup.
@@ -5038,15 +4955,6 @@ async def run_repl(
     # Let the host see the active session id so Left-arrow can return to the
     # top-level session whenever the user is inside a sub-agent.
     host.active_session_id_getter = lambda: session.session_id
-    # An open prompt reads lines as typed, and Esc declines it even when the
-    # turn was started elsewhere (no local task for Esc to cancel).
-    host.raw_input_wanted = lambda: field_input_state.pending
-
-    def _decline_open_prompt() -> None:
-        field_input_state.cancel()
-        approval_state.cancel()
-
-    host.on_idle_escape = _decline_open_prompt
 
     # ── Ctrl+E event tape overlay (--debug-events only) ────────
     # Registered unconditionally only when the debug flag is set.

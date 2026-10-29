@@ -51,6 +51,7 @@ from wcwidth import wcswidth
 
 from ._formatter import FormattedItem, StreamingText, StreamLive, StreamReplace
 from ._linkify import LinkifyingConsole, linkify_ansi
+from ._questions import Answers, QuestionPicker, QuestionSpec
 from ._theme import LIGHT_THEME, TerminalTheme, get_theme
 
 _log = logging.getLogger(__name__)
@@ -950,12 +951,8 @@ class TerminalHost:
         # when the user is "inside" a sub-agent (active != tree root) so
         # Left-arrow can jump back to the top-level session.
         self.active_session_id_getter: Callable[[], str | None] | None = None
-        # While this returns True, a submitted line reaches the handler as
-        # typed (no trimming, empty Enter kept): an open prompt is reading it.
-        self.raw_input_wanted: Callable[[], bool] | None = None
-        # Called by Esc when no handler task is running, so a prompt for a
-        # turn started elsewhere can still be dismissed.
-        self.on_idle_escape: Callable[[], None] | None = None
+        # Open inline question selector (see :meth:`ask_questions`), or None.
+        self._question_picker: QuestionPicker | None = None
         self._last_was_streaming: bool = False
         self._text_buffer: str = ""
         self._streamed_line_count: int = 0  # Lines printed from streaming text.
@@ -1013,13 +1010,15 @@ class TerminalHost:
 
         @self._kb.add("escape")
         def _on_escape(event: object) -> None:
-            # Esc first dismisses the inline ↓ sub-agents menu if it's open,
-            # otherwise cancels the in-flight turn (its usual role).
+            # Esc first dismisses an open question selector or the inline ↓
+            # sub-agents menu, otherwise cancels the in-flight turn.
+            if self._question_picker is not None:
+                self._question_picker.cancel()
+                return
             if self._subagent_menu_open:
                 self._close_subagent_menu()
                 return
-            if not self.cancel() and self.on_idle_escape is not None:
-                self.on_idle_escape()
+            self.cancel()
 
         # Multi-line input bindings — multiline=True is set on
         # the prompt session below so the buffer accepts ``\n``,
@@ -1054,6 +1053,11 @@ class TerminalHost:
 
         @self._kb.add("enter", eager=True, filter=~is_searching)
         def _on_enter(event: KeyPressEvent) -> None:
+            # An open question selector takes Enter as its answer; the line
+            # is never submitted as chat (nor saved to history).
+            if self._question_picker is not None:
+                self._answer_question(event.current_buffer)
+                return
             # When the inline ↓ menu is open, Enter picks the highlighted
             # sub-agent and exits with the select sentinel (``run`` switches
             # into it) instead of submitting the prompt.
@@ -1099,7 +1103,11 @@ class TerminalHost:
             # Finished children are retained in the selector (web parity) so the
             # user can revisit / chat with them, so the gesture stays available
             # after they settle, not only while something is running.
-            if self._subagent_menu_open or not self.has_any_subagents():
+            if (
+                self._question_picker is not None
+                or self._subagent_menu_open
+                or not self.has_any_subagents()
+            ):
                 return False
             try:
                 return get_app().current_buffer.text == ""
@@ -1124,7 +1132,11 @@ class TerminalHost:
         # inside a sub-agent, independent of whether agents are still active.
         # Falls through to normal cursor movement when there's text to edit.
         def _can_go_back_to_main() -> bool:
-            if self._subagent_menu_open or not self._is_inside_subagent():
+            if (
+                self._question_picker is not None
+                or self._subagent_menu_open
+                or not self._is_inside_subagent()
+            ):
                 return False
             try:
                 return get_app().current_buffer.text == ""
@@ -1136,6 +1148,30 @@ class TerminalHost:
             root = self._subagent_root
             if root is not None:
                 event.app.exit(result=_SUBAGENT_SELECT_SENTINEL + root)
+
+        # ── Inline question selector ──────────────────────────────
+        # While open it owns Up/Down (instead of history) and Space on a
+        # multi-select option; Enter and Esc are handled above.
+        _picker_open = Condition(lambda: self._question_picker is not None)
+
+        @self._kb.add("up", filter=_picker_open)
+        def _picker_prev(event: KeyPressEvent) -> None:
+            self._move_question_highlight(-1)
+
+        @self._kb.add("down", filter=_picker_open)
+        def _picker_next(event: KeyPressEvent) -> None:
+            self._move_question_highlight(1)
+
+        @self._kb.add(
+            "space",
+            filter=Condition(
+                lambda: self._question_picker is not None and self._question_picker.can_toggle()
+            ),
+        )
+        def _picker_toggle(event: KeyPressEvent) -> None:
+            if self._question_picker is not None:
+                self._question_picker.toggle()
+                self._invalidate_prompt()
 
         # Two-press Ctrl+C with clear-input semantics:
         #
@@ -1249,6 +1285,7 @@ class TerminalHost:
             completer=completer,
             reserve_space_for_menu=0,
         )
+        self._prompt.default_buffer.on_text_changed += self._on_buffer_text_changed
 
         # ----------------------------------------------------------
         # Layout patches.
@@ -1344,9 +1381,19 @@ class TerminalHost:
                     lambda: self._subagent_menu_open and bool(self._subagent_menu_display_rows())
                 ),
             )
+            # Inline question selector, in the same slot as the menu.
+            _question_selector = ConditionalContainer(
+                Window(
+                    FormattedTextControl(lambda: self.build_question_picker()),
+                    height=lambda: Dimension.exact(self._question_picker_line_count()),
+                    dont_extend_height=True,
+                ),
+                filter=_picker_open,
+            )
             children.append(_sep)
             children.append(_status)
             children.append(_subagent_menu)
+            children.append(_question_selector)
             _root.children = children
 
     def _make_style(self) -> PTStyle:
@@ -1792,13 +1839,6 @@ class TerminalHost:
                                 await cb(session_id)
                             except Exception:
                                 _log.exception("on_subagent_select callback failed")
-                        continue
-
-                    if self.raw_input_wanted is not None and self.raw_input_wanted():
-                        line = self._expand_pasted_blocks(line)
-                        task = asyncio.create_task(handler(line, []))
-                        self._tasks.append(task)
-                        task.add_done_callback(self._on_handler_task_done)
                         continue
 
                     line = line.strip()
@@ -3575,6 +3615,79 @@ class TerminalHost:
             return False
         return self._subagent_status_label(node) in ("Done", "Idle")
 
+    async def ask_questions(self, questions: list[QuestionSpec]) -> Answers | None:
+        """Show *questions* in the inline selector and wait for the answers.
+
+        One selector is open at a time; callers serialize their questions.
+        Any draft in the input line is set aside and restored afterwards.
+
+        :param questions: Questions to ask in order.
+        :returns: Answers keyed by :attr:`QuestionSpec.key`, single-select
+            values as strings and multi-select as lists; ``None`` when the
+            user pressed Esc or :meth:`dismiss_questions` was called.
+        """
+        if not questions:
+            return None
+        self.dismiss_questions()
+        picker = QuestionPicker(questions)
+        buffer = self._prompt.default_buffer
+        draft = buffer.document
+        self._close_subagent_menu()
+        self._question_picker = picker
+        buffer.text = picker.current.text_default or ""
+        buffer.cursor_position = len(buffer.text)
+        self._invalidate_prompt()
+        try:
+            return await picker.future
+        finally:
+            if self._question_picker is picker:
+                self._question_picker = None
+                buffer.document = draft
+                self._invalidate_prompt()
+
+    def dismiss_questions(self) -> None:
+        """Close an open question selector; its :meth:`ask_questions` returns ``None``."""
+        if self._question_picker is not None:
+            self._question_picker.cancel()
+
+    def build_question_picker(self) -> FormattedText:
+        """Render the open question selector; empty when none is open."""
+        if self._question_picker is None:
+            return FormattedText([])
+        return FormattedText(self._question_picker.render(self._picker_width()))
+
+    def _question_picker_line_count(self) -> int:
+        if self._question_picker is None:
+            return 0
+        return self._question_picker.line_count(self._picker_width())
+
+    def _picker_width(self) -> int:
+        try:
+            return get_app().output.get_size().columns
+        except Exception:
+            return 80
+
+    def _move_question_highlight(self, delta: int) -> None:
+        if self._question_picker is not None:
+            self._question_picker.move(delta)
+            self._invalidate_prompt()
+
+    def _answer_question(self, buffer: Any) -> None:  # type: ignore[explicit-any]  # prompt_toolkit Buffer
+        """Answer the open question from the highlight and the input line."""
+        picker = self._question_picker
+        if picker is None:
+            return
+        if picker.answer(self._expand_pasted_blocks(buffer.text)) and not picker.future.done():
+            # Next question: start its input line fresh (or with its prefill).
+            buffer.text = picker.current.text_default or ""
+            buffer.cursor_position = len(buffer.text)
+        self._invalidate_prompt()
+
+    def _on_buffer_text_changed(self, buffer: Any) -> None:  # type: ignore[explicit-any]  # prompt_toolkit Buffer
+        if self._question_picker is not None:
+            self._question_picker.note_typing(buffer.text)
+            self._invalidate_prompt()
+
     def build_subagent_menu(self) -> FormattedText:
         """Render the inline menu (rows + key hint) for the Window below the
         toolbar. Empty when the menu is closed."""
@@ -3589,18 +3702,12 @@ class TerminalHost:
         rows = self._render_subagent_menu_fragments()
         return len(rows) + 1 if rows else 0
 
-    def cancel(self) -> bool:
-        """Cancel all running handler tasks.
-
-        :returns: ``True`` if any task was running.
-        """
+    def cancel(self) -> None:
+        """Cancel all running handler tasks."""
         self.stop_timer()
-        cancelled = False
         for task in self._tasks:
             if not task.done():
                 task.cancel()
-                cancelled = True
-        return cancelled
 
     def request_exit(self) -> None:
         """Exit the prompt loop from a background handler."""

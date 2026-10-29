@@ -14,13 +14,13 @@ import re
 import sys
 from collections.abc import Iterable
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 from omnigent_client import child_summary_busy
 from omnigent_ui_sdk.terminal._formatter import StreamingText
 from omnigent_ui_sdk.terminal._host import TerminalHost
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.utils import get_cwidth
 from rich.text import Text
 
 
@@ -1760,57 +1760,130 @@ def test_subagent_finished_node_kept_visible_in_selector() -> None:
     assert host._subagent_status_label(node) == "Done"
 
 
-def _escape_handler(host: TerminalHost) -> Any:
-    [binding] = [b for b in host._kb.bindings if [str(k) for k in b.keys] == ["Keys.Escape"]]
-    return binding.handler
+# ── Inline question selector ──────────────────────────────────
+
+
+def _env_question(**overrides: Any) -> Any:
+    from omnigent_ui_sdk.terminal import QuestionSpec
+
+    fields: dict[str, Any] = {
+        "key": "Env?",
+        "question": "Which environment?",
+        "options": (("dev", ""), ("staging", ""), ("prod", "")),
+    }
+    fields.update(overrides)
+    return QuestionSpec(**fields)
+
+
+def _picker_text(picker: Any, width: int = 100) -> str:
+    return "".join(text for _, text in picker.render(width))
 
 
 @pytest.mark.asyncio
-async def test_escape_with_no_running_task_calls_the_idle_hook() -> None:
-    # A prompt for a turn started elsewhere has no local task for Esc to
-    # cancel; the idle hook is how it gets dismissed.
-    host = TerminalHost(model_name="test")
-    calls: list[str] = []
-    host.on_idle_escape = lambda: calls.append("idle")
+async def test_question_picker_answers_follow_the_web_form() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
 
-    _escape_handler(host)(None)
-    assert calls == ["idle"]
+    single = QuestionPicker([_env_question()])
+    single.move(-1)  # wraps to the "Type something" row
+    assert single.on_custom_row()
+    assert single.answer("") is False, "an empty custom answer must not count"
+    assert single.answer("  qa  ") is True
+    assert await single.future == {"Env?": "qa"}
 
-    busy = asyncio.create_task(asyncio.Event().wait())
-    host._tasks.append(busy)
-    _escape_handler(host)(None)
-    await asyncio.sleep(0)
-    assert busy.cancelled()
-    assert calls == ["idle"], "Esc must cancel a running turn instead of the idle hook"
+    multi = QuestionPicker([_env_question(multi_select=True)])
+    multi.move(1)
+    assert multi.answer("") is True, "Enter with nothing checked takes the highlight"
+    assert await multi.future == {"Env?": ["staging"]}
+
+    typed = QuestionPicker([_env_question(multi_select=True)])
+    typed.toggle()
+    assert typed.answer("eu-1") is True
+    assert await typed.future == {"Env?": ["dev", "eu-1"]}
+
+    closed = QuestionPicker([_env_question(allow_custom=False)])
+    closed.note_typing("x")
+    assert closed.row_count() == 3 and not closed.on_custom_row()
+    assert "Type something" not in _picker_text(closed)
+
+    editor = QuestionPicker([_env_question(options=(), text_default="draft")])
+    assert editor.answer("") is True, "an editor answer may be empty"
+    assert await editor.future == {"Env?": ""}
 
 
 @pytest.mark.asyncio
-async def test_open_prompt_receives_lines_exactly_as_typed() -> None:
-    # An editor answer keeps its whitespace, a bare Enter reaches the prompt
-    # (it keeps the prefill) instead of being dropped, and pastes still expand.
+async def test_question_picker_walks_several_questions() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    picker = QuestionPicker([_env_question(), _env_question(key="Region?", question="Region?")])
+    assert "question 1 of 2" in _picker_text(picker)
+    picker.move(2)
+    assert picker.answer("") is True
+    assert not picker.future.done()
+    assert "question 2 of 2" in _picker_text(picker)
+    assert picker.row == 0, "each question starts on its first option"
+    assert picker.answer("") is True
+    assert await picker.future == {"Env?": "prod", "Region?": "dev"}
+
+
+@pytest.mark.asyncio
+async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    many = QuestionPicker(
+        [_env_question(options=tuple((f"opt{i}", "") for i in range(12)), allow_custom=False)]
+    )
+    many.move(-1)  # wraps to the last option, which scrolls into view
+    shown = _picker_text(many)
+    assert "▸ 12. opt11" in shown and "1. opt0" not in shown
+    wide = QuestionPicker([_env_question(options=(("界" * 80, ""),))])
+    assert all(get_cwidth(text.rstrip("\n")) <= 40 for _, text in wide.render(40))
+
+
+@pytest.mark.asyncio
+async def test_ask_questions_sets_the_draft_aside_and_restores_it() -> None:
     host = TerminalHost(model_name="test")
-    host.raw_input_wanted = lambda: True
-    lines = iter(["  spaced  ", "", "PASTE"])
+    buffer = host._prompt.default_buffer
+    buffer.text = "half-typed chat message"
 
-    async def _read_input() -> str:
-        try:
-            line = next(lines)
-        except StopIteration:
-            raise EOFError from None
-        if line == "PASTE":  # pasted into this line's buffer, as bracketed paste does
-            pasted = host._register_pasted_block("line one\nline two\nline three\nline four")
-            line = f"see {pasted.placeholder}"
-        return line
-
-    host._read_input = _read_input  # type: ignore[method-assign]
-    received: list[str] = []
-
-    async def _handler(text: str, attachments: Any = None) -> None:
-        received.append(text)
-
-    with patch.object(host, "_output"):
-        await host.run(_handler)
+    asking = asyncio.create_task(host.ask_questions([_env_question()]))
     await asyncio.sleep(0)
-    # A long paste reaches the prompt as its content, not the placeholder.
-    assert received == ["  spaced  ", "", "see line one\nline two\nline three\nline four"]
-    assert host._pasted_blocks == []
+    assert host._question_picker is not None
+    assert buffer.text == "", "the selector starts with an empty input line"
+    host._move_question_highlight(1)
+    host._answer_question(buffer)
+
+    assert await asking == {"Env?": "staging"}
+    assert host._question_picker is None
+    assert buffer.text == "half-typed chat message"
+
+
+@pytest.mark.asyncio
+async def test_dismiss_questions_returns_none() -> None:
+    host = TerminalHost(model_name="test")
+    asking = asyncio.create_task(host.ask_questions([_env_question()]))
+    await asyncio.sleep(0)
+    host.dismiss_questions()
+    assert await asking is None
+    assert host._question_picker is None
+
+
+@pytest.mark.asyncio
+async def test_selector_owns_the_arrow_keys_while_open() -> None:
+    # Down on an empty line would otherwise open the sub-agents menu (and Up
+    # would recall history); the selector's bindings must win.
+    host = TerminalHost(model_name="test")
+    host.has_any_subagents = lambda: True  # type: ignore[method-assign]
+
+    def _active(key: str) -> str:
+        matches = [
+            b for b in host._kb.bindings if [str(k) for k in b.keys] == [key] and b.filter()
+        ]
+        return matches[-1].handler.__name__  # prompt_toolkit runs the last match
+
+    assert _active("Keys.Down") == "_open_menu"
+    asking = asyncio.create_task(host.ask_questions([_env_question()]))
+    await asyncio.sleep(0)
+    assert _active("Keys.Down") == "_picker_next"
+    assert _active("Keys.Up") == "_picker_prev"
+    host.dismiss_questions()
+    await asking
