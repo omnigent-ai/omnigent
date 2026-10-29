@@ -208,8 +208,13 @@ describe("ApprovePage states", () => {
       });
       expect(screen.getByText("Answer in the terminal")).toBeInTheDocument();
       fetch.mockResolvedValue(jsonResponse(next));
+      // A held prompt can wait for a long time, so it polls slower than a native re-park.
       await act(async () => {
         await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(screen.getByText("Answer in the terminal")).toBeInTheDocument();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(4000);
       });
       expect(screen.queryByText("Answer in the terminal")).not.toBeInTheDocument();
       if (next.status === "resolved") {
@@ -325,6 +330,40 @@ describe("ApprovePage submission", () => {
     fireEvent.click(await screen.findByRole("button", { name: /Reject/ }));
     expect(await screen.findByText(/Network error:/)).toBeInTheDocument();
   });
+});
+
+it("reports a 409 even when a stale poll fires before the reload", async () => {
+  vi.useFakeTimers();
+  const waiting = {
+    status: "pending",
+    policy_name: "kiro_native_permission",
+    message: "Approve pwd",
+    native_delivery: { state: "unconfirmed", attempt: "retry-2", action: "accept" },
+  };
+  let finishSubmit!: (response: Response) => void;
+  const fetch = vi.mocked(identity.authenticatedFetch);
+  fetch.mockImplementation(async (_url, init) => {
+    if (init?.method === "POST") {
+      return new Promise<Response>((resolve) => {
+        finishSubmit = resolve;
+      });
+    }
+    return jsonResponse(waiting);
+  });
+  try {
+    await act(async () => {
+      renderPage();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Retry sending approval" }));
+    await act(async () => {
+      finishSubmit(jsonResponse(null, { ok: false, status: 409 }));
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getByText("Resolve failed: 409")).toBeInTheDocument();
+  } finally {
+    cleanup();
+    vi.useRealTimers();
+  }
 });
 
 it.each(["success", "http error", "network error"])(

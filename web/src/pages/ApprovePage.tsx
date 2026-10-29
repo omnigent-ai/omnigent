@@ -60,8 +60,7 @@ export function ApprovePage() {
     elicitationId: string;
   }>();
   const [state, setState] = useState<PageState>({ kind: "loading" });
-  const [reloadCount, setReloadCount] = useState(0);
-  const refusedResolveStatus = useRef<number | undefined>(undefined);
+  const [refusal, setRefusal] = useState<{ status: number }>();
   const submission = useRef<{ revision: number; pending: boolean; attempt?: string }>({
     revision: 0,
     pending: false,
@@ -74,12 +73,14 @@ export function ApprovePage() {
     }
     let cancelled = false;
     let polling = false;
+    let pollDelay = 1000;
     let nativeDeliverySeen = false;
+    let unreportedRefusal = refusal?.status;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = async () => {
       const revision = submission.current.revision;
-      const refusedStatus = refusedResolveStatus.current;
-      refusedResolveStatus.current = undefined;
+      const refusedStatus = unreportedRefusal;
+      unreportedRefusal = undefined;
       try {
         const res = await authenticatedFetch(
           `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}`,
@@ -99,6 +100,8 @@ export function ApprovePage() {
           (nativeDeliverySeen && data.resolution !== "confirmed") ||
           Boolean(data.terminal_fallback) ||
           (data.status !== "resolved" && revision !== submission.current.revision);
+        // A terminal hold lasts until the user answers there, so poll it more slowly.
+        pollDelay = data.terminal_fallback ? 5000 : 1000;
         if (data.status === "resolved") {
           submission.current = { revision: submission.current.revision + 1, pending: false };
           setState({ kind: polling ? "recovering" : "resolved" });
@@ -121,7 +124,7 @@ export function ApprovePage() {
           setState({ kind: "error", message: `Failed to load: ${String(err)}` });
         }
       } finally {
-        if (!cancelled && polling) timer = setTimeout(() => void load(), 1000);
+        if (!cancelled && polling) timer = setTimeout(() => void load(), pollDelay);
       }
     };
     void load();
@@ -129,7 +132,7 @@ export function ApprovePage() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [sessionId, elicitationId, reloadCount]);
+  }, [sessionId, elicitationId, refusal]);
 
   const submit = useCallback(
     async (
@@ -171,9 +174,8 @@ export function ApprovePage() {
         if (!res.ok && submission.current === submitted) {
           if (res.status === 409) {
             // The prompt may have moved to the agent's terminal; reload to check.
-            refusedResolveStatus.current = res.status;
             setState({ kind: "loading" });
-            setReloadCount((count) => count + 1);
+            setRefusal({ status: res.status });
           } else {
             setState({ kind: "error", message: `Resolve failed: ${res.status}` });
           }
