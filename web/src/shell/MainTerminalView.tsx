@@ -247,24 +247,21 @@ export function MainTerminalView({
     !terminalsFetching &&
     resumeAvailable &&
     !recoveryRef.current.attempted;
+  const agentHealthy = agentTerminal !== null && !runnerOffline;
   useEffect(() => {
     const recovery = recoveryRef.current;
-    if (
-      !resumePending &&
-      ((!visible && resumeError === null) || (agentTerminal !== null && !runnerOffline))
-    ) {
+    if (resumePending) return;
+    if (!visible && resumeError === null) recovery.attempted = false;
+    if (!agentHealthy || !recovery.attempted) return;
+    // A briefly restored terminal must not create a crash/restart loop.
+    const timeout = window.setTimeout(() => {
       recovery.attempted = false;
-    }
+    }, 30_000);
+    return () => window.clearTimeout(timeout);
+  }, [conversationId, visible, resumePending, resumeError, agentHealthy]);
+  useEffect(() => {
     if (autoResumeAvailable) void handleResume(true).catch(() => {});
-  }, [
-    autoResumeAvailable,
-    handleResume,
-    visible,
-    resumePending,
-    resumeError,
-    agentTerminal,
-    runnerOffline,
-  ]);
+  }, [autoResumeAvailable, handleResume]);
   useEffect(() => {
     if (resumePhase !== "connecting") return;
     if (agentTerminal !== null) {

@@ -1336,22 +1336,30 @@ describe("late direct-attach advert", () => {
 });
 
 describe("closed bridge overlay", () => {
-  it("redials a stopped bridge after external recovery and preserves an already connected pane", async () => {
-    const props = { sessionId: "conv_abc", terminalId: "terminal_codex_main" };
-    const { rerender } = render(<TerminalView {...props} resumeGeneration={0} />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
-    const stopped = terminalSessionMock.instances[0];
-    act(() => stopped.onState({ kind: "closed", reason: "not found", code: 4404 }));
+  it.each<ConnectionState>([
+    { kind: "connecting" },
+    { kind: "closed", reason: "not found", code: 4404 },
+    { kind: "error" },
+  ])(
+    "redials a $kind bridge after external recovery and preserves an already connected pane",
+    async (state) => {
+      const props = { sessionId: "conv_abc", terminalId: "terminal_codex_main" };
+      const { rerender } = render(<TerminalView {...props} resumeGeneration={0} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      const previous = terminalSessionMock.instances[0];
+      act(() => previous.onState(state));
 
-    rerender(<TerminalView {...props} resumeGeneration={1} />);
-    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
-    expect(stopped.dispose).toHaveBeenCalledTimes(1);
-    const connected = terminalSessionMock.instances[1];
-    act(() => connected.onState({ kind: "connected" }));
-    rerender(<TerminalView {...props} resumeGeneration={2} />);
-    expect(terminalSessionMock.instances).toHaveLength(2);
-    expect(connected.dispose).not.toHaveBeenCalled();
-  });
+      rerender(<TerminalView {...props} resumeGeneration={1} />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+      expect(previous.dispose).toHaveBeenCalledTimes(1);
+      const connected = terminalSessionMock.instances[1];
+      act(() => connected.onState({ kind: "connected" }));
+      rerender(<TerminalView {...props} resumeGeneration={2} />);
+      await act(async () => {});
+      expect(terminalSessionMock.instances).toHaveLength(2);
+      expect(connected.dispose).not.toHaveBeenCalled();
+    },
+  );
 
   it("redials once when its resume callback also signals successful external recovery", async () => {
     const onResume = vi.fn().mockResolvedValue(undefined);

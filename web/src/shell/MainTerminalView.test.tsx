@@ -348,20 +348,33 @@ describe("MainTerminalView — automatic recovery", () => {
     expect(onResume).toHaveBeenCalledTimes(2);
   });
 
-  it("permits one new recovery after the restored terminal disappears", async () => {
-    hostOnlineMock.mockReturnValue(true);
-    const onResume = vi.fn().mockResolvedValue(undefined);
-    const props = { terminals: [], runnerOnline: true, onResume };
-    let rerender!: ReturnType<typeof renderView>["rerender"];
-    await act(async () => {
-      ({ rerender } = renderView(props));
-    });
-    rerender(viewTree({ ...props, terminals: [REPL_TERMINAL] }));
-    expect(await screen.findByTestId("terminal-view")).toBeInTheDocument();
-    await act(async () => rerender(viewTree(props)));
-    expect(onResume).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
-  });
+  it.each([500, 30_000])(
+    "only rearms recovery after sustained health (%i ms)",
+    async (healthyMs) => {
+      vi.useFakeTimers();
+      hostOnlineMock.mockReturnValue(true);
+      const onResume = vi.fn().mockResolvedValue(undefined);
+      const props = { terminals: [], runnerOnline: true, onResume };
+      let rerender!: ReturnType<typeof renderView>["rerender"];
+      await act(async () => {
+        ({ rerender } = renderView(props));
+      });
+      await act(async () => rerender(viewTree({ ...props, terminals: [REPL_TERMINAL] })));
+      expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
+      await act(async () => vi.advanceTimersByTime(healthyMs / 2));
+      rerender(viewTree({ ...props, terminals: [{ ...REPL_TERMINAL }] }));
+      await act(async () => vi.advanceTimersByTime(healthyMs / 2));
+      await act(async () => rerender(viewTree(props)));
+      if (healthyMs === 30_000) {
+        expect(onResume).toHaveBeenCalledTimes(2);
+        expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+      } else {
+        expect(onResume).toHaveBeenCalledTimes(1);
+        expect(screen.queryByRole("status")).toBeNull();
+        expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+      }
+    },
+  );
 
   it("offers a retry if a successful recovery never delivers a terminal", async () => {
     vi.useFakeTimers();

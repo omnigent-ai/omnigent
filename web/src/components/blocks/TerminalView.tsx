@@ -651,7 +651,7 @@ export function TerminalView({
     if (resumeGeneration === undefined) return;
     setResumeError(null);
     const current = stateRef.current;
-    if (current.kind !== "closed" && current.kind !== "error") return;
+    if (current.kind === "connected") return;
     reconnectAttemptsRef.current = 0;
     disposeActiveSession();
     setConnectAttempt((attempt) => attempt + 1);

@@ -13,6 +13,8 @@ reattach when the session moves to another host.
   and returns to chat with the terminal's content kept. States: starting up
   (no Resume action), automatically restarting on an online host, stopped
   (Resume offered after recovery fails or when the host is offline), connected.
+  A recovered terminal must stay healthy for 30 seconds before another outage
+  can trigger automatic recovery while the view stays open.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
