@@ -670,6 +670,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("runner_disconnected", "host dropped"),
         ("connection_error", "connection"),
         ("context_length_exceeded", "context window"),
+        ("input_too_large", "exceeds the agent's input limit"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("transient_upstream_error", "temporary error"),
         ("client_update_required", "too old for the selected model"),

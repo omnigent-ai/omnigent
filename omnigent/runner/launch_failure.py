@@ -492,6 +492,10 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     CODEX_COMPACTION_MODEL_FAILED: (
         "Codex couldn't compact the conversation on the previous model, so this turn didn't run."
     ),
+    "input_too_large": (
+        "The message exceeds the agent's input limit. Shorten it or split large "
+        "pasted content across turns."
+    ),
     "databricks_sign_in_pending": "The agent is waiting for a Databricks sign-in.",
     "agent_startup_pending": "The agent is still starting in the session terminal.",
     "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",
