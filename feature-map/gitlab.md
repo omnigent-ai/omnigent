@@ -25,6 +25,10 @@ reads the MR; agent CLI and MCP writes associate it with the session.
 - `canvas`: enable Canvas, open it, and follow an MR link on a session card.
 - `native-hook`: create or update an MR through a Claude or Codex native session.
 
+Select a row in the PR list to open its details; **All pull requests** returns
+to the list. Stored metadata and row actions remain available while the host
+is offline; checks and merge controls resume after reconnection.
+
 ## Driving it with the repro environment
 
 Preconditions: use the [Verify Omnigent skill](skills/verify-omnigent/SKILL.md)
@@ -35,7 +39,9 @@ responses; they exercise the actual shared UI without contacting GitLab.
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_panel_summary_and_diff`
   shows `!7` and checks, opens Comments, then opens a readable diff beside an
   empty file's no-text-diff notice and expands unchanged context with the pinned
-  MR revisions. Record every variant.
+  MR revisions. The rail and mobile reconnect variants first show stored titles/status without
+  live checks, open the offline summary, return to the list, then restore live
+  data after Refresh. Record every variant.
 - Associations:
   `tests/e2e_ui/gitlab/test_gitlab_panel.py::test_gitlab_link_select_unlink`
   attaches a second project, changes selection, and removes it.
