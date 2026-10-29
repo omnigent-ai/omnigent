@@ -18,9 +18,9 @@ will start instantiating them as those phases ship.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from datetime import UTC
-from typing import Any
+from typing import Any, Protocol, TypeVar
 
 import cachetools
 
@@ -49,7 +49,7 @@ from omnigent.spec.types import (
     Phase,
     PolicySpec,
 )
-from omnigent.stores.conversation_store import ConversationStore, DailyCostState
+from omnigent.stores.conversation_store import ConversationStore, DailyCostState, TreeUsageNode
 from omnigent.stores.policy_store import PolicyStore
 
 _logger = logging.getLogger(__name__)
@@ -212,6 +212,72 @@ def _needs_subtree_usage(specs: list[PolicySpec]) -> bool:
         and s.function is not None
         and s.function.path == _SUBAGENT_COST_POLICY_PATH
         for s in specs
+    )
+
+
+# Policies verified never to read ``event["context"]["usage"]``. Anything else
+# (CEL, cost builtins, custom callables) is assumed to, and seeds usage eagerly.
+_USAGE_FREE_POLICY_PATHS = frozenset(
+    {
+        "omnigent.policies.builtins.safety.ask_on_add_policy",
+        "omnigent.policies.builtins.safety.ask_on_scheduled_task_change",
+    }
+)
+
+
+def _policies_read_usage(specs: list[PolicySpec]) -> bool:
+    """
+    Return whether any policy in *specs* may read the session usage seed.
+
+    Conservative: only policies on :data:`_USAGE_FREE_POLICY_PATHS` are
+    known not to, so an unrecognised policy always gets its seed.
+
+    :param specs: The merged policy specs for the engine.
+    :returns: ``False`` only when every policy is known not to read usage.
+    """
+    return any(
+        not (
+            isinstance(s, FunctionPolicySpec)
+            and s.function is not None
+            and s.function.path in _USAGE_FREE_POLICY_PATHS
+        )
+        for s in specs
+    )
+
+
+def _deferred_usage_seed(
+    conversation_store: ConversationStore,
+    root_conversation_id: str,
+    *,
+    root_present: bool,
+) -> Callable[[], dict[str, float]]:
+    """
+    Build the loader for a usage seed no policy reads.
+
+    Computes what the eager path would have, at first use: the whole-tree
+    enforcement total, or empty when the root row was missing.
+
+    :param conversation_store: Store to read the tree from.
+    :param root_conversation_id: The verified tree root.
+    :param root_present: Whether the root row existed at build time.
+    :returns: A zero-argument loader for :class:`PolicyEngine`.
+    """
+
+    def load() -> dict[str, float]:
+        if not root_present:
+            return {}
+        tree = conversation_store.list_tree_usage(root_conversation_id)
+        return _normalize_usage_for_engine(_sum_subtree_usage(tree, root_conversation_id))
+
+    return load
+
+
+def _disappeared(conversation_id: str) -> OmnigentError:
+    """The fail-closed error for a conversation deleted mid-build."""
+    return OmnigentError(
+        f"Conversation {conversation_id!r} disappeared while building its "
+        f"policy engine; refusing to authorize from a stale snapshot.",
+        code=ErrorCode.CONFLICT,
     )
 
 
@@ -615,23 +681,27 @@ def build_policy_engine(
         if conversation is not None
         else conversation_store.get_conversation(conversation_id)
     )
-    # The row in hand only SUGGESTS a tree root. Loading the tree verifies it
-    # and reports the root actually used, so everything downstream — the rows,
-    # the root's own policies, the accounting sums — comes from one snapshot.
-    # Deriving the root from the pre-refresh row while taking rows from a
-    # corrected tree was the defect: a conversation deleted and recreated under
-    # another root seeded the OLD tree's spend.
-    verified = (
-        load_verified_session_tree(
-            conversation_id,
-            conversation_store,
-            conv.root_conversation_id if conv is not None else None,
+    # Freshness contract: only identity (id, root hint) is trusted from the row in
+    # hand; every mutable field the engine decides from, including the root
+    # itself, comes from one bulk read of this conversation and its hinted root.
+    fresh_rows: dict[str, Conversation] = {}
+    root_conversation_id = conversation_id
+    if conv is not None:
+        fresh_rows = conversation_store.get_conversations(
+            [conversation_id, conv.root_conversation_id]
         )
-        if conv is not None
-        else VerifiedSessionTree([], conversation_id, False)
-    )
-    tree = verified.rows
-    root_conversation_id = verified.root_conversation_id
+        fresh_self = fresh_rows.get(conversation_id)
+        if fresh_self is None:
+            # Deleted mid-request: authorizing from the earlier copy decides on
+            # state that no longer exists, and from empty state would seed a $0
+            # budget and ALLOW. Fail closed.
+            raise _disappeared(conversation_id)
+        conv = fresh_self
+        root_conversation_id = conv.root_conversation_id
+        if root_conversation_id not in fresh_rows:
+            root_row = conversation_store.get_conversation(root_conversation_id)
+            if root_row is not None:
+                fresh_rows[root_conversation_id] = root_row
     db_default_policy_specs = _load_default_policy_specs(policy_store)
     admin_policy_specs: list[PolicySpec] = db_default_policy_specs + list(default_policies or [])
     all_policy_specs = session_policy_specs + agent_policy_specs + admin_policy_specs
@@ -642,46 +712,6 @@ def build_policy_engine(
     all_policy_specs.extend(_REQUIRED_APPROVAL_SPECS)
 
     label_defs = dict((guardrails.labels or {}) if guardrails else {})
-    # One conversation read (``conv``, resolved above for policy
-    # inheritance) and ONE spawn-tree load feed everything below: labels,
-    # session state (own + inherited root keys), both usage seeds, and the
-    # model override — on the single-page happy path, which is nearly every
-    # build; a paged tree pays one further confirming read (see below). The
-    # helpers each re-fetched the same rows before — ~4x conversation reads
-    # plus two identical tree loads per build, the dominant cost of a
-    # policies/evaluate call.
-    # Freshness contract, applied to EVERY row this function decides from,
-    # regardless of how it arrived: ONLY immutable identity (id,
-    # root_conversation_id) survives from the row read above. Every mutable
-    # field — labels, session_state, model_override, agent_id — is taken from
-    # the tree load, which happened later and is therefore the newest read.
-    #
-    # The provenance of the earlier row does not change the hazard. A caller's
-    # preload and this function's own ``get_conversation`` are both snapshots
-    # taken before the tree scan, so both can be stale by the time a decision
-    # is made; gating the refresh on ``conversation is not None`` closed the
-    # window on one path and left the identical window open on the other.
-    #
-    # The tree load includes archived rows (archived conversations still hold
-    # spend), so a row missing from the tree has genuinely been deleted.
-    # Re-read once to confirm, then fail closed — never fall back to the
-    # earlier copy, which would authorize from state captured before whatever
-    # removed the row.
-    if conv is not None:
-        fresh_self = next((c for c in tree if c.id == conversation_id), None)
-        if fresh_self is None:
-            fresh_self = conversation_store.get_conversation(conversation_id)
-        if fresh_self is None:
-            # The row existed moments ago and is now gone (deleted
-            # mid-request). Authorizing from the earlier copy would decide
-            # against state that no longer exists; authorizing from empty
-            # state would seed a $0 budget and ALLOW. Fail closed.
-            raise OmnigentError(
-                f"Conversation {conversation_id!r} disappeared while building its "
-                f"policy engine; refusing to authorize from a stale snapshot.",
-                code=ErrorCode.CONFLICT,
-            )
-        conv = fresh_self
     # Must run AFTER the refresh: comparing the earlier (stale) row would accept
     # a rebind in the window. Exact equality: a fresh row bound to ``None``, or no
     # fresh row at all, is a mismatch too.
@@ -694,25 +724,6 @@ def build_policy_engine(
                 f"engine would enforce is stale. Re-resolve and retry.",
                 code=ErrorCode.CONFLICT,
             )
-    # A paged tree does not share one read instant: rows on page one were read
-    # before page two, so "the tree read is newer than the caller's row" holds
-    # for the tree but not for any row inside it. Confirm identity once when
-    # that is actually the case — single-page trees, which is nearly all of
-    # them, pay nothing.
-    if conv is not None and verified.paged:
-        confirmed = conversation_store.get_conversation(conversation_id)
-        if (
-            confirmed is None
-            or confirmed.root_conversation_id != root_conversation_id
-            or confirmed.agent_id != conv.agent_id
-        ):
-            raise OmnigentError(
-                f"Conversation {conversation_id!r} moved while its spawn tree was "
-                f"being paged; refusing to authorize against a tree assembled "
-                f"across the change.",
-                code=ErrorCode.CONFLICT,
-            )
-        conv = confirmed
     # A sub-agent conversation runs the CHILD agent's spec, but every
     # engine-build site resolves the session's agent binding to the ROOT
     # bundle spec. Resolve ``conv.sub_agent_name`` to the child spec so the
@@ -758,16 +769,10 @@ def build_policy_engine(
             + admin_policy_specs
             + list(_REQUIRED_APPROVAL_SPECS)
         )
+    # Read with self above. A missing root is genuinely gone (deleted mid-request).
     root_conv = (
-        conv
-        if root_conversation_id == conversation_id
-        else next((c for c in tree if c.id == root_conversation_id), None)
+        conv if root_conversation_id == conversation_id else fresh_rows.get(root_conversation_id)
     )
-    if root_conv is None and conv is not None and root_conversation_id != conversation_id:
-        # The tree now includes archived rows, so a missing root means the row
-        # is genuinely gone (deleted mid-request). Read once to confirm before
-        # deciding — never silently proceed on an absent root.
-        root_conv = conversation_store.get_conversation(root_conversation_id)
     initial_labels = _seed_and_load_labels(
         conversation_id=conversation_id,
         label_defs=label_defs,
@@ -789,26 +794,44 @@ def build_policy_engine(
         ):
             if _root_key in root_state:
                 initial_session_state[_root_key] = root_state[_root_key]
-    # Gating is SESSION-wide: seed from the whole spawn-tree total so a
-    # sub-agent gates against the session's full spend (parent + siblings),
-    # not just its own subtree. The cost read is the enforcement total
-    # (in-flight sub-agent spend); see _policy_usage_seed, whose semantics
-    # (including the empty seed when the root row is missing) this
-    # preserves while reusing the single tree load.
-    initial_usage = (
-        _normalize_usage_for_engine(_sum_subtree_usage(tree, root_conversation_id))
-        if conv is not None and root_conv is not None
-        else {}
-    )
-    # Conditional injection (#1a): only compute subtree usage when a
-    # subagent_cost_budget policy is present. Per-node DISPLAY-rooted seed:
-    # same tree, rooted at the evaluated node instead of the root.
+    # Gating is session-wide: seed the enforcement total of the whole spawn tree
+    # (empty when the root row is missing). The tree is read only when some
+    # policy may read usage; otherwise the seed is deferred until first use.
+    initial_usage: dict[str, float] | None = None
+    usage_loader: Callable[[], dict[str, float]] | None = None
     initial_subtree_usage: dict[str, float] | None = None
-    if _needs_subtree_usage(all_policy_specs):
-        initial_subtree_usage = (
-            _normalize_usage_for_engine(_sum_subtree_usage(tree, conversation_id))
-            if conv is not None
+    if conv is None:
+        initial_usage = {}
+        if _needs_subtree_usage(all_policy_specs):
+            initial_subtree_usage = {}
+    elif _policies_read_usage(all_policy_specs):
+        tree = conversation_store.list_tree_usage(root_conversation_id)
+        if not any(node.id == conversation_id for node in tree):
+            # Deleted or recreated elsewhere after the row read above: the
+            # sums would belong to a tree this conversation has left.
+            if conversation_store.get_conversation(conversation_id) is None:
+                raise _disappeared(conversation_id)
+            raise OmnigentError(
+                f"Conversation {conversation_id!r} moved while its spawn tree was "
+                f"being read; refusing to authorize against a tree assembled "
+                f"across the change.",
+                code=ErrorCode.CONFLICT,
+            )
+        initial_usage = (
+            _normalize_usage_for_engine(_sum_subtree_usage(tree, root_conversation_id))
+            if root_conv is not None
             else {}
+        )
+        # Conditional injection: only compute subtree usage when a
+        # subagent_cost_budget policy is present. Per-node seed over the same
+        # tree, rooted at the evaluated node instead of the root.
+        if _needs_subtree_usage(all_policy_specs):
+            initial_subtree_usage = _normalize_usage_for_engine(
+                _sum_subtree_usage(tree, conversation_id)
+            )
+    else:
+        usage_loader = _deferred_usage_seed(
+            conversation_store, root_conversation_id, root_present=root_conv is not None
         )
     # Conditional injection: only load daily cost records when cost-budget
     # policies are present. Find the oldest period across all policies and
@@ -889,6 +912,7 @@ def build_policy_engine(
         initial_labels=initial_labels,
         initial_session_state=initial_session_state,
         initial_usage=initial_usage,
+        usage_loader=usage_loader,
         initial_subtree_usage=initial_subtree_usage,
         initial_user_daily_cost=initial_user_daily_cost,
         token_pricing=token_pricing,
@@ -1201,9 +1225,9 @@ def _load_session_state(
     return dict(conv.session_state)
 
 
-# Page size for walking a spawn tree when summing sub-agent usage.
-# Sub-agent trees are small in practice, but we still paginate so a
-# large tree is not silently truncated (see load_session_usage).
+# Page size for the full-row spawn-tree walk (the usage report). Paginated so
+# a large tree is not silently truncated; accounting reads use the unpaged
+# narrow ``list_tree_usage`` instead.
 _SUBTREE_USAGE_PAGE_SIZE = 100
 
 # Usage counters summed across a conversation subtree. Restricted to the
@@ -1325,7 +1349,12 @@ def load_session_usage_and_tree(
         :func:`load_session_usage` would return, and every conversation in
         the tree it was summed from.
     """
-    tree = load_session_tree(conversation_id, conversation_store, root_conversation_id)
+    tree, _ = _verified_tree_rows(
+        conversation_id,
+        conversation_store,
+        root_conversation_id,
+        lambda root: _load_tree_conversations(root, conversation_store),
+    )
     return _sum_subtree_usage(tree, conversation_id), tree
 
 
@@ -1333,7 +1362,7 @@ def load_session_tree(
     conversation_id: str,
     conversation_store: ConversationStore,
     root_conversation_id: str | None = None,
-) -> list[Conversation]:
+) -> list[TreeUsageNode]:
     """
     Load the spawn tree *conversation_id* belongs to, verifying the root.
 
@@ -1355,75 +1384,70 @@ def load_session_tree(
     :param root_conversation_id: Caller-supplied tree root, validated as
         above. ``None`` resolves the root here.
     :returns: Every conversation in the tree (root plus all descendants,
-        archived included). Empty when the conversation does not exist.
+        archived included), narrowed to usage fields. Empty when the
+        conversation does not exist.
     """
-    return load_verified_session_tree(
-        conversation_id, conversation_store, root_conversation_id
-    ).rows
+    rows, _ = _verified_tree_rows(
+        conversation_id,
+        conversation_store,
+        root_conversation_id,
+        conversation_store.list_tree_usage,
+    )
+    return rows
 
 
-@dataclass(frozen=True)
-class VerifiedSessionTree:
-    """A spawn tree together with what is known about how it was loaded.
+class _TreeRow(Protocol):
+    """The fields tree accounting reads; both row shapes provide them."""
 
-    :param rows: Every conversation in the tree, archived included. Empty
-        when the conversation does not exist.
-    :param root_conversation_id: The root the rows were actually loaded
-        from, which is not necessarily the one the caller suggested.
-    :param paged: Whether the listing needed more than one page. Rows on an
-        earlier page were read before rows on a later one, so for a paged
-        tree "the tree read is newer than the caller's row" holds for the
-        tree as a whole but not for any individual row in it.
-    """
+    @property
+    def id(self) -> str: ...
 
-    rows: list[Conversation]
-    root_conversation_id: str
-    paged: bool
+    @property
+    def parent_conversation_id(self) -> str | None: ...
+
+    @property
+    def session_usage(self) -> dict[str, Any]: ...
 
 
-def load_verified_session_tree(
+_RowT = TypeVar("_RowT", bound=_TreeRow)
+
+
+def _verified_tree_rows(
     conversation_id: str,
     conversation_store: ConversationStore,
-    root_conversation_id: str | None = None,
-) -> VerifiedSessionTree:
+    root_conversation_id: str | None,
+    load_tree: Callable[[str], list[_RowT]],
+) -> tuple[list[_RowT], str]:
     """
-    Load a spawn tree and report the root it came from.
-
-    Same verification as :func:`load_session_tree`, but callers that derive
-    more than the sums from a tree — the tree root itself, the policies
-    attached to that root — need to know which root was used, because a
-    supplied one may have been discarded. Deriving those from the caller's
-    root while taking the rows from a corrected tree mixes two epochs.
+    Load the tree *conversation_id* belongs to, treating the root as a hint.
 
     :param conversation_id: The conversation whose tree is wanted.
-    :param conversation_store: Store to read from.
-    :param root_conversation_id: Caller-supplied root, treated as a hint.
-    :returns: The rows, the root they came from, and whether it paged.
+    :param conversation_store: Store for the root-resolving row read.
+    :param root_conversation_id: Caller-supplied root, or ``None``.
+    :param load_tree: Loads every row sharing a root id.
+    :returns: ``(rows, root)`` — empty rows when the conversation is gone.
     """
     if root_conversation_id is None:
         conv = conversation_store.get_conversation(conversation_id)
         if conv is None:
-            return VerifiedSessionTree([], conversation_id, False)
-        root_conversation_id = conv.root_conversation_id
-        rows, paged = _load_tree_pages(root_conversation_id, conversation_store)
-        return VerifiedSessionTree(rows, root_conversation_id, paged)
+            return [], conversation_id
+        return load_tree(conv.root_conversation_id), conv.root_conversation_id
 
-    rows, paged = _load_tree_pages(root_conversation_id, conversation_store)
+    rows = load_tree(root_conversation_id)
     if any(c.id == conversation_id for c in rows):
-        return VerifiedSessionTree(rows, root_conversation_id, paged)
+        return rows, root_conversation_id
     # Not in the tree the supplied root produced: either this conversation
     # is gone, or it now lives in a different tree. Resolve it once.
     conv = conversation_store.get_conversation(conversation_id)
     if conv is None:
-        return VerifiedSessionTree([], root_conversation_id, paged)
+        return [], root_conversation_id
     if conv.root_conversation_id == root_conversation_id:
-        return VerifiedSessionTree(rows, root_conversation_id, paged)
-    rows, paged = _load_tree_pages(conv.root_conversation_id, conversation_store)
-    return VerifiedSessionTree(rows, conv.root_conversation_id, paged)
+        return rows, root_conversation_id
+    return load_tree(conv.root_conversation_id), conv.root_conversation_id
 
 
 def _sum_subtree_usage(
-    tree: list[Conversation],
+    tree: Sequence[_TreeRow],
     conversation_id: str,
 ) -> dict[str, Any]:
     """
@@ -1578,46 +1602,8 @@ def _load_tree_conversations(
     return convs
 
 
-@restart_on_stale_cursor
-def _load_tree_pages(
-    root_conversation_id: str,
-    conversation_store: ConversationStore,
-) -> tuple[list[Conversation], bool]:
-    """
-    Page through a spawn tree, reporting whether more than one page was read.
-
-    A delete landing on the page cursor mid-walk restarts the walk (via
-    :func:`restart_on_stale_cursor`) instead of silently dropping the
-    remaining rows — a truncated tree under-counts spend and can move a
-    budget gate.
-
-    :param root_conversation_id: The tree's root conversation id.
-    :param conversation_store: Store to read from.
-    :returns: ``(rows, paged)`` — ``paged`` is ``True`` when the listing
-        needed a second page, which means the rows do not share one read
-        instant.
-    """
-    convs: list[Conversation] = []
-    after: str | None = None
-    pages = 0
-    while True:
-        page = conversation_store.list_conversations(
-            limit=_SUBTREE_USAGE_PAGE_SIZE,
-            after=after,
-            kind=None,
-            root_conversation_id=root_conversation_id,
-            include_archived=True,
-        )
-        pages += 1
-        convs.extend(page.data)
-        if not page.has_more or page.last_id is None:
-            break
-        after = page.last_id
-    return convs, pages > 1
-
-
 def _subtree_conversation_ids(
-    tree: list[Conversation],
+    tree: Sequence[_TreeRow],
     conversation_id: str,
 ) -> set[str]:
     """
@@ -1654,7 +1640,7 @@ def _subtree_conversation_ids(
 
 
 def ancestor_ids_from_tree(
-    tree: list[Conversation],
+    tree: Sequence[_TreeRow],
     conversation_id: str,
 ) -> list[str]:
     """
