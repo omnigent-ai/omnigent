@@ -23,6 +23,8 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_STARTUP_DELAY_S = 3.0
 _DEFAULT_LOCK_RETRY_S = 0.5
+# Runner process logs are never rotated; one file per runner start accumulates.
+_RUNNER_LOG_RETENTION_S = 14 * 24 * 3600.0
 
 MaintenanceStage = tuple[str, Callable[[], Awaitable[object]]]
 _LockOutcome = Literal["acquired", "busy", "failed"]
@@ -71,6 +73,67 @@ def _maintenance_lock(path: Path) -> Iterator[_LockOutcome]:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+def _paths_held_open() -> set[Path]:
+    """Return every file path held open by a process this user can inspect."""
+    import psutil
+
+    held: set[Path] = set()
+    for process in psutil.process_iter(["pid"]):
+        try:
+            for handle in process.open_files():
+                held.add(Path(handle.path))
+        except (psutil.Error, OSError):
+            continue
+    return held
+
+
+def prune_stale_runner_logs(
+    log_dir: Path,
+    *,
+    max_age_s: float = _RUNNER_LOG_RETENTION_S,
+    now: float | None = None,
+) -> int:
+    """Delete ``runner-*.log`` files untouched for *max_age_s* and not held open.
+
+    A live runner writes its log through an inherited descriptor, so an open
+    file is always kept even when its mtime is old.
+
+    :param log_dir: Runner process-log directory, e.g. ``~/.omnigent/logs/runner``.
+    :param max_age_s: Minimum idle age before a log can be removed.
+    :param now: Reference time as epoch seconds; defaults to the current time.
+    :returns: Number of files removed.
+    """
+    if not log_dir.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - max_age_s
+    candidates: list[Path] = []
+    for path in log_dir.glob("runner-*.log"):
+        mtime = _mtime_or_none(path)
+        if mtime is not None and mtime < cutoff and path.is_file() and not path.is_symlink():
+            candidates.append(path)
+    if not candidates:
+        return 0
+    held = _paths_held_open()
+    removed = 0
+    for path in candidates:
+        if path in held or path.resolve() in held:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
+
+
+def _mtime_or_none(path: Path) -> float | None:
+    """Return the file's mtime, or ``None`` when it vanished or is unreadable."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
 
 
 class HostMaintenanceJanitor:
@@ -142,12 +205,20 @@ class HostMaintenanceJanitor:
 
             return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
 
+        async def _prune_runner_logs() -> object:
+            from omnigent.process_logging import process_log_dir
+
+            return await _run_sync_stage(
+                lambda: prune_stale_runner_logs(process_log_dir("runner"))
+            )
+
         return cls(
             stages=(
                 ("harness_process_orphans", _reap_harness_processes),
                 ("codex_process_registry", _reconcile_codex_processes),
                 ("terminal_orphans", _reap_terminals),
                 ("native_bridge_orphans", _reap_native_bridge_dirs),
+                ("runner_log_retention", _prune_runner_logs),
             ),
             lock_path=data_dir().resolve() / "locks" / "host-maintenance.lock",
             stage_skip_reasons={"native_bridge_orphans": {"runner_superseded"}},
