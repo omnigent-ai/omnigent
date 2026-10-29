@@ -321,7 +321,7 @@ async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in() ->
         assert (
             second.json()["detail"] == "Message buffered until the Databricks sign-in completes."
         )
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.05)  # custom-lint: disable=sleep-then-assert -- no send in window
         assert len(harness.posted_bodies) == 1
 
         # The sign-in watcher saw the agent ready.

@@ -98,7 +98,7 @@ def build_sign_in_watch(
                         continue
                     try:
                         result = await entry.instance.read(join_wrapped=True)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 — a failed read must still release the hold
                         _logger.debug(
                             "Failed to read the sign-in pane for %s", conv_id, exc_info=True
                         )
