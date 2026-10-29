@@ -51,9 +51,9 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
 from omnigent.harnesses.codex_native.execution_environment import (
-    CODEX_EXEC_SERVER_URL_ENV_VAR,
     CodexRemoteExecution,
-    codex_remote_environment_request,
+    codex_remote_environment_requests,
+    configure_codex_execution_environments,
     read_remote_execution,
 )
 from omnigent.harnesses.codex_native.launch_args import (
@@ -2366,6 +2366,7 @@ class CodexNativeAppServer:
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
         )
+        configure_codex_execution_environments(self.codex_home, self.remote_execution)
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
             config_source,
@@ -2569,10 +2570,9 @@ class CodexNativeAppServer:
 
         Keep the TUI's display cwd as host-owned thread metadata, but replace
         every executable environment selection with the persisted remote
-        binding. The binding constructor already requires its cwd to exist on
-        the host as well, which lets Codex launch host-side command hooks there.
-        Only the bound remote environment is selected, so a disconnected
-        executor cannot fall back to laptop tools.
+        binding followed by the explicit laptop environment. Remote stays the
+        default for code, while the agent can deliberately select local tools
+        for laptop-owned memory and control files.
         """
         if self.remote_execution is None or isinstance(message, bytes):
             return message
@@ -2599,9 +2599,12 @@ class CodexNativeAppServer:
         projected_params["cwd"] = str(self.cwd)
         projected_params.pop("runtimeWorkspaceRoots", None)
         if method in {"thread/start", "turn/start"}:
-            projected_params["environments"] = [
-                codex_remote_environment_request(self.remote_execution)
-            ]
+            local_roots = [str(self.cwd), *self.writable_roots]
+            projected_params["environments"] = codex_remote_environment_requests(
+                self.remote_execution,
+                local_cwd=str(self.cwd),
+                local_workspace_roots=list(dict.fromkeys(local_roots)),
+            )
         return json.dumps(projected, separators=(",", ":"), ensure_ascii=False)
 
     async def _proxy_tui_connection(self, downstream: ServerConnection) -> None:
@@ -3894,8 +3897,6 @@ def build_codex_native_server(
         )
     env = _clean_codex_env()
     remote_execution = read_remote_execution(bridge_dir)
-    if remote_execution is not None:
-        env[CODEX_EXEC_SERVER_URL_ENV_VAR] = remote_execution.exec_server_url
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:

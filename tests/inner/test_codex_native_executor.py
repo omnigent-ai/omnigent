@@ -982,11 +982,11 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
     ]
 
 
-def test_web_started_codex_turn_selects_only_configured_remote_execution(
+def test_web_started_codex_turn_selects_remote_then_explicit_local_execution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A forwarded phone/web turn cannot fall back to the laptop environment."""
+    """A forwarded phone/web turn can target remote code or laptop memory explicitly."""
     _FakeCodexNativeClient.requests = []
     _FakeCodexNativeClient.created = []
     _FakeCodexNativeClient.next_turn = 1
@@ -1028,7 +1028,12 @@ def test_web_started_codex_turn_selects_only_configured_remote_execution(
                         "environmentId": "remote",
                         "cwd": str(shared_cwd),
                         "runtimeWorkspaceRoots": [str(shared_cwd)],
-                    }
+                    },
+                    {
+                        "environmentId": "local",
+                        "cwd": str(tmp_path),
+                        "runtimeWorkspaceRoots": [str(tmp_path)],
+                    },
                 ],
             },
         )

@@ -298,29 +298,30 @@ omnigent pi                          # Pi
 omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
 
-Codex can keep its app-server and per-session `CODEX_HOME` on the Omnigent host
-while an exec-server runs shell and file tools elsewhere. For example, the host
-can be a laptop reached through Omnigent's phone UI:
+Codex 0.164 or newer can keep its app-server, rollout, memory files, and
+Omnigent phone control on the laptop while an exec-server runs code elsewhere.
+The remote environment is primary, and the same agent retains an explicit
+`local` environment for laptop-owned files:
 
 ```bash
-mkdir -p /tmp/omnigent-workspace  # empty local hook cwd is enough
 omnigent codex \
   --exec-server-url ws://127.0.0.1:43111 \
-  --exec-cwd /tmp/omnigent-workspace
+  --exec-cwd /home/agent/universe
 ```
 
-Create the remote checkout as a real directory at that same absolute path.
-Codex runs tools through the exec server but runs command hooks on the Omnigent
-host, so both hosts must be able to enter the path. The local directory can
-remain empty; avoid using a remote symlink as the workspace root because the
-remote sandbox can reject writable symlink crossings.
+`--exec-cwd` is a path on the exec-server host; it does not need to exist on the
+laptop. Codex receives the environments in `[remote, local]` order on terminal
+and phone/web turns, so normal code work targets the remote checkout. Ask it to
+use `local` explicitly when it should read or write laptop-owned memory or
+control files. Both environments use the session's configured approval and
+sandbox policy; full bypass makes both shells unrestricted.
 
 The binding stays private to this host's Omnigent bridge and is reused on a
 same-host resume while that bridge is retained. It routes tools but does not
 copy `CODEX_HOME`, memory, or local workspace files into the remote cwd. If the
-exec server disconnects, the turn fails instead of running locally. After the
-Codex terminal stops, use `--local-execution` to move tool execution back to
-this computer.
+remote exec server disconnects, local files are still local; there is no file
+sync between environments. After the Codex terminal stops, use
+`--local-execution` to return to a local-only session.
 
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.

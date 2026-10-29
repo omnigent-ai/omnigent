@@ -35,11 +35,11 @@ def _server(tmp_path: Path, upstream_url: str) -> CodexNativeAppServer:
 
 
 @pytest.mark.parametrize("method", ["thread/start", "turn/start"])
-def test_tui_request_projection_selects_only_bound_remote(
+def test_tui_request_projection_selects_remote_primary_and_local_secondary(
     tmp_path: Path,
     method: str,
 ) -> None:
-    """A TUI turn cannot replace the remote binding or select local tools."""
+    """A TUI turn keeps remote as default while retaining explicit local tools."""
     app_server = _server(tmp_path, "ws://127.0.0.1:9876")
 
     projected = app_server.project_tui_request(
@@ -71,7 +71,12 @@ def test_tui_request_projection_selects_only_bound_remote(
             "environmentId": "remote",
             "cwd": str(tmp_path / "shared-cwd"),
             "runtimeWorkspaceRoots": [str(tmp_path / "shared-cwd")],
-        }
+        },
+        {
+            "environmentId": "local",
+            "cwd": str(tmp_path),
+            "runtimeWorkspaceRoots": [str(tmp_path)],
+        },
     ]
 
 
@@ -150,7 +155,12 @@ def test_tui_execution_proxy_forwards_and_projects_turn_start(tmp_path: Path) ->
                 "environmentId": "remote",
                 "cwd": str(tmp_path / "shared-cwd"),
                 "runtimeWorkspaceRoots": [str(tmp_path / "shared-cwd")],
-            }
+            },
+            {
+                "environmentId": "local",
+                "cwd": str(tmp_path),
+                "runtimeWorkspaceRoots": [str(tmp_path)],
+            },
         ],
     }
     assert json.loads(response) == {"id": 11, "result": {"accepted": True}}

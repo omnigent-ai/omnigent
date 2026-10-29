@@ -423,11 +423,11 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
         }
 
 
-def test_build_codex_native_server_scopes_exec_server_url_to_bound_session(
+def test_build_codex_native_server_does_not_leak_exec_server_url_through_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only an explicitly bound session app-server receives the remote URL."""
+    """The private environments file, not process env, owns the remote URL."""
     monkeypatch.setenv("CODEX_EXEC_SERVER_URL", "ws://ambient.example:9999")
     remote_bridge = tmp_path / "remote-bridge"
     write_remote_execution(
@@ -457,11 +457,49 @@ def test_build_codex_native_server_scopes_exec_server_url_to_bound_session(
         codex_path=sys.executable,
     )
 
-    assert remote.env["CODEX_EXEC_SERVER_URL"] == "ws://127.0.0.1:43111"
+    assert "CODEX_EXEC_SERVER_URL" not in remote.env
     assert remote.remote_execution is not None
     assert remote.remote_execution.cwd == str(tmp_path)
     assert "CODEX_EXEC_SERVER_URL" not in local.env
     assert local.remote_execution is None
+
+
+async def test_start_materializes_remote_and_local_environment_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The private registry exists before a remote-bound app-server serves turns."""
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text("", encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    server = _test_app_server(
+        tmp_path,
+        codex_home,
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.remote_execution = CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd="/home/agent/workspace",
+    )
+
+    try:
+        await server.start()
+    finally:
+        await server.close()
+
+    assert tomllib.loads((codex_home / "environments.toml").read_text(encoding="utf-8")) == {
+        "default": "remote",
+        "include_local": True,
+        "environments": [
+            {"id": "remote", "url": "ws://127.0.0.1:43111"},
+        ],
+    }
 
 
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(

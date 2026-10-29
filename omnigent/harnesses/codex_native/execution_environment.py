@@ -11,8 +11,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TypeAlias
 from urllib.parse import urlsplit
 
-CODEX_EXEC_SERVER_URL_ENV_VAR = "CODEX_EXEC_SERVER_URL"
+CODEX_LOCAL_ENVIRONMENT_ID = "local"
 CODEX_REMOTE_ENVIRONMENT_ID = "remote"
+_CODEX_ENVIRONMENTS_FILE = "environments.toml"
 _REMOTE_EXECUTION_FILE = "remote_execution.json"
 _REMOTE_EXECUTION_MAX_BYTES = 16 * 1024
 
@@ -23,7 +24,7 @@ class CodexRemoteExecutionConfigError(ValueError):
 
 @dataclass(frozen=True)
 class CodexRemoteExecution:
-    """One complete Codex exec-server binding with a shared host/remote cwd."""
+    """One complete Codex exec-server binding and its remote working directory."""
 
     exec_server_url: str
     cwd: str
@@ -48,21 +49,57 @@ class CodexRemoteExecution:
             )
         if not self.cwd or "\x00" in self.cwd or not _absolute_remote_path(self.cwd):
             raise CodexRemoteExecutionConfigError("cwd must be a non-empty absolute path")
-        local_cwd = Path(self.cwd)
-        if not local_cwd.is_dir() or not os.access(local_cwd, os.X_OK):
-            raise CodexRemoteExecutionConfigError(
-                "cwd must exist as a searchable local directory at the same absolute path "
-                "as the remote cwd so Codex host hooks can run"
-            )
 
 
-def codex_remote_environment_request(binding: CodexRemoteExecution) -> dict[str, object]:
-    """Build the one Codex environment selection for a remote-bound turn."""
-    return {
-        "environmentId": CODEX_REMOTE_ENVIRONMENT_ID,
-        "cwd": binding.cwd,
-        "runtimeWorkspaceRoots": [binding.cwd],
-    }
+def codex_remote_environment_requests(
+    binding: CodexRemoteExecution,
+    *,
+    local_cwd: str,
+    local_workspace_roots: list[str],
+) -> list[dict[str, object]]:
+    """Select remote code execution first while retaining explicit laptop tools."""
+    return [
+        {
+            "environmentId": CODEX_REMOTE_ENVIRONMENT_ID,
+            "cwd": binding.cwd,
+            "runtimeWorkspaceRoots": [binding.cwd],
+        },
+        {
+            "environmentId": CODEX_LOCAL_ENVIRONMENT_ID,
+            "cwd": local_cwd,
+            "runtimeWorkspaceRoots": local_workspace_roots,
+        },
+    ]
+
+
+def configure_codex_execution_environments(
+    codex_home: Path,
+    binding: CodexRemoteExecution | None,
+) -> None:
+    """Materialize Codex's private remote-plus-local environment registry."""
+    path = codex_home / _CODEX_ENVIRONMENTS_FILE
+    if binding is None:
+        path.unlink(missing_ok=True)
+        return
+
+    codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    content = (
+        f"default = {json.dumps(CODEX_REMOTE_ENVIRONMENT_ID)}\n"
+        "include_local = true\n\n"
+        "[[environments]]\n"
+        f"id = {json.dumps(CODEX_REMOTE_ENVIRONMENT_ID)}\n"
+        f"url = {json.dumps(binding.exec_server_url)}\n"
+    )
+    fd, temporary = tempfile.mkstemp(prefix=f"{_CODEX_ENVIRONMENTS_FILE}.", dir=codex_home)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 class CodexExecutionMode(Enum):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,26 +13,71 @@ from omnigent.harnesses.codex_native.execution_environment import (
     CodexRemoteExecution,
     CodexRemoteExecutionConfigError,
     apply_execution_selection,
+    codex_remote_environment_requests,
+    configure_codex_execution_environments,
     read_remote_execution,
     resolve_execution_selection,
 )
 
 
-def test_remote_execution_requires_a_local_hook_cwd(tmp_path: Path) -> None:
-    """A remote-only cwd cannot strand Codex's host-side command hooks."""
+def test_remote_execution_cwd_does_not_need_to_exist_on_the_laptop(tmp_path: Path) -> None:
+    """Remote and local environment selections can use different path layouts."""
     missing = tmp_path / "shared-cwd"
 
-    with pytest.raises(CodexRemoteExecutionConfigError, match="same absolute path"):
-        CodexRemoteExecution(
-            exec_server_url="ws://127.0.0.1:43111",
-            cwd=str(missing),
-        )
-
-    missing.mkdir()
     assert CodexRemoteExecution(
         exec_server_url="ws://127.0.0.1:43111",
         cwd=str(missing),
     ).cwd == str(missing)
+
+
+@pytest.mark.posix_only
+def test_remote_execution_materializes_private_dual_environment_registry(
+    tmp_path: Path,
+) -> None:
+    """Codex discovers remote as default without suppressing local tools."""
+    codex_home = tmp_path / "codex-home"
+    binding = CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd="/home/agent/workspace",
+    )
+
+    configure_codex_execution_environments(codex_home, binding)
+
+    config_path = codex_home / "environments.toml"
+    assert tomllib.loads(config_path.read_text(encoding="utf-8")) == {
+        "default": "remote",
+        "include_local": True,
+        "environments": [
+            {"id": "remote", "url": "ws://127.0.0.1:43111"},
+        ],
+    }
+    assert stat.S_IMODE(config_path.stat().st_mode) == 0o600
+
+    configure_codex_execution_environments(codex_home, None)
+    assert not config_path.exists()
+
+
+def test_remote_turn_selects_remote_first_and_laptop_second(tmp_path: Path) -> None:
+    """One turn can use Arclet code tools and laptop-owned memory tools."""
+    assert codex_remote_environment_requests(
+        CodexRemoteExecution(
+            exec_server_url="ws://127.0.0.1:43111",
+            cwd="/home/agent/workspace",
+        ),
+        local_cwd=str(tmp_path),
+        local_workspace_roots=[str(tmp_path)],
+    ) == [
+        {
+            "environmentId": "remote",
+            "cwd": "/home/agent/workspace",
+            "runtimeWorkspaceRoots": ["/home/agent/workspace"],
+        },
+        {
+            "environmentId": "local",
+            "cwd": str(tmp_path),
+            "runtimeWorkspaceRoots": [str(tmp_path)],
+        },
+    ]
 
 
 @pytest.mark.posix_only

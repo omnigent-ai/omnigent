@@ -61,7 +61,7 @@ from omnigent.harnesses.codex_native.shell_input import (
     shell_command_from_content as _shell_command_from_content,
 )
 from omnigent.harnesses.codex_native.execution_environment import (
-    codex_remote_environment_request,
+    codex_remote_environment_requests,
     read_remote_execution,
 )
 from omnigent.inner.codex_goal_command import (
@@ -428,7 +428,12 @@ async def _start_codex_turn(
     remote_execution = await asyncio.to_thread(read_remote_execution, bridge_dir)
     environments: list[dict[str, object]]
     if remote_execution is not None:
-        environments = [codex_remote_environment_request(remote_execution)]
+        local_cwd = state.cwd or str(Path.cwd())
+        environments = codex_remote_environment_requests(
+            remote_execution,
+            local_cwd=local_cwd,
+            local_workspace_roots=[local_cwd],
+        )
     else:
         environments = [
             {
