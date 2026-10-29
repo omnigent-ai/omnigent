@@ -669,19 +669,19 @@ async def bridge_tmux_control_to_websocket(
             await websocket.close(code=WS_CLOSE_INTERNAL_ERROR, reason="tmux not found")
         return
 
-    # Seed the browser terminal with the current screen BEFORE attaching so no
-    # pre-attach content is missing. Failure is non-fatal — a live pane redraw
-    # will repaint it shortly.
-    seed, tmux_answers = await asyncio.gather(
-        _run_tmux_capture(socket_path, tmux_target),
-        tmux_answered_queries(tmux, {"TERM": _WEB_TERMINAL_TERM}),
-    )
     # The browser drops its reply to these queries, which tmux answers itself.
-    # Sent before any pane output so no query reaches the browser first.
+    # Sent before any pane output so no query reaches the browser first, and
+    # probed before the capture so nothing slow sits between capture and attach.
+    tmux_answers = await tmux_answered_queries(tmux, {"TERM": _WEB_TERMINAL_TERM})
     if tmux_answers is not None:
         message = json.dumps({"type": "tmux-replies", "queries": sorted(tmux_answers)})
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_text(message)
+
+    # Seed the browser terminal with the current screen BEFORE attaching so no
+    # pre-attach content is missing. Failure is non-fatal — a live pane redraw
+    # will repaint it shortly.
+    seed = await _run_tmux_capture(socket_path, tmux_target)
     if seed:
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)

@@ -34,10 +34,12 @@ from omnigent.terminals.control_bridge import (
     _clipboard_buffer_name,
     _hex_send_keys_commands,
     _read_tmux_buffer,
+    _run_tmux_capture,
     _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
+from omnigent.terminals.query_replies import tmux_answered_queries
 from tests._helpers.polling import poll_until_async
 
 _HAS_TMUX = shutil.which("tmux") is not None
@@ -614,11 +616,31 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_control_bridge_lists_tmux_answers_before_any_pane_output() -> None:
-    """The browser learns which queries tmux answers before a query can reach it."""
+async def test_control_bridge_lists_tmux_answers_before_any_pane_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The browser learns which queries tmux answers before a query can reach it.
+
+    The probe also finishes before the screen capture, so a slow first probe
+    can't leave pane output between the capture and the attach.
+    """
     sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
     await asyncio.sleep(0.3)
 
+    steps: list[str] = []
+
+    async def _probe(tmux: str, client_env: dict[str, str]) -> frozenset[str] | None:
+        steps.append("probe")
+        answers = await tmux_answered_queries(tmux, client_env)
+        steps.append("probed")
+        return answers
+
+    async def _capture(socket_path: str, tmux_target: str) -> bytes | None:
+        steps.append("capture")
+        return await _run_tmux_capture(socket_path, tmux_target)
+
+    monkeypatch.setattr("omnigent.terminals.control_bridge.tmux_answered_queries", _probe)
+    monkeypatch.setattr("omnigent.terminals.control_bridge._run_tmux_capture", _capture)
     frames: list[str | bytes] = []
 
     class _OrderedWebSocket(_FakeWebSocket):
@@ -646,6 +668,7 @@ async def test_control_bridge_lists_tmux_answers_before_any_pane_output() -> Non
     message = json.loads(first)
     assert message["type"] == "tmux-replies"
     assert {"da1", "dsr:6"} <= set(message["queries"])
+    assert steps[:3] == ["probe", "probed", "capture"]
 
     await _kill_and_join(sock, task)
 
