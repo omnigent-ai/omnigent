@@ -3408,6 +3408,7 @@
             "enum": [
               "claude",
               "codex",
+              "hermes",
               "kimi",
               "kiro",
               "opencode",
@@ -3650,6 +3651,7 @@
                 "enum": [
                   "claude",
                   "codex",
+                  "hermes",
                   "kimi",
                   "kiro",
                   "opencode",
