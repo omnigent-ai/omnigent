@@ -527,6 +527,25 @@ describe("click sub-agent in rail (real SubagentsPanel)", () => {
     },
   );
 
+  it("opens a sub-agent tab's full screen link on the Agents tab", async () => {
+    writeOpenSubagentsInPanel(true);
+    renderSubagentTree("/c/conv_root");
+    fireEvent.click(await agentRow("conv_child"));
+
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+    fireEvent.click(within(rail).getByRole("link", { name: "Open full screen" }));
+
+    expect(screen.getByTestId("page")).toHaveTextContent("/c/conv_child");
+    await waitFor(() =>
+      expect(within(rail).getByRole("tab", { name: /^Agents/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    // Remembered, so later clicks on this sub-agent from the Agents tab stay there.
+    expect(readSessionWorkspaceState("conv_child").rightRailTab).toBe("subagents");
+  });
+
   it.each([
     {
       name: "navigates to an ancestor instead of opening it as a tab",

@@ -208,7 +208,7 @@ def test_composer_indicator_opens_subagent_tab_beside_parent(
     pane = rail.get_by_test_id("subagent-tab-pane")
     expect(pane).to_contain_text(f"audit-{sub.nonce}", timeout=30_000)
     expect(pane.get_by_test_id("subagent-tab-open-full")).to_have_attribute(
-        "href", f"/c/{sub.child_id}"
+        "href", f"/c/{sub.child_id}?panel=agents"
     )
     # Opening the tab must not navigate away from the parent chat.
     expect(page.get_by_text(_PARENT_REPLY, exact=True)).to_be_visible()

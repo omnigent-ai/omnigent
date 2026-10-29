@@ -43,14 +43,16 @@ export function SubagentTabPane({ sessionId, label }: { sessionId: string; label
   const readOnlyReason = readOnlyReasonForSessionLabels(session, null);
   // The labels that decide read-only arrive with the snapshot, so don't offer a composer first.
   const readOnly = !canEdit || session === null || readOnlyReason !== null;
-  const search = sessionNavigationSearch(useLocation().search);
+  // Open on Agents, as the transcript's sub-agent links do, so the page remembers that tab.
+  const params = new URLSearchParams(sessionNavigationSearch(useLocation().search));
+  params.set("panel", "agents");
   return (
     <div data-testid="subagent-tab-pane" className="flex h-full min-h-0 flex-1 flex-col">
       <div className="flex h-9 shrink-0 items-center gap-2 border-border border-b px-3">
         <BotIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
         <span className="min-w-0 flex-1 truncate text-sm font-medium">{label}</span>
         <Link
-          to={{ pathname: `/c/${sessionId}`, search }}
+          to={{ pathname: `/c/${sessionId}`, search: `?${params.toString()}` }}
           data-testid="subagent-tab-open-full"
           componentId="workspace.subagent_tab.open_full_screen"
           className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"

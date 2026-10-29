@@ -1514,10 +1514,10 @@ describe("WorkspacePanel sub-agent tabs", () => {
       "data-full-session",
       "true",
     );
-    // Global params like debug carry over; the parent's file param does not.
+    // Global params like debug carry over, the parent's file param does not, and it opens on Agents.
     expect(within(pane).getByRole("link", { name: "Open full screen" })).toHaveAttribute(
       "href",
-      "/c/conv_child?debug=1",
+      "/c/conv_child?debug=1&panel=agents",
     );
   });
 
