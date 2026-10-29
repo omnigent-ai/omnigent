@@ -108,6 +108,7 @@ from omnigent.server.routes._errors import (
     agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._host_launch import remember_unbound_host_runner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -3057,6 +3058,10 @@ def register_core_routes(
                     await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
                 except ConversationNotFoundError as exc:
                     raise _session_not_found() from exc
+                if conv.host_id and previous_runner_id:
+                    # The clear drops the only record of the host runner. Keep it
+                    # so a launch on a different host can stop it first.
+                    remember_unbound_host_runner(session_id, conv.host_id, previous_runner_id)
                 _logger.info(
                     "Session unbound from runner",
                     extra=debug_event(

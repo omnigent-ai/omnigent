@@ -21,6 +21,7 @@ import contextlib
 import logging
 import secrets
 import weakref
+from dataclasses import dataclass
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -85,6 +86,8 @@ from omnigent.server.host_registry import (
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
+    forget_unbound_host_runner,
+    get_unbound_host_runner,
     host_absent_error,
     resolve_host_launch,
     resolve_launch_timeout_s,
@@ -125,6 +128,154 @@ def _track_runner_launch_cleanup(task: asyncio.Task[None]) -> None:
             )
 
     task.add_done_callback(_done)
+
+
+# How long a cross-host launch waits for the previous host to acknowledge the
+# stop of the session's old runner. The host acks after terminating it (SIGTERM,
+# SIGKILL after 5s, then a further 5s reap). Past this the launch proceeds.
+_PREVIOUS_RUNNER_STOP_WAIT_S = 15.0
+
+
+@dataclass(frozen=True)
+class _PreviousRunner:
+    """What a launch must do about the runner its session was unbound from.
+
+    :param superseded_runner_id: Same-host runner the launch frame names, so the
+        host stops it once the replacement is alive. ``None`` when there is none.
+    :param stop_sent: A stop for a runner on another host went out, which can
+        take seconds, so the launch authorization is checked again.
+    :param record: The remembered ``(host_id, runner_id)`` the caller drops once
+        a same-host launch has succeeded.
+    """
+
+    superseded_runner_id: str | None = None
+    record: tuple[str, str] | None = None
+    stop_sent: bool = False
+
+
+def _runner_in_use(bound: list[Conversation], session_id: str) -> bool:
+    """Whether a row bound to the old runner means it is not this session's to stop.
+
+    The session's own tree shares its runner: its sub-agents and its side chats.
+    Anything else bound to the runner (the session itself bound again, a
+    successor from /clear or /switch, another tree's sub-agent or side chat)
+    means the runner is live and not ours.
+
+    :param bound: Conversations bound to the remembered runner.
+    :param session_id: Session being launched, e.g. ``"conv_abc123"``.
+    """
+    from omnigent.server.routes._sessions.orchestration import _side_chat_source_id
+
+    def _ours(other: Conversation) -> bool:
+        if other.kind == "sub_agent":
+            return other.root_conversation_id == session_id
+        return other.id != session_id and _side_chat_source_id(other) == session_id
+
+    return any(not _ours(other) for other in bound)
+
+
+async def _release_previous_host_runner(
+    session_id: str,
+    conn: HostConnection,
+    host_registry: HostRegistry,
+    conversation_store: ConversationStore,
+) -> _PreviousRunner:
+    """
+    Deal with the runner the session was unbound from before launching on *conn*.
+
+    "Switch host" unbinds the session (``PATCH runner_id=""``) and then
+    launches on the new host. The unbind only edits the database, so the old
+    runner and its native pane would keep running next to the new one: two
+    processes resuming the same transcript.
+
+    - Another host: stop the old runner and wait (bounded) for the host to
+      acknowledge, so the new pane starts alone.
+    - The same host: name the old runner in the launch frame, so the host stops
+      it once the replacement is alive.
+
+    Best-effort and never raises (other than cancellation). With no record, an
+    expired record, a previous host with no tunnel to this server replica, or a
+    runner that is still in use, the launch goes on and nothing is
+    stopped. The record and the host tunnels are per replica, so a switch whose
+    unbind and launch land on different replicas stops nothing. The record is
+    dropped once the stop is sent; for a same-host launch the caller drops it
+    when the host reports the launch succeeded.
+
+    :param session_id: Session being launched, e.g. ``"conv_abc123"``.
+    :param conn: Connection of the host the new runner launches on.
+    :param host_registry: Registry holding the live host tunnels.
+    :param conversation_store: Used to check the old runner is not in use.
+    :returns: What the launch must still do about the old runner.
+    """
+    previous = get_unbound_host_runner(session_id)
+    if previous is None:
+        return _PreviousRunner()
+    previous_host_id, previous_runner_id = previous
+    log_extra = {"session_id": session_id}
+    from omnigent.server.routes._sessions.helpers import _HostRunnerStopAttempt
+
+    attempt = _HostRunnerStopAttempt()
+    try:
+        previous_conn = host_registry.get(previous_host_id)
+        if previous_conn is None:
+            _logger.warning(
+                "Switching session %s to host %s: previous host %s is not connected to this "
+                "server replica, so its runner %s was not stopped",
+                session_id,
+                conn.host_id,
+                previous_host_id,
+                previous_runner_id,
+                extra=log_extra,
+            )
+            return _PreviousRunner()
+        bound = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, previous_runner_id
+        )
+        if _runner_in_use(bound, session_id):
+            _logger.info(
+                "Switching session %s to host %s: runner %s is still in use, "
+                "so it was not stopped",
+                session_id,
+                conn.host_id,
+                previous_runner_id,
+                extra=log_extra,
+            )
+            return _PreviousRunner()
+        if previous_conn.host_id == conn.host_id:
+            return _PreviousRunner(superseded_runner_id=previous_runner_id, record=previous)
+        from omnigent.server.routes import sessions as _facade
+
+        try:
+            stopped = await _facade._stop_session_host_runner(
+                session_id,
+                previous_host_id,
+                previous_runner_id,
+                host_registry,
+                expect_already_stopped=True,
+                attempt=attempt,
+                ack_timeout_s=_PREVIOUS_RUNNER_STOP_WAIT_S,
+            )
+        finally:
+            if attempt.dispatched:
+                forget_unbound_host_runner(session_id, previous)
+    except Exception:  # a failed stop must never block the launch
+        _logger.warning(
+            "Stopping the previous host's runner for session %s failed; launching anyway",
+            session_id,
+            exc_info=True,
+            extra=log_extra,
+        )
+        return _PreviousRunner(stop_sent=attempt.dispatched)
+    _logger.info(
+        "Switching session %s to host %s: runner %s on host %s %s",
+        session_id,
+        conn.host_id,
+        previous_runner_id,
+        previous_host_id,
+        "stopped" if stopped else "could not be confirmed stopped",
+        extra=log_extra,
+    )
+    return _PreviousRunner(stop_sent=attempt.dispatched)
 
 
 # Per-call timeout for host.list_dir round-trips. Listing is a single
@@ -1261,13 +1412,24 @@ def create_hosts_router(
                     workspace = worktree.workspace or worktree.worktree_path
                     git_branch = worktree.branch
 
-            try:
+            async def _admit() -> None:
                 await host_registry.admit_launch(
                     conn,
                     body.session_id,
                     allow_unbound=True,
                     transfer_from_host_id=target.conv.host_id,
                 )
+
+            try:
+                # A refusal at the first admission check leaves the old runner
+                # alone. The stop comes before the binding, so the new pane starts
+                # alone; it can take seconds, so admission is checked again after.
+                await _admit()
+                previous_runner = await _release_previous_host_runner(
+                    body.session_id, conn, host_registry, conversation_store
+                )
+                if previous_runner.stop_sent:
+                    await _admit()
             except BaseException:
                 await _rollback_worktree()
                 raise
@@ -1367,8 +1529,12 @@ def create_hosts_router(
                     if target.conv.inference_snapshot
                     else None
                 ),
-                # The session had no runner bound, so nothing is superseded.
-                superseded_runner_ids=(),
+                # The host stops a same-host runner once this one is alive.
+                superseded_runner_ids=(
+                    (previous_runner.superseded_runner_id,)
+                    if previous_runner.superseded_runner_id
+                    else ()
+                ),
             )
         )
         try:
@@ -1427,6 +1593,8 @@ def create_hosts_router(
                 detail=f"host failed to launch runner: {result.get('error')}",
             )
 
+        if previous_runner.record is not None:
+            forget_unbound_host_runner(body.session_id, previous_runner.record)
         # The runner is bound to a session carried in the body (not the request
         # path); the middleware promotes a bag session_id to the audit row's
         # session_id column. Host is an attribute.

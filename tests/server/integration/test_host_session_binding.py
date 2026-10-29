@@ -2641,3 +2641,46 @@ async def test_session_response_keeps_existing_failure_cause_while_exit_report_i
     assert _persisted_task_error(conv_store, session_id) == original_error
     assert after["status"] == "failed"
     assert after["last_task_error"] == original_error
+
+
+async def test_runner_unbind_patch_remembers_the_host_runner(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path,
+) -> None:
+    """
+    ``PATCH runner_id=""`` on a host-launched session remembers the runner it
+    dropped, so a later launch on another host can stop it ("Switch host").
+
+    A session with no host binding has nothing to stop and remembers nothing.
+    """
+    from omnigent.server.routes._host_launch import (
+        forget_unbound_host_runner,
+        get_unbound_host_runner,
+    )
+
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=conv_store,
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        host_store=HostStore(db_uri),
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        agent = await create_test_agent(client)
+        on_host = conv_store.create_conversation(agent_id=agent["id"], runner_id="runner_token_a")
+        conv_store.set_host_id(on_host.id, _HOST_ID, workspace="/work/repo")
+        off_host = conv_store.create_conversation(agent_id=agent["id"], runner_id="runner_token_b")
+        for conv in (on_host, off_host):
+            resp = await client.patch(f"/v1/sessions/{conv.id}", json={"runner_id": ""})
+            assert resp.status_code == 200, resp.text
+
+    try:
+        assert get_unbound_host_runner(on_host.id) == (_HOST_ID, "runner_token_a")
+        assert get_unbound_host_runner(off_host.id) is None
+    finally:
+        forget_unbound_host_runner(on_host.id, (_HOST_ID, "runner_token_a"))

@@ -78,6 +78,7 @@ pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "c2d81b1a6812ae1cf32221c5a2a70ba0"
 _WORKSPACE = "/work/repo"
+_OTHER_HOST_ID = "5e0f6a9c7b3d4c1e8a2b9d6f4c3a1e07"
 _RUNNER_NOT_AVAILABLE = (
     "The runner for this session is not available — it may have failed to start. "
     "See the host logs."
@@ -157,26 +158,31 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     )
 
 
-async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
+async def _connect_host(
+    app: FastAPI, host_id: str = _HOST_ID, name: str = "laptop"
+) -> ApplicationCommunicator:
     """Connect a mock host over the WebSocket tunnel and wait for it
     to register in the app's host registry.
 
     :param app: The FastAPI app under test (its ``state.host_registry``
         is the same instance the session-create launch path reads).
+    :param host_id: Host to register, e.g. ``"c2d81b1a6812ae1cf32221c5a2a70ba0"``.
+    :param name: Host name; a second host needs its own, since a same-named host
+        replaces the first and takes its sessions over.
     :returns: The connected ASGI communicator, ready to exchange frames.
     """
-    path = f"/v1/hosts/{_HOST_ID}/tunnel"
+    path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
     accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     hello = encode_host_frame(
-        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="laptop")
+        HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name=name)
     )
     await comm.send_input({"type": "websocket.receive", "text": hello})
     registry = app.state.host_registry
-    while registry.get(_HOST_ID) is None:
+    while registry.get(host_id) is None:
         await asyncio.sleep(0.01)
     return comm
 
@@ -4876,3 +4882,35 @@ async def test_side_chat_message_rebinds_to_already_relaunched_source_runner(
     side_chat_after = store.get_conversation(side_chat_id)
     assert side_chat_after is not None and side_chat_after.runner_id == replacement
     assert f"/v1/sessions/{side_chat_id}/events" in [path for path, _ in runners.posts]
+
+
+async def test_switching_hosts_stops_the_previous_hosts_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+) -> None:
+    """
+    Switch host: unbinding the session and launching it on another host stops
+    the runner the first host still has for it, so one session never keeps two
+    live panes.
+    """
+    first_comm = await _connect_host(app)
+    session = await _inline_launch_session(client, first_comm)
+    second_comm = await _connect_host(app, _OTHER_HOST_ID, name="workstation")
+
+    async with (
+        _HostFrameResponder(first_comm) as first_host,
+        _HostFrameResponder(second_comm) as second_host,
+    ):
+        unbind = await client.patch(f"/v1/sessions/{session['id']}", json={"runner_id": ""})
+        assert unbind.status_code == 200, unbind.text
+        launch = await client.post(
+            f"/v1/hosts/{_OTHER_HOST_ID}/runners",
+            json={"session_id": session["id"], "workspace": _WORKSPACE},
+        )
+        assert launch.status_code == 200, launch.text
+
+    assert first_host.stopped_runner_ids == [session["runner_id"]]
+    assert len(second_host.launch_frames) == 1
+    moved = (await client.get(f"/v1/sessions/{session['id']}")).json()
+    assert moved["host_id"] == _OTHER_HOST_ID
+    assert moved["runner_id"] == launch.json()["runner_id"]
