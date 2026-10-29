@@ -238,6 +238,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
 from omnigent.util.cost_plan import (
     reserved_cost_control_keys,
 )
@@ -1308,6 +1309,17 @@ def register_core_routes(
             )
 
         bundle_bytes = await bundle.read()
+        parsed_metadata = parsed_metadata.model_copy(
+            update={
+                "labels": {
+                    **parsed_metadata.labels,
+                    CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(
+                        request.headers,
+                        parent_labels=parent_conv.labels if parent_conv is not None else None,
+                    ),
+                }
+            }
+        )
         # Validate the bundle BEFORE any row exists: the external-host
         # branch below needs the spec's os_env.cwd for workspace
         # validation, and _create_session_from_bundle reuses the parsed
@@ -3975,7 +3987,9 @@ def register_core_routes(
         # bound target is actually codex-native (the label is inert elsewhere,
         # so refuse to stamp it on a non-Codex fork). Stamped via extra_labels,
         # which the store applies AFTER the drop so the opt-in wins.
-        extra_labels: dict[str, str] = {}
+        extra_labels: dict[str, str] = {
+            CLIENT_SURFACE_LABEL_KEY: resolve_client_surface(request.headers)
+        }
         if body.codex_bypass_sandbox:
             target_native = await asyncio.to_thread(_native_coding_agent_for_agent, base_agent)
             if target_native is None or target_native.harness != "codex-native":
