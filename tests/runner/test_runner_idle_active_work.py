@@ -9,8 +9,11 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 from fastapi import FastAPI
 
@@ -401,7 +404,99 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
 
 
 @pytest.mark.asyncio
-async def test_native_failed_status_releases_idle_pin() -> None:
+@pytest.mark.parametrize("status", ["running", "waiting"])
+@pytest.mark.parametrize(
+    "native_role,settle",
+    [
+        (True, "idle"),
+        (True, "failed"),
+        (True, "terminal-delete"),
+        (True, "session-delete"),
+        (False, None),
+    ],
+)
+async def test_terminal_only_native_work_idle_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    native_role: bool,
+    settle: str | None,
+) -> None:
+    """Terminal ensure can own live work before any harness initialization or web turn."""
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "conv_terminal_only"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        assert ctx.agent_spec is spec
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id,
+            "claude",
+            "main",
+            instance,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE if native_role else None,
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            assert not app.state.active_turns
+            publish = app.state.session_resource_registry._session_status_publisher
+            publish(conv_id, status, None)
+            if not native_role:
+                assert app.state.has_active_work() is False
+                return
+            assert app.state.has_active_work() is True
+
+            async def release() -> None:
+                if settle in {"idle", "failed"}:
+                    publish(conv_id, settle, None)
+                else:
+                    path = f"/v1/sessions/{conv_id}"
+                    if settle == "terminal-delete":
+                        path += "/resources/terminals/terminal_claude_main"
+                    response = await client.delete(path)
+                    assert response.status_code == 200, response.text
+                    assert terminals.get(conv_id, "claude", "main") is None
+                    publish(conv_id, status, None)
+                assert app.state.has_active_work() is False
+
+            await _assert_monitor_blocked_then_shuts_down(
+                has_active_work=app.state.has_active_work, release=release
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
 
@@ -412,7 +507,24 @@ async def test_native_failed_status_releases_idle_pin() -> None:
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
-        await _post_status(client, conv_id, "failed")
+        if status_source == "pane":
+            from omnigent.runner.app import _session_event_queues_ref
+
+            queue = _session_event_queues_ref[conv_id]
+            while not queue.empty():
+                queue.get_nowait()
+            publish = app.state.session_resource_registry._session_status_publisher
+            assert publish is not None
+            publish(conv_id, "failed", None)
+            events = []
+            while not queue.empty():
+                events.append(queue.get_nowait())
+            failures = [event for event in events if event and event.get("status") == "failed"]
+            assert len(failures) == 1
+            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+            assert "Open the terminal" in failures[0]["error"]["message"]
+        else:
+            await _post_status(client, conv_id, "failed")
         assert app.state.has_active_work() is False
 
 

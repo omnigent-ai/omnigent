@@ -23,7 +23,7 @@ on:
         # -- the mandatory first job every dependent CI job `needs` -- is not
         # throttled behind a saturated standard pool.
         type: string
-        default: ubuntu-latest
+        default: ubuntu-24.04
         required: false
 
 permissions:

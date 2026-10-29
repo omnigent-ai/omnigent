@@ -37,19 +37,29 @@ label yourself; a human maintainer adds it after checking the mirror.
 
 ## Committing
 
-Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
-let it run on staged files via `git commit`). Fix any issues it reports so the
-commit lands clean — CI runs the same checks.
+The `pre-commit` hooks are the local gate, and CI runs the same checks. They
+run on `git commit` and again on `git push` only after they are installed:
+`just ensure` does that (or `just hooks` on its own), once per clone. Worktrees
+share the clone's `.git`, so one install covers them all.
+
+- Never pass `--no-verify`. A hook failure is a finding to fix, not a gate to
+  skip; the push hook will fail on the same commits anyway.
+- Files written through shell heredocs or scripts are unformatted until a hook
+  or `just lint` touches them. Before pushing web changes, run
+  `cd web && pnpm exec prettier --check .` and read its exit code; do not judge
+  hook output by grepping it.
+- To check by hand, `just lint` runs the hooks over staged files and
+  `just lint-all` over the whole tree. Fix what they report, re-stage, commit.
 
 ## Local development shortcuts
 
 Use `just` for common tasks; run `just --list` for grouped recipes.
 
-- `just ensure` — install/check prerequisites
+- `just ensure` — install/check prerequisites, including the git hooks
 - `just run-ios` / `just run-android` — build/run mobile apps
 - `just dev` / `just dev-mobile` — start the omnigent dev pod
 - `just electron-dev` / `just electron-build` — Electron desktop shell
-- `just lint` / `just lint-all` — run pre-commit
+- `just lint` / `just lint-all` — run pre-commit; `just hooks` — install the git hooks
 - `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
 
 ## Pull requests

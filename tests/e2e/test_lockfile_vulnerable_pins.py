@@ -84,6 +84,7 @@ _PNPM_FINDINGS = [
     ("@tiptap/core", "3.30.5", "GHSA-j95f-988m-3j2f"),
     ("hono", "4.13.5", "CVE-2026-84363 / CVE-2026-84364 / CVE-2026-84365"),
     ("js-yaml", "4.3.2", "CVE-2026-84375"),
+    ("qs", "6.16.1", "CVE-2026-110816"),
     ("react-router", "7.18.0", "CVE-2026-53666 / CVE-2026-53669"),
     ("react-router-dom", "6.30.6", "CVE-2026-53668"),
 ]
@@ -108,12 +109,23 @@ def test_uv_lock_cryptography_at_fixed_version() -> None:
     )
 
 
-def test_uv_lock_mlflow_outside_ssrf_range() -> None:
-    # CVE-2026-71211 (AI Gateway SSRF) flags mlflow <= 3.15.2; 3.16.0 is the
-    # first release outside the advisory range. mlflow is transitive (via
-    # databricks-mcp in the databricks extra), so absence also passes.
+@pytest.mark.parametrize("name", ["mlflow", "mlflow-skinny", "mlflow-tracing"])
+def test_uv_lock_mlflow_at_fixed_version(name: str) -> None:
+    # MLflow cross-pins these three packages, so enforce the fixed floor on
+    # each. They are transitive (databricks extra), so absence also passes.
     _assert_no_vulnerable_pin(
-        "uv.lock", "mlflow", _uv_versions("mlflow"), "3.16.0", "CVE-2026-71211"
+        "uv.lock",
+        name,
+        _uv_versions(name),
+        "3.17.2",
+        "CVE-2026-53995 / CVE-2026-116692",
+    )
+
+
+def test_uv_lock_msgpack_at_fixed_version() -> None:
+    # msgpack is transitive (via locust in the loadtest group).
+    _assert_no_vulnerable_pin(
+        "uv.lock", "msgpack", _uv_versions("msgpack"), "1.2.3", "CVE-2026-114613"
     )
 
 

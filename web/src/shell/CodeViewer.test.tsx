@@ -23,12 +23,26 @@ vi.mock("@/components/ai-elements/code-block", () => ({
   // NotebookPreview renders notebook code cells through CodeBlockContent.
   CodeBlockContent: ({ code }: { code: string }) => <pre>{code}</pre>,
 }));
-vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null }));
+vi.mock("./MarkdownRichTextViewer", () => ({
+  MarkdownRichTextViewer: ({ isSettled }: { isSettled: boolean }) => (
+    <div data-testid="markdown-editor-stub" data-settled={String(isSettled)} />
+  ),
+}));
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: ({ largeMarkdown }: { largeMarkdown?: boolean }) => (
-    <div data-testid="monaco-editor-stub" data-large-markdown={String(!!largeMarkdown)} />
+  MonacoCodeEditor: ({
+    largeMarkdown,
+    isSettled,
+  }: {
+    largeMarkdown?: boolean;
+    isSettled: boolean;
+  }) => (
+    <div
+      data-testid="monaco-editor-stub"
+      data-large-markdown={String(!!largeMarkdown)}
+      data-settled={String(isSettled)}
+    />
   ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
@@ -1233,5 +1247,82 @@ describe("large Markdown source fallback", () => {
     expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
     expect(highlightCode).not.toHaveBeenCalled();
     expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
+  });
+});
+
+describe("CodeViewer refresh failures", () => {
+  function renderQuery(fileQuery: ReturnType<typeof useFileContent>) {
+    return render(
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path="notes.md"
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="source"
+      />,
+    );
+  }
+
+  it("keeps the loaded file on screen when a refresh fails", () => {
+    const { container } = renderQuery({
+      ...makeFileQuery("still here"),
+      isError: true,
+      isRefetchError: true,
+      isSuccess: false,
+      error: new Error("502 Bad Gateway"),
+    } as unknown as ReturnType<typeof useFileContent>);
+    expect(container.textContent).toContain("still here");
+    expect(container.textContent).not.toContain("Error loading file");
+  });
+
+  it.each([
+    ["the rich editor", "notes.md", "editor" as const, "markdown-editor-stub"],
+    ["Monaco", "main.ts", "source" as const, "monaco-editor-stub"],
+  ])("lets %s switch to a file whose refresh is failing", (_editor, filePath, viewMode, stub) => {
+    // Without settling, the editor would keep the previous file's document
+    // while autosave targets this path.
+    render(
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path={filePath}
+        fileQuery={
+          {
+            ...makeFileQuery("cached"),
+            isError: true,
+            isRefetchError: true,
+            isSuccess: false,
+          } as unknown as ReturnType<typeof useFileContent>
+        }
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />,
+    );
+    expect(screen.getByTestId(stub)).toHaveAttribute("data-settled", "true");
+  });
+
+  it("shows the error when the file never loaded", () => {
+    const { container } = renderQuery({
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      isLoadingError: true,
+      isSuccess: false,
+      error: new Error("404 Not Found"),
+    } as unknown as ReturnType<typeof useFileContent>);
+    expect(container.textContent).toContain("Error loading file: 404 Not Found");
   });
 });
