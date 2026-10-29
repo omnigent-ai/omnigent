@@ -5538,7 +5538,7 @@ function reconcileElicitationBlocks(
       changed = true;
       return { ...currentDelivery, ctx: b.ctx };
     }
-    // During the gap the prompt entered or left the terminal hold, or flipped `answerUndelivered`.
+    // The re-publish that changed the terminal hold was lost in the gap, so the snapshot is newer.
     if (
       currentDelivery &&
       terminalHoldChanged(currentDelivery, b) &&
@@ -6815,8 +6815,6 @@ function revivePendingElicitationBlock(
       const updated = { ...incoming, ctx: target.ctx };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
     }
-    // The server re-asks only while the prompt is still unanswered, so this
-    // replaces even a card showing the user's undelivered answer.
     if (incoming && terminalHoldChanged(incoming, target)) {
       const updated = { ...incoming, ctx: target.ctx };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };

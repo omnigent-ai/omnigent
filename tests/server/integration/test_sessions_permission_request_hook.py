@@ -2549,12 +2549,18 @@ async def _sever_hook_mid_turn(
         "_omnigent_elicitation_id": elicitation_id,
     }
     collector = await start_session_stream_collector(session_id)
-    first = await client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
-    assert first.status_code == 200, first.text
-    assert first.content == b""
-    request_event = await _next_elicitation_event(collector)
-    assert request_event["type"] == "response.elicitation_request"
-    assert "terminal_fallback" not in request_event["params"]
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+        )
+        assert first.status_code == 200, first.text
+        assert first.content == b""
+        request_event = await _next_elicitation_event(collector)
+        assert request_event["type"] == "response.elicitation_request"
+        assert "terminal_fallback" not in request_event["params"]
+    except BaseException:
+        await collector.stop()
+        raise
     return session_id, payload, collector
 
 
@@ -2845,13 +2851,17 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
     parent_agent = await create_test_agent(client, f"{name}-parent")
     parent_id = await _create_session(client, parent_agent["id"])
     parent_collector = await start_session_stream_collector(parent_id)
-    session_id, _payload, collector = await _sever_hook_mid_turn(
-        client,
-        monkeypatch,
-        name,
-        grace_s=0.2 if waiting_in_terminal else 2.0,
-        parent_session_id=parent_id,
-    )
+    try:
+        session_id, _payload, collector = await _sever_hook_mid_turn(
+            client,
+            monkeypatch,
+            name,
+            grace_s=0.2 if waiting_in_terminal else 2.0,
+            parent_session_id=parent_id,
+        )
+    except BaseException:
+        await parent_collector.stop()
+        raise
     try:
         unparked = _harness_unparked_elicitations[_REATTACH_ELICITATION_ID]
         mirrored = await _next_elicitation_event(parent_collector)

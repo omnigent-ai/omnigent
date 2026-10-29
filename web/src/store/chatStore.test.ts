@@ -17879,13 +17879,18 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     const snapshotHeld = new Promise<void>((resolve) => {
       releaseSnapshot = resolve;
     });
+    let heldSnapshots = 0;
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (String(input).startsWith(`/v1/sessions/${sid}?`)) await snapshotHeld;
+      if (String(input).startsWith(`/v1/sessions/${sid}?`)) {
+        heldSnapshots += 1;
+        await snapshotHeld;
+      }
       return route(input, init);
     });
     sinks.at(-1)!.error();
     await drainAsync();
     expect(sinks).toHaveLength(2);
+    expect(heldSnapshots).toBe(1);
 
     const inTerminal = {
       ...raw,
@@ -17897,6 +17902,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     sinks.at(-1)!.push(sse("response.elicitation_request", inTerminal));
     await drainAsync();
     expect(elicitationCards()[0]!.terminalFallback).toEqual({ answerUndelivered: true });
+    expect(elicitationCards()[0]!.status).toBe("pending");
 
     releaseSnapshot();
     await drainAsync();
