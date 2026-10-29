@@ -76,6 +76,8 @@ the header menu), and each place is a separate entry point.
   For a native target, the fork dialog also offers model, reasoning effort,
   and permission mode pickers. A long model list from several creators (Pi)
   shows creator headings; it has no search or collapsible groups.
+  Closing the dialog mid-clone keeps the clone running: a toast reports it
+  (with **Open** on success), and reopening the dialog shows it again.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
@@ -638,6 +640,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
+  Closing mid-clone has component coverage in `web/src/shell/ForkSessionDialog.test.tsx`
+  (`clone outliving its form`). To drive it by hand, delay `POST …/fork` in the
+  browser, close the dialog after Clone, and expect a toast whose **Open** opens the clone.
 - **`unsupported-sandbox-actions`:**
   `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_sandbox_fork_and_switch_host_disabled`
   covers the header, sidebar context menu, message action, and composer host menu
