@@ -1364,6 +1364,7 @@ describe("closed bridge overlay", () => {
 
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume session" })));
     expect(onResume).toHaveBeenCalledTimes(1);
+    expect(terminalSessionMock.instances).toHaveLength(1);
     rerender(<TerminalView {...props} resumeGeneration={1} />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
   });
