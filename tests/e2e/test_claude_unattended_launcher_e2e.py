@@ -29,6 +29,9 @@ def test_unattended_native_launch_reaches_gateway_without_prompt(tmp_path: Path)
         "from pathlib import Path\n"
         "if '--version' in sys.argv:\n"
         "    print('2.1.309 (synthetic launcher)'); sys.exit(0)\n"
+        # Model probes run `claude -p`; only the terminal launch is under test.
+        "if '-p' in sys.argv:\n"
+        "    sys.exit(1)\n"
         f"Path({str(receipt)!r}).write_text(json.dumps({{\n"
         "    'flag': os.environ.get('UG_NONINTERACTIVE'),\n"
         "    'home': os.environ['HOME'], 'args': sys.argv[1:],\n"
