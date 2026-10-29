@@ -110,6 +110,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Decline approval prompt", keys: [ESC_KEY] },
       { label: "Next question, or submit all answers", keys: [ENTER_KEY], desktopOnly: true },
       { label: "Pick a question option by number", keys: ["1…9"], desktopOnly: true },
       { label: "Cancel pending question", keys: ["Esc"], desktopOnly: true },
