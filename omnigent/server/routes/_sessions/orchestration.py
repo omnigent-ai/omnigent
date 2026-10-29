@@ -3616,10 +3616,72 @@ def _release_drained_inputs(
             pending_inputs.release(session_id, entry)
 
 
+async def _settle_empty_native_turn_input(
+    conversation_store: ConversationStore | None,
+    conv: Conversation,
+    session_id: str,
+    input_stable_id: str,
+) -> None:
+    """
+    Commit a web message a Codex turn dropped (it completed with no items).
+
+    The forwarder reports the stable id of the input a turn was started with
+    when that turn completes without any items. Nothing will mirror that input
+    back, so the queued entry is settled now as an undelivered message and
+    error, the same pair a later mirror would have produced. An entry already
+    settled (matched, failed, or evicted) is left alone.
+
+    :param conversation_store: Store to append to; ``None`` skips persistence.
+    :param conv: Conversation row, used to name the agent in the error.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param input_stable_id: The web stable id the forwarder reported.
+    """
+    if conversation_store is None:
+        return
+    pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if pending_id is None:
+        await restore_pending_inputs(conversation_store, session_id)
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if pending_id is None:
+        return
+    drained = pending_inputs.resolve(session_id, pending_id)
+    if drained is None:
+        return
+    items = _build_skipped_native_items(session_id, conv, [drained], after_empty_turn=True)
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
+    except Exception:  # noqa: BLE001 — keep the entry queued for the next attempt
+        _logger.exception(
+            "Relay: could not persist the undelivered native message for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        pending_inputs.restore(session_id, drained)
+        return
+    persisted_user, persisted_error = persisted[0], persisted[1]
+    if persisted_user.deduplicated:
+        return
+    log_input_event(
+        _logger,
+        "native_input_settled",
+        session_id=session_id,
+        attributes=pending_inputs.delivery_attributes(drained),
+        outcome="codex_turn_produced_no_items",
+        item_id=persisted_user.id,
+        error_item_id=persisted_error.id,
+        response_id=persisted_error.response_id,
+        match_method="input_stable_id",
+    )
+    _publish_input_consumed(session_id, persisted_user, cleared_pending_id=drained.pending_id)
+    _publish_external_conversation_item(session_id, persisted_error)
+
+
 def _build_skipped_native_items(
     session_id: str,
     conv: Conversation,
     skipped_entries: list[pending_inputs.DrainedInput],
+    *,
+    after_empty_turn: bool = False,
 ) -> list[NewConversationItem]:
     """
     Build ``NewConversationItem`` pairs for web inputs the native TUI never recorded.
@@ -3635,6 +3697,8 @@ def _build_skipped_native_items(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row, used to name the harness in the error.
     :param skipped_entries: Older queue entries skipped by a text-matched drain.
+    :param after_empty_turn: The agent finished a turn that dropped these inputs
+        instead of recording them later, so the error says that.
     :returns: The item pairs in queue order, empty when nothing was skipped.
     """
     if not skipped_entries:
@@ -3652,7 +3716,10 @@ def _build_skipped_native_items(
         harness_key = "native"
         code = "native_prompt_not_recorded"
         message = (
-            f"{display_name} never recorded this message in its transcript before "
+            f"{display_name} finished a turn without recording this message, so it was "
+            "not delivered. The native terminal may have shown the underlying error."
+            if after_empty_turn
+            else f"{display_name} never recorded this message in its transcript before "
             "accepting a later one, so it was not delivered. The native terminal may "
             "have shown the underlying error."
         )

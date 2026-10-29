@@ -8548,6 +8548,68 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
 
 
 @pytest.mark.asyncio
+async def test_empty_codex_turn_settles_its_dropped_web_input_as_undelivered(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Codex turn that completes with no items settles the web message it carried.
+
+    Codex accepted the message into a turn that produced nothing, so no
+    transcript mirror will ever arrive. The queued entry is committed now as an
+    undelivered message plus the undelivered error, and the other queued
+    message stays pending for its own mirror.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _settle_empty_native_turn_input,
+    )
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    # No saved startup inputs; the settle path looks them up after a miss.
+    monkeypatch.setattr(store, "list_pending_inputs", lambda _session_id: [], raising=False)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    stable_id = "9c2e4f6a8b0d1e3f5a7c9e1b3d5f7a9c"
+    dropped = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "run the migration"}],
+        created_by="a@example.com",
+        stable_id=stable_id,
+    )
+    still_queued = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "then check the logs"}],
+        created_by="a@example.com",
+        stable_id="0d1f3a5c7e9b2d4f6a8c0e1b3d5f7a9b",
+    )
+    caplog.set_level(logging.INFO)
+
+    try:
+        await _settle_empty_native_turn_input(store, conv, sid, stable_id)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        user_item, error_item = store.appended_items
+        assert user_item.data.content == [{"type": "input_text", "text": "run the migration"}]
+        assert user_item.created_by == "a@example.com"
+        assert error_item.data.code == "native_prompt_not_recorded"
+        assert "finished a turn without recording this message" in error_item.data.message
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [still_queued]
+        [record] = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "native_input_settled"
+        ]
+        assert record.attributes["pending_id"] == dropped
+        assert record.attributes["outcome"] == "codex_turn_produced_no_items"
+
+        # An entry already settled (or never recorded) is left alone.
+        await _settle_empty_native_turn_input(store, conv, sid, stable_id)  # type: ignore[arg-type]
+        assert len(store.appended_items) == 2
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

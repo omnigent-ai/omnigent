@@ -25,6 +25,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
+    read_turn_input_stable_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
     write_bridge_state,
@@ -899,6 +900,49 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
         assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
         assert state.active_turn_id == active_turn_id
     assert "private prompt" not in json.dumps(attrs)
+
+
+def test_web_started_turn_records_its_input_for_an_empty_turn_report(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A turn started for a web input remembers that input's stable id.
+
+    The forwarder reads the record if Codex completes the turn with no items.
+    """
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+    identity = {"input_stable_id": "d" * 32, "pending_id": "pending_" + "e" * 32}
+    with input_delivery_scope(identity, response_id="resp_web"):
+        events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert read_turn_input_stable_id(tmp_path, "turn_1") == "d" * 32
+
+
+def test_turn_started_without_a_web_input_records_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A terminal-typed turn has no web input to report."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id=None)
+
+    _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "typed in the terminal")
+
+    assert read_turn_input_stable_id(tmp_path, "turn_1") is None
 
 
 def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(

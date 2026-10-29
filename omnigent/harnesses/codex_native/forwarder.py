@@ -53,6 +53,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    read_turn_input_stable_id,
     record_child_usage_baseline,
     settle_pending_mcp_startup,
     update_active_turn_id,
@@ -1363,6 +1364,9 @@ class _CodexTurnStatusEdge:
         from *selected_model*.
     :param selected_model: Model the thread had selected when that
         compaction failed, e.g. ``"system.ai.gpt-6-1-sol"``.
+    :param undelivered_input_stable_id: Web input the turn carried when it
+        completed with no items, so the server can settle it as undelivered;
+        ``None`` otherwise.
     """
 
     status: str
@@ -1371,6 +1375,7 @@ class _CodexTurnStatusEdge:
     error: _CodexTerminalError | None = None
     compaction_model: str | None = None
     selected_model: str | None = None
+    undelivered_input_stable_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -5352,6 +5357,7 @@ def _terminal_turn_status_edge(
             turn_id=terminal_turn_id,
             source=f"{source}:turn-failed",
         )
+    undelivered_input_stable_id: str | None = None
     if method == "turn/completed":
         if _turn_items_are_empty(params):
             _logger.warning(
@@ -5360,6 +5366,11 @@ def _terminal_turn_status_edge(
                 terminal_turn_id,
                 method,
             )
+            if bridge_dir is not None:
+                # Codex dropped the input this turn was started with.
+                undelivered_input_stable_id = read_turn_input_stable_id(
+                    bridge_dir, terminal_turn_id
+                )
         if bridge_dir is not None and _turn_status_from_params(params) in (None, "completed"):
             # The model answered, so a certificate failure recorded at launch
             # no longer describes this app-server's egress.
@@ -5368,6 +5379,7 @@ def _terminal_turn_status_edge(
         status="idle" if method == "turn/completed" else "failed",
         turn_id=terminal_turn_id,
         source=source,
+        undelivered_input_stable_id=undelivered_input_stable_id,
     )
 
 
@@ -7194,6 +7206,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    undelivered_input_stable_id: str | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -7212,9 +7225,13 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param undelivered_input_stable_id: Web input an idle turn dropped, so the
+        server settles it as undelivered before the turn ends.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
+    if undelivered_input_stable_id is not None:
+        data["undelivered_input_stable_id"] = undelivered_input_stable_id
     if response_id is not None:
         data["response_id"] = response_id
     if output is not None:
@@ -7295,6 +7312,7 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        undelivered_input_stable_id=edge.undelivered_input_stable_id,
     )
 
 
