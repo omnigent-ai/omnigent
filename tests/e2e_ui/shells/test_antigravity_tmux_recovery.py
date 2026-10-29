@@ -63,7 +63,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 @dataclass
 class MockGemini:
     requested: list[str]
-    replied: list[str]
+    release: threading.Event
 
 
 @pytest.fixture
@@ -76,7 +76,7 @@ def antigravity_model(
         yield None
         return
 
-    model = MockGemini(requested=[], replied=[])
+    model = MockGemini(requested=[], release=threading.Event())
 
     class GeminiHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -89,22 +89,19 @@ def antigravity_model(
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             reply = "Ready."
-            requested: str | None = None
-            hold_seconds = 0
+            held = False
             for content in reversed(request.get("contents", [])):
                 if content.get("role") != "user":
                     continue
                 text = "\n".join(part.get("text", "") for part in content.get("parts", []))
-                matches = re.findall(
-                    r"Reply (agy-e2e-[0-9a-f]{8})(?: after (\d+) seconds)?\.", text
-                )
+                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})( once released)?\.", text)
                 if matches:
-                    requested, hold = matches[-1]
-                    reply = requested
-                    hold_seconds = int(hold or 0)
-                    model.requested.append(requested)
+                    reply, hold = matches[-1]
+                    held = bool(hold)
+                    model.requested.append(reply)
                     break
-            time.sleep(hold_seconds)
+            if held:
+                model.release.wait(timeout=180)
             response = {
                 "candidates": [
                     {
@@ -124,8 +121,6 @@ def antigravity_model(
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            if requested is not None:
-                model.replied.append(requested)
 
     home = tmp_path / "model-home"
     home.mkdir()
@@ -142,6 +137,7 @@ def antigravity_model(
         try:
             yield model
         finally:
+            model.release.set()
             server.shutdown()
             thread.join(timeout=5)
 
@@ -151,6 +147,27 @@ def _wait_until(check: Callable[[], bool], message: str, timeout: float = 60) ->
     while not check():
         assert time.monotonic() < deadline, message
         time.sleep(0.2)
+
+
+def _watch_session_events(base_url: str, session_id: str) -> list[dict]:
+    """Collect the live session events that every browser viewer also receives."""
+    events: list[dict] = []
+    subscribed = threading.Event()
+
+    def read() -> None:
+        url = f"{base_url}/v1/sessions/{session_id}/stream"
+        with (
+            contextlib.suppress(httpx.HTTPError),
+            httpx.stream("GET", url, timeout=httpx.Timeout(30, read=None)) as response,
+        ):
+            for line in response.iter_lines():
+                if line.startswith("data: {"):
+                    events.append(json.loads(line.removeprefix("data: ")))
+                    subscribed.set()
+
+    threading.Thread(target=read, daemon=True).start()
+    assert subscribed.wait(30), "could not subscribe to the session stream"
+    return events
 
 
 @dataclass
@@ -468,21 +485,32 @@ def test_antigravity_web_turn_stays_in_progress_until_agy_replies(
     token = f"agy-e2e-{uuid.uuid4().hex[:8]}"
     page.get_by_test_id("view-mode-chat").click()
     composer = page.get_by_label("Message the agent")
-    composer.fill(f"Reply {token} after 15 seconds. No tools.")
+    events = _watch_session_events(session.base_url, session.session_id)
+    composer.fill(f"Reply {token} once released. No tools.")
     page.get_by_role("button", name="Send", exact=True).click()
     sent = page.locator('[data-testid="message-bubble"][data-role="user"]')
     expect(sent.filter(has_text=token)).to_have_count(1, timeout=30_000)
-
     _wait_until(
         lambda: token in antigravity_model.requested, "agy did not ask the mock model to reply"
     )
-    deadline = time.monotonic() + 120
-    while token not in antigravity_model.replied:
-        assert time.monotonic() < deadline, "the mock model never released the held reply"
-        assert (
-            composer.get_attribute("placeholder") == "Send a follow-up (queued) — Esc to stop"
-        ), "the turn was reported complete while agy was still waiting for its model reply"
+
+    def delivered_while_running() -> bool:
+        statuses = [event["status"] for event in events if event.get("type") == "session.status"]
+        completed = any(event.get("type") == "response.completed" for event in events)
+        return completed and statuses[-1:] == ["running"]
+
+    # The browser settles its send on the same response.completed this viewer receives.
+    _wait_until(delivered_while_running, "the delivered turn did not leave agy running")
+    queued = "Send a follow-up (queued) — Esc to stop"
+    expect(composer).to_have_attribute("placeholder", queued, timeout=10_000)
+    held_until = time.monotonic() + 3
+    while time.monotonic() < held_until:
+        assert composer.get_attribute("placeholder") == queued, (
+            "the turn was reported complete while agy was still waiting for its model reply"
+        )
         time.sleep(0.2)
+    antigravity_model.release.set()
+
     reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
     expect(reply.filter(has_text=token)).to_have_count(1, timeout=60_000)
     expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
