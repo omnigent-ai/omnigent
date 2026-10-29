@@ -7841,6 +7841,33 @@ async def _claude_legacy_prompt_consumed(
     return has_prior_history
 
 
+def _without_claude_session_id_arg(args: list[str]) -> list[str]:
+    """Drop a pass-through ``--session-id`` that a cold ``--resume`` would conflict with.
+
+    Claude exits with code 1 when ``--session-id`` accompanies ``--resume``
+    without ``--fork-session``; the id only named the session's first launch.
+
+    :param args: Pass-through Claude args, e.g. ``["--session-id", "<uuid>", "--verbose"]``.
+    :returns: *args* without ``--session-id <value>`` / ``--session-id=<value>``,
+        unchanged when ``--fork-session`` is present.
+    """
+    if "--fork-session" in args:
+        return args
+    kept: list[str] = []
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if arg == "--session-id":
+            skip_value = True
+            continue
+        if arg.startswith("--session-id="):
+            continue
+        kept.append(arg)
+    return kept
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -7907,7 +7934,10 @@ def _build_claude_native_base_args(
         skip_leading_prompt = (
             skip_initial_prompt and _claude_legacy_launch_prompt(terminal_launch_args) is not None
         )
-        args.extend(terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args)
+        passthrough = terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args
+        if resume_external_session_id:
+            passthrough = _without_claude_session_id_arg(passthrough)
+        args.extend(passthrough)
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
     # or the joined ``--model=X`` form).
