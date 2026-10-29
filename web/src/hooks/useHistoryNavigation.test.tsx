@@ -2,10 +2,19 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
-import { useHistoryNavigation } from "./useHistoryNavigation";
+import {
+  requestHistoryNavigation,
+  useHistoryNavigation,
+  useHistoryNavigationAvailability,
+} from "./useHistoryNavigation";
 
 const navigate = vi.fn();
-vi.mock("@/lib/routing", () => ({ useNavigate: () => navigate }));
+let navigationType: "POP" | "PUSH" | "REPLACE" = "POP";
+vi.mock("@/lib/routing", () => ({
+  useNavigate: () => navigate,
+  useLocation: () => ({ pathname: "/" }),
+  useNavigationType: () => navigationType,
+}));
 let embedded = false;
 vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
 
@@ -64,6 +73,7 @@ describe("useHistoryNavigation", () => {
     setHistoryIndex(0);
     renderHook(() => useHistoryNavigation(true));
     pressBracket("BracketLeft");
+    requestHistoryNavigation(-1);
     expect(navigate).not.toHaveBeenCalled();
   });
 
@@ -78,6 +88,13 @@ describe("useHistoryNavigation", () => {
     setHistoryIndex(5);
     pressBracket("BracketLeft");
     expect(navigate).toHaveBeenCalledWith(-1);
+  });
+
+  it("takes the steps the Back and Forward buttons ask for", () => {
+    renderHook(() => useHistoryNavigation(true));
+    requestHistoryNavigation(-1);
+    requestHistoryNavigation(1);
+    expect(navigate.mock.calls).toEqual([[-1], [1]]);
   });
 
   it("leaves bracket chords to a focused terminal or code editor", () => {
@@ -103,5 +120,48 @@ describe("useHistoryNavigation", () => {
     renderHook(() => useHistoryNavigation(true));
     window.dispatchEvent(new MouseEvent("mouseup", { button: 3 }));
     expect(navigate).not.toHaveBeenCalled();
+  });
+});
+
+describe("useHistoryNavigationAvailability", () => {
+  function step(idx: number, type: typeof navigationType, view: { rerender: () => void }) {
+    setHistoryIndex(idx);
+    navigationType = type;
+    view.rerender();
+  }
+
+  // The buttons render inside the app shell, which binds useHistoryNavigation.
+  const renderInShell = () =>
+    renderHook(() => {
+      useHistoryNavigation(true);
+      return useHistoryNavigationAvailability();
+    });
+
+  it("tracks which entries Back and Forward can reach", () => {
+    setHistoryIndex(3);
+    navigationType = "PUSH";
+    const view = renderInShell();
+    expect(view.result.current).toEqual({ canGoBack: true, canGoForward: false });
+
+    step(1, "POP", view);
+    expect(view.result.current).toEqual({ canGoBack: true, canGoForward: true });
+
+    // A push from an earlier entry drops the entries after it.
+    step(2, "PUSH", view);
+    expect(view.result.current).toEqual({ canGoBack: true, canGoForward: false });
+
+    step(0, "POP", view);
+    expect(view.result.current).toEqual({ canGoBack: false, canGoForward: true });
+  });
+
+  it("embedded, offers Back only after the page the app opened on", () => {
+    embedded = true;
+    setHistoryIndex(4);
+    navigationType = "POP";
+    const view = renderInShell();
+    expect(view.result.current.canGoBack).toBe(false);
+
+    step(5, "PUSH", view);
+    expect(view.result.current.canGoBack).toBe(true);
   });
 });
