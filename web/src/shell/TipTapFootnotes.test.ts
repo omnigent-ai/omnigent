@@ -178,10 +178,33 @@ describe("footnote round-trips", () => {
     ["at the end of bold text", "Some **claim[^n]** here.", "Some **claim**[^n] here."],
     ["inside bold text", "**bold [^1] text**", "**bold** [^1] **text**"],
     ["inside italic text", "*em [^1] x*", "*em* [^1] *x*"],
-    ["inside link text", "[see[^1]](https://l.test)", "[see](https://l.test)[^1]"],
   ])("moves a reference %s outside the markup", (_name, markdown, expected) => {
     const definition = "\n\n[^1]: a\n[^n]: b";
     expect(roundTrip(markdown + definition)).toBe(expected + definition);
+  });
+
+  // Link text never forms references, so a link keeps its text and URL.
+  it.each([
+    ["only a reference", "See [[^1]](https://l.test)."],
+    ["text and a reference", "[see[^1]](https://l.test)"],
+  ])("keeps a link whose text is %s", (_name, markdown) => {
+    const source = `${markdown}\n\n[^1]: a`;
+    const ed = makeEditor(source);
+    expect(ed.view.dom.querySelector("a")?.getAttribute("href")).toBe("https://l.test");
+    expect(ed.getMarkdown()).toBe(source);
+  });
+
+  it("keeps the URL of a bold link whose text is a reference", () => {
+    // TipTap writes bold around a link as `[**text**](url)`, footnote or not.
+    const saved = roundTrip("**[[^1]](https://l.test)**\n\n[^1]: a");
+    expect(saved).toBe("[**[^1]**](https://l.test)\n\n[^1]: a");
+    expect(roundTrip(saved)).toBe(saved);
+  });
+
+  it("keeps typed reference syntax in link text unescaped", () => {
+    const ed = makeEditor("[see](https://l.test)\n\n[^1]: a");
+    ed.commands.insertContentAt(3, "[^1]");
+    expect(ed.getMarkdown().replace(/\n+$/, "")).toBe("[se[^1]e](https://l.test)\n\n[^1]: a");
   });
 
   it.each([

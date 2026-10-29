@@ -26,6 +26,7 @@ import {
   definedFootnoteLabels,
   documentFootnoteLabels,
   escapeFootnoteReferences,
+  installFootnoteReferenceTokenizer,
   prepareFootnoteReferences,
   withFootnoteLabels,
 } from "./TipTapFootnotes";
@@ -139,12 +140,15 @@ export function installMarkdownSerializerPatch(): void {
         this.codeTypes.has(typeof mark === "string" ? mark : (mark.type as string)),
       );
     if (insideCode) return text;
-    return escapeFootnoteReferences(
-      text
-        .replace(ENTITY_AMP, "&amp;")
-        .replace(TAG_OPEN, "&lt;")
-        .replace(LINE_START_QUOTE, "$1\\>"),
+    const encoded = text
+      .replace(ENTITY_AMP, "&amp;")
+      .replace(TAG_OPEN, "&lt;")
+      .replace(LINE_START_QUOTE, "$1\\>");
+    // Link text never forms footnote references, so it needs no escaping.
+    const insideLink = (node.marks ?? []).some(
+      (mark) => (typeof mark === "string" ? mark : mark.type) === "link",
     );
+    return insideLink ? encoded : escapeFootnoteReferences(encoded);
   };
 }
 
@@ -248,6 +252,7 @@ export function installMarkdownParserPatch(): void {
   const originalParse = proto.parse;
   proto.parse = function (this: MarkdownManager, markdown: string): JSONContent {
     installIterativeSetextHeadings(this.instance);
+    installFootnoteReferenceTokenizer(this.instance);
     // `[^x]` is a footnote reference only when the file defines `[^x]:`.
     const doc = withFootnoteLabels(definedFootnoteLabels(this.instance, markdown), () =>
       wrapLooseInlineRuns(originalParse.call(this, markdown)),

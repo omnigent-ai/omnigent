@@ -211,6 +211,37 @@ export function prepareFootnoteReferences(node: JSONContent): JSONContent {
   return changed ? { ...node, content } : node;
 }
 
+const installedReferenceTokenizers = new WeakSet<MarkdownManager["instance"]>();
+
+/**
+ * Register the `[^label]` tokenizer with *marked*.
+ *
+ * It is registered with marked directly, not through @tiptap/markdown, to see
+ * whether it is inside link text: TipTap marks only text, so a reference there
+ * would lose the link. Inside a link `[^1]` stays text, and the link round-trips.
+ *
+ * :param marked: The editor's configured marked instance.
+ */
+export function installFootnoteReferenceTokenizer(marked: MarkdownManager["instance"]): void {
+  if (installedReferenceTokenizers.has(marked)) return;
+  installedReferenceTokenizers.add(marked);
+  marked.use({
+    extensions: [
+      {
+        name: "footnoteReference",
+        level: "inline",
+        start: (source: string) => source.indexOf("[^"),
+        tokenizer(source: string) {
+          if (this.lexer.state.inLink) return undefined;
+          const match = REFERENCE.exec(source);
+          if (!match || !isDefined(match[1])) return undefined;
+          return { type: "footnoteReference", raw: match[0], label: match[1] };
+        },
+      },
+    ],
+  });
+}
+
 /** Whether *state* has a footnote node selected as a whole. */
 function footnoteSelected(state: EditorState): boolean {
   const { selection } = state;
@@ -343,17 +374,6 @@ export const FootnoteReference = Node.create({
       { "data-footnote-reference": "", class: "md-footnote-reference" },
       (node.attrs.label as string | undefined) ?? "",
     ];
-  },
-
-  markdownTokenizer: {
-    name: "footnoteReference",
-    level: "inline",
-    start: (source) => source.indexOf("[^"),
-    tokenize(source) {
-      const match = REFERENCE.exec(source);
-      if (!match || !isDefined(match[1])) return undefined;
-      return { type: "footnoteReference", raw: match[0], label: match[1] };
-    },
   },
 
   parseMarkdown: (token, helpers) =>
