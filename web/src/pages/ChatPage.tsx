@@ -2440,7 +2440,6 @@ function ComposerImpl(
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
-  const isStreaming = status === "streaming";
 
   // Read-only when either the user lacks a write grant OR the session
   // is structurally non-interactive (``readOnlyReason``). The
@@ -2493,6 +2492,9 @@ function ComposerImpl(
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  // Native turns keep the session running after this client's send settles,
+  // and shouldQueueSend still queues while it does.
+  const turnInProgress = status === "streaming" || sessionStatus === "running";
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
   const dequeueMessage = useChatStore((s) => s.dequeueMessage);
@@ -3982,7 +3984,7 @@ function ComposerImpl(
                     ? "Respond to the pending request above to continue"
                     : disabled && sendDisabledReason === null
                       ? "Waiting for agents…"
-                      : isStreaming
+                      : turnInProgress
                         ? "Send a follow-up (queued) — Esc to stop"
                         : readyPlaceholder,
           rows: 1,

@@ -4662,6 +4662,25 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
+  it.each([
+    ["running", "Send a follow-up (queued) — Esc to stop"],
+    ["waiting", "Send a message…"],
+    ["idle", "Send a message…"],
+  ] as const)(
+    "follows a %s session after this client's send settles",
+    (sessionStatus, placeholder) => {
+      const previous = useChatStore.getState().sessionStatus;
+      onTestFinished(() => useChatStore.setState({ sessionStatus: previous }));
+      useChatStore.setState({ sessionStatus });
+      render(
+        <Composer
+          {...composerProps({ status: "idle", isWorking: computeIsWorking(sessionStatus) })}
+        />,
+      );
+      expect(textarea().placeholder).toBe(placeholder);
+    },
+  );
+
   it("resets the native text input when the Send button moves focus first", () => {
     const props = composerProps({ status: "streaming", isWorking: true });
     render(<Composer {...props} />);
