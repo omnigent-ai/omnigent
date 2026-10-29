@@ -24,6 +24,12 @@ import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
 import * as sessionsApi from "@/lib/sessionsApi";
+import {
+  type AskUserQuestionDraft,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
 import type { CommentInbox } from "@/hooks/useCommentInbox";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import {
@@ -38,7 +44,7 @@ vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
   const actual = await importActual<typeof approvalCard>();
   return {
     ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) => {
-      if (props.nativeDelivery || props.permissionDirectories)
+      if (props.nativeDelivery || props.permissionDirectories || props.askUserQuestion)
         return <actual.ApprovalCard {...props} />;
       const { elicitationId, message, status, allowAutoMode, onSubmit, requester } = props;
       return (
@@ -94,6 +100,14 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
     ...overrides,
   };
 }
+
+const draftQuestions = [{ question: "Pick a region", options: [], multiSelect: false }];
+const unsentDraft: AskUserQuestionDraft = {
+  currentIndex: 0,
+  selections: { "Pick a region": "" },
+  customSelected: { "Pick a region": true },
+  customInputs: { "Pick a region": "eu-west" },
+};
 
 /** A raw `response.elicitation_request` event dict, as a snapshot replays it. */
 function rawElicitation(id: string, message: string, extra: Record<string, unknown> = {}) {
@@ -159,6 +173,8 @@ afterEach(() => {
   vi.clearAllMocks();
   resetReadStateForTests();
   localStorage.clear();
+  clearAskUserQuestionDraft("eli_1");
+  clearAskUserQuestionDraft("eli_question");
 });
 
 /** A finished session whose latest turn the viewer hasn't opened yet. */
@@ -288,6 +304,30 @@ describe("InboxPage approval items", () => {
     expect(toggle.textContent).not.toContain("**");
   });
 
+  it("keeps a question card's answers when its row is collapsed and reopened", async () => {
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_question", "Claude has questions", {
+          ask_user_question: { questions: draftQuestions },
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    fireEvent.change(await screen.findByTestId("ask-user-question-custom-input"), {
+      target: { value: "eu-west" },
+    });
+    const item = screen.getByTestId("inbox-item");
+    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+    await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
+    expect(screen.queryByTestId("ask-user-question-form")).not.toBeInTheDocument();
+    fireEvent.click(within(item).getByRole("button", { name: /My Session/ }));
+
+    expect(await screen.findByTestId("ask-user-question-custom-input")).toHaveValue("eu-west");
+  });
+
   it("previews a policy prompt's command verbatim in the collapsed row", async () => {
     // WHY: only the bridges' `**<tool>**` message is formatted; a balanced `**`
     // inside a command the user is approving must not be read as emphasis.
@@ -315,6 +355,7 @@ describe("InboxPage approval items", () => {
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    saveAskUserQuestionDraft("eli_1", draftQuestions, unsentDraft);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -325,6 +366,7 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
+    expect(getAskUserQuestionDraft("eli_1", draftQuestions)).toBeUndefined();
   });
 
   it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
@@ -388,6 +430,7 @@ describe("InboxPage approval items", () => {
       pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     vi.mocked(sessionsApi.approve).mockRejectedValue(new Error("nope"));
+    saveAskUserQuestionDraft("eli_1", draftQuestions, unsentDraft);
     renderPage();
 
     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
@@ -395,6 +438,7 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "pending"),
     );
+    expect(getAskUserQuestionDraft("eli_1", draftQuestions)).toEqual(unsentDraft);
   });
 
   it("clears a stale verdict when a snapshot refresh still shows the elicitation as pending", async () => {
@@ -1440,6 +1484,7 @@ it.each(
       act(async () => {
         await queryClient.refetchQueries({ queryKey: ["inbox-elicitations"] });
       });
+    saveAskUserQuestionDraft("eli_1", draftQuestions, unsentDraft);
     renderPage(queryClient);
     fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
     await poll();
@@ -1466,6 +1511,10 @@ it.each(
       submissions[1]!.reject(new Error("retry failed"));
     });
     expect(await screen.findByRole("button", { name: "Retry sending approval" })).toBeEnabled();
+    // Only a success for the attempt still on screen clears the draft.
+    expect(getAskUserQuestionDraft("eli_1", draftQuestions)).toEqual(
+      outcome === "success" && !retryFirst ? undefined : unsentDraft,
+    );
   },
 );
 
