@@ -585,6 +585,8 @@ async def test_user_names_do_not_replace_same_named_server_agents(
         files={"bundle": ("bundle.tar.gz", build_agent_bundle("orion"), "application/gzip")},
     )
     assert installed.status_code == (200 if collision_aware else 409), installed.text
+    if not collision_aware:
+        assert "is a server agent" in installed.json()["error"]
     assert agent_store.get(shared.id).bundle_location == "server/bundle"
     expected = [installed.json()["id"]] if collision_aware else []
     assert shared.id not in expected
@@ -993,7 +995,9 @@ async def test_all_creation_paths_update_one_owner_name(
         assert conv.parent_conversation_id == (parent["session_id"] if child else None)
         assert conv.kind == ("sub_agent" if child else "default")
     assert len(set(session_ids)) == 3
-    assert SqlAlchemyConversationStore(db_uri).count_sessions_for_agent(agent_id, 10) >= 3
+    assert SqlAlchemyConversationStore(db_uri).count_sessions_for_agent(agent_id, 10) == 3 + (
+        first != "install"
+    )
     unchanged = await _install(c, ALICE, "orion", "v1")
     assert unchanged.status_code == 200, unchanged.text
     assert (unchanged.json()["id"], unchanged.json()["version"]) == (agent_id, 1)

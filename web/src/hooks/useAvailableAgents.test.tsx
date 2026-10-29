@@ -11,7 +11,11 @@ import { SidebarDataProvider } from "./useSidebarData";
 import { useAgents } from "./useAgents";
 import { refreshScopeWindow } from "@/lib/sidebarData";
 import type { Conversation } from "./useConversations";
-import { useAvailableAgents, prefetchAvailableAgentDetails } from "./useAvailableAgents";
+import {
+  useAvailableAgents,
+  prefetchAvailableAgentDetails,
+  USER_AGENTS_QUERY_KEY,
+} from "./useAvailableAgents";
 
 // The template catalog and sidebar Mine cache load through authenticatedFetch.
 // URL-keyed stubs exercise the real fetch and mapping path.
@@ -45,12 +49,13 @@ function routeFetch(routes: Record<string, Response>) {
   });
 }
 
-function wrapper({ children }: { children: ReactNode }) {
-  // retry off so the no-network/error case resolves on the first
-  // attempt instead of stalling the test on TanStack's backoff.
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
+function wrapper({
+  children,
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+}: {
+  children: ReactNode;
+  client?: QueryClient;
+}) {
   return (
     <QueryClientProvider client={client}>
       <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
@@ -1439,9 +1444,10 @@ describe("useAvailableAgents slow discovery scan", () => {
 describe("useAvailableAgents user agents (scope=user)", () => {
   const USER_AGENTS_URL = "/v1/agents?scope=user&limit=50";
 
-  function wrapperWithInfo(agentInstall: boolean) {
+  function wrapperWithInfo(agentInstall: boolean, client?: QueryClient) {
     return function InfoWrapper({ children }: { children: ReactNode }) {
       return wrapper({
+        client,
         children: (
           <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, agent_install: agentInstall }}>
             {children}
@@ -1462,6 +1468,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
   });
 
   it("waits for capabilities before selecting a discovery mode", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     routeFetch({
       [BUILTINS_URL]: CATALOG,
       [MINE_URL]: MINE,
@@ -1476,6 +1483,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
       {
         wrapper: ({ children }) =>
           wrapper({
+            client,
             children: (
               <CapabilitiesProvider
                 info={loading ? "loading" : { ...FALLBACK_SERVER_INFO, agent_install: true }}
@@ -1728,11 +1736,13 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     expect(fetchMock.mock.calls.some(([url]) => String(url).includes("scope=user"))).toBe(false);
   });
 
-  it.each(["request", "cursor-cycle"])(
-    "keeps server agents and reports a user-catalog %s failure",
+  it.each(["request", "cursor-cycle", "cached-refetch"])(
+    "keeps available agents and reports a user-catalog %s failure",
     async (failure) => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const cached = failure === "cached-refetch";
       const userPages: Record<string, Response> =
-        failure === "request"
+        failure !== "cursor-cycle"
           ? { [USER_AGENTS_URL]: mockResponse({}, { ok: false, status: 500 }) }
           : {
               [USER_AGENTS_URL]: mockResponse({ data: [], has_more: true, last_id: "a" }),
@@ -1751,17 +1761,37 @@ describe("useAvailableAgents user agents (scope=user)", () => {
         [BUILTINS_URL]: CATALOG,
         [MINE_URL]: MINE,
         ...userPages,
+        ...(cached
+          ? {
+              [USER_AGENTS_URL]: mockResponse({
+                data: [{ id: "ag_orion", name: "orion" }],
+                has_more: false,
+              }),
+            }
+          : {}),
       });
 
       const { result } = renderHook(() => ({ ...useAvailableAgents() }), {
-        wrapper: wrapperWithInfo(true),
+        wrapper: wrapperWithInfo(true, client),
       });
+      if (cached) {
+        await waitFor(() =>
+          expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly", "ag_orion"]),
+        );
+        routeFetch({ [BUILTINS_URL]: CATALOG, [MINE_URL]: MINE, ...userPages });
+        await act(async () => {
+          await client.invalidateQueries({ queryKey: USER_AGENTS_QUERY_KEY });
+          await result.current.refetch();
+        });
+      }
       await waitFor(() => {
         expect(result.current.isError).toBe(true);
       });
 
-      expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
-      expect(result.current.isPlaceholderData).toBe(true);
+      expect(result.current.data?.map((a) => a.id)).toEqual(
+        cached ? ["ag_polly", "ag_orion"] : ["ag_polly"],
+      );
+      expect(result.current.isPlaceholderData).toBe(!cached);
       expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
     },
   );

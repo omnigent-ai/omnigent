@@ -29,7 +29,7 @@ const DEFAULT_HARNESS = Object.keys(BRAIN_HARNESS_LABELS)[0];
 /** The server's rule for agent names (`omnigent/spec/validator.py`). */
 const AGENT_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const AGENT_UPDATE_NOTICE =
-  "Creating or importing a name you already own updates that agent for all its sessions. Use a different name to keep a separate agent.";
+  "Reusing a name replaces the current agent's configuration for its sessions. Older copies keep their configuration. Use a different name for a separate agent.";
 
 /** A single MCP server row in the form. */
 interface MCPFormEntry {

@@ -155,32 +155,42 @@ describe("AgentHarnessPicker inline harness list", () => {
 });
 
 describe("AgentHarnessPicker Agents group header", () => {
-  it("distinguishes same-named server and owned agents and selects their IDs", async () => {
-    const server = agent({
-      id: "server-orion",
-      name: "Orion",
-      display_name: "Orion",
-      harness: "claude-sdk",
-      builtin: false,
-    });
-    const owned = { ...server, id: "owned-orion", mine: true as const };
-    const selected: string[] = [];
-    renderPicker({
-      harnessEntries: [claude],
-      agentEntries: [server, owned],
-      onSelectAgent: (entry) => selected.push(entry.id),
-    });
-    async function selectEntry(entry: AvailableAgent, source: string) {
-      await openPicker();
-      await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
-      const row = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
-      expect(row).toHaveTextContent(`Orion (${source})`);
-      await userEvent.click(row);
-    }
-    await selectEntry(server, "server");
-    await selectEntry(owned, "yours");
-    expect(selected).toEqual([server.id, owned.id]);
-  });
+  it.each(["server", "yours"])(
+    "distinguishes same-named agents with %s selected",
+    async (source) => {
+      const server = agent({
+        id: "server-orion",
+        name: "Orion",
+        display_name: "Orion",
+        harness: "claude-sdk",
+        builtin: false,
+      });
+      const owned = { ...server, id: "owned-orion", mine: true as const };
+      const selected: string[] = [];
+      renderPicker({
+        harnessEntries: [claude],
+        agentEntries: [server, owned],
+        effectiveAgentId: source === "server" ? server.id : owned.id,
+        onSelectAgent: (entry) => selected.push(entry.id),
+      });
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+        `Orion (${source})`,
+      );
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        `Orion (${source})`,
+      );
+      async function selectEntry(entry: AvailableAgent, expectedSource: string) {
+        await openPicker();
+        await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+        const row = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
+        expect(row).toHaveTextContent(`Orion (${expectedSource})`);
+        await userEvent.click(row);
+      }
+      await selectEntry(server, "server");
+      await selectEntry(owned, "yours");
+      expect(selected).toEqual([server.id, owned.id]);
+    },
+  );
 
   it("renders the header when a bundle agent is present", async () => {
     renderPicker({ harnessEntries: [claude], agentEntries: [polly] });

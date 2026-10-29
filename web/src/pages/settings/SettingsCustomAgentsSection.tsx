@@ -96,7 +96,6 @@ export function SettingsCustomAgentsSection() {
         <h1 className="mb-6 text-2xl font-semibold">Create custom agent</h1>
         <CreateAgentForm
           submitLabel="Save agent"
-          notice="Saving a name you already own updates that agent and replaces its entire configuration. Sessions using that agent will receive the update. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
             const agent = await save.mutateAsync(input);
