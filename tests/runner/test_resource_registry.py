@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -131,12 +132,28 @@ async def test_claude_program_status_real_launch_and_fallback(
     registry.set_session_status_publisher(
         lambda _, state, reason: statuses.append((state, reason))
     )
+    background: list[bool] = []
+    registry.set_session_background_publisher(lambda _, running: background.append(running))
     spec = _claude_osc_spec(tmp_path, peer, protocol, sandbox_type)
 
     async def wait_status(state: str, reason: str | None = None) -> None:
         async with asyncio.timeout(10):
             while not statuses or statuses[-1] != (state, reason):
                 await asyncio.sleep(0.02)
+
+    async def wait_background(running: bool) -> None:
+        # A resync re-asserts the current value, so only the latest one is checked.
+        with contextlib.suppress(AssertionError):
+            await poll_until_async(lambda: bool(background) and background[-1] is running)
+        assert background and background[-1] is running, background
+
+    def write_status_file(status: str) -> None:
+        previous = status_file.stat().st_mtime if status_file.exists() else None
+        status_file.write_text(json.dumps({"kind": "interactive", "status": status}))
+        if previous is not None:
+            # Consecutive writes must stay observable on coarse-mtime filesystems.
+            mtime = max(status_file.stat().st_mtime, previous + 1)
+            os.utime(status_file, (mtime, mtime))
 
     try:
         await registry.launch_required_terminal(
@@ -168,8 +185,10 @@ async def test_claude_program_status_real_launch_and_fallback(
                 await asyncio.sleep(0.05)
         if protocol != "osc":
             assert reader is None or reader.status is None
-            status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
+            # The turn ends with a background shell still running.
+            write_status_file("shell")
             await wait_status("idle")
+            await wait_background(True)
             return
         assert reader is not None
         async with asyncio.timeout(5):
@@ -201,6 +220,14 @@ async def test_claude_program_status_real_launch_and_fallback(
         for key, state in (("d", "idle"), ("w", "running"), ("i", "idle")):
             await instance.send(keys=key)
             await wait_status(state)
+        # OSC cannot report a background shell; the file's ``shell`` does, as a
+        # separate signal that never moves the session's status.
+        published = len(statuses)
+        write_status_file("shell")
+        await wait_background(True)
+        write_status_file("idle")
+        await wait_background(False)
+        assert len(statuses) == published
         for key in ("c", "u"):
             await instance.send(keys=key)
             await wait_status("idle")  # Falls back to the still-unchanged status file.
@@ -913,8 +940,10 @@ async def _observe_native_with_fake_poller(
         lambda _sid, status, _reason=None: statuses.append(status)
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
-        del session_id, instance
+    def _fake_build(
+        *, session_id: str, instance: object, on_status: object, on_background: object = None
+    ) -> _FakeStatusPoller:
+        del session_id, instance, on_background
         poller = _FakeStatusPoller(on_status)
         pollers.append(poller)
         return poller
@@ -2204,8 +2233,10 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         lambda _sid, status, reason=None: edges.append((status, reason))
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
-        del session_id, instance
+    def _fake_build(
+        *, session_id: str, instance: object, on_status: object, on_background: object = None
+    ) -> _FakeStatusPoller:
+        del session_id, instance, on_background
         poller = _FakeStatusPoller(on_status)
         pollers.append(poller)
         return poller

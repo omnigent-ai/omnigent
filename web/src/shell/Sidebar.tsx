@@ -5841,6 +5841,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "project_id",
   "owner",
   "pending_elicitations_count",
+  "background_work_running",
   "provisional",
 ];
 

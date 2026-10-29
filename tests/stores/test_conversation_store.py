@@ -7362,9 +7362,10 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
 
     ``updated_at`` drives sidebar ordering, so the tunnel replica's
     per-tunnel liveness stamps and per-transition status/pending writes
-    must not reorder the list. Round-trips all three columns:
+    must not reorder the list. Round-trips every live-state column:
     ``runner_last_seen`` (bulk by runner, cleared on disconnect),
-    ``live_status`` (enum round-trip), ``pending_elicitation_count``.
+    ``live_status`` (enum round-trip), ``pending_elicitation_count``,
+    ``background_work_running``.
     """
     from omnigent.stores.conversation_store import runner_seen_is_fresh
 
@@ -7395,13 +7396,32 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     connectivity = conversation_store.get_session_connectivity([conv_a.id])
     assert connectivity[conv_a.id].runner_last_seen is None
 
-    # Status + pending count round-trip through the entity.
+    # Status, pending count and background flag round-trip through the entity.
+    assert before.background_work_running is None
     conversation_store.set_session_live_status(conv_a.id, "running")
     conversation_store.set_pending_elicitation_count(conv_a.id, 2)
+    conversation_store.set_background_work_running(conv_a.id, True)
     updated = conversation_store.get_conversation(conv_a.id)
     assert updated is not None
     assert updated.live_status == "running"
     assert updated.pending_elicitation_count == 2
+    assert updated.background_work_running is True
+    # A guarded clear for another runner leaves the flag; one for the bound runner clears it.
+    conversation_store.set_background_work_running(conv_a.id, False, runner_id="runner_other")
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    # The runner reconnected at 2,000: a clear for "unseen since 2,000" keeps its report.
+    conversation_store.touch_runner_liveness(["runner_live"], now=2_000)
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_000
+    )
+    kept = conversation_store.get_conversation(conv_a.id)
+    assert kept is not None and kept.background_work_running is True
+    conversation_store.set_background_work_running(
+        conv_a.id, False, runner_id="runner_live", unseen_since=2_001
+    )
+    cleared = conversation_store.get_conversation(conv_a.id)
+    assert cleared is not None and cleared.background_work_running is False
 
     # None of the live-state writes moved updated_at.
     assert updated.updated_at == before.updated_at

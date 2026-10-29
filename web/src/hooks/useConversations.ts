@@ -180,6 +180,11 @@ export interface Conversation {
   harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
+  /**
+   * A background shell outlives the session's ended turn (claude-native). The
+   * sidebar shows the session as working; `status` stays as reported.
+   */
+  background_work_running?: boolean;
   status?: "idle" | "running" | "failed";
   /**
    * Whether the session's runner is reachable, matching `GET /health`.

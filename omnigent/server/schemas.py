@@ -3052,6 +3052,11 @@ class SessionListItem(BaseModel):
         passing through ``session_stream`` and decrements when a
         verdict is dispatched. ``0`` when the session has no
         outstanding elicitations.
+    :param background_work_running: ``True`` while a background shell
+        outlives the session's ended turn (claude-native, from Claude's
+        status file). The sidebar shows such a session as working; ``status``
+        stays as reported, so the session still takes a new message. ``False``
+        while the session's runner is offline.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3122,6 +3127,7 @@ class SessionListItem(BaseModel):
     owner: str | None = None
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
+    background_work_running: bool = False
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False

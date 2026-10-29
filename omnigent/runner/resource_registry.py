@@ -521,6 +521,11 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
+        # Optional callback ``(session_id, running) -> None`` invoked on the
+        # event loop when a claude-native session's background shells start
+        # or stop outliving its turn. Set via
+        # :meth:`set_session_background_publisher`.
+        self._session_background_publisher: Callable[[str, bool], None] | None = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -597,6 +602,20 @@ class SessionResourceRegistry:
             (e.g. ``"permission prompt"``), or ``None``.
         """
         self._session_status_publisher = publisher
+
+    def set_session_background_publisher(
+        self,
+        publisher: Callable[[str, bool], None],
+    ) -> None:
+        """Install the background-shell publisher for claude-native sessions.
+
+        Invoked on the event loop, like the session-status publisher, when
+        Claude's status file starts or stops reporting a background shell that
+        outlives the turn.
+
+        :param publisher: Callable ``(session_id, running) -> None``.
+        """
+        self._session_background_publisher = publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -1489,6 +1508,7 @@ class SessionResourceRegistry:
         """
         activity_publisher = self._terminal_activity_publisher
         status_publisher = self._session_status_publisher
+        background_publisher = self._session_background_publisher
         exit_publisher = self._terminal_exit_publisher
         # Status edges are derived only from native agent terminals — a
         # generic shell's output must not move the session's working status.
@@ -1569,6 +1589,13 @@ class SessionResourceRegistry:
             # activity badges and process-death detection.
             return status_poller is not None and status_poller.active
 
+        def _publish_background(running: bool) -> None:
+            # Runs on the watcher thread; hop to the loop for the loop-only publisher.
+            if background_publisher is None:
+                return
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(background_publisher, session_id, running)
+
         # Claude reports explicit state through OSC when opted in, with its
         # sessions/<pid>.json file as fallback. Other roles retain pane inference.
         status_poller = (
@@ -1578,6 +1605,7 @@ class SessionResourceRegistry:
                 on_status=lambda status, blocked_on=None: _publish_status(
                     status, blocked_on, record_activity=True
                 ),
+                on_background=_publish_background,
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1760,8 +1788,12 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None], None],
+        on_background: Callable[[bool], None] | None = None,
     ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
-        """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
+        """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity.
+
+        The file also supplies the background-shell signal, even while OSC owns status.
+        """
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
             read_claude_session_id,
@@ -1788,6 +1820,7 @@ class SessionResourceRegistry:
             ),
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,
+            on_background=on_background,
         )
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller

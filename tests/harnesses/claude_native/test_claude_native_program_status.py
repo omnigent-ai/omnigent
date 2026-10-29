@@ -122,6 +122,58 @@ def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path
     assert reasons == [("running", "permission prompt"), ("idle", None)]
 
 
+def test_osc_owns_status_while_the_file_reports_background_shells(tmp_path: Path) -> None:
+    """OSC says ``done`` once a turn ends with a shell still running; only the file says so."""
+    path = tmp_path / "program-status.json"
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    status_file = sessions / "4242.json"
+    statuses: list[str] = []
+    background: list[bool] = []
+
+    def on_status(status: str, _reason: str | None) -> None:
+        statuses.append(status)
+
+    def write_file(status: str) -> None:
+        previous = status_file.stat().st_mtime if status_file.exists() else None
+        status_file.write_text(
+            json.dumps({"pid": 4242, "sessionId": "s", "kind": "interactive", "status": status})
+        )
+        if previous is not None:
+            # Consecutive writes must stay observable on coarse-mtime filesystems.
+            mtime = max(status_file.stat().st_mtime, previous + 1)
+            os.utime(status_file, (mtime, mtime))
+
+    poller = ClaudeProgramStatusPoller(
+        ProgramStatusReader(path),
+        SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=lambda: 4242,
+            session_id_getter=lambda: "s",
+            config_dir=tmp_path,
+            on_background=background.append,
+        ),
+        on_status,
+    )
+    _write_report(path, {"state": "working", "app": "claude-code"})
+    write_file("busy")
+    poller.tick()
+    _write_report(path, {"state": "done", "app": "claude-code"})
+    write_file("shell")
+    poller.tick()
+    assert statuses == ["running", "idle"]
+    assert background == [True]
+
+    # The shell's completion starts a follow-up turn; the file's busy and idle
+    # publish no status edge of their own while OSC is live.
+    write_file("busy")
+    poller.tick()
+    write_file("idle")
+    poller.tick()
+    assert statuses == ["running", "idle"]
+    assert background == [True, False]
+
+
 def test_forwarded_hook_edge_cancels_the_grace_period(tmp_path: Path) -> None:
     """Once the hook's terminal edge clears the turn, the standing error report fails nothing."""
     path = tmp_path / "program-status.json"

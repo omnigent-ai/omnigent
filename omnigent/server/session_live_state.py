@@ -1,7 +1,8 @@
 """Best-effort persistence of per-session live state to the conversations table.
 
-The sidebar's live fields — ``runner_online``, turn ``status``, and the
-pending-approval count — were historically served from in-memory caches
+The sidebar's live fields — ``runner_online``, turn ``status``, the
+pending-approval count, and the background-shell flag — were historically
+served from in-memory caches
 that exist only on the server replica holding a session's runner tunnel
 (the tunnel registry, the SSE-relay status cache, and the
 pending-elicitations index). Under host_id replica sharding a session
@@ -38,8 +39,10 @@ unaffected.
 from __future__ import annotations
 
 import contextvars
+import functools
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +76,11 @@ _executor: ThreadPoolExecutor | None = None
 _last_status: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 # Last count persisted per session, for dedupe.
 _last_pending: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Last background-shell flag persisted per session, with its reporting runner, for dedupe.
+_last_background: WorkspaceScopedCache[str, tuple[str | None, bool]] = WorkspaceScopedCache()
+# Handoffs to another replica per session. A write queued before a handoff sees
+# the count change and is skipped, so it cannot overwrite the new owner's value.
+_handoffs: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 # This process's own last touch_runner_liveness() stamp per runner id.
 # Never erased by clear_runner_liveness — only configure() resets it.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally-unique runner_id
@@ -97,6 +105,8 @@ def configure(
     _scheduled_task_store = scheduled_task_store
     _last_status.clear()
     _last_pending.clear()
+    _last_background.clear()
+    _handoffs.clear()
     _last_liveness_stamp.clear()
 
 
@@ -193,9 +203,28 @@ def persist_live_status(session_id: str, status: str) -> None:
     submit("live_status", _store.set_session_live_status, session_id, status, on_failure=_evict)
 
 
+def _submit_while_owned(
+    session_id: str,
+    description: str,
+    fn: Callable[..., object],
+    *args: object,
+    on_failure: Callable[[], None] | None = None,
+) -> None:
+    """Queue a write that is skipped if *session_id* is handed off before it runs."""
+    handoffs = _handoffs.get(session_id, 0)
+
+    def _write() -> None:
+        if _handoffs.get(session_id, 0) == handoffs:
+            fn(*args)
+
+    submit(description, _write, on_failure=on_failure)
+
+
 def forget_live_status(session_id: str) -> None:
-    """Drop this process's dedupe state for a session handed to another replica."""
+    """Drop this process's dedupe state and queued writes for a session handed off."""
+    _handoffs[session_id] = _handoffs.get(session_id, 0) + 1
     _last_status.pop(session_id, None)
+    _last_background.pop(session_id, None)
 
 
 def persist_scheduled_run_completion(
@@ -285,6 +314,70 @@ def persist_pending_count(conversation_id: str, count: int) -> None:
         conversation_id,
         count,
         on_failure=_evict,
+    )
+
+
+def persist_background_work_running(
+    session_id: str, running: bool, *, runner_id: str | None = None
+) -> None:
+    """
+    Persist whether a session's background shells outlive its ended turn.
+
+    Called wherever ``_session_background_work_running_cache`` is written.
+    Deduplicated: only a change, or a report from another runner, reaches the
+    database.
+
+    :param session_id: Session/conversation identifier.
+    :param running: ``True`` while a background shell outlives the turn.
+    :param runner_id: The reporting runner, when known; the write applies only
+        while the session is still bound to it.
+    """
+    report = (runner_id, running)
+    if _store is None or _last_background.get(session_id) == report:
+        return
+    _last_background[session_id] = report
+
+    def _evict() -> None:
+        # See persist_live_status._evict: a dropped write must not leave the
+        # dedupe cache asserting this value reached the database.
+        if _last_background.get(session_id) == report:
+            _last_background.pop(session_id, None)
+
+    _submit_while_owned(
+        session_id,
+        "background_work_running",
+        functools.partial(_store.set_background_work_running, runner_id=runner_id),
+        session_id,
+        running,
+        on_failure=_evict,
+    )
+
+
+def clear_background_work_running(session_id: str, runner_id: str, *, unseen_since: int) -> None:
+    """
+    Clear a session's background flag while it is still bound to a departed runner.
+
+    The write applies only while the session is bound to *runner_id* and that
+    runner has not been seen since *unseen_since*, so neither a replacement
+    runner's report nor one from the same runner reconnecting is erased. The
+    dedupe entry is dropped so the runner's next report is written even if it
+    repeats the old value.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_id: The departed runner, e.g. ``"runner_abc123"``.
+    :param unseen_since: Epoch seconds the runner must not have been seen since.
+    """
+    _last_background.pop(session_id, None)
+    if _store is None:
+        return
+    _submit_while_owned(
+        session_id,
+        "background_work_running",
+        functools.partial(
+            _store.set_background_work_running, runner_id=runner_id, unseen_since=unseen_since
+        ),
+        session_id,
+        False,
     )
 
 
