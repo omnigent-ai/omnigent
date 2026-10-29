@@ -60,7 +60,8 @@ export function ApprovePage() {
     elicitationId: string;
   }>();
   const [state, setState] = useState<PageState>({ kind: "loading" });
-  const [refusal, setRefusal] = useState<{ status: number }>();
+  const [reloadCount, setReloadCount] = useState(0);
+  const refusedResolveStatus = useRef<number | undefined>(undefined);
   const submission = useRef<{ revision: number; pending: boolean; attempt?: string }>({
     revision: 0,
     pending: false,
@@ -75,7 +76,9 @@ export function ApprovePage() {
     let polling = false;
     let pollDelay = 1000;
     let nativeDeliverySeen = false;
-    let unreportedRefusal = refusal?.status;
+    // Only the load this run starts reports the refusal; stale polls and later links don't.
+    let unreportedRefusal = refusedResolveStatus.current;
+    refusedResolveStatus.current = undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const load = async () => {
       const revision = submission.current.revision;
@@ -106,7 +109,7 @@ export function ApprovePage() {
           submission.current = { revision: submission.current.revision + 1, pending: false };
           setState({ kind: polling ? "recovering" : "resolved" });
         } else if (refusedStatus !== undefined && !data.terminal_fallback) {
-          // The prompt didn't move to the terminal, so report the refusal.
+          // Without a terminal hold, the 409 is some other conflict rather than a hand-off.
           setState({ kind: "error", message: `Resolve failed: ${refusedStatus}` });
         } else if (revision === submission.current.revision) {
           // A new server attempt supersedes the POST still waiting on its response.
@@ -132,7 +135,7 @@ export function ApprovePage() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [sessionId, elicitationId, refusal]);
+  }, [sessionId, elicitationId, reloadCount]);
 
   const submit = useCallback(
     async (
@@ -174,8 +177,9 @@ export function ApprovePage() {
         if (!res.ok && submission.current === submitted) {
           if (res.status === 409) {
             // The prompt may have moved to the agent's terminal; reload to check.
+            refusedResolveStatus.current = res.status;
             setState({ kind: "loading" });
-            setRefusal({ status: res.status });
+            setReloadCount((count) => count + 1);
           } else {
             setState({ kind: "error", message: `Resolve failed: ${res.status}` });
           }

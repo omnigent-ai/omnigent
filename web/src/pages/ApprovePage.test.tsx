@@ -8,7 +8,7 @@
 // (bad status, network throw, missing params).
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApprovePage } from "./ApprovePage";
 import * as identity from "@/lib/identity";
@@ -319,6 +319,36 @@ describe("ApprovePage submission", () => {
     expect(await screen.findByText("Answer in the terminal")).toBeInTheDocument();
     expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
+  });
+
+  it("doesn't carry a refused answer's error to the next approval link", async () => {
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
+      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 409 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
+      .mockResolvedValue(jsonResponse({ status: "pending", message: "Deploy the release?" }));
+    function OpenNextApproval() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate("/approve/sess_1/eli_2")}>
+          Next link
+        </button>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/approve/sess_1/eli_1"]}>
+        <OpenNextApproval />
+        <Routes>
+          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
+    expect(await screen.findByText("Resolve failed: 409")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next link" }));
+    expect(await screen.findByText("Deploy the release?")).toBeInTheDocument();
+    expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
   });
 
   it("shows a network error when the resolve POST throws", async () => {
