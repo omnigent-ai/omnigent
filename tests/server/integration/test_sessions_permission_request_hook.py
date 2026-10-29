@@ -3375,6 +3375,7 @@ async def test_card_waiting_in_terminal_expires_once_session_is_deleted_on_anoth
             expired = await _next_elicitation_event(stream)
             assert expired["type"] == "response.elicitation_resolved"
             assert expired["reason"] == "unanswered"
+        await _finish_deferred_clears()
         assert pending_elicitations.count_for(session_id) == 0
         assert pending_elicitations.count_for(parent_id) == 0
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
