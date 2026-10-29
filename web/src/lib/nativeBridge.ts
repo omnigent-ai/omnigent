@@ -305,7 +305,9 @@ export type DesktopCommand =
   | "toggle-pin-session"
   | "fork-session"
   | "go-back"
-  | "go-forward";
+  | "go-forward"
+  | "reload"
+  | "focus-address-bar";
 
 const DESKTOP_COMMANDS: readonly string[] = [
   "close",
@@ -316,6 +318,8 @@ const DESKTOP_COMMANDS: readonly string[] = [
   "fork-session",
   "go-back",
   "go-forward",
+  "reload",
+  "focus-address-bar",
 ] satisfies DesktopCommand[];
 
 export interface DesktopCommandEvent {

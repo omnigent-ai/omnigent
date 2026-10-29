@@ -247,6 +247,7 @@ describe("KeyboardShortcutsDialog", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Close tab, or leave the session")).toBeNull();
     expect(screen.queryByText("Quit Omnigent")).toBeNull();
+    expect(screen.queryByText("Reload the browser tab")).toBeNull();
     expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
 
@@ -260,6 +261,8 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Fork current session")).toEqual(["Ctrl", "Alt", "F"]);
     expect(keysFor("Quit Omnigent")).toEqual(["Ctrl", "Q"]);
     expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T", "Ctrl", "Alt", "B"]);
+    expect(keysFor("Reload the browser tab")).toEqual(["Ctrl", "R"]);
+    expect(keysFor("Focus the browser address bar")).toEqual(["Ctrl", "L"]);
   });
 });
 

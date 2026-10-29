@@ -2102,6 +2102,8 @@ function AppShellImpl() {
     // An open file with unsaved edits asks before the session (and its viewer) goes away.
     else guardFileNavigation(null, undefined, () => navigateTo("/"));
   });
+  // Desktop Reload (⌘R) reloads the app unless a browser tab's toolbar took it.
+  useDesktopCommand("reload", () => window.location.reload());
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
