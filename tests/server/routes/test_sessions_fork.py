@@ -892,7 +892,8 @@ async def test_fork_copies_all_file_rows_without_probing_blobs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fork_session_run_config_overrides_pass_through() -> None:
+@pytest.mark.parametrize("side_chat", [False, True])
+async def test_fork_session_run_config_overrides_pass_through(side_chat: bool) -> None:
     """The dialog's model / effort / launch-args picks reach the store as
     explicit overrides with their set-flags on.
 
@@ -908,6 +909,7 @@ async def test_fork_session_run_config_overrides_pass_through() -> None:
     resp = client.post(
         "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
         json={
+            "side_chat": side_chat,
             "model_override": "opus",
             "reasoning_effort": "high",
             "terminal_launch_args": ["--permission-mode", "auto"],
@@ -1458,9 +1460,10 @@ async def test_fork_codex_bypass_stamps_label_on_codex_target(
 
     assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
     extra = conv_store.fork_calls[0]["extra_labels"]
-    assert extra == {"omnigent.codex_native.bypass_sandbox": "1"}, (
-        f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
-    )
+    assert extra == {
+        "omnigent.codex_native.bypass_sandbox": "1",
+        "omnigent.client_surface": "web",
+    }, f"bypass opt-in must stamp the codex bypass label, got {extra!r}"
 
 
 @pytest.mark.asyncio
@@ -1978,7 +1981,10 @@ async def test_fork_managed_launches_its_requested_host_id(
     assert body["labels"][REQUESTED_HOST_ID_LABEL_KEY] == host_id
     # Born with the row (not patched onto the response): a list read racing the
     # fork can't return the row without the id the caller routes it by.
-    assert conv_store.fork_calls[0]["extra_labels"] == {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+    assert conv_store.fork_calls[0]["extra_labels"] == {
+        REQUESTED_HOST_ID_LABEL_KEY: host_id,
+        "omnigent.client_surface": "web",
+    }
     assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
 
 

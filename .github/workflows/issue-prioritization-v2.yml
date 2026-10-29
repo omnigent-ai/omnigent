@@ -43,7 +43,7 @@ concurrency:
 
 jobs:
   prioritize:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       UV_INDEX_URL: https://pypi.org/simple
@@ -131,3 +131,30 @@ jobs:
           path: /tmp/issue-priority-v2
           retention-days: 30
           if-no-files-found: warn
+
+  sync-linked-prs:
+    # Labels written above with the workflow token never trigger
+    # sync-pr-priority.yml, so mirror them onto linked PRs here, even if grading
+    # fails after labeling. A separate job keeps PR write access out of grading.
+    needs: prioritize
+    if: ${{ !cancelled() && inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Check out default-branch script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/sync_pr_priority.py
+          persist-credentials: false
+
+      - name: Sync priority onto PRs that close the issue
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: python3 .github/scripts/sync_pr_priority.py

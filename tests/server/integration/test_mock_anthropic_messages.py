@@ -91,3 +91,47 @@ async def test_nonstream_tool_use_has_decoded_input() -> None:
         assert message["stop_reason"] == "tool_use"
         assert message["content"][0]["name"] == "inspect"
         assert message["content"][0]["input"] == {"path": "synthetic.txt"}
+
+
+async def test_message_requests_record_each_requests_beta_flags() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=mock_llm_server.app), base_url="http://mock"
+    ) as client:
+        (
+            await client.post(
+                "/mock/configure", json={"responses": [{"text": "a"}, {"text": "b"}]}
+            )
+        ).raise_for_status()
+        long_context = {
+            "model": "model-long",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "one"}],
+        }
+        plain = {
+            "model": "model-plain",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "two"}],
+        }
+        headers = {"anthropic-beta": "context-1m-2025-08-07, interleaved-thinking-2025-05-14"}
+        assert (
+            await client.post("/v1/messages", json=long_context, headers=headers)
+        ).status_code == 200
+        assert (await client.post("/v1/messages", json=plain)).status_code == 200
+
+        filtered = (
+            await client.get("/mock/message_requests", params={"key": "model-long"})
+        ).json()
+        assert filtered["requests"] == [
+            {
+                "body": long_context,
+                "betas": ["context-1m-2025-08-07", "interleaved-thinking-2025-05-14"],
+            }
+        ]
+        everything = (await client.get("/mock/message_requests")).json()["requests"]
+        assert [entry["betas"] for entry in everything] == [
+            ["context-1m-2025-08-07", "interleaved-thinking-2025-05-14"],
+            [],
+        ]
+
+        (await client.post("/mock/reset")).raise_for_status()
+        assert (await client.get("/mock/message_requests")).json() == {"requests": []}
