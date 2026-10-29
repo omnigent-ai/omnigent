@@ -434,3 +434,40 @@ async def test_attachment_requests_correlate_with_binding_change(
     assert {r["phase"] for r in rows} == {"start", "ok"}
     assert all(r["operation"] == "get_session" for r in rows)
     assert all("client_launch_id" not in r and "client_host_id" not in r for r in rows)
+
+
+@pytest.mark.parametrize(
+    ("runner_id", "included"),
+    [("r" * 256, True), ("r" * 257, False), ("runner\ninvalid", False), ("runner\u00e9", False)],
+    ids=["at-limit", "over-limit", "control-character", "non-ascii"],
+)
+async def test_rejected_runner_id_audit_is_bounded(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    runner_id: str,
+    included: bool,
+) -> None:
+    """Rejected bindings retain action context without copying unbounded IDs."""
+    from omnigent.server import app as app_module
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(client, "rejected-binding-audit")
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    rows: list[dict[str, object]] = []
+
+    def capture(operation: str, phase: str, **fields: object) -> None:
+        rows.append({"operation": operation, "phase": phase, **fields})
+
+    monkeypatch.setattr(app_module, "_emit_audit_event", capture)
+    response = await client.patch(
+        f"/v1/sessions/{created.json()['id']}", json={"runner_id": runner_id}
+    )
+    assert response.status_code == 400, response.text
+    rejected = [row for row in rows if row.get("status") == "400"]
+    assert len(rejected) == 1
+    assert rejected[0]["binding_action"] == "bind"
+    if included:
+        assert rejected[0]["requested_runner_id"] == runner_id
+    else:
+        assert "requested_runner_id" not in rejected[0]

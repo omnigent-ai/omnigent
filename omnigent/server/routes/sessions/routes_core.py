@@ -3031,7 +3031,11 @@ def register_core_routes(
             add_audit_attrs(
                 previous_runner_id=previous_runner_id,
                 previous_host_id=conv.host_id,
-                requested_runner_id=body.runner_id,
+                requested_runner_id=body.runner_id
+                if len(body.runner_id) <= 256
+                and body.runner_id.isascii()
+                and (body.runner_id == "" or body.runner_id.isprintable())
+                else None,
                 binding_action="clear" if body.runner_id == "" else "bind",
             )
             # Empty string is the clear sentinel (None = leave unchanged);
