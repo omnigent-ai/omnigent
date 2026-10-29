@@ -61,5 +61,11 @@ describe("SidebarHeaderActions shortcut hints", () => {
     expect(screen.queryByLabelText("Settings")).toBeNull();
     expect(screen.getByLabelText("Search")).toBeInTheDocument();
     expect(screen.getByLabelText("Close sidebar")).toBeInTheDocument();
+    expect(
+      Array.from(
+        screen.getByTestId("sidebar-header-actions").querySelectorAll<HTMLElement>("[aria-label]"),
+        (control) => control.getAttribute("aria-label"),
+      ),
+    ).toEqual(["Close sidebar", "Search"]);
   });
 });
