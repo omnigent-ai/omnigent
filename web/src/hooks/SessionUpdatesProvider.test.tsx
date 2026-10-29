@@ -17,6 +17,7 @@ import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearRecentlyCreated,
   clearSessionTombstones,
   useArchiveConversation,
   type Conversation,
@@ -120,6 +121,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -525,6 +527,41 @@ describe("SessionUpdatesProvider list invalidation", () => {
 
   it("patches a rename in place when no search list is cached", () => {
     expect(renameInvalidatesLists(false)).toBe(false);
+  });
+
+  it("places a row bumped on Mine's second page into the palette list without a refetch", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a", "conv_b"]);
+      client.setQueryData(["conversations", "", false, null, "mine"], {
+        pages: [
+          {
+            data: [conv("conv_a"), conv("conv_b")],
+            first_id: "conv_a",
+            last_id: "conv_b",
+            has_more: true,
+          },
+          { data: [conv("conv_old")], first_id: "conv_old", last_id: "conv_old", has_more: false },
+        ],
+        pageParams: [undefined, "conv_b"],
+      } satisfies ConversationsInfiniteData);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+
+      act(() =>
+        frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), updated_at: 99 }] }),
+      );
+      act(() => vi.advanceTimersByTime(300));
+
+      const palette = client.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
+      expect(palette?.pages[0].data.find((row) => row.id === "conv_old")?.updated_at).toBe(99);
+      expect(
+        invalidate.mock.calls.some(([filters]) => filters?.queryKey?.[0] === "conversations"),
+      ).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
