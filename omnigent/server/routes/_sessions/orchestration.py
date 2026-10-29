@@ -549,10 +549,12 @@ async def _publish_and_wait_for_harness_elicitation(
     _harness_elicitation_owners[elicitation_id] = session_id
     _harness_parked_elicitations[elicitation_id] = parked
     unparked = _harness_unparked_elicitations.get(elicitation_id)
+    reclaimed_event_payload: dict[str, Any] | None = None
     reclaimed_terminal_card = False
     answered_in_terminal = False
     if unparked is not None and unparked.session_id == session_id:
         _harness_unparked_elicitations.pop(elicitation_id, None)
+        reclaimed_event_payload = unparked.event_payload
         reclaimed_terminal_card = unparked.in_terminal
         answered_in_terminal = unparked.resolved_elsewhere.is_set()
     event_payload: dict[str, Any] | None = None
@@ -564,15 +566,21 @@ async def _publish_and_wait_for_harness_elicitation(
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
     try:
-        if conversation_store is not None:
-            # A hook that passed its session check before a delete must not park after it.
-            session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if session is None or parked.released:
-                return None
         if answered_in_terminal:
             # The terminal answered before this retry; clear the card instead of re-asking.
             published_request = settled = True
             return None
+        if conversation_store is not None:
+            # A hook that passed its session check before a delete must not park after it.
+            try:
+                session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            except BaseException:
+                # Keep owning a reclaimed card so it is held or expired again below.
+                event_payload = reclaimed_event_payload
+                published_request = event_payload is not None
+                raise
+            if session is None or parked.released:
+                return None
         tombstone = _consume_pre_resolved_harness_elicitation(
             session_id, elicitation_id, request_fingerprint
         )

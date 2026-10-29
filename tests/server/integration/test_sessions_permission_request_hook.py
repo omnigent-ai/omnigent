@@ -2866,6 +2866,76 @@ async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
         pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("cleared_by", ["terminal_answer", "turn_end"])
+async def test_failed_hook_retry_keeps_card_waiting_in_terminal(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    cleared_by: str,
+) -> None:
+    """A retry that fails before re-asking leaves the card held until the terminal or turn ends."""
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes.sessions import routes_hooks
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    release_grace = asyncio.Event()
+    session_id, payload, collector = await _sever_hook_mid_turn(
+        client,
+        monkeypatch,
+        f"test-terminal-fallback-failed-retry-{cleared_by}",
+        release_grace=release_grace,
+    )
+    lookup_fails = False
+    get_conversation = SqlAlchemyConversationStore.get_conversation
+    publish_and_wait = routes_hooks._publish_and_wait_for_harness_elicitation
+
+    def _get_conversation_fails_once(store: Any, conversation_id: str) -> Any:
+        nonlocal lookup_fails
+        if lookup_fails:
+            lookup_fails = False
+            raise RuntimeError("session lookup failed")
+        return get_conversation(store, conversation_id)
+
+    async def _fail_retry_lookup(*args: Any, **kwargs: Any) -> Any:
+        nonlocal lookup_fails
+        lookup_fails = True
+        return await publish_and_wait(*args, **kwargs)
+
+    try:
+        release_grace.set()
+        waiting = await _next_elicitation_event(collector)
+        assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
+
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore, "get_conversation", _get_conversation_fails_once
+        )
+        monkeypatch.setattr(
+            routes_hooks, "_publish_and_wait_for_harness_elicitation", _fail_retry_lookup
+        )
+        with pytest.raises(RuntimeError, match="session lookup failed"):
+            await client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+        held_again = await _next_elicitation_event(collector)
+        assert held_again["type"] == "response.elicitation_request"
+        assert held_again["params"]["terminal_fallback"] == {"answer_undelivered": False}
+        assert pending_elicitations.count_for(session_id) == 1
+
+        if cleared_by == "terminal_answer":
+            sessions_route._signal_terminal_resolved_harness_elicitation(
+                session_id, payload["tool_name"], {"command": "ls -la"}
+            )
+        else:
+            sessions_route._session_status_cache[session_id] = "idle"
+        cleared = await _next_elicitation_event(collector)
+        assert cleared["type"] == "response.elicitation_resolved"
+        assert cleared["elicitation_id"] == _REATTACH_ELICITATION_ID
+        assert cleared.get("reason") == (None if cleared_by == "terminal_answer" else "unanswered")
+        await _finish_deferred_clears()
+        assert pending_elicitations.count_for(session_id) == 0
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+    finally:
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
 @pytest.mark.parametrize(
     ("answered_during_grace", "ancestor_clear_fails", "hook_retries_after_answer"),
     [(False, False, False), (True, False, False), (False, True, False), (True, False, True)],
