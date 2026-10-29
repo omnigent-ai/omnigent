@@ -7450,7 +7450,7 @@ def _wait_for_claude_prompt_ready(
                 _occupying_surface(pane) == _SHELL_MODE_SURFACE
                 or (
                     _occupying_surface(pane) == _OVERLAY_SURFACE
-                    and _ESCAPE_DISMISS_HINT.search(pane)
+                    and (_ESCAPE_DISMISS_HINT.search(pane) or _background_panel_close_hint(pane))
                     and _terminal_dialog_headline(pane) is None
                     and not _escape_quits_claude(pane)
                 )

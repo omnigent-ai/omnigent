@@ -10409,7 +10409,7 @@ def test_inject_user_message_does_not_paste_into_a_menu_under_a_clipped_title(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog, match="panel is covering"):
         inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
     assert not [cmd for cmd in writes if "load-buffer" in cmd or "paste-buffer" in cmd]
 
@@ -13034,7 +13034,7 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=None),
     )
     bridge_dir = _picker_bridge_dir(tmp_path)
-    if pane == _REVERSE_SEARCH_PANE and not slash:
+    if pane == _REVERSE_SEARCH_PANE and (not slash or recovery == "quoted-frame-late-resize"):
         error = claude_native_bridge.ClaudeTerminalDialog
     with pytest.raises(error):
         if slash:
