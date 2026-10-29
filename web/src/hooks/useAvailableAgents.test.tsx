@@ -1565,8 +1565,8 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     );
     const mine = (result.current.data ?? []).filter((a) => a.mine);
     expect(mine.map((a) => [a.id, a.display_name])).toEqual([
-      ["ag_orion", "Orion"],
-      ["ag_scout", "Scout"],
+      ["ag_orion", "orion"],
+      ["ag_scout", "scout"],
     ]);
   });
 

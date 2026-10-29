@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.db.utils import get_or_create_engine
+from omnigent.db.utils import get_or_create_engine, installed_agent_id
 from omnigent.entities import Agent, PagedList
 from omnigent.errors import StaleCursorError
 from omnigent.stores.agent_store import AgentStore
@@ -704,14 +704,12 @@ def test_list_user_agents_skips_copies_and_keeps_legacy_originals(
     )
 
     assert {a.id for a in agent_store.list_user_agents(_OWNER).data} == {orion.id, legacy.id}
-    assert agent_store.get_user_agent_by_name(_OWNER, "atlas").id == legacy.id
-    assert agent_store.get_user_agent_by_name("someone-else", "atlas") is None
 
 
-def test_list_user_agents_selects_one_stable_original_per_name(
+def test_list_user_agents_prefers_shared_id_to_legacy_duplicates(
     agent_store: SqlAlchemyAgentStore, clock: None
 ) -> None:
-    """Legacy rows remain addressable; paging and new writes agree on one identity."""
+    """Shared IDs hide legacy duplicates across pages without changing those rows."""
     agent_store.create(uuid.uuid4().hex, "polly", "x/y")
     uploaded = _user_agent(agent_store, "orion")
     installed = _user_agent(agent_store, "orion")
@@ -722,12 +720,18 @@ def test_list_user_agents_selects_one_stable_original_per_name(
         polly.id,
         edited_fork.id,
         installed.id,
+        uploaded.id,
     ]
-    assert agent_store.get(uploaded.id) is not None
-    assert agent_store.get_user_agent_by_name(_OWNER, "orion").id == installed.id
-    # Editing a historical row does not change the current identity.
+    shared_id = installed_agent_id(_OWNER, "orion")
+    shared = agent_store.create_user_agent(shared_id, "orion", f"{shared_id}/{_SHA}", _OWNER)
+    upper = _user_agent(agent_store, "Orion")
+    late_legacy = _user_agent(agent_store, "orion")
+    other_owner = _user_agent(agent_store, "orion", owner="bob@example.com")
     agent_store.update(uploaded.id, f"{uploaded.id}/new")
-    assert agent_store.get_user_agent_by_name(_OWNER, "orion").id == installed.id
+    expected = [upper.id, shared.id, polly.id, edited_fork.id]
+    assert [a.id for a in agent_store.list_user_agents(_OWNER).data] == expected
+    assert agent_store.list_user_agents("bob@example.com").data == [other_owner]
+    assert all(agent_store.get(a.id) is not None for a in (uploaded, installed, late_legacy))
     after = None
     seen = []
     while True:
@@ -736,7 +740,7 @@ def test_list_user_agents_selects_one_stable_original_per_name(
         if not page.has_more:
             break
         after = page.last_id
-    assert seen == [polly.id, edited_fork.id, installed.id]
+    assert seen == expected
 
 
 def test_list_user_agents_reads_a_bounded_window(

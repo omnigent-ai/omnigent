@@ -2,7 +2,9 @@
 
 > **Updated identity contract:** one user agent per workspace, owner, and exact name,
 > across every creation path. This revision supersedes the separate upload/install
-> identities in the original design. Existing historical rows are retained.
+> identities in the original design, going forward. It reuses the existing primary key
+> and owner-list index; no new schema or migration is required. Pre-fix upload IDs
+> and their session bindings are retained separately.
 
 ## 1. Summary
 
@@ -83,7 +85,7 @@ the user's 30 most recent sessions.
 - A UI to remove agents (CLI only in this stack).
 - Editing MCP servers of server (kind-1) agents.
 - Dropping `ix_agents_created_at` (D5), until no older server uses it.
-- Cleaning up legacy duplicate rows already in databases (they are hidden, not deleted).
+- Consolidating legacy duplicate rows or rebinding their existing sessions.
 
 ## 4. Terminology
 
@@ -107,7 +109,7 @@ the user's 30 most recent sessions.
 |---|---|---|
 | 1 | Installs are kind-2 rows with `created_by` = installer. No new kind, no constraint change. | Kind 2 already means user-provided; sessions already bind to it directly. |
 | 2 | Rename the Python codec names `template` to `server` and `session` to `user`. Stored integers unchanged. | Names match meaning; no migration. |
-| 3 | All user-agent creation paths reuse the current original for the same workspace, owner and exact name. New IDs use `sha256("installed:" + (owner or "") + "\0" + name)[:32]`; existing IDs stay unchanged. | One primary key prevents concurrent first-time uploads, installs and copies from creating duplicate identities. |
+| 3 | All user-agent creation paths use `sha256("installed:" + (owner or "") + "\0" + name)[:32]` in the current workspace. Pre-fix upload IDs remain separate; existing installs already use this shared ID. | One primary key prevents concurrent first-time uploads, installs and copies from creating duplicate identities. |
 | 4 | A user may own an agent with the same name as a server agent; their owners and IDs differ. Both catalogs remain visible in their respective groups. | Server agents never get overwritten or hide a user agent. |
 | 5 | Install bundles over 100 MiB are rejected before being read (413). Bundles are validated like any tenant upload and never executed at install. | Trust boundary. |
 | 6 | Sessions bind directly to the installed row. Reinstall therefore updates running sessions from their next turn, through any server process (6.18). A native terminal session keeps its launch configuration until it relaunches. | One agent, many sessions. |
@@ -117,7 +119,7 @@ the user's 30 most recent sessions.
 | 10 | Removal warns: 409 with `sessions_in_use` while sessions use the agent; `force=true` removes anyway. The count reads at most 101 rows, unordered (N3). The CLI asks before forcing (`--yes` skips). | User chose "break with a warning" over blocking or copying. |
 | 11 | After removal, sessions keep running for as long as the runner can (cached spec). The error appears only when the agent cannot be loaded at all. No per-message server check. | Verified live: SDK sessions keep working from the runner cache (Appendix A). |
 | 12 | With `agent_install`, the picker reads the same catalogs as Settings and does not rediscover agents from recent sessions or restore historical IDs through pins. | Both surfaces expose the same current identities, including owned agents named like server agents. |
-| 13 | The owner-scoped catalog returns one current original per exact name: newest `created_at`, then greatest ID. Older duplicates remain addressable by ID and retain their session bindings. | A stable compatibility choice avoids consolidation and prevents an edit or recent session from changing which ID normal creation targets. |
+| 13 | The owner-scoped catalog prefers the shared owner/name ID whenever it exists. Otherwise legacy originals remain listed; Settings and the picker select the newest by creation time, then ID. | Forward-only identity enforcement preserves legacy sessions and requires no migration. |
 | 14 | "My agents" reads at most 50 rows per request. | Bounded work per picker open. |
 | 15 | New index `ix_agents_kind_owner_created (workspace_id, kind, created_by, created_at, id)`, non-unique, built concurrently on PostgreSQL, in its own schema-only PR. | Bounded keyset listing per owner. |
 | 16 | The server-agent listing also filters `created_by IS NULL` (server agents never have an owner, and `update()` never stamps one on them), so it walks the shared `ix_agents_kind_owner_created` in order (D1). `ix_agents_created_at` stays until no older server uses it, then drops (D5). | One index serves both listings; the server listing no longer walks every agent. |
@@ -186,13 +188,13 @@ Invariant enforced in code: server agents (kind 1) never have `created_by` set.
 | Q6 | `update(id)` | PK | PK | 1 | unchanged; also used by reinstall |
 | Q7 | `delete(id)` | PK | PK | 1 | unchanged; used by removal |
 | Q8 | `_session_id_for_agent` | `conversations: ws, agent_id LIMIT 1` | `ix_conversations_agent_id` | 1 | unchanged |
-| Q9 | session create with uploaded bundle | same owner/name save as install, then session insert | name index + PK | one name lookup; at most 3 write attempts | **changed** |
-| Q10 | fork | resolve or insert recipient's owner/name identity | name index + PK | one name lookup; insert on first use | **changed** (decision 7) |
+| Q9 | session create with uploaded bundle | same owner/name save as install, then session insert | PK | one deterministic-ID lookup; at most 3 write attempts | **changed** |
+| Q10 | fork | resolve or insert recipient's owner/name identity | PK | one deterministic-ID lookup; insert on first use | **changed** (decision 7) |
 | Q11 | switch | delete old + insert copy | | 2 | **removed** (decision 8) |
 | Q12 | session delete cleanup | 2 `conversations` lookups + `DELETE agents WHERE kind=2` | `ix_conversations_agent_id` | subtree | **removed** (decision 9) |
 | Q13 | `list_conversations(agent_name=)` | `ws, name` then `IN` | `ix_agents_name` | all rows with that name | unchanged (stops growing for new forks of your own sessions) |
-| N1 | `list_user_agents(owner)` | `ws, kind=2, created_by=:owner` + cursor (`created_at <= :ts` plus the tie-break, so the seek starts at the cursor), `ORDER BY created_at DESC, id DESC LIMIT 51` | new index | at most 51 candidates plus indexed same-name existence checks | **changed** |
-| N2 | shared save | resolve current original by `ws, name, kind, owner`, then insert or revision-checked update | `ix_agents_name`, PK | one name lookup; at most 3 write attempts | **changed** |
+| N1 | `list_user_agents(owner)` | `ws, kind=2, created_by=:owner` + cursor (`created_at <= :ts` plus the tie-break, so the seek starts at the cursor), `ORDER BY created_at DESC, id DESC LIMIT 51` | new index | at most 51 candidates plus at most 50 primary-key lookups | **changed** |
+| N2 | shared save | derive owner/name ID, then insert or revision-checked update | PK | one ID lookup; at most 3 write attempts | **changed** |
 | N3 | removal | `get`; `conversations: ws, agent_id LIMIT 101`; `DELETE` | PK, `ix_conversations_agent_id` | at most 103 | **new** |
 | N4 | cross-user fork source check | `get(source agent)` (already loaded by the fork route) | PK | 0 extra | **new logic, no new query** |
 | N5 | other sessions using a shared agent (non-owner binding, only after the Q8 root denies) | `conversations: ws, agent_id` in `id` pages of 200, deduped to 50 roots | `ix_conversations_agent_id` | at most 1,000 | **new** |
@@ -220,7 +222,7 @@ clients treat its absence on older servers as unsupported.
 **`GET /v1/agents?scope=user`** ("my agents")
 - Params: `limit` (at most 50; larger values are capped), `after` (cursor: id of the last row read).
   The listing pages forward only: `before` or `order=asc` returns 400.
-- Server reads up to 50 rows (N1), applies 6.7, returns `data` (at most `limit`, one current original per exact name), `has_more`, and
+- Server reads up to 50 rows (N1), applies 6.7, returns `data` (at most `limit`, preferring shared owner/name IDs), `has_more`, and
   `last_id` = id of the **last row read** (may not appear in `data`) to continue.
 - A cursor row that no longer exists returns `stale_cursor` (existing error code).
 - Default `GET /v1/agents` (no `scope`) is byte-for-byte unchanged.
@@ -258,8 +260,6 @@ working and report `agent_install: false`:
 - `create_user_agent(agent_id, name, bundle_location, owner, description=None) -> Agent`: inserts
   kind 2 with `created_by = owner`. Raises the store's integrity error on primary-key conflict.
   Default raises "unsupported".
-- `get_user_agent_by_name(owner, name) -> Agent | None`: current original by creation time
-  and ID, scoped to the current workspace. Default returns None.
 - `list_user_agents(owner, limit, after) -> PagedList[Agent]`: N1 plus 6.7. Default returns empty.
 
 Existing methods (`create`, `get`, `get_by_name`, `list`, `get_names`, `update`, `delete`) keep their
@@ -273,8 +273,8 @@ whose sessions were all deleted stays a user agent.
    caller's shell (same as `omnigent run`); a single YAML is materialized into a bundle; a `.tar.gz`
    is uploaded as is (`${VAR}` left literal).
 2. Server validation (6.4) never imports or runs bundle code.
-3. Resolve the current original by owner and exact name; keep its ID. If absent, derive the
-   shared ID (decision 3). Store the blob at `"<id>/<files hash>"`; create on first use, otherwise
+3. Derive the shared owner/name ID (decision 3) and look it up by primary key.
+   Pre-fix uploads under other IDs are not adopted. Store the blob at `"<id>/<files hash>"`; create on first use, otherwise
    compare and update the existing revision. Other processes follow the revision (6.18).
 4. Reinstalling the same files is a no-op, however the client tarred them.
 5. Single-user local servers stamp owner `"local"` (the auth layer's local identity).
@@ -287,10 +287,12 @@ For each row read by N1, in order:
    `ag_`-prefixed form of the id). Skip derived copies.
 2. Stop when `limit` rows are kept or 50 rows are read.
 
-For each candidate, an indexed same-name existence check identifies whether a newer original
-exists for this workspace and owner. Only the current original is returned, using the same
-`created_at, id` ordering as creation. The check occurs before pagination output, so a duplicate
-on another page cannot reappear. Older rows are retained; no sessions or schedules are rebound.
+For the at-most-50 candidates, derive their shared owner/name IDs and batch-fetch them
+with the existing `get_many` primary-key lookup. When a shared original exists, omit
+other IDs of that exact name, including candidates on different pages. Otherwise
+keep legacy originals; Settings and the picker select the newest per exact name
+across loaded pages. No SQL name comparison or historical lookup scan is needed.
+Legacy IDs remain directly addressable; no sessions or schedules are rebound.
 
 Ceiling (documented in code): a user with more than 50 derived copies newer than an original sees that
 original only on a later page. Upgrade path if it matters: a column marking derived copies.
@@ -386,7 +388,7 @@ With `agent_install`, both Settings and the picker read `GET /v1/agents` and
 `GET /v1/agents?scope=user`. The picker follows every page. Session history and
 configured pins cannot add a second identity or resurrect a removed one. On older
 servers without this capability, the existing session-discovery merge remains.
-For older catalog responses containing duplicates, both clients select the same
+For legacy originals or older catalog responses containing duplicates, both clients select the same
 newest original by creation time and ID; they compare exact names, not fork-name roots.
 
 User agents stay in Agents regardless of harness. Server agents stay in their
@@ -464,7 +466,7 @@ updates an agent.
 | Old server, new web client | `agent_install` false: no Import button, no third picker source. |
 | Old server, new CLI | Clear upgrade message. |
 | Clients calling switch-agent | 410 Gone with fork guidance (intentional API break, labelled as such). |
-| Legacy rows | Ownerless rows on authenticated servers and derived copies stay out of the catalog. One newest original per owner/name is current; new uploads and installs reuse it. Other IDs and their existing sessions remain untouched and accessible directly. Deleting the current row can expose the next retained original. There is no consolidation or migration of historical sessions. |
+| Legacy rows | Ownerless rows on authenticated servers and derived copies stay out of the catalog. New uploads and installs use the deterministic owner/name ID. Pre-fix uploads at other IDs remain untouched, and their sessions do not adopt updates to the shared ID. A shared ID hides those legacy rows in the catalog; without one, the web clients show the newest original per exact name. Deleting the shared row can expose retained legacy originals. |
 | Deployments applying schema outside alembic | Must add the index before enabling the feature; until the store supports user agents the feature reports off. |
 | Old and new servers sharing one database (rolling deploy across replicas, or a rollback) | Old servers treat an agent no session uses as unowned. Accepted risk; see section 11. |
 
@@ -482,7 +484,7 @@ For each of: kind-1 row; kind-2 row used by a session; kind-2 row with NULL owne
 ### 9.2 New behavior
 
 - Store: `create_user_agent`, `list_user_agents` (50-row read cap, originals only, legacy prefix,
-  one stable original per exact name across pages, cursor = last read row, stale cursor), defaults on a store without
+  shared IDs preferred across pages, exact name case, retained legacy IDs, cursor = last read row, stale cursor), defaults on a store without
   support; capped session count.
 - Migration: index columns, non-unique, downgrade, concurrent path on PostgreSQL (SQL emitted).
 - Routes: install (new, reinstall in place, identical no-op, concurrent child/install race, isolated server-name collision, 413,
@@ -535,8 +537,8 @@ Watch each PR; before attributing a failure, check whether it also fails on `mai
 |---|---|---|---|
 | 1 | Schema: `ix_agents_kind_owner_created` (existing #8777) | model index, migration (concurrent on PostgreSQL), migration tests, deployment note | `main` |
 | 2 | Retire the switch-agent API to a reserved 410 stub (new) | 6.10, docs, OpenAPI, feature map; intentional API break label | 1 |
-| 3 | All user-agent creation paths reuse the current original for the same workspace, owner and exact name. New IDs use `sha256("installed:" + (owner or "") + "\0" + name)[:32]`; existing IDs stay unchanged. | One primary key prevents concurrent first-time uploads, installs and copies from creating duplicate identities. |
-| 4 | A user may own an agent with the same name as a server agent; their owners and IDs differ. Both catalogs remain visible in their respective groups. | Server agents never get overwritten or hide a user agent. |
+| 3 | Fork reuses your agent; cross-user copy (new) | 6.9, shared-row binding in 6.8 | 2 |
+| 4 | User agents: install, list, remove; session delete keeps agents (existing #8677, rebuilt) | 6.4 to 6.8, 6.11 to 6.13, 6.15, 6.16, 6.18, codec rename, `Agent.kind` | 3 |
 | 5 | UI import (existing #8680, rebuilt) | 6.17 | 4 |
 
 - Reviewers: only PR 1 (migration code owners). Push top-down to avoid CODEOWNERS churn on children.
@@ -567,10 +569,12 @@ long as the deploy.
 - Install from a git URL (follow-up).
 - UI removal of agents (follow-up).
 - Dropping `ix_agents_created_at` (D5) once no older server uses it.
-- Legacy duplicate rows and their session bindings are retained. Only the current original is
-  listed and targeted by new uploads. Updating it does not update sessions still bound to a
-  historical duplicate. Direct ID links still work. Deleting the current original can reveal
-  the next retained one; removing historical duplicates is a separate cleanup operation.
+- Identity enforcement is forward-only. Pre-fix uploads keep their IDs and session bindings.
+  A later upload/install may create the shared owner/name ID instead of updating those sessions.
+  Existing installs already have the shared ID and continue receiving updates. Legacy rows
+  remain directly accessible; once a shared ID exists they are hidden from the catalog.
+  Deleting it can reveal retained originals. Without a shared ID, the API/CLI may list legacy
+  duplicates; Settings and the picker both select the newest per exact name.
 - Mixed deployments can still create duplicates through old replicas. Upgrade every writer
   before relying on owner/name uniqueness. No bulk migration or database constraint rewrite.
 - The 50-row read cap in 6.7 still applies per request; callers follow all pages.

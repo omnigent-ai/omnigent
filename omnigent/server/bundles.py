@@ -318,12 +318,12 @@ def save_user_agent(
     """Save one owner/name identity across installs, session uploads and copies.
 
     New identities share a deterministic primary key, including concurrent
-    requests from different creation paths. Existing originals keep their ID.
+    requests from different creation paths. Legacy upload IDs remain separate.
     Copying another user's agent may reuse identical files, but never replace
     the recipient's configuration. Explicit uploads replace the whole bundle.
     """
-    existing = agent_store.get_user_agent_by_name(owner, name)
-    agent_id = existing.id if existing is not None else installed_agent_id(owner, name)
+    agent_id = installed_agent_id(owner, name)
+    existing = agent_store.get(agent_id)
     location = content_bundle_location(agent_id, bundle_bytes)
     for _ in range(3):
         if existing is None:

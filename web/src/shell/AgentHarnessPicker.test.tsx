@@ -77,6 +77,7 @@ function renderPicker(props: {
   effectiveAgentId?: string | null;
   allowCreateCustomAgent?: boolean;
   sandboxSelected?: boolean;
+  onSelectAgent?: (agent: AvailableAgent) => void;
 }) {
   return render(
     <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
@@ -88,7 +89,7 @@ function renderPicker(props: {
           agentLabel="Picker"
           hasAgents
           host={readyHost}
-          onSelectAgent={() => undefined}
+          onSelectAgent={props.onSelectAgent ?? (() => undefined)}
           pendingAgent={null}
           pendingAgentId="pending-agent"
           onSelectPending={() => undefined}
@@ -154,6 +155,33 @@ describe("AgentHarnessPicker inline harness list", () => {
 });
 
 describe("AgentHarnessPicker Agents group header", () => {
+  it("distinguishes same-named server and owned agents and selects their IDs", async () => {
+    const server = agent({
+      id: "server-orion",
+      name: "Orion",
+      display_name: "Orion",
+      harness: "claude-sdk",
+      builtin: false,
+    });
+    const owned = { ...server, id: "owned-orion", mine: true as const };
+    const selected: string[] = [];
+    renderPicker({
+      harnessEntries: [claude],
+      agentEntries: [server, owned],
+      onSelectAgent: (entry) => selected.push(entry.id),
+    });
+    async function selectEntry(entry: AvailableAgent, source: string) {
+      await openPicker();
+      await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+      const row = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
+      expect(row).toHaveTextContent(`Orion (${source})`);
+      await userEvent.click(row);
+    }
+    await selectEntry(server, "server");
+    await selectEntry(owned, "yours");
+    expect(selected).toEqual([server.id, owned.id]);
+  });
+
   it("renders the header when a bundle agent is present", async () => {
     renderPicker({ harnessEntries: [claude], agentEntries: [polly] });
     await openPicker();

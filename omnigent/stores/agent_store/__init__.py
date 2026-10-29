@@ -230,15 +230,6 @@ class AgentStore(ABC):
         """
         raise NotImplementedError("this agent store does not support user agents")
 
-    def get_user_agent_by_name(self, owner: str | None, name: str) -> Agent | None:
-        """Return the current original for this owner/name, or None.
-
-        Legacy duplicates resolve to the newest created original (ID breaks ties).
-        Updates retain that ID; historical rows and their sessions stay intact.
-        """
-        del owner, name
-        return None
-
     def list_user_agents(
         self,
         owner: str | None,
@@ -246,12 +237,12 @@ class AgentStore(ABC):
         after: str | None = None,
     ) -> PagedList[Agent]:
         """
-        List one current original per owner/name, newest first.
+        List *owner*'s own agents, newest first, preferring shared owner/name IDs.
 
         Returns originals only (a bundle stored under the row's own id; legacy
-        fork and switch copies are skipped). Legacy same-name originals are omitted
-        from this list but remain
-        accessible by ID. Reads a bounded number of rows per call, so a page may
+        fork and switch copies are skipped). A shared owner/name ID hides older
+        identities of that exact name. Otherwise legacy originals may repeat names.
+        Reads a bounded number of rows per call, so a page may
         hold fewer than ``limit`` agents; ``last_id`` is the last row read and
         continues the listing.
 

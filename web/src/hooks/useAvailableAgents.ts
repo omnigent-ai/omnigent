@@ -218,6 +218,7 @@ export async function fetchUserAgents(): Promise<AvailableAgent[]> {
   /* oxlint-enable no-await-in-loop */
   return currentUserAgents(rows).map((a) => ({
     ...agentFromWire(a),
+    display_name: a.name,
     updated_at: a.updated_at ?? null,
     mine: true as const,
   }));

@@ -112,7 +112,9 @@ requires `user_owned: true` and `agent_config_edit: true`.
   Model/harness incompatibilities are reported on save.
 - Search covers loaded results. Load more to include older agents.
 - A detail bookmark uses the single-agent endpoint, independently of list
-  pagination. Historical duplicates remain accessible by ID but only the newest original
-  appears in the catalog. Their existing session bindings are not migrated.
+  pagination. A shared owner/name ID takes precedence over legacy originals. Without
+  one, both web lists show the newest legacy original per exact name. Re-uploading a
+  pre-fix agent can create the shared ID; sessions on legacy IDs retain their old agent.
+  Direct legacy links keep working; no session bindings are migrated.
 - Built-in harness wrappers belong in Harnesses settings. The older Create
   custom agent dialog in new-session composition still starts a session.

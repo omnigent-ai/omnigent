@@ -1692,6 +1692,16 @@ export function AgentHarnessPicker({
     setOpen(true);
   }, [openNonce, effectiveAgentId, hasSelectedConfig, isMobile, open]);
 
+  const duplicateAgentNames = useMemo(() => {
+    const seen = new Set<string>();
+    const duplicates = new Set<string>();
+    for (const agent of agentEntries) {
+      if (seen.has(agent.name)) duplicates.add(agent.name);
+      seen.add(agent.name);
+    }
+    return duplicates;
+  }, [agentEntries]);
+
   const renderEntry = (agent: AvailableAgent): ReactNode => {
     const active = !autoHarnessActive && agent.id === effectiveAgentId;
     const blurb = AGENT_PICKER_DESCRIPTIONS[agent.name];
@@ -1735,7 +1745,11 @@ export function AgentHarnessPicker({
         }}
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
-        label={agent.display_name}
+        label={
+          duplicateAgentNames.has(agent.name)
+            ? `${agent.display_name} (${agent.mine ? "yours" : "server"})`
+            : agent.display_name
+        }
         summary={summary}
         description={blurb}
         active={active}

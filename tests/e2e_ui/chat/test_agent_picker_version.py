@@ -1,28 +1,11 @@
-"""E2E: the new-session agent picker binds the NEWEST version of an agent.
-
-Regression for the picker selecting a stale agent version. Setup mirrors the
-report:
-
-* Agent A exists as a user-registered template (``builtin: false`` in
-  ``GET /v1/agents``) — e.g. created via ``omnigent server --agent``.
-* A newer ``omnigent run`` minted a session-scoped Agent A with a DISTINCT
-  agent_id (discovered via ``GET /v1/sessions?visibility=mine``), created after the
-  template.
-
-The picker must offer (and bind) the newest — the upload — not the stale
-template. A seeded built-in (``builtin: true``) is the control: a same-named
-upload must NOT supersede it.
-
-Route-stubbing approach (same as ``test_create_custom_agent.py``): the SPA is
-served by the live server, but ``/v1/agents`` + ``/v1/sessions`` are faked so
-the test pins the picker's resolution without provisioning real agents.
-"""
+"""The picker binds the current owned agent; old servers retain session discovery."""
 
 from __future__ import annotations
 
 import json
 import re
 
+import pytest
 from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
@@ -38,6 +21,7 @@ _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 _DEBBY_ID = "ag_debby_seeded"
 _TEMPLATE_ID = "ag_agenta_template"  # builtin:false, older
 _UPLOAD_ID = "ag_agenta_upload_v2"  # session-scoped, newer — must win
+_OLD_UPLOAD_ID = "ag_agenta_upload_v1"
 _SCAN_TEMPLATE_SESSION = "conv_bound_template"
 _SCAN_UPLOAD_SESSION = "conv_upload_v2"
 
@@ -100,7 +84,9 @@ def _hosts_body() -> str:
     )
 
 
-async def _register_routes(page, *, created_session_id: str, create_requests: list[dict]) -> None:
+async def _register_routes(
+    page, *, created_session_id: str, create_requests: list[dict], agent_install: bool
+) -> None:
     async def handle_hosts(route: Route) -> None:
         await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
 
@@ -148,7 +134,32 @@ async def _register_routes(page, *, created_session_id: str, create_requests: li
     await page.route("**/v1/hosts", handle_hosts)
     await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
-    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
+    await page.route(
+        OWN_AGENTS,
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "id": agent_id,
+                        "name": "agent-a",
+                        "harness": "claude-sdk",
+                        "created_at": created,
+                    }
+                    for agent_id, created in [(_OLD_UPLOAD_ID, 200), (_UPLOAD_ID, 300)]
+                ]
+                if agent_install
+                else []
+            }
+        ),
+    )
+
+    async def info(route: Route) -> None:
+        response = await route.fetch()
+        body = await response.json()
+        body["agent_install"] = agent_install
+        await route.fulfill(response=response, json=body)
+
+    await page.route("**/v1/info", info)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
 
@@ -162,20 +173,26 @@ async def _seed_workspace(page) -> None:
     )
 
 
-def test_picker_binds_newest_agent_version(seeded_session: tuple[str, str]) -> None:
-    """Selecting Agent A binds the newer upload, not the stale template."""
+@pytest.mark.parametrize("agent_install", [False, True], ids=["legacy", "owned-catalog"])
+def test_picker_binds_newest_agent_version(
+    seeded_session: tuple[str, str], agent_install: bool
+) -> None:
+    """Selecting Agent A binds its current owned ID or the legacy session upload."""
     base_url, session_id = seeded_session
-    _run_in_fresh_loop(_drive(base_url, session_id))
+    _run_in_fresh_loop(_drive(base_url, session_id, agent_install))
 
 
-async def _drive(base_url: str, created_session_id: str) -> None:
+async def _drive(base_url: str, created_session_id: str, agent_install: bool) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
             create_requests: list[dict] = []
             await _register_routes(
-                page, created_session_id=created_session_id, create_requests=create_requests
+                page,
+                created_session_id=created_session_id,
+                create_requests=create_requests,
+                agent_install=agent_install,
             )
             await _seed_workspace(page)
 
@@ -194,12 +211,13 @@ async def _drive(base_url: str, created_session_id: str) -> None:
             # agent, so it lives in the custom-agent "Other..." submenu — drill in.
             await expect(option(_DEBBY_ID)).to_be_visible()
             await page.get_by_test_id("new-chat-landing-custom-agents").click()
-            # Agent A is offered as the NEWER upload id — the stale template id
-            # must not appear (it was superseded).
+            # Server and owned names are separate identities on current servers.
             await expect(option(_UPLOAD_ID)).to_be_visible()
-            assert await option(_TEMPLATE_ID).count() == 0, (
-                "stale template version leaked into the picker"
-            )
+            await expect(option(_OLD_UPLOAD_ID)).to_have_count(0)
+            await expect(option(_TEMPLATE_ID)).to_have_count(1 if agent_install else 0)
+            if agent_install:
+                await expect(option(_UPLOAD_ID)).to_contain_text("agent-a (yours)")
+                await expect(option(_TEMPLATE_ID)).to_contain_text("(server)")
 
             # Select Agent A, send, and assert the create POST bound the upload.
             await option(_UPLOAD_ID).click()
