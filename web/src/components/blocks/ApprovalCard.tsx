@@ -401,7 +401,9 @@ export function ApprovalCard({
           ? "Cursor has questions"
           : policyName.startsWith("pi_") || phase.startsWith("pi_")
             ? "Pi needs your input"
-            : "Claude has questions";
+            : policyName.startsWith("devin_") || phase.startsWith("devin_")
+              ? "Devin needs your input"
+              : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-

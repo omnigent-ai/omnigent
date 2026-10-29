@@ -94,6 +94,11 @@ Two independent gates, matching `claude-native`:
   stranded in a pane nobody is watching. A timeout or unreachable server emits
   nothing, which Devin reads as "no opinion" and falls back to its own TUI
   prompt (fail-ask).
+* **Questions** — Devin's `ask_user_question` tool fires `PreToolUse`, even in
+  bypass mode. After policy evaluation, Omnigent shows the questions in Chat
+  and Inbox and returns selected options or custom text through the hook's
+  `updatedInput`. If Omnigent cannot show the form, Devin's terminal picker
+  remains available.
 
 Verified against devin 3000.10.21: a `PreToolUse` hook returning
 `hookSpecificOutput.permissionDecision: "deny"` blocks the tool **even under

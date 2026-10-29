@@ -52,6 +52,8 @@ implements them separately, so a fix for one harness does not reach the others.
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness.
+- `devin-questions`: Devin's native question picker appears in Chat and Inbox;
+  selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
@@ -164,6 +166,11 @@ before entering the harness menu. Then start a new CLI or web session.
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
+
+**Devin questions:** start Devin from the CLI or the new-session picker and ask
+it to use `ask_user_question` with selectable options. Answer in Chat or open Inbox
+to answer there. Reload while a choice is pending, submit it, and confirm Devin
+continues with the answer and the session no longer needs a response.
 
 **Approval links:** open a pending permission's standalone approval link.
 Claude directory requests show the exact directories in Chat, Inbox, and the
@@ -714,6 +721,17 @@ Cross-harness journeys:
   uv run --no-sync pytest tests/e2e_ui/approvals/test_pi_extension_ui.py --ui-skip-build --video=on --screenshot=on --reruns 0 -q
   pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
   ```
+
+- **`devin-questions`:**
+  `tests/e2e_ui/approvals/test_ask_user_question.py::test_devin_question_hook_round_trip_survives_reload`
+  runs the real native hook subprocess with a recorded question shape through
+  the server and browser. Chat and Inbox each restore a pending question after
+  reload, submit the answer in Devin's native input shape, and clear the pending
+  count and sidebar badge. This uses no Devin CLI or live model; a live native
+  session must additionally confirm that the tool consumes the answer and
+  continues. Custom and multiple selections belong in the hook's component
+  coverage. Standalone approval links do not expose the question form; mobile
+  and Managed question journeys remain unverified.
 
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
