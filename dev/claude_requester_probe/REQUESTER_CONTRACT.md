@@ -1,5 +1,10 @@
 # Completing native Claude requester support
 
+**Deferred follow-up.** Native Claude delegation with edit sharing is an
+accepted release limitation. The work below is not a release prerequisite;
+resume it when supported provider APIs justify further integration work.
+Keep Chat and terminal typing available and refuse unverifiable delegation.
+
 **The tool-to-turn link works. The input-to-turn link is still a provider
 dependency.** This describes the required semantics, not APIs Claude currently
 implements. Keep terminal typing and mid-turn steering; unknown work remains

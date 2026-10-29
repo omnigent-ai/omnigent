@@ -1,5 +1,10 @@
 # Native Claude requester probe
 
+Native Claude requester support is deferred. Edit sharing and terminal typing
+remain available, but native Claude cannot safely distinguish owner-authorized
+delegation from collaborator input. This probe records follow-up research and
+is not a prerequisite for releasing the supported orchestration paths.
+
 This opt-in development plugin measures whether Claude mods expose enough
 information to bind an Omnigent request to a later tool call. It **does not
 enable delegation** or identify a human requester. The server's existing
