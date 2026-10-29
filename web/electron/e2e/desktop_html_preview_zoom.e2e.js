@@ -114,8 +114,12 @@ it(
           async () => (await badge.textContent()) === `Preview zoom ${percent}%`,
           `preview zoom ${percent}%`,
         );
-        const ratio = baseWidth / (await frameWidth());
-        assert.ok(Math.abs(ratio - percent / 100) < 0.02, `preview scaled ${ratio}`);
+        // The frame sees its new width once the resize reaches its document.
+        let ratio = 0;
+        await eventually(async () => {
+          ratio = baseWidth / (await frameWidth());
+          return Math.abs(ratio - percent / 100) < 0.02;
+        }, `preview scaled to ${percent}%`);
         assert.equal(await windowZoom(), 1, "the app window must not zoom");
         assert.deepEqual(await fileViewer.boundingBox(), viewerBefore);
         await pause();

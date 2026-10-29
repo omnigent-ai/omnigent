@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
+import type { Comment } from "@/hooks/useComments";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
 import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
@@ -195,7 +196,7 @@ describe("HtmlCommentViewer", () => {
 });
 
 describe("HtmlCommentViewer zoom", () => {
-  /** Wait for the frame to load and return the bridge's end of the channel the viewer hands it. */
+  /** Return the preview iframe and its zoom wrapper. */
   function previewParts() {
     const iframe = screen.getByTitle<HTMLIFrameElement>("HTML preview");
     return { iframe, zoomBox: iframe.parentElement as HTMLElement };
@@ -311,6 +312,51 @@ describe("HtmlCommentViewer zoom", () => {
     // The viewer answers ready with its state, after handling the earlier report.
     send({ type: BRIDGE_MSG.ready });
     await act(() => stateFlushed);
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
+    port.close();
+  });
+
+  it("does not activate a draft comment from a reflow report", async () => {
+    const content = "<body><p>Quarterly revenue</p></body>";
+    const start = content.indexOf("revenue");
+    const draft: Comment = {
+      id: "draft_1",
+      conversation_id: "conv_1",
+      path: "report.html",
+      start_index: start,
+      end_index: start + "revenue".length,
+      body: "Check this",
+      status: "draft",
+      created_at: 0,
+      updated_at: 0,
+      anchor_content: "revenue",
+      created_by: null,
+    };
+    const onSetActiveSelection = vi.fn();
+    render(
+      <HtmlCommentViewer
+        conversationId="conv_1"
+        content={content}
+        truncated={false}
+        comments={[draft]}
+        activeSelection={null}
+        onSetActiveSelection={onSetActiveSelection}
+      />,
+    );
+    const { port, send } = await connectHtmlPreviewBridge(previewParts().iframe);
+    send({
+      type: BRIDGE_MSG.selection,
+      text: "revenue",
+      occ: 0,
+      rect: { left: 40, top: 30, right: 90, bottom: 45 },
+      reflow: true,
+    });
+    // A no-op reset only shows the badge, so it marks the earlier report as handled.
+    send({ type: BRIDGE_MSG.zoom, action: "reset" });
+    await waitFor(() =>
+      expect(screen.getByTestId("html-preview-zoom").textContent).toBe("Preview zoom 100%"),
+    );
+    expect(onSetActiveSelection).not.toHaveBeenCalled();
     expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
     port.close();
   });

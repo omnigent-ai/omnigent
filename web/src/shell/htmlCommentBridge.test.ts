@@ -243,12 +243,13 @@ describe("bridge runtime zoom shortcuts", () => {
   });
 
   it.each([
-    ["document", () => document],
-    ["window", () => window],
-  ])("leaves the shortcut to an artifact %s listener that handles it", (_, target) => {
+    ["document listener that cancels it", () => document, (e: Event) => e.preventDefault()],
+    ["window listener that cancels it", () => window, (e: Event) => e.preventDefault()],
+    ["listener that stops its propagation", () => document, (e: Event) => e.stopPropagation()],
+  ])("leaves the shortcut to an artifact %s", (_, target, handler) => {
     // Artifact scripts run after the injected bridge but before the parent connects.
     const port = startRuntime({
-      beforeConnect: () => target().addEventListener("keydown", (e) => e.preventDefault()),
+      beforeConnect: () => target().addEventListener("keydown", handler),
     });
     press({ key: "=", metaKey: true });
     expect(port.postMessage).not.toHaveBeenCalled();
