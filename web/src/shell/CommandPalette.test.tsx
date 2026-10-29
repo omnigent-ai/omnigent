@@ -10,8 +10,14 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 const useConversations = vi.fn();
+const useSessionSearch = vi.fn();
+const serverInfo = vi.fn();
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => serverInfo(),
+}));
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
+  useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
 }));
 
 function conv(
@@ -26,6 +32,31 @@ function conv(
 function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
 }
+
+type SearchGroupState = Record<string, unknown>;
+
+/** Serve each typed-search group (`title` / `content` / `all`) its own hook state. */
+function setSearchGroups({
+  title = {},
+  content = {},
+  all = {},
+}: {
+  title?: SearchGroupState;
+  content?: SearchGroupState;
+  all?: SearchGroupState;
+}) {
+  const groups: Record<string, SearchGroupState> = { title, content, all };
+  useSessionSearch.mockImplementation((_query: string, scope: string) => ({
+    isFetching: false,
+    ...groups[scope],
+  }));
+}
+
+function searchPages(...pages: ReturnType<typeof conv>[][]) {
+  return { data: { pages: pages.map((data) => ({ data })) } };
+}
+
+const SEARCH_GROUP_OPTIONS = { enabled: true, limit: 8 };
 
 /** Find a session row by its full label text even when the highlighter has
     split it around a <mark> (so the text lives across several nodes). */
@@ -48,7 +79,10 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
 beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
+  useSessionSearch.mockReset();
+  serverInfo.mockReturnValue({ session_search_scope: true });
   setSessions([]);
+  setSearchGroups({});
 });
 afterEach(cleanup);
 
@@ -221,14 +255,15 @@ describe("CommandPalette — sessions", () => {
       fireEvent.change(screen.getByTestId("command-palette-input"), {
         target: { value: "deploy" },
       });
-      // Before the debounce elapses the query has NOT yet reached the hook.
-      expect(useConversations).not.toHaveBeenCalledWith("deploy", false, { enabled: true });
+      // Before the debounce elapses the query has NOT yet reached the search.
+      expect(useSessionSearch).not.toHaveBeenCalledWith("deploy", "title", SEARCH_GROUP_OPTIONS);
 
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      // The debounced query searches active sessions on the server.
-      expect(useConversations).toHaveBeenCalledWith("deploy", false, { enabled: true });
+      // The debounced query searches titles and content as separate groups.
+      expect(useSessionSearch).toHaveBeenCalledWith("deploy", "title", SEARCH_GROUP_OPTIONS);
+      expect(useSessionSearch).toHaveBeenCalledWith("deploy", "content", SEARCH_GROUP_OPTIONS);
     } finally {
       vi.useRealTimers();
     }
@@ -249,6 +284,7 @@ describe("CommandPalette — sessions", () => {
     try {
       const many = Array.from({ length: 8 }, (_, i) => conv(`c${i}`, `Session ${i}`, "agent"));
       setSessions(many);
+      setSearchGroups({ title: searchPages(many) });
       renderPalette();
 
       // Empty query: only the first 5 recent sessions show, so the Actions
@@ -311,7 +347,9 @@ describe("CommandPalette — match preview", () => {
   afterEach(() => vi.useRealTimers());
 
   it("shows the content snippet as a second line when the match is in the body", () => {
-    setSessions([conv("c1", "Hello", "cursor", "…can you fix the what if I switch…")]);
+    setSearchGroups({
+      content: searchPages([conv("c1", "Hello", "cursor", "…can you fix the what if I switch…")]),
+    });
     renderPalette();
     search("what");
 
@@ -321,7 +359,10 @@ describe("CommandPalette — match preview", () => {
   });
 
   it("highlights the query term in both the title and the snippet", () => {
-    setSessions([conv("c1", "what model", "cursor", "Hello what model are you using?")]);
+    setSearchGroups({
+      title: searchPages([conv("t1", "what model", "cursor")]),
+      content: searchPages([conv("c1", "Hello", "cursor", "Hello what model are you using?")]),
+    });
     renderPalette();
     search("what");
 
@@ -332,7 +373,7 @@ describe("CommandPalette — match preview", () => {
   });
 
   it("omits the snippet line for a title-only match (no search_snippet)", () => {
-    setSessions([conv("c1", "deploy runbook", "agent", null)]);
+    setSearchGroups({ title: searchPages([conv("c1", "deploy runbook", "agent", null)]) });
     renderPalette();
     search("deploy");
 
@@ -417,10 +458,331 @@ describe("CommandPalette — mobile full-screen sheet", () => {
       act(() => {
         vi.advanceTimersByTime(300);
       });
-      expect(useConversations).toHaveBeenCalledWith("deploy", false, { enabled: true });
+      expect(useSessionSearch).toHaveBeenCalledWith("deploy", "title", SEARCH_GROUP_OPTIONS);
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("CommandPalette — title and content groups", () => {
+  function search(term: string) {
+    fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: term } });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+  }
+
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it("lists title matches under Sessions before content matches under In messages", () => {
+    setSearchGroups({
+      title: searchPages([conv("old", "Kestrel plan")]),
+      content: searchPages([conv("new", "Weekly sync", null, "the kestrel checklist")]),
+    });
+    renderPalette();
+    search("kestrel");
+
+    const headings = screen
+      .getAllByText(/^(Sessions|In messages|Actions)$/)
+      .map((el) => el.textContent);
+    expect(headings).toEqual(["Sessions", "In messages"]);
+    const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
+    expect(options[0]).toContain("Kestrel plan");
+    expect(options[1]).toContain("Weekly sync");
+  });
+
+  it("does not search while the palette is closed or listing sessions only", () => {
+    renderPalette({ open: false });
+    expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
+    cleanup();
+    useSessionSearch.mockClear();
+    renderPalette({ sessionsOnly: true });
+    search("deploy");
+    expect(useSessionSearch).toHaveBeenLastCalledWith("deploy", "content", {
+      enabled: false,
+      limit: 8,
+    });
+  });
+
+  it("keeps the top row selected when title matches arrive after content matches", () => {
+    setSearchGroups({
+      title: { isFetching: true },
+      content: searchPages([conv("content", "Notes", null, "kestrel list")]),
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("kestrel");
+    setSearchGroups({
+      title: searchPages([conv("title", "Kestrel plan")]),
+      content: searchPages([conv("content", "Notes", null, "kestrel list")]),
+    });
+    rerender(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/title");
+  });
+
+  it("keeps the user's selection when title matches arrive later", () => {
+    setSearchGroups({
+      title: { isFetching: true },
+      content: searchPages([
+        conv("first", "Notes", null, "kestrel list"),
+        conv("second", "Retro", null, "kestrel again"),
+      ]),
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("kestrel");
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    setSearchGroups({
+      title: searchPages([conv("title", "Kestrel plan")]),
+      content: searchPages([
+        conv("first", "Notes", null, "kestrel list"),
+        conv("second", "Retro", null, "kestrel again"),
+      ]),
+    });
+    rerender(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/second");
+  });
+
+  it("selects the top row again when the palette reopens", () => {
+    setSessions([conv("c1", "Fix the parser"), conv("c2", "Deploy API")]);
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "ArrowDown" });
+    rerender(<CommandPalette {...props} open={false} />);
+    rerender(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c1");
+  });
+
+  it("ignores pointer movement off the rows when title matches arrive later", () => {
+    setSearchGroups({
+      title: { isFetching: true },
+      content: searchPages([conv("content", "Notes", null, "kestrel list")]),
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("kestrel");
+    fireEvent.pointerMove(screen.getByText("In messages"));
+    setSearchGroups({
+      title: searchPages([conv("title", "Kestrel plan")]),
+      content: searchPages([conv("content", "Notes", null, "kestrel list")]),
+    });
+    rerender(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/title");
+  });
+
+  it("continues from the group's last row once Show more loads the final page", () => {
+    const fetchContentPage = vi.fn();
+    const firstPage = [
+      conv("c1", "Notes", null, "deploy on Friday"),
+      conv("c2", "Sync", null, "deploy checklist"),
+    ];
+    setSearchGroups({
+      content: { ...searchPages(firstPage), hasNextPage: true, fetchNextPage: fetchContentPage },
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("deploy");
+    fireEvent.click(screen.getByText("Show more"));
+    expect(fetchContentPage).toHaveBeenCalledOnce();
+    setSearchGroups({
+      content: searchPages(firstPage, [conv("c3", "Retro", null, "deploy went fine")]),
+    });
+    rerender(<CommandPalette {...props} />);
+
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c3");
+  });
+
+  it("holds the search until server info loads, then sends only the grouped requests", () => {
+    serverInfo.mockReturnValue("loading");
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("deploy");
+
+    // Nothing is enabled yet, and the palette shows it is still searching.
+    const enabledScopes = () =>
+      useSessionSearch.mock.calls
+        .filter(([query, , options]) => query === "deploy" && options.enabled)
+        .map(([, scope]) => scope);
+    expect(enabledScopes()).toEqual([]);
+    expect(screen.getByText("Searching…")).toBeTruthy();
+    expect(screen.queryByText("No results found")).toBeNull();
+
+    serverInfo.mockReturnValue({ session_search_scope: true });
+    rerender(<CommandPalette {...props} />);
+    expect(new Set(enabledScopes())).toEqual(new Set(["title", "content"]));
+  });
+
+  it("falls back to the mixed search when server info stalls", () => {
+    serverInfo.mockReturnValue("loading");
+    setSearchGroups({ all: searchPages([conv("t1", "Deploy plan")]) });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("deploy");
+    const enabledScopes = () =>
+      new Set(
+        useSessionSearch.mock.calls
+          .filter(([query, , options]) => query === "deploy" && options.enabled)
+          .map(([, scope]) => scope),
+      );
+    act(() => {
+      vi.advanceTimersByTime(1499);
+    });
+    expect(enabledScopes()).toEqual(new Set());
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(enabledScopes()).toEqual(new Set(["all"]));
+    expect(labelRow("Deploy plan")).toBeTruthy();
+
+    // A late answer still switches to the grouped requests.
+    useSessionSearch.mockClear();
+    serverInfo.mockReturnValue({ session_search_scope: true });
+    rerender(<CommandPalette {...props} />);
+    expect(enabledScopes()).toEqual(new Set(["title", "content"]));
+  });
+
+  it("lists one mixed group on an older server that ignores search_scope", () => {
+    serverInfo.mockReturnValue({});
+    setSearchGroups({
+      all: searchPages([conv("t1", "Deploy plan"), conv("c1", "Notes", null, "deploy on Friday")]),
+    });
+    renderPalette();
+    search("deploy");
+
+    expect(useSessionSearch).toHaveBeenCalledWith("deploy", "all", SEARCH_GROUP_OPTIONS);
+    expect(useSessionSearch).toHaveBeenCalledWith("deploy", "content", {
+      enabled: false,
+      limit: 8,
+    });
+    expect(screen.queryByText("In messages")).toBeNull();
+    const options = screen.getAllByRole("option").map((el) => el.textContent ?? "");
+    expect(options[0]).toContain("Deploy plan");
+    expect(options[1]).toContain("deploy on Friday");
+  });
+
+  it("loads more of one group without paging the other", () => {
+    const fetchTitlePage = vi.fn();
+    const fetchContentPage = vi.fn();
+    setSearchGroups({
+      title: { ...searchPages([conv("t1", "Deploy plan")]), fetchNextPage: fetchTitlePage },
+      content: {
+        ...searchPages([conv("c1", "Notes", null, "deploy on Friday")]),
+        hasNextPage: true,
+        fetchNextPage: fetchContentPage,
+      },
+    });
+    renderPalette();
+    search("deploy");
+
+    // Only the content group has more rows, so only it offers "Show more".
+    const showMore = screen.getAllByText("Show more");
+    expect(showMore).toHaveLength(1);
+    fireEvent.click(showMore[0]);
+    expect(fetchContentPage).toHaveBeenCalledOnce();
+    expect(fetchTitlePage).not.toHaveBeenCalled();
+  });
+
+  it("lists a session in only one group when both requests return it", () => {
+    setSearchGroups({
+      title: searchPages([conv("s1", "Deploy plan")]),
+      content: searchPages([conv("s1", "Deploy plan", null, "deploy now"), conv("s2", "Notes")]),
+    });
+    renderPalette();
+    search("deploy");
+
+    expect(
+      screen.getAllByRole("option").filter((el) => el.textContent?.includes("Deploy plan")),
+    ).toHaveLength(1);
+    expect(screen.getByText("Notes")).toBeTruthy();
+  });
+
+  it("retries loading more for only the group whose next page failed", () => {
+    const fetchTitlePage = vi.fn();
+    const fetchContentPage = vi.fn();
+    setSearchGroups({
+      title: {
+        ...searchPages([conv("t1", "Deploy plan")]),
+        hasNextPage: true,
+        isError: true,
+        isFetchNextPageError: true,
+        fetchNextPage: fetchTitlePage,
+      },
+      content: { ...searchPages([]), isFetching: true, fetchNextPage: fetchContentPage },
+    });
+    renderPalette();
+    search("deploy");
+
+    expect(screen.getByRole("status").textContent).toContain("Couldn't load more sessions.");
+    // A slow content request doesn't block retrying the failed title page.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(fetchTitlePage).toHaveBeenCalledOnce();
+    expect(fetchContentPage).not.toHaveBeenCalled();
+  });
+
+  it("retries only the group whose search failed", () => {
+    const refetchTitle = vi.fn();
+    const refetchContent = vi.fn();
+    setSearchGroups({
+      title: { ...searchPages([conv("t1", "Deploy plan")]), refetch: refetchTitle },
+      content: { isError: true, refetch: refetchContent },
+    });
+    renderPalette();
+    search("deploy");
+
+    expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(refetchContent).toHaveBeenCalledOnce();
+    expect(refetchTitle).not.toHaveBeenCalled();
   });
 });
 

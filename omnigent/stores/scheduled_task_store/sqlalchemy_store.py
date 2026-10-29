@@ -7,9 +7,10 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -25,9 +26,11 @@ from omnigent.db.enum_codecs import (
     SCHEDULED_TASK_STATE,
     decode_scheduled_task_execution_target,
     decode_scheduled_task_run_status,
+    decode_scheduled_task_session_mode,
     decode_scheduled_task_state,
     encode_scheduled_task_execution_target,
     encode_scheduled_task_run_status,
+    encode_scheduled_task_session_mode,
     encode_scheduled_task_state,
 )
 from omnigent.db.utils import (
@@ -41,8 +44,12 @@ from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_ERROR_CODE,
     STALE_RUN_MAX_AGE_SECONDS,
 )
-from omnigent.server.scheduled.schedule import next_scheduled_time, scheduled_trigger_key
-from omnigent.stores.scheduled_task_store import ScheduledTaskStore
+from omnigent.server.scheduled.schedule import (
+    next_scheduled_time,
+    occurrence_host_id,
+    scheduled_trigger_key,
+)
+from omnigent.stores.scheduled_task_store import AdoptOutcome, ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
@@ -58,6 +65,12 @@ _UNSET: Any = object()
 _UNFINISHED_CLAIM_STATUSES = {
     encode_scheduled_task_run_status(status) for status in ("starting", "running")
 }
+# Run now requests awaiting a claim; ordered like the expired-claims index.
+_PENDING_RUN_FILTER = (
+    SqlScheduledTaskRun.status == encode_scheduled_task_run_status("scheduled"),
+    SqlScheduledTaskRun.lease_expires_at.is_(None),
+    SqlScheduledTaskRun.trigger_key.is_not(None),
+)
 
 
 def _purge_finished_deleted_task(
@@ -111,6 +124,8 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         reasoning_effort=row.reasoning_effort,
         permission_mode=row.permission_mode,
         max_cost_usd=row.max_cost_usd,
+        session_mode=decode_scheduled_task_session_mode(row.session_mode),
+        session_id=row.session_id,
         workspace=row.workspace,
         base_branch=row.base_branch,
         execution_target=decode_scheduled_task_execution_target(row.execution_target),
@@ -123,6 +138,22 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         project_id=row.project_id,
         delegation_ref=row.delegation_ref,
     )
+
+
+# What a session is created with and keeps, so an edit to any of them makes a
+# first run's session stale. updated_at has second resolution, so it alone
+# would miss an edit in the same second.
+_SESSION_CREATION_FIELDS = (
+    "agent_id",
+    "host_id",
+    "workspace",
+    "execution_target",
+    "model_override",
+    "reasoning_effort",
+    "permission_mode",
+    "project_id",
+    "updated_at",
+)
 
 
 def _run_to_entity(row: SqlScheduledTaskRun) -> ScheduledTaskRun:
@@ -201,8 +232,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
         max_cost_usd: float | None = None,
+        session_mode: str = "new",
+        session_id: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
     ) -> ScheduledTask:
@@ -224,18 +258,20 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
                 max_cost_usd=max_cost_usd,
+                session_mode=encode_scheduled_task_session_mode(session_mode),
+                session_id=session_id,
                 workspace=workspace,
                 base_branch=None,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
+                project_id=project_id,
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
                 created_at=created_at,
                 updated_at=None,
             )
-            if self._dispatch_enabled:
-                row.next_run_at = next_scheduled_time(_to_entity(row), created_at)
+            self._refresh_schedule(row, created_at)
             session.add(row)
             session.flush()
             return _to_entity(row)
@@ -335,8 +371,11 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
+        session_mode: str | None = None,
+        session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
@@ -346,7 +385,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``workspace``, ``host_id``, ``max_cost_usd``, and
+        ``workspace``, ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
         ``last_run_conversation_id``, the sentinel default means "not provided /
         leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (a set
@@ -396,11 +435,22 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd
                 changed = True
+            if session_mode is not None:
+                encoded_mode = encode_scheduled_task_session_mode(session_mode)
+                if row.session_mode != encoded_mode:
+                    row.session_mode = encoded_mode
+                    changed = True
+            if session_id is not _UNSET and row.session_id != session_id:
+                row.session_id = session_id
+                changed = True
             if workspace is not _UNSET and row.workspace != workspace:
                 row.workspace = workspace
                 changed = True
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
+                changed = True
+            if project_id is not _UNSET and row.project_id != project_id:
+                row.project_id = project_id
                 changed = True
             if execution_target is not None:
                 encoded_target = encode_scheduled_task_execution_target(execution_target)
@@ -421,17 +471,69 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.last_run_conversation_id = last_run_conversation_id
                 changed = True
             if (row.rrule, row.timezone, row.state) != schedule_before:
-                row.next_run_at = (
-                    next_scheduled_time(_to_entity(row), updated_at)
-                    if self._dispatch_enabled
-                    else None
-                )
+                self._refresh_schedule(row, updated_at)
             if changed:
                 row.updated_at = updated_at
             session.flush()
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_task", write)
+
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        """Clear the task's project only while it is still *project_id*."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlScheduledTask)
+                    .where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == scheduled_task_id,
+                        SqlScheduledTask.project_id == project_id,
+                    )
+                    .values(project_id=None, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "clear_task_project", write)
+
+    def adopt_session(
+        self,
+        scheduled_task_id: str,
+        session_id: str,
+        *,
+        snapshot: ScheduledTask,
+        host_id: str | None = None,
+    ) -> AdoptOutcome:
+        """Record the first firing's session under the task lock, unless the task changed."""
+
+        def write(session: Session) -> AdoptOutcome:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
+            )
+            if (
+                row is None
+                or row.state == encode_scheduled_task_state("deleted")
+                or row.session_mode != encode_scheduled_task_session_mode("continue")
+            ):
+                return "stale"
+            if row.session_id is not None:
+                return "taken"
+            current = _to_entity(row)
+            if any(
+                getattr(current, name) != getattr(snapshot, name)
+                for name in _SESSION_CREATION_FIELDS
+            ):
+                return "stale"
+            row.session_id = session_id
+            if host_id is not None and row.host_id is None:
+                row.host_id = host_id
+            row.updated_at = now_epoch()
+            return "adopted"
+
+        return run_write_transaction(self._session_immediate, "adopt_task_session", write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
@@ -706,8 +808,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         """Return the ``running`` run for a conversation, or ``None``.
 
         Workspace-scoped reverse lookup for the event-driven completion hook;
-        backed by ``ix_scheduled_task_runs_conversation_id``. A conversation has
-        at most one ``running`` run, so ``.first()`` is exact rather than lossy.
+        backed by ``ix_scheduled_task_runs_conversation_status``, so a continued
+        session's finished runs are not read. A conversation has at most one
+        ``running`` run, so ``LIMIT 1`` is exact rather than lossy.
         """
         running_code = encode_scheduled_task_run_status("running")
         with self._session("select_running_run_by_conversation") as session:
@@ -716,6 +819,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
                 .where(SqlScheduledTaskRun.conversation_id == conversation_id)
                 .where(SqlScheduledTaskRun.status == running_code)
+                .limit(1)
             )
             row = session.execute(stmt).scalars().first()
             return _run_to_entity(row) if row is not None else None
@@ -808,6 +912,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
         )
 
+    def _refresh_schedule(self, row: SqlScheduledTask, after: int) -> None:
+        """Recompute the saved next run; persistent mode completes exhausted schedules."""
+        if row.state == encode_scheduled_task_state("completed"):
+            # A schedule edit or resume re-evaluates a finished schedule.
+            row.state = encode_scheduled_task_state("active")
+        if not self._dispatch_enabled:
+            row.next_run_at = None
+            return
+        row.next_run_at = next_scheduled_time(_to_entity(row), after)
+        if row.next_run_at is None and row.state == encode_scheduled_task_state("active"):
+            row.state = encode_scheduled_task_state("completed")
+
     def configure_dispatch(self, enabled: bool) -> None:
         """Select cursor maintenance before serving requests, using the app's release flag."""
         self._dispatch_enabled = enabled
@@ -857,6 +973,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 )
                 if cursor is None:
                     break
+
+        def skip_pending(session: Session, *, cursor: TaskCursor | None) -> TaskCursor | None:
+            columns = (SqlScheduledTaskRun.workspace_id, SqlScheduledTaskRun.id)
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(*_PENDING_RUN_FILTER)
+                .order_by(*columns)
+                .limit(self._cleanup_batch_size)
+                .with_for_update()
+            )
+            if cursor is not None:
+                stmt = stmt.where(self._cursor_after(columns, cursor))
+            rows = list(session.scalars(stmt))
+            timestamp = now_epoch()
+            for row in rows:
+                row.status = encode_scheduled_task_run_status("skipped")
+                row.finished_at = timestamp
+                row.error = "The persistent scheduler was turned off before this run started."
+                row.error_code = "dispatch_disabled"
+            return (rows[-1].workspace_id, rows[-1].id) if rows else None
+
+        # Legacy timers never start pending Run now requests. Skip them so a later
+        # switch back does not start requests made before the rollback.
+        pending: TaskCursor | None = None
+        while True:
+            pending = run_write_transaction(
+                self._session_immediate,
+                "skip_pending_runs_page",
+                partial(skip_pending, cursor=pending),
+            )
+            if pending is None:
+                break
 
     def list_uninitialized_tasks(
         self, *, after: TaskCursor | None = None, limit: int = 100
@@ -925,6 +1073,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "pause_invalid_schedule", write)
 
+    def complete_schedule(self, task: ScheduledTask) -> bool:
+        """Mark an exhausted schedule completed only if no concurrent edit changed it."""
+        if (
+            task.workspace_id != current_workspace_id()
+            or task.state != "active"
+            or task.next_run_at is not None
+        ):
+            return False
+
+        def write(session: Session) -> bool:
+            row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
+            if row is None or _to_entity(row) != task:
+                return False
+            row.state = encode_scheduled_task_state("completed")
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session_immediate, "complete_schedule", write)
+
     def list_due_tasks(
         self, now: int, *, after: DispatchCursor | None = None, limit: int = 100
     ) -> builtins.list[ScheduledTask]:
@@ -963,7 +1130,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         Comparing the full snapshot also catches same-second prompt/host edits;
         updated_at alone cannot serve as a revision. A uniqueness error rolls
-        back the advance, as does any other write failure.
+        back the advance, as does any other write failure. Claiming the final
+        occurrence (``next_run_at=None``) marks the task completed.
         """
         self.check_dispatch_support()
         if lease_seconds <= 0 or (next_run_at is not None and next_run_at <= now):
@@ -994,6 +1162,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 )
             )
             row.next_run_at = next_run_at
+            if next_run_at is None:
+                # Completing changes the task's visible state, unlike advancing the cursor.
+                row.state = encode_scheduled_task_state("completed")
+                row.updated_at = now
             if existing is not None:
                 return None
             run = SqlScheduledTaskRun(
@@ -1011,6 +1183,96 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _run_to_entity(run)
 
         return run_write_transaction(self._session_immediate, "claim_occurrence", write)
+
+    def request_manual_run(
+        self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
+    ) -> ScheduledTaskRun | None:
+        """Insert under the task lock, so a concurrent delete either wins or purges the run."""
+        if task.workspace_id != current_workspace_id():
+            return None
+        run_id = uuid.uuid4().hex
+
+        def write(session: Session) -> ScheduledTaskRun | None:
+            row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
+            if row is None or row.state == encode_scheduled_task_state("deleted"):
+                return None
+            run = SqlScheduledTaskRun(
+                workspace_id=task.workspace_id,
+                id=run_id,
+                scheduled_task_id=task.id,
+                status=encode_scheduled_task_run_status("scheduled"),
+                scheduled_at=now,
+                trigger_key=trigger_key,
+                host_id=host_id,
+            )
+            session.add(run)
+            return _run_to_entity(run)
+
+        return run_write_transaction(self._session_immediate, "request_manual_run", write)
+
+    def list_pending_runs(
+        self, *, after: TaskCursor | None = None, limit: int = 100
+    ) -> builtins.list[ScheduledTaskRun]:
+        """Seek the expired-claims index: pending runs have status ``scheduled`` and no lease."""
+        if limit < 1:
+            raise ValueError("The page size (limit) for fetching pending runs must be at least 1.")
+        with self._session("discover_pending_runs") as session:
+            columns = (SqlScheduledTaskRun.workspace_id, SqlScheduledTaskRun.id)
+            stmt = (
+                select(SqlScheduledTaskRun)
+                .where(*_PENDING_RUN_FILTER)
+                .order_by(*columns)
+                .limit(limit)
+            )
+            if after is not None:
+                stmt = stmt.where(self._cursor_after(columns, after))
+            return [_run_to_entity(row) for row in session.scalars(stmt)]
+
+    def claim_pending_run(
+        self, run: ScheduledTaskRun, *, now: int, lease_seconds: int
+    ) -> tuple[ScheduledTask, ScheduledTaskRun] | None:
+        """Lock the task, then the run, matching deletion's lock order."""
+        self.check_dispatch_support()
+        if lease_seconds <= 0:
+            raise ValueError(
+                "Cannot claim a pending run: lease_seconds must be greater than zero."
+            )
+        if run.workspace_id != current_workspace_id():
+            return None
+
+        def write(session: Session) -> tuple[ScheduledTask, ScheduledTaskRun] | None:
+            task = session.get(
+                SqlScheduledTask, (run.workspace_id, run.scheduled_task_id), with_for_update=True
+            )
+            row = session.get(
+                SqlScheduledTaskRun, (run.workspace_id, run.id), with_for_update=True
+            )
+            if (
+                row is None
+                or row.status != encode_scheduled_task_run_status("scheduled")
+                or row.trigger_key is None
+            ):
+                return None
+            if task is None or task.state == encode_scheduled_task_state("deleted"):
+                row.status = encode_scheduled_task_run_status("skipped")
+                row.finished_at = now
+                row.error = "The automation was deleted before this run started."
+                row.error_code = "task_deleted"
+                _purge_finished_deleted_task(session, task, row)
+                return None
+            snapshot = _to_entity(task)
+            host_id = occurrence_host_id(snapshot, row.trigger_key)
+            if host_id != row.host_id:
+                # The task's target changed after the request; leave the run for
+                # the replica that owns its new host.
+                row.host_id = host_id
+                return None
+            row.status = encode_scheduled_task_run_status("starting")
+            row.fired_at = now
+            row.lease_expires_at = now + lease_seconds
+            return snapshot, _run_to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "claim_pending_run", write)
 
     def renew_starting_run(
         self, run_id: str, *, now: Callable[[], float], lease_seconds: int
@@ -1084,10 +1346,16 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         error_code: str | None = None,
     ) -> ScheduledTaskRun | None:
         """Transition only a matching startup lease."""
-        if status not in {"starting", "running", "failed", "skipped"}:
+        if status not in {"starting", "running", "succeeded", "failed", "skipped"}:
             raise ValueError(
                 f"Cannot update a starting run to status {status!r}. "
-                "Expected 'starting', 'running', 'failed', or 'skipped'."
+                "Expected 'starting', 'running', 'succeeded', 'failed', or 'skipped'."
+            )
+        if status == "succeeded" and not expired and conversation_id is None:
+            raise ValueError(
+                "An executor records 'succeeded' for a starting run only with the "
+                "conversation_id of the continued session it delivered a prompt into. "
+                "Recovery records it after finding that the run's session already finished."
             )
         if status == "starting" and (expired or conversation_id is None):
             raise ValueError(
@@ -1118,7 +1386,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.lease_expires_at = None
             if conversation_id is not None:
                 row.conversation_id = conversation_id
-            row.finished_at = timestamp if status in {"failed", "skipped"} else None
+            row.finished_at = timestamp if status in {"succeeded", "failed", "skipped"} else None
             row.error = error
             row.error_code = error_code
             result = _run_to_entity(row)

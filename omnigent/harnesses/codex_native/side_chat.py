@@ -59,6 +59,8 @@ SIDE_REFERENCE_ONLY_INSTRUCTIONS = (
 # Display name stamped on a side-chat child so the web can tell it apart from a
 # Codex-spawned sub-agent (drives the "this is a side chat" banner).
 SIDE_CHAT_DISPLAY_NAME = "Side chat"
+CAP_SIDE_CHAT_SETTINGS = "codex_side_chat_settings"
+EFFORT_RESET_LABEL = "omnigent.side_chat.effort_reset"
 _NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname"
 
 _SIDE_PREFIX = "/side "
@@ -175,12 +177,46 @@ async def fork_ephemeral_side_thread(
     return None
 
 
+class SideChatEffortUnavailable(ValueError):
+    """The selected model has no discoverable default effort."""
+
+
+async def _resolve_side_effort(
+    codex_client: CodexAppServerClient,
+    thread_id: str,
+    effort: str | None,
+    model: str | None,
+    transport: str | None,
+) -> str:
+    """Resolve effort against the live thread when no model override was saved."""
+    from omnigent.harnesses.codex_native.app_server import resolve_codex_effort_for_model
+
+    if model is None:
+        response = await codex_client.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
+        )
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        actual_model = thread.get("model") if isinstance(thread, dict) else None
+        model = actual_model if isinstance(actual_model, str) and actual_model else None
+    try:
+        return await resolve_codex_effort_for_model(
+            codex_client, effort, model, transport=transport
+        )
+    except ValueError as exc:
+        raise SideChatEffortUnavailable(str(exc)) from exc
+
+
 async def submit_side_turn(
     codex_client: CodexAppServerClient,
     child_thread_id: str,
     text: str,
     *,
     collaboration_mode: _JsonObject | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    reset_effort: bool = False,
+    transport: str | None = None,
 ) -> str | None:
     """
     Submit one user turn to a side-chat thread over the app-server.
@@ -194,14 +230,26 @@ async def submit_side_turn(
     :param child_thread_id: Side-chat Codex thread id.
     :param text: User input for the turn.
     :param collaboration_mode: Optional Codex collaboration mode payload.
+    :param model: Side-thread model override for this and subsequent turns.
+    :param effort: Side-thread reasoning effort for this and subsequent turns.
+    :param reset_effort: Resolve the selected model's default instead of inheriting effort.
+    :param transport: Parent app-server address used to share its effort-catalog cache.
     :returns: The started turn id, or ``None`` when absent.
     """
+    if reset_effort or effort is not None:
+        effort = await _resolve_side_effort(
+            codex_client, child_thread_id, None if reset_effort else effort, model, transport
+        )
     params: _JsonObject = {
         "threadId": child_thread_id,
         "input": [{"type": "text", "text": text}],
     }
     if collaboration_mode is not None:
         params["collaborationMode"] = collaboration_mode
+    if model is not None:
+        params["model"] = model
+    if effort is not None:
+        params["effort"] = effort
     response = await codex_client.request("turn/start", params)
     result = response.get("result")
     turn = result.get("turn") if isinstance(result, dict) else None
