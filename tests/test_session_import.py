@@ -2218,12 +2218,14 @@ def test_list_recent_sessions_across_harnesses_normalizes_millisecond_recency(
 
 
 @pytest.mark.parametrize("version", [1, 3])
-@pytest.mark.parametrize("boundary", ["recent", "all", "missing", "repeated"])
+@pytest.mark.parametrize(
+    "boundary", ["recent", "recent-image", "recent-image-only", "all", "missing", "repeated"]
+)
 def test_pi_import_retains_compaction_for_resume(
     tmp_path: Path, version: int, boundary: str
 ) -> None:
     """Keep readable history while resuming only the summary and retained tail."""
-    keep_recent = boundary == "recent"
+    keep_recent = boundary.startswith("recent")
     records = [
         {"type": "session", "version": version, "id": "old-pi", "cwd": "/repo"},
         {"type": "message", "message": {"role": "user", "content": "old large prompt"}},
@@ -2258,6 +2260,11 @@ def test_pi_import_retains_compaction_for_resume(
         },
         {"type": "message", "message": {"role": "user", "content": "continue after compaction"}},
     ]
+    if "image" in boundary:
+        records[3]["message"]["content"] = [
+            *([] if boundary.endswith("only") else [{"type": "text", "text": "recent question"}]),
+            {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="},
+        ]
     for index, record in enumerate(records[1:], 1):
         record.update(id=f"entry-{index}", parentId=f"entry-{index - 1}" if index > 1 else None)
     records[6]["firstKeptEntryId"] = "entry-3" if keep_recent else "entry-6"
@@ -2275,7 +2282,10 @@ def test_pi_import_retains_compaction_for_resume(
             }
         )
     if version == 1:
-        records[6]["firstKeptEntryIndex"] = {"recent": 3, "missing": 99}.get(boundary, 6)
+        # Pi's migrateV1ToV2 indexes entries including the session header.
+        records[6]["firstKeptEntryIndex"] = (
+            3 if keep_recent else 99 if boundary == "missing" else 6
+        )
         records[6].pop("firstKeptEntryId")
         for record in records[1:]:
             record.pop("id")
@@ -2291,6 +2301,10 @@ def test_pi_import_retains_compaction_for_resume(
     assert "old large answer" in json.dumps([item.data.model_dump() for item in imported.items])
     checkpoints = [item for item in imported.items if item.type == "compaction"]
     assert len(checkpoints) == {"missing": 0, "repeated": 2}.get(boundary, 1)
+    if "image" in boundary:
+        assert "data:image/png;base64,aW1hZ2U=" in json.dumps(
+            [item.data.model_dump() for item in imported.items]
+        )
     rebuilt = pi_session_records_from_session_items(
         [
             {"type": item.type, "response_id": item.response_id, **item.data.model_dump()}
@@ -2312,7 +2326,7 @@ def test_pi_import_retains_compaction_for_resume(
     else:
         assert "Remember the migration decision." in context
     assert "old large" not in context
-    assert ("recent question" in context) is keep_recent
+    assert ("recent question" in context) is (keep_recent and not boundary.endswith("only"))
     assert ("recent file" in context) is keep_recent
     if keep_recent:
         result = next(

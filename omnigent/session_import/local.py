@@ -1161,7 +1161,9 @@ def _pi_active_branch(records: list[dict[str, object]]) -> list[dict[str, object
         current = by_id[parent_id]
 
 
-def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, ...]:
+def _pi_message_items(
+    record: dict[str, object], *, text_only: bool = False
+) -> tuple[NewConversationItem, ...]:
     """Convert one Pi message entry to visible Omnigent items."""
     if record.get("type") == "branch_summary":
         summary = record.get("summary")
@@ -1218,7 +1220,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
     items: list[NewConversationItem] = []
     content = message.get("content")
     if role == "user":
-        normalized = _pi_message_content(content, role=role)
+        normalized = _pi_message_content(_pi_text(content) if text_only else content, role=role)
         if not normalized:
             return ()
         items.append(
@@ -1318,6 +1320,7 @@ def _pi_compaction_item(
     # A damaged boundary cannot justify discarding any of the readable history.
     if kept_index is None:
         return ()
+    # Match the live extension's text-only resume snapshot; keep images in history.
     snapshot = [
         {
             "type": "message",
@@ -1333,7 +1336,7 @@ def _pi_compaction_item(
         *(
             {"type": item.type, **item.data.model_dump()}
             for record in branch[kept_index:index]
-            for item in _pi_message_items(record)
+            for item in _pi_message_items(record, text_only=True)
         ),
     ]
     return (

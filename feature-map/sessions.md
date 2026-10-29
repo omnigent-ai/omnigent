@@ -847,7 +847,9 @@ plain `uv run pytest`, which starts a private server for the test.
   covers the shared host picker with Claude. For Pi checkpoint conversion, run
   `tests/test_session_import.py::test_pi_import_retains_compaction_for_resume`
   with retries disabled; it covers legacy/current formats, retained tool pairs,
-  and missing boundaries. This is component coverage, not a running Pi session.
+  images and missing boundaries. Imported images remain in readable history;
+  resume snapshots use the same text-only representation as live Pi checkpoints.
+  This is component coverage, not a running Pi session.
   For real Pi acceptance, create a session with enough history to compact,
   compact it, then add another turn. Import it using the CLI and Settings
   (exact ID and recent sessions), and check duplicate imports remain a single
