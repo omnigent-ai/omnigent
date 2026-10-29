@@ -29,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _auto_create_pi_terminal,
     _pi_native_model_from_spec,
 )
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.polling import poll_until_async
@@ -173,7 +174,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
 
     launched: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Captures the launched terminal spec (args + env)."""
 
         terminal_registry = None
@@ -305,7 +306,7 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
 
     launched: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -404,7 +405,7 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
                 request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -515,7 +516,7 @@ async def test_auto_create_pi_terminal_cold_resume_keeps_persisted_pi_login_pick
 
     launched: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
