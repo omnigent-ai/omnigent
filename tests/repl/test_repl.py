@@ -21,6 +21,8 @@ from omnigent.repl._repl import (
     _SLASH_COMMAND_ALIASES,
     COMMANDS,
     WELCOME_HINTS,
+    _ApprovalState,
+    _ApprovalVerdict,
     _build_call_id_to_name_lookup,
     _build_call_id_to_tool_metadata_lookup,
     _build_model_readout_lines,
@@ -29,11 +31,13 @@ from omnigent.repl._repl import (
     _decode_terminal_target_key,
     _fetch_server_version,
     _is_recoverable_sse_transport_error,
+    _make_elicitation_prompt,
     _parse_sub_agent_handle,
     _parse_terminal_tool_output,
     _reconstruct_terminals_from_items,
     _render_history_item,
     _render_startup_banner_ansi,
+    _retire_prompt_held_in_terminal,
     _server_event_to_sdk_event,
     _SessionsChatReplAdapter,
     _SlashCommandCompleter,
@@ -3024,6 +3028,90 @@ async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict(
     else:
         assert "web UI" in emitted.error.message
         assert "still waiting" in emitted.error.message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("held_elicitation_id", "terminal_fallback", "retired"),
+    [
+        ("elicit_abc", {"answer_undelivered": False}, True),
+        ("elicit_other", {"answer_undelivered": False}, False),
+        ("elicit_abc", None, False),
+    ],
+    ids=["held", "other_prompt_held", "not_held"],
+)
+async def test_prompt_held_in_terminal_retires_repl_approval_without_verdict(
+    held_elicitation_id: str,
+    terminal_fallback: dict[str, bool] | None,
+    retired: bool,
+) -> None:
+    """A prompt that moves to the agent's terminal takes down the REPL's y/a/n prompt.
+
+    The server refuses answers sent from here, so no verdict is posted.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from omnigent_client import StreamHooks
+
+    from omnigent.server.schemas import ElicitationRequestEvent, ElicitationRequestParams
+
+    outputs: list[object] = []
+    host = SimpleNamespace(output=outputs.append)
+    fmt = SimpleNamespace(warning="yellow", muted="dim", accent="cyan")
+    state = _ApprovalState()
+    client = MagicMock()
+    client.sessions.resolve_elicitation = AsyncMock()
+    adapter = _SessionsChatReplAdapter(
+        client=client,
+        agent_name="test-agent",
+        hooks=StreamHooks(on_elicitation_request=_make_elicitation_prompt(host, fmt, state)),
+        session_id="conv_abc",
+    )
+    request = SimpleNamespace(
+        elicitation_id="elicit_abc",
+        message="approve?",
+        requested_schema={},
+        mode="form",
+        phase="tool_call",
+        policy_name="test-policy",
+        content_preview="",
+        url=None,
+    )
+    task = asyncio.create_task(adapter._handle_elicitation("conv_abc", request))
+    for _ in range(10):
+        if state.pending:
+            break
+        await asyncio.sleep(0)
+    assert state.pending
+    params: dict[str, object] = {"message": "approve?"}
+    if terminal_fallback is not None:
+        params["terminal_fallback"] = terminal_fallback
+    held = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id=held_elicitation_id,
+        params=ElicitationRequestParams.model_validate(params),
+    )
+
+    try:
+        _retire_prompt_held_in_terminal(held, host, fmt, state)
+
+        notices = [str(line) for line in outputs if "agent's terminal" in str(line)]
+        if not retired:
+            assert state.pending
+            assert notices == []
+            state.resolve_verdict(_ApprovalVerdict.REFUSE)
+            await task
+            client.sessions.resolve_elicitation.assert_awaited_once()
+            return
+        assert not state.pending
+        assert notices == ["   › waiting in the agent's terminal · answer it there"]
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        client.sessions.resolve_elicitation.assert_not_awaited()
+    finally:
+        task.cancel()
 
 
 def test_is_recoverable_sse_transport_error_for_write_errors() -> None:

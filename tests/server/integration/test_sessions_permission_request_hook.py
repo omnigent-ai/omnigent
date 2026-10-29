@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import threading
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -50,6 +51,7 @@ from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.routes._sessions import orchestration as sessions_orchestration
 from omnigent.server.routes._sessions.helpers import TERMINAL_FALLBACK_CLIENT_HEADER
+from omnigent.server.routes.sessions import routes_events
 from omnigent.server.schemas import ElicitationRequestParams
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent, start_session_stream_collector
@@ -2714,6 +2716,20 @@ async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_ret
             listed = await client.get("/v1/sessions", params={"limit": 1000}, headers=headers)
             [row] = [row for row in listed.json()["data"] if row["id"] == session_id]
             assert row["pending_elicitations_count"] == listed_count
+        stream_opt_ins: list[bool] = []
+
+        async def finite_stream(
+            *args: Any, client_supports_terminal_fallback: bool, **kwargs: Any
+        ) -> AsyncIterator[str]:
+            stream_opt_ins.append(client_supports_terminal_fallback)
+            yield "data: [DONE]\n\n"
+
+        with monkeypatch.context() as patch_stream:
+            patch_stream.setattr(routes_events, "_stream_live_events", finite_stream)
+            for headers in ({}, _TERMINAL_FALLBACK_HEADERS):
+                stream = await client.get(f"/v1/sessions/{session_id}/stream", headers=headers)
+                assert stream.status_code == 200, stream.text
+        assert stream_opt_ins == [False, True]
 
         answer = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
         answer_by_url = await client.post(

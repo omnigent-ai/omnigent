@@ -1197,6 +1197,9 @@ Content-Type: application/json
 404 Not Found — no session with that id
 422 Unprocessable Entity — body fails Pydantic validation (e.g. a bad
     `action` value)
+423 Locked — `prompt_in_terminal`: the prompt waits for its answer in the
+    agent's terminal (only for a client that sends
+    `x-omnigent-terminal-fallback: on`)
 ```
 
 Delivers a human approval verdict for an outstanding elicitation (one
@@ -1429,6 +1432,16 @@ settled the prompt (answered in another tab, the inbox, or the approve
 page) and `reason: "unanswered"` when the hook stopped waiting before
 anyone answered; a clear with neither means the prompt was answered
 in the native terminal, where the verdict is not observable.
+
+A Claude prompt whose permission hook stops waiting mid-turn is held for an
+answer in the agent's terminal. A client that can show it sends
+`x-omnigent-terminal-fallback: on` (a WebSocket connects with
+`?omnigent_terminal_fallback=on`). It then receives the prompt re-published
+with `params.terminal_fallback = {"answer_undelivered": <bool>}`, finds it in
+snapshots and pending counts, and gets 423 `prompt_in_terminal` if it answers.
+Without the opt-in, the prompt resolves with `reason: "unanswered"` and is left
+out of snapshots and counts, and a late answer gets 202 and is kept for a hook
+retry.
 
 ### Reconnect Contract
 

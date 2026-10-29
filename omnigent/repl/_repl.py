@@ -974,6 +974,31 @@ class _ApprovalState:
             return False
         return self.resolve_verdict(_resolved_elsewhere_verdict(action))
 
+    def move_to_terminal(self, elicitation_id: str) -> bool:
+        """
+        Retire the pending approval, without a verdict, once its prompt
+        waits in the agent's terminal.
+
+        The server refuses answers sent from here, so the future is
+        cancelled rather than resolved: the hook's task then ends without
+        posting an accept or decline.
+
+        :param elicitation_id: Id carried by the held re-publish.
+        :returns: ``True`` iff the pending approval was for this
+            elicitation and has now been retired.
+        """
+        if not self.pending or not elicitation_id:
+            return False
+        if elicitation_id != self._current_elicitation_id:
+            return False
+        assert self._future is not None
+        self._future.cancel()
+        self._future = None
+        self._current_policy = None
+        self._current_phase = None
+        self._current_elicitation_id = None
+        return True
+
     def cancel(self) -> None:
         """
         Cancel any pending approval — refuse fail-closed.
@@ -1199,6 +1224,37 @@ def _make_elicitation_prompt(
         return await future
 
     return _on_elicitation_request
+
+
+def _retire_prompt_held_in_terminal(
+    event: object,
+    host: TerminalHost,
+    fmt: RichBlockFormatter,
+    state: _ApprovalState,
+) -> None:
+    """
+    Retire the REPL's prompt for a request that now waits in the agent's terminal.
+
+    Without this the ``y/a/n`` prompt stays up for an answer the server refuses.
+
+    :param event: A server stream event, e.g. an ``ElicitationRequestEvent``.
+    :param host: Terminal host the notice is written to.
+    :param fmt: Formatter whose muted style the notice uses.
+    :param state: Shared approval state holding the pending prompt.
+    """
+    from omnigent.server.schemas import ElicitationRequestEvent
+
+    if not isinstance(event, ElicitationRequestEvent):
+        return
+    if getattr(event.params, "terminal_fallback", None) is None:
+        return
+    if state.move_to_terminal(event.elicitation_id):
+        host.output(
+            Text.from_markup(
+                f"   [{fmt.muted}]› waiting in the agent's terminal · "
+                f"answer it there[/{fmt.muted}]",
+            ),
+        )
 
 
 def _elicitation_resolve_session_id(sdk_event: object, fallback_session_id: str) -> str:
@@ -3800,6 +3856,8 @@ async def run_repl(
             if tape_entry is not None:
                 _maybe_log_tape_entry(tape_entry)
             return
+        # A prompt held in the agent's terminal arrives as a re-publish, not an expiry.
+        _retire_prompt_held_in_terminal(event, host, fmt, approval_state)
 
         # Live sub-agent tree updates ride the parent stream as
         # ``session.created`` / ``session.child_session.updated``. Apply them

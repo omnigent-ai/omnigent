@@ -56,6 +56,8 @@ implements them separately, so a fix for one harness does not reach the others.
   way, with the composer locked, until the terminal answers, the hook retries,
   or the turn ends. A hook retry still delivers an answer given in chat meanwhile
   while the server keeps it (up to 5 minutes); after that the retry asks again.
+  In `omnigent chat`, the y/a/n prompt is replaced by a note to answer in the
+  agent's terminal.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
