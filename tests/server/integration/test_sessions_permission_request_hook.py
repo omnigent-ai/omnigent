@@ -3062,6 +3062,16 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         assert [card["params"].get("terminal_fallback") for card in parent_cards] == [
             {"answer_undelivered": False} if waiting_in_terminal else None
         ]
+        older_parent = await client.get(f"/v1/sessions/{parent_id}")
+        aware_parent = await client.get(
+            f"/v1/sessions/{parent_id}", headers=_TERMINAL_FALLBACK_HEADERS
+        )
+        assert [
+            event["elicitation_id"] for event in older_parent.json()["pending_elicitations"]
+        ] == ([] if waiting_in_terminal else [_REATTACH_ELICITATION_ID])
+        assert [
+            event["elicitation_id"] for event in aware_parent.json()["pending_elicitations"]
+        ] == [_REATTACH_ELICITATION_ID]
 
         deleted = await client.delete(f"/v1/sessions/{parent_id if delete_parent else session_id}")
         assert deleted.status_code == 200, deleted.text
