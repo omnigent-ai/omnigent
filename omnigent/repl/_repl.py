@@ -1102,6 +1102,7 @@ class _QuestionPrompt:
     :param allow_custom: Whether a typed answer outside the options is accepted.
     :param text_default: Prefilled text for editor-style questions, whose
         exact text (empty allowed) is the answer; ``None`` otherwise.
+    :param secret: The producer marked the answer secret (``isSecret``).
     """
 
     key: str
@@ -1111,6 +1112,7 @@ class _QuestionPrompt:
     multi_select: bool
     allow_custom: bool
     text_default: str | None = None
+    secret: bool = False
 
 
 def _question_prompts(payload: object) -> list[_QuestionPrompt]:
@@ -1157,6 +1159,7 @@ def _question_prompts(payload: object) -> list[_QuestionPrompt]:
                 # producer says otherwise, and always when there are no options.
                 allow_custom=raw.get("isOther") is not False or not options,
                 text_default=default if isinstance(default, str) else None,
+                secret=raw.get("isSecret") is True,
             )
         )
     return prompts
@@ -1175,22 +1178,26 @@ def _parse_question_answer(text: str, question: _QuestionPrompt) -> str | list[s
     if not stripped:
         return None
     labels = [label for label, _ in question.options]
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] == '"':
+        # Quoted input is always literal text, e.g. ``"2"`` for the answer 2.
+        literal = stripped[1:-1]
+        if not literal or not question.allow_custom:
+            return None
+        return [literal] if question.multi_select else literal
+    tokens = [token for token in re.split(r"[,\s]+", stripped) if token]
+    # Numbers pick by the position shown, even when a label is itself a number.
+    if labels and all(token.isdecimal() and 1 <= int(token) <= len(labels) for token in tokens):
+        picked: list[str] = []
+        for token in tokens:
+            if labels[int(token) - 1] not in picked:
+                picked.append(labels[int(token) - 1])
+        if question.multi_select:
+            return picked
+        return picked[0] if len(picked) == 1 else None
     by_label = {label.casefold(): label for label in labels}
     if stripped.casefold() in by_label:
         label = by_label[stripped.casefold()]
         return [label] if question.multi_select else label
-    tokens = [token for token in re.split(r"[,\s]+", stripped) if token]
-    if labels and all(token.isdigit() for token in tokens):
-        picked: list[str] = []
-        for token in tokens:
-            index = int(token)
-            if not 1 <= index <= len(labels):
-                return None
-            if labels[index - 1] not in picked:
-                picked.append(labels[index - 1])
-        if question.multi_select:
-            return picked
-        return picked[0] if len(picked) == 1 else None
     if not question.allow_custom:
         return None
     return [stripped] if question.multi_select else stripped
@@ -1204,7 +1211,7 @@ def _question_hint(question: _QuestionPrompt) -> str:
         return "type your answer · Esc cancels"
     hint = "enter one or more numbers, e.g. 1,3" if question.multi_select else "enter a number"
     if question.allow_custom:
-        hint += ", or type your own answer"
+        hint += ', or type your own answer ("…" sends it as typed)'
     return f"{hint} · Esc cancels"
 
 
@@ -2933,8 +2940,13 @@ class _SessionsChatReplAdapter:
                 return
             # Question prompts get a numbered picker instead of y/a/n: an
             # accept without answers would reach the agent as an empty reply.
-            questions = _question_prompts(getattr(event, "ask_user_question", None))
-            if questions and self._field_input_state is not None:
+            ask_user_question = getattr(event, "ask_user_question", None)
+            questions = _question_prompts(ask_user_question)
+            resolve_payload: dict[str, object] | None
+            if isinstance(ask_user_question, dict) and not questions:
+                # Nothing usable to ask; an approval would accept with no answers.
+                resolve_payload = {"action": "decline"}
+            elif questions and self._field_input_state is not None:
                 resolve_payload = await self._question_payload(elicitation_id, questions)
             else:
                 resolve_payload = await self._approval_payload(event, elicitation_id)
@@ -2967,11 +2979,8 @@ class _SessionsChatReplAdapter:
             already resolved); ``False`` when every attempt failed.
         """
 
-        # URL-based elicitation: deliver the verdict to the elicitation's
-        # dedicated resolve URL rather than as an in-band ``approval`` event.
-        # A transport error can happen after the server accepted the POST but
-        # before the client received its response, so retrying is safe: the
-        # server either accepts the retry or reports the elicitation resolved.
+        # Retrying is safe: the server accepts a retry or reports it already
+        # resolved (``not_found``), even if a dropped response hid a success.
         for attempt in range(3):
             try:
                 await self._client.sessions.resolve_elicitation(
@@ -2990,11 +2999,8 @@ class _SessionsChatReplAdapter:
                 if not _is_recoverable_sse_transport_error(exc):
                     raise
                 if attempt == 2:
-                    # One line here, postmortem behind DEBUG: the REPL
-                    # configures no log handlers, so a WARNING carrying
-                    # exc_info falls through to ``logging.lastResort`` and
-                    # paints a traceback over the TUI frame. Same split
-                    # ``_stream_pump`` makes for the same reason.
+                    # No exc_info on the WARNING: with no handlers configured,
+                    # ``logging.lastResort`` would paint a traceback over the TUI.
                     _log.warning("Could not resolve elicitation after transport retries")
                     _log.debug("elicitation resolve failed", exc_info=exc)
                     # The elicitation is still parked server-side, so the
@@ -3118,8 +3124,22 @@ class _SessionsChatReplAdapter:
         :param elicitation_id: Id of the elicitation being answered.
         :param questions: Parsed questions from the ``ask_user_question`` extra.
         :returns: An accept carrying the web form's answer shape, a decline
-            when the user aborts, or ``None`` when another client answered.
+            when the user aborts, or ``None`` to post nothing (another client
+            answered, or the question is secret and must be answered there).
         """
+        if any(question.secret for question in questions):
+            # Terminal input is echoed and saved to history; leave it pending.
+            if self._host is not None and self._fmt is not None:
+                from rich.text import Text
+
+                self._host.output(
+                    Text(
+                        "   ? This question asks for a secret, which the terminal can't take "
+                        "safely. Answer it in the web UI.",
+                        style=self._fmt.warning,
+                    )
+                )
+            return None
         try:
             answers = await self._prompt_questions(elicitation_id, questions)
         except Exception:  # noqa: BLE001
@@ -4566,6 +4586,9 @@ async def run_repl(
         # Pending schema field input: consume this line as the
         # current field's value before any other routing.
         if field_input_state.pending:
+            if text.strip() == "/cancel":
+                field_input_state.cancel()
+                return
             field_name = field_input_state.field_name or "field"
             # Plain styled text: ``field_name`` (server schema) and
             # ``text`` (user input) must not be parsed as Rich markup.
@@ -5008,6 +5031,15 @@ async def run_repl(
     # Let the host see the active session id so Left-arrow can return to the
     # top-level session whenever the user is inside a sub-agent.
     host.active_session_id_getter = lambda: session.session_id
+    # An open prompt reads lines as typed, and Esc declines it even when the
+    # turn was started elsewhere (no local task for Esc to cancel).
+    host.raw_input_wanted = lambda: field_input_state.pending
+
+    def _decline_open_prompt() -> None:
+        field_input_state.cancel()
+        approval_state.cancel()
+
+    host.on_idle_escape = _decline_open_prompt
 
     # ── Ctrl+E event tape overlay (--debug-events only) ────────
     # Registered unconditionally only when the debug flag is set.

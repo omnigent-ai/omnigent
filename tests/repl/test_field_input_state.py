@@ -355,7 +355,13 @@ def _question(**overrides: Any) -> Any:
         ("3 1 3", {"multi_select": True}, ["prod", "dev"]),
         ("dev", {"multi_select": True}, ["dev"]),
         ("1,2", {}, None),
-        ("4", {}, None),
+        ("4", {"allow_custom": False}, None),
+        ("8080", {}, "8080"),
+        ("3", {"options": (("1", ""), ("3", ""), ("5", ""))}, "5"),
+        ("3,1", {"options": (("1", ""), ("3", ""), ("5", "")), "multi_select": True}, ["5", "1"]),
+        ('"3"', {"options": (("1", ""), ("3", ""), ("5", ""))}, "3"),
+        ('"2"', {"allow_custom": False}, None),
+        ("²", {"allow_custom": False}, None),
         ("", {}, None),
         ("qa", {}, "qa"),
         ("qa", {"multi_select": True}, ["qa"]),
@@ -372,6 +378,12 @@ def _question(**overrides: Any) -> Any:
         "multi-label",
         "single-rejects-two",
         "out-of-range",
+        "out-of-range-is-text",
+        "number-beats-numeric-label",
+        "multi-number-beats-numeric-label",
+        "quoted-number-is-text",
+        "quoted-needs-custom",
+        "superscript-is-not-a-number",
         "empty",
         "custom-text",
         "multi-custom-text",
@@ -433,7 +445,7 @@ def test_question_picker_collects_answers_keyed_like_the_web_form() -> None:
     adapter = _prompt_adapter(fis, host)
     # A bad answer re-prompts the same question instead of skipping it.
     result = _run(
-        _feed_answers(fis, adapter._prompt_questions("elicit_q", questions), ["9", "2", "1,2"])
+        _feed_answers(fis, adapter._prompt_questions("elicit_q", questions), ["", "2", "1,2"])
     )
     assert result == {"Env?": "prod", "regions": ["a", "b"]}
     text = _outputs_text(host)
@@ -698,18 +710,9 @@ def test_undelivered_answer_can_be_retried_from_a_later_replay() -> None:
 
 
 def test_schema_prompt_resolved_elsewhere_stops_without_posting() -> None:
-    from types import SimpleNamespace
-
     adapter, fis, client, approval_hook = _question_adapter()
-    event = SimpleNamespace(
-        elicitation_id="elicit_form",
-        message="Fill in",
-        requested_schema={"properties": {"name": {"type": "string"}}, "required": ["name"]},
-        mode="form",
-        phase="tool_call",
-        policy_name="p",
-        content_preview="",
-        url=None,
+    event = _form_event(
+        "elicit_form", {"properties": {"name": {"type": "string"}}, "required": ["name"]}
     )
 
     async def _run_case() -> None:
@@ -759,18 +762,12 @@ def test_stream_reconnect_replays_pending_prompts_once_per_subscription() -> Non
 
 
 def _form_event(elicitation_id: str, schema: dict[str, Any]) -> Any:
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
-        elicitation_id=elicitation_id,
-        message="Fill in",
-        requested_schema=schema,
-        mode="form",
-        phase="tool_call",
-        policy_name="p",
-        content_preview="",
-        url=None,
-    )
+    event = _question_event()
+    event.elicitation_id = elicitation_id
+    event.requested_schema = schema
+    event.phase = "tool_call"
+    del event.ask_user_question
+    return event
 
 
 def test_a_release_elsewhere_does_not_swallow_the_next_verdict() -> None:
@@ -807,17 +804,17 @@ def test_esc_on_a_question_posts_a_decline() -> None:
     )
 
 
-def test_malformed_question_options_fall_back_to_the_approval_prompt() -> None:
-    # An unusable question must still settle the elicitation, not crash it.
+def test_malformed_questions_decline_without_the_approval_prompt() -> None:
+    # Nothing usable to ask: decline rather than accept with no answers.
     adapter, _, client, approval_hook = _question_adapter()
     event = _question_event()
     event.ask_user_question = {"questions": [{"question": "Q?", "options": 1}]}
 
     _run(adapter._handle_elicitation("conv_abc", event))
 
-    approval_hook.assert_awaited_once()
+    approval_hook.assert_not_awaited()
     client.sessions.resolve_elicitation.assert_awaited_once_with(
-        "conv_abc", "elicit_q", {"action": "accept"}
+        "conv_abc", "elicit_q", {"action": "decline"}
     )
 
 
@@ -881,3 +878,23 @@ def test_stopping_the_pump_cancels_its_replay() -> None:
         return replay
 
     assert _run(_run_case()).cancelled()
+
+
+def test_secret_questions_are_left_for_another_client() -> None:
+    # Terminal input is echoed and saved to history, so a producer-marked
+    # secret is never collected here and the elicitation stays pending.
+    adapter, fis, client, approval_hook = _question_adapter()
+    event = _question_event()
+    event.ask_user_question = {
+        "questions": [{"question": "Token?", "options": [], "isSecret": True}]
+    }
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", event))
+        await _until(lambda: task.done(), "a picker opened for a secret question")
+
+    _run(_run_case())
+    assert not fis.pending
+    approval_hook.assert_not_awaited()
+    client.sessions.resolve_elicitation.assert_not_awaited()
+    assert "Answer it in the web UI" in _outputs_text(adapter._host)  # type: ignore[arg-type]

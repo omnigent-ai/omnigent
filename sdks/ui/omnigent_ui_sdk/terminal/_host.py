@@ -950,6 +950,12 @@ class TerminalHost:
         # when the user is "inside" a sub-agent (active != tree root) so
         # Left-arrow can jump back to the top-level session.
         self.active_session_id_getter: Callable[[], str | None] | None = None
+        # While this returns True, a submitted line reaches the handler as
+        # typed (no trimming, empty Enter kept): an open prompt is reading it.
+        self.raw_input_wanted: Callable[[], bool] | None = None
+        # Called by Esc when no handler task is running, so a prompt for a
+        # turn started elsewhere can still be dismissed.
+        self.on_idle_escape: Callable[[], None] | None = None
         self._last_was_streaming: bool = False
         self._text_buffer: str = ""
         self._streamed_line_count: int = 0  # Lines printed from streaming text.
@@ -1012,7 +1018,8 @@ class TerminalHost:
             if self._subagent_menu_open:
                 self._close_subagent_menu()
                 return
-            self.cancel()
+            if not self.cancel() and self.on_idle_escape is not None:
+                self.on_idle_escape()
 
         # Multi-line input bindings — multiline=True is set on
         # the prompt session below so the buffer accepts ``\n``,
@@ -1785,6 +1792,12 @@ class TerminalHost:
                                 await cb(session_id)
                             except Exception:
                                 _log.exception("on_subagent_select callback failed")
+                        continue
+
+                    if self.raw_input_wanted is not None and self.raw_input_wanted():
+                        task = asyncio.create_task(handler(line, []))
+                        self._tasks.append(task)
+                        task.add_done_callback(self._on_handler_task_done)
                         continue
 
                     line = line.strip()
@@ -3575,12 +3588,18 @@ class TerminalHost:
         rows = self._render_subagent_menu_fragments()
         return len(rows) + 1 if rows else 0
 
-    def cancel(self) -> None:
-        """Cancel all running handler tasks."""
+    def cancel(self) -> bool:
+        """Cancel all running handler tasks.
+
+        :returns: ``True`` if any task was running.
+        """
         self.stop_timer()
+        cancelled = False
         for task in self._tasks:
             if not task.done():
                 task.cancel()
+                cancelled = True
+        return cancelled
 
     def request_exit(self) -> None:
         """Exit the prompt loop from a background handler."""

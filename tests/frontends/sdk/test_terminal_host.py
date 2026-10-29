@@ -8,10 +8,13 @@ by the pty-driver tests in this directory).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import sys
 from collections.abc import Iterable
+from typing import Any
+from unittest.mock import patch
 
 import pytest
 from omnigent_client import child_summary_busy
@@ -1755,3 +1758,53 @@ def test_subagent_finished_node_kept_visible_in_selector() -> None:
     node = host._subagents["conv_c1"]
     assert host._subagent_visible(node, host._monotonic()) is True
     assert host._subagent_status_label(node) == "Done"
+
+
+def _escape_handler(host: TerminalHost) -> Any:
+    [binding] = [b for b in host._kb.bindings if [str(k) for k in b.keys] == ["Keys.Escape"]]
+    return binding.handler
+
+
+@pytest.mark.asyncio
+async def test_escape_with_no_running_task_calls_the_idle_hook() -> None:
+    # A prompt for a turn started elsewhere has no local task for Esc to
+    # cancel; the idle hook is how it gets dismissed.
+    host = TerminalHost(model_name="test")
+    calls: list[str] = []
+    host.on_idle_escape = lambda: calls.append("idle")
+
+    _escape_handler(host)(None)
+    assert calls == ["idle"]
+
+    busy = asyncio.create_task(asyncio.Event().wait())
+    host._tasks.append(busy)
+    _escape_handler(host)(None)
+    await asyncio.sleep(0)
+    assert busy.cancelled()
+    assert calls == ["idle"], "Esc must cancel a running turn instead of the idle hook"
+
+
+@pytest.mark.asyncio
+async def test_open_prompt_receives_lines_exactly_as_typed() -> None:
+    # An editor answer keeps its whitespace, and a bare Enter reaches the
+    # prompt (it keeps the prefill) instead of being dropped as chat would.
+    host = TerminalHost(model_name="test")
+    host.raw_input_wanted = lambda: True
+    lines = iter(["  spaced  ", ""])
+
+    async def _read_input() -> str:
+        try:
+            return next(lines)
+        except StopIteration:
+            raise EOFError from None
+
+    host._read_input = _read_input  # type: ignore[method-assign]
+    received: list[str] = []
+
+    async def _handler(text: str, attachments: Any = None) -> None:
+        received.append(text)
+
+    with patch.object(host, "_output"):
+        await host.run(_handler)
+    await asyncio.sleep(0)
+    assert received == ["  spaced  ", ""]
