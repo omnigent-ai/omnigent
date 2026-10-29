@@ -15,7 +15,7 @@ from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.polling import poll_until
 
-# Seeded files land in the server's cwd, the repo root (<repo>/tests/e2e_ui/files/...).
+# With ``os_env.cwd: .`` seeded files land under <repo>/<session_id>/; teardown removes it.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _FILE_PATH = "ProxyHandler.scala"

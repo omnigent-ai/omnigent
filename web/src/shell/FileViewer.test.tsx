@@ -2515,6 +2515,25 @@ describe("large Markdown file routing", () => {
     },
   );
 
+  it.each([
+    { size: "large", content: large, monaco: true },
+    { size: "small", content: "# Small", monaco: false },
+  ])("offers Wrap lines in $size Markdown source only when it opens in Monaco", (c) => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    setContent(c.content);
+    render(viewerTree({ open: true, path: `${c.size}.md` }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(!!screen.queryByRole("menuitem", { name: "Wrap lines" })).toBe(c.monaco);
+  });
+
   it.each([true, false])(
     "keeps the initial editor across size-changing saves (large=%s)",
     (initiallyLarge) => {

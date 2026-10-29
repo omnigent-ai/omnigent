@@ -325,10 +325,8 @@ describe("MonacoCodeEditor word wrap", () => {
       />,
     );
 
-    // @monaco-editor/react pushes changed options through updateOptions, so the
-    // toggle reaches the mounted editor without the "Loading…" remount.
+    // Preservation of edits and selection across the toggle is checked in the E2E.
     expect(h.editorProps?.options?.wordWrap).toBe("on");
-    expect(screen.queryByText("Loading…")).toBeNull();
   });
 });
 
