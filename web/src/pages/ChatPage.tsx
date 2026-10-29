@@ -4350,34 +4350,6 @@ function ComposerImpl(
 
 export const Composer = memo(forwardRef(ComposerImpl));
 
-/**
- * Whether the main chat's display-only "Working…" indicator should light up.
- *
- * @param sessionStatus - The main session status, e.g. ``"running"``.
- * @param options - Display gates for the main chat indicator.
- * @param options.hasPendingElicitation - ``true`` when an elicitation prompt
- *   owns the in-progress slot and should suppress the shimmer/pinned pill.
- * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
- *   known offline, ``undefined`` before the health poll resolves. A known-offline
- *   runner suppresses the indicator ONLY when the session is otherwise idle: a
- *   session actively reporting ``running``/``waiting`` cannot have an offline
- *   runner, so its live status wins over the ``/health`` poll — which polls at a
- *   10s cadence and reads stale-offline during the runner's connect window on a
- *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
- * @param options.backgroundTaskCount - Background shells still running after
- *   the turn ended. A claude-native turn settles to ``idle`` (the status file's
- *   edge) even while shells run, so the bare status alone would hide the
- *   indicator; a positive count keeps it lit so "N background tasks still running"
- *   stays visible.
- * @param options.localSendInFlight - This client's own send is in flight
- *   (``chatStore.status === "streaming"``). Lights the indicator optimistically
- *   the moment the user presses Enter, before any server edge confirms the turn
- *   — the sidebar row already does this (see ``isStartingUp`` in Sidebar.tsx),
- *   so without it the two disagree for the dispatch round-trip. Distinct from
- *   ``sessionStatus``, which mirrors the server: this one means "we asked", not
- *   "the agent is working".
- * @returns ``true`` when the main session's own status should render Working.
- */
 // A native terminal session finishes a send's response once the message reaches the
 // terminal, before its agent reports `running`. Measured gaps run 70-350ms.
 const NATIVE_PICKUP_GRACE_MS = 3_000;
@@ -4433,6 +4405,34 @@ export function useWorkingSignals({
   };
 }
 
+/**
+ * Whether the main chat's display-only "Working…" indicator should light up.
+ *
+ * @param sessionStatus - The main session status, e.g. ``"running"``.
+ * @param options - Display gates for the main chat indicator.
+ * @param options.hasPendingElicitation - ``true`` when an elicitation prompt
+ *   owns the in-progress slot and should suppress the shimmer/pinned pill.
+ * @param options.runnerOnline - Runner liveness: ``true`` online, ``false``
+ *   known offline, ``undefined`` before the health poll resolves. A known-offline
+ *   runner suppresses the indicator ONLY when the session is otherwise idle: a
+ *   session actively reporting ``running``/``waiting`` cannot have an offline
+ *   runner, so its live status wins over the ``/health`` poll — which polls at a
+ *   10s cadence and reads stale-offline during the runner's connect window on a
+ *   fresh session's first turn (it would otherwise hide "Working…" for seconds).
+ * @param options.backgroundTaskCount - Background shells still running after
+ *   the turn ended. A claude-native turn settles to ``idle`` (the status file's
+ *   edge) even while shells run, so the bare status alone would hide the
+ *   indicator; a positive count keeps it lit so "N background tasks still running"
+ *   stays visible.
+ * @param options.localSendInFlight - This client's own send is in flight
+ *   (``chatStore.status === "streaming"``). Lights the indicator optimistically
+ *   the moment the user presses Enter, before any server edge confirms the turn
+ *   — the sidebar row already does this (see ``isStartingUp`` in Sidebar.tsx),
+ *   so without it the two disagree for the dispatch round-trip. Distinct from
+ *   ``sessionStatus``, which mirrors the server: this one means "we asked", not
+ *   "the agent is working".
+ * @returns ``true`` when the main session's own status should render Working.
+ */
 export function computeShowsWorking(
   sessionStatus: SessionStatus,
   options: {
