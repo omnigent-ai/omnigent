@@ -33,7 +33,7 @@
 //   3. rolls back to "pending" on network error.
 
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
-import { useContext } from "react";
+import { useContext, useMemo } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -54,6 +54,7 @@ import {
   exitPlanModePlan,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -79,6 +80,21 @@ import { ExitPlanModeReview } from "./ExitPlanModeReview";
 const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
   "agent's own terminal, another tab, or the approve page.";
+
+const QUESTION_TITLES = [
+  ["agy_", "Antigravity needs your input"],
+  ["codex_", "Codex needs input"],
+  ["cursor_", "Cursor has questions"],
+  ["pi_", "Pi needs your input"],
+  ["devin_", "Devin needs your input"],
+] as const;
+
+function questionPromptTitle(policyName: string, phase: string): string {
+  const match = QUESTION_TITLES.find(
+    ([prefix]) => policyName.startsWith(prefix) || phase.startsWith(prefix),
+  );
+  return match?.[1] ?? "Claude has questions";
+}
 
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
@@ -350,8 +366,16 @@ export function ApprovalCard({
   // (full, non-truncated); fall back to parsing the content_preview
   // JSON for backwards compatibility with elicitations published
   // before the structured field was added.
-  const askPayload: AskUserQuestionPayload | null =
-    castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview);
+  const askPayload: AskUserQuestionPayload | null = useMemo(
+    () =>
+      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    [askUserQuestion, contentPreview],
+  );
+  // Remount the question form when the same elicitation carries new questions.
+  const askQuestionsKey = useMemo(
+    () => (askPayload ? askUserQuestionSignature(askPayload.questions) : ""),
+    [askPayload],
+  );
   // ExitPlanMode plan review: the server stamps the full tool_input
   // as `exit_plan_mode`; a usable plan card needs the `plan` markdown
   // string. Anything else falls back to the binary card.
@@ -383,16 +407,7 @@ export function ApprovalCard({
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
   const showPhase = phase !== "" && !isNativePolicy;
-  const askUserQuestionTitle =
-    policyName.startsWith("agy_") || phase.startsWith("agy_")
-      ? "Antigravity needs your input"
-      : policyName.startsWith("codex_") || phase.startsWith("codex_")
-        ? "Codex needs input"
-        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
-          ? "Cursor has questions"
-          : policyName.startsWith("pi_") || phase.startsWith("pi_")
-            ? "Pi needs your input"
-            : "Claude has questions";
+  const askUserQuestionTitle = questionPromptTitle(policyName, phase);
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -869,6 +884,8 @@ export function ApprovalCard({
           </>
         ) : isAskUserQuestion ? (
           <AskUserQuestionForm
+            key={`${elicitationId}:${askQuestionsKey}`}
+            elicitationId={elicitationId}
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from omnigent.harnesses.codex_egress import CertificateFailure
-from omnigent.native import native_bridge_common
+from omnigent.native import native_bridge_common, policy_allow_cache
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -1083,6 +1083,8 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         _write_bridge_state_unlocked(bridge_dir, state)
+    # A new or rotated session's policies were never checked.
+    policy_allow_cache.invalidate(bridge_dir)
 
 
 def _validated_startup_timeout(value: object) -> float | None:

@@ -68,6 +68,7 @@ import {
   ChevronsUpDownIcon,
   GitBranchIcon,
   LockIcon,
+  FileTextIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -178,12 +179,18 @@ import {
   initialPrefillState,
   prefillDone,
   projectPrefillStep,
+  withProjectLaunchDefaults,
   type ProjectPrefillConfig,
   type ProjectPrefillState,
 } from "./projectPrefill";
 import { getCliServerUrl, getOmnigentHostConfig } from "@/lib/host";
 import { quoteShellArgument } from "@/lib/shell";
 import { readLastAgentId, writeLastAgentId } from "@/lib/agentPreferences";
+import {
+  onProjectLaunchDefaultsCleared,
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import {
   readLastHostChoice,
   writeLastHostChoice,
@@ -270,6 +277,7 @@ import {
   DEVIN_NATIVE_DEFAULT_PERMISSION_MODE,
   DEVIN_NATIVE_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
+import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
@@ -291,6 +299,7 @@ import {
   onHostStatusChanged,
   type HostIdentity,
 } from "@/lib/nativeBridge";
+import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
 import {
   fetchUserAgents,
   USER_AGENTS_QUERY_KEY,
@@ -522,9 +531,12 @@ function ConnectingText({ className }: { className?: string }) {
 export function ConnectHostInstructions({
   serverUrl,
   label,
+  onSshConnected,
 }: {
   serverUrl: string;
   label?: string;
+  /** After the desktop shell connects a machine over SSH, with its host id. */
+  onSshConnected?: (hostId: string) => void;
 }) {
   // Databricks/internal deployments add the "Databricks Lakebox" connect
   // path; OSS deployments (where the lakebox launcher is excluded) show
@@ -534,6 +546,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
+  const sshConnectAvailable = useSshConnectAvailable();
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -570,6 +583,7 @@ export function ConnectHostInstructions({
           testIdPrefix="connect-host"
         />
       )}
+      {sshConnectAvailable && <SshConnectForm onConnected={onSshConnected} />}
     </div>
   );
 }
@@ -2184,6 +2198,7 @@ interface LandingDraft {
   permissionMode: string;
   approvalMode: string;
   bypassSandbox: boolean;
+  codexPlanMode: boolean;
   cursorExecMode: string;
   agySkipMode: string;
   devinPermissionMode: string;
@@ -2253,7 +2268,7 @@ export function NewChatLandingScreen() {
     [pickerCacheKey],
   );
   // Project prefill source: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree).
+  // project's stored defaults, overlaid with its last start (localStorage).
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
   // has no config to read. Resolved before the agent catalog below so the
@@ -2268,6 +2283,33 @@ export function NewChatLandingScreen() {
   );
   const { data: storedProjectConfig, isLoading: projectConfigLoading } =
     useProjectConfig(configProjectId);
+  // The project's last start wins until its stored defaults are saved after it;
+  // a Project settings save clears it, so re-read it then.
+  const [launchClears, setLaunchClears] = useState(0);
+  useEffect(() => onProjectLaunchDefaultsCleared(() => setLaunchClears((count) => count + 1)), []);
+  const projectLaunch = useMemo(() => {
+    void launchClears;
+    return configProjectId === null || projectConfigLoading
+      ? null
+      : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {});
+  }, [configProjectId, projectConfigLoading, storedProjectConfig, launchClears]);
+  // Option keys picked per harness during this visit. A pick also updates the
+  // app-global memory, so those keys keep coming from there.
+  const pickedOptionKeysRef = useRef(new Map<string, Set<string>>());
+  // The options the last start's harness launched with outrank the app-global
+  // per-harness memory for that harness, except keys picked during this visit.
+  const readRememberedHarnessOptions = useCallback(
+    (harness: string | null | undefined): HarnessOptions => {
+      const remembered = readHarnessOptions(harness);
+      if (harness == null || projectLaunch?.harness !== harness) return remembered;
+      const picked = pickedOptionKeysRef.current.get(harness);
+      const launched = Object.entries(projectLaunch.harnessOptions ?? {}).filter(
+        ([key]) => !picked?.has(key),
+      );
+      return { ...remembered, ...Object.fromEntries(launched) };
+    },
+    [projectLaunch],
+  );
   // Normalize into the machine's shape. `undefined` = still loading (the machine
   // waits so a generic default can't win the race); `{}` = nothing to wait for
   // (plain visit / label-only folder / genuinely empty config), so it settles
@@ -2279,21 +2321,24 @@ export function NewChatLandingScreen() {
     if (projectParam !== "" && projectListLoading) return undefined;
     if (configProjectId !== null && projectConfigLoading) return undefined;
     const c = storedProjectConfig;
-    if (!c) return {};
-    return {
-      hostId: c.host_id,
-      workspace: c.workspace,
-      agentId: c.agent_id,
-      useWorktree: c.use_worktree,
-      model: c.model,
-      effort: c.effort,
-    };
+    const stored: ProjectPrefillConfig = c
+      ? {
+          hostId: c.host_id,
+          workspace: c.workspace,
+          agentId: c.agent_id,
+          useWorktree: c.use_worktree,
+          model: c.model,
+          effort: c.effort,
+        }
+      : {};
+    return withProjectLaunchDefaults(stored, projectLaunch);
   }, [
     projectParam,
     projectListLoading,
     configProjectId,
     projectConfigLoading,
     storedProjectConfig,
+    projectLaunch,
   ]);
 
   // Preserve a configured agent through name deduplication when it is in the
@@ -2304,7 +2349,9 @@ export function NewChatLandingScreen() {
     isError: agentsError,
     isPlaceholderData: agentsArePlaceholder,
   } = useAvailableAgents({
-    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+    pinnedAgentIds: [prefillConfig?.agentId, prefillConfig?.launchAgentId].filter(
+      (id): id is string => id != null,
+    ),
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
@@ -2687,6 +2734,11 @@ export function NewChatLandingScreen() {
   const [bypassSandbox, setBypassSandbox] = useState<boolean>(
     () => restoredDraft?.bypassSandbox ?? false,
   );
+  // Codex Plan mode armed before the first prompt; sent as the session's
+  // collaboration-mode label, which the in-session Plan toggle also drives.
+  const [codexPlanMode, setCodexPlanMode] = useState<boolean>(
+    () => restoredDraft?.codexPlanMode ?? false,
+  );
   // Execution mode for Cursor (cursor-agent --mode / --yolo). Only meaningful
   // for the cursor-native wrapper; ignored otherwise.
   const [cursorExecMode, setCursorExecMode] = useState<string>(
@@ -2814,6 +2866,7 @@ export function NewChatLandingScreen() {
     permissionMode,
     approvalMode,
     bypassSandbox,
+    codexPlanMode,
     cursorExecMode,
     agySkipMode,
     devinPermissionMode,
@@ -2954,6 +3007,7 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     setPickerEdits(null);
+    pickedOptionKeysRef.current.clear();
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project, prefillConfigSig]);
@@ -3876,6 +3930,9 @@ export function NewChatLandingScreen() {
               ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
             : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
+    const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
+    for (const key of Object.keys(options)) picked.add(key);
+    pickedOptionKeysRef.current.set(harness, picked);
     const previous = pickerEdits;
     setPickerEdits({
       agentId: effectiveAgentId,
@@ -4187,7 +4244,7 @@ export function NewChatLandingScreen() {
         const harness = agent.id === effectiveAgentId ? pickedHarness : readLastHarness(agent.id);
         return [agent.id, brainHarnessLabelsAll[harness ?? agent.harness ?? ""] ?? "Default"];
       }
-      const saved = readHarnessOptions(native.harness);
+      const saved = readRememberedHarnessOptions(native.harness);
       if (saved.routing === "on") return [agent.id, SMART_ROUTING_LABEL];
       const catalogSuppressed = sandboxHasModelCatalog && native.harness !== previewHarness;
       const catalog = catalogSuppressed
@@ -4241,6 +4298,18 @@ export function NewChatLandingScreen() {
             : supportsDevinPermission
               ? DEVIN_NATIVE_PERMISSION_MODES
               : [];
+  // Unsaved custom agents launch through the host runners route, which cannot
+  // refuse a host too old to start Codex in Plan mode.
+  const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
+  const codexPlanModeSelectable =
+    codexPlanLaunchEnabled &&
+    !smartRoutingHarnessSelected &&
+    selectedNativeHarness === "codex-native" &&
+    effectiveAgentId !== PENDING_AGENT_ID;
+  const toggleCodexPlanMode = codexPlanModeSelectable
+    ? () => setCodexPlanMode((armed) => !armed)
+    : undefined;
+  const codexPlanToggleLabel = codexPlanMode ? "Exit Plan mode" : "Enter Plan mode";
   const selectDirectMode = (mode: string) => {
     if (!selectedNativeHarness) return;
     if (supportsPermissionMode) setPermissionMode(mode);
@@ -4279,6 +4348,7 @@ export function NewChatLandingScreen() {
     userPickedModelRef.current = false;
     userPickedEffortRef.current = false;
     setBypassSandbox(false);
+    setCodexPlanMode(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
   // A project-configured default model (Project settings) outranks the user's
@@ -4339,7 +4409,7 @@ export function NewChatLandingScreen() {
         ? pickerEdits.options
         : {};
     const stored = {
-      ...readHarnessOptions(selectedNativeHarness),
+      ...readRememberedHarnessOptions(selectedNativeHarness),
       ...editedOptions,
     };
     // Resolve the mode to the stored value when it's still valid for this
@@ -4466,8 +4536,8 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
-    // Reseed on harness, host-catalog, and async project model/effort changes;
-    // capability flags derive from the harness.
+    // Reseed on harness, host-catalog, and async project model/effort or
+    // last-start changes; capability flags derive from the harness.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4477,6 +4547,7 @@ export function NewChatLandingScreen() {
     piModelOptions,
     projectDefaultModel,
     projectDefaultEffort,
+    readRememberedHarnessOptions,
   ]);
   useEffect(() => {
     if (!sandboxDefaultModelsEnabled || !previewHarness) return;
@@ -4484,7 +4555,7 @@ export function NewChatLandingScreen() {
       pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === previewHarness
         ? pickerEdits.options
         : {};
-    const saved = { ...readHarnessOptions(previewHarness), ...edited };
+    const saved = { ...readRememberedHarnessOptions(previewHarness), ...edited };
     const candidate =
       !userPickedModelRef.current && projectDefaultModel != null
         ? projectDefaultModel
@@ -4509,6 +4580,7 @@ export function NewChatLandingScreen() {
     pickerEdits,
     projectDefaultModel,
     projectDefaultEffort,
+    readRememberedHarnessOptions,
     setPickedModel,
   ]);
   useEffect(() => {
@@ -4544,7 +4616,7 @@ export function NewChatLandingScreen() {
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
-        : undefined) ?? readHarnessOptions(selectedNativeHarness).routing;
+        : undefined) ?? readRememberedHarnessOptions(selectedNativeHarness).routing;
     if (storedRouting === undefined) return;
     setCostControlMode(smartRoutingEligible && storedRouting === "on" ? "on" : null);
   }, [
@@ -4556,6 +4628,7 @@ export function NewChatLandingScreen() {
     projectDefaultEffortValid,
     setCostControlMode,
     pickerEdits,
+    readRememberedHarnessOptions,
   ]);
   // Top-level Smart Routing pins permissions to Default (no override sent), so
   // entering it resets the mode rather than restoring one: nothing is remembered
@@ -4851,7 +4924,13 @@ export function NewChatLandingScreen() {
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
       if (pickedAgentId === null) {
-        setPickedHarness(readLastHarness(writes.agentId));
+        // The last start's own harness pick (e.g. Smart Routing) outranks the
+        // app-global one, which another project's start may have changed.
+        setPickedHarness(
+          writes.agentId === projectLaunch?.agentId && projectLaunch.pickedHarness !== undefined
+            ? projectLaunch.pickedHarness
+            : readLastHarness(writes.agentId),
+        );
         // Config-sourced seed into an empty slot (as opposed to the last-agent
         // fallback): the create omits the field until any other write flips this.
         agentFromConfigRef.current = writes.agentId === prefillConfig?.agentId;
@@ -4879,6 +4958,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    projectLaunch,
     defaultSandboxProvider,
   ]);
 
@@ -4974,6 +5054,7 @@ export function NewChatLandingScreen() {
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
+    skillsWarnings,
     skillsStatus,
     refetch: refreshSkills,
   } = useSkills({
@@ -5801,10 +5882,15 @@ export function NewChatLandingScreen() {
       // when the toggle is armed for a codex-native agent) so the runner
       // launches with --dangerously-bypass-approvals-and-sandbox and the choice
       // survives reload.
-      const baseLabels =
-        agentSupportsApprovalMode && bypassSandbox
-          ? { ...(nativeLabels ?? {}), [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
-          : nativeLabels;
+      const baseLabels = {
+        ...(nativeLabels ?? {}),
+        ...(agentSupportsApprovalMode && bypassSandbox
+          ? { [CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY]: "1" }
+          : {}),
+        ...(codexPlanModeSelectable && codexPlanMode
+          ? { [CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY]: "plan" }
+          : {}),
+      };
       // First-class project filing: a project-driven visit whose `?project=`
       // name resolved to a real project id sends `project_id` so the server
       // files the session atomically at create (born filed, no follow-up
@@ -5818,17 +5904,17 @@ export function NewChatLandingScreen() {
       // from the config. Any user interaction — even re-picking the exact
       // config value — cleared the ref, so an explicit choice is always SENT
       // (the server treats it as authoritative and only warns on mismatch).
-      // The value-equality guard covers seeds later displaced without a write.
+      // The value-equality guard checks the server's config, so it also sends last-start seeds.
       const agentFromProjectConfig =
         createProjectId !== null &&
         agentFromConfigRef.current &&
-        prefillConfig?.agentId != null &&
-        effectiveAgentId === prefillConfig.agentId;
+        storedProjectConfig?.agent_id != null &&
+        effectiveAgentId === storedProjectConfig.agent_id;
       const workspaceFromProjectConfig =
         createProjectId !== null &&
         workspaceFromConfigRef.current &&
-        prefillConfig?.workspace != null &&
-        workspaceTrimmed === prefillConfig.workspace;
+        storedProjectConfig?.workspace != null &&
+        workspaceTrimmed === storedProjectConfig.workspace;
       // When filing into a project by LABEL, stamp its legacy `omni_project`
       // label at create so the session is BORN FILED. The sidebar dual-reads
       // project membership from this label OR the first-class `project_id` the
@@ -5862,6 +5948,8 @@ export function NewChatLandingScreen() {
               data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
             };
       let data: { id: string };
+      // The agent the create ran; a custom agent's id comes back from its create.
+      let launchedAgentId = effectiveAgentId;
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agents upload their bundle with the session, then launch on the host below.
@@ -5886,6 +5974,7 @@ export function NewChatLandingScreen() {
           metadata as Parameters<typeof createBundledSession>[1],
         );
         data = { id: bundled.id };
+        launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -6115,8 +6204,9 @@ export function NewChatLandingScreen() {
       // storage eagerly so an immediate Send cannot observe stale state; this
       // successful-create snapshot also covers restored drafts and every
       // harness-specific creation path.
+      let launchedOptions: HarnessOptions | null = null;
       if (!smartRoutingHarnessSelected) {
-        const launchedOptions = createdHarnessOptions({
+        launchedOptions = createdHarnessOptions({
           harness: selectedNativeHarness,
           supportsPermissionMode: agentSupportsPermissionMode,
           supportsDevinMode,
@@ -6141,6 +6231,7 @@ export function NewChatLandingScreen() {
           writeHarnessOption(selectedNativeHarness, launchedOptions);
         }
       }
+      let launchProjectId = createProjectId;
       if (createProjectId !== null) {
         // The create filed the session atomically via first-class
         // `project_id` — no follow-up move. Still refresh the project lists:
@@ -6161,7 +6252,10 @@ export function NewChatLandingScreen() {
           // name to a project id, creating an empty project on demand when the
           // name is new or label-only.
           const filed = await moveConversationToProject(data.id, selectedProject);
-          if (filed?.project_id) createdCanvasId = filed.project_id;
+          if (filed?.project_id) {
+            createdCanvasId = filed.project_id;
+            launchProjectId = filed.project_id;
+          }
           void queryClient.invalidateQueries({ queryKey: ["projects"] });
           // Refetch the target project folder's own paginated list so the new
           // session shows up immediately (the folder fetches via
@@ -6173,6 +6267,29 @@ export function NewChatLandingScreen() {
           // `project_id` promotion fails — the sidebar's dual-read grouping
           // still shows it under the project.
         }
+      }
+      // This start becomes the project's default for its next session.
+      if (launchProjectId !== null) {
+        writeProjectLaunchDefaults(
+          launchProjectId,
+          {
+            ...(launchedAgentId !== null && launchedAgentId !== PENDING_AGENT_ID
+              ? {
+                  agentId: launchedAgentId,
+                  pickedHarness,
+                  ...(launchedOptions !== null
+                    ? {
+                        harness: selectedNativeHarness ?? undefined,
+                        harnessOptions: launchedOptions,
+                      }
+                    : {}),
+                }
+              : {}),
+            hostId: sandboxSelected ? SANDBOX_HOST_CHOICE : (selectedHostId ?? undefined),
+            workspace: sandboxSelected ? undefined : workspaceTrimmed,
+          },
+          storedProjectConfig ?? {},
+        );
       }
       // Sandbox creates have no user-picked workspace to remember.
       if (!sandboxSelected) addRecent(workspaceTrimmed);
@@ -6956,6 +7073,7 @@ export function NewChatLandingScreen() {
                         builtinNames={slashCompletion.builtinNames}
                         labels={slashCompletion.labels}
                         skillsStatus={skillsStatus}
+                        skillsWarnings={skillsWarnings}
                         skillsUnavailableMessage={skillsUnavailableMessage}
                         onRetrySkills={() => void refreshSkills()}
                       />
@@ -7038,11 +7156,22 @@ export function NewChatLandingScreen() {
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
-                            : undefined
+                            : toggleCodexPlanMode
                         }
                         planActive={
                           (supportsPermissionMode && permissionMode === "plan") ||
-                          (supportsCursorMode && cursorExecMode === "plan")
+                          (supportsCursorMode && cursorExecMode === "plan") ||
+                          (codexPlanModeSelectable && codexPlanMode)
+                        }
+                        planLabel={codexPlanModeSelectable ? codexPlanToggleLabel : undefined}
+                        planUnavailableReason={
+                          selectedNativeHarness === "codex-native"
+                            ? !codexPlanLaunchEnabled
+                              ? "This server does not support starting Codex in Plan mode"
+                              : effectiveAgentId === PENDING_AGENT_ID
+                                ? "Turn Plan mode on after this custom agent's session starts"
+                                : undefined
+                            : undefined
                         }
                         projects={projectList ?? []}
                         onProjectSelect={(name) => {
@@ -7332,6 +7461,15 @@ export function NewChatLandingScreen() {
                         testIdPrefix="new-chat-landing"
                       />
                     ) : null}
+                    {codexPlanModeSelectable && codexPlanMode && (
+                      <span
+                        data-testid="new-chat-landing-plan-mode"
+                        className="inline-flex shrink-0 items-center gap-1 px-1 text-sm font-medium text-foreground"
+                      >
+                        <FileTextIcon className="ui-icon" />
+                        <span>Plan mode</span>
+                      </span>
+                    )}
 
                     {/* The session's project membership (from a `?project=` landing)
                 is shown in the hero heading instead of a tray chip; filing on
@@ -7705,6 +7843,10 @@ export function NewChatLandingScreen() {
           <ConnectHostInstructions
             serverUrl={serverUrl}
             label="Run this on the machine you want to use, then pick it from the host menu:"
+            onSshConnected={(hostId) => {
+              setConnectOpen(false);
+              selectHost(hostId);
+            }}
           />
         </DialogContent>
       </Dialog>
