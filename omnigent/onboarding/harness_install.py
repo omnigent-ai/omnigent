@@ -57,6 +57,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
 )
+from omnigent.inner import _proc
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
@@ -1168,42 +1169,56 @@ def _run_installer(cmd: list[str], *, timeout: float) -> tuple[int, str]:
     written straight through as it arrives, while a bounded tail is retained
     for :func:`_installer_failure_reason`. stdout is left inheriting, untouched.
 
+    The tee thread owns the pipe and closes it at EOF. A child the installer
+    leaves running can hold the pipe open after the installer exits, so the
+    drain wait is bounded rather than closing the pipe here, which would block
+    until that child exits.
+
     :param cmd: The installer argv, e.g. ``["npm", "install", "-g", pkg]``.
     :param timeout: Seconds to wait before killing the installer.
     :returns: ``(returncode, stderr_tail)``.
     :raises subprocess.TimeoutExpired: If *timeout* elapses first; the
-        installer is killed before this propagates.
+        installer and its child processes are killed before this propagates.
     :raises OSError: If the installer cannot be executed at all.
     """
     tail: deque[str] = deque(maxlen=_INSTALLER_STDERR_TAIL_LINES)
-    with subprocess.Popen(
+    tail_lock = threading.Lock()
+    # Not _proc.spawn_kwargs(): a new session would cut the setup wizard's
+    # installers off from the terminal (prompts, /dev/tty, Ctrl-C).
+    proc = subprocess.Popen(
         cmd,
         stderr=subprocess.PIPE,
         text=True,
         errors="replace",
         bufsize=1,
-    ) as proc:
-        stream = proc.stderr
-        assert stream is not None  # stderr=PIPE above
+    )
+    stream = proc.stderr
+    assert stream is not None  # stderr=PIPE above
 
-        def _tee() -> None:
+    def _tee() -> None:
+        with stream:
             for line in stream:
-                tail.append(line)
+                with tail_lock:
+                    tail.append(line)
                 sys.stderr.write(line)
                 sys.stderr.flush()
 
-        # A reader thread, so a wedged installer still hits the timeout below
-        # instead of blocking forever on a read that never reaches EOF.
-        pump = threading.Thread(target=_tee, name="harness-install-stderr", daemon=True)
-        pump.start()
-        try:
-            returncode = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            raise
-        finally:
-            pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
-    return returncode, "".join(tail)
+    # A reader thread, so a wedged installer still hits the timeout below
+    # instead of blocking forever on a read that never reaches EOF.
+    pump = threading.Thread(target=_tee, name="harness-install-stderr", daemon=True)
+    pump.start()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Killing only the installer would leave npm lifecycle scripts or the
+        # inner shell of ``curl | bash`` running and writing to the pipe.
+        _proc.kill_tree(proc)
+        proc.wait()
+        raise
+    finally:
+        pump.join(timeout=_INSTALLER_TEE_DRAIN_TIMEOUT_S)
+    with tail_lock:
+        return returncode, "".join(tail)
 
 
 class HarnessInstallResult(NamedTuple):
