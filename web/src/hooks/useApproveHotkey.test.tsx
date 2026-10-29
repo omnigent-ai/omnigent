@@ -4,7 +4,7 @@
 // bare Enter, Alt/Shift-modified Enter, and a chord landing in a text field
 // that holds a draft (a send intent, not a verdict).
 
-import { renderHook } from "@testing-library/react";
+import { fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const submitApproval = vi.fn();
@@ -12,7 +12,15 @@ let blocks: Record<string, unknown>[] = [];
 vi.mock("@/store/chatStore", () => ({
   useChatStore: { getState: () => ({ blocks, submitApproval }) },
 }));
+let embedded = false;
+vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => embedded }));
+// The drawer's own tree stands in as one folder button.
+vi.mock("@/shell/FilesPanel", () => ({
+  FilesPanel: () => <button type="button">src</button>,
+}));
 
+import { setEmbedRoot } from "@/lib/host";
+import { FilesPanelDrawer } from "@/shell/FilesPanelDrawer";
 import { useApproveHotkey } from "./useApproveHotkey";
 
 /** Dispatch a keydown that reaches window from body (default: Cmd+Enter). */
@@ -33,6 +41,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   blocks = [];
+  embedded = false;
+  setEmbedRoot(null);
 });
 
 describe("useApproveHotkey", () => {
@@ -237,5 +247,152 @@ describe("useApproveHotkey", () => {
     } finally {
       ta.remove();
     }
+  });
+});
+
+describe("useApproveHotkey Esc", () => {
+  const pending = { type: "elicitation", elicitationId: "e1", status: "pending" };
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  function pressEscapeFrom(target: HTMLElement): KeyboardEvent {
+    target.focus();
+    const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  function mount(html: string, selector: string): HTMLElement {
+    document.body.innerHTML = html;
+    return document.querySelector<HTMLElement>(selector)!;
+  }
+
+  it("declines the newest plain prompt", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    press({}, "Escape");
+    expect(submitApproval).toHaveBeenCalledWith("e1", "decline");
+  });
+
+  it("declines from the chat composer unless its suggestion list is open", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    const composer = mount("<div data-composer-card><textarea></textarea></div>", "textarea");
+    expect(pressEscapeFrom(composer).defaultPrevented).toBe(true);
+    expect(submitApproval).toHaveBeenCalledTimes(1);
+
+    composer.closest<HTMLElement>("[data-composer-card]")!.dataset.suggestionsOpen = "true";
+    pressEscapeFrom(composer);
+    expect(submitApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves question prompts and other text fields alone", () => {
+    blocks = [{ ...pending, askUserQuestion: {} }];
+    renderHook(() => useApproveHotkey(true));
+    press({}, "Escape");
+    expect(submitApproval).not.toHaveBeenCalled();
+
+    blocks = [pending];
+    pressEscapeFrom(mount('<input type="search" />', "input"));
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it.each(["src", "Files", "composer"])(
+    "leaves Escape to the open Files drawer with focus on %s",
+    (focused) => {
+      blocks = [pending];
+      renderHook(() => useApproveHotkey(true));
+      const onClose = vi.fn();
+      render(
+        <>
+          {/* The header toggle and the composer sit outside the drawer. */}
+          <button type="button">Files</button>
+          <div data-composer-card="">
+            <textarea aria-label="composer" />
+          </div>
+          <FilesPanelDrawer
+            open
+            onClose={onClose}
+            onFileSelect={vi.fn()}
+            flatView={false}
+            showHidden={false}
+            onShowHiddenChange={vi.fn()}
+            sort="recent"
+            onSortChange={vi.fn()}
+          />
+        </>,
+      );
+      const target =
+        focused === "composer"
+          ? screen.getByLabelText("composer")
+          : screen.getByRole("button", { name: focused });
+      target.focus();
+      fireEvent.keyDown(target, { key: "Escape" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(submitApproval).not.toHaveBeenCalled();
+    },
+  );
+
+  it("leaves Escape to an open panel that closes on it, such as Execution Logs, wherever focus is", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    document.body.innerHTML =
+      '<aside data-escape-owner=""><button>Close</button></aside><nav><button>Other</button></nav>';
+    const panelClose = vi.fn();
+    const onWindowEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") panelClose();
+    };
+    window.addEventListener("keydown", onWindowEscape);
+    try {
+      pressEscapeFrom(screen.getByRole("button", { name: "Close" }));
+      pressEscapeFrom(screen.getByRole("button", { name: "Other" }));
+      expect(panelClose).toHaveBeenCalledTimes(2);
+      expect(submitApproval).not.toHaveBeenCalled();
+
+      // Once the panel has closed, Escape declines again.
+      document.querySelector("aside")!.remove();
+      pressEscapeFrom(screen.getByRole("button", { name: "Other" }));
+      expect(submitApproval).toHaveBeenCalledWith("e1", "decline");
+    } finally {
+      window.removeEventListener("keydown", onWindowEscape);
+    }
+  });
+
+  it("embedded, declines only for Escape pressed inside the app", () => {
+    blocks = [pending];
+    embedded = true;
+    document.body.innerHTML = '<div id="app"><button>In app</button></div><button>Host</button>';
+    setEmbedRoot(document.getElementById("app"));
+    renderHook(() => useApproveHotkey(true));
+    const hostHandler = vi.fn();
+    const host = screen.getByRole("button", { name: "Host" });
+    host.addEventListener("keydown", hostHandler);
+
+    expect(pressEscapeFrom(host).defaultPrevented).toBe(false);
+    expect(hostHandler).toHaveBeenCalledTimes(1);
+    expect(submitApproval).not.toHaveBeenCalled();
+
+    pressEscapeFrom(screen.getByRole("button", { name: "In app" }));
+    expect(submitApproval).toHaveBeenCalledWith("e1", "decline");
+  });
+
+  it("yields to an open dialog", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    pressEscapeFrom(mount('<div role="dialog"><button>Close</button></div>', "button"));
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a fullscreen diagram", "<div data-fullscreen-overlay></div>"],
+    ["the model/effort preview", "<div data-cycle-preview></div>"],
+  ])("yields to %s open with focus outside it", (_name, html) => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    document.body.innerHTML = html;
+    press({}, "Escape");
+    expect(submitApproval).not.toHaveBeenCalled();
   });
 });

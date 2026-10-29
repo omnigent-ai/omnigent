@@ -35,3 +35,41 @@ export function hasCommandModifier(
 export function isFocusInDialogOrMenu(): boolean {
   return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');
 }
+
+// Open surfaces that keep the keys even while focus stays outside them: a fullscreen
+// table or diagram, and the composer's model/effort preview.
+const KEY_OWNING_OVERLAYS = "[aria-modal='true'], [data-fullscreen-overlay], [data-cycle-preview]";
+
+/** Whether such a surface is open, so page-wide shortcuts leave its keys alone. */
+export function isKeyOwningOverlayOpen(): boolean {
+  return document.querySelector(KEY_OWNING_OVERLAYS) !== null;
+}
+
+/**
+ * Whether something that closes on Escape itself is open (marked `data-escape-owner`):
+ * the Files, Execution Logs or Terminals panel, a table of contents, or dictation. It
+ * takes Escape first, wherever focus is.
+ */
+export function isEscapeOwnerOpen(): boolean {
+  return document.querySelector("[data-escape-owner]") !== null;
+}
+
+// Input types that take a click or a choice rather than typed text.
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "image",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+]);
+
+/** Whether the target takes typed text, so keys such as digits and Escape belong to it. */
+export function isTextEntry(target: HTMLElement): boolean {
+  if (target instanceof HTMLTextAreaElement) return true;
+  if (target instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(target.type);
+  return target.closest("[contenteditable]:not([contenteditable='false'])") !== null;
+}
