@@ -3,7 +3,7 @@ import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from 
 import {
   ARIA_MOD_KEY,
   COMMAND_PALETTE_KEYS,
-  SETTINGS_KEYS,
+  settingsShortcutKeys,
   SIDEBAR_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
@@ -184,7 +184,7 @@ export function SidebarSettingsButton({
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" shortcut={SETTINGS_KEYS}>
+      <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
         <span>Settings</span>
       </TooltipContent>
     </Tooltip>
