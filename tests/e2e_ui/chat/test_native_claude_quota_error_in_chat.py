@@ -1,4 +1,4 @@
-"""A Claude Code quota error (HTTP 429) must reach the Chat view as a retryable failure.
+"""A Claude Code provider failure must reach the Chat view as a classified failure.
 
 Drives the real claude-native stack: a live ``claude`` CLI in the session
 terminal, fed by the mock LLM scripted to reject every request with a 429
@@ -7,7 +7,8 @@ Code retries the 429 with backoff for a few minutes, then prints
 ``API Error: Request rejected (429) · Quota exceeded …`` in its own pane and
 ends the turn. The Chat view must show that same failure as the rate-limit
 error pill with a Retry action that survives a reload — never a silently
-unanswered turn, and not an unclassified generic error.
+unanswered turn, and not an unclassified generic error. A safeguard refusal
+(``stop_reason: refusal``) must likewise show as a content-policy block, without Retry.
 """
 
 from __future__ import annotations
@@ -42,10 +43,11 @@ _QUOTA_ERROR = (
     "Quota exceeded for model serving endpoint claude-sonnet-4: the workspace "
     "quota for this endpoint has been exhausted. Request rejected (429)."
 )
-# Enough 429s to outlast Claude Code's whole retry loop plus its background
+# Enough failures to outlast Claude Code's whole retry loop plus its background
 # requests; an exhausted mock queue without a fallback answers 200 instead.
-_QUOTA_RESPONSES = 400
+_PROVIDER_RESPONSES = 400
 _RATE_LIMIT_HEADLINE = "The model's rate limit was reached. You can retry this turn."
+_REFUSAL_HEADLINE = "The model's safeguards blocked this message"
 
 # Claude Code retries a 429 with backoff for roughly three minutes before it
 # gives up on the turn.
@@ -201,18 +203,55 @@ def _screenshot(page: Page, name: str) -> None:
 
 @pytest.mark.nightly
 @pytest.mark.timeout(900)
-def test_native_claude_quota_error_surfaces_in_chat_as_retryable_pill(
+@pytest.mark.parametrize(
+    (
+        "provider_response",
+        "transcript_fragment",
+        "expanded_fragments",
+        "headline",
+        "retry_buttons",
+    ),
+    [
+        pytest.param(
+            {"error": _QUOTA_ERROR, "status_code": 429},
+            "429",
+            ("429", "Quota exceeded"),
+            _RATE_LIMIT_HEADLINE,
+            1,
+            id="quota-429",
+        ),
+        pytest.param(
+            {"refusal_category": ""},
+            "can't help with this",
+            ("stays in this session's history", "Start a new session"),
+            _REFUSAL_HEADLINE,
+            0,
+            id="safeguard-refusal",
+        ),
+    ],
+)
+def test_native_claude_provider_error_surfaces_in_chat_as_classified_pill(
     request: pytest.FixtureRequest,
     native_claude_mock_session: tuple[str, str],
     mock_llm_server_url: str,
+    provider_response: dict[str, object],
+    transcript_fragment: str,
+    expanded_fragments: tuple[str, ...],
+    headline: str,
+    retry_buttons: int,
 ) -> None:
-    """A 429 quota failure printed by Claude Code shows in Chat as a retryable rate limit.
+    """A provider failure printed by Claude Code shows in Chat under its classified headline.
 
     :param request: Used to create the recorded page only after the session
         and terminal setup, so a recording starts at the user's first action.
     :param native_claude_mock_session: ``(base_url, session_id)`` on the real
         claude-native wrapper, backed by the mock LLM.
     :param mock_llm_server_url: The mock LLM server base URL.
+    :param provider_response: Mock LLM response returned for every request.
+    :param transcript_fragment: Text Claude Code's API error must carry in the transcript.
+    :param expanded_fragments: Text the expanded error pill must show.
+    :param headline: Expected error-pill headline, live and after reload.
+    :param retry_buttons: Expected number of Retry buttons on the pill.
     """
     base_url, session_id = native_claude_mock_session
     _log.info("claude-native session %s on %s", session_id, base_url)
@@ -230,12 +269,12 @@ def test_native_claude_quota_error_surfaces_in_chat_as_retryable_pill(
     _select_view_mode(page, "Chat")
 
     # The provider rejects every request from here on.
-    quota_responses = [{"error": _QUOTA_ERROR, "status_code": 429}] * _QUOTA_RESPONSES
-    configure_mock_llm(mock_llm_server_url, quota_responses, key=_CLAUDE_MOCK_MODEL)
-    configure_mock_llm(mock_llm_server_url, quota_responses, key="default")
+    provider_responses = [provider_response] * _PROVIDER_RESPONSES
+    configure_mock_llm(mock_llm_server_url, provider_responses, key=_CLAUDE_MOCK_MODEL)
+    configure_mock_llm(mock_llm_server_url, provider_responses, key="default")
     baseline = _mock_request_count(mock_llm_server_url)
 
-    prompt = f"quota-{uuid.uuid4().hex[:8]} please say hello"
+    prompt = f"provider-{uuid.uuid4().hex[:8]} please say hello"
     composer = page.get_by_role("textbox", name="Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(prompt)
@@ -296,20 +335,21 @@ def test_native_claude_quota_error_surfaces_in_chat_as_retryable_pill(
     assert api_error_texts, (
         f"Claude Code's API error never reached the session transcript; pane:\n{failed_pane}"
     )
-    assert any("429" in text for text in api_error_texts), api_error_texts
+    assert any(transcript_fragment in text for text in api_error_texts), api_error_texts
     if failed_pane:
         assert "API Error" in failed_pane, failed_pane
 
     # The failed turn must be visible in Chat at all...
     assert live_state["pill_count"] == 1, (
-        f"Chat shows no error pill for the failed 429 turn: {live_state}"
+        f"Chat shows no error pill for the failed turn: {live_state}"
     )
-    # ...and as the retryable rate-limit failure the quota error is.
-    assert live_state["headline"] == _RATE_LIMIT_HEADLINE and live_state["retry_button"] == 1, (
-        "Chat shows the 429 quota failure as "
+    # ...and under the headline and recovery its classification implies.
+    assert live_state["headline"] == headline and live_state["retry_button"] == retry_buttons, (
+        "Chat shows the provider failure as "
         f"{live_state['headline']!r} with controls {live_state['controls']!r} "
-        f"(expanded: {live_expanded!r}) instead of {_RATE_LIMIT_HEADLINE!r} with Retry"
+        f"(expanded: {live_expanded!r}) instead of {headline!r} "
+        f"with {retry_buttons} Retry button(s)"
     )
-    assert "429" in live_expanded and "Quota exceeded" in live_expanded, live_expanded
-    assert reloaded_state.get("headline") == _RATE_LIMIT_HEADLINE, reloaded_state
-    assert reloaded_state.get("retry_button") == 1, reloaded_state
+    assert all(fragment in live_expanded for fragment in expanded_fragments), live_expanded
+    assert reloaded_state.get("headline") == headline, reloaded_state
+    assert reloaded_state.get("retry_button") == retry_buttons, reloaded_state
