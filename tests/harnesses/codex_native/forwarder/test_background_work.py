@@ -22,6 +22,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
+    _deliver_to_parent,
     _RecordingClient,
     _seed_active_turn,
 )
@@ -95,33 +96,6 @@ def _failed_status_post(output: str, **data: Any) -> tuple[str, dict[str, Any]]:
     )
 
 
-async def _deliver(
-    client: _RecordingClient,
-    bridge_dir: Path,
-    state: fwd._CodexForwarderState,
-    event: dict[str, Any],
-) -> None:
-    """
-    Deliver one Codex notification to the parent session ``conv_x``.
-
-    :param client: Recording HTTP client standing in for the Omnigent server.
-    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
-    :param state: Forwarder state for the connection under test.
-    :param event: Codex notification envelope.
-    :returns: None.
-    """
-    await fwd._handle_event(
-        client,  # type: ignore[arg-type]
-        session_id="conv_x",
-        bridge_dir=bridge_dir,
-        event=event,
-        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
-        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
-        expected_thread_id="thread_123",
-        forwarder_state=state,
-    )
-
-
 class _GoalCodexClient:
     """
     App-server stub whose ``thread/goal/get`` answers with a fixed response.
@@ -181,9 +155,9 @@ async def test_active_goal_keeps_the_session_working_until_it_ends(tmp_path: Pat
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(client, tmp_path, state, _goal_updated("active"))
-    await _deliver(client, tmp_path, state, _goal_updated("active", turn_id="turn_1"))
-    await _deliver(client, tmp_path, state, _goal_updated("complete"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active", turn_id="turn_1"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
 
     assert client.posts == [_background_work_post(True), _background_work_post(False)]
 
@@ -194,8 +168,8 @@ async def test_cleared_goal_stops_the_session_working(tmp_path: Path) -> None:
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(client, tmp_path, state, _goal_updated("active"))
-    await _deliver(client, tmp_path, state, _goal_cleared())
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_cleared())
 
     assert client.posts == [_background_work_post(True), _background_work_post(False)]
 
@@ -206,7 +180,9 @@ async def test_goal_of_another_thread_does_not_change_the_session(tmp_path: Path
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(client, tmp_path, state, _goal_updated("active", thread_id="thread_child"))
+    await _deliver_to_parent(
+        client, tmp_path, state, _goal_updated("active", thread_id="thread_child")
+    )
 
     assert client.posts == []
 
@@ -254,7 +230,7 @@ async def test_goal_cleared_during_a_resync_post_ends_not_working(tmp_path: Path
         )
     )
     await client.true_post_started.wait()
-    cleared = asyncio.create_task(_deliver(client, tmp_path, state, _goal_cleared()))
+    cleared = asyncio.create_task(_deliver_to_parent(client, tmp_path, state, _goal_cleared()))
     await asyncio.sleep(0)
     client.release_true_post.set()
     await asyncio.gather(resync, cleared)
@@ -271,7 +247,7 @@ async def test_goal_read_overtaken_by_a_notification_is_dropped(tmp_path: Path) 
 
     class _ClearedDuringRead(_GoalCodexClient):
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            await _deliver(client, tmp_path, state, _goal_cleared())
+            await _deliver_to_parent(client, tmp_path, state, _goal_cleared())
             return await super().request(method, params)
 
     codex = _ClearedDuringRead({"result": {"goal": {"status": "active"}}})
@@ -315,10 +291,10 @@ async def test_server_without_the_flag_is_not_asked_again(tmp_path: Path) -> Non
     client = _OldServerClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(client, tmp_path, state, _goal_updated("active"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
     failures = fwd._forward_health.consecutive_failures
-    await _deliver(client, tmp_path, state, _goal_updated("complete"))
-    await _deliver(client, tmp_path, state, _goal_updated("active"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
 
     assert client.posts == [_background_work_post(True)]
     assert fwd._forward_health.consecutive_failures == failures
@@ -338,7 +314,7 @@ async def test_goal_that_is_not_active_reports_idle_without_a_failure(
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(client, tmp_path, state, _goal_updated(status))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated(status))
 
     assert client.posts == [_background_work_post(False)]
 
@@ -362,9 +338,9 @@ async def test_goal_stopped_by_a_limit_fails_the_session_once(
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(client, tmp_path, state, _goal_updated("active"))
-    await _deliver(client, tmp_path, state, _goal_updated(status, turn_id="turn_1"))
-    await _deliver(client, tmp_path, state, _goal_updated(status, turn_id="turn_1"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated(status, turn_id="turn_1"))
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated(status, turn_id="turn_1"))
 
     assert client.posts == [
         _background_work_post(True),
@@ -387,7 +363,7 @@ async def test_goal_limit_does_not_repeat_a_failure_the_turn_already_reported(
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    await _deliver(
+    await _deliver_to_parent(
         client,
         tmp_path,
         state,
@@ -404,7 +380,9 @@ async def test_goal_limit_does_not_repeat_a_failure_the_turn_already_reported(
             },
         },
     )
-    await _deliver(client, tmp_path, state, _goal_updated("usageLimited", turn_id="turn_1"))
+    await _deliver_to_parent(
+        client, tmp_path, state, _goal_updated("usageLimited", turn_id="turn_1")
+    )
 
     assert client.posts == [
         _failed_status_post(
@@ -460,7 +438,7 @@ async def test_turn_completion_after_a_goal_limit_keeps_the_failure(
     if turn_id == "null":
         limit["params"]["turnId"] = None
 
-    await _deliver(client, tmp_path, state, limit)
+    await _deliver_to_parent(client, tmp_path, state, limit)
     if delta is not None:
         coalescer = fwd._OutputTextDeltaCoalescer(client, "conv_x")  # type: ignore[arg-type]
         await fwd._handle_event(
@@ -483,7 +461,7 @@ async def test_turn_completion_after_a_goal_limit_keeps_the_failure(
             delta_coalescer=coalescer,
         )
         await coalescer.close()
-    await _deliver(
+    await _deliver_to_parent(
         client,
         tmp_path,
         state,
@@ -582,8 +560,10 @@ async def test_reconnect_reading_a_stopped_goal_still_fails_on_its_notification(
     )
     assert client.posts == [_background_work_post(False)]
     for _ in range(2):
-        await _deliver(client, tmp_path, state, _goal_updated("budgetLimited", turn_id="turn_1"))
-    await _deliver(
+        await _deliver_to_parent(
+            client, tmp_path, state, _goal_updated("budgetLimited", turn_id="turn_1")
+        )
+    await _deliver_to_parent(
         client,
         tmp_path,
         state,
