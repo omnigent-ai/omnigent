@@ -136,10 +136,13 @@ async def test_install_creates_a_user_agent_only_its_owner_lists(client, agent_s
     assert default.status_code == 200 and default.json()["data"] == []
 
 
-@pytest.mark.parametrize("blob_disappears", [False, True])
+@pytest.mark.parametrize(
+    ("blob_disappears", "config_edit"), [(False, True), (True, True), (False, False)]
+)
 async def test_reinstall_updates_in_place(
-    client, agent_store, artifact_store, monkeypatch, blob_disappears: bool
+    client, agent_store, artifact_store, monkeypatch, blob_disappears: bool, config_edit: bool
 ) -> None:
+    monkeypatch.setattr(type(agent_store), "supports_config_edit", config_edit)
     first = (await _install(client, ALICE, "orion", "v1")).json()
     if blob_disappears:
         original_get = artifact_store.get

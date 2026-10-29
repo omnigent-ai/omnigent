@@ -372,7 +372,7 @@ def save_user_agent(
         elif current_location == existing.bundle_location:
             return existing
         else:
-            updated = agent_store.update(agent_id, current_location)
+            updated = agent_store.update(agent_id, current_location, description=description)
         if updated is not None:
             return updated
         existing = agent_store.get(agent_id)
