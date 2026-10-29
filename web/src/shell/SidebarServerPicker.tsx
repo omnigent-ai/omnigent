@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, ChevronUpIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
+import { CheckIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
 import { logout } from "@/lib/accountsApi";
 import { withBasePath } from "@/lib/basePath";
@@ -225,7 +225,7 @@ export function SidebarServerPicker() {
             title={currentDescription}
             data-testid="sidebar-server-picker"
           >
-            <Avatar className="size-6 after:border-0">
+            <Avatar className="size-7 after:border-0">
               <AvatarFallback className="bg-secondary font-medium text-sm text-secondary-foreground">
                 {userInitials(userName.replace(/\s+/g, "."))}
               </AvatarFallback>
@@ -238,8 +238,6 @@ export function SidebarServerPicker() {
                 {currentHost}
               </span>
             </span>
-            {/* Points up: the menu opens upward from the sidebar's bottom. */}
-            <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
           </Button>
         </DropdownMenuTrigger>
         {/* side="top" — the trigger sits at the bottom of the window, so the

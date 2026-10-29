@@ -114,7 +114,8 @@ describe("SidebarServerPicker", () => {
 
     const initials = await screen.findByText("AS");
     expect(initials).toHaveClass("bg-secondary", "text-secondary-foreground");
-    expect(initials.parentElement).toHaveClass("size-6", "after:border-0");
+    expect(initials).toHaveClass("text-sm");
+    expect(initials.parentElement).toHaveClass("size-7", "after:border-0");
     expect(screen.getByText("alice.smith@example.com")).toHaveClass(
       "text-left",
       "font-medium",

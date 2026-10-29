@@ -957,12 +957,6 @@ html[data-electron-mac] .electron-sidebar-header-actions {
   z-index: 51;
   display: flex;
   align-items: center;
-
-  /* Read Collapse · Search · Settings outward from the window controls: pull
-   * the cluster's last button (the toggle) to the front. */
-  & > * > *:last-child {
-    order: -1;
-  }
 }
 /* Clear the fixed native-control area plus the font-relative action cluster
  * when the collapsed sidebar exposes the chat header at the window edge. */
