@@ -254,8 +254,10 @@ export function MainTerminalView({
     if (!visible && resumeError === null) recovery.attempted = false;
     // Opening a live terminal consumes this opening's recovery allowance.
     // Later idle reaping must not restart it without another user action.
-    else if (visible && agentHealthy && !terminalsLoading && !terminalsFetching)
-      recovery.attempted = true;
+    else if (agentHealthy && !terminalsLoading && !terminalsFetching) {
+      if (visible) recovery.attempted = true;
+      if (resumeError !== null) setResumeState({ conversationId, phase: "idle", error: null });
+    }
   }, [
     conversationId,
     visible,

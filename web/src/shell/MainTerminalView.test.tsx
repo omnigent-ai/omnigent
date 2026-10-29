@@ -292,7 +292,7 @@ describe("MainTerminalView — automatic recovery", () => {
     expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
   });
 
-  it("shows a short failure and leaves an explicit retry without an effect loop", async () => {
+  it.each([false, true])("keeps failures until external recovery (visible=%s)", async (visible) => {
     hostOnlineMock.mockReturnValue(true);
     const onResume = vi.fn().mockRejectedValueOnce(new Error("private backend details"));
     const props = { terminals: [REPL_TERMINAL], runnerOnline: false, onResume };
@@ -315,6 +315,16 @@ describe("MainTerminalView — automatic recovery", () => {
     expect(await screen.findByText("Couldn't resume session: host offline")).toBeVisible();
     expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
     expect(onResume).toHaveBeenCalledTimes(2);
+
+    rerender(viewTree({ ...props, runnerOnline: true, visible }));
+    rerender(viewTree({ ...props, terminals: [], visible }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(onResume).toHaveBeenCalledTimes(2);
+    rerender(viewTree({ ...props, terminals: [], visible: false }));
+    onResume.mockImplementationOnce(() => new Promise<void>(() => {}));
+    await act(async () => rerender(viewTree({ ...props, terminals: [] })));
+    expect(onResume).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
   });
 
   it("preserves an attached terminal through automatic failure and manual recovery", async () => {
@@ -379,8 +389,10 @@ describe("MainTerminalView — automatic recovery", () => {
     vi.useFakeTimers();
     hostOnlineMock.mockReturnValue(true);
     const onResume = vi.fn().mockResolvedValue(undefined);
+    const props = { terminals: [], runnerOnline: true, onResume };
+    let rerender!: ReturnType<typeof renderView>["rerender"];
     await act(async () => {
-      renderView({ terminals: [], onResume });
+      ({ rerender } = renderView(props));
     });
     await act(async () => {
       vi.advanceTimersByTime(10_000);
@@ -390,6 +402,16 @@ describe("MainTerminalView — automatic recovery", () => {
     ).toBeVisible();
     expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
     expect(onResume).toHaveBeenCalledTimes(1);
+
+    await act(async () => rerender(viewTree({ ...props, terminals: [REPL_TERMINAL] })));
+    rerender(viewTree(props));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+    expect(onResume).toHaveBeenCalledTimes(1);
+    rerender(viewTree({ ...props, visible: false }));
+    await act(async () => rerender(viewTree(props)));
+    expect(onResume).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
   });
 
   it("ignores an old session's completion while the new session reconnects", async () => {
