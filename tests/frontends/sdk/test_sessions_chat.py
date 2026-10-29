@@ -756,29 +756,6 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("opted_in", [False, True])
-async def test_client_asks_for_prompts_held_in_terminal_only_when_told(opted_in: bool) -> None:
-    """Raw ``stream()`` callers keep seeing a held prompt expire unless they send the header."""
-    from omnigent_client import TERMINAL_FALLBACK_HEADER, OmnigentClient
-
-    from omnigent.server.routes._sessions.helpers import _client_supports_terminal_fallback
-
-    headers = {"Authorization": "Bearer token"}
-    if opted_in:
-        headers[TERMINAL_FALLBACK_HEADER] = "on"
-    client = OmnigentClient("http://example.invalid", headers=headers)
-    try:
-        request = client._http.build_request(
-            "POST", "http://example.invalid/v1/sessions/conv_abc/elicitations/elicit_1/resolve"
-        )
-    finally:
-        await client.close()
-
-    assert _client_supports_terminal_fallback(request.headers) is opted_in
-    assert request.headers["authorization"] == "Bearer token"
-
-
-@pytest.mark.asyncio
 async def test_send_raises_on_failed_status_with_error_message() -> None:
     """A terminal ``session.status: failed`` raises with its error message.
 

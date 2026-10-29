@@ -675,7 +675,7 @@ export function ApprovalCard({
   }
 
   if (status === "pending" && terminalFallback) {
-    // Hide Open terminal for mirrored or side-chat cards; only this session's terminal can answer.
+    // Mirrored, side-chat and grid-cell cards hide Open terminal; a grid cell has its own switch.
     const canOpenTerminal =
       !requester && !scopedConversationId && Boolean(terminalFirst?.isTerminalFirst);
     let promptDetails: ReactNode;

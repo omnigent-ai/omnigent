@@ -1438,9 +1438,11 @@ answer in the agent's terminal. A client that can show it sends
 `x-omnigent-terminal-fallback: on` (a WebSocket connects with
 `?omnigent_terminal_fallback=on`). It then receives the prompt re-published
 with `params.terminal_fallback = {"answer_undelivered": <bool>}`, finds it in
-snapshots and pending counts, and gets 423 `prompt_in_terminal` if it answers.
-A session list or updates socket served by a replica other than the session's
-host leaves held prompts out of its counts. Without the opt-in, the prompt
+snapshots and in the pending counts of session lists and the session-updates
+socket, and gets 423 `prompt_in_terminal` if it answers. Sub-agent summaries
+leave held prompts out for every client, and a session list or updates socket
+served by a replica other than the session's host leaves them out of its
+counts. Without the opt-in, the prompt
 resolves with `reason: "unanswered"` and is left out of snapshots and counts,
 and a late answer gets 202 and is kept for a hook retry.
 

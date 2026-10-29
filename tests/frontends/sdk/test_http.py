@@ -7,12 +7,15 @@ resolves ``127.0.0.1`` against itself. httpx trusts the environment by
 default, so a client built without ``trust_env=False`` fails with
 ``httpx.ConnectError: All connection attempts failed`` even though the
 server is listening and healthy.
+
+The client's opt-in headers are checked here too.
 """
 
 from __future__ import annotations
 
+import httpx
 import pytest
-from omnigent_client import OmnigentClient
+from omnigent_client import TERMINAL_FALLBACK_HEADER, OmnigentClient
 from omnigent_client._http import is_loopback_url
 
 
@@ -83,3 +86,29 @@ def test_client_bypasses_env_proxies_only_for_loopback(
     client = OmnigentClient(base_url=server_url)
 
     assert client._http.trust_env is expected_trust_env
+
+
+@pytest.mark.parametrize("opted_in", [False, True])
+async def test_client_asks_for_prompts_held_in_terminal_only_when_told(opted_in: bool) -> None:
+    """Raw ``sessions.stream()`` callers see held prompts expire unless they send the header."""
+    stream_requests: list[httpx.Request] = []
+
+    def _end_stream(request: httpx.Request) -> httpx.Response:
+        stream_requests.append(request)
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=b"data: [DONE]\n\n"
+        )
+
+    headers = {"Authorization": "Bearer token"}
+    if opted_in:
+        headers[TERMINAL_FALLBACK_HEADER] = "on"
+    async with OmnigentClient("http://127.0.0.1:9", headers=headers) as client:
+        client._http._transport = httpx.MockTransport(_end_stream)
+        assert [event async for event in client.sessions.stream("conv_abc")] == []
+
+    [stream_request] = stream_requests
+    assert stream_request.url.path == "/v1/sessions/conv_abc/stream"
+    assert stream_request.headers.get("x-omnigent-terminal-fallback") == (
+        "on" if opted_in else None
+    )
+    assert stream_request.headers["authorization"] == "Bearer token"

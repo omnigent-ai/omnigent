@@ -1959,6 +1959,15 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       opensTerminal: false,
       ownerOnlyNote: false,
     },
+    {
+      viewer: "a grid cell showing the session",
+      requester: null,
+      sideChatId: "conv_parent",
+      isTerminalFirst: true,
+      isOwner: true,
+      opensTerminal: false,
+      ownerOnlyNote: false,
+    },
   ])(
     "offers Open terminal when viewed from $viewer: $opensTerminal",
     ({ requester, sideChatId, isTerminalFirst, isOwner, opensTerminal, ownerOnlyNote }) => {
