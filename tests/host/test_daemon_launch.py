@@ -418,3 +418,42 @@ def test_daemon_poll_intervals_open_tight_then_hold_at_the_cadence() -> None:
     # Reaching "ready" on the third probe must cost less than the old flat
     # cadence would have spent getting there.
     assert sum(first_ten[:2]) < 2 * daemon_launch.DAEMON_POLL_INTERVAL_S
+
+
+def test_launch_audit_context_is_bounded_and_contains_no_arguments() -> None:
+    """Only diagnostic hints survive; separate invocations have distinct ids."""
+    from omnigent.host.launch_audit import launch_audit_headers, request_client_audit_attributes
+
+    with click.Context(click.Command("claude")) as context:
+        context.params = {"prompt": "private prompt", "token": "secret-token"}
+        first = launch_audit_headers(host_id="host_b", fresh=False)
+        second = launch_audit_headers(host_id="host_b", fresh=True)
+    assert first["X-Omnigent-Launch-Id"] != second["X-Omnigent-Launch-Id"]
+    assert first["X-Omnigent-Launch-Command"] == "claude"
+    assert first["X-Omnigent-Launch-Mode"] == "ensure_existing"
+    assert second["X-Omnigent-Launch-Mode"] == "fresh"
+    attrs = request_client_audit_attributes(
+        {
+            **first,
+            "Authorization": "Bearer secret-token",
+            "Cookie": "private-cookie",
+            "User-Agent": "python-httpx/test",
+            OMNIGENT_SLICE_KEY_HEADER: "host:host_b",
+        }
+    )
+    assert attrs["client_host_id"] == "host_b"
+    assert attrs["request_slice_key"] == "host:host_b"
+    assert attrs["client_user_agent"] == "python-httpx/test"
+    assert "private" not in str(attrs) and "secret" not in str(attrs)
+    assert (
+        request_client_audit_attributes(
+            {"User-Agent": "a" * 257, "X-Omnigent-Launch-Command": "claude\nforged", "Cookie": "x"}
+        )
+        == {}
+    )
+
+    with click.Context(click.Command("invalid\ncommand")):
+        assert (
+            launch_audit_headers(host_id="host_b", fresh=False)["X-Omnigent-Launch-Command"]
+            == "unknown"
+        )
