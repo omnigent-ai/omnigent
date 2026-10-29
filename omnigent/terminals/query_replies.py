@@ -147,7 +147,10 @@ async def _probe(tmux: str, client_env: Mapping[str, str]) -> frozenset[str] | N
     )
     client: asyncio.subprocess.Process | None = None
     try:
-        if await _tmux(tmux, socket, "new-session", "-d", "-x", "80", "-y", "24", pane_command):
+        # Run sh directly: tmux would run a single-string command through the
+        # user's $SHELL, which may not be POSIX (nushell, PowerShell).
+        sh_command = ("--", "/bin/sh", "-c", pane_command)
+        if await _tmux(tmux, socket, "new-session", "-d", "-x", "80", "-y", "24", *sh_command):
             return None
         client = await asyncio.create_subprocess_exec(
             tmux,

@@ -27,8 +27,18 @@ def test_answered_queries_is_unknown_when_sentinels_are_missing() -> None:
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_probe_finds_the_queries_every_supported_tmux_answers() -> None:
-    """Invariants that hold from tmux 3.3 to 3.8; the rest varies by release."""
+async def test_probe_finds_the_queries_every_supported_tmux_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invariants that hold from tmux 3.3 to 3.8; the rest varies by release.
+
+    The login shell can't run POSIX commands (as with nushell or PowerShell),
+    so the probe must not depend on it.
+    """
+    login_shell = tmp_path / "login-shell"
+    login_shell.write_text("#!/bin/sh\nexit 1\n")
+    login_shell.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(login_shell))
     query_replies._cache.clear()
     answered = await tmux_answered_queries(shutil.which("tmux") or "", {})
 
