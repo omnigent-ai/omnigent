@@ -360,6 +360,35 @@ def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str
 
 
 @pytest.mark.parametrize(
+    "failure",
+    [
+        "OSError: [Errno 28] No space left on device: '/tmp/token-helper-example'",
+        "OSError: [Errno 122] Disk quota exceeded: '/tmp/token-helper-example'",
+    ],
+)
+@pytest.mark.parametrize("hint", ["", _CODEX_LOGIN_HINT])
+def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, hint: str) -> None:
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: "
+        "Traceback (most recent call last):\n"
+        '  File "/opt/token-helper/bootstrap.py", line 10, in create_venv\n'
+        f"    tempfile.mkdtemp()\n{failure}{hint}"
+    )
+
+    diagnosis = diagnose_codex_provider_auth_failure(message)
+
+    assert diagnosis == FailureDiagnosis(
+        title="Host storage is full",
+        cause=f"The model provider's token command `isaac` failed on the host: {failure}",
+        remediation=(
+            "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+            "then send your message again."
+        ),
+        category=ErrorCategory.HOST,
+    )
+
+
+@pytest.mark.parametrize(
     ("message", "cause", "remediation"),
     [
         (
