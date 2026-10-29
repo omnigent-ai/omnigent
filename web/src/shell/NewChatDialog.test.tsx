@@ -6532,6 +6532,38 @@ describe("NewChatLandingScreen", () => {
     }
   });
 
+  it("closes Connect a host and selects the exact host an SSH connect returns", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_1");
+    mockHosts([host("online", 1), host("online", 2)]);
+    const desktop = {
+      kind: "electron",
+      connectSshHost: vi.fn().mockResolvedValue({
+        ok: true,
+        alreadyRunning: false,
+        identity: { serverUrl: window.location.origin, hostId: "host_2" },
+        shownInConsole: true,
+      }),
+    };
+    (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+    try {
+      renderLanding();
+      const chip = screen.getByTestId("new-chat-landing-host-chip");
+      await waitFor(() => expect(chip).toHaveAccessibleName(expect.stringContaining("machine-1")));
+      fireEvent.pointerDown(chip, { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-connect-host"));
+      fireEvent.change(await screen.findByTestId("ssh-connect-destination"), {
+        target: { value: "devbox" },
+      });
+      fireEvent.click(screen.getByTestId("ssh-connect-submit"));
+
+      await waitFor(() => expect(screen.queryByTestId("connect-host-dialog")).toBeNull());
+      expect(desktop.connectSshHost).toHaveBeenCalledWith("devbox");
+      expect(chip).toHaveAccessibleName(expect.stringContaining("machine-2"));
+    } finally {
+      delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+    }
+  });
+
   it("offers connect-host even when no hosts are online (no dead end)", () => {
     mockHosts([]);
     renderLanding();
