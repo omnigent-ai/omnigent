@@ -42,11 +42,11 @@ export const RIGHT_SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 export const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
+  return native ? [MOD_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
 }
 
 export function newSessionAriaShortcut(native = isNativeShell()): string {
-  return `${ARIA_MOD_KEY}+${native ? "Alt+N" : "Shift+O"}`;
+  return `${ARIA_MOD_KEY}+${native ? "N" : "Shift+O"}`;
 }
 
 /** Keys for the pinned-session jump chord; `digit` is one slot's digit or a range label. */
