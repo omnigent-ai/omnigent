@@ -6,6 +6,7 @@ import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { useIsSessionOwner } from "@/hooks/usePermissions";
+import type * as UsePermissionsModule from "@/hooks/usePermissions";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -17,7 +18,7 @@ import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
 vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/hooks/usePermissions")>()),
+  ...(await importOriginal<typeof UsePermissionsModule>()),
   useIsSessionOwner: vi.fn(() => true),
 }));
 
@@ -1814,6 +1815,11 @@ describe("ApprovalCard — prompt expired", () => {
 });
 
 describe("ApprovalCard — prompt waiting in the terminal", () => {
+  afterEach(() => {
+    vi.mocked(useIsSessionOwner).mockReturnValue(true);
+    useChatStore.setState({ conversationId: null, blocks: [] });
+  });
+
   const question = {
     question: "Which deployment target should I use?",
     header: "Target",
