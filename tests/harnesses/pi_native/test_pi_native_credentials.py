@@ -1046,12 +1046,12 @@ def test_to_models_config_attributes_unity_gateway_providers() -> None:
 
     assert providers["omnigent"]["headers"] == {
         "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
     }
     assert providers["ug-openai"]["headers"] == {
         "User-Agent": "ucode/0.1.0 pi/0.80.0",
         "Databricks-Custom-Coding-Agent": "pi",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli, ug",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
     assert "headers" not in providers["other"]
     # The configured payload is shared across renders, so it stays unstamped.

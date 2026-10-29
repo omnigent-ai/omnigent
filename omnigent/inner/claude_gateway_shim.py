@@ -42,8 +42,10 @@ import uvicorn
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
     is_databricks_ai_gateway_url,
-    with_gateway_attribution,
+    is_ug_route,
+    with_gateway_attribution_pairs,
 )
+from omnigent.telemetry.surface import harness_client_surface
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +177,13 @@ class ClaudeGatewayShim:
 
     def __init__(self, upstream_base_url: str) -> None:
         self._upstream_base_url = upstream_base_url.rstrip("/")
+        # Resolved once per shim: is_ug_route reads ug's state file.
+        self._attribution_via_ug: bool | None = (
+            is_ug_route(self._upstream_base_url)
+            if is_databricks_ai_gateway_url(self._upstream_base_url)
+            else None
+        )
+        self._client_surface = harness_client_surface()
         self._client: httpx.AsyncClient | None = None
         self._server: uvicorn.Server | None = None
         self._serve_task: asyncio.Task[None] | None = None
@@ -306,11 +315,12 @@ class ClaudeGatewayShim:
             name = raw_name.decode("latin-1")
             if name.lower() not in _REQUEST_HEADER_EXCLUDES:
                 headers.append((name, raw_value.decode("latin-1")))
-        if is_databricks_ai_gateway_url(self._upstream_base_url):
-            headers = list(
-                with_gateway_attribution(
-                    dict(headers), CLAUDE_CODE_AGENT, self._upstream_base_url
-                ).items()
+        if self._attribution_via_ug is not None:
+            headers = with_gateway_attribution_pairs(
+                headers,
+                CLAUDE_CODE_AGENT,
+                via_ug=self._attribution_via_ug,
+                client_surface=self._client_surface,
             )
         query = scope.get("query_string", b"").decode("latin-1")
         url = f"{self._upstream_base_url}{path}" + (f"?{query}" if query else "")

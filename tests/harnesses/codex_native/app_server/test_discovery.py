@@ -60,7 +60,11 @@ async def test_discover_codex_model_options_strips_secrets_and_stops_process(
         listen_url: str,
         env: dict[str, str],
         cwd: Path,
+        config_overrides: tuple[str, ...] = (),
+        launch_args: tuple[str, ...] = (),
     ) -> object:
+        assert not config_overrides
+        assert not launch_args
         assert codex_path == "/test/codex"
         assert listen_url.startswith("ws://127.0.0.1:")
         assert cwd.is_dir()
@@ -258,7 +262,9 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
+        launch_args: tuple[str, ...] = (),
     ) -> object:
+        assert not launch_args
         captured["codex_path"] = codex_path
         captured["env"] = dict(env)
         captured["cwd"] = cwd
@@ -386,7 +392,9 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
         env: dict[str, str],
         cwd: Path,
         config_overrides: tuple[str, ...] = (),
+        launch_args: tuple[str, ...] = (),
     ) -> object:
+        assert not launch_args
         captured["env"] = dict(env)
         captured["config_overrides"] = list(config_overrides)
 
@@ -957,3 +965,35 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     else:
         assert "Inherited.Provider" not in providers
     assert "inherited-secret" not in text
+
+
+@pytest.mark.parametrize(
+    ("overrides", "app_server_command", "probed"),
+    [
+        (['model_provider="openai"'], (), False),
+        (['model_provider="openai"'], ("/wrapped/codex",), True),
+        (['model="gpt-5.5"'], (), True),
+    ],
+    ids=["omnigent-picked", "launcher-wrapper", "codex-picked"],
+)
+async def test_provider_attribution_probes_only_when_codex_may_pick_the_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: list[str],
+    app_server_command: tuple[str, ...],
+    probed: bool,
+) -> None:
+    from omnigent.harnesses.codex_native import app_server
+
+    started = AsyncMock(side_effect=OSError("probe started"))
+    monkeypatch.setattr(app_server, "_start_codex_model_discovery_process", started)
+    result = await app_server.prepare_codex_provider_config(
+        tmp_path / "home",
+        overrides,
+        codex_path="/codex",
+        cwd=tmp_path,
+        env={},
+        app_server_command=app_server_command,
+    )
+    assert result == overrides
+    assert started.await_count == int(probed)

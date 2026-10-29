@@ -71,6 +71,7 @@ from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, COD
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
 from . import _proc
@@ -3055,8 +3056,10 @@ class _CodexAppServerSession:
                 cwd=Path(self._cwd or os.getcwd()),
                 env=self._env,
                 retry_policy=self._retry_policy,
+                client_surface=harness_client_surface(),
             )
         else:
+            # The signer replaces gateway attribution from its own launch metadata.
             self._codex_config_overrides = materialize_codex_provider_config(
                 self._codex_home_dir,
                 self._codex_config_overrides,

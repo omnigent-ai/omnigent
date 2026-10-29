@@ -6921,7 +6921,8 @@ def _claude_terminal_request(
         "cwd": str(Path.cwd().resolve()),
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
-    spec["env"] = build_native_claude_terminal_env(claude_config)
+    # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
+    spec["env"] = build_native_claude_terminal_env(claude_config, client_surface="cli")
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove provider/session variables that can override the

@@ -1765,7 +1765,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             [
                 "x-databricks-use-coding-agent-mode: true",
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli",
+                "Databricks-Custom-Client-Surfaces: omnigent",
             ],
         )
 
@@ -1888,7 +1888,9 @@ class TestResolveGatewayEnv(unittest.TestCase):
     def test_generic_provider_on_unity_gateway_gets_attribution(self):
         from omnigent.inner.claude_sdk_executor import _resolve_gateway_env
 
-        with patch.dict("os.environ", {"ANTHROPIC_CUSTOM_HEADERS": "X-Trace: keep"}, clear=True):
+        # The worker's own custom headers belong to whatever launched it, not the gateway.
+        ambient = {"ANTHROPIC_CUSTOM_HEADERS": "X-Trace: drop", "OMNIGENT_CLIENT_SURFACE": "web"}
+        with patch.dict("os.environ", ambient, clear=True):
             env = _resolve_gateway_env(
                 base_url_override="https://wkspc.cloud.databricks.com/ai-gateway/anthropic",
                 auth_command_override="printf sk-test",
@@ -1898,9 +1900,8 @@ class TestResolveGatewayEnv(unittest.TestCase):
         self.assertEqual(
             env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
             [
-                "X-Trace: keep",
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli",
+                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-web",
             ],
         )
 

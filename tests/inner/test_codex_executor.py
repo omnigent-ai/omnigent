@@ -4596,11 +4596,11 @@ def test_materialize_codex_provider_config_attributes_unity_gateway_providers(
     assert providers["Databricks"]["http_headers"] == {
         "User-Agent": "ucode/0.1.0 codex/0.145.0",
         "Databricks-Custom-Coding-Agent": "codex",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli, ug",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
     assert providers["omnigent_databricks"]["http_headers"] == {
         "Databricks-Custom-Coding-Agent": "codex",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
     }
     assert "http_headers" not in providers["other"]
 
@@ -4640,7 +4640,7 @@ def test_materialize_attributes_effective_gateway_without_copying_credentials(
         provider = tomllib.loads(written)["model_providers"]["Managed"]
         assert provider["http_headers"] == {
             "Databricks-Custom-Coding-Agent": "codex",
-            "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli, ug, inner",
+            "Databricks-Custom-Client-Surfaces": "omnigent, ug, inner",
         }
         assert "base_url" not in provider
         assert "auth" not in provider

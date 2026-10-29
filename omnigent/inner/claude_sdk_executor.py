@@ -65,6 +65,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -1375,16 +1376,10 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            "\n".join(
-                value
-                for value in (
-                    os.environ.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
-                    gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
-                )
-                if value
-            ),
+            gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(base_url),
+            client_surface=harness_client_surface(),
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"

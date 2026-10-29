@@ -63,35 +63,43 @@ def test_reconstructs_authority_and_bearer_from_frozen_inputs() -> None:
 
 
 @pytest.mark.parametrize(
-    ("host", "path", "via_ug", "surfaces"),
+    ("binding_id", "host", "path", "surfaces"),
     [
         (
+            "databricks-ucode-v1",
             "workspace.cloud.databricks.com",
             "/ai-gateway/codex/v1/responses",
-            False,
-            "omnigent, omnigent-cli",
+            "omnigent, omnigent-desktop, ug",
         ),
         (
-            "workspace.cloud.databricks.com",
-            "/ai-gateway/codex/v1/responses",
-            True,
-            "omnigent, omnigent-cli, ug",
-        ),
-        (
+            "databricks-ucode-v1",
             "workspace.ai-gateway.cloud.databricks.com",
             "/v1/responses",
-            False,
-            "omnigent, omnigent-cli",
+            "omnigent, omnigent-desktop, ug",
         ),
-        (_HOST, _PATH, True, None),
+        ("databricks-ucode-v1", _HOST, _PATH, None),
+        (
+            "test-fake-provider-v1",
+            "workspace.cloud.databricks.com",
+            "/ai-gateway/codex/v1/responses",
+            None,
+        ),
     ],
-    ids=["workspace", "ug", "dedicated", "serving-endpoint"],
+    ids=["workspace", "dedicated", "serving-endpoint", "test-binding"],
 )
 def test_signer_synthesizes_gateway_attribution(
-    host: str, path: str, via_ug: bool, surfaces: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    binding_id: str,
+    host: str,
+    path: str,
+    surfaces: str | None,
 ) -> None:
+    from omnigent.inner.model_signer_service import _gateway_attribution
+
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
+    route = FrozenModelRoute(method="POST", host=host, path=path)
     request = reconstruct_signed_request(
-        route=FrozenModelRoute(method="POST", host=host, path=path),
+        route=route,
         placeholder=_PLACEHOLDER,
         bearer_token=_TOKEN,
         method="POST",
@@ -106,7 +114,7 @@ def test_signer_synthesizes_gateway_attribution(
             ("Databricks-Custom-Client-Surfaces", "other-app"),
         ],
         body=b'{"model":"test"}',
-        via_ug=via_ug,
+        trusted_headers=_gateway_attribution(binding_id, route),
     )
     assert request.header("Databricks-Custom-Coding-Agent") == ("codex" if surfaces else None)
     assert request.header("Databricks-Custom-Client-Surfaces") == surfaces

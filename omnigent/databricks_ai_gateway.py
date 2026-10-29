@@ -11,12 +11,9 @@ so each harness names the coding agent and client surfaces the same way.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable, Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
-
-from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 
 # Trusted parent domains for a Databricks-owned host. The Unity Gateway lives
 # under a per-workspace subdomain of one of these (the canonical form is
@@ -110,6 +107,7 @@ OPENCODE_AGENT: Final[str] = "opencode"
 # ug stamps ``ucode/<version> <agent>/<version>`` on the providers it writes.
 _UG_USER_AGENT_PREFIX: Final[str] = "ucode/"
 
+# Session client surface (``omnigent.telemetry.surface``) -> the gateway's surface name.
 _OMNIGENT_CLIENT_SURFACES: Final[dict[str, str]] = {
     "desktop": "omnigent-desktop",
     "web": "omnigent-web",
@@ -118,6 +116,10 @@ _OMNIGENT_CLIENT_SURFACES: Final[dict[str, str]] = {
     "mobile": "omnigent-mobile",
     "cli": "omnigent-cli",
 }
+_ATTRIBUTION_HEADER_NAMES: Final[tuple[str, str]] = (CODING_AGENT_HEADER, CLIENT_SURFACES_HEADER)
+_ATTRIBUTION_HEADER_KEYS: Final[frozenset[str]] = frozenset(
+    name.lower() for name in _ATTRIBUTION_HEADER_NAMES
+)
 
 _HeaderValue = TypeVar("_HeaderValue")
 
@@ -133,31 +135,24 @@ def gateway_attribution_headers(
 
     :param coding_agent: The harness making the request, e.g. ``"codex"``.
     :param via_ug: Whether the route comes from ug's configuration.
-    :param client_surfaces: Existing inner surfaces, in their original order.
-    :param client_surface: Creating interface; defaults to launch metadata or CLI.
+    :param client_surfaces: Surfaces already on the request; stale Omnigent ones are dropped.
+    :param client_surface: The session's creating interface, e.g. ``"desktop"``;
+        ``None`` or an unknown value sends only ``omnigent``.
     :returns: e.g. ``{"Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug"}``.
     """
+    qualified = _OMNIGENT_CLIENT_SURFACES.get(client_surface or "")
+    stale = set(_OMNIGENT_CLIENT_SURFACES.values())
+    candidates = (
+        "omnigent",
+        *((qualified,) if qualified else ()),
+        *(surface for surface in client_surfaces if surface.strip().lower() not in stale),
+        *(("ug",) if via_ug else ()),
+    )
     surfaces: list[str] = []
     seen: set[str] = set()
-    source = (
-        client_surface
-        if client_surface is not None
-        else os.environ.get(CLIENT_SURFACE_ENV_VAR, "cli")
-    )
-    qualified_surface = _OMNIGENT_CLIENT_SURFACES.get(source)
-    inner_surfaces = (
-        surface
-        for surface in client_surfaces
-        if surface.strip().lower() not in _OMNIGENT_CLIENT_SURFACES.values()
-    )
-    for surface in (
-        "omnigent",
-        *((qualified_surface,) if qualified_surface else ()),
-        *inner_surfaces,
-        *(("ug",) if via_ug else ()),
-    ):
-        name = surface.strip()
+    for candidate in candidates:
+        name = candidate.strip()
         if name and name.lower() not in seen:
             seen.add(name.lower())
             surfaces.append(name)
@@ -172,6 +167,36 @@ def is_ug_route(base_url: str) -> bool:
     return hostname is not None and read_ucode_state(f"https://{hostname}") is not None
 
 
+def with_gateway_attribution_pairs(
+    headers: Iterable[tuple[str, _HeaderValue]],
+    coding_agent: str,
+    *,
+    via_ug: bool = False,
+    client_surface: str | None = None,
+) -> list[tuple[str, _HeaderValue | str]]:
+    """Replace the attribution in an ordered header list, keeping every other entry.
+
+    Repeated headers survive; existing surfaces are merged and a ug ``User-Agent`` adds ``ug``.
+    """
+    kept: list[tuple[str, _HeaderValue | str]] = []
+    surfaces: list[str] = []
+    for name, value in headers:
+        lowered = name.lower()
+        if lowered in _ATTRIBUTION_HEADER_KEYS:
+            if lowered == CLIENT_SURFACES_HEADER.lower() and isinstance(value, str):
+                surfaces.extend(value.split(","))
+            continue
+        if lowered == "user-agent" and isinstance(value, str):
+            via_ug = via_ug or any(
+                product.startswith(_UG_USER_AGENT_PREFIX) for product in value.split()
+            )
+        kept.append((name, value))
+    attribution = gateway_attribution_headers(
+        coding_agent, via_ug=via_ug, client_surfaces=surfaces, client_surface=client_surface
+    )
+    return [*kept, *attribution.items()]
+
+
 def with_gateway_attribution(
     headers: Mapping[str, _HeaderValue] | None,
     coding_agent: str,
@@ -184,28 +209,14 @@ def with_gateway_attribution(
 
     The provider is ug's when ug configured its workspace or wrote its ``User-Agent``.
     """
-    existing: dict[str, _HeaderValue | str] = {}
-    surfaces: list[str] = []
-    for name, value in (headers or {}).items():
-        lowered = name.lower()
-        if lowered == CLIENT_SURFACES_HEADER.lower():
-            if isinstance(value, str):
-                surfaces.extend(value.split(","))
-        elif lowered != CODING_AGENT_HEADER.lower():
-            existing[name] = value
-        if lowered == "user-agent" and isinstance(value, str):
-            via_ug = via_ug or any(
-                product.startswith(_UG_USER_AGENT_PREFIX) for product in value.split()
-            )
-    return {
-        **existing,
-        **gateway_attribution_headers(
+    return dict(
+        with_gateway_attribution_pairs(
+            (headers or {}).items(),
             coding_agent,
             via_ug=via_ug or is_ug_route(base_url),
-            client_surfaces=surfaces,
             client_surface=client_surface,
-        ),
-    }
+        )
+    )
 
 
 def with_gateway_attribution_lines(
@@ -220,21 +231,21 @@ def with_gateway_attribution_lines(
     :param custom_headers: The existing newline-separated ``Name: value`` block, or ``None``.
     :param coding_agent: The harness making the request, e.g. ``"claude-code"``.
     :param via_ug: Whether the route comes from ug's configuration.
-    :returns: The block with one line per attribution header.
+    :param client_surface: The session's creating interface, e.g. ``"web"``.
+    :returns: The block with its other lines unchanged and one line per attribution header.
     """
     lines: list[str] = []
-    headers: dict[str, str] = {}
+    headers: list[tuple[str, str]] = []
     for line in (custom_headers or "").splitlines():
         name, separator, value = line.partition(":")
-        lowered = name.strip().lower()
         if separator:
-            headers[lowered] = ",".join(filter(None, (headers.get(lowered), value.strip())))
-        if lowered not in (CODING_AGENT_HEADER.lower(), CLIENT_SURFACES_HEADER.lower()):
+            headers.append((name.strip(), value.strip()))
+        if name.strip().lower() not in _ATTRIBUTION_HEADER_KEYS:
             lines.append(line)
-    attribution = with_gateway_attribution(
-        headers, coding_agent, "", via_ug=via_ug, client_surface=client_surface
+    attributed = with_gateway_attribution_pairs(
+        headers, coding_agent, via_ug=via_ug, client_surface=client_surface
     )
     lines.extend(
-        f"{name}: {attribution[name]}" for name in (CODING_AGENT_HEADER, CLIENT_SURFACES_HEADER)
+        f"{name}: {value}" for name, value in attributed if name in _ATTRIBUTION_HEADER_NAMES
     )
     return "\n".join(lines)

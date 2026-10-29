@@ -339,6 +339,12 @@ async def test_start_respawns_a_silent_app_server_on_the_same_transport(
     monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 3.0)
     _set_codex_version(monkeypatch, (0, 147, 0))
     monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+    # Only the session app-server may run the fake script; its attempts are counted below.
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_start_codex_model_discovery_process",
+        AsyncMock(side_effect=OSError("no provider attribution probe in this test")),
+    )
 
     state_dir = tmp_path / "app-server-state"
     state_dir.mkdir()

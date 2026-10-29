@@ -143,7 +143,9 @@ _CONNECT_TIMEOUT_SECONDS = 10.0
 _APP_SERVER_READY_TIMEOUT_SECONDS = 60.0
 # Initialization and model/list can stall after the listener becomes ready.
 _MODEL_CATALOG_PROBE_TIMEOUT_SECONDS = 30.0
-_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS = 5.0
+# Provider attribution is best-effort on the launch path, so it shares discovery's
+# readiness budget; a probe that runs out falls back to the generated config.
+_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS = _CONNECT_TIMEOUT_SECONDS
 _MODEL_DISCOVERY_CACHE_SECONDS = 300.0
 _MODEL_DISCOVERY_STDERR_TAIL_BYTES = 64 * 1024
 _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
@@ -1519,8 +1521,6 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
         root = Path(raw_dir)
         codex_home = root / "codex-home"
         codex_home.mkdir(mode=0o700)
-        port = _allocate_loopback_port()
-        listen_url = f"ws://127.0.0.1:{port}"
         env = _clean_codex_env()
         for name in tuple(env):
             if name.startswith("OPENAI_") or name in {
@@ -1529,29 +1529,54 @@ async def discover_codex_model_options(*, codex_path: str | None = None) -> list
             }:
                 env.pop(name)
         env["CODEX_HOME"] = str(codex_home)
-        discovery = await _start_codex_model_discovery_process(
+        async with _discovery_app_server_client(
             codex_path=resolved_codex,
-            listen_url=listen_url,
             env=env,
             cwd=root,
-        )
-        client: CodexAppServerClient | None = None
-        try:
-            await _wait_for_discovery_listener(discovery, port)
-            client = CodexAppServerClient(
-                ws_url=listen_url,
-                client_name="omnigent-codex-model-discovery",
-            )
-            await client.connect()
+            client_name="omnigent-codex-model-discovery",
+        ) as client:
             options = await list_codex_model_options(client)
-        finally:
-            if client is not None:
-                with contextlib.suppress(Exception):
-                    await client.close()
-            await _stop_codex_model_discovery_process(discovery)
 
     _model_discovery_cache[resolved_codex] = tuple(dict(option) for option in options)
     return options
+
+
+@contextlib.asynccontextmanager
+async def _discovery_app_server_client(
+    *,
+    codex_path: str,
+    env: dict[str, str],
+    cwd: Path,
+    client_name: str,
+    config_overrides: Sequence[str] = (),
+    launch_args: Sequence[str] = (),
+) -> AsyncIterator[CodexAppServerClient]:
+    """Run a short-lived loopback app-server and yield a connected client.
+
+    :raises RuntimeError: When the app-server exits before connecting.
+    :raises TimeoutError: When the app-server does not become ready.
+    """
+    port = _allocate_loopback_port()
+    listen_url = f"ws://127.0.0.1:{port}"
+    discovery = await _start_codex_model_discovery_process(
+        codex_path=codex_path,
+        listen_url=listen_url,
+        env=env,
+        cwd=cwd,
+        config_overrides=config_overrides,
+        launch_args=launch_args,
+    )
+    client: CodexAppServerClient | None = None
+    try:
+        await _wait_for_discovery_listener(discovery, port)
+        client = CodexAppServerClient(ws_url=listen_url, client_name=client_name)
+        await client.connect()
+        yield client
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+        await _stop_codex_model_discovery_process(discovery)
 
 
 async def _start_codex_model_discovery_process(
@@ -1875,31 +1900,16 @@ async def probe_codex_model_options(
         pinned_model = databricks.model
     codex_home = await asyncio.to_thread(_probe_codex_home, config_overrides)
     env["CODEX_HOME"] = str(codex_home)
-    port = _allocate_loopback_port()
-    listen_url = f"ws://127.0.0.1:{port}"
-    discovery = await _start_codex_model_discovery_process(
+    async with _discovery_app_server_client(
         codex_path=resolved_codex,
-        listen_url=listen_url,
         env=env,
         cwd=codex_home,
+        client_name="omnigent-codex-model-probe",
         config_overrides=config_overrides,
-    )
-    client: CodexAppServerClient | None = None
-    try:
-        await _wait_for_discovery_listener(discovery, port)
-        client = CodexAppServerClient(
-            ws_url=listen_url,
-            client_name="omnigent-codex-model-probe",
-        )
-        await client.connect()
+    ) as client:
         rows = await list_codex_model_options(client)
         if pinned_model is None:
             pinned_model = await _read_codex_probe_default(client)
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
-        await _stop_codex_model_discovery_process(discovery)
     return mark_launch_default(rows, pinned_model)
 
 
@@ -1914,58 +1924,62 @@ async def prepare_codex_provider_config(
     client_surface: str | None = None,
     app_server_command: tuple[str, ...] = (),
 ) -> list[str]:
-    """Attribute inherited providers using Codex's own configuration resolution.
+    """Materialize provider config, attributing gateway providers Codex inherits.
 
-    Materialize credentials before probing so they stay out of process arguments.
-    The bounded probe uses the session's command, environment and working directory.
+    Credentials are materialized first so they stay out of process arguments. Codex
+    resolves inherited providers itself only when Omnigent didn't pick the provider.
     """
     overrides = materialize_codex_provider_config(
         codex_home, config_overrides, retry_policy=retry_policy, client_surface=client_surface
     )
-    discovery: _CodexModelDiscoveryProcess | None = None
-    client: CodexAppServerClient | None = None
-    effective_providers: Mapping[str, object] | None = None
+    if not _codex_may_inherit_provider(overrides, app_server_command):
+        return overrides
+    executable, *launch_args = app_server_command or (codex_path,)
     try:
-        async with asyncio.timeout(_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS):
-            port = _allocate_loopback_port()
-            executable, *launch_args = app_server_command or (codex_path,)
-            discovery = await _start_codex_model_discovery_process(
+        async with (
+            asyncio.timeout(_PROVIDER_CONFIG_PROBE_TIMEOUT_SECONDS),
+            _discovery_app_server_client(
                 codex_path=executable,
-                listen_url=f"ws://127.0.0.1:{port}",
                 env={**env, "CODEX_HOME": str(codex_home)},
                 cwd=cwd,
+                client_name="omnigent-codex-config-probe",
                 config_overrides=overrides,
                 launch_args=launch_args,
-            )
-            await _wait_for_discovery_listener(discovery, port)
-            client = CodexAppServerClient(
-                ws_url=f"ws://127.0.0.1:{port}", client_name="omnigent-codex-config-probe"
-            )
-            await client.connect()
+            ) as client,
+        ):
             response = await client.request(
                 "config/read", {"includeLayers": False, "cwd": str(cwd)}
             )
-            result = response.get("result")
-            config = result.get("config") if isinstance(result, dict) else None
-            providers = config.get("model_providers") if isinstance(config, dict) else None
-            if isinstance(providers, dict):
-                effective_providers = providers
-    except Exception:  # noqa: BLE001 - attribution must not prevent a launch
-        _logger.debug("Could not resolve inherited Codex provider attribution")
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
-        if discovery is not None:
-            await _stop_codex_model_discovery_process(discovery)
-    if not effective_providers:
+    except Exception as exc:  # noqa: BLE001 - attribution must not prevent a launch
+        _logger.info(
+            "Codex provider attribution skipped: config/read probe failed (%s)",
+            type(exc).__name__,
+        )
+        return overrides
+    result = response.get("result")
+    config = result.get("config") if isinstance(result, dict) else None
+    providers = config.get("model_providers") if isinstance(config, dict) else None
+    if not isinstance(providers, dict) or not providers:
         return overrides
     return materialize_codex_provider_config(
         codex_home,
         overrides,
         retry_policy=retry_policy,
         client_surface=client_surface,
-        effective_providers=effective_providers,
+        effective_providers=providers,
+    )
+
+
+def _codex_may_inherit_provider(
+    overrides: Sequence[str], app_server_command: Sequence[str]
+) -> bool:
+    """Whether Codex may route through a provider Omnigent didn't write.
+
+    An explicit ``model_provider`` names a built-in or a generated, already
+    attributed provider, unless a launcher wrapper can still inject its own.
+    """
+    return bool(app_server_command) or not any(
+        override.startswith(_MODEL_PROVIDER_OVERRIDE_PREFIX) for override in overrides
     )
 
 

@@ -27,7 +27,6 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
-from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -1835,9 +1834,7 @@ async def _auto_create_opencode_terminal(
         write_opencode_provider_config(
             xdg_config_home_for_bridge_dir(bridge_dir),
             config,
-            client_surface=resource_registry.client_surface_env(session_id)[
-                CLIENT_SURFACE_ENV_VAR
-            ],
+            client_surface=resource_registry.client_surface(session_id),
         )
 
     # The server runs with a per-session XDG_DATA_HOME, so copy the user's
@@ -2798,9 +2795,7 @@ async def _auto_create_pi_terminal(
                 launch_config.reasoning_effort,
                 selection=spec_model,
                 global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
-                client_surface=resource_registry.client_surface_env(session_id)[
-                    CLIENT_SURFACE_ENV_VAR
-                ],
+                client_surface=resource_registry.client_surface(session_id),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -9669,9 +9664,7 @@ async def _auto_create_claude_terminal(
         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
         env=build_native_claude_terminal_env(
             claude_config,
-            client_surface=resource_registry.client_surface_env(session_id)[
-                CLIENT_SURFACE_ENV_VAR
-            ],
+            client_surface=resource_registry.client_surface(session_id),
         ),
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers

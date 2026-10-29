@@ -24,6 +24,13 @@ from pathlib import Path
 from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
 
+from omnigent.databricks_ai_gateway import (
+    CODEX_AGENT,
+    gateway_attribution_headers,
+    is_databricks_ai_gateway_url,
+)
+from omnigent.telemetry.surface import harness_client_surface
+
 from .egress.ca import ensure_ca, ensure_ca_bundle
 from .egress.certs import HostCertCache
 from .egress.proxy import EgressProxy, _parse_http_headers
@@ -242,7 +249,7 @@ class _SignerRelay(EgressProxy):
         ca_key_path: Path,
         ca_bundle_path: Path,
         provider_port: int | None,
-        via_ug: bool = False,
+        trusted_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(
             parse_rules([f"{route.method} {route.host}{route.path}"]),
@@ -257,7 +264,7 @@ class _SignerRelay(EgressProxy):
             raise ValueError("signer relay requires exactly one credential source")
         self._credential_source = credential_source or _StaticCredential(bearer_token or "")
         self._provider_port = provider_port
-        self._via_ug = via_ug
+        self._trusted_headers = trusted_headers
         self._tls_sni_by_task: dict[asyncio.Task[object], str | None] = {}
         self._tls_sni_by_object: weakref.WeakKeyDictionary[
             ssl.SSLObject | ssl.SSLSocket, str | None
@@ -354,7 +361,7 @@ class _SignerRelay(EgressProxy):
             target=path,
             headers=headers,
             body=body,
-            via_ug=self._via_ug,
+            trusted_headers=self._trusted_headers,
         )
         if port != 443:
             await self._send_forbidden(client_writer, "")
@@ -896,6 +903,19 @@ def _load_config(fd: int) -> tuple[str, FrozenModelRoute, str | None]:
     return str(binding_id), route, auth_profile
 
 
+def _gateway_attribution(binding_id: str, route: FrozenModelRoute) -> tuple[tuple[str, str], ...]:
+    """Attribute ucode-bound Codex gateway calls from launch metadata, not worker headers."""
+    if binding_id != _UCODE_BINDING or not is_databricks_ai_gateway_url(
+        f"https://{route.host}{route.path}"
+    ):
+        return ()
+    return tuple(
+        gateway_attribution_headers(
+            CODEX_AGENT, via_ug=True, client_surface=harness_client_surface()
+        ).items()
+    )
+
+
 def _pick_relay_port() -> int:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -985,7 +1005,7 @@ async def _run(config_fd: int) -> int:
             ca_key_path=ca_key,
             ca_bundle_path=ca_bundle,
             provider_port=provider_port,
-            via_ug=binding_id == _UCODE_BINDING,
+            trusted_headers=_gateway_attribution(binding_id, route),
         )
         socket_path = public_dir / "relay.sock"
         await relay.start_unix(socket_path)

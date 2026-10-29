@@ -415,10 +415,12 @@ async def test_sigkill_signer_during_ucode_preflight_reaps_helper_tree(
     assert not process_alive(child_pid)
 
 
-@pytest.mark.parametrize("via_ug", [False, True])
+@pytest.mark.parametrize("binding_id", ["databricks-ucode-v1", "test-fake-provider-v1"])
 async def test_signer_gateway_attribution_reaches_tls_upstream(
-    tmp_path: Path, via_ug: bool, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, binding_id: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from omnigent.inner.model_signer_service import _gateway_attribution
+
     monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
     route = FrozenModelRoute(
         method="POST",
@@ -452,7 +454,7 @@ async def test_signer_gateway_attribution_reaches_tls_upstream(
             ca_key_path=ca_key,
             ca_bundle_path=ca_cert,
             provider_port=upstream.sockets[0].getsockname()[1],
-            via_ug=via_ug,
+            trusted_headers=_gateway_attribution(binding_id, route),
         )
         port = await relay.start_tcp()
         try:
@@ -474,9 +476,11 @@ async def test_signer_gateway_attribution_reaches_tls_upstream(
             await relay.stop()
     assert status == 200
     assert len(captured) == 1
-    assert b"Databricks-Custom-Coding-Agent: codex\r\n" in captured[0]
-    surfaces = b"omnigent, omnigent-desktop, ug" if via_ug else b"omnigent, omnigent-desktop"
-    assert b"Databricks-Custom-Client-Surfaces: " + surfaces + b"\r\n" in captured[0]
+    attributed = binding_id == "databricks-ucode-v1"
+    assert (b"Databricks-Custom-Coding-Agent: codex\r\n" in captured[0]) is attributed
+    assert (
+        b"Databricks-Custom-Client-Surfaces: omnigent, omnigent-desktop, ug\r\n" in captured[0]
+    ) is attributed
     assert b"stale-agent" not in captured[0]
     assert b"stale-app" not in captured[0]
 

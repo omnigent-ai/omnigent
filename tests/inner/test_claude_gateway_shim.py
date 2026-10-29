@@ -299,15 +299,16 @@ async def test_shim_forwards_non_opus_and_non_messages_traffic_verbatim(upstream
     [
         (
             "https://ws.cloud.databricks.com/ai-gateway/anthropic",
-            "omnigent, omnigent-cli, ug, inner",
+            "omnigent, omnigent-desktop, ug, inner",
         ),
         ("https://ws.cloud.databricks.com/serving-endpoints/anthropic", "ug, inner"),
     ],
     ids=["gateway", "serving-endpoint"],
 )
 async def test_shim_restores_gateway_attribution_after_cli_settings(
-    upstream_url: str, surfaces: str
+    upstream_url: str, surfaces: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "desktop")
     requests: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -324,11 +325,13 @@ async def test_shim_restores_gateway_attribution_after_cli_settings(
             response = await client.post(
                 f"{shim.base_url}/v1/messages",
                 json={"model": "test", "messages": []},
-                headers={
-                    "Authorization": "Bearer synthetic-key",
-                    "databricks-custom-coding-agent": "stale-agent",
-                    "databricks-custom-client-surfaces": "ug, inner",
-                },
+                headers=[
+                    ("Authorization", "Bearer synthetic-key"),
+                    ("anthropic-beta", "one"),
+                    ("anthropic-beta", "two"),
+                    ("databricks-custom-coding-agent", "stale-agent"),
+                    ("databricks-custom-client-surfaces", "ug, inner"),
+                ],
             )
         assert response.status_code == 200
         assert len(requests) == 1
@@ -339,6 +342,7 @@ async def test_shim_restores_gateway_attribution_after_cli_settings(
             "claude-code" if surfaces.startswith("omnigent") else "stale-agent"
         )
         assert request.headers["Authorization"] == "Bearer synthetic-key"
+        assert request.headers.get_list("anthropic-beta") == ["one", "two"]
     finally:
         await shim.aclose()
 

@@ -249,7 +249,7 @@ def test_gateway_headers_reach_real_cli_requests(
         if config_source == "claude-native":
             launch = _provider_config_for_native_claude(entry)
             assert launch is not None
-            env.update(build_native_claude_terminal_env(launch))
+            env.update(build_native_claude_terminal_env(launch, client_surface=client_surface))
             api_key_helper = launch.api_key_helper
         else:
             gateway_env = _resolve_gateway_env(

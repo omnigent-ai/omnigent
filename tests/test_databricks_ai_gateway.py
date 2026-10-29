@@ -8,6 +8,7 @@ from omnigent.databricks_ai_gateway import (
     gateway_attribution_headers,
     with_gateway_attribution,
     with_gateway_attribution_lines,
+    with_gateway_attribution_pairs,
 )
 
 _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
@@ -28,25 +29,45 @@ _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
     ],
 )
 def test_gateway_attribution_names_the_creating_interface(
-    monkeypatch: pytest.MonkeyPatch,
     client_surface: str,
     qualified_surface: str | None,
     via_ug: bool,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", client_surface)
     expected = ["omnigent"]
     if qualified_surface is not None:
         expected.append(qualified_surface)
     if via_ug:
         expected.append("ug")
-    assert gateway_attribution_headers("codex", via_ug=via_ug) == {
+    assert gateway_attribution_headers("codex", via_ug=via_ug, client_surface=client_surface) == {
         "Databricks-Custom-Coding-Agent": "codex",
         "Databricks-Custom-Client-Surfaces": ", ".join(expected),
     }
 
 
-def test_explicit_surface_replaces_stale_launch_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "cli")
+def test_gateway_attribution_ignores_an_inherited_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shell inside a web session must not label the CLI it launches as web."""
+    monkeypatch.setenv("OMNIGENT_CLIENT_SURFACE", "web")
+    assert gateway_attribution_headers("codex")["Databricks-Custom-Client-Surfaces"] == "omnigent"
+
+
+def test_header_pairs_keep_repeated_headers_and_replace_attribution() -> None:
+    headers = [
+        ("anthropic-beta", "one"),
+        ("Databricks-Custom-Coding-Agent", "stale"),
+        ("anthropic-beta", "two"),
+        ("databricks-custom-client-surfaces", "omnigent-web, inner"),
+    ]
+    assert with_gateway_attribution_pairs(
+        headers, "claude-code", via_ug=True, client_surface="desktop"
+    ) == [
+        ("anthropic-beta", "one"),
+        ("anthropic-beta", "two"),
+        ("Databricks-Custom-Coding-Agent", "claude-code"),
+        ("Databricks-Custom-Client-Surfaces", "omnigent, omnigent-desktop, inner, ug"),
+    ]
+
+
+def test_explicit_surface_replaces_stale_launch_identity() -> None:
     original = {
         "databricks-custom-client-surfaces": "omnigent, omnigent-cli, omnigent-web, ug, inner",
         "X-Trace": "keep",
@@ -69,7 +90,7 @@ def test_explicit_surface_replaces_stale_launch_identity(monkeypatch: pytest.Mon
 
 @pytest.mark.parametrize(
     ("via_ug", "surfaces"),
-    [(False, "omnigent, omnigent-cli"), (True, "omnigent, omnigent-cli, ug")],
+    [(False, "omnigent"), (True, "omnigent, ug")],
 )
 def test_gateway_attribution_headers_name_omnigent_outermost(via_ug: bool, surfaces: str) -> None:
     assert gateway_attribution_headers("codex", via_ug=via_ug) == {
@@ -81,17 +102,17 @@ def test_gateway_attribution_headers_name_omnigent_outermost(via_ug: bool, surfa
 @pytest.mark.parametrize(
     ("headers", "surfaces"),
     [
-        (None, "omnigent, omnigent-cli"),
-        ({"User-Agent": "ucode/0.1.0 pi/0.80.0"}, "omnigent, omnigent-cli, ug"),
-        ({"user-agent": "ucode/0.1.0 pi/0.80.0"}, "omnigent, omnigent-cli, ug"),
-        ({"User-Agent": "outer/1 ucode/0.1.0 pi/0.80.0"}, "omnigent, omnigent-cli, ug"),
+        (None, "omnigent"),
+        ({"User-Agent": "ucode/0.1.0 pi/0.80.0"}, "omnigent, ug"),
+        ({"user-agent": "ucode/0.1.0 pi/0.80.0"}, "omnigent, ug"),
+        ({"User-Agent": "outer/1 ucode/0.1.0 pi/0.80.0"}, "omnigent, ug"),
         (
             {
                 "databricks-custom-coding-agent": "codex",
                 "databricks-custom-client-surfaces": "ug, inner, ug, omnigent",
                 "X-Trace": "keep",
             },
-            "omnigent, omnigent-cli, ug, inner",
+            "omnigent, ug, inner",
         ),
         (
             {
@@ -99,9 +120,9 @@ def test_gateway_attribution_headers_name_omnigent_outermost(via_ug: bool, surfa
                 "Databricks-Custom-Client-Surfaces": "ug",
                 "databricks-custom-client-surfaces": "inner, ug",
             },
-            "omnigent, omnigent-cli, ug, inner",
+            "omnigent, ug, inner",
         ),
-        ({"Databricks-Custom-Client-Surfaces": " , omnigent, , "}, "omnigent, omnigent-cli"),
+        ({"Databricks-Custom-Client-Surfaces": " , omnigent, , "}, "omnigent"),
     ],
     ids=["plain", "ug", "lowercase", "nested-user-agent", "inherited", "duplicate-keys", "empty"],
 )
@@ -142,7 +163,7 @@ def test_with_gateway_attribution_lines_merges_the_claude_block(attribution: str
     assert block.splitlines() == [
         "x-databricks-use-coding-agent-mode: true",
         "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli, ug",
+        "Databricks-Custom-Client-Surfaces: omnigent, ug",
     ]
     assert with_gateway_attribution_lines(block, "claude-code", via_ug=True) == block
 
@@ -157,7 +178,7 @@ def test_claude_header_block_detects_ug_and_keeps_inner_surfaces() -> None:
         "user-agent: outer/1 ucode/0.1.0 claude/2",
         "X-Trace: keep:colon",
         "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent, omnigent-cli, ug, inner",
+        "Databricks-Custom-Client-Surfaces: omnigent, ug, inner",
     ]
 
 
@@ -180,5 +201,5 @@ def test_ug_configured_workspace_marks_a_provider_without_a_ug_user_agent(
     ) == {
         "X-Tag": "1",
         "Databricks-Custom-Coding-Agent": "codex",
-        "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-cli, ug",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
