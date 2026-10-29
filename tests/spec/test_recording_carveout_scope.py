@@ -103,3 +103,9 @@ def test_caption_rules_reach_the_agent_without_treating_hidden_labels_as_visible
     assert "Quote only text the viewer can see" in lanes
     assert "quote only visibly rendered text" in instructions
     assert "hidden accessibility labels and backend logs are not screen evidence" in instructions
+
+
+def test_repro_agent_loads_caption_timing_guidance() -> None:
+    spec = load(_REPRO_AGENT, expand_env=False)
+    assert "Omit unverified opening states and timestamps" in spec.instructions
+    assert "Omit unverified opening states and timings" in _normalized(_DEV / "recording-lanes.md")

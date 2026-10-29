@@ -682,6 +682,8 @@ Declare the inspected captioned MP4, or use the shared guide's explicit
 Follow these rules for each clip:
 
 - Show the user action and the product's response.
+- Omit unverified opening states and timestamps from captions. Pixel similarity
+  does not identify a view; see `dev/recording-lanes.md` for evidence requirements.
 - **Caption the screen from screen evidence.** Check that claimed elements are
   in view and unobstructed, and quote only visibly rendered text. DOM attributes,
   hidden accessibility labels and backend logs are not screen evidence. Disclose
