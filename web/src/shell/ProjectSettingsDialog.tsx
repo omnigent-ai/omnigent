@@ -216,7 +216,10 @@ export function ProjectSettingsDialog({
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
     else delete config.workspace;
-    if (agentId) config.agent_id = agentId;
+    // A last-start agent that no longer exists saves as the stored agent, even
+    // before the fallback effect below has re-rendered the field.
+    const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
+    if (savedAgentId) config.agent_id = savedAgentId;
     else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;
     // while it matches, leave the key unset so the project keeps inheriting
