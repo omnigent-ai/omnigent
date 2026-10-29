@@ -336,9 +336,10 @@ class ClaudeNativeExecutor(Executor):
                 message = f"{message} Cleanup also failed: {cleanup_error}"
             # A launcher that printed a known fatal error before exiting gets
             # the same diagnosis the runner gives a required-terminal exit.
+            exit_status = exc.exit_status
             diagnosis = classify_terminal_failure(
                 command="claude",
-                exit_status=int(exc.exit_status) if (exc.exit_status or "").isdigit() else None,
+                exit_status=int(exit_status) if exit_status and exit_status.isdigit() else None,
                 output=terminal_failure_tail(str(exc)),
             )
             if diagnosis is None:
