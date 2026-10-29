@@ -497,6 +497,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
 ) -> None:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "ambient-token")
     captured: dict[str, Any] = {}
     claude_config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
@@ -576,6 +578,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
+    assert "ANTHROPIC_API_KEY" not in captured["kwargs"]["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["kwargs"]["env"]
 
 
 @pytest.mark.asyncio

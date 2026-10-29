@@ -57,22 +57,32 @@ afterEach(() => {
 });
 
 describe("listScheduledTasks", () => {
-  it("GETs /v1/scheduled-tasks and camelCases the rows", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [TASK_WIRE] }));
-    const tasks = await listScheduledTasks();
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks");
-    expect(tasks).toHaveLength(1);
-    expect(tasks[0]).toMatchObject({
-      id: "st_1",
-      name: "Nightly triage",
-      ownerUserId: "alice",
-      agentId: "ag_1",
-      timezone: "America/New_York",
-      state: "active",
-      hostId: null,
-      workspace: null,
-    });
-  });
+  // Servers that predate task projects omit the key.
+  it.each([
+    ["absent", {}, null],
+    ["present", { project_id: "proj_1" }, "proj_1"],
+  ])(
+    "GETs /v1/scheduled-tasks and camelCases the rows (project %s)",
+    async (_, extra, projectId) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
+      );
+      const tasks = await listScheduledTasks();
+      expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks");
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0]).toMatchObject({
+        id: "st_1",
+        name: "Nightly triage",
+        ownerUserId: "alice",
+        agentId: "ag_1",
+        timezone: "America/New_York",
+        state: "active",
+        hostId: null,
+        workspace: null,
+        projectId,
+      });
+    },
+  );
 
   it("returns [] when the server omits the key", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}));
@@ -117,6 +127,41 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
+      // An older server sends no session read state.
+      conversationUpdatedAt: null,
+      conversationStatus: null,
+      viewerLastSeen: null,
+      viewerUnread: null,
+    });
+  });
+
+  it("maps a run's session read state when the server sends it", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [
+          {
+            id: "run_1",
+            scheduled_task_id: "st_1",
+            status: "succeeded",
+            scheduled_at: 1_700_000_000,
+            conversation_id: "conv_1",
+            fired_at: 1_700_000_005,
+            finished_at: 1_700_000_050,
+            error_code: null,
+            conversation_updated_at: 1_700_000_060,
+            conversation_status: "idle",
+            viewer_last_seen: 1_700_000_055,
+            viewer_unread: false,
+          },
+        ],
+      }),
+    );
+    const [run] = await listScheduledTaskRuns("st_1");
+    expect(run).toMatchObject({
+      conversationUpdatedAt: 1_700_000_060,
+      conversationStatus: "idle",
+      viewerLastSeen: 1_700_000_055,
+      viewerUnread: false,
     });
   });
 });
@@ -162,6 +207,16 @@ describe("createScheduledTask", () => {
     expect(body.host_id).toBe("host_1");
     expect(body.workspace).toBe("/home/me/repo");
   });
+
+  it("sends a project id and omits a null one", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    await createScheduledTask({ ...base, projectId: "proj_1" });
+    await createScheduledTask({ ...base, projectId: null });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0].project_id).toBe("proj_1");
+    expect(bodies[1]).not.toHaveProperty("project_id");
+  });
 });
 
 describe("updateScheduledTask", () => {
@@ -173,6 +228,15 @@ describe("updateScheduledTask", () => {
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body)).toEqual({ state: "paused" });
     expect(updated.state).toBe("paused");
+  });
+
+  it.each([
+    ["moves future runs to a project", "proj_2"],
+    ["sends an explicit null to unfile future runs", null],
+  ])("%s", async (_, projectId) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, project_id: projectId }));
+    await updateScheduledTask("st_1", { projectId });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_id: projectId });
   });
 });
 

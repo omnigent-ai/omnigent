@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 export const HARNESS_MENU_CLASS_NAME =
-  "composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2";
+  "composer-agent-menu max-h-[min(clamp(20rem,40vh,36rem),var(--radix-dropdown-menu-content-available-height))] min-w-[17.5rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2";
 
 export const COMPOSER_HARNESS_MENU_SIZE = "w-[17.5rem]";
 

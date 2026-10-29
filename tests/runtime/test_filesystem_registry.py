@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.runtime.filesystem_registry import (
+    _CURSOR_PLUMBING_PATHS,
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
     GitStatusUnavailable,
@@ -146,18 +147,22 @@ def test_ephemeral_files_are_suppressed(registry: AgentEditFilesystemRegistry) -
         ".main.py.swo",  # vim secondary swap
         "#README.md#",  # Emacs auto-save
     ]
-    for f in ephemeral_files:
+    hidden = [*ephemeral_files, *sorted(_CURSOR_PLUMBING_PATHS)]
+    for f in hidden:
         _inject(registry, f, "created", conv_id)
+    # The user's own .cursor content is not plumbing.
+    _inject(registry, ".cursor/rules/style.md", "created", conv_id)
     _inject(registry, "real_file.md", "created", conv_id)
 
     results = registry.list_changed_files(conv_id, limit=50)
     paths = [r["path"] for r in results]
 
-    # Only the real file should appear.
-    assert paths == ["real_file.md"], (
-        f"Expected only 'real_file.md', got {paths}. "
-        "Ephemeral process-artifact files must be suppressed by record_change."
+    assert sorted(paths) == [".cursor/rules/style.md", "real_file.md"], (
+        f"Expected only the real files, got {paths}. "
+        "Ephemeral artifacts and Omnigent's .cursor plumbing must be suppressed."
     )
+    for f in hidden:
+        assert registry.get_changed_file(conv_id, f) is None, f
 
 
 def test_created_modified_multiple_times_stays_added(
@@ -502,19 +507,22 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
         ".main.py.swo",
         "#README.md#",
     ]
-    for file_path in ephemeral_files:
+    hidden = [*ephemeral_files, *sorted(_CURSOR_PLUMBING_PATHS)]
+    (tmp_path / ".cursor" / "rules").mkdir(parents=True)
+    for file_path in hidden:
         (tmp_path / file_path).write_text("temporary artifact")
+    (tmp_path / ".cursor" / "rules" / "style.md").write_text("user rule")
     (tmp_path / "real_change.py").write_text("agent wrote this")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     results = reg.list_changed_files("any-conv", limit=100)
 
     paths = [r["path"] for r in results]
-    assert paths == ["real_change.py"], (
-        f"Expected only 'real_change.py', got {paths}. "
-        "Git-backed changed files should suppress temp/editor artifacts."
+    assert sorted(paths) == [".cursor/rules/style.md", "real_change.py"], (
+        f"Expected only the real files, got {paths}. "
+        "Git-backed changed files should suppress temp/editor artifacts and .cursor plumbing."
     )
-    for file_path in ephemeral_files:
+    for file_path in hidden:
         result = reg.get_changed_file("any-conv", file_path)
         assert result is None, (
             f"Expected get_changed_file to hide {file_path!r}, got {result!r}. "
@@ -524,6 +532,34 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
     real_result = reg.get_changed_file("any-conv", "real_change.py")
     assert real_result is not None
     assert real_result["status"] == "created"
+
+
+def test_cursor_plumbing_allowlist_matches_the_launchers(tmp_path: Path, monkeypatch) -> None:
+    """The hidden paths are exactly the files the Cursor launchers write into a workspace."""
+    from omnigent.harnesses.cursor_native import bridge
+    from omnigent.inner.cursor_executor import _write_cursor_hooks
+    from omnigent.native import native_policy_hook
+
+    # Stub the launchers' side effects outside the workspace: the relay token
+    # dir, the real ~/.cursor config, and credential discovery for the hook wrapper.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.setattr(bridge, "write_mcp_bridge_config", lambda bridge_dir: None)
+    monkeypatch.setattr(bridge, "enable_mcp_for_workspace", lambda workspace: None)
+    monkeypatch.setattr(bridge, "allow_mcp_tools_in_cli_config", lambda: None)
+    monkeypatch.setattr(
+        native_policy_hook, "policy_hook_wrapper_script", lambda *args: "#!/bin/sh\n"
+    )
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    bridge.write_mcp_config(workspace, tmp_path / "bridge")
+    bridge.write_hooks_config(workspace, tmp_path / "bridge")
+    _write_cursor_hooks(str(workspace), "/opt/omnigent/hook.py", "http://127.0.0.1:6767", "conv_1")
+
+    written = {p.relative_to(workspace).as_posix() for p in workspace.rglob("*") if p.is_file()}
+    assert written == _CURSOR_PLUMBING_PATHS, (
+        f"The Cursor launchers now write {sorted(written)}; keep _CURSOR_PLUMBING_PATHS in step."
+    )
 
 
 def test_git_list_changed_files_raises_on_timeout(tmp_path: Path, monkeypatch) -> None:
