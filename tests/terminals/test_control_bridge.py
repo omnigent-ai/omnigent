@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -218,6 +219,20 @@ async def _kill_tmux(sock: Path) -> None:
         )
         await proc.communicate()
     shutil.rmtree(sock.parent, ignore_errors=True)
+
+
+async def _capture_when(
+    sock: Path, target: str, ready: Callable[[bytes], bool], timeout_s: float = 15
+) -> bytes:
+    """Capture the pane until *ready* accepts it; the shell writes on its own schedule."""
+    from omnigent.terminals.control_bridge import _run_tmux_capture
+
+    seed = b""
+    async with asyncio.timeout(timeout_s):
+        while not ready(seed):
+            await asyncio.sleep(0.05)
+            seed = await _run_tmux_capture(str(sock), target) or b""
+    return seed
 
 
 async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
@@ -616,10 +631,9 @@ async def test_seed_full_height_pane_does_not_scroll_or_shift_cursor() -> None:
 @pytest.mark.asyncio
 async def test_seed_recovers_primary_screen_scrollback() -> None:
     """On the primary screen the seed captures full history, not just the screen."""
-    from omnigent.terminals.control_bridge import _run_tmux_capture
-
     sock, target = await _new_private_tmux("bash --norc")
-    await asyncio.sleep(0.2)
+    # Type only once bash shows its prompt.
+    await _capture_when(sock, target, lambda seed: b"$" in seed or b"#" in seed)
     tmux = shutil.which("tmux")
     assert tmux
     # Emit 100 history lines — far more than the 24-row visible screen.
@@ -638,10 +652,8 @@ async def test_seed_recovers_primary_screen_scrollback() -> None:
         tmux, "-S", str(sock), "send-keys", "-t", target, "Enter"
     )
     await proc.communicate()
-    await asyncio.sleep(0.6)
     try:
-        seed = await _run_tmux_capture(str(sock), target)
-        assert seed is not None
+        seed = await _capture_when(sock, target, lambda seed: b"hist-100" in seed)
         # Full history recovered (a visible-only capture would show ~23 lines).
         assert seed.count(b"hist-") >= 100, (
             f"scrollback not recovered: only {seed.count(b'hist-')} history lines"

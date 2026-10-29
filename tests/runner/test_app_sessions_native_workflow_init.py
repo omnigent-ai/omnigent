@@ -2474,6 +2474,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     resolver_entered = asyncio.Event()
     release_resolver = asyncio.Event()
     resolver_calls = 0
+    resource_registry = SessionResourceRegistry(terminal_registry=None)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         nonlocal resolver_calls
@@ -2487,7 +2488,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
         process_manager=pm,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=server_client,  # type: ignore[arg-type]
-        resource_registry=SessionResourceRegistry(terminal_registry=None),
+        resource_registry=resource_registry,
     )
     session_id = "initv2_8e32600337d08f59ad381caf96a90659"
     agent_id = "agentv2_880b5afda28ad55ff74cbeb9b5fc67fb"
@@ -2505,7 +2506,7 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
                 "created_at": 1234,
                 "updated_at": 1234,
                 "workspace": None,
-                "labels": {},
+                "labels": {"omnigent.client_surface": "desktop"},
             },
         },
     }
@@ -2523,6 +2524,9 @@ async def test_create_session_envelope_is_single_flight_and_skips_metadata_callb
     assert first_response.json()["session_init_protocol_version"] == 2
     assert resolver_calls == 1
     assert len(pm.get_client_calls) == 1
+    assert resource_registry.client_surface_env(session_id) == {
+        "OMNIGENT_CLIENT_SURFACE": "desktop"
+    }
     # The envelope supplies session metadata, so the only snapshot-style
     # callback is the history read; restart recovery adds one read of the
     # durable child-session list, which is empty here.

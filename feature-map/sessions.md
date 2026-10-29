@@ -67,7 +67,8 @@ the header menu), and each place is a separate entry point.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
   For a native target, the fork dialog also offers model, reasoning effort,
-  and permission mode pickers.
+  and permission mode pickers. A long model list from several creators (Pi)
+  shows creator headings; it has no search or collapsible groups.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
@@ -266,13 +267,18 @@ when the live lookup has none, with its age once that state is over five
 minutes old. With the flag off, the funnel sits on the Sessions header and
 offers Display only.
 
-**Offline pull requests:** link a PR to a session, then stop its host. The
-session's Pull Requests tab still lists the PR with its title, link, and status,
-plus "Last sync time" and a note to reconnect the host (or, for a sleeping
-sandbox, to send a message). Link a PR is disabled; Unlink PR still works, and
-the server keeps the unlink. A session whose PRs the server hasn't imported yet
-says so instead. Against servers that predate stored PRs, the tab behaves as it
-did before and unlinking needs the host.
+**Offline pull requests:** link PRs to a session, then stop its host. Open the
+Pull Requests tab from the Workspace rail or composer (desktop and mobile).
+On phones, Refresh and Link sit beside Close in the single drawer header;
+in details, the header title becomes the back-to-list button.
+The list retains stored titles and status pills; each row shows **Host offline**
+(or **Sandbox asleep**) instead of checks and Merge. Hover or focus that notice
+for the last sync time and reconnect guidance. Click a row for its stored summary,
+then **All pull requests** to return. The row menu can open, copy, or unlink the
+PR while offline; linking needs the host. Reconnect and verify live checks and
+merge controls return. Unlink the last PR and verify it stays absent after refresh.
+A session not yet imported to the server says so. Older servers retain their
+host-dependent unlink behavior.
 
 **Canvas:** choose Canvas in the sidebar, select Main or a project, and click
 a session card once. Expand navigation manually to keep it open while switching
@@ -388,6 +394,13 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
+With Settings → General → **Open sub-agents in the Workspace panel** on, a
+plain click on a sub-agent (transcript link, composer indicator, Agents row or
+graph node) opens it as a tab in the same strip, marked with a bot icon, and
+reveals the panel; ancestors still open full screen. The tab's **Open full
+screen** link opens the sub-agent's own page. Claude Code and closed sub-agents
+are read-only there too. Closing a sub-agent tab only hides it; the sub-agent
+keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.

@@ -655,6 +655,16 @@ Cross-harness journeys:
   relative settings must survive relocation of the agent root, including a
   relative custom root. Existing context/prompt opt-outs remain independent.
   This is not Claude marketplace or Managed deployment coverage.
+- **`auth-recovery`, Pi token commands (component/process boundaries):**
+  With a positive configured auth refresh interval, warm and renew tokens in the
+  session workspace, even when the runner starts elsewhere. Relative token files
+  must keep working after renewal. Discard caches created in another directory
+  or before directory tracking was added.
+  `tests/runner/test_app_pi_native_model.py::test_auto_create_pi_terminal_threads_spec_model_into_models_json`
+  drives startup and renewal with real helpers and a stubbed terminal launcher;
+  `tests/harnesses/pi_native/test_pi_native_auth_refresh.py` covers cache rejection,
+  failed refreshes and cleanup. These checks do not establish browser, sandbox
+  or live-gateway acceptance.
 - **`resume`, Pi cost reporting (component boundaries):**
   `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
   dollars, duplicate callbacks, local/server restart baselines and missing pricing.

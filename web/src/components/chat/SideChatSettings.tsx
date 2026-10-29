@@ -200,6 +200,7 @@ export function SideChatSettings({
                     });
                   },
                   data: { "data-model-id": option.id },
+                  modelOption: option,
                 })),
               }
             : undefined

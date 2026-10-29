@@ -898,6 +898,52 @@ async def test_wait_until_ready_fails_at_once_when_the_process_exited(tmp_path: 
     assert not isinstance(excinfo.value, codex_native_app_server.CodexAppServerSilentStartTimeout)
 
 
+async def test_wait_until_ready_names_a_missing_model_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exit over an undefined model provider is a config error naming its table."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "user-codex"
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = ["Error: Model provider `Databricks` not found"]
+
+    with pytest.raises(codex_native_app_server.CodexModelProviderMissingError) as excinfo:
+        await server._wait_until_ready()
+
+    assert isinstance(excinfo.value, RuntimeError)
+    assert excinfo.value.code == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert excinfo.value.provider == "Databricks"
+    assert "[model_providers.Databricks]" in excinfo.value.message
+    assert str(source_home / "config.toml") in excinfo.value.message
+    assert "`omnigent setup`" in excinfo.value.message
+
+
+async def test_wait_until_ready_keeps_legacy_profile_provider_errors_generic(
+    tmp_path: Path,
+) -> None:
+    """The legacy-profile form of the message has another remedy, so it stays generic."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = [
+        "Error: error loading default config after config error: "
+        "Model provider `Databricks` not found"
+    ]
+
+    with pytest.raises(RuntimeError, match="exited early") as excinfo:
+        await server._wait_until_ready()
+
+    assert not isinstance(excinfo.value, codex_native_app_server.CodexModelProviderMissingError)
+
+
 async def test_standalone_hook_trust_closes_client_when_connect_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

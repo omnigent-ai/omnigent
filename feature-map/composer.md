@@ -39,9 +39,19 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Ctrl+Shift+M opens it in both composers.
   Hovering a row shows the model ID it launches, except when the label already
   shows it and on the Fusion row.
+  A catalog of ten or more models adds a search box above the list that stays
+  visible while scrolling. When it spans several creators, models group under
+  collapsible headings with counts (Anthropic, OpenAI, Google, Moonshot AI,
+  Z.ai, ..., Other models), and the selected model's group opens. The heading
+  names who made the model, not who hosts it: Claude on Bedrock is Anthropic,
+  GLM on Databricks is Z.ai. Search matches names, IDs, and creators and shows
+  matches inside collapsed groups. Same-named rows from different hosts show
+  the host. Shorter or single-creator catalogs stay a flat list.
   States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model),
-  a managed sandbox launching before its host is bound (its provider's default catalog).
+  a managed sandbox launching before its host is bound (its provider's default catalog),
+  long mixed catalog (grouped), search with no matches, unidentified models
+  (Other models).
   Equivalent model-ID spellings use the catalog's display name consistently,
   including case, gateway-prefix, and version-punctuation differences; context
   variants keep their own labels and checked rows, including in side chats.
@@ -434,6 +444,17 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`model-picker`, row hover (both composers):** no browser-level coverage;
   `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
   a family name and expect its full model ID; the Fusion row shows none.
+- **`model-picker`, long mixed catalog:** in session,
+  `tests/browser_ui/chat/test_model_catalog.py::test_long_catalog_groups_by_creator_and_searches_by_keyboard`
+  opens on the selected creator, keeps the height cap and search while
+  scrolling, and picks a model in a collapsed group by keyboard. Creator
+  attribution is in `web/src/lib/modelCreators.test.ts`; grouping, search,
+  and keyboard cases for every composer are in
+  `web/src/components/composer/ComposerConfigSections.test.tsx`. The mock
+  environment has no long multi-creator catalog, so check the new-session
+  composer and side chat manually: pick Pi on a host whose Pi lists models
+  from several labs, open its configuration, expand a creator, search for
+  another creator's model, and pick it.
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -758,6 +779,10 @@ Other connection providers alone do not enable the managed MCP picker.
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
   catalogs need real CLIs or credentials.
+- Creator groups appear only for ten or more models from at least two
+  creators, so Claude and Codex catalogs normally stay flat. A model whose IDs
+  don't name a known creator (a router alias such as Pi's `radius/balanced`)
+  lands in Other models; that is expected, not a missing catalog.
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.
