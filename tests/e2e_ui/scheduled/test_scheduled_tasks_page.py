@@ -687,8 +687,8 @@ def test_scheduled_task_edit_switches_the_harness(
     expect(agent_trigger).to_contain_text("Codex", timeout=30_000)
     agent_trigger.click()
     expect(agent_trigger).to_have_attribute("aria-expanded", "true")
-    expect(page.get_by_role("menuitem", name="Codex", exact=True)).to_be_focused()
-    page.get_by_role("menuitem").filter(has_text="Claude Code").click()
+    expect(page.get_by_test_id(f"new-chat-landing-agent-{codex_agent_id}")).to_be_focused()
+    page.get_by_test_id(f"new-chat-landing-agent-{claude_agent_id}").click()
     expect(agent_trigger).to_contain_text("Claude Code")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
