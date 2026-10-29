@@ -1931,3 +1931,36 @@ async def test_selector_owns_the_arrow_keys_while_open() -> None:
     assert _active("Keys.Up") == "_picker_prev"
     host.dismiss_questions()
     await asking
+
+
+@pytest.mark.asyncio
+async def test_editor_question_leaves_the_arrows_to_its_text() -> None:
+    # No rows to move through, so Up/Down must move the cursor in a
+    # multi-line prefill instead of being swallowed.
+    host = TerminalHost(model_name="test")
+    asking = asyncio.create_task(
+        host.ask_questions([_env_question(options=(), text_default="line one\nline two")])
+    )
+    await asyncio.sleep(0)
+    picker_keys = {"_picker_prev", "_picker_next"}
+    active = {
+        b.handler.__name__
+        for b in host._kb.bindings
+        if [str(k) for k in b.keys] in (["Keys.Up"], ["Keys.Down"]) and b.filter()
+    }
+    assert not active & picker_keys
+    host.dismiss_questions()
+    await asking
+
+
+@pytest.mark.asyncio
+async def test_question_with_options_ignores_a_prefill() -> None:
+    # A prefill would read as typing and move the highlight to "Type
+    # something"; only option-less (editor) questions start prefilled.
+    host = TerminalHost(model_name="test")
+    buffer = host._prompt.default_buffer
+    asking = asyncio.create_task(host.ask_questions([_env_question(text_default="draft")]))
+    await asyncio.sleep(0)
+    assert buffer.text == ""
+    host._answer_question(buffer)
+    assert await asking == {"Env?": "dev"}

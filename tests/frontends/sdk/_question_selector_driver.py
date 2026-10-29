@@ -14,6 +14,7 @@ Run directly with ``python _question_selector_driver.py <history-file>``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
 from typing import Any
@@ -64,6 +65,8 @@ async def _main(history_file: str) -> None:
             await host.run(_chat)
         finally:
             asker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asker
 
 
 if __name__ == "__main__":

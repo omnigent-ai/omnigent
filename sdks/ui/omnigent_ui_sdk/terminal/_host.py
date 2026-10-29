@@ -1152,15 +1152,19 @@ class TerminalHost:
                 event.app.exit(result=_SUBAGENT_SELECT_SENTINEL + root)
 
         # ── Inline question selector ──────────────────────────────
-        # While open it owns Up/Down (instead of history) and Space on a
-        # multi-select option; Enter and Esc are handled above.
+        # While open it owns Up/Down (instead of history) when the question
+        # has rows, and Space on a multi-select option; Enter and Esc are
+        # handled above. An editor question keeps the arrows for its text.
         _picker_open = Condition(lambda: self._question_picker is not None)
+        _picker_rows = Condition(
+            lambda: self._question_picker is not None and self._question_picker.row_count() > 0
+        )
 
-        @self._kb.add("up", filter=_picker_open)
+        @self._kb.add("up", filter=_picker_rows)
         def _picker_prev(event: KeyPressEvent) -> None:
             self._move_question_highlight(-1)
 
-        @self._kb.add("down", filter=_picker_open)
+        @self._kb.add("down", filter=_picker_rows)
         def _picker_next(event: KeyPressEvent) -> None:
             self._move_question_highlight(1)
 
@@ -3642,7 +3646,7 @@ class TerminalHost:
         picker = QuestionPicker(questions)
         self._close_subagent_menu()
         self._question_picker = picker
-        buffer.text = picker.current.text_default or ""
+        buffer.text = picker.prefill
         buffer.cursor_position = len(buffer.text)
         self._invalidate_prompt()
         try:
@@ -3694,7 +3698,7 @@ class TerminalHost:
         self._pasted_blocks = []
         if not picker.future.done():
             # Next question: start its input line fresh (or with its prefill).
-            buffer.text = picker.current.text_default or ""
+            buffer.text = picker.prefill
             buffer.cursor_position = len(buffer.text)
         self._invalidate_prompt()
 

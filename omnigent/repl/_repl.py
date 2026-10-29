@@ -1109,18 +1109,16 @@ def _question_prompts(payload: object) -> list[QuestionSpec]:
         if not isinstance(raw, dict):
             return []
         text = raw.get("question")
-        raw_options = raw.get("options") or []
+        raw_options = raw.get("options", [])
         if not isinstance(text, str) or not text or not isinstance(raw_options, list):
             return []
         options: list[tuple[str, str]] = []
         for option in raw_options:
-            if isinstance(option, str) and option:
-                options.append((option, ""))
-            elif isinstance(option, dict) and isinstance(option.get("label"), str):
-                description = option.get("description")
-                options.append(
-                    (option["label"], description if isinstance(description, str) else "")
-                )
+            label = option.get("label") if isinstance(option, dict) else option
+            if not isinstance(label, str) or not label:
+                return []  # a malformed option: the question can't be shown faithfully
+            description = option.get("description") if isinstance(option, dict) else ""
+            options.append((label, description if isinstance(description, str) else ""))
         text_input = raw.get("textInput")
         default = text_input.get("default") if isinstance(text_input, dict) else None
         allow_custom = raw.get("isOther") is not False
@@ -1560,9 +1558,9 @@ class _SessionsChatReplAdapter:
         # second prompt would otherwise take it from the first.
         self._prompt_lock = asyncio.Lock()
         # Elicitation whose prompt holds ``_prompt_lock`` (shown to the user),
-        # and the session it resolves against.
+        # and the session whose stream (and snapshot) it arrived on.
         self._open_elicitation_id: str | None = None
-        self._open_elicitation_session: str | None = None
+        self._open_elicitation_stream: str | None = None
         self._replay_task: asyncio.Task[None] | None = None
         self._host = host
         self._fmt = fmt
@@ -2878,12 +2876,14 @@ class _SessionsChatReplAdapter:
             if elicitation_id in self._resolved_elicitation_ids:
                 return
             self._open_elicitation_id = elicitation_id
-            self._open_elicitation_session = session_id
+            # Not ``session_id``: a mirrored child prompt resolves against the
+            # child but is listed in the parent stream's snapshot.
+            self._open_elicitation_stream = self._session_id
             try:
                 resolve_payload = await self._collect_verdict(event, elicitation_id)
             finally:
                 self._open_elicitation_id = None
-                self._open_elicitation_session = None
+                self._open_elicitation_stream = None
         if resolve_payload is None:
             return  # another client answered it
         delivered = False
@@ -2952,8 +2952,7 @@ class _SessionsChatReplAdapter:
                 if not _is_recoverable_sse_transport_error(exc):
                     raise
                 if attempt == 2:
-                    # No exc_info on the WARNING: with no handlers configured,
-                    # ``logging.lastResort`` would paint a traceback over the TUI.
+                    # Details are logged at DEBUG.
                     _log.warning("Could not resolve elicitation after transport retries")
                     _log.debug("elicitation resolve failed", exc_info=exc)
                     # The elicitation is still parked server-side, so the
@@ -2990,9 +2989,9 @@ class _SessionsChatReplAdapter:
         if self._on_event is None:
             return
         open_before = self._open_elicitation_id
-        # Only this session's snapshot can show its own prompt settled: a
-        # child's snapshot never lists the parent's prompts.
-        open_here = self._open_elicitation_session == session_id
+        # Only the snapshot of the stream the prompt arrived on lists it (with
+        # its descendants'); a child's snapshot never lists the parent's.
+        open_here = self._open_elicitation_stream == session_id
         try:
             snapshot = await self._client.sessions.get(session_id)
         except Exception:  # noqa: BLE001

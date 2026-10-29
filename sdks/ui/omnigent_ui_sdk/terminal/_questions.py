@@ -64,6 +64,12 @@ class QuestionPicker:
         """The question being asked."""
         return self.questions[self.index]
 
+    @property
+    def prefill(self) -> str:
+        """Input-line text to start the current question with: an editor's prefill."""
+        question = self.current
+        return (question.text_default or "") if not question.options else ""
+
     def row_count(self) -> int:
         """Selectable rows: the options plus the "Type something" row when allowed."""
         question = self.current

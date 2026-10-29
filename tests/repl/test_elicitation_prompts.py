@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
+import pytest
 from omnigent_client import StreamHooks
 
 from omnigent.repl._repl import (
@@ -156,6 +157,9 @@ def test_one_unanswerable_question_rejects_the_batch() -> None:
     valid = {"question": "Env?", "options": ["dev"]}
     for unusable in (
         {"question": "Q?", "options": 1},
+        {"question": "Q?", "options": {}},
+        {"question": "Q?", "options": ["dev", 1]},
+        {"question": "Q?", "options": [{"label": ""}], "isOther": False},
         {"question": "Q?", "options": [], "isOther": False},
         {"question": "", "options": ["x"]},
         "not-a-question",
@@ -423,9 +427,14 @@ def test_replay_feeds_pending_prompts_through_the_live_path() -> None:
     assert seen[0].elicitation_id == "elicit_q"
 
 
-def test_replay_releases_an_open_prompt_settled_while_disconnected() -> None:
+@pytest.mark.parametrize(
+    "resolve_target", ["conv_abc", "conv_child"], ids=["own-prompt", "mirrored-child-prompt"]
+)
+def test_replay_releases_an_open_prompt_settled_while_disconnected(resolve_target: str) -> None:
     # Its resolved event was missed, so without reconciling it would hold the
     # prompt lock until the user answered a prompt that is already settled.
+    # A child's prompt mirrored into this stream resolves against the child,
+    # but this stream's snapshot is the one that lists it.
     from omnigent.server.schemas import ElicitationResolvedEvent
 
     adapter, host, _, client, _ = _adapter()
@@ -443,7 +452,7 @@ def test_replay_releases_an_open_prompt_settled_while_disconnected() -> None:
 
     async def _run_case() -> None:
         open_a = asyncio.create_task(
-            adapter._handle_elicitation("conv_abc", _question_event("elicit_a"))
+            adapter._handle_elicitation(resolve_target, _question_event("elicit_a"))
         )
         await _until(lambda: host.selector_open, "prompt A never opened")
         await adapter._replay_pending_elicitations("conv_abc")
