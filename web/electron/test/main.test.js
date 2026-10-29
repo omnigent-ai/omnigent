@@ -5384,6 +5384,26 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, []);
   });
 
+  // Run on Arca replaces SSH connect where it is offered: the internal flag on a managed server.
+  const managed = "https://workspace.cloud.databricks.com/omnigent";
+  const arcaCases = {
+    "an internal laptop on a Databricks server, which offers Run on Arca": [managed, true, false],
+    "any other laptop on a Databricks server": [managed, false, true],
+    "an internal laptop on a self-hosted server": [server, true, true],
+  };
+  for (const [label, [serverUrl, internalFeatures, connects]] of Object.entries(arcaCases)) {
+    it(`${connects ? "connects" : "refuses"} for ${label}`, async (t) => {
+      const h = sshHarness(t, { serverUrl, internalFeatures });
+      const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+      const result = await h.ipc.get("omnigent:ssh-connect")(event, "devbox");
+
+      assert.equal(result.ok, connects);
+      assert.equal(h.calls.sshConnects.length, connects ? 1 : 0);
+      if (!connects) assert.match(result.error, /Use Run on Arca instead/);
+    });
+  }
+
   it("gives no page a way to list the user's SSH hosts", (t) => {
     // Aliases can name internal machines, and the server page is untrusted.
     const h = sshHarness(t);

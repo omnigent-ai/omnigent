@@ -62,7 +62,8 @@ be able to write resources without a separate Omnigent account.
   installing omnigent when it is missing, finishing in the browser, connected
   (the new host selected), already connected, closing the window mid sign-in
   (nothing left running on the machine), and failures, shown only in the app's
-  own window.
+  own window. Hidden where **Run on Arca** is offered (the Databricks-internal
+  flag on a Databricks-managed server).
 - `embedded-resource-write`: an identity from a custom `AuthProvider` can
   create, rename, and reorder its own projects; unauthenticated and other users
   remain restricted.

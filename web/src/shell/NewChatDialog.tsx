@@ -290,10 +290,9 @@ import {
   hasDbcertPreflightBridge,
   isElectronShell,
   onHostStatusChanged,
-  supportsSshConnect,
   type HostIdentity,
 } from "@/lib/nativeBridge";
-import { SshConnectForm } from "./SshConnectForm";
+import { SshConnectForm, useSshConnectAvailable } from "./SshConnectForm";
 import {
   fetchUserAgents,
   USER_AGENTS_QUERY_KEY,
@@ -540,6 +539,7 @@ export function ConnectHostInstructions({
   // hints) until known, so the clean UI shows first and lakebox never flashes.
   const databricksFeatures = info !== "loading" && info.databricks_features;
   const quotedServerUrl = quoteShellArgument(serverUrl);
+  const sshConnectAvailable = useSshConnectAvailable();
   return (
     <div className="flex flex-col gap-4 rounded-lg border border-dashed border-border p-4">
       {label && <p className="text-sm text-muted-foreground">{label}</p>}
@@ -576,7 +576,7 @@ export function ConnectHostInstructions({
           testIdPrefix="connect-host"
         />
       )}
-      {supportsSshConnect() && <SshConnectForm onConnected={onSshConnected} />}
+      {sshConnectAvailable && <SshConnectForm onConnected={onSshConnected} />}
     </div>
   );
 }

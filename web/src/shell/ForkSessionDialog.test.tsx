@@ -1450,7 +1450,7 @@ describe("ForkSessionDialog", () => {
       try {
         renderDialog(CODING);
         fireEvent.click(screen.getByTestId("fork-session-connect-host-toggle"));
-        fireEvent.change(screen.getByTestId("ssh-connect-destination"), {
+        fireEvent.change(await screen.findByTestId("ssh-connect-destination"), {
           target: { value: "devbox" },
         });
         fireEvent.click(screen.getByTestId("ssh-connect-submit"));

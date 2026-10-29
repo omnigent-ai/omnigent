@@ -4887,6 +4887,11 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    // Where Run on Arca is offered, it replaces this path. Re-checked here: the
+    // server's own page decides what it shows.
+    if (databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)) {
+      return { ok: false, error: "Connecting over SSH is off here. Use Run on Arca instead." };
+    }
     let target;
     try {
       target = sshConnect.validateDestination(destination);
