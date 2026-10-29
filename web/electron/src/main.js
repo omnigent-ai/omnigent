@@ -21,6 +21,7 @@ const {
   Notification,
   clipboard,
   dialog,
+  globalShortcut,
   ipcMain,
   nativeImage,
   nativeTheme,
@@ -119,6 +120,7 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const { createQuitConfirmation } = require("./quitConfirmation");
+const { createGlobalShowShortcut } = require("./globalShowShortcut");
 const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
@@ -1613,6 +1615,24 @@ const quitConfirmation = createQuitConfirmation({
       ? dialog.showMessageBox(parent, options)
       : dialog.showMessageBox(options),
   quit: () => app.quit(),
+});
+
+// "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
+// come forward from another app.
+const globalShowShortcut = createGlobalShowShortcut({
+  globalShortcut,
+  loadSettings,
+  saveSettings,
+  show: () => {
+    const win = activeWindow();
+    if (!win) {
+      createWindow();
+      return;
+    }
+    if (win.isMinimized()) win.restore();
+    win.focus();
+    if (process.platform === "darwin") app.focus({ steal: true });
+  },
 });
 
 // Shell-owned About window: available from the native application menu even
@@ -4626,6 +4646,20 @@ function registerIpc() {
     return true;
   });
 
+  // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
+  ipcMain.handle("omnigent:get-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("get-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.current();
+  });
+  ipcMain.handle("omnigent:set-global-shortcut", (event, setting) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("set-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.set(setting);
+  });
+
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
   // app-wide badge shown is the sum across windows (see updateBadge), so two
   // windows on different servers don't clobber each other's counts.
@@ -5734,6 +5768,7 @@ if (!gotLock) {
     registerSessionExpiryAccess();
     registerIpc();
     buildMenu();
+    globalShowShortcut.apply();
     // Patch PATH for GUI-launched Electron on macOS/Linux:
     // A desktop launcher inherits a minimal system PATH that omits directories like
     // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
@@ -5779,6 +5814,7 @@ if (!gotLock) {
     });
   });
 
+  app.on("will-quit", () => globalShortcut.unregisterAll());
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();

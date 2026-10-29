@@ -358,6 +358,38 @@ describe("SettingsPage", () => {
     }
   });
 
+  it("offers the desktop shortcut only when the shell has both of its calls", async () => {
+    const getGlobalShortcut = vi
+      .fn()
+      .mockResolvedValue({ enabled: false, accelerator: "Alt+Space" });
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    // An older shell can read the shortcut but not save it.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut,
+    };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut,
+      setGlobalShortcut: vi.fn(),
+    };
+    renderPage("/settings/general");
+    expect(
+      await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
+    ).toBeInTheDocument();
+  });
+
   it("renders session auto-rename enabled by default", async () => {
     renderPage("/settings/general");
 
