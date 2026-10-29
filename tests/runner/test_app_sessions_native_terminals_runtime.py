@@ -2350,6 +2350,9 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cold bridge does not block dispatch or strand a cancelled worker."""
+    from omnigent.runner.slow_io import run_slow_io
+    from tests._helpers.polling import poll_until_async
+
     session_id = uuid.uuid4().hex
     # claude-native pins the bridge tree under /tmp (see _ensure_secure_dir);
     # use the real per-user bridge dir like tests/runner/test_comment_relay.py
@@ -2407,7 +2410,16 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
 
+    slow_release = threading.Event()
+    slow_started = [threading.Event() for _ in range(4)]
+
+    def hold_slow_worker(started: threading.Event) -> None:
+        started.set()
+        slow_release.wait(budget(30))
+
+    slow_jobs = [asyncio.create_task(run_slow_io(hold_slow_worker, e)) for e in slow_started]
     try:
+        await poll_until_async(lambda: all(e.is_set() for e in slow_started), timeout_s=budget(5))
         async with _runner_client(app) as client:
             resp = await client.post(
                 f"/v1/sessions/{session_id}/events",
@@ -2456,6 +2468,8 @@ async def test_claude_native_first_turn_not_blocked_by_cold_bridge_notify(
                 "cancelling the notification task left its readiness worker running"
             )
     finally:
+        slow_release.set()
+        await asyncio.gather(*slow_jobs)
         # Release a worker after a failed assertion, without masking a broken cancel path.
         if cancellation_event is not None:
             cancellation_event.set()

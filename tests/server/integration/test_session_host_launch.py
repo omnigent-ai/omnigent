@@ -184,20 +184,20 @@ async def _connect_host(app: FastAPI) -> ApplicationCommunicator:
 async def _wait_for_runner_connect_waiter(
     app: FastAPI,
     runner_id: str,
-    *,
-    timeout_s: float = 1.0,
 ) -> None:
     """Wait until the app registry has a connect waiter for a runner.
+
+    The wait is a scaled ``budget`` hang guard: a loaded ``-n 4`` CI worker
+    can take over a second to route the POST to its connect grace wait.
 
     :param app: FastAPI app whose ``state.tunnel_registry`` is under
         test.
     :param runner_id: Runner id expected to have one waiter, e.g.
         ``"runner_token_abc123"``.
-    :param timeout_s: Maximum seconds to wait, e.g. ``1.0``.
     :returns: None.
-    :raises AssertionError: If no waiter appears before the timeout.
+    :raises AssertionError: If no waiter appears before the budget expires.
     """
-    deadline = time.monotonic() + timeout_s
+    deadline = time.monotonic() + budget(5.0)
     while time.monotonic() < deadline:
         if app.state.tunnel_registry.connect_waiter_count(runner_id) > 0:
             return
@@ -2136,7 +2136,7 @@ async def test_message_relaunch_resolves_runner_client_that_misses_after_connect
         launch = await _serve_one_launch(comm, launch_status="launched")
         runner_id = token_bound_runner_id(launch.binding_token)
         relaunched.append(runner_id)
-        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        await _wait_for_runner_connect_waiter(app, runner_id)
         app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
         response = await asyncio.wait_for(post, budget(10.0))
     finally:
@@ -2714,7 +2714,7 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         release_spawn.set()
         response = await asyncio.wait_for(create, budget(5.0))
         assert response.status_code == 201, response.text
-        await _wait_for_runner_connect_waiter(app, runner_id, timeout_s=budget(5.0))
+        await _wait_for_runner_connect_waiter(app, runner_id)
         app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
         response = await asyncio.wait_for(post, budget(5.0))
         assert response.status_code < 300, response.text

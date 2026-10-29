@@ -41,6 +41,12 @@ import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import {
+  askUserQuestionSignature,
+  clearAskUserQuestionDraft,
+  getAskUserQuestionDraft,
+  saveAskUserQuestionDraft,
+} from "@/lib/askUserQuestionDrafts";
+import {
   clearSessionDrafts,
   getSessionDraft,
   promoteSessionDraft,
@@ -1430,6 +1436,7 @@ describe("chatStore — switchTo", () => {
     expect(cardOf("conv_vis_elic")[0]!.status).toBe("pending");
 
     // Background it, then the prompt is answered on another surface.
+    saveRegionDraft("elic_vis");
     await useChatStore.getState().switchTo("conv_vis_other");
     seedPendingElicitations("conv_vis_elic", []);
 
@@ -1442,6 +1449,7 @@ describe("chatStore — switchTo", () => {
     expect(reconciled).toHaveLength(1);
     expect(reconciled[0]!.status).toBe("responded");
     expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
+    expect(getAskUserQuestionDraft("elic_vis", regionSignature)).toBeDefined();
   });
 
   it("does not abort a conversation's stream when switching away", async () => {
@@ -10649,6 +10657,26 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
   });
 });
 
+const regionSignature = askUserQuestionSignature([
+  { question: "Pick a region", options: [], multiSelect: false },
+]);
+const savedRegionDrafts = new Set<string>();
+
+afterEach(() => {
+  for (const elicitationId of savedRegionDrafts) clearAskUserQuestionDraft(elicitationId);
+  savedRegionDrafts.clear();
+});
+
+function saveRegionDraft(elicitationId: string): void {
+  savedRegionDrafts.add(elicitationId);
+  saveAskUserQuestionDraft(elicitationId, regionSignature, {
+    currentIndex: 0,
+    selections: { "Pick a region": "" },
+    customSelected: { "Pick a region": true },
+    customInputs: { "Pick a region": "eu-west" },
+  });
+}
+
 function elicitationBlock(id: string): ElicitationBlock {
   return {
     type: "elicitation",
@@ -10725,6 +10753,25 @@ describe("chatStore — submitApproval", () => {
       status: "pending",
       nativeDelivery: { state: "unconfirmed", attempt: "retry-1", action: "decline" },
     });
+  });
+
+  it("keeps an AskUserQuestion draft until the server accepts the verdict", async () => {
+    useChatStore.setState({ conversationId: "conv_abc", blocks: [elicitationBlock("elic_ask")] });
+    saveRegionDraft("elic_ask");
+
+    fetchMock.mockImplementationOnce(() => mockResponse({}, { ok: false, status: 500 }));
+    await useChatStore
+      .getState()
+      .submitApproval("elic_ask", "accept", { "Pick a region": "eu-west" });
+    expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "pending" });
+    expect(getAskUserQuestionDraft("elic_ask", regionSignature)?.customInputs).toEqual({
+      "Pick a region": "eu-west",
+    });
+
+    await useChatStore
+      .getState()
+      .submitApproval("elic_ask", "accept", { "Pick a region": "eu-west" });
+    expect(getAskUserQuestionDraft("elic_ask", regionSignature)).toBeUndefined();
   });
 
   it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
@@ -11128,6 +11175,7 @@ describe("chatStore — elicitation_resolved", () => {
     // ambiguous "Resolved elsewhere" pill, so the user could not tell
     // whether the tool was approved and the session looked stuck.
     useChatStore.setState({ blocks: [elicitationBlock("elic_verdict")] });
+    saveRegionDraft("elic_verdict");
 
     handleSessionEvent(elicitationResolvedEvent("elic_verdict", "accept"));
 
@@ -11137,6 +11185,7 @@ describe("chatStore — elicitation_resolved", () => {
     }
     expect(block.status).toBe("responded");
     expect(block.response).toEqual({ action: "accept" });
+    expect(getAskUserQuestionDraft("elic_verdict", regionSignature)).toBeUndefined();
   });
 
   it("carries the unanswered reason so the card can say the prompt expired", () => {
@@ -17853,6 +17902,30 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     await closeLoop(sinks, loop);
   });
 
+  it("keeps a question draft when a later snapshot reopens the card", async () => {
+    const reopened = pendingElicitationRaw("elic_reopen", "Pick a region?");
+    seedSession("conv_gapreopen", []);
+    seedPendingElicitations("conv_gapreopen", [reopened]);
+    const { sinks, loop } = await openLoop("conv_gapreopen");
+    sinks[0]!.push(elicitationReqFrame("elic_reopen", "Pick a region?"));
+    await drainAsync();
+    saveRegionDraft("elic_reopen");
+
+    seedPendingElicitations("conv_gapreopen", []);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(elicitationCards()[0]!.response).toEqual({ action: "auto_resolved" });
+
+    seedPendingElicitations("conv_gapreopen", [reopened]);
+    sinks[1]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(3);
+    expect(elicitationCards()[0]!.status).toBe("pending");
+    expect(getAskUserQuestionDraft("elic_reopen", regionSignature)).toBeDefined();
+
+    await closeLoop(sinks, loop);
+  });
+
   it("does not duplicate a card when the server re-publishes the same id", async () => {
     seedSession("conv_dup", []);
     const { sinks, controller, loop } = await openLoop("conv_dup");
@@ -17880,6 +17953,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
 
     sinks[0]!.push(elicitationReqFrame("elic_rev", "Approve revived?"));
     await drainAsync();
+    saveRegionDraft("elic_rev");
     // The deferred clear fired before the harness retry re-parked: the
     // card flips to "Resolved elsewhere" without a user verdict.
     sinks[0]!.push(sse("response.elicitation_resolved", { elicitation_id: "elic_rev" }));
@@ -17897,6 +17971,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     expect(cards).toHaveLength(1);
     expect(cards[0]!.status).toBe("pending");
     expect(cards[0]!.response).toBeNull();
+    expect(getAskUserQuestionDraft("elic_rev", regionSignature)).toBeDefined();
 
     await abortLoop(sinks, controller, loop);
   });
