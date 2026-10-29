@@ -36,6 +36,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, Request, WebSocket, expect
 
+from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import TwoAgentChatSession, _build_hello_world_bundle
 
@@ -309,11 +310,7 @@ def test_running_agent_updates_do_not_reload_loaded_folder_pages(
             timeout=10.0,
         ).raise_for_status()
 
-        tab_a_ctx = browser.new_context()
-        tab_b_ctx = browser.new_context()
-        try:
-            tab_a = tab_a_ctx.new_page()
-            tab_b = tab_b_ctx.new_page()
+        with user_page(browser, headers={}) as tab_a, user_page(browser, headers={}) as tab_b:
             tab_a_traffic = _record_sidebar_traffic(tab_a)
             tab_b_traffic = _record_sidebar_traffic(tab_b)
             tab_a.goto(f"{base_url}/c/{chat.session_id}")
@@ -362,9 +359,6 @@ def test_running_agent_updates_do_not_reload_loaded_folder_pages(
                 for tab, urls in folder_requests.items()
             }
             assert reloaded_pages == {"tab A": [], "tab B": []}, report
-        finally:
-            tab_a_ctx.close()
-            tab_b_ctx.close()
     finally:
         for session_id in filler_ids:
             httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)

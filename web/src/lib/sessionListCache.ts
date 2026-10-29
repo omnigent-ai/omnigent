@@ -68,6 +68,8 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /** Server sort order; ``undefined`` means ``updated_at``. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -180,6 +182,7 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    sortBy: key[5] === "created_at" ? "created_at" : undefined,
   };
 }
 
@@ -225,14 +228,14 @@ const MEMBERSHIP_FIELDS = ["archived", "owner", "project_id"];
  * Push frames patch row fields in place and lists sort loaded rows client-side,
  * so only changes the client cannot place need a refetch: a move between
  * projects, owners, or archive state (the caller's prefix-wide invalidation
- * reconciles every variant), a rename under a search filter, and an
- * `updated_at` bump on the next-page cursor, which would shift the next page
- * and the Mine/Shared watermark.
+ * reconciles every variant), and an `updated_at` bump on the next-page cursor
+ * of an `updated_at`-ordered list, which would shift the next page and the
+ * Mine/Shared watermark. Renames are left to the caller, which knows whether
+ * any cached search list could gain the row.
  *
  * @param changed - Names of wire fields that changed the cached row.
  * @param previous - The cached row before the patch.
  * @param next - The row after applying the wire item.
- * @param filters - Canonical filters for the query being patched.
  * @param isNextPageCursor - Whether this row is the next-page cursor.
  * @returns `true` when the query should be invalidated after patching.
  */
@@ -240,12 +243,10 @@ function changedFieldsNeedRefetch(
   changed: Set<string>,
   previous: Conversation,
   next: Conversation,
-  filters: ConversationListFilters,
   isNextPageCursor: boolean,
 ): boolean {
   if (MEMBERSHIP_FIELDS.some((field) => changed.has(field))) return true;
   if (previous.labels?.[PROJECT_LABEL_KEY] !== next.labels?.[PROJECT_LABEL_KEY]) return true;
-  if (changed.has("title") && filters.searchQuery !== "") return true;
   return changed.has("updated_at") && isNextPageCursor;
 }
 
@@ -265,20 +266,28 @@ function changedFieldsNeedRefetch(
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @returns The possibly updated data, ids found in it, and whether this
- *   query needs a server refetch after the local patch.
+ * @returns The possibly updated data, ids found in it, whether this query
+ *   needs a server refetch after the local patch, and whether a row's title
+ *   changed.
  */
 export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-): { data: ConversationsInfiniteData | undefined; found: Set<string>; needsRefetch: boolean } {
+): {
+  data: ConversationsInfiniteData | undefined;
+  found: Set<string>;
+  needsRefetch: boolean;
+  titleChanged: boolean;
+} {
   const found = new Set<string>();
-  if (!data) return { data, found, needsRefetch: false };
+  if (!data) return { data, found, needsRefetch: false, titleChanged: false };
   let anyPageChanged = false;
   let needsRefetch = false;
+  let titleChanged = false;
   const lastPage = data.pages.at(-1);
-  const nextPageCursor = lastPage?.has_more ? lastPage.last_id : null;
+  const nextPageCursor =
+    lastPage?.has_more && filters.sortBy !== "created_at" ? lastPage.last_id : null;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
@@ -294,13 +303,14 @@ export function mergeItemsIntoPages(
         nextData.push(conv);
         continue;
       }
+      if (changed.has("title")) titleChanged = true;
       const nextConv = { ...conv, ...wire };
       if (violatesKnownMembership(nextConv, filters)) {
         rowChanged = true;
         needsRefetch = true;
         continue;
       }
-      if (changedFieldsNeedRefetch(changed, conv, nextConv, filters, conv.id === nextPageCursor)) {
+      if (changedFieldsNeedRefetch(changed, conv, nextConv, conv.id === nextPageCursor)) {
         needsRefetch = true;
       }
       rowChanged = true;
@@ -310,8 +320,8 @@ export function mergeItemsIntoPages(
     anyPageChanged = true;
     return { ...page, data: nextData };
   });
-  if (!anyPageChanged) return { data, found, needsRefetch };
-  return { data: { ...data, pages }, found, needsRefetch };
+  if (!anyPageChanged) return { data, found, needsRefetch, titleChanged };
+  return { data: { ...data, pages }, found, needsRefetch, titleChanged };
 }
 
 // ── Recently-created keep-alive ───────────────────────────────────────
@@ -472,11 +482,12 @@ export function parseProjectSessionsQueryKey(key: readonly unknown[]): {
 
 /** Membership filters for an unsearched project-folder query. */
 export function filtersFromProjectQueryKey(key: readonly unknown[]): ConversationListFilters {
-  const { archived } = parseProjectSessionsQueryKey(key);
+  const { sortBy, archived } = parseProjectSessionsQueryKey(key);
   return {
     searchQuery: "",
     includeArchived: archived,
     visibility: archived ? "archived" : "mine",
+    sortBy,
   };
 }
 

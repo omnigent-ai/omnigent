@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
+  type ConversationListFilters,
   type ConversationsInfiniteData,
   type SessionListWireItem,
   collectConversationIds,
@@ -199,20 +200,23 @@ describe("mergeItemsIntoPages", () => {
     expect(needsRefetch).toBe(false);
   });
 
-  it("asks for a refetch when a searched row's title changes", () => {
+  it("reports a searched row's title change for the caller to reconcile", () => {
     const before = data([conv("a", { title: "alpha" })]);
     const items = new Map<string, SessionListWireItem>([["a", { id: "a", title: "beta" }]]);
 
-    const { data: after, needsRefetch } = mergeItemsIntoPages(before, items, {
+    const {
+      data: after,
+      needsRefetch,
+      titleChanged,
+    } = mergeItemsIntoPages(before, items, {
       searchQuery: "alp",
       includeArchived: false,
     });
 
-    // The local cache cannot know whether the server-side search still
-    // matches via title or item content, so it patches the row then
-    // reconciles with the filtered list endpoint.
+    // Only the caller sees every cached search list a rename can move the row into.
     expect(after!.pages[0].data[0].title).toBe("beta");
-    expect(needsRefetch).toBe(true);
+    expect(titleChanged).toBe(true);
+    expect(needsRefetch).toBe(false);
   });
 
   it("patches updated_at in place without a refetch", () => {
@@ -230,12 +234,14 @@ describe("mergeItemsIntoPages", () => {
   it("asks for a refetch only when the next-page cursor's updated_at changes", () => {
     const loaded = data([conv("a"), conv("b")], [conv("c"), conv("d")]);
     const before = { ...loaded, pages: loaded.pages.map((page) => ({ ...page, has_more: true })) };
-    const bump = (id: string) =>
-      mergeItemsIntoPages(before, new Map([[id, { id, updated_at: 2 }]]), DEFAULT_FILTERS);
+    const bump = (id: string, filters: ConversationListFilters = DEFAULT_FILTERS) =>
+      mergeItemsIntoPages(before, new Map([[id, { id, updated_at: 2 }]]), filters);
 
-    // "b" was page 2's cursor, already fetched; "d" anchors the next fetch.
+    // "b" anchored the already-loaded page 2; "d" anchors the next fetch.
     expect(bump("b").needsRefetch).toBe(false);
     expect(bump("d").needsRefetch).toBe(true);
+    // Creation order doesn't move when updated_at changes.
+    expect(bump("d", { ...DEFAULT_FILTERS, sortBy: "created_at" }).needsRefetch).toBe(false);
   });
 
   it("asks for a refetch for membership changes but not for other labels or titles", () => {
@@ -366,7 +372,13 @@ describe("filtersFromConversationQueryKey", () => {
   it("accepts creation-order caches for live updates and optimistic mutations", () => {
     expect(
       filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({ searchQuery: "", includeArchived: false, project: undefined, visibility: "mine" });
+    ).toEqual({
+      searchQuery: "",
+      includeArchived: false,
+      project: undefined,
+      visibility: "mine",
+      sortBy: "created_at",
+    });
   });
 
   it("rejects non-canonical conversation query keys", () => {
