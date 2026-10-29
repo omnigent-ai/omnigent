@@ -3031,7 +3031,7 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
     The gated tool's mirrored result clears the card as answered.
 
     An answer given during the re-park grace never points the card to the terminal.
-    A hook retry that arrives after the terminal answered clears the card, not re-asks.
+    A hook retry after the terminal answered, even after the card cleared, doesn't re-ask.
     A failed clear in ancestor sessions must not fail the session's own clear.
     """
     from omnigent.runtime import pending_elicitations
@@ -3078,6 +3078,14 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
         assert pending_elicitations.count_for(session_id) == 0
         await _finish_deferred_clears()
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+        if not hook_retries_after_answer:
+            late_retry = await client.post(
+                f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+            )
+            assert late_retry.status_code == 200, late_retry.text
+            assert late_retry.content == b""
+            assert pending_elicitations.count_for(session_id) == 0
+            await collector.assert_no_event(within=0.05)
     finally:
         await collector.stop()
         pending_elicitations.reset_for_tests()
@@ -3167,28 +3175,23 @@ async def test_answer_during_cancelled_hook_cleanup_is_kept(
 
 
 @pytest.mark.parametrize(
-    ("waiting_in_terminal", "delete_parent", "ancestor_lookup_fails"),
-    [(True, False, False), (False, False, False), (True, True, False), (True, False, True)],
+    ("waiting_in_terminal", "delete_parent"),
+    [(True, False), (False, False), (True, True)],
 )
 async def test_deleting_session_releases_prompt_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     waiting_in_terminal: bool,
     delete_parent: bool,
-    ancestor_lookup_fails: bool,
 ) -> None:
     """
     A deleted session's status can stay mid-turn, so deleting it or an ancestor ends its hold.
 
-    Deleting during the re-park grace or the hold also clears the surviving parent's mirror,
-    even when the parent links can't be read before the delete.
+    Deleting during the re-park grace or the hold also clears the surviving parent's mirror.
     """
     from omnigent.runtime import pending_elicitations
 
-    name = (
-        f"test-terminal-fallback-deleted-{waiting_in_terminal}-{delete_parent}"
-        f"-{ancestor_lookup_fails}"
-    )
+    name = f"test-terminal-fallback-deleted-{waiting_in_terminal}-{delete_parent}"
     parent_agent = await create_test_agent(client, f"{name}-parent")
     parent_id = await _create_session(client, parent_agent["id"])
     parent_collector = await start_session_stream_collector(parent_id)
@@ -3229,14 +3232,6 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
             event["elicitation_id"] for event in aware_parent.json()["pending_elicitations"]
         ] == [_REATTACH_ELICITATION_ID]
 
-        if ancestor_lookup_fails:
-
-            def _ancestor_lookup_fails(*_args: Any, **_kwargs: Any) -> list[str]:
-                raise RuntimeError("ancestor lookup failed")
-
-            monkeypatch.setattr(
-                sessions_orchestration, "_ancestor_session_ids", _ancestor_lookup_fails
-            )
         deleted = await client.delete(f"/v1/sessions/{parent_id if delete_parent else session_id}")
         assert deleted.status_code == 200, deleted.text
         assert sessions_route._session_status_cache.get(session_id) == "running"
@@ -3572,7 +3567,13 @@ async def test_hook_registering_around_session_delete_leaves_no_prompt(
 async def test_deleting_session_expires_held_prompts_only_after_delete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed delete leaves held prompts and their parents' mirrors in place."""
+    """
+    A failed delete leaves held prompts and their parents' mirrors in place.
+
+    An overlapping delete of the same session keeps the hook fence until both finish.
+    """
+    from omnigent.server import _elicitation_registry
+
     held = _UnparkedHarnessElicitation(
         session_id="conv_deleted",
         tool_name="AskUserQuestion",
@@ -3581,35 +3582,24 @@ async def test_deleting_session_expires_held_prompts_only_after_delete(
         request_fingerprint=None,
         resolved_elsewhere=asyncio.Event(),
     )
-    ancestors_read: list[str] = []
-    expired: list[tuple[str, list[str] | None]] = []
+    expired: list[str] = []
 
-    def read_ancestors(_store: Any, session_id: str) -> list[str]:
-        ancestors_read.append(session_id)
-        return ["conv_parent"]
+    async def record_expiry(_session_id: str, elicitation_id: str, *_args: Any) -> None:
+        expired.append(elicitation_id)
 
-    def expire_mirrors(_store: Any, _session_id: str, elicitation_id: str, **kwargs: Any) -> None:
-        expired.append((elicitation_id, kwargs.get("ancestor_ids")))
-
-    monkeypatch.setattr(sessions_orchestration, "_ancestor_session_ids", read_ancestors)
-    monkeypatch.setattr(
-        sessions_orchestration, "_publish_elicitation_resolved", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(
-        sessions_orchestration, "_publish_elicitation_resolved_to_ancestors", expire_mirrors
-    )
+    monkeypatch.setattr(sessions_orchestration, "_expire_deleted_session_prompt", record_expiry)
     _harness_unparked_elicitations["elicit_held"] = held
-    try:
-        with pytest.raises(RuntimeError, match="delete failed"):
-            async with sessions_orchestration._release_deleted_session_prompts(
-                ["conv_deleted"], cast(Any, None)
-            ):
-                assert ancestors_read == ["conv_deleted"]
-                raise RuntimeError("delete failed")
-        assert expired == []
-        assert _harness_unparked_elicitations.get("elicit_held") is held
-    finally:
-        _harness_unparked_elicitations.clear()
+    release_prompts = sessions_orchestration._release_deleted_session_prompts
+    with pytest.raises(RuntimeError, match="outer delete failed"):
+        async with release_prompts(["conv_deleted"], cast(Any, None)):
+            with pytest.raises(RuntimeError, match="inner delete failed"):
+                async with release_prompts(["conv_deleted"], cast(Any, None)):
+                    raise RuntimeError("inner delete failed")
+            assert "conv_deleted" in _elicitation_registry._harness_deleting_sessions
+            raise RuntimeError("outer delete failed")
+    assert expired == []
+    assert _harness_unparked_elicitations.get("elicit_held") is held
+    assert _elicitation_registry._harness_deleting_sessions.items() == []
 
 
 @pytest.mark.parametrize("vendor", ["kimi", "devin"])

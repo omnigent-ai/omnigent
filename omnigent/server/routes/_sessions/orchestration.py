@@ -253,7 +253,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
-    _ancestor_session_ids,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
@@ -884,7 +883,13 @@ async def _hold_elicitation_for_terminal_answer(
     finally:
         if _harness_unparked_elicitations.get(elicitation_id) is unparked:
             _harness_unparked_elicitations.pop(elicitation_id, None)
-    # A mirrored tool result proved the terminal answered the prompt.
+    # A mirrored tool result proved the terminal answered; a later hook retry must not re-ask.
+    _prune_pre_resolved_harness_elicitations()
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id=session_id,
+        created_at=time.time(),
+        request_fingerprint=unparked.request_fingerprint,
+    )
     _publish_elicitation_resolved(session_id, elicitation_id)
     if conversation_store is not None:
         try:
@@ -1069,17 +1074,6 @@ async def _release_deleted_session_prompts(
             for parked in _harness_parked_elicitations.values()
             if parked.session_id in deleted
         ]
-        # Parent links are gone after the delete, so read the mirrors' targets now.
-        ancestor_ids: dict[str, list[str]] = {}
-        for session_id in {prompt_session_id for prompt_session_id, _ in prompts}:
-            try:
-                ancestor_ids[session_id] = await asyncio.to_thread(
-                    _ancestor_session_ids, conversation_store, session_id
-                )
-            except Exception:  # noqa: BLE001 — the delete must still go through
-                _logger.warning(
-                    "Could not read ancestors of deleted session %s", session_id, exc_info=True
-                )
         yield
         # Mark parked hooks before any await so a later disconnect cannot open a hold.
         for parked in waits:
@@ -1090,13 +1084,13 @@ async def _release_deleted_session_prompts(
             if unparked.session_id in deleted:
                 _harness_unparked_elicitations.pop(elicitation_id, None)
         # Prompts whose hooks exited during the delete may still have cards up.
+        # Parent links are gone after the delete; the pending index still records the mirrors.
         for session_id, elicitation_id in prompts:
-            mirror_ids = ancestor_ids.get(session_id)
-            if mirror_ids is None:
-                # The ancestor read failed; the pending index still records the mirrors.
-                mirror_ids = _mirrored_prompt_session_ids(session_id, elicitation_id)
             await _expire_deleted_session_prompt(
-                session_id, elicitation_id, conversation_store, mirror_ids
+                session_id,
+                elicitation_id,
+                conversation_store,
+                _mirrored_prompt_session_ids(session_id, elicitation_id),
             )
     finally:
         for session_id in deleted:
