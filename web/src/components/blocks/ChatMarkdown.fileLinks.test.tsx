@@ -637,6 +637,65 @@ describe("dead file links give feedback instead of a silent no-op", () => {
   });
 });
 
+describe("links to folders", () => {
+  const openFolder = vi.fn();
+  const FOLDER_VIEWER = { ...FILE_VIEWER_WITH_SESSION, openFolder };
+  const FOLDER = `${WORKSPACE}/experimental/data/mobile-touch-targets`;
+
+  function folderListing(): Response {
+    return jsonResponse({
+      object: "list",
+      data: [
+        {
+          name: "mobile-touch-targets",
+          path: "experimental/data/mobile-touch-targets",
+          type: "directory",
+          bytes: null,
+        },
+        { name: "summary.md", path: "experimental/data/summary.md", type: "file", bytes: 5 },
+      ],
+      has_more: false,
+    });
+  }
+
+  beforeEach(() => openFolder.mockClear());
+
+  it("opens a linked folder in the Files tree instead of claiming it wasn't found", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(`[mobile-touch-targets](${FOLDER})`, [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "mobile-touch-targets" }));
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("opens a workspace-relative folder link at its host-absolute location", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown("[targets](experimental/data/mobile-touch-targets)", [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "targets" }));
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a folder as plain text where no Files tree can show it", async () => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(
+      `[summary](experimental/data/summary.md) and [mobile-touch-targets](${FOLDER})`,
+      [],
+      FILE_VIEWER_WITH_SESSION,
+    );
+
+    // The sibling file shares the parent listing, so once it opens the folder has been checked.
+    fireEvent.click(await screen.findByRole("button", { name: "summary" }));
+    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
+    expect(screen.queryByRole("button", { name: "mobile-touch-targets" })).toBeNull();
+    expect(screen.getByText("mobile-touch-targets")).toBeInTheDocument();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+});
+
 // A file link carries no href, so neither the browser nor the desktop shell
 // offers "Copy Link Address" for it. Its own menu copies the path it names,
 // host-absolute so it still resolves when pasted into another session.

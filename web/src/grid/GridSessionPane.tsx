@@ -49,6 +49,7 @@ import {
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 
@@ -298,6 +299,13 @@ export function GridSessionPane({
         selectTab("github");
         onOpenWorkspace();
       },
+      openFolder: showFiles
+        ? (absolutePath: string) => {
+            revealFolderInFilesPanel(sessionId, absolutePath);
+            selectTab("files");
+            onOpenWorkspace();
+          }
+        : undefined,
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
       workspaceHome: environment.data?.home ?? null,
@@ -309,6 +317,7 @@ export function GridSessionPane({
       registerNavigationGuard,
       selectTab,
       onOpenWorkspace,
+      showFiles,
       sessionId,
       environment.data,
       session?.hostId,

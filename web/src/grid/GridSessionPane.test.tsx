@@ -1,5 +1,6 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type * as FilesPanelModule from "@/shell/FilesPanel";
 import { type ComponentProps, useContext, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
@@ -13,6 +14,7 @@ import { splitGrid } from "./gridLayout";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 
 const fixture = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
@@ -32,6 +34,10 @@ vi.mock("@/components/blocks/TerminalView", () => ({
 }));
 
 vi.mock("@/canvas/CanvasWorkspace", () => ({ CanvasWorkspace: () => null }));
+vi.mock("@/shell/FilesPanel", async (original) => ({
+  ...(await original<typeof FilesPanelModule>()),
+  revealFolderInFilesPanel: vi.fn(),
+}));
 vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -91,6 +97,9 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
           Block navigation
         </button>
+        <button type="button" onClick={() => context.openFolder?.("/workspace/experimental")}>
+          Open folder
+        </button>
       </>
     );
   },
@@ -106,6 +115,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-maximized={String(props.maximized)}
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
+        data-tab={props.rightRailTab ?? ""}
         data-end-line={props.filePosition?.endLine}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
@@ -163,6 +173,26 @@ it("opens agent-requested files only in the active workspace and respects naviga
   act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
   expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
   expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
+});
+
+it("browses a chat-linked folder in the Files tab of that pane's workspace", () => {
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "folder-link", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+
+  fireEvent.click(within(screen.getByRole("region", { name: "second" })).getByText("Open folder"));
+
+  expect(revealFolderInFilesPanel).toHaveBeenCalledWith("second", "/workspace/experimental");
+  const workspace = screen.getByRole("complementary", { name: "Workspace" });
+  expect(workspace).toHaveAttribute("data-testid", "workspace-second");
+  expect(workspace).toHaveAttribute("data-tab", "files");
+  expect(workspace).toHaveTextContent("No file");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {

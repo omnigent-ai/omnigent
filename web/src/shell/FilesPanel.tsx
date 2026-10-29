@@ -225,6 +225,13 @@ function SearchFilterInput({
  * switch still lands on that session's own last location (or its root).
  */
 const browseLocationCache = new Map<string, string>();
+const folderRevealListeners = new Set<(conversationId: string, absolutePath: string) => void>();
+
+/** Point a session's Files tree at a folder: live if mounted, else on its next mount. */
+export function revealFolderInFilesPanel(conversationId: string, absolutePath: string): void {
+  browseLocationCache.set(conversationId, absolutePath);
+  folderRevealListeners.forEach((listener) => listener(conversationId, absolutePath));
+}
 
 /**
  * Right-side Files card. Always visible on desktop.
@@ -334,6 +341,16 @@ export function FilesPanel({
     },
     [workspaceRoot, conversationId],
   );
+
+  useEffect(() => {
+    const listener = (revealedId: string, absolutePath: string) => {
+      if (revealedId === conversationId) navigateTo(absolutePath);
+    };
+    folderRevealListeners.add(listener);
+    return () => {
+      folderRevealListeners.delete(listener);
+    };
+  }, [conversationId, navigateTo]);
 
   const navigateToChild = useCallback(
     (relativePath: string) => {
