@@ -14287,6 +14287,60 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("recovers a visible tab whose reconnect gets no response", async () => {
+    const preGap = [userMessage("hung_pre", "before the drop")];
+    seedSession("conv_hung_open", preGap);
+    const sinks: StreamSink[] = [];
+    let streamOpens = 0;
+    // jsdom's DOMException is not `instanceof Error`, unlike a real fetch abort.
+    const abortError = () => Object.assign(new Error("aborted"), { name: "AbortError" });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        streamOpens += 1;
+        if (streamOpens === 2) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(abortError()));
+          });
+        }
+        const sink = pushableStream();
+        sinks.push(sink);
+        init?.signal?.addEventListener("abort", () => sink.error(abortError()));
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_hung_open",
+      abortController: controller,
+      blocks: itemsToBlocks(preGap),
+    });
+
+    const loop = startStreamPump("conv_hung_open", controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+    expect(document.hidden).toBe(false);
+
+    sinks[0]!.error();
+    await drainAsync();
+    expect(streamOpens).toBe(2);
+    const gapItem = userMessage("hung_gap", "sent while the reconnect hangs");
+    seedSessionItems("conv_hung_open", [...preGap, gapItem]);
+
+    await vi.advanceTimersByTimeAsync(2 * SSE_STALL_TIMEOUT_MS);
+    await drainAsync();
+    const opensAfterWait = streamOpens;
+    const renderedItemIds = useChatStore.getState().blocks.map((b) => b.ctx.itemId);
+
+    controller.abort();
+    await drainAsync();
+    await loop;
+
+    expect(opensAfterWait).toBeGreaterThanOrEqual(3);
+    expect(renderedItemIds).toContain(gapItem.id);
+  });
+
   it("acks an optimistic user bubble when reconnect backfills its committed item", async () => {
     const before = userMessage("ack_pre", "before the gap");
     seedSession("conv_reconnect_ack", [before]);
@@ -15271,7 +15325,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     expect(sinks).toHaveLength(1);
 
-    // Fresh bytes → a visibility return must NOT churn the connection.
+    // Fresh bytes → neither the open deadline nor a visibility return may
+    // churn the connection.
+    await advanceWithHeartbeats(sinks[0]!, SSE_STALL_TIMEOUT_MS + 15_000);
     sinks[0]!.push(sse("session.heartbeat", {}));
     await drainAsync();
     document.dispatchEvent(new Event("visibilitychange"));
