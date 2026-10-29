@@ -39,6 +39,13 @@ def test_create_and_get(agent_store: SqlAlchemyAgentStore) -> None:
     assert fetched is not None
     assert fetched.id == agent.id
     assert fetched.name == "gpt-4"
+    assert agent_store.get_many([agent.id, "5ff5b2e31fe10beb80134394037b17b0", agent.id]) == {
+        agent.id: agent
+    }
+    assert agent_store.get_many([]) == {}
+    assert AgentStore.get_many(agent_store, [agent.id]) == {agent.id: agent}
+    with workspace_scope(42):
+        assert agent_store.get_many([agent.id]) == {}
 
 
 def test_get_nonexistent(agent_store: SqlAlchemyAgentStore) -> None:

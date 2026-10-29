@@ -73,6 +73,23 @@ class WebSocketLike(Protocol):
     async def receive_text(self) -> str: ...
 
 
+@dataclass(frozen=True)
+class TunnelEnd:
+    """How one tunnel connection ended, before registry cleanup touched it.
+
+    :param at: Unix epoch seconds when the route's socket loop ended.
+    :param peer_code: Close code the runner's side ended with, e.g. ``1006``;
+        ``None`` when the loop ended without a peer disconnect.
+    :param peer_reason: Reason in the runner's close frame, or ``None``.
+    :param server_code: Close code this server requested before the end, or ``None``.
+    """
+
+    at: float
+    peer_code: int | None
+    peer_reason: str | None
+    server_code: int | None
+
+
 @dataclass
 class RunnerSession:
     """Per-runner state living in the registry while the tunnel is open.
@@ -107,6 +124,8 @@ class RunnerSession:
     :param close_reason: Reason accompanying ``close_code``.
     :param peer_close_reason: Reason in the runner's own close frame, e.g.
         ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
+    :param ended: How the socket loop ended, captured before cleanup records
+        its own close; ``None`` until the route's loop ends.
     :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
@@ -128,6 +147,7 @@ class RunnerSession:
     close_code: int | None = None
     close_reason: str | None = None
     peer_close_reason: str | None = None
+    ended: TunnelEnd | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 

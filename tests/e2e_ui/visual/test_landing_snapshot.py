@@ -10,7 +10,7 @@ single source of truth). See ``tests/e2e_ui/visual/README.md`` for how to update
 the baseline (label the PR, or regenerate locally with Docker).
 
 The test is marked ``@pytest.mark.visual`` so the main e2e_ui suite (which runs
-on the unpinned ``ubuntu-latest``) excludes it via ``-m 'not visual'``; only the
+on the standard runner image) excludes it via ``-m 'not visual'``; only the
 dedicated pinned gate runs it.
 
 Determinism strategy -- mock every HTTP call the landing makes:
