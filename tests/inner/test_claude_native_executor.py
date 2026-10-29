@@ -211,6 +211,7 @@ async def test_run_turn_rejects_stale_session_after_clear(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "no longer active after /clear" in events[0].message
+    assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio

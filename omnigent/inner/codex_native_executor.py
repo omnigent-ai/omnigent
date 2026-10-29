@@ -11,6 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
@@ -68,10 +69,15 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
+    SpilledTextUnavailable,
+    attachment_cache_dir,
     attachment_reference_line,
     codex_resize_metadata_path,
     materialize_attachment,
+    materialize_text,
     parse_data_uri,
+    record_spilled_text,
+    restore_spilled_text,
     unresolved_attachment_marker,
     uses_filesystem_delivery,
 )
@@ -106,6 +112,13 @@ _CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
     remediation="Check the native terminal for the message before sending it again.",
 )
 
+# Codex rejects a turn whose text items total over 1,048,576 characters;
+# text beyond this moves to an attachment file, with headroom to spare.
+_MAX_INLINE_TEXT_CHARS = 900_000
+
+# Error code for input Codex won't take, from Omnigent's checks or Codex's own.
+_INPUT_TOO_LARGE_CODE = "input_too_large"
+
 
 class _CodexNativeInputUndelivered(RuntimeError):
     """Delivery stopped after a proven refusal and before any resubmission."""
@@ -113,6 +126,62 @@ class _CodexNativeInputUndelivered(RuntimeError):
     def __init__(self, failure: CodexStartupFailure) -> None:
         self.failure = failure
         super().__init__(failure.message)
+
+
+# A paste moved to a file is mirrored back in full, so it has to fit one session event.
+_MIRROR_TOO_LARGE_FAILURE = CodexStartupFailure(
+    message="This message is too large to keep in the conversation history, so it was not sent.",
+    code=_INPUT_TOO_LARGE_CODE,
+    title="Message too long for Codex",
+    remediation="Shorten the message, or attach the text as a file.",
+)
+
+_SPILL_RECORD_FAILURE = CodexStartupFailure(
+    message="The large paste could not be recorded safely; this message was not sent.",
+    remediation="Check local disk space and try again, or attach the text as a file.",
+)
+
+_SPILL_UNSUPPORTED_FAILURE = CodexStartupFailure(
+    message="This Codex version cannot preserve a large paste in history; "
+    "this message was not sent.",
+    remediation="Upgrade Codex to 0.154.0 or later, or attach the text as a file.",
+)
+
+
+class _SpilledInputItems(list[dict[str, object]]):
+    """Wire input with the identity of its generated paste occurrences."""
+
+    def __init__(
+        self,
+        items: list[dict[str, object]],
+        client_message_id: str | None,
+        expected_ranges: tuple[tuple[int, int], ...],
+    ) -> None:
+        super().__init__(items)
+        self.client_message_id = client_message_id
+        self.expected_ranges = expected_ranges
+
+
+def _spilled_mirror_fits(input_items: list[dict[str, object]], bridge_dir: Path) -> bool:
+    """Whether the forwarder can mirror this input with its spilled pastes restored."""
+    text = "\n\n".join(
+        value for item in input_items if isinstance(value := item.get("text"), str) and value
+    )
+    message_id = (
+        input_items.client_message_id if isinstance(input_items, _SpilledInputItems) else None
+    )
+    if isinstance(input_items, _SpilledInputItems) and message_id is None:
+        return False
+    expected_ranges = (
+        input_items.expected_ranges if isinstance(input_items, _SpilledInputItems) else None
+    )
+    try:
+        return (
+            restore_spilled_text(text, bridge_dir, message_id, expected_ranges=expected_ranges)
+            is not None
+        )
+    except SpilledTextUnavailable as error:
+        raise _CodexNativeInputUndelivered(_SPILL_RECORD_FAILURE) from error
 
 
 async def _wait_for_bridge_state(
@@ -230,6 +299,9 @@ async def _native_delivery_request(
     bridge_dir: Path,
 ) -> CodexMessage:
     """Reconnect once after an authoritative refusal; never retry socket loss."""
+    input_items = params.get("input")
+    if isinstance(input_items, _SpilledInputItems):
+        params = {**params, "clientUserMessageId": input_items.client_message_id}
     try:
         return await _native_delivery_request_once(client, method, params, state)
     except CodexAppServerResponseError as error:
@@ -277,6 +349,8 @@ async def _native_delivery_request_once(
     state: CodexNativeBridgeState,
 ) -> CodexMessage:
     """Pair each RPC attempt with its result, including a rejected stale steer."""
+    if params.get("clientUserMessageId") and not client.supports_user_message_ids:
+        raise _CodexNativeInputUndelivered(_SPILL_UNSUPPORTED_FAILURE)
     attempt_id = uuid.uuid4().hex
     stage = "turn_start" if method == "turn/start" else "turn_steer"
     expected = params.get("expectedTurnId") if method == "turn/steer" else None
@@ -546,6 +620,13 @@ async def _inject_codex_turn_once(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Steer an active turn or start one, recovering one proven stale steer."""
+    if isinstance(input_items, _SpilledInputItems) and input_items.client_message_id is None:
+        raise _CodexNativeInputUndelivered(_SPILL_RECORD_FAILURE)
+    if not await asyncio.to_thread(_spilled_mirror_fits, input_items, bridge_dir):
+        raise _CodexNativeInputUndelivered(_MIRROR_TOO_LARGE_FAILURE)
+    # Refuse known unsupported input before model/settings RPCs or config mirroring.
+    if isinstance(input_items, _SpilledInputItems) and not client.supports_user_message_ids:
+        raise _CodexNativeInputUndelivered(_SPILL_UNSUPPORTED_FAILURE)
     if state.active_turn_id is None:
         await _start_codex_turn(
             client,
@@ -639,7 +720,9 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
-        input_items = _content_to_input_items(content, self._bridge_dir)
+        input_items = await asyncio.to_thread(
+            _content_to_input_items, content, self._bridge_dir, session_id=self._request_session_id
+        )
         if not input_items:
             return False
         # Serialized against run_turn so the read-decide-RPC-write below
@@ -733,7 +816,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # the local cancel above already took effect.
+                except Exception:
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
@@ -792,18 +875,31 @@ class CodexNativeExecutor(Executor):
         goal_objective = goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
             # Reject over-long objectives here so the app-server's raw
-            # JSON-RPC -32600 error never reaches the user.
+            # JSON-RPC -32600 error never reaches the user. Nothing was sent,
+            # so the queued message settles instead of lingering.
             length_error = goal_objective_length_error(goal_objective)
             if length_error is not None:
-                yield ExecutorError(message=length_error)
+                yield ExecutorError(
+                    message=length_error,
+                    code=_INPUT_TOO_LARGE_CODE,
+                    title="Goal is too long for Codex",
+                    undelivered=True,
+                )
                 return
         input_items: list[dict[str, object]] = (
             [{"type": "text", "text": goal_objective}]
             if goal_objective is not None
-            else _content_to_input_items(latest_user_content, self._bridge_dir)
+            else await asyncio.to_thread(
+                _content_to_input_items,
+                latest_user_content,
+                self._bridge_dir,
+                session_id=self._request_session_id,
+            )
         )
         if not input_items:
-            yield ExecutorError(message="Codex native turn had no user input to send")
+            yield ExecutorError(
+                message="Codex native turn had no user input to send", undelivered=True
+            )
             return
         # Wait for the bridge to boot OUTSIDE the injection lock. Poll quickly
         # during the expected startup window, then back off. Once state exists,
@@ -960,6 +1056,12 @@ class CodexNativeExecutor(Executor):
                         ) and is_compaction_steer_refusal(exc):
                             startup_failure = _CODEX_COMPACTING_FAILURE
                             undelivered = True
+                        elif isinstance(exc, CodexAppServerResponseError) and (
+                            too_large := _input_too_large_failure(exc)
+                        ):
+                            # Codex validates the size before it submits any input.
+                            startup_failure = too_large
+                            undelivered = True
                         _logger.exception(
                             "Codex native turn injection failed",
                             extra=with_input_attributes(
@@ -1008,6 +1110,34 @@ class CodexNativeExecutor(Executor):
             )
         else:
             yield TurnComplete(response=None)
+
+
+def _input_too_large_failure(error: CodexAppServerResponseError) -> CodexStartupFailure | None:
+    """
+    Describe Codex refusing input as longer than it accepts.
+
+    :param error: The structured error Codex answered with, whose data names the
+        limit, e.g. ``{"input_error_code": "input_too_large", "max_chars": 1048576,
+        "actual_chars": 1309439}``.
+    :returns: A coded failure stating the limit when Codex reports it, or ``None``
+        for any other error.
+    """
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    if not isinstance(data, dict) or data.get("input_error_code") != _INPUT_TOO_LARGE_CODE:
+        return None
+    max_chars, actual_chars = data.get("max_chars"), data.get("actual_chars")
+    detail = (
+        f"This message has {actual_chars:,} characters of text; Codex accepts at most "
+        f"{max_chars:,} per message, so it was not sent."
+        if isinstance(max_chars, int) and isinstance(actual_chars, int)
+        else "This message is longer than Codex accepts, so it was not sent."
+    )
+    return CodexStartupFailure(
+        message=detail,
+        code=_INPUT_TOO_LARGE_CODE,
+        title="Message too long for Codex",
+        remediation="Shorten the message, or send it in smaller parts.",
+    )
 
 
 def _model_effort_overrides(config: ExecutorConfig | None) -> dict[str, object]:
@@ -1104,7 +1234,28 @@ def _latest_user_content(messages: list[Message]) -> object:
     return None
 
 
-def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str, object]]:
+@dataclass(frozen=True)
+class _InlineText:
+    """
+    One inline text item that can move to an attachment file.
+
+    :param kind: ``"text"`` for message text, ``"file"`` for an inlined ``text/*`` file.
+    :param text: The inline text.
+    :param block: The ``input_file`` block for a ``"file"``, so the original upload is what
+        gets written; ``None`` for message text.
+    """
+
+    kind: Literal["text", "file"]
+    text: str
+    block: Mapping[str, object] | None = None
+
+
+def _content_to_input_items(
+    content: object,
+    bridge_dir: Path,
+    *,
+    session_id: str | None = None,
+) -> list[dict[str, object]]:
     """
     Normalize executor content into Codex app-server input items.
 
@@ -1114,18 +1265,73 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
     URI inline as text would blow past the app-server's 1 MiB input
     limit. Files inline their decoded text when they are textual;
     binary files are materialized and referenced by path in a text
-    item so the model can open them with its tools.
+    item so the model can open them with its tools. The same limit
+    caps the turn's total text, so past :data:`_MAX_INLINE_TEXT_CHARS`
+    the largest text moves to a file the same way.
 
     :param content: Message content, e.g. a string or a list of content
         blocks like ``{"type": "input_text", "text": "..."}`` and
         ``{"type": "input_image", "image_url": "data:image/png;base64,..."}``.
     :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param session_id: Omnigent session id that log events are attributed to,
+        e.g. ``"conv_abc123"``.
     :returns: Codex input item dicts.
     """
+    items, inline, attachments = _collect_input_items(content, bridge_dir)
+    spilled = _spill_oversized_text(items, inline, bridge_dir, session_id)
+    if spilled:
+        # Pending-input matching removes generated attachment prefixes before comparing text.
+        order = sorted(attachments) + [
+            index for index in range(len(items)) if index not in attachments
+        ]
+        ranges: list[list[int]] = []
+        texts: list[str] = []
+        offset = 0
+        for index in order:
+            text = items[index].get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            start = offset + (2 if texts else 0)
+            offset = start + len(text)
+            texts.append(text)
+            if index in spilled and inline[index].kind == "text":
+                ranges.append([start, offset])
+        items = [items[index] for index in order]
+        if ranges:
+            message_id = record_spilled_text("\n\n".join(texts), ranges, bridge_dir)
+            items = _SpilledInputItems(
+                items, message_id, tuple((start, end) for start, end in ranges)
+            )
+    return items
+
+
+def _collect_input_items(
+    content: object,
+    bridge_dir: Path,
+) -> tuple[list[dict[str, object]], dict[int, _InlineText], set[int]]:
+    """
+    Build the input items for *content* before any text moves to a file.
+
+    :param content: Message content, as for :func:`_content_to_input_items`.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :returns: The items, inline text by item index, and attachment item indices.
+    """
+    items: list[dict[str, object]] = []
+    inline: dict[int, _InlineText] = {}
+    attachments: set[int] = set()
+
+    def add_text(
+        text: str,
+        kind: Literal["text", "file"],
+        block: Mapping[str, object] | None = None,
+    ) -> None:
+        inline[len(items)] = _InlineText(kind, text, block)
+        items.append({"type": "text", "text": text})
+
     if isinstance(content, str):
-        return [{"type": "text", "text": content}] if content else []
-    if isinstance(content, list):
-        items: list[dict[str, object]] = []
+        if content:
+            add_text(content, "text")
+    elif isinstance(content, list):
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
@@ -1134,10 +1340,11 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
             if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
                 _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
                 continue
+            item_index = len(items)
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
                 if isinstance(text, str) and text:
-                    items.append({"type": "text", "text": text})
+                    add_text(text, "text")
             elif _requires_filesystem(block):
                 # Delivery follows the stored filename, whichever block type the
                 # client chose: a zip declared image/png still needs filesystem tools,
@@ -1155,13 +1362,83 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 else:
                     items.append({"type": "text", "text": unresolved_attachment_marker(block)})
             elif block_type == "input_file":
-                file_item = _file_block_to_input_item(block, bridge_dir)
-                if file_item is not None:
-                    items.append(file_item)
-        return items
-    if content is None:
-        return []
-    return [{"type": "text", "text": json.dumps(content, ensure_ascii=True)}]
+                file_text = _text_file_contents(block)
+                if file_text is None:
+                    items.append(_file_block_to_input_item(block, bridge_dir))
+                elif file_text:
+                    add_text(file_text, "file", block)
+            if block_type in {"input_image", "input_file"} and len(items) > item_index:
+                attachments.add(item_index)
+    elif content is not None:
+        add_text(json.dumps(content, ensure_ascii=True), "text")
+    return items, inline, attachments
+
+
+def _spill_oversized_text(
+    items: list[dict[str, object]],
+    inline: Mapping[int, _InlineText],
+    bridge_dir: Path,
+    session_id: str | None,
+) -> set[int]:
+    """
+    Move uploads, then the largest authored text, to files until the turn fits.
+
+    Codex counts all of a turn's text against one limit, so the total matters,
+    not any single block. A moved item becomes an ``[Attached file: ...]``
+    reference, as a binary attachment does. In an oversized turn, every text
+    upload uses a reference so the mirrored authored text still matches its
+    pending input. Failed writes keep the original input available.
+
+    :param items: Input items; a spilled item is replaced in place.
+    :param inline: The inline text items by index in *items*.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :param session_id: Omnigent session id that the log event is attributed to.
+    :returns: Indices whose text was replaced with a file reference.
+    """
+    total = sum(len(text) for item in items if isinstance(text := item.get("text"), str))
+    if total <= _MAX_INLINE_TEXT_CHARS:
+        return set()
+    # Even a one-character file name makes a reference this long.
+    cache_reference = _attached_file_item(attachment_cache_dir(bridge_dir) / "x")
+    shortest_reference = len(str(cache_reference["text"]))
+    replacements: dict[int, dict[str, object]] = {}
+    for index in sorted(inline, key=lambda i: (inline[i].kind != "file", -len(inline[i].text))):
+        entry = inline[index]
+        if entry.kind == "text" and (
+            total <= _MAX_INLINE_TEXT_CHARS or len(entry.text) <= shortest_reference
+        ):
+            break
+        path = (
+            materialize_attachment(entry.block, bridge_dir)
+            if entry.block is not None
+            else materialize_text(entry.text, bridge_dir)
+        )
+        if path is None:
+            if entry.kind == "file":
+                return set()
+            continue
+        reference = _attached_file_item(path)
+        saved = len(entry.text) - len(str(reference["text"]))
+        if entry.kind == "text" and saved <= 0:
+            continue
+        total -= saved
+        replacements[index] = reference
+
+    for index, reference in replacements.items():
+        entry = inline[index]
+        items[index] = reference
+        _logger.info(
+            "Codex native spilled oversized text to an attachment: kind=%s chars=%d",
+            entry.kind,
+            len(entry.text),
+            extra=debug_event(
+                "codex_native_text_spilled",
+                session_id=session_id,
+                kind=entry.kind,
+                chars=len(entry.text),
+            ),
+        )
+    return set(replacements)
 
 
 def _requires_filesystem(block: Mapping[str, object]) -> bool:
@@ -1182,44 +1459,58 @@ def _apply_resize_notice_to_latest_image(
             item["path"] = str(codex_resize_metadata_path(Path(path), source_metadata))
 
 
-def _file_block_to_input_item(
-    block: Mapping[str, object],
-    bridge_dir: Path,
-) -> dict[str, object] | None:
+def _text_file_contents(block: Mapping[str, object]) -> str | None:
     """
-    Convert an ``input_file`` block into a Codex input item.
-
-    The Codex app-server has no native file input item, so a textual
-    file (``text/*``) is inlined as a ``text`` item. A binary file is
-    materialized to disk and referenced by path in a ``text`` item so
-    the model can open it with its tools. This keeps multi-megabyte
-    base64 payloads out of the turn's text input.
+    Decode a textual (``text/*``) ``input_file`` block.
 
     :param block: An ``input_file`` content block, expected to carry a
         ``file_data`` data URI, e.g.
         ``"data:text/plain;base64,aGVsbG8="``.
-    :param bridge_dir: Session bridge path identifying the attachment cache.
-    :returns: A Codex ``text`` input item; a visible could-not-load
-        marker item when the file failed to materialize; or ``None``
-        for an empty text file.
+    :returns: The decoded text (empty for an empty file), or ``None`` when the
+        file is not textual or could not be decoded.
     """
     file_data = block.get("file_data")
     if isinstance(file_data, str) and file_data.startswith("data:"):
         try:
             parsed = parse_data_uri(file_data)
             if parsed.mime_type.startswith("text/"):
-                text = base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
-                return {"type": "text", "text": text} if text else None
+                return base64.b64decode(parsed.base64_payload).decode("utf-8", errors="replace")
         except (ValueError, binascii.Error):
             _logger.warning("Failed to decode input_file data URI", exc_info=True)
+    return None
+
+
+def _file_block_to_input_item(
+    block: Mapping[str, object],
+    bridge_dir: Path,
+) -> dict[str, object]:
+    """
+    Convert a non-textual ``input_file`` block into a Codex input item.
+
+    The Codex app-server has no native file input item, so the file is
+    materialized to disk and referenced by path in a ``text`` item so
+    the model can open it with its tools. This keeps multi-megabyte
+    base64 payloads out of the turn's text input.
+
+    :param block: An ``input_file`` content block, expected to carry a
+        ``file_data`` data URI, e.g.
+        ``"data:application/pdf;base64,JVBERi0="``.
+    :param bridge_dir: Session bridge path identifying the attachment cache.
+    :returns: A Codex ``text`` input item referencing the file, or a visible
+        could-not-load marker item when the file failed to materialize.
+    """
     path = materialize_attachment(block, bridge_dir)
     if path is not None:
-        # Marker format is load-bearing: codex echoes this text item back
-        # in the mirrored user message, and title seeding strips lines
-        # matching _ATTACHMENT_MARKER_RE in
-        # omnigent/entities/conversation.py. Keep in sync.
-        return {"type": "text", "text": f"[Attached file: {path}]"}
+        return _attached_file_item(path)
     return {"type": "text", "text": unresolved_attachment_marker(block)}
+
+
+def _attached_file_item(path: Path) -> dict[str, object]:
+    """Text item that points the model at a file it can open with its tools."""
+    # Load-bearing format: codex echoes this item back in the mirrored user
+    # message, and title seeding strips lines matching _ATTACHMENT_MARKER_RE
+    # in omnigent/entities/conversation.py. Keep in sync.
+    return {"type": "text", "text": f"[Attached file: {path}]"}
 
 
 def _json_object(value: object) -> dict[str, object] | None:

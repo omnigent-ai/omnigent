@@ -12,9 +12,11 @@ Run with ``uv run --no-sync pytest tests/e2e/test_codex_native_supported_efforts
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -140,6 +142,155 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
                 pass
 
 
+@pytest.mark.parametrize("input_kind", ["paste", "text-upload", "aggregate"])
+def test_oversized_input_survives_real_codex_transport(
+    codex_effort_rig: _Rig, input_kind: str
+) -> None:
+    """Preserve supported large inputs and prove older peers refuse before inference."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        native = asyncio.run(_native_settings(session, _STANDARD_MODEL))
+        version = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", rig.codex_version)
+        assert version is not None, rig.codex_version
+        expected_support = tuple(int(part) for part in version.groups()) >= (0, 154, 0)
+        assert native["supports_user_message_ids"] is expected_support
+        expect_refusal = input_kind != "text-upload" and not expected_support
+        refusal_message = (
+            "This Codex version cannot preserve a large paste in history; "
+            "this message was not sent."
+        )
+        marker = f"LARGE_INPUT_{uuid.uuid4().hex}"
+        authored = marker + "\n" + "x" * 1_100_000 + "\nLAST_LINE_preserved"
+        _json(rig.model.post("/mock/configure", json={"key": _STANDARD_MODEL, "responses": []}))
+        _json(rig.model.post("/mock/set_fallback", json={"key": _STANDARD_MODEL, "text": marker}))
+        before = len(_json(rig.model.get("/mock/requests"))["requests"])
+        if input_kind == "text-upload":
+            content = [
+                {
+                    "type": "input_file",
+                    "filename": "large-input.txt",
+                    "file_data": "data:text/plain;base64,"
+                    + base64.b64encode(authored.encode()).decode(),
+                }
+            ]
+        elif input_kind == "aggregate":
+            content = [
+                {"type": "input_text", "text": chunk}
+                for chunk in (authored[:600_000], authored[600_000:])
+            ]
+        else:
+            content = [{"type": "input_text", "text": authored}]
+        _json(
+            rig.api.post(
+                f"/v1/sessions/{session.id}/events",
+                json={"type": "message", "data": {"role": "user", "content": content}},
+            )
+        )
+        deadline = time.monotonic() + 90
+        items = []
+        while time.monotonic() < deadline:
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            state = read_bridge_state(session.bridge)
+            replies = [
+                item
+                for item in items
+                if item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+            ]
+            refusals = [
+                item
+                for item in items
+                if item.get("type") == "error" and refusal_message in item.get("message", "")
+            ]
+            if expect_refusal:
+                if (
+                    refusals
+                    and snapshot.get("status") == "failed"
+                    and state is not None
+                    and state.active_turn_id is None
+                ):
+                    break
+            else:
+                assert snapshot.get("status") != "failed", snapshot.get("status_error")
+                if replies and state is not None and state.active_turn_id is None:
+                    break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                f"Oversized-input outcome did not settle (expect_refusal={expect_refusal}).\n"
+                f"{session.tmux('capture-pane', '-p')}\n"
+                f"{rig.stack.log_tail()}"
+            )
+        assert len(replies) == (0 if expect_refusal else 1)
+        assert len(refusals) == (1 if expect_refusal else 0)
+        users = [item for item in items if item.get("role") == "user"]
+        assert len(users) == 1, "native echo must not duplicate the pending authored message"
+        requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
+        assert state is not None
+        own_requests = [
+            request for request in requests if request.get("prompt_cache_key") == state.thread_id
+        ]
+        cached = {}
+        if expect_refusal:
+            assert not own_requests, "refused authored input must never reach inference"
+            assert not requests, "refusal must not trigger background inference either"
+        else:
+            assert len(own_requests) == 1, "one submitted input must cause one mock inference"
+            assert "[Attached file:" in json.dumps(own_requests[0]["input"])
+            paths = re.findall(
+                r"\[Attached file: ([^\]]+)\]", json.dumps(own_requests[0]["input"])
+            )
+            cached = {Path(path).name: Path(path).read_text() for path in paths}
+        normalized = (
+            authored
+            if input_kind != "aggregate"
+            else authored[:600_000] + "\n" + authored[600_000:]
+        )
+        if not expect_refusal:
+            assert normalized in cached.values(), (
+                "spill must preserve every byte of normalized input"
+            )
+        if expect_refusal:
+            assert users[0]["content"] == content, (
+                "refusal must retain the authored blocks exactly"
+            )
+        elif input_kind != "text-upload":
+            assert "".join(block.get("text", "") for block in users[0]["content"]) == normalized
+        (rig.stack.root / f"oversized-{input_kind}-evidence.json").write_text(
+            json.dumps(
+                {
+                    "thread_id": state.thread_id,
+                    "supports_user_message_ids": native["supports_user_message_ids"],
+                    "expected_refusal": expect_refusal,
+                    "refusal_items": len(refusals),
+                    "authored_characters": len(authored),
+                    "authored_sha256": hashlib.sha256(authored.encode()).hexdigest(),
+                    "cached_files": {
+                        name: {
+                            "characters": len(text),
+                            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        }
+                        for name, text in cached.items()
+                    },
+                    "requests": own_requests,
+                    "user_items": len(users),
+                    "reply_items": len(replies),
+                },
+                indent=2,
+            )
+        )
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium")
+        settled = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+            "data"
+        ]
+        assert len([item for item in settled if item.get("role") == "user"]) == 2
+        assert len([item for item in settled if item.get("role") == "assistant"]) == (
+            1 if expect_refusal else 2
+        )
+
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.timeout(240),
@@ -163,6 +314,7 @@ class _Rig:
     source_home: Path
     catalog: dict[str, Any]
     runner_env: dict[str, str]
+    codex_version: str
 
     def capabilities(self, model: str) -> set[str]:
         row = next((row for row in self.catalog["models"] if row["slug"] == model), None)
@@ -243,7 +395,7 @@ def codex_effort_rig(
         httpx.Client(base_url=mock_llm_server_url, timeout=10, trust_env=False) as model,
     ):
         stack.start_runner(cwd=_REPO_ROOT, env=env)
-        yield _Rig(stack, api, model, source, catalog, env)
+        yield _Rig(stack, api, model, source, catalog, env, version)
 
 
 @dataclass
@@ -349,7 +501,11 @@ async def _native_settings(session: _Session, model: str) -> dict[str, Any]:
                     thread = await client.request(
                         "thread/read", {"threadId": state.thread_id, "includeTurns": False}
                     )
-                    return {"model": row, "thread": thread["result"]["thread"]}
+                    return {
+                        "model": row,
+                        "thread": thread["result"]["thread"],
+                        "supports_user_message_ids": client.supports_user_message_ids,
+                    }
             cursor = result.get("nextCursor")
             assert cursor, f"Real Codex model/list did not advertise {model}"
     finally:
