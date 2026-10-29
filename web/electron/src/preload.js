@@ -134,6 +134,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** The "Show Omnigent from anywhere" shortcut (off by default). */
+  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * Saves `{ enabled, accelerator }`. Resolves `{ ok, error? }`; `ok: false` means the
+   * chord was refused and the saved setting is unchanged.
+   */
+  setGlobalShortcut: ({ enabled, accelerator }) =>
+    ipcRenderer.invoke("omnigent:set-global-shortcut", {
+      enabled: enabled === true,
+      accelerator: String(accelerator ?? ""),
+    }),
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
