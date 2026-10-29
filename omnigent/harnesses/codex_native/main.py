@@ -615,8 +615,13 @@ def _materialize_codex_agent_spec(
     raw: _JsonObject = {
         "name": _AGENT_NAME,
         "prompt": (
-            "Codex is running in the session terminal. Web UI messages are "
-            "forwarded into the same native Codex app-server thread."
+            "You are Codex running inside Omnigent. Codex is running in the "
+            "session terminal. Web UI messages are forwarded into the same "
+            "native Codex app-server thread. Questions about this session or "
+            "thread, sharing, permissions, or other app features are about "
+            "Omnigent, not ChatGPT or the Codex app. Do not answer them from "
+            "OpenAI or Codex documentation or skills; use Omnigent sources such "
+            "as `omnigent --help`, and say so when you are unsure."
         ),
         "executor": executor,
         # Opt the native session into the child-session spawn writes

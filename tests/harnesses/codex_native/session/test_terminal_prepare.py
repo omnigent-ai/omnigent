@@ -25,12 +25,17 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
 
     Its ``prompt`` field is real ``AgentSpec.instructions`` content, not
     framework-composed text, so it must reach ``developer_instructions``
-    like any other codex-native author instructions.
+    like any other codex-native author instructions. It must also tell Codex
+    it runs inside Omnigent, so app questions are not answered from
+    OpenAI/Codex docs.
     """
     spec_path = codex_native._materialize_codex_agent_spec(tmp_path, model=None)
     result = codex_native._wrapper_spec_raw_instructions(spec_path)
     assert result is not None
     assert "Codex is running in the session terminal" in result
+    assert "You are Codex running inside Omnigent." in result
+    assert "sharing, permissions, or other app features are about Omnigent" in result
+    assert "Do not answer them from OpenAI or Codex documentation" in result
 
 
 def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
