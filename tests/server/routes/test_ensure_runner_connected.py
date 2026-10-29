@@ -364,3 +364,139 @@ def _async_return(value: Any):
         return value
 
     return _fn
+
+
+@pytest.mark.asyncio
+async def test_raised_uncoded_refusal_fails_fast_with_host_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host that answers "failed" for any other reason ends recovery at once."""
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_launch_runner_on_host",
+        _async_return(
+            SimpleNamespace(
+                runner_id="runner_new",
+                error_code="runner_spawn_failed",
+                error="failed to spawn runner: boom",
+            )
+        ),
+    )
+
+    def _boom(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("a refused launch must not wait for a runner")
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", _boom)
+    monkeypatch.setattr(orchestration, "_wait_for_host_bound_runner_client", _boom)
+
+    conv = _conv(host_id="host_1", workspace="/w")
+    app_state = SimpleNamespace(
+        host_registry=SimpleNamespace(get=lambda _hid: SimpleNamespace(owner=None)),
+        runner_exit_reports=None,
+        tunnel_registry=None,
+    )
+
+    with pytest.raises(orchestration.HostLaunchRefusedError) as excinfo:
+        await orchestration.ensure_runner_connected(
+            session_id="conv_1",
+            conv=conv,
+            app_state=app_state,
+            conversation_store=_Store(conv),
+            runner_router=None,
+            raise_host_refusal=True,
+        )
+
+    assert excinfo.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    # An unowned host has nobody to scope the reason to.
+    assert "failed to spawn runner: boom" in excinfo.value.message
+
+
+@pytest.mark.parametrize(
+    ("session_exists", "error_code"),
+    [
+        (False, "session_not_found"),
+        (False, _WORKSPACE_MISSING_ERROR_CODE),
+        (True, "session_not_found"),
+    ],
+    ids=["deleted-server-ended", "deleted-categorized-refusal", "live-echoed-code"],
+)
+@pytest.mark.asyncio
+async def test_not_found_launch_code_is_a_404_only_for_a_deleted_session(
+    monkeypatch: pytest.MonkeyPatch,
+    session_exists: bool,
+    error_code: str,
+) -> None:
+    """The row, not the host's code, decides: a deleted session is gone, a live one was refused."""
+    monkeypatch.setattr(orchestration, "_get_runner_client", _async_return(None))
+    monkeypatch.setattr(
+        orchestration,
+        "_maybe_wake_stale_resumable_managed_sandbox",
+        _async_return(False),
+    )
+    monkeypatch.setattr(
+        orchestration,
+        "_launch_runner_on_host",
+        _async_return(
+            SimpleNamespace(
+                runner_id="",
+                error_code=error_code,
+                error="session was deleted while its relaunch was in flight",
+            )
+        ),
+    )
+
+    conv = _conv(host_id="host_1", workspace="/w")
+    store = _Store(conv) if session_exists else SimpleNamespace(get_conversation=lambda _cid: None)
+    app_state = SimpleNamespace(
+        host_registry=SimpleNamespace(get=lambda _hid: SimpleNamespace(owner="alice@example.com")),
+        runner_exit_reports=None,
+        tunnel_registry=None,
+    )
+
+    with pytest.raises(OmnigentError) as excinfo:
+        await orchestration.ensure_runner_connected(
+            session_id="conv_1",
+            conv=conv,
+            app_state=app_state,
+            conversation_store=store,
+            runner_router=None,
+            raise_host_refusal=True,
+        )
+
+    if session_exists:
+        assert isinstance(excinfo.value, orchestration.HostLaunchRefusedError)
+    else:
+        assert excinfo.value.code == ErrorCode.NOT_FOUND
+        assert "host" not in excinfo.value.message.lower()
+
+
+def test_host_launch_refusal_shows_reason_only_to_the_host_owner() -> None:
+    """The host's text loses control sequences, is flattened and capped, and is owner-only."""
+    refusal = orchestration.HostLaunchRefusedError(
+        "\x1b[31mbad\x1b[0m\n" + "x" * 1000, "owner@example.com"
+    )
+
+    hidden = refusal.for_viewer("collaborator@example.com")
+    assert "bad" not in str(hidden)
+    assert "daemon log on the host" in str(hidden)
+    assert str(refusal) == str(hidden)
+    shown = str(refusal.for_viewer("owner@example.com"))
+    reason = shown.split("the launch failed: ", 1)[1].split(". Fix it", 1)[0]
+    assert reason.startswith("bad x")
+    assert len(reason) == orchestration._HOST_REFUSAL_REASON_MAX_CHARS
+    assert reason.endswith("…")
+
+    unowned = orchestration.HostLaunchRefusedError("failed to spawn runner: boom", None)
+    assert "failed to spawn runner: boom" in str(unowned)
+    assert str(unowned.for_viewer("anyone@example.com")) == str(unowned)
+    for raw in ("\x1b]0;title\x07bad", "\x1b]8;;http://x\x1b\\bad", "\x1bPq payload\x1b\\bad"):
+        detail = str(orchestration.HostLaunchRefusedError(raw, None)).split("launch failed: ", 1)[
+            1
+        ]
+        assert detail.startswith("bad. Fix it"), detail
