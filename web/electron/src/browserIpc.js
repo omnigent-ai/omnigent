@@ -63,8 +63,8 @@ function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
     message: `Import ${what} into Omnigent?`,
     detail:
       `From Chrome profile "${flattenProfileLabel(profileName, scope)}" for ${where}.\n\n` +
-      "They stay available to this conversation's embedded browser tabs, including any the " +
-      "agent controls, until you quit Omnigent.",
+      "They are saved in Omnigent's browser profile, which every conversation's embedded " +
+      "browser tabs share, including any the agent controls.",
   };
 }
 
@@ -705,8 +705,7 @@ function registerBrowserIpc({
   });
 
   // ── Import cookies from Google Chrome (macOS) ────────────────────────────
-  // Copies only the current site's cookies into this conversation's in-memory
-  // partition: a metadata-only preview (no Keychain), then the import. The site
+  // Copies only the current site's cookies into the view's browser profile: a metadata-only preview (no Keychain), then the import. The site
   // comes from the view's real URL in main and is re-checked before writing.
 
   const siteForEntry = (entry) => {

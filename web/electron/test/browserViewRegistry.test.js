@@ -12,7 +12,7 @@
 const { describe, it, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
+const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
 /** Build a registry with spy-backed injected deps. Returns the registry plus
@@ -582,7 +582,7 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
     "proxy.corp": ["10.0.0.2"],
   };
   const ctx = makeEventCapturingRegistry({
-    partitionScope: "w-test",
+    resolvePartition: () => "persist:omnigent-browser-test",
     resolveHost: async (hostname, partition) => {
       lookups.push({ hostname, partition });
       return dnsTable[hostname] ?? [];
@@ -600,9 +600,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     const verdict = await registry.checkAgentNavigation("conv_1", "http://lvh.me:8899/", null);
     assert.equal(verdict.ok, false);
     assert.match(verdict.error, /does not resolve to a public address/);
-    assert.deepEqual(lookups, [
-      { hostname: "lvh.me", partition: agentPartition("w-test", "conv_1") },
-    ]);
+    assert.deepEqual(lookups, [{ hostname: "lvh.me", partition: "persist:omnigent-browser-test" }]);
     assert.equal(registry.has("conv_1"), false, "the check creates no view");
   });
 
