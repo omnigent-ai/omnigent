@@ -1032,19 +1032,32 @@ def test_claude_managed_gateway_first_readable_file_decides(clean_env, monkeypat
     assert ambient.claude_managed_gateway() == (None, False)
 
 
-@pytest.mark.skipif(
-    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs directory permissions"
-)
-def test_claude_code_managed_mcp_presence_follows_claude_code(tmp_path, monkeypatch) -> None:
-    """An unparseable file still counts as deployed; an unsearchable directory does not."""
+def _claude_code_managed_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     managed_dir = tmp_path / "claude-code"
     managed_dir.mkdir()
     monkeypatch.setattr(
         ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_dir / "managed-settings.json",)
     )
+    return managed_dir
+
+
+def test_claude_code_managed_mcp_presence_counts_unparseable_file(tmp_path, monkeypatch) -> None:
+    """An unparseable file still counts as deployed, as it does for Claude Code."""
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
     assert not ambient.claude_code_managed_mcp_present()
 
     (managed_dir / "managed-mcp.json").write_text("not json")
+    assert ambient.claude_code_managed_mcp_present()
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs directory permissions"
+)
+def test_claude_code_managed_mcp_presence_ignores_unsearchable_directory(
+    tmp_path, monkeypatch
+) -> None:
+    managed_dir = _claude_code_managed_dir(tmp_path, monkeypatch)
+    (managed_dir / "managed-mcp.json").write_text("{}")
     assert ambient.claude_code_managed_mcp_present()
 
     managed_dir.chmod(0)
