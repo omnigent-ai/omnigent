@@ -121,7 +121,8 @@ function isWindowFocused(): boolean {
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
-  const { data } = useLoadedConversations();
+  // `data` subtracts answers in flight; new prompts are detected on the server's counts.
+  const { data, serverRows } = useLoadedConversations();
   const prevStatus = useRef<Map<string, ConversationStatus>>(new Map());
   const prevElicitations = useRef<Map<string, number>>(new Map());
   // Last badge state sent to the shell, as a `count|navigatePath|title|body` key.
@@ -286,9 +287,9 @@ export function useIdleNotifications(activeConversationId?: string): void {
     pushBadge(unread, conversations);
 
     const idle = detectIdleTransitions(prevStatus.current, conversations);
-    const newElicitations = detectNewElicitations(prevElicitations.current, conversations);
+    const newElicitations = detectNewElicitations(prevElicitations.current, serverRows);
     prevStatus.current = buildStatusMap(conversations);
-    prevElicitations.current = buildElicitationMap(conversations);
+    prevElicitations.current = buildElicitationMap(serverRows);
 
     const windowFocused = windowFocusedRef.current;
     const grantedOrNative = isNativeShell() || getNotificationPermission() === "granted";
@@ -376,7 +377,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
         notify(conversation, ELICITATION_BODY, navigate);
       }
     }
-  }, [data, navigate, activeConversationId]);
+  }, [data, serverRows, navigate, activeConversationId]);
 }
 
 /**
