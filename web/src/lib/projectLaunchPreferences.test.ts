@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { readProjectLaunchDefaults, writeProjectLaunchDefaults } from "./projectLaunchPreferences";
+import { SANDBOX_HOST_CHOICE } from "./hostPreferences";
+import {
+  projectConfigWithLaunch,
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+  type ProjectLaunchDefaults,
+} from "./projectLaunchPreferences";
+import type { ProjectConfig } from "./projectsApi";
 
 const STORAGE_KEY = "omnigent:project-launch-defaults";
 const START = {
@@ -68,5 +75,55 @@ describe("projectLaunchPreferences", () => {
     });
     expect(() => writeProjectLaunchDefaults("proj_a", START, {})).not.toThrow();
     expect(readProjectLaunchDefaults("proj_a", {})).toBeNull();
+  });
+});
+
+describe("projectConfigWithLaunch", () => {
+  const stored = {
+    host_id: "host_1",
+    workspace: "/repos/alpha",
+    agent_id: "ag_claude",
+    model: "opus",
+    effort: "low",
+    use_worktree: true,
+  };
+
+  it("keeps the stored settings without a last start", () => {
+    expect(projectConfigWithLaunch(stored, null)).toEqual(stored);
+  });
+
+  it.each<{ label: string; launch: ProjectLaunchDefaults; expected: ProjectConfig }>([
+    {
+      label: "fills the agent, model and effort from the start's options",
+      launch: { agentId: "ag_codex", harnessOptions: { model: "gpt-5.6-sol", effort: "high" } },
+      expected: { ...stored, agent_id: "ag_codex", model: "gpt-5.6-sol", effort: "high" },
+    },
+    {
+      label: "shows a start on the harness defaults as no model or effort",
+      launch: { agentId: "ag_codex", harnessOptions: { model: "", effort: "" } },
+      expected: { ...stored, agent_id: "ag_codex", model: undefined, effort: undefined },
+    },
+    {
+      label: "drops the stored model and effort for another agent without options",
+      launch: { agentId: "ag_polly", pickedHarness: null },
+      expected: { ...stored, agent_id: "ag_polly", model: undefined, effort: undefined },
+    },
+    {
+      label: "keeps the stored model and effort for the same agent without options",
+      launch: { agentId: "ag_claude", pickedHarness: null },
+      expected: stored,
+    },
+    {
+      label: "keeps the stored agent for a Smart Routing start",
+      launch: { agentId: "ag_claude_wrapper", pickedHarness: "auto-native" },
+      expected: stored,
+    },
+    {
+      label: "fills the host together with its working directory",
+      launch: { hostId: SANDBOX_HOST_CHOICE },
+      expected: { ...stored, host_id: SANDBOX_HOST_CHOICE, workspace: undefined },
+    },
+  ])("$label", ({ launch, expected }) => {
+    expect(projectConfigWithLaunch(stored, launch)).toEqual(expected);
   });
 });

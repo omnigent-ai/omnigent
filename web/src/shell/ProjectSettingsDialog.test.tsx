@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
+import { writeProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
@@ -86,7 +87,10 @@ beforeEach(() => {
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
 
 describe("ProjectSettingsDialog", () => {
   it("seeds fields from the project's stored config", async () => {
@@ -652,4 +656,56 @@ describe("ProjectSettingsDialog", () => {
       );
     },
   );
+
+  // The project's last start (remembered in this browser) fills the fields, so
+  // the dialog shows what the project's next session opens with.
+  it("fills the fields from the project's last start and saves them as the settings", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults(
+      "p_1",
+      {
+        agentId: "ag_claude",
+        pickedHarness: null,
+        harness: "claude-native",
+        harnessOptions: { model: "opus", effort: "high", mode: "default" },
+        hostId: "h1",
+        workspace: "/repo-b",
+      },
+      { agent_id: "ag_1" },
+    );
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent(/opus/i),
+    );
+    expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument();
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        host_id: "h1",
+        workspace: "/repo-b",
+        model: "opus",
+        effort: "high",
+      }),
+    );
+  });
+
+  it("keeps the stored agent when the last start's agent no longer exists", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_1" } });
+    writeProjectLaunchDefaults("p_1", { agentId: "ag_gone", hostId: "h1" }, { agent_id: "ag_1" });
+    renderDialog();
+
+    await waitFor(() =>
+      expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
+        false,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1", host_id: "h1" }),
+    );
+  });
 });

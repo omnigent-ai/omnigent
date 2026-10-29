@@ -3,6 +3,7 @@
 // once the project's stored settings change after that start.
 
 import { z } from "zod";
+import { AUTO_NATIVE_HARNESS_ID } from "./agentLabels";
 import type { HarnessOptions } from "./modePreferences";
 import type { ProjectConfig } from "./projectsApi";
 
@@ -33,6 +34,32 @@ export interface ProjectLaunchDefaults {
   hostId?: string;
   /** Working directory on that host; unset for a sandbox. */
   workspace?: string;
+}
+
+/**
+ * A project's stored settings with its last start overlaid, as Project settings
+ * shows them. The model and effort come from the start's harness options (`""`
+ * = no default). A Smart Routing start keeps the stored agent, since the
+ * settings have no field for Smart Routing.
+ */
+export function projectConfigWithLaunch(
+  config: ProjectConfig,
+  launch: ProjectLaunchDefaults | null,
+): ProjectConfig {
+  if (launch === null) return config;
+  const merged = { ...config };
+  if (launch.agentId !== undefined && launch.pickedHarness !== AUTO_NATIVE_HARNESS_ID) {
+    merged.agent_id = launch.agentId;
+    if (launch.harnessOptions !== undefined || launch.agentId !== config.agent_id) {
+      merged.model = launch.harnessOptions?.model || undefined;
+      merged.effort = launch.harnessOptions?.effort || undefined;
+    }
+  }
+  if (launch.hostId !== undefined) {
+    merged.host_id = launch.hostId;
+    merged.workspace = launch.workspace;
+  }
+  return merged;
 }
 
 /**
