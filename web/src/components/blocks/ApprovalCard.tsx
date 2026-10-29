@@ -54,6 +54,7 @@ import {
   exitPlanModePlan,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -357,7 +358,7 @@ export function ApprovalCard({
   );
   // Remount the question form when the same elicitation carries new questions.
   const askQuestionsKey = useMemo(
-    () => JSON.stringify(askPayload?.questions ?? null),
+    () => (askPayload ? askUserQuestionSignature(askPayload.questions) : ""),
     [askPayload],
   );
   // ExitPlanMode plan review: the server stamps the full tool_input

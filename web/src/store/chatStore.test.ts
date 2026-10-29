@@ -41,6 +41,7 @@ import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import {
+  askUserQuestionSignature,
   clearAskUserQuestionDraft,
   getAskUserQuestionDraft,
   saveAskUserQuestionDraft,
@@ -1448,7 +1449,7 @@ describe("chatStore — switchTo", () => {
     expect(reconciled).toHaveLength(1);
     expect(reconciled[0]!.status).toBe("responded");
     expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
-    expect(getAskUserQuestionDraft("elic_vis", regionQuestions)).toBeDefined();
+    expect(getAskUserQuestionDraft("elic_vis", regionSignature)).toBeDefined();
   });
 
   it("does not abort a conversation's stream when switching away", async () => {
@@ -10656,7 +10657,9 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
   });
 });
 
-const regionQuestions = [{ question: "Pick a region", options: [], multiSelect: false }];
+const regionSignature = askUserQuestionSignature([
+  { question: "Pick a region", options: [], multiSelect: false },
+]);
 const savedRegionDrafts = new Set<string>();
 
 afterEach(() => {
@@ -10666,7 +10669,7 @@ afterEach(() => {
 
 function saveRegionDraft(elicitationId: string): void {
   savedRegionDrafts.add(elicitationId);
-  saveAskUserQuestionDraft(elicitationId, regionQuestions, {
+  saveAskUserQuestionDraft(elicitationId, regionSignature, {
     currentIndex: 0,
     selections: { "Pick a region": "" },
     customSelected: { "Pick a region": true },
@@ -10761,14 +10764,14 @@ describe("chatStore — submitApproval", () => {
       .getState()
       .submitApproval("elic_ask", "accept", { "Pick a region": "eu-west" });
     expect(useChatStore.getState().blocks[0]).toMatchObject({ status: "pending" });
-    expect(getAskUserQuestionDraft("elic_ask", regionQuestions)?.customInputs).toEqual({
+    expect(getAskUserQuestionDraft("elic_ask", regionSignature)?.customInputs).toEqual({
       "Pick a region": "eu-west",
     });
 
     await useChatStore
       .getState()
       .submitApproval("elic_ask", "accept", { "Pick a region": "eu-west" });
-    expect(getAskUserQuestionDraft("elic_ask", regionQuestions)).toBeUndefined();
+    expect(getAskUserQuestionDraft("elic_ask", regionSignature)).toBeUndefined();
   });
 
   it("posts the verdict to the elicitation resolve URL and optimistically marks responded", async () => {
@@ -11182,7 +11185,7 @@ describe("chatStore — elicitation_resolved", () => {
     }
     expect(block.status).toBe("responded");
     expect(block.response).toEqual({ action: "accept" });
-    expect(getAskUserQuestionDraft("elic_verdict", regionQuestions)).toBeUndefined();
+    expect(getAskUserQuestionDraft("elic_verdict", regionSignature)).toBeUndefined();
   });
 
   it("carries the unanswered reason so the card can say the prompt expired", () => {
@@ -17918,7 +17921,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     await drainAsync();
     expect(sinks).toHaveLength(3);
     expect(elicitationCards()[0]!.status).toBe("pending");
-    expect(getAskUserQuestionDraft("elic_reopen", regionQuestions)).toBeDefined();
+    expect(getAskUserQuestionDraft("elic_reopen", regionSignature)).toBeDefined();
 
     await closeLoop(sinks, loop);
   });
@@ -17968,7 +17971,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     expect(cards).toHaveLength(1);
     expect(cards[0]!.status).toBe("pending");
     expect(cards[0]!.response).toBeNull();
-    expect(getAskUserQuestionDraft("elic_rev", regionQuestions)).toBeDefined();
+    expect(getAskUserQuestionDraft("elic_rev", regionSignature)).toBeDefined();
 
     await abortLoop(sinks, controller, loop);
   });
