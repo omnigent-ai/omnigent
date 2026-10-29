@@ -51,13 +51,53 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: merge-ready-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
-  cancel-in-progress: true
-
 jobs:
+  resolve-head:
+    # Comments and dispatches lack a head SHA for the per-commit lock.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        contains(github.event.comment.body, '/merge') &&
+        !endsWith(github.actor, '[bot]')
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      skip: ${{ steps.head.outputs.skip }}
+    steps:
+      - name: Resolve current head
+        id: head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ inputs.pr || github.event.issue.number }}
+          SHA_INPUT: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::Expected a PR number"; exit 1; }
+          PULL=$(gh api "repos/$REPO/pulls/$PR")
+          SHA=$(jq -r '.head.sha' <<<"$PULL")
+          if [[ -n "$SHA_INPUT" ]] && ! [[ "$SHA_INPUT" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "::error::Expected a head SHA"
+            exit 1
+          fi
+          if [[ $(jq -r '.state' <<<"$PULL") != 'open' || "$SHA" != "$SHA_INPUT"* ]]; then
+            echo "::notice::Skipped: PR is closed or its head changed"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
   evaluate:
     name: evaluate
+    needs: resolve-head
+    concurrency:
+      group: merge-ready-${{ needs.resolve-head.outputs.sha || github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
+      cancel-in-progress: false
     permissions:
       contents: write       # enable PR merge for `/merge`
       pull-requests: write  # post comments + enable auto-merge
@@ -69,6 +109,10 @@ jobs:
     # workflow_dispatch re-eval. Runs with no open PR (push to main, etc.) are
     # dropped by the ctx step.
     if: >-
+      !cancelled() &&
+      (needs.resolve-head.result == 'success' || needs.resolve-head.result == 'skipped') &&
+      needs.resolve-head.outputs.skip != 'true' &&
+      (
       (
         github.event_name == 'pull_request_target' &&
         (
@@ -104,6 +148,7 @@ jobs:
           github.event.comment.author_association == 'COLLABORATOR'
         )
       )
+      )
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -131,7 +176,7 @@ jobs:
           CHECK_RUN_SHA: ${{ github.event.check_run.head_sha }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           PR_INPUT: ${{ inputs.pr }}
-          SHA_INPUT: ${{ inputs.sha }}
+          RESOLVED_SHA: ${{ needs.resolve-head.outputs.sha }}
         run: |
           # Resolve the open PR from a head SHA -- fork-PR events leave the
           # payload's pull_requests array empty (cross-repo). Use the search
@@ -153,11 +198,7 @@ jobs:
               exit 1
             fi
             PR="$PR_INPUT"
-            if [[ "$SHA_INPUT" =~ ^[0-9a-f]{7,40}$ ]]; then
-              SHA="$SHA_INPUT"
-            else
-              SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
-            fi
+            SHA="$RESOLVED_SHA"
           elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
             # The job `if` contains() pre-filter also fires on incidental
             # mentions; re-validate `/merge` as a command (first non-space
@@ -168,7 +209,7 @@ jobs:
               exit 0
             fi
             PR="${{ github.event.issue.number }}"
-            SHA=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid')
+            SHA="$RESOLVED_SHA"
           elif [[ "${{ github.event_name }}" == "check_run" ]]; then
             SHA="$CHECK_RUN_SHA"
             PR=$(resolve_pr_from_sha "$SHA")
@@ -213,8 +254,7 @@ jobs:
             echo "automerge=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # post_red gates posting a red status: /merge needs it, automerge opts
-      # in; otherwise post green only so partial CI doesn't paint red.
+      # Explicit reevaluations (including expiry sweeps) must revoke old green.
       - name: Determine eligibility
         id: eligible
         if: steps.ctx.outputs.skip != 'true'
@@ -223,7 +263,7 @@ jobs:
           AUTOMERGE:   ${{ steps.labels.outputs.automerge }}
         run: |
           echo "run=true" >> "$GITHUB_OUTPUT"
-          if [[ "$EVENT" == "issue_comment" ]] || [[ "$AUTOMERGE" == "true" ]]; then
+          if [[ "$EVENT" == "issue_comment" || "$EVENT" == "workflow_dispatch" || "$AUTOMERGE" == "true" ]]; then
             echo "post_red=true" >> "$GITHUB_OUTPUT"
           else
             echo "post_red=false" >> "$GITHUB_OUTPUT"
@@ -278,13 +318,14 @@ jobs:
         env:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
+          FRESHNESS_FAILED: ${{ steps.eval.outputs.freshness_failed }}
+          EXPIRES_AT: ${{ steps.eval.outputs.expires_at }}
           DEPENDENCY_EVAL: ${{ steps.dependency.outcome }}
           DEPENDENCY_REQUIRED: ${{ steps.labels.outputs.dependency_required }}
           POST_RED: ${{ steps.eligible.outputs.post_red }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
-      # Dependency failures always revoke an earlier green status, including
-      # native auto-merge PRs without the automerge label.
+      # Expired CI and dependency failures revoke green even without a label.
       - name: Post Merge Ready status on PR head SHA
         if: >-
           steps.ctx.outputs.skip != 'true' &&

@@ -428,6 +428,25 @@ request enforces this, so unsigned commits will block merging.
   section. The complete changelog still credits the PR using its title. This
   records your recommendation; maintainers curate the release notes.
 
+### CI freshness
+
+Passing CI is valid for 48 hours from each workflow's original creation time.
+`Merge Ready` shows the earliest expiry across the required CI checks. Changes
+to `main` during that window do not invalidate a passing result.
+
+After expiry, update your PR branch from `main` and let fresh CI finish. If the
+branch is already current, push a new commit to trigger fresh PR workflows.
+Re-running an existing workflow, including with `/rerun`, keeps its original
+age and does not renew the window. DCO and intentionally skipped checks do not
+expire.
+
+A sweep scheduled every 15 minutes rechecks expired green statuses on open
+PRs, including those without the `automerge` label. GitHub can delay scheduled
+runs, so idle PRs become blocked when the sweep and gate evaluation complete.
+Each sweep reevaluates at most 50 PRs, prioritizing known expiries over older
+statuses that have no expiry recorded yet. Large backlogs take multiple sweeps.
+Normal gate evaluations also enforce expiry.
+
 ### Database migration reviews
 
 Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when
