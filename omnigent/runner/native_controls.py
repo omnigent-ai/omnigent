@@ -135,6 +135,8 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         captured, or ``None`` for failures with no person-actionable cause.
     """
     from omnigent.harnesses.claude_native.bridge import (
+        ClaudeComposerNotCleared,
+        ClaudeInjectionCancelled,
         ClaudePromptTimeout,
         ClaudeSignInPending,
         ClaudeTerminalDialog,
@@ -163,6 +165,18 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         next_step = (
             "Claude Code's input box never appeared. It may still be starting, or waiting "
             "on a prompt such as a password. Check the terminal, then switch models again."
+        )
+    elif isinstance(exc, ClaudeComposerNotCleared):
+        next_step = (
+            "A draft is left in Claude Code's input box, so the switch was not sent. Open "
+            "the terminal, clear the input box, then switch models again."
+        )
+    elif isinstance(exc, ClaudeInjectionCancelled):
+        # A pane that never became ready uses up the switch budget before it can type.
+        next_step = (
+            "Claude Code did not accept the switch before the request timed out. It may "
+            "still be starting, or showing a prompt. Check the terminal, then switch models "
+            "again."
         )
     else:
         return None

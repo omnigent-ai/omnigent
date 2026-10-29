@@ -2775,6 +2775,26 @@ _PASSWORD_PANE_TAIL = (
             + _PASSWORD_PANE_TAIL,
             id="exited",
         ),
+        pytest.param(
+            "inject",
+            claude_native_bridge.ClaudeComposerNotCleared(
+                "A draft left in Claude Code's input box could not be cleared, so nothing "
+                "was sent. Open the terminal, clear the input box, then retry."
+            ),
+            "A draft is left in Claude Code's input box, so the switch was not sent. Open "
+            "the terminal, clear the input box, then switch models again.",
+            id="leftover-draft",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeInjectionCancelled(
+                "Claude Code message delivery was cancelled"
+            ),
+            "Claude Code did not accept the switch before the request timed out. It may "
+            "still be starting, or showing a prompt. Check the terminal, then switch models "
+            "again.",
+            id="cancelled-before-ready",
+        ),
     ],
 )
 async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
