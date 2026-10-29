@@ -629,7 +629,7 @@ export function CodeViewer({
       !isFilePositionPending(position) ||
       showMonaco ||
       viewMode !== "source" ||
-      !fileQuery.isSuccess
+      fileQuery.data === undefined
     )
       return;
     if (revealedPositionRef.current === position) return;
@@ -638,7 +638,7 @@ export function CodeViewer({
     if (!line) return;
     line.scrollIntoView({ block: "center" });
     revealedPositionRef.current = position;
-  }, [position, showMonaco, viewMode, fileQuery.isSuccess, rawLines]);
+  }, [position, showMonaco, viewMode, fileQuery.data, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
   // composer reads — only the native coding-agent harnesses act on it, so
@@ -890,7 +890,8 @@ export function CodeViewer({
       </div>
     );
   }
-  if (fileQuery.isError) {
+  // A failed refresh keeps the loaded content (and any unsaved edits) on screen.
+  if (fileQuery.isLoadingError) {
     return (
       <div className="p-8 text-destructive text-ui">
         Error loading file:{" "}
@@ -947,7 +948,9 @@ export function CodeViewer({
         content={content}
         conversationId={conversationId}
         path={path}
-        isSettled={fileQuery.isSuccess}
+        // Cached content counts: a failed refresh must not leave the previous
+        // file's editor mounted (and saving) under this path.
+        isSettled={fileQuery.data !== undefined}
         truncated={truncated}
         onDirtyChange={onDirtyChange}
         comments={comments}
@@ -1015,7 +1018,7 @@ export function CodeViewer({
           content={content}
           conversationId={conversationId}
           path={path}
-          isSettled={fileQuery.isSuccess}
+          isSettled={fileQuery.data !== undefined}
           truncated={truncated}
           largeMarkdown={markdownSourceFallback}
           onDirtyChange={onDirtyChange}

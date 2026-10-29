@@ -15,6 +15,8 @@ and the recording protocol for comparing revisions.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
+- `live-refresh`: an open file shows saves from other sessions and processes
+  in place, keeping the caret; unsaved edits raise a conflict instead.
 - `large-files`: files above 1 MiB open as editable source; truncated files
   remain read-only, with full-file download available.
 
@@ -34,7 +36,8 @@ and the recording protocol for comparing revisions.
   Markdown path, or call the [file-opening endpoint](../docs/agent-ui-api.md).
   Only current session viewers (the selected pane in grids) open the file;
   background requests are not replayed.
-- `document-link`: follow a relative file link inside the editor's link popup.
+- `document-link`: click a web or relative file link directly in the editor;
+  Alt-click or move the caret with the keyboard to edit it and use its link popup.
 - `mobile`: use the session Files surface or a file link at a phone width.
 
 ## Driving it with the repro environment
@@ -135,18 +138,52 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
   confirms the edit, undo, and redo through fresh filesystem API reads from
   the real server, then reloads the saved edit.
+- `direct-link`, `live-refresh`:
+  `tests/e2e_ui/files/test_file_autosave.py::test_open_markdown_follows_other_writers`
+  leaves an idle session's editor open while another process replaces the file
+  and another session saves it. Both edits appear without a reload, and typing
+  at the parked caret saves beside them. With saves failing, a later external
+  change raises the conflict instead of replacing unsaved text, and Keep mine
+  saves it. Edits typed during a save, the pre-save conflict check, undo, and
+  caret mapping are covered by component tests
+  (`MarkdownRichTextViewer.integration.test.tsx`,
+  `MonacoCodeEditor.autosave.test.tsx`, `TipTapEditorHelpers.test.ts`).
 - `files`, `review`:
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_heading_text_anchor_content_excludes_prefix`.
+  `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_repeated_word_keeps_selected_occurrence_after_reopen`
+  checks exact raw endpoints and the highlighted occurrence after save/reopen,
+  including a word split across formatting beside a hidden URL and a plain copy,
+  a bold word in an ordered-list parent followed by a nested ordered list,
+  and a repeated bold word outside a table containing an escaped pipe.
+  `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_mixed_structures_accumulated_comments_after_autosave`
+  edits the mixed fixture, waits for real autosave, then comments on every
+  duplicate through the UI, selecting the nested-list parent last. It checks
+  persisted raw endpoints and every highlight again after a full page reload.
+  This covers accumulated decorations and serialization, unlike single-comment
+  tests or parser-only input matrices.
+  `tests/browser_ui/files/test_markdown_editor_journey.py::test_markdown_comment_boundary_save_reload`
+  checks raw endpoints and highlights after saving/reloading selections ending
+  on a CRLF soft break, hard break, or image next to duplicate text.
+  `test_markdown_existing_comment_after_autosave` checks an existing highlight
+  before clicking it or adding another comment.
+  `test_markdown_source_comment_after_external_edit` reloads externally changed
+  text and checks Source-mode ranges with formatting retained or removed.
+  These browser-contract cases reuse the file journey's mock backend; they do
+  not establish server persistence. Parser input matrices remain in unit tests.
 - `agent-api`, desktop and phone-sized browser:
   `tests/e2e_ui/files/test_right_panel.py::test_agent_opens_workspace_file`
   drives a scripted agent tool call through the runner, server and stream into
   the real file viewer. Grid targeting and dirty-navigation guards are covered
   by `web/src/grid/GridSessionPane.test.tsx`; native app/device runs remain manual.
 - `document-link`:
+  `tests/e2e_ui/files/test_markdown_editor_link_popup.py::test_editor_links_open_with_one_click`
+  opens a table's web link and a relative file link with one desktop click or
+  phone-width tap, preserves drag selection, and checks the source is unchanged.
   `tests/e2e_ui/files/test_markdown_editor_link_popup.py::test_editor_link_popup_opens_relative_link_from_keyboard`
-  opens a relative file from the keyboard-accessible link popup.
+  uses Alt-click to place the caret, then opens a relative file from the
+  keyboard-accessible link popup.
 - `chat-link`, `offline`:
   `tests/browser_ui/files/test_file_line_navigation.py::test_citation_preserves_offline_markdown_draft_with_diff_preference`
   exercises a citation, offline editing, and the dirty-navigation guard. Its
@@ -171,6 +208,21 @@ instead of treating one comparison clip as complete feature verification.
 
 ## Gotchas
 
+- Comment offsets remain raw-source ranges; the quote is rendered text. A
+  selection such as `wo**rd**` can span markup, and its minimal source range
+  ends at the last selected character, before the closing `**`. Comments whose
+  raw ranges span markup are remapped through the same parser in Edit, Source,
+  and Diff views,
+  preferring an exact stored range, then the closest verified source occurrence.
+  Unsupported or oversized documents retain stored ranges in Source mode.
+  If the remapping module cannot load, Source and Diff use the legacy text search.
+  Equal-length source ranges still use legacy search after external edits,
+  including selections entirely inside bold or italic delimiters.
+  This does not repair previously mis-saved offsets or guarantee tracking
+  through arbitrary subsequent edits.
+- Older clients can display a formatted comment on a plain literal copy.
+  Refresh those tabs to load the source-map behavior; this display difference
+  does not overwrite the comment's saved offsets.
 - The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
   It applies above 1 MiB regardless of the saved view preference. The choice
   stays fixed for that file visit so an autosave cannot replace an editor with
@@ -190,6 +242,18 @@ instead of treating one comparison clip as complete feature verification.
   when upstream handles long lines without exhausting the regex stack.
 - Browser-contract saves update an in-memory mock filesystem. A successful
   reload there does not prove server/runner persistence or external-file edits.
+- Live refresh polls only an on-screen UTF-8 file up to 256 KiB, every two
+  seconds; hidden browser tabs pause. Larger and binary files, and the diff
+  view, refresh when shown again or when the session finishes a turn.
+- Every autosave re-reads the file first and raises the conflict if another
+  writer changed it. Saves are still last-writer-wins: a write landing between
+  that read and the save can be overwritten.
+- A failed refresh keeps the last loaded content, shows a notice, and re-checks
+  every 30 seconds; saving a file that was deleted meanwhile recreates it.
+- An external update replaces the document as `setContent` would, maps the
+  caret through the changed range, and clears undo history, as Monaco does. A
+  caret inside that range, or between separately changed regions, moves to its
+  end. Monaco keeps the caret's line and column instead of mapping it.
 - Desktop and mobile can have hidden viewer instances on older revisions.
   Interact with the visible viewer and report total editor count separately.
 - Resizing saved content is not evidence that unsaved edits or comments survive.

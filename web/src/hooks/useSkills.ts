@@ -61,7 +61,10 @@ export function useSkills({ target, enabled = true, starting = false }: SkillsOp
     queryFn: available ? ({ signal }) => fetchSkills(target, signal) : skipToken,
     enabled: available,
     staleTime: 30_000,
-    refetchInterval: available && target.sessionId !== undefined ? 60_000 : false,
+    refetchInterval: (skillsQuery) =>
+      available && (target.sessionId !== undefined || skillsQuery.state.status === "error")
+        ? 60_000
+        : false,
     retry: false,
   });
   const skillsStatus: SkillsStatus = !available
