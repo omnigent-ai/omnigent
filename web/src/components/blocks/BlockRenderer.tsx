@@ -158,14 +158,17 @@ function isFailureItem(item: RenderItem | undefined): boolean {
   return item?.kind === "error" || item?.kind === "retry" || item?.kind === "policy_denied";
 }
 
-/** Narration folds only in a turn that finished cleanly; otherwise it explains the outcome. */
+/**
+ * Narration folds only in a turn that finished cleanly; otherwise it explains the outcome.
+ * Codex labels its messages, so its commentary folds without the opt-in.
+ */
 function foldsNarration({
   items,
   turnLifecycle,
   foldNarration = false,
 }: Pick<FoldInputs, "items" | "turnLifecycle" | "foldNarration">): boolean {
   return (
-    foldNarration &&
+    (foldNarration || items.some(hasMessagePhase)) &&
     (turnLifecycle === undefined || turnLifecycle === "completed") &&
     // A retry that later succeeded stays in the transcript; a trailing one blocks any fold.
     !items.some((item) => item.kind === "error" || item.kind === "policy_denied")
@@ -567,10 +570,7 @@ function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
  * answer phase (Codex) folds only commentary; otherwise all but its last message.
  */
 function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) => boolean {
-  const hasAnswerPhase = items.some(
-    (item) =>
-      item.kind === "text" && (item.phase === "final_answer" || item.phase === "partial_answer"),
-  );
+  const hasAnswerPhase = items.some((item) => hasMessagePhase(item) && item.phase !== "commentary");
   if (hasAnswerPhase) return (item) => item.kind === "text" && item.phase === "commentary";
   // Keep the last non-blank message visible, even in a continued bubble; blank
   // text after it stays with it rather than opening a second fold.
@@ -578,6 +578,10 @@ function narrationFolds(items: RenderItem[]): (item: RenderItem, index: number) 
     (item) => item.kind === "text" && item.text.trim() !== "",
   );
   return (_item, index) => index < answerIndex;
+}
+
+function hasMessagePhase(item: RenderItem): item is Extract<RenderItem, { kind: "text" }> {
+  return item.kind === "text" && item.phase !== undefined;
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
