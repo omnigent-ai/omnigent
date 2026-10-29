@@ -112,10 +112,12 @@ _AUTH_MARKERS = (
 
 # --- dbcert client certificate missing ----------------------------------------
 # A launcher that authenticates with the user's dbcert client certificate exits
-# before the agent starts when the files are absent or carry no team memberships.
+# before the agent starts when the files are absent, carry no team memberships,
+# or are about to expire.
 _DBCERT_MARKERS = (
     "noteamsfoundinyourcertificate",
     "missingrequiredcredentialfiles",
+    "certificateexpirestoosoon",
 )
 # Pane captures wrap long lines and draw borders, which can split a marker.
 _PANE_WRAP = re.compile(r"[\s│┃]+")
@@ -163,7 +165,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             and any(m in _PANE_WRAP.sub("", s.output) for m in _DBCERT_MARKERS)
         ),
         FailureDiagnosis(
-            title="Client certificate missing",
+            title="Client certificate missing or expired",
             cause=(
                 "The agent's launcher exited before the agent started because this "
                 "machine has no usable dbcert client certificate."

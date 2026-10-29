@@ -168,12 +168,15 @@ def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
         # Pane wrapping and borders can split the marker mid-word.
         "│ Direct API access authentication failed: No teams found in your cert │\n"
         "│ ificate. Please run 'dbcert' and try again.                           │",
+        # A launcher refuses a certificate that is about to expire; the pane wraps it.
+        "Error: failed to build HTTP client: failed to read dbcert: certificate\n"
+        "expires too soon (expires: 2026-01-01 00:00:00 +0000 UTC)",
     ],
 )
 def test_classifies_missing_dbcert_certificate(output: str) -> None:
     diagnosis = classify_terminal_failure(command="isaac", exit_status=1, output=output)
     assert diagnosis is not None
-    assert diagnosis.title == "Client certificate missing"
+    assert diagnosis.title == "Client certificate missing or expired"
     assert diagnosis.remediation is not None
     assert "`dbcert`" in diagnosis.remediation
 
@@ -191,7 +194,7 @@ def test_dbcert_wins_over_missing_binary_and_auth_markers() -> None:
         ),
     )
     assert diagnosis is not None
-    assert diagnosis.title == "Client certificate missing"
+    assert diagnosis.title == "Client certificate missing or expired"
 
 
 def test_other_missing_credentials_are_not_reported_as_dbcert() -> None:
@@ -200,7 +203,7 @@ def test_other_missing_credentials_are_not_reported_as_dbcert() -> None:
         exit_status=1,
         output="Missing required credential files in directory: /custom/cloud-profile",
     )
-    assert diagnosis is None or diagnosis.title != "Client certificate missing"
+    assert diagnosis is None or diagnosis.title != "Client certificate missing or expired"
 
 
 def test_unclassified_failure_returns_none() -> None:
