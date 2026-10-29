@@ -2835,6 +2835,54 @@ async def test_on_runner_connect_logs_deferred_init_event_for_idle_and_archived(
 
 
 @pytest.mark.asyncio
+async def test_on_runner_connect_repairs_pending_count_without_prompts_held_in_terminal(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconnect repair of a persisted count leaves out a prompt held in the terminal."""
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server import session_live_state
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_held_prompt_count_test"
+    parked_id, held_id = _bind_sessions(db_uri, runner_id, count=2)
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    request = {"type": "response.elicitation_request", "params": {}}
+    pending_elicitations.record_publish(parked_id, {**request, "elicitation_id": "elicit_parked"})
+    pending_elicitations.record_publish(
+        held_id,
+        {
+            **request,
+            "elicitation_id": "elicit_held",
+            "params": {"terminal_fallback": {"answer_undelivered": False}},
+        },
+    )
+    persisted: dict[str, int] = {}
+    monkeypatch.setattr(
+        session_live_state,
+        "persist_pending_count",
+        lambda session_id, count: persisted.__setitem__(session_id, count),
+    )
+
+    async def _initialize(*_a: object, **_k: object) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert persisted == {parked_id: 1, held_id: 0}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
 async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
     db_uri: str,
