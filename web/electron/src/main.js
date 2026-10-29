@@ -2749,6 +2749,9 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  // The menu item opens the bar without a page keydown; the page must still
+  // render every transcript row for find to reach off-screen messages.
+  target.webContents.send("omnigent:find-opened");
   const existing = findBars.get(target);
   if (existing && !existing.isDestroyed()) {
     existing.focus();
@@ -2783,9 +2786,15 @@ function openFindBar(target) {
       matches: result.matches,
     });
   };
+  // Results belong to the searched conversation, so switching closes the bar.
+  const openedIn = findConversationId(target.webContents.getURL());
+  const onNavigate = (_event, url) => {
+    if (findConversationId(url) !== openedIn) bar.close();
+  };
   target.on("resize", reposition);
   target.on("move", reposition);
   target.webContents.on("found-in-page", onFound);
+  target.webContents.on("did-navigate-in-page", onNavigate);
 
   bar.once("ready-to-show", () => {
     reposition();
@@ -2797,12 +2806,18 @@ function openFindBar(target) {
     target.removeListener("resize", reposition);
     target.removeListener("move", reposition);
     target.webContents.removeListener("found-in-page", onFound);
+    target.webContents.removeListener("did-navigate-in-page", onNavigate);
     // Closing the parent (Cmd+W) destroys its webContents before this child's
     // "closed" fires, while the parent window itself is not yet destroyed.
     if (target.webContents.isDestroyed()) return;
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+/** The `/c/<id>` conversation a shell URL shows, or null. */
+function findConversationId(url) {
+  return /\/c\/([^/?#]+)/.exec(url)?.[1] ?? null;
 }
 
 /**
