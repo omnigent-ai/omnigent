@@ -34,7 +34,7 @@
 
 import type { ElicitationTerminalFallback } from "@/lib/events";
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
-import { type ReactNode, useContext } from "react";
+import { type ReactNode, useContext, useMemo } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -56,6 +56,7 @@ import {
   exitPlanModePlan,
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
+import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
 import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
@@ -384,8 +385,16 @@ export function ApprovalCard({
   // (full, non-truncated); fall back to parsing the content_preview
   // JSON for backwards compatibility with elicitations published
   // before the structured field was added.
-  const askPayload: AskUserQuestionPayload | null =
-    castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview);
+  const askPayload: AskUserQuestionPayload | null = useMemo(
+    () =>
+      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    [askUserQuestion, contentPreview],
+  );
+  // Remount the question form when the same elicitation carries new questions.
+  const askQuestionsKey = useMemo(
+    () => (askPayload ? askUserQuestionSignature(askPayload.questions) : ""),
+    [askPayload],
+  );
   // ExitPlanMode plan review: the server stamps the full tool_input
   // as `exit_plan_mode`; a usable plan card needs the `plan` markdown
   // string. Anything else falls back to the binary card.
@@ -682,6 +691,9 @@ export function ApprovalCard({
     if (isAskUserQuestion) {
       promptDetails = (
         <AskUserQuestionForm
+          // Its own key keeps the answerable card's state and draft out of the read-only card.
+          key={`${elicitationId}:${askQuestionsKey}:read-only`}
+          elicitationId={elicitationId}
           questions={askPayload.questions}
           onSubmit={() => {}}
           onReject={() => {}}
@@ -958,6 +970,8 @@ export function ApprovalCard({
           </>
         ) : isAskUserQuestion ? (
           <AskUserQuestionForm
+            key={`${elicitationId}:${askQuestionsKey}`}
+            elicitationId={elicitationId}
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}

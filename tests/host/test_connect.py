@@ -10311,6 +10311,29 @@ def test_host_serves_a_pr_the_server_vouches_for(
     assert written.status == "ok", written
 
 
+def test_host_reads_a_file_named_as_the_workspace_root(tmp_path: Path) -> None:
+    """An absolute file target sent as the root is read rather than refused as a missing dir."""
+    target = tmp_path / "notes.md"
+    target.write_text("# hello\n")
+    host = _make_host_process()
+    try:
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="read-file",
+                op="list_or_read",
+                workspace=str(target),
+                session_id="session",
+                params={"path": ""},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert result.status == "ok", result
+    assert result.payload is not None
+    assert result.payload["content"] == "# hello\n"
+    assert result.payload["content_type"] == "text/markdown"
+
+
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):

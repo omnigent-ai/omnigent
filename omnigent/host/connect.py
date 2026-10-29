@@ -3710,6 +3710,11 @@ class HostProcess:
                 error_code="invalid_workspace",
                 error=f"workspace path expansion failed: {exc}",
             )
+        params = frame.params or {}
+        # An absolute file target: root the reader at its parent and read the file by name.
+        if frame.op == "list_or_read" and not params.get("path") and os.path.isfile(expanded):
+            params = {**params, "path": os.path.basename(expanded)}
+            expanded = os.path.dirname(expanded)
         if not os.path.isdir(expanded):
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3731,7 +3736,6 @@ class HostProcess:
                     self._fs_readers.popitem(last=False)
             self._fs_readers.move_to_end(expanded)
             reader = cached[1]
-        params = frame.params or {}
         from omnigent.runner import pr_resource
 
         try:
