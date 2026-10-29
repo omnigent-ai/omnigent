@@ -923,6 +923,38 @@ async def test_wait_until_ready_names_a_missing_model_provider(
     assert "`omnigent setup`" in excinfo.value.message
 
 
+def test_startup_snapshot_names_the_layer_that_selected_a_missing_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure event says whether a -c pin or the config file chose the missing provider."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "user-codex"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text('model_provider = "Databricks"\n')
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('model_provider = "Databricks"\n')
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.config_overrides = ['model_provider="Databricks"']
+
+    event = server._startup_snapshot_event(
+        "codex_app_server_start_failed",
+        codex_native_app_server.CodexModelProviderMissingError(
+            "Databricks", source_home / "config.toml"
+        ),
+    )
+
+    attributes = event["attributes"]
+    assert attributes["model_provider_pinned_by_override"] is True
+    assert attributes["codex_home_selects_provider"] is True
+    assert attributes["codex_home_defines_provider"] is False
+    assert attributes["source_config_defines_provider"] is False
+
+
 async def test_wait_until_ready_keeps_legacy_profile_provider_errors_generic(
     tmp_path: Path,
 ) -> None:
