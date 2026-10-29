@@ -55,6 +55,7 @@ class _RecordingStore:
         self.status_writes: list[tuple[str, str]] = []
         self.pending_writes: list[tuple[str, int]] = []
         self.background_writes: list[tuple[str, bool]] = []
+        self.blocked_writes: list[tuple[str, str | None]] = []
         self.touches: list[list[str]] = []
         self.clears: list[tuple[str, int | None]] = []
 
@@ -74,6 +75,9 @@ class _RecordingStore:
     ) -> None:
         guard = () if runner_id is None else (runner_id, unseen_since)
         self.background_writes.append((conversation_id, running, *guard))
+
+    def set_blocked_on(self, conversation_id: str, blocked_on: str | None) -> None:
+        self.blocked_writes.append((conversation_id, blocked_on))
 
     def touch_runner_liveness(self, runner_ids: list[str], now: int) -> None:
         del now
@@ -171,13 +175,56 @@ def test_a_flag_write_queued_before_a_handoff_never_lands(
     assert recording_store.background_writes == [("conv_2", True)]
 
 
+def test_persist_blocked_on_dedupes_changes(recording_store: _RecordingStore) -> None:
+    """Every status edge reports its reason; only a change reaches the store."""
+    session_live_state.persist_blocked_on("conv_1", "permission prompt")
+    session_live_state.persist_blocked_on("conv_1", "permission prompt")
+    session_live_state.persist_blocked_on("conv_1", None)
+    session_live_state.persist_blocked_on("conv_1", None)
+    _wait_until(lambda: len(recording_store.blocked_writes) >= 2)
+    assert recording_store.blocked_writes == [("conv_1", "permission prompt"), ("conv_1", None)]
+
+
+def test_a_reason_queued_before_a_handoff_cannot_restore_a_cleared_prompt(
+    recording_store: _RecordingStore,
+) -> None:
+    """The new owner clears the prompt; this replica's delayed write must not bring it back."""
+    release = threading.Event()
+    session_live_state.submit("hold", release.wait, 10)
+    session_live_state.persist_blocked_on("conv_1", "permission prompt")
+    session_live_state.forget_live_status("conv_1")
+    session_live_state.persist_blocked_on("conv_2", "question")
+    release.set()
+    _wait_until(lambda: bool(recording_store.blocked_writes))
+    assert recording_store.blocked_writes == [("conv_2", "question")]
+
+
+def test_status_edges_set_and_clear_the_parked_reason() -> None:
+    """A parked edge records its reason; the next edge without one clears it."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "conv_parked"
+    try:
+        sessions_module._publish_status(session_id, "running", blocked_on="x" * 200)
+        assert sessions_module._blocked_on_for(session_id, None) == "x" * 128
+        sessions_module._publish_status(session_id, "running")
+        # This replica's edge wins over a stale row from another replica.
+        assert sessions_module._blocked_on_for(session_id, "permission prompt") is None
+    finally:
+        sessions_module._session_blocked_on_cache.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+    assert sessions_module._blocked_on_for(session_id, "permission prompt") == "permission prompt"
+
+
 def test_forget_live_status_drops_dedupe_state() -> None:
     """A replica handing off a session must not keep its stale dedupe state."""
     session_live_state._last_status["conv_1"] = "running"
     session_live_state._last_background["conv_1"] = True
+    session_live_state._last_blocked_on["conv_1"] = "permission prompt"
     session_live_state.forget_live_status("conv_1")
     assert "conv_1" not in session_live_state._last_status
     assert "conv_1" not in session_live_state._last_background
+    assert "conv_1" not in session_live_state._last_blocked_on
 
 
 def test_pending_count_hook_persists_publish_and_resolve(
@@ -496,6 +543,7 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
             updated_at=1,
             pending_elicitations_count=3,
             background_work_running=True,
+            blocked_on="permission prompt",
         )
 
     items = [_item("conv_dead"), _item("conv_live")]
@@ -506,12 +554,13 @@ async def test_liveness_pass_zeroes_pending_count_for_offline_runner() -> None:
 
     await _apply_liveness_to_items(items, lambda ids: {i: liveness[i] for i in ids})
 
-    # A dead runner's background shells died with it too.
+    # A dead runner's background shells and terminal prompts died with it too.
     assert [
-        (i.runner_online, i.pending_elicitations_count, i.background_work_running) for i in items
+        (i.runner_online, i.pending_elicitations_count, i.background_work_running, i.blocked_on)
+        for i in items
     ] == [
-        (False, 0, False),
-        (True, 3, True),
+        (False, 0, False, None),
+        (True, 3, True, "permission prompt"),
     ]
 
 

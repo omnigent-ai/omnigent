@@ -3057,6 +3057,11 @@ class SessionListItem(BaseModel):
         status file). The sidebar shows such a session as working; ``status``
         stays as reported, so the session still takes a new message. ``False``
         while the session's runner is offline.
+    :param blocked_on: Why the session's agent is parked on a terminal prompt,
+        e.g. ``"permission prompt"``, from the last status edge, truncated to
+        128 characters. The sidebar shows such a session as needing input even
+        when no web card exists for the prompt. ``None`` when it is not parked
+        or its runner is offline.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3128,6 +3133,7 @@ class SessionListItem(BaseModel):
     external_session_id: str | None = None
     pending_elicitations_count: int = 0
     background_work_running: bool = False
+    blocked_on: str | None = None
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False

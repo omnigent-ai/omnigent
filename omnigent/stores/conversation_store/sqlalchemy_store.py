@@ -297,6 +297,7 @@ def _to_conversation(
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
         background_work_running=meta.background_work_running if meta else None,
+        blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
     )
 
@@ -4200,6 +4201,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_background_work_running", write)
+
+    def set_blocked_on(self, conversation_id: str, blocked_on: str | None) -> None:
+        """
+        Persist why a running session's agent is parked on a terminal prompt.
+
+        Lives on ``omnigent_conversation_metadata``, so ``conversations.updated_at``
+        (sidebar ordering) is untouched by construction. See the abstract method.
+
+        :param conversation_id: Session/conversation identifier.
+        :param blocked_on: The reason, at most 128 characters, or ``None``.
+        """
+        from sqlalchemy import update
+
+        def write(session: Session) -> None:
+            session.execute(
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id == conversation_id,
+                )
+                .values(blocked_on=blocked_on)
+            )
+
+        run_write_transaction(self._session_immediate, "set_blocked_on", write)
 
     def replace_runner_id(
         self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None

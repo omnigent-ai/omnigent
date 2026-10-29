@@ -682,6 +682,12 @@ _session_background_work_running_cache: WorkspaceScopedCache[str, tuple[str | No
 )
 
 
+# Why a running session's agent is parked on a terminal prompt, as of the last
+# status edge this replica published; ``""`` when that edge was not parked.
+# Absent when this replica has no edge, in which case the list reads the row.
+_session_blocked_on_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+
+
 _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
 
 
@@ -1302,6 +1308,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_background_work_running_cache",
+    "_session_blocked_on_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

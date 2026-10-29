@@ -7365,7 +7365,7 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     must not reorder the list. Round-trips every live-state column:
     ``runner_last_seen`` (bulk by runner, cleared on disconnect),
     ``live_status`` (enum round-trip), ``pending_elicitation_count``,
-    ``background_work_running``.
+    ``background_work_running``, ``blocked_on``.
     """
     from omnigent.stores.conversation_store import runner_seen_is_fresh
 
@@ -7420,8 +7420,13 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.set_background_work_running(
         conv_a.id, False, runner_id="runner_live", unseen_since=2_001
     )
+    conversation_store.set_blocked_on(conv_a.id, "permission prompt")
     cleared = conversation_store.get_conversation(conv_a.id)
     assert cleared is not None and cleared.background_work_running is False
+    assert cleared.blocked_on == "permission prompt"
+    conversation_store.set_blocked_on(conv_a.id, None)
+    unparked = conversation_store.get_conversation(conv_a.id)
+    assert unparked is not None and unparked.blocked_on is None
 
     # None of the live-state writes moved updated_at.
     assert updated.updated_at == before.updated_at
