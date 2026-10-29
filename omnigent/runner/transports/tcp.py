@@ -88,6 +88,7 @@ class RunnerTCPSubprocess:
             self.port = _pick_free_port()
         cmd = [
             sys.executable,
+            "-P",
             "-m",
             "uvicorn",
             "--factory",

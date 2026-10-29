@@ -1,4 +1,12 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -30,7 +38,10 @@ import {
 import { Button } from "@/components/ui/button";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
+import {
+  SESSION_ACTIONS_LOADING,
+  workspaceRecoveryDisabledReason,
+} from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
@@ -85,6 +96,17 @@ import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
+  attachClone,
+  beginClone,
+  cloneKey,
+  detachClone,
+  finishClone,
+  pendingClone,
+  subscribeClones,
+  type CloneListener,
+  type CloneRequest,
+} from "./cloneRequests";
+import {
   ConnectHostInstructions,
   SANDBOX_REPO_LABEL_KEY,
   composeSandboxWorkspace,
@@ -105,6 +127,8 @@ const SAME_AS_SOURCE = "__same__";
 // their own `text-ui`, so the option font is shrunk via a descendant selector
 // on the dropdown content rather than plain inheritance.
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
+
+const NO_HOSTS: Host[] = [];
 
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
 type ForkField = "host" | "directory" | "sandboxRepo";
@@ -699,15 +723,23 @@ function ForkRunConfig({
  * @param upToResponseId - Truncation point for a "fork from here": the
  *   fork copies history only up to and including this response. `null` /
  *   omitted forks the full history.
+ * @param visible - Whether the user can see this form. While hidden, a
+ *   running clone continues and a toast reports it (see `cloneRequests`).
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
-export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionForm>[0]) {
-  const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
-    hostId: props.sourceHostId,
-  });
-  if (forkDisabledReason) {
-    const loading = forkDisabledReason === SESSION_ACTIONS_LOADING;
+export function ForkSessionForm(
+  props: Omit<Parameters<typeof SupportedForkSessionForm>[0], "sandboxOnlyProvider">,
+) {
+  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
+    props.sourceSessionId,
+    { hostId: props.sourceHostId },
+  );
+  const disabledReason =
+    forkDisabledReason ??
+    (props.workspaceRecovery ? workspaceRecoveryDisabledReason(forkSandboxProvider) : undefined);
+  if (disabledReason) {
+    const loading = disabledReason === SESSION_ACTIONS_LOADING;
     return (
       <>
         <p
@@ -715,14 +747,14 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
           className="text-sm text-muted-foreground"
           data-testid="fork-session-unavailable"
         >
-          {forkDisabledReason}
+          {disabledReason}
         </p>
         <DialogFooter>
           <Button variant="ghost" onClick={props.onClose}>
             Cancel
           </Button>
           {!loading && (
-            <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
+            <DisabledActionTooltip reason={disabledReason} label="Clone session">
               <Button data-testid="fork-session-submit" disabled>
                 {props.workspaceRecovery
                   ? "Continue"
@@ -736,7 +768,7 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
       </>
     );
   }
-  return <SupportedForkSessionForm {...props} />;
+  return <SupportedForkSessionForm {...props} sandboxOnlyProvider={forkSandboxProvider} />;
 }
 
 function SupportedForkSessionForm({
@@ -747,6 +779,8 @@ function SupportedForkSessionForm({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
+  sandboxOnlyProvider,
+  visible,
   onClose,
 }: {
   sourceSessionId: string;
@@ -756,6 +790,9 @@ function SupportedForkSessionForm({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
+  /** The only target offered: a fresh sandbox from this provider. */
+  sandboxOnlyProvider?: string;
+  visible: boolean;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -775,6 +812,33 @@ function SupportedForkSessionForm({
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // `submitting` covers the directory pre-flight; `request` the clone after it.
+  const requestKey = cloneKey(sourceSessionId, upToResponseId, workspaceRecovery);
+  const request = useSyncExternalStore(subscribeClones, () => pendingClone(requestKey));
+  const busy = submitting || request !== undefined;
+  // Read through a ref so a clone that settles later closes with the latest host callback.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const [listener] = useState<CloneListener>(() => ({
+    onSuccess: (forkId) => {
+      onCloseRef.current();
+      navigate(`/c/${forkId}`);
+    },
+    onError: setError,
+  }));
+  useLayoutEffect(() => {
+    if (!visible || request === undefined) return;
+    attachClone(request, listener);
+    return () => detachClone(request);
+  }, [visible, request, listener]);
+  // Hiding the form cancels a pre-flight for good, even if it's shown again.
+  const preflight = useRef({ cancelled: false });
+  useLayoutEffect(
+    () => () => {
+      preflight.current.cancelled = true;
+    },
+    [visible],
+  );
   // Ready-to-send model/effort/permission overrides from the run-config
   // section. Empty until that section (rendered only for a native target)
   // reports its seeded value.
@@ -791,10 +855,11 @@ function SupportedForkSessionForm({
   const [showErrors, setShowErrors] = useState(false);
   const [focusField, setFocusField] = useState<ForkField | null>(null);
 
-  // A coding source ran in a working directory; only then does the fork
-  // need a host + directory to start. A non-coding source forks with just
-  // name + agent (no directory to pick).
-  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace);
+  // A coding source ran in a working directory, so the fork needs a host +
+  // directory to start; a sandbox-only fork always picks its sandbox. Others
+  // fork with just name + agent (no directory to pick).
+  const sandboxOnly = sandboxOnlyProvider !== undefined;
+  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace) || sandboxOnly;
 
   // Host/dir/worktree state — only meaningful for a coding source.
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
@@ -823,8 +888,9 @@ function SupportedForkSessionForm({
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
   // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field).
-  const { data: hosts } = useHosts({ enabled: isCodingSource });
+  // never shows the host field). A sandbox-only fork offers none.
+  const { data: fetchedHosts } = useHosts({ enabled: isCodingSource && !sandboxOnly });
+  const hosts = sandboxOnly ? NO_HOSTS : fetchedHosts;
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
@@ -839,11 +905,14 @@ function SupportedForkSessionForm({
   const managedSandboxesEnabled =
     !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
-  // yields exactly one.
-  const sandboxProviderRows = useMemo(
-    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
-    [info],
-  );
+  // yields exactly one, as does a sandbox-only fork.
+  const sandboxProviderRows = useMemo(() => {
+    if (info === "loading") return [];
+    const offered = sandboxProviderOptions(info);
+    return sandboxOnlyProvider === undefined
+      ? offered
+      : offered.filter((provider) => provider === sandboxOnlyProvider);
+  }, [info, sandboxOnlyProvider]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1264,6 +1333,9 @@ function SupportedForkSessionForm({
     }
     setSubmitting(true);
     setError(null);
+    const token = { cancelled: false };
+    preflight.current = token;
+    let clone: CloneRequest | undefined;
     try {
       // Pre-flight the directory BEFORE creating anything: the runner
       // launch below is detached and its failure is swallowed, so a
@@ -1288,16 +1360,19 @@ function SupportedForkSessionForm({
             // detached launch below swallows its failure.
             const repoProblem = await checkHostDirectory(selectedHostId, workspaceTrimmed);
             if (repoProblem !== null) {
-              setError(repoProblem);
+              if (!token.cancelled) setError(repoProblem);
               return;
             }
             recreateSourceWorktree = true;
           } else {
-            setError(problem);
+            if (!token.cancelled) setError(problem);
             return;
           }
         }
       }
+      if (token.cancelled) return;
+      clone = beginClone(requestKey, listener, (forkId) => navigate(`/c/${forkId}`));
+      setSubmitting(false);
       const trimmed = title.trim();
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
@@ -1378,11 +1453,12 @@ function SupportedForkSessionForm({
       // it either: it skips the active session, and the navigate below makes
       // the fork active.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      onClose();
-      navigate(`/c/${fork.id}`);
+      finishClone(clone, { forkId: fork.id });
     } catch (e) {
       // forkSession failed — nothing created, so inputs stay editable for a resubmit.
-      setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");
+      const message = e instanceof Error ? e.message : "Couldn't clone the session. Try again.";
+      if (clone) finishClone(clone, { error: message });
+      else setError(message);
     } finally {
       setSubmitting(false);
     }
@@ -1442,6 +1518,38 @@ function SupportedForkSessionForm({
       )}
     </div>
   );
+  const worktreeField = (
+    <div className="flex flex-col gap-1">
+      <label
+        htmlFor="fork-session-branch"
+        className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
+      >
+        <GitBranchIcon className="size-3.5" />
+        Git worktree (optional)
+      </label>
+      <input
+        id="fork-session-branch"
+        type="text"
+        value={branchName}
+        onChange={(e) => setBranchName(e.target.value)}
+        placeholder="feature/my-branch"
+        data-testid="fork-session-branch-input"
+        className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+      />
+      <p className="text-sm text-muted-foreground">
+        {usingSourceWorktree
+          ? "The clone starts in the original session's existing worktree for this " +
+            "branch. Name a different branch to work in an isolated copy."
+          : workspaceRecovery
+            ? "Creates a git worktree for a new branch of the picked repository, so the " +
+              "session continues in its own directory. Leave blank to start in the picked " +
+              "directory."
+            : "Creates a git worktree for a new branch in an isolated directory — " +
+              "keeps the clone from fighting the original over the same files. Leave " +
+              "blank to start in the picked directory."}
+      </p>
+    </div>
+  );
 
   return (
     <>
@@ -1473,6 +1581,7 @@ function SupportedForkSessionForm({
                     ? "No hosts connected yet. Connect one from your terminal:"
                     : "No hosts online. Reconnect from your terminal to start the clone:"
                 }
+                onSshConnected={selectHost}
               />
             ) : (
               <>
@@ -1547,27 +1656,45 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                {/* A sandbox is a usable target, so no dead-end even with no
-                    host online: offer connecting one as a collapsed, optional
-                    step rather than an alarming "no hosts connected" banner. */}
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setShowConnect((v) => !v)}
-                    className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                    data-testid="fork-session-connect-host-toggle"
+                {/* A sandbox is a usable target, so connecting a host is a
+                    collapsed, optional step rather than a "no hosts connected"
+                    banner. A sandbox-only fork can't use one, so it says why. */}
+                {sandboxOnlyProvider !== undefined ? (
+                  <p
+                    className="text-sm text-muted-foreground"
+                    data-testid="fork-session-sandbox-only-hint"
                   >
-                    {showConnect ? (
-                      <ChevronUpIcon className="size-3.5" />
-                    ) : (
-                      <ChevronDownIcon className="size-3.5" />
+                    This session can only be cloned onto a new{" "}
+                    {sandboxOptionLabel(sandboxOnlyProvider)}.
+                  </p>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setShowConnect((v) => !v)}
+                      className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                      data-testid="fork-session-connect-host-toggle"
+                    >
+                      {showConnect ? (
+                        <ChevronUpIcon className="size-3.5" />
+                      ) : (
+                        <ChevronDownIcon className="size-3.5" />
+                      )}
+                      {onlineHosts.length === 0
+                        ? "Connect a host from your terminal"
+                        : "Connect another host from your terminal"}
+                    </button>
+                    {showConnect && (
+                      <ConnectHostInstructions
+                        serverUrl={serverUrl}
+                        onSshConnected={(hostId) => {
+                          setShowConnect(false);
+                          selectHost(hostId);
+                        }}
+                      />
                     )}
-                    {onlineHosts.length === 0
-                      ? "Connect a host from your terminal"
-                      : "Connect another host from your terminal"}
-                  </button>
-                  {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
-                </>
+                  </>
+                )}
               </>
             )}
             <ForkFieldError message={fieldError("host")} />
@@ -1575,6 +1702,9 @@ function SupportedForkSessionForm({
         )}
 
         {directoryAtTop && directoryField}
+        {/* Recovery never inherits the missing worktree's branch, so a new
+              worktree is offered beside the directory it would branch from. */}
+        {workspaceRecovery && worktreeField}
 
         <div className="flex flex-col gap-1.5">
           <label htmlFor="fork-session-agent" className="text-sm font-medium text-muted-foreground">
@@ -1707,10 +1837,11 @@ function SupportedForkSessionForm({
               {conflictingSessions.length === 1
                 ? "1 other agent is"
                 : `${conflictingSessions.length} other agents are`}{" "}
-              working in this directory, so writes may conflict.
-              {!workspaceRecovery && (
+              working in this directory, so writes may conflict.{" "}
+              {workspaceRecovery ? (
+                "Name a git branch to work in an isolated copy."
+              ) : (
                 <>
-                  {" "}
                   Name a {usingSourceWorktree ? "different git branch" : "git branch"} under
                   Advanced settings to work in an isolated copy.
                 </>
@@ -1760,7 +1891,7 @@ function SupportedForkSessionForm({
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && !submitting) handleFork();
+                    if (e.key === "Enter" && !busy) handleFork();
                   }}
                   placeholder={namePlaceholder}
                   className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
@@ -1858,33 +1989,7 @@ function SupportedForkSessionForm({
               {isCodingSource && !sandboxSelected && !workspaceRecovery && (
                 <>
                   {!directoryAtTop && directoryField}
-
-                  <div className="flex flex-col gap-1">
-                    <label
-                      htmlFor="fork-session-branch"
-                      className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
-                    >
-                      <GitBranchIcon className="size-3.5" />
-                      Git worktree (optional)
-                    </label>
-                    <input
-                      id="fork-session-branch"
-                      type="text"
-                      value={branchName}
-                      onChange={(e) => setBranchName(e.target.value)}
-                      placeholder="feature/my-branch"
-                      data-testid="fork-session-branch-input"
-                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
-                    />
-                    <p className="text-sm text-muted-foreground">
-                      {usingSourceWorktree
-                        ? "The clone starts in the original session's existing worktree for this " +
-                          "branch. Name a different branch to work in an isolated copy."
-                        : "Creates a git worktree for a new branch in an isolated directory — " +
-                          "keeps the clone from fighting the original over the same files. Leave " +
-                          "blank to start in the picked directory."}
-                    </p>
-                  </div>
+                  {worktreeField}
                 </>
               )}
             </div>
@@ -1898,14 +2003,20 @@ function SupportedForkSessionForm({
         </p>
       )}
 
+      {request && (
+        <p className="text-sm text-muted-foreground">
+          Large sessions can take a minute. You can close this, and it continues in the background.
+        </p>
+      )}
+
       <DialogFooter>
         <Button variant="ghost" onClick={onClose} disabled={submitting}>
-          Cancel
+          {request ? "Close" : "Cancel"}
         </Button>
         <Button
           data-testid="fork-session-submit"
           onClick={handleFork}
-          loading={submitting}
+          loading={busy}
           // Greyed but clickable: a blocked click points at the missing field.
           aria-disabled={!canSubmit || undefined}
           className="aria-disabled:opacity-50"
@@ -2003,7 +2114,7 @@ export function ForkSessionDialog({
           </DialogTitle>
           <DialogDescription className={workspaceRecovery ? undefined : "sr-only"}>
             {workspaceRecovery
-              ? "Choose an existing directory to continue this conversation in a new session. Files from the missing workspace won’t be restored."
+              ? "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored."
               : cloneDescription}
           </DialogDescription>
         </DialogHeader>
@@ -2015,6 +2126,7 @@ export function ForkSessionDialog({
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
           workspaceRecovery={workspaceRecovery}
+          visible={open}
           onClose={() => onOpenChange(false)}
         />
       </DialogContent>

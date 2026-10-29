@@ -426,7 +426,8 @@ def test_background_budget_write_pins_owner_registration(
                             action=StateUpdateAction.SET,
                             value=0.5,
                         )
-                    ]
+                    ],
+                    approved=True,
                 )
             else:
                 _record_daily_cost(conversation, 1.0, conversations)

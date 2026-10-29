@@ -416,10 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
-async def test_executor_error_preserves_only_explicitly_idle_sessions(
+async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
 ) -> None:
-    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
@@ -1047,7 +1047,7 @@ def test_classify_anthropic_exception_maps_known_types(
     monkeypatch arranges.
 
     Regression: Phase 1d/1e wires
-    ``ANTHROPIC_MAX_RETRIES`` into the Claude CLI subprocess,
+    ``CLAUDE_CODE_MAX_RETRIES`` into the Claude CLI subprocess,
     which can still surface raw :class:`anthropic.RateLimitError`
     upward when the SDK's framing layer fails. Without this
     classifier, those would render as ``[llm] RateLimitError``
@@ -1331,6 +1331,71 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
         f"Expected 2 messages (empty assistant skipped), got {len(messages)}: {messages!r}."
     )
     assert [m["role"] for m in messages] == ["user", "user"]
+
+
+def test_translate_input_to_messages_carries_tool_history() -> None:
+    """
+    Tool items are dropped unless the executor opts in. Opted in, each call appears
+    once (live history repeats it per status), a nameless call is dropped, bad
+    arguments become ``{}``, and outputs are image-stripped and capped for replay.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _REPLAYED_TOOL_OUTPUT_MAX_BYTES,
+        _translate_input_to_messages,
+    )
+
+    greet = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "greet",
+        "arguments": '{"name": "Ada"}',
+    }
+    image_output = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "QUJD" * 64},
+            }
+        ]
+    )
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "greet the new hire"}],
+        },
+        {"type": "function_call", "call_id": "call_0", "arguments": "{}"},
+        greet,
+        {"type": "function_call", "call_id": "call_2", "name": "read", "arguments": "not json"},
+        {"type": "function_call", "call_id": "call_3", "name": "read", "arguments": "{}"},
+        greet,
+        {"type": "function_call_output", "call_id": "call_1", "output": "Hello, Ada!"},
+        {"type": "function_call_output", "call_id": "call_2", "output": "x" * 100_000},
+        {"type": "function_call_output", "call_id": "call_3", "output": image_output},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}],
+        },
+    ]
+
+    assert [m["role"] for m in _translate_input_to_messages(input_value)] == ["user", "assistant"]
+    messages = _translate_input_to_messages(input_value, include_tool_history=True)
+
+    roles = [m["role"] for m in messages]
+    assert roles == ["user", *["tool_call"] * 3, *["tool_result"] * 3, "assistant"]
+    assert messages[1]["content"] == {"tool": "greet", "args": {"name": "Ada"}}
+    assert messages[1]["metadata"] == {"call_id": "call_1"}
+    assert messages[2]["content"] == {"tool": "read", "args": {}}
+    assert messages[4] == {
+        "role": "tool_result",
+        "content": "Hello, Ada!",
+        "metadata": {"call_id": "call_1"},
+    }
+    capped = messages[5]["content"]
+    assert len(capped.encode()) < _REPLAYED_TOOL_OUTPUT_MAX_BYTES + 200
+    assert "[output truncated by omnigent:" in capped
+    assert "QUJD" not in messages[6]["content"]
 
 
 # ── MCP tool-call observed/dispatch correlation ──────────
@@ -1739,6 +1804,37 @@ def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
         ("function_call", "completed"),
         ("function_call_output", None),
     ]
+
+
+def test_claude_native_tool_before_mcp_call_keeps_dispatch_ids_aligned() -> None:
+    """Keep Claude Code's own ``Skill`` call from shifting later dispatch ids.
+
+    claude-sdk's MCP callback carries no call id, so ``_stable_tool_executor``
+    pops the oldest queued id. A ``Skill`` (or ``ToolSearch``) call runs inside
+    the CLI and is never dispatched; queued, its id would be popped by the next
+    Omnigent tool's dispatch, and from then on every call in the turn would pair
+    with the previous call's id and be recorded twice.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.inner.claude_sdk_executor import _tool_call_metadata
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    for name, call_id, args in (
+        ("Skill", "toolu_skill", {"skill": "agent:scout"}),
+        ("mcp__omnigent__sys_os_shell", "toolu_shell", {"command": "pwd"}),
+    ):
+        block = SimpleNamespace(id=call_id, name=name, input=args)
+        adapter._translate_event(
+            ToolCallRequest(name=name, args=args, metadata=_tool_call_metadata(block)),  # type: ignore[arg-type]
+            ctx,  # type: ignore[arg-type]
+        )
+
+    # The shell dispatch pops its own id, not the Skill's.
+    assert list(adapter._pending_mcp_call_ids) == ["toolu_shell"]
 
 
 def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
@@ -2226,6 +2322,90 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert marker.injection_id == "inj_x"
 
 
+class _ScriptedInjectionExecutor:
+    """Inner executor stub whose enqueue_session_message returns or raises a scripted outcome."""
+
+    def __init__(self, outcome: bool | BaseException) -> None:
+        """Hold the outcome to return or raise.
+
+        :param outcome: ``True``/``False`` to return, or an exception to raise.
+        """
+        self.outcome = outcome
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        """Return or raise the scripted outcome.
+
+        :param session_key: Adapter session key.
+        :param content: The injected user text.
+        :returns: The scripted boolean.
+        """
+        del session_key, content
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "consumed", "logged"),
+    [
+        (True, True, "executor_accepted"),
+        (False, False, "executor_refused"),
+        (None, True, "executor_ambiguous"),
+        (RuntimeError("socket closed before sending"), False, "error"),
+    ],
+    ids=["accepted", "refused", "ambiguous", "error"],
+)
+async def test_watch_injections_marks_ambiguous_delivery_consumed(
+    outcome: bool | BaseException | None,
+    consumed: bool,
+    logged: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An injection the harness may already hold is marked consumed, so it is never resent."""
+    import asyncio as _aio
+    import logging
+
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    executor = _ScriptedInjectionExecutor(
+        InjectionDeliveryAmbiguous("reply lost") if outcome is None else outcome
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(
+            model="m", input="steer me", injection_id="inj_x", input_stable_id="a" * 32
+        )
+    )
+
+    caplog.set_level(logging.INFO)
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if any(
+                getattr(record, "event_name", None) == "native_input_steering_finished"
+                for record in caplog.records
+            ):
+                break
+            await _aio.sleep(0.01)
+        await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    finished = [
+        record.attributes["outcome"]
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_steering_finished"
+    ]
+    assert finished == [logged]
+    markers = [event for event in ctx.emitted if isinstance(event, InjectionConsumedEvent)]
+    assert [marker.injection_id for marker in markers] == (["inj_x"] if consumed else [])
+
+
 @pytest.mark.asyncio
 async def test_watch_injections_drops_injection_when_turn_cancelled() -> None:
     """A queued injection is dropped if the turn was interrupted.
@@ -2697,26 +2877,23 @@ async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> None:
-    """The choice bridge reaches executors that accept it, and only those.
-
-    Bridges are installed by attribute, so a rename on either side would leave the
-    feature silently inert — the card would quietly stay Approve/Reject. Executors
-    that don't offer the agent's own options must not grow the attribute.
-    """
+@pytest.mark.parametrize(
+    "bridge",
+    ["_elicitation_choice_handler", "_form_elicitation_handler", "_ask_question_handler"],
+)
+@pytest.mark.parametrize("supported", [False, True])
+async def test_run_turn_installs_optional_bridges_only_where_supported(
+    bridge: str,
+    supported: bool,
+) -> None:
     import asyncio
 
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.inner.executor import ExecutorConfig, Message, ToolSpec, TurnComplete
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    class _ChoiceCapableExecutor(Executor):
-        """Declares the attribute, as :class:`AcpExecutor` does."""
-
-        def __init__(self) -> None:
-            self._elicitation_choice_handler = None
-
+    class TurnExecutor(Executor):
         async def run_turn(
             self,
             messages: list[Message],
@@ -2726,29 +2903,30 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         ):
             yield TurnComplete(response="ok")
 
-    class _BinaryOnlyExecutor(Executor):
-        """Declares no choice attribute — e.g. the SDK harnesses."""
+    executor = TurnExecutor()
+    if supported:
+        setattr(executor, bridge, None)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext("resp_bridge", asyncio.Queue(), asyncio.Event())
+    await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+    assert (getattr(executor, bridge, None) is not None) is supported
+    assert getattr(executor, "_elicitation_handler", None) is not None
 
-        async def run_turn(
-            self,
-            messages: list[Message],
-            tools: list[ToolSpec],
-            system_prompt: str,
-            config: ExecutorConfig | None = None,
-        ):
-            yield TurnComplete(response="ok")
 
-    for executor, expected in ((_ChoiceCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
-        adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
-        ctx = TurnContext(
-            response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
-        )
-        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+@pytest.mark.asyncio
+async def test_form_elicitation_handler_decline_does_not_cancel_the_turn() -> None:
+    """Form dialogs return the declined verdict without killing the session."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
-        installed = getattr(executor, "_elicitation_choice_handler", None) is not None
-        assert installed is expected, type(executor).__name__
-        # The yes/no bridge is installed on both — the choice bridge is additive.
-        assert getattr(executor, "_elicitation_handler", None) is not None
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    params = ElicitationRequestParams(mode="form", message="Continue?")
+    result = await adapter._stable_form_elicitation_handler("form-id", params)
+    assert result.action == "decline"
+    assert not ctx.cancelled.was_set
+    assert ctx.seen[0][0] == "form-id"
 
 
 def test_translate_event_emits_subagent_started() -> None:
@@ -2903,3 +3081,158 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_returns_answers_on_accept() -> None:
+    """AskUserQuestion bridge renders the clickable form and, on accept,
+    feeds the user's selections back via ``{**tool_input, "answers": ...}``
+    (the shape Claude Code expects so it returns them as the tool result).
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="accept", content={"q1": "dev"}))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    tool_input = {
+        "questions": [
+            {"question": "Which environment?", "options": [{"label": "dev"}, {"label": "prod"}]}
+        ]
+    }
+    out = await adapter._stable_ask_question_handler(tool_input)
+    assert out == {**tool_input, "answers": {"q1": "dev"}}
+    [(_, params)] = ctx.seen
+    payload = getattr(params, "ask_user_question", None)
+    assert payload is not None, (
+        "AskUserQuestion elicitation must carry the structured ask_user_question "
+        "extra so the UI renders clickable options."
+    )
+    assert payload["questions"][0]["question"] == "Which environment?"
+    # Distinct from the generic tool-call card so a REPL "approve always"
+    # on tool calls can't auto-accept a question.
+    assert params.phase == "pre_tool_use"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "content", "expected"),
+    [
+        ("decline", None, "The user dismissed the question without answering."),
+        ("cancel", None, "The user dismissed the question without answering."),
+        # A client without the question form (the terminal REPL) can only
+        # approve, so the model must re-ask instead of hearing "dismissed".
+        (
+            "accept",
+            None,
+            "The user's client could not show these options and no answer came "
+            "back. Ask the question again in plain text.",
+        ),
+    ],
+    ids=["declined", "cancelled", "accepted-without-answers"],
+)
+async def test_ask_question_handler_explains_unanswered_question(
+    action: str, content: dict[str, Any] | None, expected: str
+) -> None:
+    """An unanswered question denies with a reason and leaves the turn running."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action=action, content=content))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    out = await adapter._stable_ask_question_handler(
+        {"questions": [{"question": "Q", "options": ["a", "b"]}]}
+    )
+    assert out == expected
+    assert not ctx.cancelled.was_set
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_denies_without_elicit_when_no_questions() -> None:
+    """Input with no usable questions never elicits and tells the model why."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    class _NoElicitCtx:
+        def __init__(self) -> None:
+            self.response_id = "resp_aq"
+
+        async def elicit(self, elicitation_id: str, params: object) -> object:
+            raise AssertionError("elicit must not be called when there are no questions")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    adapter._current_ctx = _NoElicitCtx()  # type: ignore[assignment]
+    out = await adapter._stable_ask_question_handler({"not": "questions"})
+    assert isinstance(out, str)
+    assert "nothing was shown to the user" in out
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_denies_without_an_active_turn() -> None:
+    """An orphaned callback has no turn to ask in, so it denies without eliciting."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    assert adapter._current_ctx is None
+    out = await adapter._stable_ask_question_handler(
+        {"questions": [{"question": "Q", "options": ["a", "b"]}]}
+    )
+    assert out == "AskUserQuestion is unavailable outside an active Omnigent turn."
+
+
+@pytest.mark.asyncio
+async def test_ask_user_question_roundtrip_real_executor_hook_through_adapter_bridge() -> None:
+    """Integration seam across components: a real ClaudeSDKExecutor's PreToolUse
+    hook calls the real adapter ``_stable_ask_question_handler`` it was wired
+    with, which elicits and returns the user's selections via ``updatedInput``.
+
+    Unit tests exercise each half with mocks; this pins the seam — the
+    ``_ask_question_handler`` attribute name and the async signature must match
+    between the adapter's install and the executor's hook, or the round-trip
+    breaks even though both halves pass in isolation.
+    """
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationResult
+
+    executor = ClaudeSDKExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    # Wire the bridge exactly as ExecutorAdapter does on first use (the
+    # executor must define the attribute for the adapter's hasattr guard).
+    assert hasattr(executor, "_ask_question_handler")
+    executor._ask_question_handler = adapter._stable_ask_question_handler  # type: ignore[attr-defined]
+
+    ctx = _ElicitingTurnContext(ElicitationResult(action="accept", content={"q1": "prod"}))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+
+    # Register the real hook via a minimal fake SDK exposing HookMatcher.
+    class _HookMatcher:
+        def __init__(self, matcher=None, timeout=None, hooks=None) -> None:
+            self.matcher = matcher
+            self.timeout = timeout
+            self.hooks = hooks
+
+    class _FakeSdk:
+        HookMatcher = _HookMatcher
+
+    class _Opts:
+        def __init__(self) -> None:
+            self.hooks = None
+
+    opts = _Opts()
+    executor._install_ask_user_question_hook(_FakeSdk, opts)
+    matcher = next(m for m in opts.hooks["PreToolUse"] if m.matcher == "AskUserQuestion")
+    hook_cb = matcher.hooks[0]
+
+    tool_input = {"questions": [{"question": "Env?", "options": ["dev", "prod"]}]}
+    out = await hook_cb({"tool_input": tool_input}, "tuid", {})
+
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "allow"
+    assert hso["updatedInput"] == {**tool_input, "answers": {"q1": "prod"}}
+    # The elicited params carried the clickable form spec the UI renders.
+    [(_, params)] = ctx.seen
+    payload = getattr(params, "ask_user_question", None)
+    assert payload is not None
+    assert payload["questions"][0]["question"] == "Env?"

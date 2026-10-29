@@ -15,7 +15,6 @@ from fastapi import HTTPException
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.server.auth import local_single_user_enabled
 from omnigent.server.bundles import validate_agent_bundle
 from omnigent.server.routes.session_mcp_servers import (
     _find_mcp_location,
@@ -172,8 +171,7 @@ def edit_agent_bundle(bundle: bytes, patch: AgentConfigPatch | None) -> tuple[by
 
 
 def _edit_agent_bundle(bundle: bytes, patch: AgentConfigPatch | None) -> tuple[bytes, AgentSpec]:
-    enforce_handlers = not local_single_user_enabled()
-    spec = validate_agent_bundle(bundle, enforce_handler_allowlist=enforce_handlers)
+    spec = validate_agent_bundle(bundle, enforce_handler_allowlist=True)
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir) / "agent"
         extract_safe(bundle, root)
@@ -234,7 +232,7 @@ def _edit_agent_bundle(bundle: bytes, patch: AgentConfigPatch | None) -> tuple[b
             config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
 
         result = _tar_gz_dir(root, original_bundle=bundle)
-        updated = validate_agent_bundle(result, enforce_handler_allowlist=enforce_handlers)
+        updated = validate_agent_bundle(result, enforce_handler_allowlist=True)
         if updated.name != spec.name or updated.executor.type != spec.executor.type:
             raise OmnigentError("Agent identity cannot change", code=ErrorCode.INVALID_INPUT)
         for server in updated.mcp_servers:

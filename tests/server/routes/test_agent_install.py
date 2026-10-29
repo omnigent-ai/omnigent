@@ -143,7 +143,10 @@ async def test_reinstall_updates_in_place(client) -> None:
     assert [row["description"] for row in (await _mine(client, ALICE))["data"]] == ["v2"]
 
 
-async def test_config_patch_preserves_identity_and_omitted_fields(client, agent_store) -> None:
+@pytest.mark.parametrize("with_etag", [True, False])
+async def test_config_patch_preserves_identity_and_omitted_fields(
+    client, agent_store, with_etag: bool
+) -> None:
     installed = (await _install(client, ALICE, "orion")).json()
     path = f"/v1/agents/{installed['id']}"
     config = await client.get(f"{path}/config", headers=ALICE)
@@ -151,7 +154,7 @@ async def test_config_patch_preserves_identity_and_omitted_fields(client, agent_
     assert config.headers["cache-control"] == "no-store"
     assert config.headers["access-control-expose-headers"] == "ETag"
     before = agent_store.get(installed["id"])
-    headers = {**ALICE, "If-Match": config.headers["etag"]}
+    headers = {**ALICE, **({"If-Match": config.headers["etag"]} if with_etag else {})}
     for patch in ({}, {"description": "v1"}):
         no_op = await client.patch(path, headers=headers, json=patch)
         assert no_op.status_code == 200, no_op.text
@@ -166,7 +169,10 @@ async def test_config_patch_preserves_identity_and_omitted_fields(client, agent_
         "version": installed["version"] + 1,
     }
     assert changed.headers["etag"] != config.headers["etag"]
-    assert (await client.patch(path, headers=headers, json={})).status_code == 412
+    stale = await client.patch(
+        path, headers={**ALICE, "If-Match": config.headers["etag"]}, json={}
+    )
+    assert stale.status_code == 412
     cleared = await client.patch(
         path, headers={**ALICE, "If-Match": changed.headers["etag"]}, json={"description": None}
     )
@@ -175,6 +181,41 @@ async def test_config_patch_preserves_identity_and_omitted_fields(client, agent_
     assert (await client.get(path, headers=ALICE)).json()["description"] is None
     reinstalled = await _install(client, ALICE, "orion", "reinstalled")
     assert reinstalled.json()["description"] == "reinstalled"
+
+
+@pytest.mark.parametrize("method", ["GET", "PATCH"])
+async def test_local_config_rejects_legacy_source_tools(
+    client, agent_store, artifact_store, monkeypatch, method
+) -> None:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    installed = await _install(client, ALICE, "orion")
+    assert installed.status_code == 200, installed.text
+    path = f"/v1/agents/{installed.json()['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    assert config.status_code == 200, config.text
+    agent = agent_store.get(installed.json()["id"])
+    assert agent is not None
+    legacy = bundle_files(
+        {
+            "config.yaml": b"spec_version: 1\nname: orion\n",
+            "tools/python/echo.py": b"def echo(text: str) -> str:\n    return text\n",
+        }
+    )
+    # Older installations can contain bundles current HTTP uploads would reject.
+    artifact_store.put(agent.bundle_location, legacy)
+    response = await client.request(
+        method,
+        f"{path}/config" if method == "GET" else path,
+        headers={**ALICE, "If-Match": config.headers["etag"]},
+        **({"json": {"description": "updated"}} if method == "PATCH" else {}),
+    )
+    assert response.status_code == 400, response.text
+    assert "Invalid agent configuration" in response.text
+    persisted = agent_store.get(agent.id)
+    assert persisted is not None
+    assert persisted.bundle_location == agent.bundle_location
+    assert persisted.version == agent.version
+    assert artifact_store.get(agent.bundle_location) == legacy
 
 
 async def test_config_patch_checks_owner_before_preconditions(client, agent_store) -> None:
@@ -266,8 +307,8 @@ async def test_config_patch_preconditions_and_body_limit(client, monkeypatch) ->
     installed = (await _install(client, ALICE, "orion")).json()
     path = f"/v1/agents/{installed['id']}"
     config = await client.get(f"{path}/config", headers=ALICE)
-    assert (await client.patch(path, headers=ALICE, json={})).status_code == 428
-    for tag in ("*", "W/" + config.headers["etag"], config.headers["etag"] + ', "other"'):
+    assert (await client.patch(path, headers=ALICE, json={})).status_code == 200
+    for tag in ("", "*", "W/" + config.headers["etag"], config.headers["etag"] + ', "other"'):
         result = await client.patch(path, headers={**ALICE, "If-Match": tag}, json={})
         assert result.status_code == 400, result.text
     headers = {**ALICE, "If-Match": config.headers["etag"]}
@@ -287,9 +328,10 @@ async def test_config_patch_preconditions_and_body_limit(client, monkeypatch) ->
     assert result.json()["error"]["code"] == "payload_too_large"
 
 
+@pytest.mark.parametrize("with_etag", [True, False])
 @pytest.mark.parametrize("race", ["update", "identical_update", "delete", "artifact_failure"])
 async def test_config_patch_does_not_overwrite_racing_changes(
-    client, agent_store, artifact_store, monkeypatch, race: str
+    client, agent_store, artifact_store, monkeypatch, race: str, with_etag: bool
 ) -> None:
     installed = (await _install(client, ALICE, "orion")).json()
     path = f"/v1/agents/{installed['id']}"
@@ -313,14 +355,14 @@ async def test_config_patch_does_not_overwrite_racing_changes(
         with pytest.raises(OSError, match="artifact storage unavailable"):
             await client.patch(
                 path,
-                headers={**ALICE, "If-Match": config.headers["etag"]},
+                headers={**ALICE, **({"If-Match": config.headers["etag"]} if with_etag else {})},
                 json={"description": "loser"},
             )
         assert agent_store.get(installed["id"]) == before
     else:
         result = await client.patch(
             path,
-            headers={**ALICE, "If-Match": config.headers["etag"]},
+            headers={**ALICE, **({"If-Match": config.headers["etag"]} if with_etag else {})},
             json={"description": "loser"},
         )
         assert result.status_code == 412, result.text

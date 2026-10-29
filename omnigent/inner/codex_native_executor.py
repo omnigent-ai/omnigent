@@ -24,6 +24,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexMessage,
     CodexParams,
     client_for_transport,
+    is_compaction_steer_refusal,
     is_server_draining_error,
     is_stale_active_turn_error,
     resolve_codex_effort_for_model,
@@ -60,6 +61,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ToolSpec,
     TurnComplete,
@@ -70,8 +72,8 @@ from omnigent.inner.native_attachments import (
     codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
-    requires_filesystem,
     unresolved_attachment_marker,
+    uses_filesystem_delivery,
 )
 from omnigent.native.input_diagnostics import (
     log_input_event,
@@ -90,6 +92,19 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
+_COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
+_CODEX_COMPACTING_FAILURE = CodexStartupFailure(
+    message="Codex is still compacting, so this message was not delivered.",
+    code="codex_compacting",
+    title="Codex is compacting",
+    remediation="Wait for compaction to finish, then send your message again.",
+)
+_CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
+    message="Codex disconnected while submitting this message. It may already be running.",
+    code="codex_delivery_unconfirmed",
+    title="Codex delivery is unconfirmed",
+    remediation="Check the native terminal for the message before sending it again.",
+)
 
 
 class _CodexNativeInputUndelivered(RuntimeError):
@@ -250,8 +265,8 @@ async def _native_delivery_request(
                     remediation="Send the message again in the current session.",
                 )
             ) from error
-        # A second refusal still proves non-delivery. Any other failure after
-        # this submission is ambiguous and must reach the caller unchanged.
+        # A second refusal still proves non-delivery. Transport failure after
+        # this submission remains ambiguous and cannot authorize another retry.
         return await _native_delivery_request_once(client, method, params, state)
 
 
@@ -286,6 +301,8 @@ async def _native_delivery_request_once(
             outcome = "cancelled"
         elif isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc):
             outcome = "rpc_rejected_draining"
+        elif isinstance(exc, CodexAppServerResponseError) and is_compaction_steer_refusal(exc):
+            outcome = "rpc_rejected_compacting"
         log_input_event(
             _logger,
             "codex_native_delivery_finished",
@@ -299,6 +316,8 @@ async def _native_delivery_request_once(
             exception_type=type(exc).__name__,
             rpc_error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
         )
+        if isinstance(exc, (OSError, WebSocketException)):
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         raise
     result = _json_object(response.get("result"))
     if method == "turn/start":
@@ -434,6 +453,98 @@ async def _inject_codex_turn(
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
 ) -> None:
+    """Retain explicitly refused input while an active compaction settles."""
+    try:
+        await _inject_codex_turn_once(
+            client,
+            bridge_dir=bridge_dir,
+            state=state,
+            input_items=input_items,
+            settings_overrides=settings_overrides,
+        )
+        return
+    except CodexAppServerResponseError as error:
+        if state.active_turn_id is None or not is_compaction_steer_refusal(error):
+            raise
+    recovered_state = await _wait_for_compaction_turn(bridge_dir, state)
+    try:
+        await _inject_codex_turn_once(
+            client,
+            bridge_dir=bridge_dir,
+            state=recovered_state,
+            input_items=input_items,
+            settings_overrides=settings_overrides,
+        )
+    except (CodexAppServerResponseError, _CodexNativeInputUndelivered):
+        raise
+    except Exception as exc:
+        # Codex may have accepted the resubmitted input before its reply was lost.
+        raise InjectionDeliveryAmbiguous(str(exc)) from exc
+
+
+async def _wait_for_compaction_turn(
+    bridge_dir: Path, state: CodexNativeBridgeState
+) -> CodexNativeBridgeState:
+    """Wait for the rejected turn to settle without clearing a live native turn."""
+    deadline = asyncio.get_running_loop().time() + _COMPACTION_WAIT_TIMEOUT_SECONDS
+    log_input_event(
+        _logger,
+        "codex_native_compaction_wait",
+        session_id=state.session_id,
+        thread_id=state.thread_id,
+        native_turn_id=state.active_turn_id,
+        stage="compaction",
+        outcome="waiting",
+    )
+    outcome = "error"
+    try:
+        while True:
+            current = read_bridge_state(bridge_dir)
+            if (
+                current is None
+                or current.session_id != state.session_id
+                or current.thread_id != state.thread_id
+                or current.socket_path != state.socket_path
+            ):
+                outcome = "session_changed"
+                raise _CodexNativeInputUndelivered(
+                    CodexStartupFailure(
+                        message="Codex native session changed while waiting for compaction; "
+                        "this message was not delivered.",
+                        remediation="Send the message again in the current session.",
+                    )
+                )
+            if current.active_turn_id != state.active_turn_id:
+                outcome = "settled"
+                return current
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                outcome = "timed_out"
+                raise _CodexNativeInputUndelivered(_CODEX_COMPACTING_FAILURE)
+            await asyncio.sleep(min(_BRIDGE_STATE_SLOW_POLL_SECONDS, remaining))
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    finally:
+        log_input_event(
+            _logger,
+            "codex_native_compaction_wait",
+            session_id=state.session_id,
+            thread_id=state.thread_id,
+            native_turn_id=state.active_turn_id,
+            stage="compaction",
+            outcome=outcome,
+        )
+
+
+async def _inject_codex_turn_once(
+    client: CodexAppServerClient,
+    *,
+    bridge_dir: Path,
+    state: CodexNativeBridgeState,
+    input_items: list[dict[str, object]],
+    settings_overrides: Mapping[str, object],
+) -> None:
     """Steer an active turn or start one, recovering one proven stale steer."""
     if state.active_turn_id is None:
         await _start_codex_turn(
@@ -552,7 +663,8 @@ class CodexNativeExecutor(Executor):
                     input_items=input_items,
                     settings_overrides={},
                 )
-            except Exception as exc:  # noqa: BLE001 - steering is best-effort from the runner facade.
+            except Exception as exc:
+                ambiguous = isinstance(exc, InjectionDeliveryAmbiguous)
                 _logger.warning(
                     "Codex native turn/steer failed",
                     exc_info=True,
@@ -567,10 +679,12 @@ class CodexNativeExecutor(Executor):
                             if isinstance(exc, CodexAppServerResponseError)
                             else None,
                             stage="native_rpc",
-                            outcome="error",
+                            outcome="ambiguous" if ambiguous else "error",
                         )
                     ),
                 )
+                if ambiguous:
+                    raise
                 return False
             finally:
                 await client.close()
@@ -619,7 +733,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # noqa: BLE001 - the local cancel above already took effect.
+                except Exception:  # the local cancel above already took effect.
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
@@ -712,6 +826,7 @@ class CodexNativeExecutor(Executor):
         error_msg: str | None = None
         startup_failure: CodexStartupFailure | None = None
         undelivered = False
+        delivery_unconfirmed = False
         while True:
             if state is None:
                 (
@@ -829,13 +944,21 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
-                        if isinstance(exc, _CodexNativeInputUndelivered):
+                        if isinstance(exc, InjectionDeliveryAmbiguous):
+                            startup_failure = _CODEX_DELIVERY_UNCONFIRMED_FAILURE
+                            delivery_unconfirmed = True
+                        elif isinstance(exc, _CodexNativeInputUndelivered):
                             startup_failure = exc.failure
                             undelivered = True
                         elif isinstance(
                             exc, CodexAppServerResponseError
                         ) and is_server_draining_error(exc):
                             startup_failure = CODEX_APP_SERVER_STOPPED
+                            undelivered = True
+                        elif isinstance(
+                            exc, CodexAppServerResponseError
+                        ) and is_compaction_steer_refusal(exc):
+                            startup_failure = _CODEX_COMPACTING_FAILURE
                             undelivered = True
                         _logger.exception(
                             "Codex native turn injection failed",
@@ -879,6 +1002,9 @@ class CodexNativeExecutor(Executor):
                 # Transport loss after submission stays ambiguous unless Codex
                 # explicitly rejected the input.
                 undelivered=undelivered,
+                # Failed delivery does not own cancellation of an independent native turn.
+                preserve_session=delivery_unconfirmed
+                or (undelivered and state is not None and state.active_turn_id is not None),
             )
         else:
             yield TurnComplete(response=None)
@@ -1039,9 +1165,9 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
 
 
 def _requires_filesystem(block: Mapping[str, object]) -> bool:
-    """Whether *block* names a file that requires filesystem tools."""
+    """Whether *block* is a file that must be opened with filesystem tools."""
     filename = block.get("filename")
-    return requires_filesystem(filename if isinstance(filename, str) else None)
+    return uses_filesystem_delivery(filename if isinstance(filename, str) else None, block)
 
 
 def _apply_resize_notice_to_latest_image(

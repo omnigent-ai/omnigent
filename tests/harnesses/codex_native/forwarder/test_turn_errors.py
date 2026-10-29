@@ -7,6 +7,7 @@ Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -959,7 +960,7 @@ def test_resume_terminal_status_edge_attaches_error(tmp_path: Path) -> None:
         }
     ]
 
-    edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
+    edge = fwd._resume_turn_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
 
     assert edge is not None
     assert edge.status == "failed"
@@ -1028,6 +1029,37 @@ async def test_post_turn_status_edge_auth_error_includes_reauth_hint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_provider_token_command_failure_posts_without_codex_login_hint(
+    tmp_path: Path,
+) -> None:
+    """A failed model provider token command is not a Codex login problem."""
+    _seed_active_turn(tmp_path, "turn_123")
+    message = (
+        "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+        "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+        "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools "
+        "access token. Run `isaac` to log in and try again."
+    )
+    params = {
+        "turn": {
+            "id": "turn_123",
+            "status": "failed",
+            "error": {"message": message, "codexErrorInfo": "other"},
+        }
+    }
+    edge = fwd._terminal_turn_status_edge(tmp_path, "turn/completed", params)
+    assert edge is not None
+    client = _RecordingClient()
+
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    data = client.posts[0][1]["data"]
+    assert data["status"] == "failed"
+    assert data["output"] == message
+    assert "reauth_required" not in data
+
+
+@pytest.mark.asyncio
 async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()
@@ -1047,6 +1079,48 @@ _CERTIFICATE_LINE = (
     "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
     "ssl/tls alert certificate expired (_ssl.c:2580)"
 )
+
+
+@pytest.mark.parametrize(
+    ("message", "turn_id", "reason"),
+    [
+        ("Failed to shutdown thread persistence", None, "thread_persistence_shutdown"),
+        ("private-error-detail", "child-turn", "unclassified"),
+        ("x" * 5000 + "Failed to shutdown thread persistence", "child-turn", "unclassified"),
+    ],
+)
+async def test_status_audit_correlates_child_errors_without_copying_error_text(
+    caplog: pytest.LogCaptureFixture,
+    message: str,
+    turn_id: str | None,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    client = _RecordingClient()
+    await fwd._post_turn_status_edge(
+        client,
+        "child-session",
+        fwd._CodexTurnStatusEdge(
+            status="failed",
+            turn_id=turn_id,
+            source="error",
+            error=fwd._CodexTerminalError(message=message, kind=fwd._CODEX_ERROR_KIND_GENERIC),
+        ),
+    )
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status"
+    ]
+    assert record.session_id == "child-session"
+    assert record.attributes["has_turn_id"] is (turn_id is not None)
+    assert record.attributes["has_error"] is True
+    assert record.attributes["native_error_kind"] == "generic"
+    assert record.attributes["native_error_reason"] == reason
+    assert record.attributes["protocol_source"] == "error"
+    assert "private-error-detail" not in json.dumps(record.attributes)
+    assert message not in record.getMessage()
+    assert client.posts[0][1]["data"]["output"] == message
 
 
 def _connection_retry_params(*, http_status: int | None = None) -> dict:

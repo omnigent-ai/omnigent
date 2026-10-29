@@ -134,7 +134,7 @@ async def host_setup() -> AsyncIterator[tuple[HostRegistry, _FakeWebSocket, asyn
         conn.outbound_queue.put_nowait(None)
         try:
             await asyncio.wait_for(drain_task, timeout=1.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             drain_task.cancel()
 
 

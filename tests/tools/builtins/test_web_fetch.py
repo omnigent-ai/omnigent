@@ -333,6 +333,34 @@ def test_researcher_has_instructions() -> None:
     assert "web" in instructions.lower()
 
 
+def test_researcher_drops_every_framework_tool_group() -> None:
+    """
+    The headless researcher advertises none of the opt-out tool groups, and
+    its prompt carries no embedded-browser guidance to pull it away from
+    ``sys_os_shell``.
+    """
+    from omnigent.runtime.prompt import (
+        EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
+        build_instructions_nullable,
+    )
+    from omnigent.tools.manager import ToolManager
+
+    researcher = WebFetchTool(parent_spec=_make_parent_spec()).researcher_spec
+    names = {
+        s["function"]["name"]
+        for s in ToolManager(researcher, os_env_schema_only=True).get_tool_schemas()
+    }
+
+    assert not {
+        n for n in names if n.startswith(("browser_", "sys_scheduled_task_", "sys_agent_"))
+    }
+    assert not names & {"list_comments", "update_comment", "sys_add_policy", "sys_policy_registry"}
+    assert "sys_os_shell" in names
+    composed = build_instructions_nullable(researcher, None, [])
+    assert composed is not None
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in composed
+
+
 # ── Runner-side dispatch ─────────────────────────────
 
 
