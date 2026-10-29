@@ -309,14 +309,14 @@
   // React to programmatic and keyboard selection too; mouseup misses these.
   // Debounced and only emits non-empty selections; mouseup owns clearing.
   let selTimer = null;
-  document.addEventListener("selectionchange", function () {
+  function scheduleSelection() {
     if (selTimer) clearTimeout(selTimer);
     selTimer = setTimeout(emitSelection, 150);
-  });
+  }
+  document.addEventListener("selectionchange", scheduleSelection);
+  // Zooming the preview resizes this frame and reflows the selection.
+  window.addEventListener("resize", scheduleSelection);
 
-  // Browser zoom shortcuts would zoom the whole app; once the parent is
-  // connected, zoom only this preview instead. An artifact that handles the
-  // shortcut itself (and cancels it) keeps it.
   function zoomAction(e) {
     if (!(e.metaKey || e.ctrlKey) || e.altKey) return null;
     if (e.key === "=" || e.key === "+" || e.code === "NumpadAdd") return "in";
@@ -325,19 +325,23 @@
     return null;
   }
 
-  window.addEventListener("keydown", function (e) {
-    if (!port || e.defaultPrevented) return;
+  // Browser zoom shortcuts would zoom the whole app; zoom only this preview.
+  // Bound on connect, after the artifact's startup listeners, so a shortcut
+  // the artifact cancels stays with it.
+  function onZoomKey(e) {
+    if (e.defaultPrevented) return;
     const action = zoomAction(e);
     if (!action) return;
     e.preventDefault();
     send({ type: T.zoom, action: action });
-  });
+  }
 
   window.addEventListener("message", function (e) {
     const d = e.data;
     if (!d || d.source !== SRC || d.nonce !== NONCE) return;
     if (d.type === T.init && e.ports && e.ports[0]) {
       port = e.ports[0];
+      window.addEventListener("keydown", onZoomKey);
       port.onmessage = function (ev) {
         const m = ev.data;
         if (!m) return;

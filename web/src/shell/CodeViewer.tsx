@@ -971,7 +971,7 @@ export function CodeViewer({
     return (
       <HtmlCommentViewer
         // A different file starts back at 100% zoom.
-        key={path ?? ""}
+        key={path}
         conversationId={conversationId}
         content={content}
         truncated={truncated}

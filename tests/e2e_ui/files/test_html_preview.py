@@ -157,6 +157,7 @@ def test_html_preview_links_and_sandboxed_popout(
     base_url, session_id = seeded_html
     # Keep the viewport wide so the responsive toolbar renders its actions
     # inline (the "Open in new tab" button is found by role, not via overflow).
+    page.set_viewport_size({"width": 1600, "height": 900})
     # HTML files default to the preview view, so the iframe mounts directly.
     page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
@@ -278,6 +279,21 @@ def _expect_scaled(heading: Locator, base_height: float, scale: float) -> None:
 _ZOOM_VIEWPORT = {"width": 1600, "height": 900}
 
 
+def _expect_button_above(page: Page, button: Locator, selected: Locator) -> None:
+    """Wait for ``button`` to sit just above ``selected`` on screen."""
+    expect(button).to_be_visible()
+    # The button moves on a debounced selection report after the frame resizes.
+    for _ in range(50):
+        button_box, selected_box = _box(button), _box(selected)
+        if (
+            abs(button_box["x"] - selected_box["x"]) < 4
+            and abs(button_box["y"] + button_box["height"] + 6 - selected_box["y"]) < 4
+        ):
+            return
+        page.wait_for_timeout(100)
+    raise AssertionError(f"Add comment at {button_box}, selection at {selected_box}")
+
+
 def _hold_for_recording(page: Page) -> None:
     """Leave each zoom step on screen long enough to follow in a recorded run."""
     if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
@@ -312,7 +328,6 @@ def test_html_preview_zoom_shortcuts_scale_only_the_preview(
     base_url, session_id = seeded_html
     # Create the page after setup so a recording starts at the user's journey.
     page: Page = request.getfixturevalue("page")
-    page.set_viewport_size({"width": 1600, "height": 900})
     page.goto(f"{base_url}/c/{session_id}?file={_HTML_PATH}")
 
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
@@ -350,17 +365,16 @@ def test_html_preview_zoom_shortcuts_scale_only_the_preview(
     status_line = preview.locator("#js-status")
     status_line.select_text()
     add_comment = page.get_by_role("button", name="Add comment")
-    expect(add_comment).to_be_visible()
-    button_box, selected_box = _box(add_comment), _box(status_line)
-    assert abs(button_box["x"] - selected_box["x"]) < 4
-    assert abs(button_box["y"] + button_box["height"] + 6 - selected_box["y"]) < 4
+    _expect_button_above(page, add_comment, status_line)
     _hold_for_recording(page)
 
-    # Zooming moves the text, so the stale button is dropped.
+    # Zooming reflows the text; the button follows the selection to its new place.
+    selected_before = _box(status_line)
     assert _press_in_preview(page, preview, "Control+Minus")
-    expect(add_comment).to_be_hidden()
     expect(badge).to_have_text("Preview zoom 110%")
     _expect_scaled(heading, base_height, 1.1)
+    assert _box(status_line) != selected_before
+    _expect_button_above(page, add_comment, status_line)
     _hold_for_recording(page)
 
     assert _press_in_preview(page, preview, "Control+0")
@@ -369,7 +383,7 @@ def test_html_preview_zoom_shortcuts_scale_only_the_preview(
     _hold_for_recording(page)
 
     # Other shortcuts still reach the page untouched.
-    assert not _press_in_preview(page, preview, "Control+9")
+    assert _press_in_preview(page, preview, "Control+9") is False
 
     # The app itself never zoomed.
     assert _host_scale(page) == host_before

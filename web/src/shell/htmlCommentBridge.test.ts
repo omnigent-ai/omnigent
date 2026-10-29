@@ -118,7 +118,10 @@ describe("bridge runtime zoom shortcuts", () => {
   });
 
   /** Run the runtime in this document, as the injected script would, and connect a port. */
-  function startRuntime({ connect = true } = {}) {
+  function startRuntime({
+    connect = true,
+    beforeConnect,
+  }: { connect?: boolean; beforeConnect?: () => void } = {}) {
     for (const target of [window, document]) {
       const original = target.addEventListener.bind(target);
       vi.spyOn(target, "addEventListener").mockImplementation((type, listener, options) => {
@@ -134,8 +137,7 @@ describe("bridge runtime zoom shortcuts", () => {
     );
     vi.spyOn(document, "currentScript", "get").mockReturnValue(script);
     new Function(HTML_COMMENT_BRIDGE_RUNTIME)();
-    vi.mocked(window.addEventListener).mockRestore();
-    vi.mocked(document.addEventListener).mockRestore();
+    beforeConnect?.();
 
     const port = { postMessage: vi.fn(), onmessage: null };
     if (connect) {
@@ -147,6 +149,8 @@ describe("bridge runtime zoom shortcuts", () => {
       window.dispatchEvent(init);
       port.postMessage.mockClear(); // drop the ready message
     }
+    vi.mocked(window.addEventListener).mockRestore();
+    vi.mocked(document.addEventListener).mockRestore();
     return port;
   }
 
@@ -197,15 +201,15 @@ describe("bridge runtime zoom shortcuts", () => {
     expect(port.postMessage).not.toHaveBeenCalled();
   });
 
-  it("leaves the shortcut to an artifact that already handled it", () => {
-    const port = startRuntime();
-    const artifactHandler = (event: Event) => event.preventDefault();
-    document.addEventListener("keydown", artifactHandler);
-    try {
-      press({ key: "=", metaKey: true });
-    } finally {
-      document.removeEventListener("keydown", artifactHandler);
-    }
+  it.each([
+    ["document", () => document],
+    ["window", () => window],
+  ])("leaves the shortcut to an artifact %s listener that handles it", (_, target) => {
+    // Artifact scripts run after the injected bridge but before the parent connects.
+    const port = startRuntime({
+      beforeConnect: () => target().addEventListener("keydown", (e) => e.preventDefault()),
+    });
+    press({ key: "=", metaKey: true });
     expect(port.postMessage).not.toHaveBeenCalled();
   });
 });

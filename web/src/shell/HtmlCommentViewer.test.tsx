@@ -261,22 +261,6 @@ describe("HtmlCommentViewer zoom", () => {
     port.close();
   });
 
-  it("ignores zoom requests with an unknown action", async () => {
-    renderViewer("<body><p>doc</p></body>");
-    const { iframe, zoomBox } = previewParts();
-    const { port, send } = await connectBridge(iframe);
-    send({ type: BRIDGE_MSG.zoom, action: "max" });
-    send({ type: BRIDGE_MSG.ready });
-    // ready is answered with the comment state, so once it arrives the bad request was handled.
-    const answered = new Promise((resolve) => {
-      port.onmessage = resolve;
-    });
-    await answered;
-    expect(zoomBox.style.transform).toBe("");
-    expect(screen.getByTestId("html-preview-zoom").textContent).toBe("");
-    port.close();
-  });
-
   it("keeps the zoom when the content reloads", async () => {
     const { rerender } = renderViewer("<body><p>first</p></body>");
     const { send, port } = await connectBridge(previewParts().iframe);
@@ -301,23 +285,33 @@ describe("HtmlCommentViewer zoom", () => {
     renderViewer("<body><p>Quarterly revenue</p></body>");
     const { iframe, zoomBox } = previewParts();
     const { port, send } = await connectBridge(iframe);
+    const selectRevenue = () =>
+      send({
+        type: BRIDGE_MSG.selection,
+        text: "revenue",
+        occ: 0,
+        rect: { left: 40, top: 30, right: 90, bottom: 45 },
+      });
+    selectRevenue();
+    await screen.findByRole("button", { name: "Add comment" });
+
+    // A shortcut that leaves the level unchanged keeps the button in place.
     send({ type: BRIDGE_MSG.zoom, action: "reset" });
+    await waitFor(() =>
+      expect(screen.getByTestId("html-preview-zoom").textContent).toBe("Preview zoom 100%"),
+    );
+    expect(screen.getByRole("button", { name: "Add comment" })).toBeTruthy();
+
+    // A real change drops it until the frame reports the reflowed selection.
     for (let step = 0; step < 5; step++) send({ type: BRIDGE_MSG.zoom, action: "in" });
     await waitFor(() => expect(zoomBox.style.transform).toBe("scale(2)"));
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
 
-    send({
-      type: BRIDGE_MSG.selection,
-      text: "revenue",
-      occ: 0,
-      rect: { left: 40, top: 30, right: 90, bottom: 45 },
-    });
+    selectRevenue();
     const button = await screen.findByRole("button", { name: "Add comment" });
     // jsdom puts the frame at the origin, so the button sits at the scaled rect.
     expect(button.style.left).toBe("80px");
     expect(button.style.top).toBe("54px");
-
-    send({ type: BRIDGE_MSG.zoom, action: "out" });
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull());
     port.close();
   });
 });

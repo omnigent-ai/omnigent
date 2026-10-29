@@ -236,9 +236,13 @@ export function HtmlCommentViewer({
       onSetActiveSelectionRef.current(null);
       setFloating(null);
     } else if (msg.type === BRIDGE_MSG.zoom) {
-      setZoom((current) => nextHtmlPreviewZoom(current, msg.action));
-      // The selection's button would no longer sit over the rescaled text.
-      setFloating(null);
+      const next = nextHtmlPreviewZoom(zoomRef.current, msg.action);
+      if (next !== zoomRef.current) {
+        zoomRef.current = next;
+        setZoom(next);
+        // The frame resizes and re-reports the selection at its new position.
+        setFloating(null);
+      }
       setZoomBadgeVisible(true);
       if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
       zoomBadgeTimerRef.current = setTimeout(() => setZoomBadgeVisible(false), ZOOM_BADGE_MS);

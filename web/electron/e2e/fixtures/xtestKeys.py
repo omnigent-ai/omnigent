@@ -37,9 +37,14 @@ def _load() -> tuple[ctypes.CDLL, ctypes.CDLL, int]:
         ctypes.c_int,
         ctypes.c_ulong,
     ]
+    xtst.XTestQueryExtension.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_int)] * 4
     display = x11.XOpenDisplay(None)
     if not display:
         raise OSError("cannot open the X display")
+    versions = [ctypes.c_int() for _ in range(4)]
+    if not xtst.XTestQueryExtension(display, *(ctypes.byref(value) for value in versions)):
+        x11.XCloseDisplay(display)
+        raise OSError("the X display does not support XTEST")
     return x11, xtst, display
 
 

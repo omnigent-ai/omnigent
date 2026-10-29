@@ -18,6 +18,7 @@ describe("nextHtmlPreviewZoom", () => {
   it("clamps at the smallest and largest preset", () => {
     const smallest = HTML_PREVIEW_ZOOM_LEVELS[0];
     const largest = HTML_PREVIEW_ZOOM_LEVELS[HTML_PREVIEW_ZOOM_LEVELS.length - 1];
+    expect([smallest, largest]).toEqual([0.25, 5]);
     expect(nextHtmlPreviewZoom(smallest, "out")).toBe(smallest);
     expect(nextHtmlPreviewZoom(largest, "in")).toBe(largest);
   });
@@ -26,6 +27,7 @@ describe("nextHtmlPreviewZoom", () => {
     expect(nextHtmlPreviewZoom(1.2, "in")).toBe(1.25);
     expect(nextHtmlPreviewZoom(1.2, "out")).toBe(1.1);
     expect(nextHtmlPreviewZoom(1.1 + 1e-9, "in")).toBe(1.25);
+    expect(nextHtmlPreviewZoom(0.9 - 1e-9, "out")).toBe(0.8);
   });
 
   it("resets to 100% from any level", () => {
