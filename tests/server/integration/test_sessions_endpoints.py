@@ -3025,26 +3025,24 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
 
 
 @pytest.mark.parametrize(
-    "interrupt_text",
-    ["[Request interrupted by user]", "[Request interrupted by user for tool use]"],
+    ("marker_text", "source_id"),
+    [
+        ("[Request interrupted by user]", None),
+        ("[Request interrupted by user for tool use]", None),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake"),
+    ],
 )
-async def test_external_interrupt_record_leaves_pending_input_for_real_message(
+async def test_external_native_marker_leaves_pending_input_for_real_message(
     client: httpx.AsyncClient,
-    interrupt_text: str,
+    marker_text: str,
+    source_id: str | None,
 ) -> None:
     """
-    Regression: steering with an upload must not feed it to the interrupt marker.
+    Native markers must not absorb a queued user message's upload.
 
-    Interrupting a turn to steer makes Claude write its own ``[Request
-    interrupted by user...]`` record into the transcript BEFORE the steering
-    message. The forwarder mirrors both back as user items. The interrupt
-    record has no pending-input entry of its own, so a FIFO drain for it
-    shifts the queue by a slot: the marker absorbs the queued message's
-    uploads and the real message persists with none. In the web UI that
-    renders as the raw marker text next to the screenshots, followed by a
-    blank bubble (the real message's ``[Attached:]`` markers are stripped and
-    its file blocks are gone). Assert the marker persists bare and the
-    steering message keeps the image.
+    Interrupt records and bridge-generated peer labels have no pending input
+    of their own. Keep the marker text-only so it renders as a system row,
+    and leave the upload queued for its real transcript echo.
     """
     from omnigent.runtime import pending_inputs
 
@@ -3058,9 +3056,9 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         [{"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"}],
     )
     try:
-        for text in (
-            interrupt_text,
-            "[Attached: /tmp/uploads/shot.png]",
+        for text, item_source_id in (
+            (marker_text, source_id),
+            ("[Attached: /tmp/uploads/shot.png]", None),
         ):
             resp = await client.post(
                 f"/v1/sessions/{session['id']}/events",
@@ -3073,10 +3071,13 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
                             "content": [{"type": "input_text", "text": text}],
                         },
                         "response_id": "native_turn_1",
+                        **({"source_id": item_source_id} if item_source_id else {}),
                     },
                 },
             )
             assert resp.status_code == 202, resp.text
+            if text == marker_text:
+                assert len(pending_inputs.snapshot_for(session["id"])) == 1
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         messages = [item for item in items if item["type"] == "message"]
@@ -3084,7 +3085,7 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         marker, steered = messages
         # The marker stays text-only, so the UI still classifies it as a
         # system marker instead of rendering it as user text beside an image.
-        assert marker["content"] == [{"type": "input_text", "text": interrupt_text}]
+        assert marker["content"] == [{"type": "input_text", "text": marker_text}]
         # The upload landed on the message that actually queued it.
         assert steered["content"][0] == {
             "type": "input_image",
@@ -3099,16 +3100,27 @@ async def test_external_interrupt_record_leaves_pending_input_for_real_message(
         pending_inputs.reset_for_tests()
 
 
-async def test_external_interrupt_lookalike_still_drains_pending_input(
+@pytest.mark.parametrize(
+    ("text", "source_id"),
+    [
+        ("[Request interrupted by user?]", None),
+        ("[System: Message from another session]", None),
+        ("[System: Message from another session]", "user-input:0:message"),
+        ("Please check the other session.", "peer-input:0:peer_message_wake"),
+    ],
+)
+async def test_external_native_marker_lookalike_still_drains_pending_input(
     client: httpx.AsyncClient,
+    text: str,
+    source_id: str | None,
 ) -> None:
     """
-    The interrupt-record exemption must not swallow real user messages.
+    Native marker exemptions must not swallow real user messages.
 
     A user can type a message that merely resembles the marker. Over-matching
     would skip the drain for it, stranding the pending entry and dropping the
     upload it carries — the same class of bug from the other direction. The
-    regex is anchored, so a bracketed question is a normal message.
+    interrupt regex is anchored, and a peer label requires its synthetic source id.
     """
     from omnigent.runtime import pending_inputs
 
@@ -3128,11 +3140,10 @@ async def test_external_interrupt_lookalike_still_drains_pending_input(
                     "item_type": "message",
                     "item_data": {
                         "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": "[Request interrupted by user?]"}
-                        ],
+                        "content": [{"type": "input_text", "text": text}],
                     },
                     "response_id": "native_turn_1",
+                    **({"source_id": source_id} if source_id else {}),
                 },
             },
         )

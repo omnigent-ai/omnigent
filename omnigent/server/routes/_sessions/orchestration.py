@@ -3069,7 +3069,19 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
-    if item.stable_id is not None and _drains_pending_inputs(item):
+    source_id = body.data.get("source_id")
+    is_peer_wake_marker = (
+        isinstance(source_id, str)
+        and source_id.strip().endswith(":0:peer_message_wake")
+        and item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and item.data.content
+        == [{"type": "input_text", "text": "[System: Message from another session]"}]
+    )
+    # Bridge-generated peer labels have no queued input; literal user text still does.
+    drains_pending_inputs = _drains_pending_inputs(item) and not is_peer_wake_marker
+    if item.stable_id is not None and drains_pending_inputs:
         # A forwarder retry of a mirror already persisted under its source-derived
         # id: nothing to drain, persist or publish. Draining again could match a
         # NEWER identical queued message and mark everything queued in between
@@ -3078,7 +3090,7 @@ async def _persist_external_conversation_item_unlocked(
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
         if existing is not None:
             return existing.id
-    if _drains_pending_inputs(item) and STARTUP_LABEL in conv.labels:
+    if drains_pending_inputs and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry and fold the entry's file
@@ -3100,13 +3112,7 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
-    if (
-        item.type == "message"
-        and isinstance(item.data, MessageData)
-        and item.data.role == "user"
-        and not item.data.is_meta
-        and not _is_native_interrupt_record(item.data)
-    ):
+    if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).

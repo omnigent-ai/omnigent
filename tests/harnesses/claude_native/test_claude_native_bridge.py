@@ -2106,7 +2106,8 @@ def test_scheduled_wake_opens_marked_turn(tmp_path: Path) -> None:
     ]
 
 
-def test_scheduled_wake_requires_settled_turn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("pending", [False, True])
+def test_scheduled_wake_requires_settled_turn(tmp_path: Path, pending: bool) -> None:
     """
     Without a settle, post-turn assistant output inherits the active id.
 
@@ -2125,6 +2126,7 @@ def test_scheduled_wake_requires_settled_turn(tmp_path: Path) -> None:
         start_line=0,
         agent_name="claude-native-ui",
         current_response_id="resp_live_turn",
+        pending_settled_response_id="resp_live_turn" if pending else None,
     )
 
     assert [item.item_type for item in result.items] == ["message"]
@@ -2177,6 +2179,242 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(tmp_path: Path) ->
     assert resumed.data["role"] == "assistant"
     assert resumed.response_id == "resp_prev_turn"
     assert result.current_response_id == "resp_prev_turn"
+
+
+def _peer_wake_entry(shape: str, provenance: str) -> dict[str, Any]:
+    """Build a native peer input in one supported transcript shape."""
+    metadata: dict[str, Any] = (
+        {"isMeta": True} if provenance == "meta-envelope" else {"origin": {"kind": "peer"}}
+    )
+    if provenance == "handback":
+        metadata.update(
+            isMeta=True,
+            origin={"kind": "peer", "handback": True, "senderTaskId": "agent-1"},
+        )
+    text = _TEAMMATE_MESSAGE if provenance == "meta-envelope" else "The other session finished."
+    if shape == "queued":
+        return {
+            "type": "attachment",
+            "uuid": "peer-input",
+            "attachment": {
+                "type": "queued_command",
+                "commandMode": "prompt",
+                "prompt": text,
+                **metadata,
+            },
+        }
+    content = [{"type": "text", "text": text}] if shape == "blocks" else text
+    return {
+        "type": "user",
+        "uuid": "peer-input",
+        "message": {"role": "user", "content": content},
+        **metadata,
+    }
+
+
+@pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
+@pytest.mark.parametrize("provenance", ["peer", "handback", "meta-envelope"])
+@pytest.mark.parametrize("turn", ["active", "settled", "pending"])
+def test_peer_message_wake_has_its_own_label(
+    tmp_path: Path, shape: str, provenance: str, turn: str
+) -> None:
+    """A settled peer wake gets a label; active input and hidden provenance stay intact."""
+    entry = _peer_wake_entry(shape, provenance)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+    before = read_transcript_items_from_offset(
+        transcript, 0, start_line=0, agent_name="Claude", current_response_id="previous"
+    )
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(
+            _transcript_line(_assistant_text_entry("peer-reply", "Thanks for the update."))
+        )
+
+    def read() -> claude_native_bridge.TranscriptReadResult:
+        """Read the same input with a settled or active preceding turn."""
+        return read_transcript_items_from_offset(
+            transcript,
+            0,
+            start_line=0,
+            agent_name="Claude",
+            current_response_id="previous",
+            settled_response_id="previous" if turn == "settled" else None,
+            pending_settled_response_id="previous" if turn == "pending" else None,
+        )
+
+    result = read()
+    assert read().items == result.items
+    if turn != "active":
+        marker, *rest = result.items
+        assert marker.data == {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "[System: Message from another session]"}],
+        }
+        assert marker.response_id == result.current_response_id != "previous"
+        assert rest[:-1] == before.items
+    else:
+        assert result.items[:-1] == before.items
+        assert result.current_response_id == "previous"
+    reply = result.items[-1]
+    assert reply.response_id == result.current_response_id
+    assert reply.data["content"] == [{"type": "output_text", "text": "Thanks for the update."}]
+    assert all(
+        item.data.get("content")
+        != [{"type": "input_text", "text": "[System: scheduled prompt fired]"}]
+        for item in result.items
+    )
+    if provenance == "handback":
+        hidden = next(item for item in result.items if item.subagent_return_id == "agent-1")
+        assert hidden.data["is_meta"] is True
+
+
+@pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
+@pytest.mark.parametrize("provenance", ["peer", "handback", "meta-envelope"])
+def test_peer_message_wake_survives_a_poll_before_the_reply(
+    tmp_path: Path, shape: str, provenance: str
+) -> None:
+    """The existing response cursor preserves the peer label across poll boundaries."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(_peer_wake_entry(shape, provenance)), encoding="utf-8")
+    first = read_transcript_items_from_offset(
+        transcript,
+        0,
+        start_line=0,
+        agent_name="Claude",
+        current_response_id="previous",
+        settled_response_id="previous",
+    )
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(_transcript_line(_assistant_text_entry("peer-reply", "Continuing.")))
+    next_poll = read_transcript_items_from_offset(
+        transcript,
+        first.byte_offset,
+        start_line=first.line_cursor,
+        agent_name="Claude",
+        current_response_id=first.current_response_id,
+        settled_response_id="previous",
+    )
+    whole = read_transcript_items_from_offset(
+        transcript,
+        0,
+        start_line=0,
+        agent_name="Claude",
+        current_response_id="previous",
+        settled_response_id="previous",
+    )
+    assert [*first.items, *next_poll.items] == whole.items
+    assert len(next_poll.items) == 1
+    assert next_poll.items[0].data["role"] == "assistant"
+    assert next_poll.current_response_id == first.current_response_id == whole.current_response_id
+
+
+@pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
+@pytest.mark.parametrize("text", ["Internal guidance", _TASK_COMPLETION])
+def test_other_hidden_context_is_not_labelled_as_a_peer_message(
+    tmp_path: Path, shape: str, text: str
+) -> None:
+    """Generic meta input and task notifications do not establish a peer-message wake."""
+    entry = _peer_wake_entry(shape, "meta-envelope")
+    if shape == "queued":
+        entry["attachment"]["prompt"] = text
+    else:
+        entry["message"]["content"] = (
+            [{"type": "text", "text": text}] if shape == "blocks" else text
+        )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(entry)
+        + _transcript_line(_assistant_text_entry("automatic-reply", "Resumed.")),
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript,
+        0,
+        start_line=0,
+        agent_name="Claude",
+        current_response_id="previous",
+        settled_response_id="previous",
+    )
+    texts = [block["text"] for item in result.items for block in item.data.get("content", [])]
+    assert "[System: Message from another session]" not in texts
+    if text == "Internal guidance":
+        assert "[System: scheduled prompt fired]" in texts
+
+
+@pytest.mark.parametrize("kind", ["compaction", "other-attachment", "other-command"])
+def test_peer_metadata_on_non_message_records_does_not_label_a_wake(
+    tmp_path: Path, kind: str
+) -> None:
+    """Peer provenance cannot turn ignored attachments or compaction into a message wake."""
+    entry = _peer_wake_entry("string" if kind == "compaction" else "queued", "peer")
+    if kind == "compaction":
+        entry["isCompactSummary"] = True
+    elif kind == "other-attachment":
+        entry["attachment"]["type"] = "other"
+    else:
+        entry["attachment"]["commandMode"] = "bash"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(entry)
+        + _transcript_line(_assistant_text_entry("automatic-reply", "Resumed.")),
+        encoding="utf-8",
+    )
+    result = read_transcript_items_from_offset(
+        transcript,
+        0,
+        start_line=0,
+        agent_name="Claude",
+        current_response_id="previous",
+        settled_response_id="previous",
+    )
+    if kind == "compaction":
+        assert result.items[0].is_compact_summary
+        assert result.current_response_id == "previous"
+    else:
+        assert result.items[0].data["content"] == [
+            {"type": "input_text", "text": "[System: scheduled prompt fired]"}
+        ]
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("legacy_cursor", [False, True])
+def test_compaction_disarms_peer_wake_labels(
+    tmp_path: Path, pending: bool, legacy_cursor: bool
+) -> None:
+    """A peer message after compaction continues the current turn in both transcript readers."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "summary",
+                "isCompactSummary": True,
+                "message": {"role": "user", "content": "Summary of the current turn."},
+            }
+        )
+        + _transcript_line(_peer_wake_entry("string", "peer"))
+        + _transcript_line(_assistant_text_entry("after-compact", "Continuing.")),
+        encoding="utf-8",
+    )
+    reader = (
+        claude_native_bridge.read_transcript_items_since_with_position
+        if legacy_cursor
+        else read_transcript_items_from_offset
+    )
+    result = reader(
+        transcript,
+        0,
+        **({} if legacy_cursor else {"start_line": 0}),
+        agent_name="Claude",
+        current_response_id="previous",
+        settled_response_id=None if pending else "previous",
+        pending_settled_response_id="previous" if pending else None,
+    )
+    assert len(result.items) == 3
+    assert result.items[0].is_compact_summary
+    assert result.items[1].data["is_meta"] is True
+    assert result.items[2].data["role"] == "assistant"
+    assert result.current_response_id == "previous"
 
 
 def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> None:

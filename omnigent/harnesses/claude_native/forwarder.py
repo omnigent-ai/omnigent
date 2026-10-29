@@ -5150,7 +5150,11 @@ async def _forward_available_items(
     ):
         dedupe.pending_settled_response_id = state.pending_settled_response_id
     result = await asyncio.to_thread(
-        _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
+        _read_transcript_items_for_state,
+        state,
+        agent_name,
+        dedupe.settled_response_id,
+        dedupe.pending_settled_response_id,
     )
     items = result.items
     if not items:
@@ -5644,6 +5648,7 @@ def _read_transcript_items_for_state(
     state: TranscriptForwardState,
     agent_name: str,
     settled_response_id: str | None = None,
+    pending_settled_response_id: str | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items using the best cursor available in ``state``.
@@ -5652,6 +5657,8 @@ def _read_transcript_items_for_state(
     :param agent_name: Agent/model name to stamp on mirrored output.
     :param settled_response_id: Active turn-settle latch — assistant
         output inheriting this id parses as a scheduled wake.
+    :param pending_settled_response_id: Stopped turn awaiting transcript
+        quiescence; peer inputs can already establish a new turn.
     :returns: Transcript items and updated cursors. States without a
         byte offset are migrated by one line-cursor compatibility scan.
     """
@@ -5662,6 +5669,7 @@ def _read_transcript_items_for_state(
             agent_name=agent_name,
             current_response_id=state.current_response_id,
             settled_response_id=settled_response_id,
+            pending_settled_response_id=pending_settled_response_id,
         )
     return read_transcript_items_from_offset(
         state.transcript_path,
@@ -5670,6 +5678,7 @@ def _read_transcript_items_for_state(
         agent_name=agent_name,
         current_response_id=state.current_response_id,
         settled_response_id=settled_response_id,
+        pending_settled_response_id=pending_settled_response_id,
     )
 
 
