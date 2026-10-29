@@ -56,6 +56,19 @@ function blockRange(ed: Editor, needle: string): { from: number; to: number } {
   return range;
 }
 
+/** Types of the top-level blocks, without the empty paragraph TipTap appends. */
+function blockTypes(ed: Editor): string[] {
+  const types: string[] = [];
+  ed.state.doc.forEach((block) => {
+    if (block.type.name !== "paragraph" || block.content.size) types.push(block.type.name);
+  });
+  return types;
+}
+
+function blockTypeOf(ed: Editor, needle: string): string {
+  return ed.state.doc.nodeAt(blockRange(ed, needle).from)!.type.name;
+}
+
 // Each block uses syntax the serialiser writes differently.
 const MIXED = [
   "* star list\n* two",
@@ -198,6 +211,35 @@ describe("saving after an edit", () => {
     });
     ed.commands.deleteRange({ from: at, to: at + ed.state.doc.nodeAt(at)!.nodeSize });
     expect(saved(ed)).toBe("See [x](/r) and [https://example.com](https://example.com)");
+  });
+
+  // Kept source can change meaning beside a block it was not next to.
+  it.each([
+    ["indented code that would join a list", "- item\n\nPara\n\n    code()", "Para"],
+    ["a list that would take in indented code", "- item\n\n# Head\n\n    code()", "Head"],
+  ])("keeps the block structure when deleting a block leaves %s", (_name, markdown, deleted) => {
+    const ed = makeEditor(markdown);
+    const before = blockTypes(ed).filter((type) => type !== blockTypeOf(ed, deleted));
+    ed.commands.deleteRange(blockRange(ed, deleted));
+    expect(blockTypes(makeEditor(saved(ed)))).toEqual(before);
+  });
+
+  it("keeps text typed after an unclosed fence out of the code block", () => {
+    const ed = makeEditor("```js\nconst a = 1");
+    ed.commands.insertContentAt(ed.state.doc.content.size, {
+      type: "paragraph",
+      content: [{ type: "text", text: "more" }],
+    });
+    const reloaded = makeEditor(saved(ed));
+    expect(blockTypes(reloaded)).toEqual(["codeBlock", "paragraph"]);
+    expect(reloaded.state.doc.child(1).textContent).toBe("more");
+  });
+
+  it("keeps source beside an edit whose neighbours read back the same", () => {
+    const markdown = "* one\n\nPara\n\nTitle\n=====";
+    const ed = makeEditor(markdown);
+    ed.commands.insertContentAt(textPosition(ed, "Para"), "New ");
+    expect(saved(ed)).toBe("* one\n\nNew Para\n\nTitle\n=====");
   });
 
   it("keeps source loaded by an external update", () => {

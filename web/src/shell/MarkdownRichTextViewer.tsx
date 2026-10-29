@@ -64,10 +64,9 @@ installMarkdownSerializerPatch();
 // tiptapMarkdownPatches.ts).
 installMarkdownParserPatch();
 
-// TipTap drops a file's final newline, and the empty paragraph it appends after
-// a closing heading, code block or footnote list saves as blank lines. End the
-// file the way it was loaded: with one newline, or none.
-// Blocks the user did not change keep their source bytes (markdownSourceBlocks.ts).
+// Unedited blocks keep their source (markdownSourceBlocks.ts). TipTap drops the
+// final newline and saves its trailing empty paragraph as blank lines, so end
+// the file the way it was loaded: with one newline, or none.
 function readMarkdown(editor: Editor, endsWithNewline: boolean): string {
   const markdown = markdownKeepingSource(editor).replace(/\n+$/, "");
   return endsWithNewline && markdown !== "" ? `${markdown}\n` : markdown;

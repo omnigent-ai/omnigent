@@ -1,7 +1,5 @@
-// Keep unedited blocks byte-for-byte when the Markdown editor saves. The
-// serialiser rewrites syntax it reads (`*` bullets, setext headings, bare URLs,
-// table padding), so top-level blocks the user did not change are written back
-// from the file's source; only edited blocks are serialised.
+// Write unedited top-level blocks back from source on save, since the serialiser
+// rewrites syntax such as `*` bullets, setext headings and bare URLs.
 
 import type { Editor, JSONContent, MarkdownToken } from "@tiptap/core";
 import type { MarkdownManager } from "@tiptap/markdown";
@@ -41,14 +39,21 @@ interface ParseInternals {
   createImplicitEmptyParagraphsFromSpace: (token: MarkdownToken, ...rest: unknown[]) => unknown[];
 }
 
+/** The source of the first or last block in a kept run, and the nodes it parsed to. */
+export interface SourceEdge {
+  source: string;
+  nodes: ProseMirrorNode[];
+}
+
 /** A step in writing a document: source text to keep, or a block index to serialise. */
-export type SourcePlanStep = string | number;
+export type SourcePlanStep = number | { source: string; head: SourceEdge; tail: SourceEdge };
 
 // Editors parse their content before they can record it, so keep the last few parses.
 const RECENT_PARSES = 4;
 const recentParses: ParsedSource[] = [];
 const editorBlocks = new WeakMap<Editor, SourceBlocks>();
 let tracking = false;
+let recording = true;
 
 /**
  * Run a top-level parse and record how many nodes each top-level token became.
@@ -67,6 +72,9 @@ export function trackTopLevelTokens(
   if (tracking || !parseToken || !emptyParagraphs) return { doc: parse(), groups: null };
   const groups: TokenGroup[] = [];
   let depth = 0;
+  // Restore own properties too, in case a later version defines these per instance.
+  const ownParseToken = Object.hasOwn(internals, "parseToken");
+  const ownEmptyParagraphs = Object.hasOwn(internals, "createImplicitEmptyParagraphsFromSpace");
   internals.parseToken = function (this: ParseInternals, token, ...rest) {
     depth++;
     try {
@@ -92,9 +100,27 @@ export function trackTopLevelTokens(
   try {
     return { doc: parse(), groups };
   } finally {
-    delete internals.parseToken;
-    delete internals.createImplicitEmptyParagraphsFromSpace;
+    if (ownParseToken) internals.parseToken = parseToken;
+    else delete internals.parseToken;
+    if (ownEmptyParagraphs) internals.createImplicitEmptyParagraphsFromSpace = emptyParagraphs;
+    else delete internals.createImplicitEmptyParagraphsFromSpace;
     tracking = false;
+  }
+}
+
+/**
+ * Run *callback* without recording its parses for :func:`rememberSourceBlocks`.
+ *
+ * :param callback: Code that parses Markdown which no editor loads.
+ * :returns: The callback's result.
+ */
+export function withoutRecording<T>(callback: () => T): T {
+  const previous = recording;
+  recording = false;
+  try {
+    return callback();
+  } finally {
+    recording = previous;
   }
 }
 
@@ -113,6 +139,7 @@ export function recordParse(
   doc: JSONContent,
   groups: TokenGroup[] | null,
 ): void {
+  if (!recording) return;
   const source = markdown.replace(/\r\n|\r/g, "\n");
   const children = parsed.content ?? [];
   // Tokens must cover the source in order and account for every parsed node.
@@ -190,8 +217,8 @@ export function rememberSourceBlocks(editor: Editor, markdown: string): void {
   const segments = parsed.segments.map(({ start, end, nodes: count }, segment) => {
     const nodes: ProseMirrorNode[] = [];
     for (let node = 0; node < count; node++, index++) {
-      // A block changed while loading (e.g. a table given missing cells) is
-      // written by the serialiser. Unchanged blocks are compared by identity.
+      // Blocks changed while loading (e.g. a table given missing cells) are
+      // serialised; unchanged ones match by structure and are found by identity.
       const child = index < doc.childCount ? doc.child(index) : null;
       const kept = child?.eq(originals[index]) ? child : null;
       if (kept) segmentOf.set(kept, segment);
@@ -205,6 +232,11 @@ export function rememberSourceBlocks(editor: Editor, markdown: string): void {
     segmentOf,
     definitions: definitionSources(doc),
   });
+}
+
+/** *text* without leading newlines or trailing blank lines. */
+function trimLines(text: string): string {
+  return text.replace(/^\n+/, "").replace(/(?:\n[ \t]*)+$/, "");
 }
 
 /**
@@ -246,12 +278,22 @@ export function sourceBlockPlan(editor: Editor): SourcePlanStep[] | null {
       index++;
       continue;
     }
-    plan.push(
-      source
-        .slice(segments[first].start, segments[last].end)
-        .replace(/^\n+/, "")
-        .replace(/(?:\n[ \t]*)+$/, ""),
-    );
+    const text = (from: number, to: number) =>
+      trimLines(source.slice(segments[from].start, segments[to].end));
+    // The blocks at each end of the run meet blocks that may not have been there.
+    const edges = segments
+      .slice(first, last + 1)
+      .map((segment, offset) => ({
+        source: text(first + offset, first + offset),
+        nodes: segment.nodes,
+      }))
+      .filter((edge) => edge.nodes.length && edge.source);
+    if (!edges.length) {
+      plan.push(index);
+      index++;
+      continue;
+    }
+    plan.push({ source: text(first, last), head: edges[0], tail: edges[edges.length - 1] });
     index = end;
     nextSegment = last + 1;
   }
