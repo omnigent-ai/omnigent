@@ -30,6 +30,7 @@ import {
 } from "./lib/uiFontPreferences";
 import { applyThemePalette, readThemePalette } from "./lib/themePalette";
 import { applyCustomTheme, readCustomTheme } from "./lib/customTheme";
+import { applyFullWidthChat, readFullWidthChat } from "./lib/fullWidthChatPreferences";
 import { initChatStore } from "./store/chatStore";
 import "katex/dist/katex.min.css";
 import "streamdown/styles.css";
@@ -110,6 +111,7 @@ if (typeof window !== "undefined") {
 // so the app renders in the chosen theme rather than flashing the brand default.
 applyCustomTheme(readCustomTheme());
 applyThemePalette(readThemePalette());
+applyFullWidthChat(readFullWidthChat());
 
 // Probe /v1/info BEFORE the first render so the route table knows
 // whether to mount accounts routes. The probe is unauthed and the

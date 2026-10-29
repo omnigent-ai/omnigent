@@ -40,6 +40,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:hide-unconfigured-harnesses",
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  "omnigent:full-width-chat",
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
