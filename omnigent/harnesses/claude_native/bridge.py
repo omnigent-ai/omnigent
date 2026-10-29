@@ -54,7 +54,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -112,6 +112,9 @@ _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
 )
+_COMPOSER_RECOVERY_CLEANUP: ContextVar[contextlib.ExitStack | None] = ContextVar(
+    "claude_native_composer_recovery_cleanup", default=None
+)
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
 _INJECTION_LOCK_POLL_INTERVAL_S = 0.1
@@ -162,18 +165,13 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
         with (
             _cancellable_injection_lock(_bridge_injection_lock(bridge_dir)),
             _cancellable_injection_lock(_bridge_injection_file_lock(bridge_dir)),
+            contextlib.ExitStack() as cleanup,
         ):
+            token = _COMPOSER_RECOVERY_CLEANUP.set(cleanup)
             try:
                 return function(bridge_dir, *args, **kwargs)
-            except ClaudeComposerNotCleared:
-                # The refused paste sent nothing. Give a clipped composer room,
-                # then recheck readiness and pending prompts before retrying.
-                info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
-                with _usable_composer_height(info["socket_path"], info["tmux_target"]) as resized:
-                    if not resized:
-                        raise
-                    time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-                    return function(bridge_dir, *args, **kwargs)
+            finally:
+                _COMPOSER_RECOVERY_CLEANUP.reset(token)
 
     return cast(_InjectionFunction, wrapped)
 
@@ -325,6 +323,12 @@ _DIALOG_FOOTER_RE = re.compile(
     r"enter to (confirm|continue)|press enter to continue|esc to (cancel|exit|reject)",
     re.IGNORECASE,
 )
+# The selected row of a numbered option list, e.g. "❯ 1. Yes".
+_NUMBERED_SELECTOR_ROW_RE = re.compile(r"❯\s*\d+\.")
+# Headlines of the plan-approval dialog across Claude Code releases: the current
+# "Exit plan mode?" and the older "Claude has written up a plan and is ready to
+# execute. Would you like to proceed?".
+_PLAN_APPROVAL_HINTS = ("Exit plan mode?", "Would you like to proceed?")
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
@@ -4340,13 +4344,17 @@ def inject_user_message(
     # message's rejection.
     unknown_name = _passthrough_slash_command_name(content)
     rejection_needle: str | None = None
-    rejection_baseline = 0
     if unknown_name is not None:
         rejection_needle = f"{_UNKNOWN_COMMAND_REJECTION_PREFIX}/{unknown_name}"
-        rejection_baseline = _count_unknown_command_rejections(
-            _capture_pane(socket_path, tmux_target), rejection_needle
-        )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    rejection_baseline = _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=injected_text,
+        needle=needle,
+        rejection_needle=rejection_needle,
+        ready_timeout_s=timeout_s,
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -4371,6 +4379,8 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        preserve_draft=True,
+        ready_timeout_s=timeout_s,
     )
 
 
@@ -4381,7 +4391,10 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
-) -> None:
+    rejection_needle: str | None = None,
+    preserve_draft: bool = False,
+    ready_timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> int:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
@@ -4397,7 +4410,10 @@ def _paste_and_submit(
     :param text: Exact text to paste (already escaped as needed).
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
-    :returns: None.
+    :param rejection_needle: Unknown-command rejection to baseline before the paste.
+    :param preserve_draft: Refuse to replace terminal edits during a fallback delivery.
+    :param ready_timeout_s: Bound the readiness wait after recovering a clipped composer.
+    :returns: Pre-submit rejection count, or zero when no rejection is watched.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
     :raises ClaudeComposerNotCleared: If a draft left in the input box could
@@ -4416,7 +4432,29 @@ def _paste_and_submit(
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
-    _clear_composer(socket_path, tmux_target)
+    with _cleared_composer_for_delivery(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        preserve_draft=preserve_draft,
+        ready_timeout_s=ready_timeout_s,
+    ):
+        # Recovery can reveal stale rejections outside the original viewport.
+        rejection_baseline = (
+            _count_unknown_command_rejections(
+                _capture_pane(socket_path, tmux_target), rejection_needle
+            )
+            if rejection_needle is not None
+            else 0
+        )
+        _paste_and_verify(bridge_dir, socket_path, tmux_target, text=text, needle=needle)
+    return rejection_baseline
+
+
+def _paste_and_verify(
+    bridge_dir: Path, socket_path: str, tmux_target: str, *, text: str, needle: str
+) -> None:
+    """Paste into a prepared composer and verify this submission without restarting it."""
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4425,12 +4463,13 @@ def _paste_and_submit(
     # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
     # interior newlines (mapped to CR below) stay data instead of becoming
     # per-line submits. See anthropics/claude-code#52126.
-    with tempfile.NamedTemporaryFile(
-        dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-    ) as paste_file:
-        paste_file.write(_paste_payload_bytes(text + "\n"))
-        paste_path = paste_file.name
+    paste_path: str | None = None
     try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            paste_file.write(_paste_payload_bytes(text + "\n"))
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
         _run_tmux(
             socket_path,
@@ -4444,8 +4483,9 @@ def _paste_and_submit(
         )
         delivery_diagnostics.record_details(paste_sent=True)
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(paste_path)
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
     # Wait until the TUI has visibly committed the paste into its input
     # box before submitting. Claude Code coalesces rapid stdin bursts
     # into a paste; an Enter that arrives while it is still consuming
@@ -4960,7 +5000,26 @@ def inject_slash_command(
     # concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
-    _clear_composer(socket_path, tmux_target)
+    with _cleared_composer_for_delivery(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        ready_timeout_s=timeout_s if ready_timeout_s is None else ready_timeout_s,
+    ):
+        _type_and_submit_slash_command(
+            bridge_dir, socket_path, tmux_target, command=command, dialog_hint=dialog_hint
+        )
+
+
+def _type_and_submit_slash_command(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    command: str,
+    dialog_hint: str | None,
+) -> None:
+    """Submit one settings command while the prepared composer remains visible."""
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
@@ -5089,10 +5148,7 @@ def _permission_mode_from_pane(pane: str) -> str | None:
         pane is mid-repaint, or the mode is one with no footer).
     """
     lines = [line for line in pane.splitlines() if line.strip()]
-    # Below the last box rule is the footer region. With no rule the input box
-    # isn't mounted; fall back to the tail so a footer still reads during boot.
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    region = _rows_below_last_rule(lines, _PROMPT_SCAN_TAIL_LINES)
     for line in reversed(region):
         for mode, footer in _PERMISSION_MODE_FOOTERS.items():
             if footer in line:
@@ -5929,14 +5985,55 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # A narrow pane wraps the footer ("Esc to" / "cancel"). Only the rows below
+    # the last rule are joined, so wrapped transcript text can't form a phrase.
+    footer = _collapse_whitespace(lines[rules[-1] + 1 :]) if rules else ""
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
-        or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
-        )
+        or any(_select_footer_shown(text) for text in (region, footer))
+        or _plan_approval_dialog_visible(lines, rules)
+    )
+
+
+def _select_footer_shown(text: str) -> bool:
+    """Whether *text* carries a selection dialog's "Enter to … · Esc to cancel" hints."""
+    return (
+        any(hint in text for hint in ("Enter to select", "Enter to submit"))
+        and "Esc to cancel" in text
+    )
+
+
+def _plan_approval_dialog_visible(lines: list[str], rules: list[int]) -> bool:
+    """Recognize the plan-approval dialog, which has no "Enter to …" footer.
+
+    It is drawn below the last rule: one of the :data:`_PLAN_APPROVAL_HINTS`
+    headlines on its own line, then a numbered option list led by ``❯``.
+
+    :param lines: The pane's non-blank lines.
+    :param rules: Indices into *lines* of the box rules.
+    :returns: Whether the dialog is holding the terminal.
+    """
+    if not rules:
+        return False
+    region = lines[rules[-1] + 1 :]
+    # Match the headline within one pane line and require the numbered options
+    # below it; collapsing the whole region would let a wrapped transcript
+    # phrase above a stray numbered row look like the dialog.
+    headline = next(
+        (
+            index
+            for index, line in enumerate(region)
+            if any(hint in _collapse_whitespace([line]) for hint in _PLAN_APPROVAL_HINTS)
+        ),
+        None,
+    )
+    if headline is None:
+        return False
+    return any(
+        _NUMBERED_SELECTOR_ROW_RE.match(line.strip().lstrip("│ "))
+        for line in region[headline + 1 :]
     )
 
 
@@ -6325,6 +6422,13 @@ def _composer_row(pane: str) -> str | None:
     terminal), the lowest rule is the opening one and the row under it is
     the composer.
 
+    Wrapped rules are read as bands (:func:`_rule_bands`). The box is first
+    searched upward from the closing band
+    (:func:`_composer_start_above_closing_rule`): when its title wraps the
+    frame, the band above may be an earlier rule in the transcript. A
+    dialog's footer below the frame overrides all of this
+    (:func:`_is_dialog_option_row`).
+
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
@@ -6350,19 +6454,73 @@ def _composer_rows(pane: str) -> list[str]:
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: The framed rows, e.g. ``["❯", "[Pasted text #1 +7 lines]"]``.
     """
-    non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = _composer_frame_rule_indices(non_empty)
-    if not rules:
+    box = _composer_box(pane)
+    if box is None or box.rows[0].strip()[:1] not in _COMPOSER_MODE_GLYPHS:
         return []
-    candidates = [rules[-2] + 1] if len(rules) >= 2 else []
-    candidates.append(rules[-1] + 1)
-    for idx in candidates:
-        if idx >= len(non_empty):
-            continue
-        if non_empty[idx].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            end = next((rule for rule in rules if rule > idx), idx + 1)
-            return non_empty[idx:end]
-    return []
+    return box.rows if box.framed else box.rows[:1]
+
+
+def _is_dialog_option_row(row: str, lines: list[str]) -> bool:
+    """
+    Return whether *row* is a dialog's selected option rather than the composer.
+
+    A numbered option over a dialog footer is a menu whatever rule sits above
+    it, e.g. ``"❯ 2. No (recommended)"`` over "Enter to confirm · Esc to cancel".
+
+    :param row: The candidate composer row.
+    :param lines: Captured pane rows, in order.
+    :returns: ``True`` when the footer below the frame belongs to a dialog.
+    """
+    if not _NUMBERED_SELECTOR_ROW_RE.match(row.strip()):
+        return False
+    footer = _rows_below_last_rule(lines, _DIALOG_SCAN_TAIL_LINES)
+    return _DIALOG_FOOTER_RE.search(_collapse_whitespace(footer)) is not None
+
+
+def _composer_start_above_closing_rule(
+    lines: list[str], closing_rule: tuple[int, int]
+) -> int | None:
+    """
+    Return the composer index when the opening rule wraps through its title.
+
+    When the title overflows the pane the opening rule wraps: its trailing
+    glyph lands alone on a row, or after a bare slice of the title, so
+    :func:`_is_box_rule` finds nothing above ``❯``. The box is still
+    framed: its composer is the mode-glyph row above the closing rule, past
+    the draft's indented continuation rows, and the row above it ends in
+    the opening rule's glyph (:func:`_is_rule_tail`). A box wider than the
+    pane wraps its closing rule as well (:func:`_is_wrapped_rule`); the one
+    shape that keeps a single-row closing rule is a title that exactly fills
+    the opening rule, one space in (:func:`_is_edge_aligned_title_row`). An
+    echoed prompt under a transcript line that happens to end in a rule
+    glyph meets neither condition, and a dialog's selector and footer below
+    the rule (a rewind dialog under a wrapped divider) rule the box out.
+
+    :param lines: Captured pane rows, in order.
+    :param closing_rule: ``(first, last)`` row span of the closing rule.
+    :returns: The composer index, or ``None`` when the rows above the closing
+        rule are not framed that way.
+    """
+    first = closing_rule[0]
+    idx = first - 1
+    while idx > 0 and (
+        not lines[idx].strip()
+        or (lines[idx].startswith("  ") and lines[idx].strip()[:1] not in _COMPOSER_MODE_GLYPHS)
+    ):
+        idx -= 1
+    if idx < 1 or lines[idx].strip()[:1] not in _COMPOSER_MODE_GLYPHS:
+        return None
+    above = lines[idx - 1]
+    if not _is_rule_tail(above):
+        return None
+    if not _is_wrapped_rule(lines, closing_rule) and not _is_edge_aligned_title_row(above):
+        return None
+    below = lines[closing_rule[1] + 1 :]
+    if _DIALOG_FOOTER_RE.search(_collapse_whitespace(below)) and any(
+        line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in below
+    ):
+        return None
+    return idx
 
 
 class _ComposerBox(NamedTuple):
@@ -6385,8 +6543,8 @@ def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
         return rules
-    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
-    rules = [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+    frame_indent = min(_composer_rule_indent(lines[idx]) for idx in rules[-2:])
+    rules = [idx for idx in rules if _composer_rule_indent(lines[idx]) == frame_indent]
     last_prompt = next((line for line in lines[rules[-1] + 1 :] if line.strip()), "")
     if (
         last_prompt.strip()[:1] in _COMPOSER_MODE_GLYPHS
@@ -6414,15 +6572,20 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     """
     lines = pane.splitlines()
     rules = _composer_frame_rule_indices(lines)
-    if not rules:
+    bands = _rule_bands(lines, rule_indices=rules)
+    if not bands:
         return None
-    if len(rules) >= 2:
-        first = _first_non_blank(lines, rules[-2] + 1, rules[-1])
-        if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return _ComposerBox(lines[first : rules[-1]], framed=True)
-    first = _first_non_blank(lines, rules[-1] + 1, len(lines))
-    if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-        return _ComposerBox(lines[first:], framed=False)
+    first = _composer_start_above_closing_rule(lines, bands[-1])
+    candidates = [(first, bands[-1][0])] if first is not None else []
+    if len(bands) >= 2:
+        candidates.append((_first_non_blank(lines, bands[-2][1] + 1, bands[-1][0]), bands[-1][0]))
+    candidates.append((_first_non_blank(lines, bands[-1][1] + 1, len(lines)), len(lines)))
+    for first, end in candidates:
+        if first >= end or lines[first].strip()[:1] not in _COMPOSER_MODE_GLYPHS:
+            continue
+        if _is_dialog_option_row(lines[first], lines):
+            return None
+        return _ComposerBox(lines[first:end], framed=end < len(lines))
     scrolled = _scrolled_draft_rows(lines, rules)
     return None if scrolled is None else _ComposerBox(scrolled, framed=False)
 
@@ -6459,7 +6622,38 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
     return rows
 
 
-def _clear_composer(socket_path: str, tmux_target: str) -> None:
+@contextlib.contextmanager
+def _cleared_composer_for_delivery(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    preserve_draft: bool = False,
+    ready_timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> Iterator[None]:
+    """Recover before typing; keep the resized pane through verification and fallback."""
+    with contextlib.ExitStack() as local_cleanup:
+        try:
+            _clear_composer(socket_path, tmux_target, preserve_draft=preserve_draft)
+        except ClaudeComposerNotCleared:
+            # The rejection watch also needs the expanded pane after a submit.
+            cleanup = _COMPOSER_RECOVERY_CLEANUP.get() or local_cleanup
+            resized = cleanup.enter_context(_usable_composer_height(socket_path, tmux_target))
+            if not resized:
+                raise
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            _wait_for_claude_prompt_ready(
+                socket_path,
+                tmux_target,
+                timeout_s=ready_timeout_s,
+                bridge_dir=bridge_dir,
+                extend_for_slow_boot=False,
+            )
+            _clear_composer(socket_path, tmux_target, preserve_draft=preserve_draft)
+        yield
+
+
+def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool = False) -> None:
     """
     Delete the whole draft in Claude Code's input box.
 
@@ -6470,10 +6664,14 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     line would leave the rest of a multi-line draft to be submitted with the
     next message.
 
-    One burst is known to have emptied the box only when the capture showed
-    the box whole (both rules on screen) with nothing after its glyph row but
-    blank rows. A box with more text, or one the pane cut off (a draft taller
-    than the pane, or a sliver-height pane with no room for the closing rule),
+    A successful tmux command does not prove the terminal handled its keys.
+    Each clear ends with a space: Claude's empty-input hints disappear when
+    the input is nonempty, so a later capture can verify that only whitespace
+    remains. Remove the probe before typing the message or slash command.
+    The capture must show the whole box (both rules on screen) with only its
+    prompt glyph and blank rows before a paste is safe. A box with more text,
+    or one the pane cut off (a draft taller than the pane, or a sliver-height
+    pane with no room for the closing rule),
     may still hold lines the capture did not show, so it is cleared again,
     up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
     state afterwards is refused rather than pasted into: an exhausted budget
@@ -6484,19 +6682,38 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param preserve_draft: Only verify an empty composer; leave new terminal edits intact.
     :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
-        capture showed the box whole and down to one row; nothing was pasted.
+        capture showed the whole box empty; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+    if not preserve_draft:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
-        # Blank rows after the glyph row hold nothing a paste could join.
-        settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
-        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+        cleared = (
+            box is not None
+            and box.framed
+            and box.rows[0].strip() == _CLAUDE_PROMPT_GLYPH
+            and not any(row.strip() for row in box.rows[1:])
+        )
+        if preserve_draft and box is not None:
+            if box.rows[0].strip() != _CLAUDE_PROMPT_GLYPH or any(
+                row.strip() for row in box.rows[1:]
+            ):
+                raise ClaudeMessageNotAccepted(
+                    "Claude Code's terminal input changed after rejecting the command. "
+                    "The message was not resent; keep or clear the terminal draft before retrying."
+                )
+            if cleared:
+                return
+        if not preserve_draft and cleared and round_no > 0:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BSpace")
+            return
+        if round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
             delivery_diagnostics.record_composer_not_cleared(
                 pane=pane,
                 rows=None if box is None else box.rows,
@@ -6507,23 +6724,29 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
                 "Claude Code's input box could not be verified clear, so nothing was sent. "
                 "Open the terminal, expand it and clear the input box, then retry."
             )
-        if box is not None:
-            _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
-            if settled:
-                return
+        if box is not None and not preserve_draft:
+            _send_composer_clear_keys(
+                socket_path, tmux_target, rows=len(box.rows), probe_empty=True
+            )
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
-def _send_composer_clear_keys(socket_path: str, tmux_target: str, *, rows: int) -> None:
+def _send_composer_clear_keys(
+    socket_path: str, tmux_target: str, *, rows: int, probe_empty: bool = False
+) -> None:
     """
     Send the Ctrl+K and Ctrl+U presses that empty *rows* rows of a draft.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param rows: Draft rows to delete, e.g. ``3``.
+    :param probe_empty: Append a space to suppress empty-input hints before
+        verifying that only whitespace remains.
     """
     presses = 2 * rows
     keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+    if probe_empty:
+        keys += " "
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
 
 
@@ -6573,8 +6796,7 @@ def _history_search_footer_shown(pane: str) -> bool:
     :returns: ``True`` when a footer row names the history search.
     """
     lines = [line for line in pane.splitlines() if line.strip()]
-    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_PROMPT_SCAN_TAIL_LINES:]
+    region = _rows_below_last_rule(lines, _PROMPT_SCAN_TAIL_LINES)
     # A narrow pane wraps the footer's left cell across rows ("search" /
     # "prompts:"), interleaving the right cell's text, so no single row
     # carries the whole marker. Each row's left-cell fragment is the text
@@ -6582,6 +6804,19 @@ def _history_search_footer_shown(pane: str) -> bool:
     # spell the footer out again.
     fragments = (re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in region)
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
+
+
+def _collapse_whitespace(lines: Iterable[str]) -> str:
+    """
+    Join pane lines into one string with every whitespace run collapsed.
+
+    A narrow pane wraps dialog text across rows, so a phrase matched against
+    the joined text is found whether or not a row break fell inside it.
+
+    :param lines: Pane lines, e.g. ``["Enter to select · Esc to", "cancel"]``.
+    :returns: The single-spaced text, e.g. ``"Enter to select · Esc to cancel"``.
+    """
+    return " ".join(" ".join(lines).split())
 
 
 def _is_box_rule(line: str) -> bool:
@@ -6612,7 +6847,9 @@ def _is_box_rule(line: str) -> bool:
     are otherwise the same shape. The length of the leading run cannot draw
     it: Claude Code right-aligns the label, so that run shrinks to a single
     glyph once the title nears the pane width, and the pane is only as wide
-    as the person's browser terminal.
+    as the person's browser terminal. A clipped title without a leading
+    run (``" a very long title… ─"``) is accepted only when it starts one
+    space in and its label ends in ``… ``.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
@@ -6625,12 +6862,135 @@ def _is_box_rule(line: str) -> bool:
         return True
     lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
-    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+    if trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
         return False
     label = stripped[lead : len(stripped) - trail]
     if any(ch in _BOX_RULE_CHARS for ch in label):
         return False
+    if lead < 1:
+        starts_at_edge = line.startswith(" ") and not line.startswith("  ")
+        return starts_at_edge and label.endswith("… ") and bool(label[:-2].strip())
     return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
+
+
+def _is_rule_tail(line: str) -> bool:
+    """
+    Return whether a row ends the way a wrapped labelled rule's last row does.
+
+    That row is the rule's trailing run of edge glyphs, alone or spaced off
+    from the tail of the title, with no other rule glyph on the row. Like the
+    rule it belongs to it starts at the pane edge or one space in; draft and
+    transcript rows are indented further.
+
+    :param line: A single pane line, e.g. ``"─"`` or ``"lease-freeze ─"``.
+    :returns: ``True`` when the row can close a wrapped labelled rule.
+    """
+    stripped = line.strip()
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    if trail < 1 or line.startswith("  "):
+        return False
+    label = stripped[:-trail]
+    if any(ch in _BOX_RULE_CHARS for ch in label):
+        return False
+    return not label or label.endswith(" ")
+
+
+def _is_edge_aligned_title_row(line: str) -> bool:
+    """
+    Return whether a row is a title filling the opening rule: one space in, then a glyph.
+
+    :param line: A single pane line, e.g. ``" a title as wide as the pane ─"``.
+    :returns: ``True`` for a labelled row whose only lead is the rule's edge.
+    """
+    if not line.startswith(" ") or line.startswith("  "):
+        return False
+    stripped = line.strip()
+    trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
+    return trail >= 1 and bool(stripped[:-trail].strip())
+
+
+def _is_edge_glyph_run(line: str) -> bool:
+    """Return whether *line* is nothing but horizontal rule glyphs, however few."""
+    stripped = line.strip()
+    return bool(stripped) and all(ch in _TITLED_RULE_EDGE_GLYPHS for ch in stripped)
+
+
+def _composer_rule_indent(line: str) -> int:
+    """Measure frame indentation without a clipped title's reserved label space."""
+    indent = len(line) - len(line.lstrip())
+    return indent - 1 if indent and line.lstrip()[:1] not in _BOX_RULE_CHARS else indent
+
+
+def _rule_bands(
+    lines: list[str], *, rule_indices: list[int] | None = None
+) -> list[tuple[int, int]]:
+    """
+    Return each box rule's row span as ``(first, last)`` indices into *lines*.
+
+    A rule wider than the pane wraps onto the rows below it, so consecutive
+    rule rows are one rule. The wrapped remainder can be shorter than
+    :func:`_is_box_rule` admits (a lone ``─`` under a full-width row), so a
+    bare run of edge glyphs continues the rule above it; on its own, or above
+    a rule, it is content.
+
+    :param lines: Captured pane rows, in order.
+    :returns: Rule spans, top to bottom.
+    """
+    indices = (
+        set(rule_indices)
+        if rule_indices is not None
+        else {idx for idx, line in enumerate(lines) if _is_box_rule(line)}
+    )
+    bands: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx, line in enumerate([*lines, ""]):
+        if idx in indices or (
+            start is not None
+            and _is_edge_glyph_run(line)
+            and _composer_rule_indent(line) == _composer_rule_indent(lines[start])
+        ):
+            start = idx if start is None else start
+            continue
+        if start is not None:
+            bands.append((start, idx - 1))
+        start = None
+    return bands
+
+
+def _is_wrapped_rule(lines: list[str], band: tuple[int, int]) -> bool:
+    """
+    Return whether a rule band is one rule wrapped at the pane width.
+
+    A wrapped rule starts with a full-width row and continues with rows no
+    wider than it. Two separate rules on neighbouring rows, such as a short
+    divider over a dialog's frame, do not have that shape.
+
+    :param lines: Captured pane rows, in order.
+    :param band: ``(first, last)`` row span from :func:`_rule_bands`.
+    :returns: ``True`` when the band spans several rows of a single rule.
+    """
+    first, last = band
+    width = len(lines[first].strip())
+    return last > first and all(
+        len(lines[idx].strip()) <= width for idx in range(first + 1, last + 1)
+    )
+
+
+def _rows_below_last_rule(lines: list[str], tail_lines: int) -> list[str]:
+    """
+    Return the rows under the last box rule, where Claude Code's footer sits.
+
+    With no rule on screen the input box is not mounted, so the last
+    *tail_lines* rows stand in for the footer region. A wrapped closing
+    rule ends with the last row of its band (:func:`_rule_bands`), so a stub
+    shorter than a rule never leads the region.
+
+    :param lines: Captured pane rows, in order.
+    :param tail_lines: Rows to take from the bottom when no rule is drawn.
+    :returns: The footer region, top to bottom.
+    """
+    bands = _rule_bands(lines)
+    return lines[bands[-1][1] + 1 :] if bands else lines[-tail_lines:]
 
 
 def _submit_needle(content: str) -> str:
@@ -6783,8 +7143,18 @@ def _terminal_dialog_headline(pane: str) -> str | None:
         return None
     lines = [line for line in pane.splitlines() if line.strip()]
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
-    footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
+    if last_rule is not None:
+        # Collapse wrapped footer rows and keep only the matched hints, so other
+        # "press enter" text in the region can't qualify a selector-less notice.
+        region = lines[last_rule + 1 :]
+        hints = _DIALOG_FOOTER_RE.finditer(_collapse_whitespace(region))
+        footer = " · ".join(hint.group(0) for hint in hints) or None
+    else:
+        # No framing rule: this is the bare transcript tail. Match the footer
+        # within a single line, or wrapped output quoting a footer phrase could
+        # masquerade as a dialog and raise a spurious ClaudeTerminalDialog.
+        region = lines[-_DIALOG_SCAN_TAIL_LINES:]
+        footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None
     has_selector = any(
