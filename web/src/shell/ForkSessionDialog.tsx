@@ -111,6 +111,7 @@ import {
   SANDBOX_REPO_LABEL_KEY,
   composeSandboxWorkspace,
   deriveRepoName,
+  directoryConflictCandidates,
   isValidSandboxRepoUrl,
   normalizeWorkspacePath,
   sessionsSharingDirectory,
@@ -1236,9 +1237,7 @@ function SupportedForkSessionForm({
   const conflictCandidates = useMemo(
     () =>
       isCodingSource && !sandboxSelected
-        ? (directorySessions ?? []).filter(
-            (s) => s.host_id === selectedHostId && s.workspace != null,
-          )
+        ? directoryConflictCandidates(directorySessions, selectedHostId)
         : [],
     [isCodingSource, sandboxSelected, directorySessions, selectedHostId],
   );
