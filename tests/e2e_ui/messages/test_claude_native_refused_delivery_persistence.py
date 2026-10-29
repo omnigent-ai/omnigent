@@ -18,13 +18,13 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.native_session import create_native_session
-from tests.e2e.test_claude_native_delivery_timeout_e2e import _FAKE_CLAUDE_TUI
 from tests.e2e.test_native_terminal_start_error_log_correlation_e2e import (
     _bind_session,
     _ensure_claude_terminal,
     _native_stack,
 )
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view
+from tests.harnesses.claude_native._terminal import FAKE_CLAUDE_TUI
 
 
 @pytest.mark.parametrize("refusal", ["missing_target", "draft_not_accepted"])
@@ -47,7 +47,7 @@ def test_claude_refused_message_survives_reload(
 ) -> None:
     marker = f"refused-input-{uuid.uuid4().hex[:8]}"
     tui = tmp_path / "controlled-tui.py"
-    tui.write_text(_FAKE_CLAUDE_TUI)
+    tui.write_text(FAKE_CLAUDE_TUI)
     trigger = marker if refusal == "draft_not_accepted" else "unused-trigger"
     script = (
         "#!/bin/sh\n"
