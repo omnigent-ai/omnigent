@@ -659,7 +659,8 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
     Without this, an SDK user who registers ``on_elicitation_request``
     through the sessions chat helper sees the prompt but the parked
     workflow never receives the approval verdict. A prompt waiting in the
-    agent's terminal isn't offered, and a refused answer doesn't end the turn.
+    agent's terminal isn't offered, and a refused or undelivered answer is
+    logged without ending the turn.
     """
     from omnigent_client._errors import OmnigentError
 
@@ -689,6 +690,13 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
             {"message": "Run ls?", "terminal_fallback": {"answer_undelivered": False}}
         ),
     )
+    held_undelivered = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_undelivered",
+        params=ElicitationRequestParams.model_validate(
+            {"message": "Run cat?", "terminal_fallback": {"answer_undelivered": True}}
+        ),
+    )
     refused = ElicitationRequestEvent(
         type="response.elicitation_request",
         elicitation_id="elicit_refused",
@@ -696,7 +704,16 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
     )
     ns = _FakeNamespace(
         stream_scripts=[
-            _StreamScript(events=[_created_event(), request, held, refused, _completed_event()])
+            _StreamScript(
+                events=[
+                    _created_event(),
+                    request,
+                    held,
+                    held_undelivered,
+                    refused,
+                    _completed_event(),
+                ]
+            )
         ],
         session_obj=session,
     )
@@ -717,6 +734,8 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
         events = [event async for event in chat.send("hi")]
 
     assert "elicit_refused is waiting in the agent's terminal" in caplog.text
+    assert "elicitation elicit_undelivered didn't reach the agent" in caplog.text
+    assert "elicit_held" not in caplog.text
     assert calls == [
         ("elicit_1", "Approve this?", "resp_1"),
         ("elicit_refused", "Run pwd?", "resp_1"),

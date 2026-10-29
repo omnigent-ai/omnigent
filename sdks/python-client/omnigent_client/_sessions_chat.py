@@ -1113,10 +1113,18 @@ class SessionsChat:
         deprecated responses client and avoiding a parked workflow that
         waits forever for a decision the SDK will never send. A prompt
         held in the agent's terminal can only be answered there, so it
-        is skipped, and a refused answer is logged instead of ending the turn.
+        is skipped, and a refused or undelivered answer is logged instead
+        of ending the turn.
         """
         params = event.params
-        if getattr(params, "terminal_fallback", None) is not None:
+        terminal_fallback = getattr(params, "terminal_fallback", None)
+        if terminal_fallback is not None:
+            if isinstance(terminal_fallback, dict) and terminal_fallback.get("answer_undelivered"):
+                _log.warning(
+                    "An answer to elicitation %s didn't reach the agent; answer it in the "
+                    "agent's terminal",
+                    event.elicitation_id,
+                )
             return
         accepted = await _invoke_elicitation_hook(
             self._hooks,
