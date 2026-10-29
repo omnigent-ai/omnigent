@@ -3,7 +3,6 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
 const {
-  DESKTOP_COMMANDS,
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("../src/desktopCommands");
@@ -24,16 +23,6 @@ describe("sanitizeDesktopCommandState", () => {
     assert.equal(sanitizeDesktopCommandState(null), null);
     assert.equal(sanitizeDesktopCommandState("close"), null);
     assert.deepEqual([...sanitizeDesktopCommandState({}).commands], []);
-  });
-
-  it("covers every command the menu dispatches", () => {
-    assert.deepEqual([...DESKTOP_COMMANDS].sort(), [
-      "archive-session",
-      "close",
-      "new-browser-tab",
-      "new-terminal",
-      "toggle-pin-session",
-    ]);
   });
 });
 

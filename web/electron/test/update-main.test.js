@@ -454,6 +454,7 @@ describe("application menu layout", () => {
       "File",
       "Edit",
       "View",
+      "Go",
       "Session",
       "Server",
       "windowMenu",
@@ -504,6 +505,7 @@ describe("application menu layout", () => {
       "File",
       "Edit",
       "View",
+      "Go",
       "Session",
       "Server",
       "Window",
@@ -638,6 +640,42 @@ describe("desktop command menu items", () => {
           closingQuits: true,
         },
       },
+    ]);
+  });
+
+  it("steps a focused web page's own history, else hands Back/Forward to the app", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    const pageHistory = [];
+    let viewFocused = true;
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({
+        view: {
+          webContents: {
+            isFocused: () => viewFocused,
+            navigationHistory: {
+              canGoBack: () => true,
+              canGoForward: () => true,
+              goBack: () => pageHistory.push("back"),
+              goForward: () => pageHistory.push("forward"),
+            },
+          },
+        },
+      }),
+    };
+    const menu = reportState(harness, { commands: ["go-back", "go-forward"] });
+    assert.equal(findMenuItem(menu, "go_back").accelerator, "CmdOrCtrl+[");
+    assert.equal(findMenuItem(menu, "go_forward").accelerator, "CmdOrCtrl+]");
+
+    findMenuItem(menu, "go_back").click();
+    findMenuItem(menu, "go_forward").click();
+    viewFocused = false;
+    findMenuItem(menu, "go_back").click();
+
+    assert.deepEqual(pageHistory, ["back", "forward"]);
+    assert.deepEqual(plain(harness.calls.sent), [
+      { channel: "omnigent:desktop-command", payload: { command: "go-back" } },
     ]);
   });
 
