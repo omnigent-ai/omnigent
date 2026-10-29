@@ -36,7 +36,8 @@ let lastReported: string | null = null;
 
 function dispatch(event: DesktopCommandEvent): void {
   // A modal dialog or open menu owns the keyboard, like a sheet in a native app.
-  if (isFocusInDialogOrMenu()) return;
+  // Quit still asks, so ⌘Q never goes dead behind a dialog.
+  if (event.command !== "quit" && isFocusInDialogOrMenu()) return;
   const candidates = [...registrations]
     .filter((registration) => registration.command === event.command)
     .sort((a, b) => b.priority - a.priority);

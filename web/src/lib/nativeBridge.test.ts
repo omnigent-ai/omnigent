@@ -4,6 +4,7 @@ import {
   applyMacElectronShellAttribute,
   checkDbcert,
   closeDesktopWindow,
+  confirmDesktopQuit,
   onDesktopCommand,
   setDesktopCommandState,
   supportsDesktopCommands,
@@ -706,6 +707,7 @@ describe("desktop command bridge", () => {
     command: string;
     browserViewId: string | null;
     closingQuits?: boolean;
+    quitDetail?: string | null;
   }) => void;
 
   function installDesktop(api: Record<string, unknown>): void {
@@ -744,9 +746,25 @@ describe("desktop command bridge", () => {
     listener({ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true });
     listener({ command: "open-everything", browserViewId: null });
     listener({ command: "new-terminal", browserViewId: null });
+    listener({ command: "quit", browserViewId: null, quitDetail: "The local server will stop." });
     expect(received.mock.calls).toEqual([
-      [{ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true }],
-      [{ command: "new-terminal", browserViewId: null, closingQuits: false }],
+      [
+        {
+          command: "close",
+          browserViewId: "browser-tab:s:t",
+          closingQuits: true,
+          quitDetail: null,
+        },
+      ],
+      [{ command: "new-terminal", browserViewId: null, closingQuits: false, quitDetail: null }],
+      [
+        {
+          command: "quit",
+          browserViewId: null,
+          closingQuits: false,
+          quitDetail: "The local server will stop.",
+        },
+      ],
     ]);
     stop();
     expect(unsubscribe).toHaveBeenCalled();
@@ -758,6 +776,17 @@ describe("desktop command bridge", () => {
       setDesktopCommandState({ commands: [], sessionPinned: false, sessionArchived: false }),
     ).not.toThrow();
     await expect(closeDesktopWindow()).resolves.toBe(false);
+    await expect(confirmDesktopQuit(false)).resolves.toBe(false);
+  });
+
+  it("confirms a quit with the Don't ask again choice", async () => {
+    const confirmQuit = vi.fn().mockResolvedValue(true);
+    installDesktop({ confirmQuit });
+    await expect(confirmDesktopQuit(true)).resolves.toBe(true);
+    expect(confirmQuit).toHaveBeenCalledWith({ dontAskAgain: true });
+
+    confirmQuit.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(confirmDesktopQuit(false)).resolves.toBe(false);
   });
 
   it("reports state and asks the shell to close the window", async () => {

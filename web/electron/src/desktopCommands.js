@@ -4,8 +4,8 @@
 // The menu owns their accelerators so they fire even while an embedded browser
 // view has focus, where the SPA's own key listeners never see the keystroke.
 // The SPA reports which commands it can act on right now; until it does (an
-// older web bundle, the setup page, a sign-in page) the items stay disabled and
-// Close falls back to closing the window.
+// older web bundle, the setup page, a sign-in page) the items stay disabled,
+// Close falls back to closing the window, and Quit quits without asking.
 
 /** Commands the SPA can report and receive. */
 const DESKTOP_COMMANDS = Object.freeze([
@@ -21,6 +21,7 @@ const DESKTOP_COMMANDS = Object.freeze([
   "reopen-closed-tab",
   "previous-tab",
   "next-tab",
+  "quit",
 ]);
 
 /**
