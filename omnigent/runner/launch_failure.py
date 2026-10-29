@@ -279,6 +279,7 @@ _CODEX_PROVIDER_AUTH_FAILURE = re.compile(
     r"|produced an empty token|timed out|failed to start|wrote non-UTF-8)"
 )
 _EXIT_STATUS_PREFIX = re.compile(r"^\s*(?:exit status: -?\d+|signal: \d+[^:\n]*):?\s*")
+_STORAGE_EXHAUSTED_FRAGMENTS = ("no space left on device", "disk quota exceeded")
 # Shells that wrap a token helper; the helper to run is in their arguments.
 _SHELL_PROGRAMS = frozenset({"sh", "bash", "zsh", "dash"})
 # Persisted error labels hold 256 characters.
@@ -382,8 +383,8 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
     """Explain a model provider token command that failed, naming the command to run.
 
     A custom Codex model provider can set ``auth.command`` (for example
-    ``isaac``) to print a bearer token. When that command fails, every turn
-    fails until the user signs in with it again; ``codex login`` doesn't help.
+    ``isaac``) to print a bearer token. Its output can identify an expired
+    login or exhausted host storage, which need different recovery steps.
 
     :param message: Codex's turn error, e.g. ``"provider auth command `isaac`
         exited with status exit status: 1: ... Run `isaac` to log in and try again."``.
@@ -412,6 +413,18 @@ def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | Non
         if helper_output
         else f"{cause}."
     )
+    if helper_output and any(
+        fragment in helper_output.lower() for fragment in _STORAGE_EXHAUSTED_FRAGMENTS
+    ):
+        return FailureDiagnosis(
+            title="Host storage is full",
+            cause=cause,
+            remediation=(
+                "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+                "then send your message again."
+            ),
+            category=ErrorCategory.HOST,
+        )
     if outcome == "failed to start":
         remediation = (
             f"Check that `{command}` is installed and on PATH on the host, "
