@@ -11,28 +11,26 @@
 //
 // Key design choices:
 //   • Decorations never touch the document → markdown serialisation is clean.
-//   • Comment anchor mapping uses doc.textBetween("\n") for plain-text offsets,
-//     avoiding markdown-syntax drift.
-//   • ProseMirror positions are stable integers; binary search maps text
-//     offsets to PM positions without bespoke offset-inversion code.
+//   • Comment anchors use the validated Markdown source map, with a
+//     text-offset fallback for documents the map cannot verify.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-react";
 import { useEditor, EditorContent } from "@tiptap/react";
+import type { Editor } from "@tiptap/core";
 import type { Transaction } from "@tiptap/pm/state";
 import type { Node } from "@tiptap/pm/model";
-import { StarterKit } from "@tiptap/starter-kit";
-import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
-import { ListItem, TaskItem } from "@tiptap/extension-list";
-import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { useFileViewer } from "./FileViewerContext";
+import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
-import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { type FinishServerCheck, useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useScrollRestore } from "./useScrollRestore";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
@@ -46,16 +44,14 @@ import {
   createSearchDecorationExtension,
   type SearchDecorationState,
 } from "./TipTapSearchExtension";
-import { createWorkspaceImageExtension, ImageAwareLink } from "./TipTapWorkspaceImage";
-import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
+import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
-import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
-import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
-import { SoftBreak } from "./TipTapSoftBreak";
-import { BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
+import { applyExternalMarkdown } from "./TipTapEditorHelpers";
+import { rememberSourceBlocks } from "./markdownSourceBlocks";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
+  markdownKeepingSource,
 } from "./tiptapMarkdownPatches";
 
 // Minimal-escaping serialiser override (see tiptapMarkdownPatches.ts) —
@@ -68,19 +64,13 @@ installMarkdownSerializerPatch();
 // tiptapMarkdownPatches.ts).
 installMarkdownParserPatch();
 
-// @tiptap/markdown parses a list item whose first child is a non-paragraph
-// block — a nested list, a fenced code block, a blockquote, a heading, or a
-// table — into a `listItem` that violates the stock `paragraph block*` content
-// model. ProseMirror builds the initial doc via `nodeFromJSON`, which does NOT
-// validate content, so the invalid doc loads silently; the first transaction
-// that touches it (a user edit, or StarterKit's TrailingNode plugin on load)
-// then calls `contentMatchAt` and throws ("Called contentMatchAt on a node
-// with invalid content"), which the viewer's panel boundary catches — the
-// whole file view crashes instead of rendering. Relaxing the content model to
-// `block+` accepts a non-paragraph first child, keeping the parsed doc
-// schema-valid. Same class as the blockquote fix in #2004 (see toBlockContent),
-// for list items.
-const SafeListItem = ListItem.extend({ content: "block+" });
+// Unedited blocks keep their source (markdownSourceBlocks.ts). TipTap drops the
+// final newline and saves its trailing empty paragraph as blank lines, so end
+// the file the way it was loaded: with one newline, or none.
+function readMarkdown(editor: Editor, endsWithNewline: boolean): string {
+  const markdown = markdownKeepingSource(editor).replace(/\n+$/, "");
+  return endsWithNewline && markdown !== "" ? `${markdown}\n` : markdown;
+}
 
 // ---------------------------------------------------------------------------
 // MarkdownRichTextViewer — outer shell manages the editor key for remounting
@@ -147,7 +137,7 @@ export function MarkdownRichTextViewer({
     discardAndApplyExternal,
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } = useMarkdownEditorSync({
     content,
     path,
@@ -180,7 +170,7 @@ export function MarkdownRichTextViewer({
       discardAndApplyExternal={discardAndApplyExternal}
       dismissExternalUpdate={dismissExternalUpdate}
       markSaved={markSaved}
-      reconcileServerContent={reconcileServerContent}
+      beginServerCheck={beginServerCheck}
       comments={comments}
       activeSelection={activeSelection}
       onSetActiveSelection={onSetActiveSelection}
@@ -213,7 +203,7 @@ interface InnerProps {
   discardAndApplyExternal: () => void;
   dismissExternalUpdate: () => void;
   markSaved: (content: string) => void;
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
   comments: Comment[];
   activeSelection: ActiveSelection | null;
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
@@ -239,7 +229,7 @@ function MarkdownRichTextViewerInner({
   discardAndApplyExternal,
   dismissExternalUpdate,
   markSaved,
-  reconcileServerContent,
+  beginServerCheck,
   comments,
   activeSelection,
   onSetActiveSelection,
@@ -251,6 +241,7 @@ function MarkdownRichTextViewerInner({
   searchInputRef,
   setContentRef,
 }: InnerProps) {
+  const openFile = useFileViewer();
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
   useEffect(
@@ -260,6 +251,7 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const linkMouseDownRef = useRef<{ x: number; y: number } | null>(null);
   // Persist/restore the editor's scroll position across unmount/remount and
   // session switches. Content is present at mount (the parent gates on the
   // file query), so the restore is ready immediately.
@@ -287,14 +279,9 @@ function MarkdownRichTextViewerInner({
       });
   }, [content]);
 
-  // Stable ref to the raw server content for comment offset mapping.
-  const contentRef = useRef(content);
-  useEffect(() => {
-    contentRef.current = content;
-  }, [content]);
-
   // Baseline used to detect actual edits vs TipTap normalisation.
   const baselineRef = useRef<string | null>(null);
+  const endsWithNewlineRef = useRef(content.endsWith("\n"));
   // Immutable snapshots share unchanged subtrees, so dirty checks need no
   // Markdown serialization and undo can still restore a clean document.
   const baselineDocRef = useRef<Node | null>(null);
@@ -329,7 +316,7 @@ function MarkdownRichTextViewerInner({
     const ed = editorRef.current;
     if (!ed) return "";
     savingDocRef.current = ed.state.doc;
-    const markdown = ed.getMarkdown();
+    const markdown = readMarkdown(ed, endsWithNewlineRef.current);
     // Document attributes can change without changing the saved Markdown.
     // The shared save hook skips the write (and markSaved) in that case.
     if (markdown === baselineRef.current) baselineDocRef.current = savingDocRef.current;
@@ -346,7 +333,7 @@ function MarkdownRichTextViewerInner({
     [markSaved],
   );
 
-  // All save orchestration — write mutation, mid-turn conflict check, teardown
+  // All save orchestration — write mutation, pre-write conflict check, teardown
   // guard, and debounce/flush wiring — lives in the shared hook, identical to
   // the Monaco editor. This surface only supplies its own content access.
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
@@ -357,7 +344,7 @@ function MarkdownRichTextViewerInner({
     setDirty,
     hasExternalUpdate,
     markSaved: markDocumentSaved,
-    reconcileServerContent,
+    beginServerCheck,
     dismissExternalUpdate,
     baselineRef,
     getContent,
@@ -367,43 +354,7 @@ function MarkdownRichTextViewerInner({
   // Extensions are created once per component mount.
   const extensions = useMemo(
     () => [
-      // link/blockquote: false — StarterKit bundles its own versions whose
-      // markdown handlers would shadow the GitHub-flavored replacements
-      // below (duplicate extension names: first wins).
-      // listItem: false — replaced by SafeListItem (content: block+) so a list
-      // item whose first child is a non-paragraph block doesn't build a
-      // schema-invalid doc that crashes the panel. See SafeListItem above.
-      // codeBlock: false — replaced by CodeBlockWithLanguage, which adds a
-      // language picker and a live mermaid preview via a React node view.
-      StarterKit.configure({
-        link: false,
-        blockquote: false,
-        listItem: false,
-        codeBlock: false,
-      }),
-      SafeListItem,
-      CodeBlockWithLanguage,
-      // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
-      // BulletList/OrderedList/ListItem but NOT TaskList/TaskItem, so without
-      // these two the markdown parser drops the checkbox and renders a plain
-      // bullet. Registering them (a) makes @tiptap/markdown pick up TaskList's
-      // built-in `- [ ]` marked tokenizer so the syntax parses into checkbox
-      // items, and (b) round-trips back to identical markdown via their
-      // built-in renderMarkdown. nested:true lets Tab indent sub-checklists.
-      BoundedTaskList,
-      TaskItem.configure({ nested: true }),
-      BoundedTable.configure({ resizable: true }),
-      TableRow,
-      TableCell,
-      TableHeader,
-      ImageAwareLink.configure({ openOnClick: false, autolink: false }),
-      GitHubAlertBlockquote,
-      HtmlPassthrough,
-      // Soft line breaks in hard-wrapped source render as spaces so Edit mode
-      // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
-      SoftBreak,
-      Markdown,
-      createWorkspaceImageExtension(conversationId, path),
+      ...createMarkdownDocumentExtensions(conversationId, path),
       createCommentDecorationExtension(commentStateRef),
       createSearchDecorationExtension(searchStateRef),
     ],
@@ -434,7 +385,7 @@ function MarkdownRichTextViewerInner({
       // language change is a user edit even though it arrives blurred (the
       // picker holds focus), so isUserEditUpdate also honours its flag.
       if (baselineDocRef.current === null || !isUserEditUpdate(ed.isFocused, transaction)) {
-        baselineRef.current = ed.getMarkdown();
+        baselineRef.current = readMarkdown(ed, endsWithNewlineRef.current);
         baselineDocRef.current = ed.state.doc;
         setDirty(false);
         return;
@@ -444,8 +395,9 @@ function MarkdownRichTextViewerInner({
       setDirty(!ed.state.doc.eq(baselineDocRef.current));
     },
     onCreate: ({ editor: ed }) => {
+      rememberSourceBlocks(ed, content);
       // Capture baseline after the initial content has been parsed.
-      baselineRef.current = ed.getMarkdown();
+      baselineRef.current = readMarkdown(ed, endsWithNewlineRef.current);
       baselineDocRef.current = ed.state.doc;
     },
   });
@@ -475,22 +427,18 @@ function MarkdownRichTextViewerInner({
     };
   }, [editor, autoSave]);
 
-  // Register an in-place content setter so the outer sync hook can update
-  // the editor without triggering a full remount (preserves scroll/cursor).
-  // emitUpdate=false suppresses onUpdate so we recapture baseline manually,
-  // preventing the editor from being incorrectly flagged as dirty.
-  //
-  // Scroll is saved and restored via requestAnimationFrame: ProseMirror's
-  // selectionToDOM re-establishes the cursor in the new DOM, which can cause
-  // the browser to scroll the selection into view after the full-document
-  // replace — undoing the user's scroll position.
+  // In-place setter for the sync hook; skipping a remount keeps scroll and caret.
+  // It emits no onUpdate, so re-baseline here, and restore scroll next frame
+  // because selectionToDOM can scroll the caret into view.
   useEffect(() => {
     if (!editor) return;
     setContentRef.current = (newContent: string) => {
       if (editor.isDestroyed) return;
       const savedScroll = scrollContainerRef.current?.scrollTop ?? 0;
-      editor.commands.setContent(newContent, { emitUpdate: false, contentType: "markdown" });
-      baselineRef.current = editor.getMarkdown();
+      applyExternalMarkdown(editor, newContent);
+      rememberSourceBlocks(editor, newContent);
+      endsWithNewlineRef.current = newContent.endsWith("\n");
+      baselineRef.current = readMarkdown(editor, endsWithNewlineRef.current);
       baselineDocRef.current = editor.state.doc;
       // Programmatic replace establishes a fresh baseline — no user edits relative to it.
       hasUserEditedRef.current = false;
@@ -542,17 +490,47 @@ function MarkdownRichTextViewerInner({
         ref={scrollContainerRef}
         onScroll={handleScrollPersist}
         className="relative flex-1 overflow-auto px-8 py-6"
-        // Link following. The Link extension runs with openOnClick:false so a
-        // plain click in edit mode positions the cursor instead of navigating.
-        // Read-only: any click on a link opens it. Edit mode: a modifier-click
-        // (⌘/Ctrl) opens it, and the caret in a link shows MarkdownLinkBubble's
-        // Open action, so plain-click-to-edit is preserved (incl. in tables).
-        onClick={(e) => {
-          if (canEdit && !e.metaKey && !e.ctrlKey) return;
-          const anchor = (e.target as Element).closest("a[href]");
-          if (anchor) {
-            e.preventDefault();
-            window.open(anchor.getAttribute("href")!, "_blank", "noopener,noreferrer");
+        onMouseDown={(event) => {
+          linkMouseDownRef.current = { x: event.clientX, y: event.clientY };
+        }}
+        // Follow links with one click in both modes. Alt-click places the
+        // editing caret; Shift-click and dragging retain text selection.
+        onClick={(event) => {
+          const mouseDown = linkMouseDownRef.current;
+          linkMouseDownRef.current = null;
+          if (event.defaultPrevented || event.button !== 0) return;
+          const anchor = (event.target as Element).closest("a[href]");
+          if (!anchor) return;
+          const href = anchor.getAttribute("href");
+          // The editor may collapse a previous selection only after click.
+          // Suppress navigation for a selection gesture, not that stale range.
+          const selectingText =
+            window.getSelection()?.isCollapsed === false &&
+            (event.detail > 1 ||
+              (mouseDown &&
+                (Math.abs(event.clientX - mouseDown.x) > 4 ||
+                  Math.abs(event.clientY - mouseDown.y) > 4)));
+          if (
+            !href ||
+            /^[?#]/.test(href) ||
+            selectingText ||
+            (canEdit && !event.metaKey && !event.ctrlKey && (event.altKey || event.shiftKey))
+          ) {
+            event.preventDefault();
+            return;
+          }
+          if (isWorkspaceRelativeSrc(href)) {
+            event.preventDefault();
+            const filePath = resolveWorkspacePath(path, href);
+            if (filePath) openFile?.(filePath);
+            return;
+          }
+          followLinkWithPopupFallback(event, href, conversationId);
+          // Contenteditable anchors have no native navigation, including
+          // modified clicks and the desktop shell's external-browser path.
+          if (!event.defaultPrevented) {
+            event.preventDefault();
+            window.open(href, "_blank", "noopener,noreferrer");
           }
         }}
       >
@@ -620,7 +598,7 @@ function MarkdownRichTextViewerInner({
       )}
       <MarkdownCommentPlugin
         editor={editor}
-        contentRef={contentRef}
+        content={content}
         commentStateRef={commentStateRef}
         comments={comments}
         isDirty={isDirty}

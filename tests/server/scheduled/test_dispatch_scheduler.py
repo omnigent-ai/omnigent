@@ -13,12 +13,20 @@ import pytest
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
+    ScheduledTaskDispatchHooks,
     StartupLease,
     StartupLeaseLost,
 )
-from omnigent.server.scheduled.schedule import occurrence_host_id
+from omnigent.server.scheduled.schedule import (
+    occurrence_host_id,
+    sandbox_host_id,
+    scheduled_trigger_key,
+)
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests._helpers.polling import poll_until_async
 from tests.server.scheduled.test_scheduler import FakeClock
+
+_SCHEDULER_LOGGER = "omnigent.server.scheduled.dispatch_scheduler"
 
 
 @pytest.fixture
@@ -28,18 +36,28 @@ def store(db_uri: str) -> SqlAlchemyScheduledTaskStore:
     return store
 
 
-def _task(store: SqlAlchemyScheduledTaskStore, seed: str = "task", **kwargs):
+def _task(
+    store: SqlAlchemyScheduledTaskStore, seed: str = "task", rrule: str = "FREQ=HOURLY", **kwargs
+):
     task = store.create(
         uuid.uuid5(uuid.NAMESPACE_DNS, seed).hex,
         seed,
         "prompt",
-        "FREQ=HOURLY",
+        rrule,
         None,
         uuid.uuid4().hex,
         "UTC",
         **kwargs,
     )
     return store.get(task.id)
+
+
+def _events(caplog, event_name: str) -> list[dict]:
+    return [
+        {**record.attributes, "session_id": getattr(record, "session_id", None)}
+        for record in caplog.records
+        if getattr(record, "event_name", None) == event_name
+    ]
 
 
 async def _drain(scheduler: PersistentTaskScheduler) -> None:
@@ -141,29 +159,32 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
 
 
-async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store) -> None:
+async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog) -> None:
     tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
     clock = FakeClock(max(task.next_run_at for task in tasks))
     ordered = store.list_due_tasks(int(clock.now()))
     own = ordered[-1]
     calls = []
 
-    async def owns(workspace, host):
-        calls.append(host)
-        if host == ordered[0].host_id:
+    async def owned(keys):
+        calls.append(list(keys))
+        if keys == [ordered[0].host_id]:
             raise RuntimeError("no assignment")
-        return host == own.host_id
+        return [key for key in keys if key == own.host_id]
 
     async def fire(task, lease):
         assert lease.run.host_id == own.host_id
         await lease.finish("running")
 
     scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(), owns_host=owns, now=clock.now, batch_size=1
+        store, fire, AsyncMock(), owned_hosts=owned, now=clock.now, batch_size=1
     )
     await scheduler.poll_once()
     await _drain(scheduler)
-    assert calls == [task.host_id for task in ordered]
+    # One lookup per page; a failed lookup skips only its own page.
+    assert calls == [[task.host_id] for task in ordered]
+    failures = _events(caplog, "scheduled_task_operation_failed")
+    assert [event["operation"] for event in failures] == ["claim"]
     assert store.list_runs(own.id)[0][0].status == "running"
     assert store.list_runs(ordered[0].id)[0] == []
 
@@ -204,14 +225,28 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
     loop = asyncio.get_running_loop()
 
     failed_once = False
+    renewing = asyncio.Event()
+    clock_advanced = threading.Event()
 
     def renew(run_id, *, now, lease_seconds):
-        nonlocal failed_once
-        if transient_failure and not failed_once and now() == task.next_run_at + 30:
-            failed_once = True
-            raise RuntimeError("temporary database outage")
-        result = original_renew(run_id, now=now, lease_seconds=lease_seconds)
-        if now() == task.next_run_at + 30:
+        def renewal_time():
+            nonlocal failed_once
+            timestamp = now()
+            if transient_failure and not failed_once and timestamp == task.next_run_at + 30:
+                failed_once = True
+                raise RuntimeError("temporary database outage")
+            return timestamp
+
+        # Advance the clock while a heartbeat is already in flight.
+        if started.is_set() and not clock_advanced.is_set():
+            loop.call_soon_threadsafe(renewing.set)
+            assert clock_advanced.wait(10)
+        result = original_renew(run_id, now=renewal_time, lease_seconds=lease_seconds)
+        if (
+            result is not None
+            and result.lease_expires_at == task.next_run_at + 150
+            and (failed_once or not transient_failure)
+        ):
             loop.call_soon_threadsafe(renewed.set)
         return result
 
@@ -229,7 +264,9 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
+        await asyncio.wait_for(renewing.wait(), 10)
         clock.advance(30)
+        clock_advanced.set()
         await asyncio.wait_for(renewed.wait(), 10)
         assert store.list_runs(task.id)[0][0].lease_expires_at == task.next_run_at + 150
         release.set()
@@ -241,6 +278,7 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
         await scheduler.poll_once()
         assert store.list_runs(task.id)[0][0].status == "running"
     finally:
+        clock_advanced.set()
         await scheduler.stop()
 
 
@@ -418,31 +456,49 @@ async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
 
 @pytest.mark.parametrize(
     "interruption",
-    ["lease_loss", "renewal_timeout", "stop", "executor_error", "running_executor_error"],
+    [
+        "lease_loss",
+        "renewal_timeout",
+        "stop",
+        "stop_during_finish",
+        "executor_error",
+        "running_executor_error",
+    ],
 )
 async def test_interrupted_executor_stops_and_preserves_run_state(
     store, monkeypatch, caplog, interruption
 ):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     entered = asyncio.Event()
     exited = asyncio.Event()
     renewal_blocked = asyncio.Event()
+    finish_blocked = asyncio.Event()
     release = threading.Event()
     leases = []
     loop = asyncio.get_running_loop()
     original_renew = store.renew_starting_run
+    original_transition = store.transition_starting_run
 
     def hanging_renewal(*args, **kwargs):
         loop.call_soon_threadsafe(renewal_blocked.set)
         assert release.wait(10)
         return original_renew(*args, **kwargs)
 
+    def blocked_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(finish_blocked.set)
+        assert release.wait(10)
+        return original_transition(*args, **kwargs)
+
+    if interruption == "stop_during_finish":
+        monkeypatch.setattr(store, "transition_starting_run", blocked_transition)
+
     async def fire(task, lease):
         leases.append(lease)
         entered.set()
         try:
-            if interruption == "running_executor_error":
+            if interruption in {"running_executor_error", "stop_during_finish"}:
                 await lease.finish("running")
             if interruption in {"executor_error", "running_executor_error"}:
                 raise RuntimeError("executor could not complete startup")
@@ -477,16 +533,30 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
             clock.advance(1)
         elif interruption == "stop":
             await asyncio.wait_for(scheduler.stop(), 10)
+        elif interruption == "stop_during_finish":
+            await asyncio.wait_for(finish_blocked.wait(), 10)
+            await asyncio.wait_for(scheduler.stop(), 10)
+            # The shielded write commits after its caller was cancelled.
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(*list(leases[0]._writes), return_exceptions=True), 10
+            )
         await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
         assert exited.is_set()
         assert all(startup.cancelled() or startup.exception() is None for startup in startups)
         assert scheduler._startups == {}
         run = store.list_runs(task.id)[0][0]
-        expected_status = "running" if interruption == "running_executor_error" else "starting"
+        expected_status = (
+            "running"
+            if interruption in {"running_executor_error", "stop_during_finish"}
+            else "starting"
+        )
         assert run.status == expected_status
         assert (run.lease_expires_at is None) == (expected_status == "running")
         records = [
-            record for record in caplog.records if record.name.endswith("dispatch_scheduler")
+            record
+            for record in caplog.records
+            if record.name.endswith("dispatch_scheduler") and record.levelno >= logging.WARNING
         ]
         if interruption in {"lease_loss", "renewal_timeout"}:
             assert len(records) == 1
@@ -508,6 +578,19 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
             assert "executor could not complete startup" in caplog.text
             assert records[0].levelno == logging.ERROR
             assert records[0].exc_info is not None
+        expected_outcome = {
+            "lease_loss": "lease_lost",
+            "renewal_timeout": "lease_lost",
+            "stop": "cancelled",
+            "stop_during_finish": "running",
+            "executor_error": "interrupted",
+            "running_executor_error": "running",
+        }[interruption]
+        # A startup that ends with a write in flight is logged once that write settles.
+        await poll_until_async(lambda: _events(caplog, "scheduled_run_startup_ended"))
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_startup_ended")] == [
+            expected_outcome
+        ]
     finally:
         release.set()
         await scheduler.stop()
@@ -535,16 +618,16 @@ async def test_stop_prevents_a_poll_from_starting_more_work(store, monkeypatch, 
         block()
         return run
 
-    async def owns(workspace, host):
+    async def owned(keys):
         if blocked_at == "ownership":
             await asyncio.to_thread(block)
-        return True
+        return keys
 
     if blocked_at == "claim":
         monkeypatch.setattr(store, "claim_scheduled_run", claim)
     fire = AsyncMock()
     scheduler = PersistentTaskScheduler(
-        store, fire, AsyncMock(return_value=None), now=clock.now, owns_host=owns
+        store, fire, AsyncMock(return_value=None), now=clock.now, owned_hosts=owned
     )
     poll = asyncio.create_task(scheduler.poll_once())
     try:
@@ -566,7 +649,8 @@ async def test_stop_prevents_a_poll_from_starting_more_work(store, monkeypatch, 
         await scheduler.stop()
 
 
-async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store) -> None:
+async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     started = asyncio.Event()
@@ -601,6 +685,10 @@ async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store
         assert reconciled[0].status == "starting"
         assert store.list_runs(task.id)[0][0].status == "failed"
         assert fire_calls == 1
+        assert [e["outcome"] for e in _events(caplog, "scheduled_run_startup_ended")] == [
+            "cancelled"
+        ]
+        assert [e["outcome"] for e in _events(caplog, "scheduled_run_recovered")] == ["failed"]
     finally:
         await scheduler.stop()
 
@@ -656,23 +744,23 @@ async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
     clock.advance(120)
     runs = store.list_expired_starting_runs(int(clock.now()))
     checked = []
+    failing = {runs[0].host_id}
+    owned_keys = {runs[-1].host_id}
 
-    async def owns(workspace, host):
-        assert workspace == 42
-        checked.append(host)
-        if host == runs[0].host_id:
+    async def owned(keys):
+        checked.extend(keys)
+        if set(keys) & failing:
             raise RuntimeError("ownership lookup unavailable")
-        return host == runs[-1].host_id
+        return [key for key in keys if key in owned_keys]
 
     async def recover(run):
         assert current_workspace_id() == 42
-        assert run == runs[-1]
         return "running"
 
     recovery = AsyncMock(side_effect=recover)
     fire = AsyncMock()
     scheduler = PersistentTaskScheduler(
-        store, fire, recovery, owns_host=owns, now=clock.now, batch_size=1
+        store, fire, recovery, owned_hosts=owned, now=clock.now, batch_size=1
     )
     try:
         for index in range(len(runs)):
@@ -684,11 +772,22 @@ async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
         assert store.list_expired_starting_runs(int(clock.now())) == runs[:2]
         with workspace_scope(42):
             assert store.list_runs(runs[-1].scheduled_task_id)[0][0].status == "running"
+
+        # A failed lookup's page is checked again only after the scan wraps.
+        failing.clear()
+        owned_keys.add(runs[0].host_id)
+        for _ in range(2):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+        assert checked == [run.host_id for run in runs] + [runs[0].host_id]
+        assert recovery.await_args_list[-1].args == (runs[0],)
+        assert store.list_expired_starting_runs(int(clock.now())) == [runs[1]]
     finally:
         await scheduler.stop()
 
 
-async def test_late_recovery_result_cannot_overwrite_another_replica(store, monkeypatch):
+async def test_late_recovery_result_cannot_overwrite_another_replica(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     run = store.claim_scheduled_run(
@@ -742,6 +841,9 @@ async def test_late_recovery_result_cannot_overwrite_another_replica(store, monk
         assert recorded == results[0]
         assert recorded.error is None
         fire.assert_not_awaited()
+        # Each replica logs when its own write finishes, in either order.
+        outcomes = [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")]
+        assert sorted(outcomes) == ["running", "superseded"]
     finally:
         await asyncio.gather(*(scheduler.stop() for scheduler in schedulers))
 
@@ -806,6 +908,7 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
     store, failure, deleted, caplog
 ) -> None:
     task = _task(store, execution_target="managed_sandbox")
+    healthy_task = _task(store, "healthy-expired", execution_target="managed_sandbox")
     clock = FakeClock(task.next_run_at)
     run = store.claim_scheduled_run(
         task,
@@ -814,13 +917,23 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         host_id=occurrence_host_id(task, f"schedule:{task.next_run_at}"),
         lease_seconds=120,
     )
+    # One second later, so the failing run is first in the scan order.
+    healthy_run = store.claim_scheduled_run(
+        healthy_task,
+        now=int(clock.now()) + 1,
+        next_run_at=healthy_task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
     if deleted:
         assert store.delete(task.id)
-    clock.advance(120)
+    clock.advance(121)
 
-    async def recovery(run):
+    async def recovery(recovered):
+        if recovered.id == healthy_run.id:
+            return "failed"
         assert store.get(task.id) is not None
-        assert run.host_id == occurrence_host_id(task, f"schedule:{task.next_run_at}")
+        assert recovered.host_id == occurrence_host_id(task, f"schedule:{task.next_run_at}")
         if recover.await_count == 1:
             if failure == "unknown":
                 return None
@@ -833,7 +946,9 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
 
     recover = AsyncMock(side_effect=recovery)
     fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now, recovery_seconds=0.05)
+    scheduler = PersistentTaskScheduler(
+        store, fire, recover, now=clock.now, recovery_seconds=0.05, batch_size=1
+    )
     await scheduler.poll_once()
     await _drain(scheduler)
     assert store.list_runs(task.id)[0] == [run]
@@ -841,6 +956,13 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         assert "Invalid recovery result" in caplog.text
     elif failure == "timeout":
         assert "Recovery timed out" in caplog.text
+    # The next page is the healthy run; the failed run waits for the scan to wrap.
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert recover.await_args.args == (healthy_run,)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert recover.await_count == 2
     await scheduler.poll_once()
     await _drain(scheduler)
     if deleted:
@@ -848,11 +970,14 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         assert store.list_runs(task.id)[0] == []
     else:
         assert store.list_runs(task.id)[0][0].status == "failed"
-    assert recover.await_count == 2
+    assert recover.await_count == 3
+    assert recover.await_args.args == (run,)
     fire.assert_not_awaited()
 
 
-async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, monkeypatch):
+async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(
+    store, monkeypatch, caplog
+):
     monkeypatch.setattr(store, "_cleanup_batch_size", 1)
     deleted = [_task(store, f"deleted-{index}") for index in range(2)]
     for task in deleted:
@@ -870,6 +995,15 @@ async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, 
         lease_seconds=120,
     )
     clock.advance(120)
+    # Expires after the first scan's cutoff, so it must wait for the scan to wrap.
+    late_task = _task(store, "expires-after-cutoff")
+    late_run = store.claim_scheduled_run(
+        late_task,
+        now=int(clock.now()),
+        next_run_at=late_task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
     original_list = store.list_expired_starting_runs
     original_purge = store.purge_deleted_tasks
     discovery_calls = 0
@@ -900,10 +1034,24 @@ async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, 
         recover.assert_not_awaited()
         cursor = scheduler._cleanup_cursor
         assert cursor is not None and cursor[2] is not None
+        scan_cutoff = scheduler._recovery_cutoff
+        assert scan_cutoff == int(clock.now())
+        # The discovery failure leaves the cutoff in place while time passes.
+        clock.advance(120)
         await scheduler.poll_once()
         await _drain(scheduler)
         assert scheduler._cleanup_cursor == cursor
         recover.assert_awaited_once_with(run)
+        assert scheduler._recovery_cutoff == scan_cutoff
+        # The empty page after the first run wraps the scan, so late_run waits.
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        recover.assert_awaited_once_with(run)
+        assert scheduler._recovery_cutoff is None
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert recover.await_count == 2
+        assert recover.await_args.args == (late_run,)
         for _ in range(10):
             await scheduler.poll_once()
             await _drain(scheduler)
@@ -915,11 +1063,14 @@ async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, 
         assert all(store.get(item.id) is None for item in deleted)
         assert store.list_runs(task.id)[0][0].status == "failed"
         fire.assert_not_awaited()
+        failed = _events(caplog, "scheduled_task_operation_failed")
+        assert [event["operation"] for event in failed] == ["recovery", "cleanup"]
     finally:
         await scheduler.stop()
 
 
 async def test_recovery_timeout_allows_inflight_transition_to_finish(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     store.claim_scheduled_run(
@@ -963,6 +1114,12 @@ async def test_recovery_timeout_allows_inflight_transition_to_finish(store, monk
         release.set()
         await asyncio.wait_for(committed.wait(), 10)
         assert store.list_runs(task.id)[0][0].status == "running"
+        # The late commit is still logged, after the timeout.
+        await poll_until_async(lambda: len(_events(caplog, "scheduled_run_recovered")) == 2)
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")] == [
+            "timeout",
+            "running",
+        ]
         await scheduler.poll_once()
         await _drain(scheduler)
         recover.assert_awaited_once()
@@ -1247,7 +1404,8 @@ async def test_heartbeat_stops_retrying_at_last_confirmed_expiry(store, monkeypa
     assert store.list_runs(task.id)[0] == [run]
 
 
-async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(store):
+async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     tasks = [_task(store, f"expired-{index}") for index in range(3)]
     clock = FakeClock(max(task.next_run_at for task in tasks))
     for task in tasks:
@@ -1265,21 +1423,25 @@ async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(
     recover = AsyncMock(return_value=None)
     scheduler = PersistentTaskScheduler(store, AsyncMock(), recover, now=clock.now, batch_size=1)
     try:
-        for index in range(len(runs)):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert [call.args[0] for call in recover.await_args_list] == runs[:1]
+        assert store.get(deleted.id) is None
+        # Expires after the scan's cutoff, so it must wait for the next scan.
+        later = _task(store, "expires-during-scan")
+        later_run = store.claim_scheduled_run(
+            later,
+            now=int(clock.now()),
+            next_run_at=int(clock.now()) + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+        clock.advance(120)
+        for index in range(1, len(runs)):
             await scheduler.poll_once()
             await _drain(scheduler)
             assert [call.args[0] for call in recover.await_args_list] == runs[: index + 1]
             assert store.get(deleted.id) is None
-            if index == 0:
-                later = _task(store, "expires-during-scan")
-                later_run = store.claim_scheduled_run(
-                    later,
-                    now=int(clock.now()),
-                    next_run_at=int(clock.now()) + 3600,
-                    host_id=None,
-                    lease_seconds=120,
-                )
-                clock.advance(120)
         # New expirations wait for the next scan, so older uncertain work gets a turn.
         # The empty page ends this scan; the following poll revisits uncertain work.
         await scheduler.poll_once()
@@ -1290,5 +1452,839 @@ async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(
             await _drain(scheduler)
             assert recover.await_args.args == (run,)
         assert recover.await_count == 2 * len(runs) + 1
+        # Each inspection that cannot decide logs another uncertain event.
+        uncertain = _events(caplog, "scheduled_run_recovered")
+        assert len(uncertain) == recover.await_count
+        assert {event["outcome"] for event in uncertain} == {"uncertain"}
     finally:
         await scheduler.stop()
+
+
+async def test_restart_after_stop_starts_recovery_scan_from_the_beginning(store):
+    tasks = [_task(store, f"restart-{index}") for index in range(2)]
+    clock = FakeClock(max(task.next_run_at for task in tasks))
+    for task in tasks:
+        store.claim_scheduled_run(
+            task,
+            now=int(clock.now()),
+            next_run_at=int(clock.now()) + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+    clock.advance(120)
+    runs = store.list_expired_starting_runs(int(clock.now()))
+    recovered = []
+    recovery_started = asyncio.Event()
+
+    async def recover(run):
+        recovered.append(run)
+        recovery_started.set()
+        return
+
+    # The loop polls once on start; the long interval keeps the test to that poll.
+    scheduler = PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(side_effect=recover),
+        now=clock.now,
+        batch_size=1,
+        poll_seconds=3600,
+    )
+    try:
+        await scheduler.start()
+        await asyncio.wait_for(recovery_started.wait(), 10)
+        await _drain(scheduler)
+        assert recovered == runs[:1]
+        await scheduler.stop()
+        assert scheduler._recovery_cursor is None
+        assert scheduler._recovery_cutoff is None
+        clock.advance(10)
+        recovery_started.clear()
+        await scheduler.start()
+        await asyncio.wait_for(recovery_started.wait(), 10)
+        await _drain(scheduler)
+        # The restarted scan begins at the first run, with a cutoff taken after the restart.
+        assert recovered == [runs[0], runs[0]]
+        assert scheduler._recovery_cutoff == int(clock.now())
+    finally:
+        await scheduler.stop()
+
+
+async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    pinned = {"execution_target": "connected_host", "host_id": uuid.uuid4().hex}
+    tasks = {
+        seed: _task(store, seed, **pinned)
+        for seed in ("delivered", "failed", "skipped", "unfinished", "interrupted", "duplicate")
+    }
+    clock = FakeClock(max(task.next_run_at for task in tasks.values()) + 7)
+    # Another replica already started this occurrence; a stale cursor revisits it.
+    duplicate = tasks["duplicate"]
+    started = store.claim_scheduled_run(
+        duplicate,
+        now=duplicate.next_run_at,
+        next_run_at=duplicate.next_run_at + 3600,
+        host_id=duplicate.host_id,
+        lease_seconds=120,
+    )
+    store.transition_starting_run(started, now=clock.now, status="running")
+    with store._session_immediate("test_revisited_occurrence") as session:
+        session.execute(
+            update(SqlScheduledTask)
+            .where(SqlScheduledTask.id == duplicate.id)
+            .values(next_run_at=duplicate.next_run_at)
+        )
+    session_id = uuid.uuid4().hex
+    claims_done = asyncio.Event()
+
+    async def fire(task, lease):
+        if task.name == "delivered":
+            await lease.attach_session(session_id)
+            # Re-recording the same session is not a second session event.
+            await lease.attach_session(session_id)
+            # Advance only after every claim has read the clock.
+            await claims_done.wait()
+            clock.advance(3)
+            await lease.finish("running")
+        elif task.name == "failed":
+            await lease.finish("failed", error_code="host_offline")
+        elif task.name == "skipped":
+            await lease.finish("skipped")
+        elif task.name == "interrupted":
+            raise RuntimeError("runner start failed")
+
+    recover = AsyncMock(return_value="running")
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now)
+    try:
+        await scheduler.poll_once()
+        claims_done.set()
+        await _drain(scheduler)
+        clock.advance(120)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+
+    names = {task.id: name for name, task in tasks.items()}
+    claimed = _events(caplog, "scheduled_run_claimed")
+    assert sorted(names[event["task_id"]] for event in claimed) == [
+        "delivered",
+        "failed",
+        "interrupted",
+        "skipped",
+        "unfinished",
+    ]
+    assert {(event["target"], event["claim_delay_seconds"]) for event in claimed} == {
+        ("connected_host", 7)
+    }
+    assert [event["task_id"] for event in _events(caplog, "scheduled_run_claim_skipped")] == [
+        duplicate.id
+    ]
+    [attached] = _events(caplog, "scheduled_run_session_attached")
+    assert (attached["session_id"], attached["session_delay_seconds"]) == (session_id, 7)
+    ended = {
+        names[event["task_id"]]: event for event in _events(caplog, "scheduled_run_startup_ended")
+    }
+    assert {name: event["outcome"] for name, event in ended.items()} == {
+        "delivered": "running",
+        "failed": "failed",
+        "skipped": "skipped",
+        "unfinished": "unfinished",
+        "interrupted": "interrupted",
+    }
+    assert ended["delivered"]["prompt_delay_seconds"] == 10
+    assert ended["delivered"]["session_id"] == session_id
+    assert ended["failed"]["error_code"] == "host_offline"
+    # Both unresolved startups are handed to recovery.
+    recovered = _events(caplog, "scheduled_run_recovered")
+    assert sorted(names[event["task_id"]] for event in recovered) == ["interrupted", "unfinished"]
+    assert {event["outcome"] for event in recovered} == {"running"}
+    claimed_runs = {event["run_id"] for event in claimed}
+    assert {event["run_id"] for event in recovered} <= claimed_runs
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "poll",
+        "initialize_scan",
+        "initialize_task",
+        "claim",
+        "lease_renewal",
+        "recovery_inspection",
+    ],
+)
+async def test_failed_operations_log_debug_events(store, monkeypatch, caplog, failure):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    release = asyncio.Event()
+
+    async def fire(task, lease):
+        await release.wait()
+        await lease.finish("running")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"{failure} unavailable")
+
+    if failure == "poll":
+        monkeypatch.setattr(store, "list_due_tasks", fail)
+    elif failure == "initialize_scan":
+        monkeypatch.setattr(store, "list_uninitialized_tasks", fail)
+    elif failure == "initialize_task":
+        with store._session_immediate("test_uninitialized_task") as session:
+            session.execute(
+                update(SqlScheduledTask)
+                .where(SqlScheduledTask.id == task.id)
+                .values(next_run_at=None)
+            )
+        monkeypatch.setattr(store, "initialize_next_run_at", fail)
+    elif failure == "claim":
+        monkeypatch.setattr(store, "claim_scheduled_run", fail)
+    elif failure == "lease_renewal":
+        original_renew = store.renew_starting_run
+        renewals = 0
+
+        def renew_failing_once(*args, **kwargs):
+            nonlocal renewals
+            renewals += 1
+            # The executor's first check succeeds; a heartbeat renewal fails once.
+            if renewals == 2:
+                raise RuntimeError("renewal unavailable")
+            return original_renew(*args, **kwargs)
+
+        monkeypatch.setattr(store, "renew_starting_run", renew_failing_once)
+    elif failure == "recovery_inspection":
+        store.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+        clock.advance(120)
+    expected = {
+        "poll": ("scheduled_task_operation_failed", {"operation": "poll"}),
+        "initialize_scan": ("scheduled_task_operation_failed", {"operation": "initialize"}),
+        "initialize_task": (
+            "scheduled_task_operation_failed",
+            {"operation": "initialize", "task_id": task.id},
+        ),
+        "claim": ("scheduled_task_operation_failed", {"operation": "claim", "task_id": task.id}),
+        "lease_renewal": (
+            "scheduled_task_operation_failed",
+            {"operation": "lease_renewal", "task_id": task.id},
+        ),
+        "recovery_inspection": (
+            "scheduled_run_recovered",
+            {"outcome": "error", "task_id": task.id},
+        ),
+    }
+    event_name, attributes = expected[failure]
+
+    def matching():
+        return [
+            event for event in _events(caplog, event_name) if attributes.items() <= event.items()
+        ]
+
+    recover = AsyncMock(side_effect=RuntimeError("inspection failed"))
+    scheduler = PersistentTaskScheduler(
+        store, fire, recover, now=clock.now, renewal_seconds=0.01, poll_seconds=3600
+    )
+    try:
+        await scheduler.start()
+        await poll_until_async(matching)
+        if failure == "initialize_scan":
+            assert all("task_id" not in event for event in matching())
+        if failure == "lease_renewal":
+            assert matching()[0]["run_id"] == store.list_runs(task.id)[0][0].id
+    finally:
+        release.set()
+        await scheduler.stop()
+
+
+async def test_failed_outcome_log_does_not_fail_committed_finish(store, monkeypatch, caplog):
+    from omnigent.server.scheduled import dispatch_scheduler
+
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    original_info = dispatch_scheduler._logger.info
+
+    def broken_info(message, *args, **kwargs):
+        if kwargs.get("extra", {}).get("event_name") == "scheduled_run_startup_ended":
+            raise RuntimeError("debug-log sink unavailable")
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(dispatch_scheduler._logger, "info", broken_info)
+    await lease.finish("running")
+    assert lease.run.status == store.list_runs(task.id)[0][0].status == "running"
+    assert "Could not log a scheduler event" in caplog.text
+
+
+async def test_recovery_failure_after_timeout_is_still_logged(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def failing_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "transition_starting_run", failing_transition)
+    recover = AsyncMock(return_value="running")
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), recover, now=clock.now, recovery_seconds=0.1
+    )
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(entered.wait(), 10)
+        await asyncio.wait_for(_drain(scheduler), 10)
+        release.set()
+        await poll_until_async(lambda: len(_events(caplog, "scheduled_run_recovered")) == 2)
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")] == [
+            "timeout",
+            "error",
+        ]
+        assert "failed after its sweep timed out" in caplog.text
+        assert store.list_runs(task.id)[0][0].status == "starting"
+    finally:
+        release.set()
+        await scheduler.stop()
+
+
+async def test_logged_delays_exclude_database_write_time(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 4)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    original = store.transition_starting_run
+
+    def slow_transition(*args, **kwargs):
+        clock.advance(30)  # A slow database write.
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "transition_starting_run", slow_transition)
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    await lease.attach_session(uuid.uuid4().hex)
+    await lease.finish("running")
+    [attached] = _events(caplog, "scheduled_run_session_attached")
+    [ended] = _events(caplog, "scheduled_run_startup_ended")
+    assert attached["session_delay_seconds"] == 4
+    assert ended["prompt_delay_seconds"] == 34
+
+
+async def test_concurrent_session_attachment_logs_one_session(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    session_id = uuid.uuid4().hex
+    await asyncio.gather(lease.attach_session(session_id), lease.attach_session(session_id))
+    assert [
+        event["session_id"] for event in _events(caplog, "scheduled_run_session_attached")
+    ] == [session_id]
+
+
+async def test_failed_startup_error_text_is_not_logged_as_an_attribute(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    secret = "token=sk-live-123 for alice@example.com"
+    await lease.finish("failed", error=secret, error_code="host_offline")
+    [ended] = _events(caplog, "scheduled_run_startup_ended")
+    assert ended["error_code"] == "host_offline"
+    assert all(secret not in str(value) for value in ended.values())
+    assert store.list_runs(task.id)[0][0].error == secret
+
+
+async def test_recovery_failure_after_stop_is_still_logged(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def failing_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "transition_starting_run", failing_transition)
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(return_value="running"), now=clock.now
+    )
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(entered.wait(), 10)
+        # Stopping cancels the sweep while its shielded update is still running.
+        await asyncio.wait_for(scheduler.stop(), 10)
+        release.set()
+        await poll_until_async(lambda: _events(caplog, "scheduled_run_recovered"))
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")] == [
+            "error"
+        ]
+    finally:
+        release.set()
+        await scheduler.stop()
+
+
+async def test_failing_claim_log_still_starts_the_claimed_run(store, monkeypatch, caplog):
+    from omnigent.server.scheduled import dispatch_scheduler
+
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    original_info = dispatch_scheduler._logger.info
+
+    def broken_info(message, *args, **kwargs):
+        if kwargs.get("extra", {}).get("event_name") == "scheduled_run_claimed":
+            raise RuntimeError("debug-log sink unavailable")
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(dispatch_scheduler._logger, "info", broken_info)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert store.list_runs(task.id)[0][0].status == "running"
+        assert "Could not log a scheduler event" in caplog.text
+        assert "Could not prepare a scheduled run" not in caplog.text
+    finally:
+        await scheduler.stop()
+
+
+async def test_event_records_keep_their_call_site(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+    [claimed] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "scheduled_run_claimed"
+    ]
+    # Dashboards group by function name, so the guard must not replace the caller.
+    assert claimed.funcName == "_claim_due"
+
+
+async def test_changed_session_is_logged_again(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    first, second = uuid.uuid4().hex, uuid.uuid4().hex
+    await lease.attach_session(first)
+    await lease.attach_session(first)
+    await lease.attach_session(second)
+    sessions = [event["session_id"] for event in _events(caplog, "scheduled_run_session_attached")]
+    assert sessions == [first, second]
+    assert store.list_runs(task.id)[0][0].conversation_id == second
+
+
+async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeypatch):
+    store.configure_dispatch(False)
+    ended = _task(store, "ended", rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
+    store.configure_dispatch(True)
+    counted = _task(store, "counted", rrule="FREQ=HOURLY;COUNT=2")
+    clock = FakeClock(counted.next_run_at)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    try:
+        for _ in range(4):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+            clock.advance(3600)
+        assert store.get(ended.id).state == "completed"
+        assert store.list_runs(ended.id)[0] == []
+        assert store.get(counted.id).state == "completed"
+        assert len(store.list_runs(counted.id)[0]) == 2
+        assert store.list_uninitialized_tasks() == []
+    finally:
+        await scheduler.stop()
+
+
+def test_dispatch_hooks_replace_the_built_in_executor_only_as_a_whole() -> None:
+    assert ScheduledTaskDispatchHooks().on_fire is None
+    ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock())
+    with pytest.raises(ValueError, match="both on_fire and on_expired"):
+        ScheduledTaskDispatchHooks(on_fire=AsyncMock())
+    with pytest.raises(ValueError, match="both on_fire and on_expired"):
+        ScheduledTaskDispatchHooks(on_expired=AsyncMock())
+    # A replacement executor would silently ignore it.
+    with pytest.raises(ValueError, match="fire_identity applies only"):
+        ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(), fire_identity=AsyncMock())
+
+
+async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
+    store, monkeypatch
+) -> None:
+    task = store.update(_task(store).id, state="paused")
+    clock = FakeClock(task.created_at + 60)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append((snapshot.state, lease.run))
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
+    # Only the request itself may start the run in this test.
+    monkeypatch.setattr(scheduler, "_claim_pending", AsyncMock())
+    await scheduler.start()
+    try:
+        run = await scheduler.run_now(task)
+        await asyncio.gather(*list(scheduler._startups.values()))
+    finally:
+        await scheduler.stop()
+
+    # Run now is a manual override: a paused task starts, under its own occurrence key.
+    [(state, started)] = fired
+    assert state == "paused"
+    assert (started.id, started.status) == (run.id, "starting")
+    assert started.trigger_key.startswith("manual:")
+    assert started.host_id == occurrence_host_id(task, started.trigger_key)
+    assert store.list_runs(task.id)[0][0].status == "running"
+    assert store.get(task.id).next_run_at is None
+
+
+async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
+    task = _task(store)
+    clock = FakeClock(task.created_at + 60)
+    owned = False
+
+    async def owned_hosts(keys):
+        return keys if owned else []
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owned_hosts=owned_hosts, now=clock.now
+    )
+    run = await scheduler.run_now(task)
+    assert run.status == "scheduled"
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_not_awaited()
+
+    owned = True
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    [(snapshot, lease)] = [call.args for call in fire.await_args_list]
+    assert (snapshot.id, lease.run.id) == (task.id, run.id)
+    assert store.list_pending_runs() == []
+    # Run now never moves the schedule of an active task.
+    assert store.get(task.id).next_run_at == task.next_run_at
+
+
+async def test_run_now_keeps_a_recorded_request_when_starting_it_here_fails(store) -> None:
+    task = _task(store)
+    clock = FakeClock(task.created_at + 60)
+    calls = 0
+
+    async def owned_hosts(keys):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("ownership lookup unavailable")
+        return keys
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owned_hosts=owned_hosts, now=clock.now, poll_seconds=3600
+    )
+    await scheduler.start()
+    try:
+        # Recorded, so the caller must not retry and create a second run.
+        run = await scheduler.run_now(task)
+        assert run is not None
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+    [(_snapshot, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == run.id
+
+
+async def test_pending_runs_cost_each_poll_one_page_and_still_make_progress(store) -> None:
+    # Each sandbox request has its own host, so ownership differs per request.
+    task = _task(store, execution_target="managed_sandbox")
+    clock = FakeClock(task.created_at + 60)
+
+    def request(key):
+        host_id = occurrence_host_id(task, key)
+        return store.request_manual_run(
+            task, now=task.created_at, trigger_key=key, host_id=host_id
+        )
+
+    unowned = [request(f"manual:{i}") for i in range(5)]
+    owned = request("manual:owned")
+    owned_host = owned.host_id
+    pages = []
+    list_pending_runs = store.list_pending_runs
+
+    def recording_list(**kwargs):
+        pages.append(kwargs["after"])
+        return list_pending_runs(**kwargs)
+
+    store.list_pending_runs = recording_list
+
+    async def owned_hosts(keys):
+        return [key for key in keys if key == owned_host]
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owned_hosts=owned_hosts, now=clock.now, batch_size=2
+    )
+    polls = 0
+    while not fire.await_count:
+        polls += 1
+        assert polls <= 4
+        pages.clear()
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        # Requests owned by other replicas never cost a poll more than one page.
+        assert len(pages) == 1
+    [(_snapshot, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == owned.id
+    assert {run.id for run in list_pending_runs()} == {run.id for run in unowned}
+
+
+async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) -> None:
+    task = _task(store, host_id=uuid.uuid4().hex, workspace="/repo")
+    clock = FakeClock(task.created_at + 60)
+    old_host = task.host_id
+    asked = {"old": [], "new": []}
+    fired = {"old": AsyncMock(), "new": AsyncMock()}
+    new_host = None
+
+    def replica(name, owns):
+        async def owned_hosts(keys):
+            asked[name].extend(keys)
+            return [key for key in keys if owns(key)]
+
+        return PersistentTaskScheduler(
+            store, fired[name], AsyncMock(), owned_hosts=owned_hosts, now=clock.now
+        )
+
+    old_owner = replica("old", lambda host_id: host_id == old_host)
+    new_owner = replica("new", lambda host_id: host_id == new_host)
+    # Recorded on the old host; neither replica polls before the edit.
+    run = await new_owner.run_now(task)
+    assert run.host_id == old_host
+    store.update(task.id, execution_target="managed_sandbox", host_id=None, workspace=None)
+    new_host = sandbox_host_id(task.id, task.workspace_id, run.trigger_key)
+
+    # The old owner's claim moves the request to the sandbox host instead of starting it.
+    await old_owner.poll_once()
+    await _drain(old_owner)
+    await new_owner.poll_once()
+    await _drain(new_owner)
+
+    assert old_host in asked["old"]
+    assert new_host in asked["new"]
+    fired["old"].assert_not_awaited()
+    [(snapshot, lease)] = [call.args for call in fired["new"].await_args_list]
+    assert snapshot.execution_target == "managed_sandbox"
+    assert (lease.run.id, lease.run.host_id) == (run.id, new_host)
+
+
+async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
+    store,
+) -> None:
+    """Replica A holds the session's host and B owns the workspace key. Once the
+    first run records the session, its host is pinned, so A claims every run."""
+    task = _task(store, "continue_unpinned", session_mode="continue")
+    assert task.host_id is None
+    session_host = uuid.uuid4().hex
+    assert (
+        store.adopt_session(task.id, uuid.uuid4().hex, snapshot=task, host_id=session_host)
+        == "adopted"
+    )
+    task = store.get(task.id)
+    clock = FakeClock(task.created_at + 60)
+    fired = {"a": AsyncMock(), "b": AsyncMock()}
+
+    def replica(name, owns):
+        async def owned_hosts(keys):
+            return [key for key in keys if owns(key)]
+
+        return PersistentTaskScheduler(
+            store, fired[name], AsyncMock(), owned_hosts=owned_hosts, now=clock.now
+        )
+
+    a = replica("a", lambda key: key == session_host)
+    b = replica("b", lambda key: key == str(task.workspace_id))
+    run = await b.run_now(task)
+    await b.poll_once()
+    await _drain(b)
+    await a.poll_once()
+    await _drain(a)
+
+    fired["b"].assert_not_awaited()
+    [(snapshot, lease)] = [call.args for call in fired["a"].await_args_list]
+    assert (snapshot.session_id, lease.run.id, lease.run.host_id) == (
+        task.session_id,
+        run.id,
+        session_host,
+    )
+
+
+async def test_claim_checks_ownership_once_per_page_with_workspace_fallback(store) -> None:
+    host_id = uuid.uuid4().hex
+    with workspace_scope(42):
+        pinned = _task(store, "pinned", host_id=host_id)
+        same_host = _task(store, "same-host", host_id=host_id)
+        sandbox = _task(store, "sandbox", execution_target="managed_sandbox")
+        # A legacy row with no pinned host is owned by its workspace's replica.
+        hostless = _task(store, "hostless")
+    assert hostless.host_id is None
+    clock = FakeClock(max(t.next_run_at for t in (pinned, same_host, sandbox, hostless)))
+    sandbox_key = occurrence_host_id(sandbox, scheduled_trigger_key(sandbox.next_run_at))
+    calls = []
+
+    async def owned(keys):
+        calls.append(list(keys))
+        # Unrequested keys are ignored.
+        return [host_id, "42", "unrequested"]
+
+    fired = []
+
+    async def fire(task, lease):
+        fired.append(task.name)
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), owned_hosts=owned, now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+    assert calls == [sorted({host_id, sandbox_key, "42"})]
+    assert sorted(fired) == ["hostless", "pinned", "same-host"]
+    with workspace_scope(42):
+        assert store.list_runs(sandbox.id)[0] == []
+        assert store.list_runs(hostless.id)[0][0].host_id is None
+
+
+async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -> None:
+    with workspace_scope(7):
+        task = _task(store)
+        clock = FakeClock(task.next_run_at)
+        run = store.claim_scheduled_run(
+            task,
+            now=task.next_run_at,
+            next_run_at=task.next_run_at + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+    clock.advance(120)
+    hang = True
+    calls = []
+
+    async def owned(keys):
+        calls.append(list(keys))
+        if hang:
+            await asyncio.Event().wait()
+        return keys
+
+    recover = AsyncMock(return_value="failed")
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), recover, owned_hosts=owned, now=clock.now, recovery_seconds=1
+    )
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        recover.assert_not_awaited()
+        assert "Could not check which of 1 hosts this server owns" in caplog.text
+        failures = _events(caplog, "scheduled_task_operation_failed")
+        assert [event["operation"] for event in failures] == ["recovery"]
+        hang = False
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        recover.assert_awaited_once_with(run)
+    finally:
+        await scheduler.stop()
+    # The host-less run is keyed by its workspace.
+    assert calls == [["7"], ["7"]]
+    assert len(_events(caplog, "scheduled_task_operation_failed")) == 1
+    with workspace_scope(7):
+        assert store.list_runs(task.id)[0][0].status == "failed"
