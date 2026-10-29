@@ -3096,6 +3096,8 @@ class _SessionsChatReplAdapter:
             if content is not None:
                 resolve_payload["content"] = content
             elif schema.get("properties"):
+                if elicitation_id in self._resolved_elicitation_ids:
+                    return None  # settled elsewhere while the y/a/n card was open
                 # Never leave the elicitation unresolved: any failure
                 # while prompting (or a user abort) declines, so the
                 # agent turn doesn't hang waiting on a verdict that the
@@ -3183,6 +3185,8 @@ class _SessionsChatReplAdapter:
                 if description:
                     line += f" — {description}"
                 host.output(Text(line))
+            if question.text_default is not None:
+                host.output(Text(f"     prefilled: {question.text_default}", style=fmt.muted))
             hint = _question_hint(question)
             host.output(Text(f"   {hint}", style=fmt.accent))
             while True:

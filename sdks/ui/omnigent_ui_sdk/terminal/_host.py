@@ -1795,6 +1795,7 @@ class TerminalHost:
                         continue
 
                     if self.raw_input_wanted is not None and self.raw_input_wanted():
+                        line = self._expand_pasted_blocks(line)
                         task = asyncio.create_task(handler(line, []))
                         self._tasks.append(task)
                         task.add_done_callback(self._on_handler_task_done)

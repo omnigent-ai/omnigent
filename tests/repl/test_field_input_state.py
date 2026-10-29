@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.repl._repl import _FieldInputState, _SessionsChatReplAdapter
+from tests._helpers.polling import poll_until_async
 
 
 def test_not_pending_initially() -> None:
@@ -626,12 +627,11 @@ def test_a_prompt_seen_live_and_in_replay_is_handled_once() -> None:
 
 
 async def _until(condition: Any, message: str) -> None:
-    """Yield to the loop until *condition()* holds; fail rather than hang."""
-    for _ in range(200):
-        if condition():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError(message)
+    """Yield to the loop until *condition()* holds; fail with *message* rather than hang."""
+    try:
+        await poll_until_async(condition, timeout_s=2.0, interval_s=0)
+    except AssertionError:
+        raise AssertionError(message) from None
 
 
 def test_concurrent_prompts_are_asked_one_at_a_time() -> None:
@@ -731,11 +731,13 @@ def test_stream_reconnect_replays_pending_prompts_once_per_subscription() -> Non
     from unittest.mock import AsyncMock
 
     adapter, _, client, _ = _question_adapter()
-    subscriptions = 0
+    opened = 0
 
     async def _stream(session_id: str) -> Any:
-        nonlocal subscriptions
-        subscriptions += 1
+        nonlocal opened
+        if opened == 2:
+            await asyncio.Event().wait()  # later subscriptions stay quiet
+        opened += 1
         yield SimpleNamespace()
         yield SimpleNamespace()
 
@@ -746,19 +748,15 @@ def test_stream_reconnect_replays_pending_prompts_once_per_subscription() -> Non
 
     async def _run_case() -> None:
         pump = asyncio.create_task(adapter._stream_pump())
-        for _ in range(60):  # the pump backs off 0.5s between subscriptions
-            if subscriptions >= 2:
-                break
-            await asyncio.sleep(0.05)
-        for _ in range(20):
-            await asyncio.sleep(0)
+        # The pump backs off 0.5s before resubscribing.
+        await poll_until_async(lambda: opened == 2 and replay.call_count >= 2, timeout_s=5.0)
         pump.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await pump
 
     _run(_run_case())
-    assert subscriptions >= 2
-    assert replay.call_count == subscriptions
+    # Two events per subscription, but one replay each.
+    assert replay.call_count == 2
 
 
 def _form_event(elicitation_id: str, schema: dict[str, Any]) -> Any:
@@ -898,3 +896,47 @@ def test_secret_questions_are_left_for_another_client() -> None:
     approval_hook.assert_not_awaited()
     client.sessions.resolve_elicitation.assert_not_awaited()
     assert "Answer it in the web UI" in _outputs_text(adapter._host)  # type: ignore[arg-type]
+
+
+def test_form_accepted_elsewhere_during_its_approval_opens_no_fields() -> None:
+    # Another client submits the form while its y/a/n card is open: the
+    # terminal must not open stale fields, which would hold the prompt lock.
+    adapter, fis, client, approval_hook = _question_adapter()
+
+    async def _accepted_elsewhere(ctx: Any) -> bool:
+        adapter.note_elicitation_resolved(ctx.elicitation_id)  # as run_repl does
+        return True
+
+    approval_hook.side_effect = _accepted_elsewhere
+    form = _form_event("elicit_form", {"properties": {"name": {"type": "string"}}})
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
+        await _until(lambda: task.done(), "stale form fields opened")
+        # The lock is free: the next prompt still opens and gets answered.
+        nxt = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        await _until(lambda: fis.pending, "the next prompt never opened")
+        fis.resolve("1")
+        await nxt
+
+    _run(_run_case())
+    assert [c.args[1] for c in client.sessions.resolve_elicitation.await_args_list] == ["elicit_q"]
+
+
+def test_editor_question_shows_its_prefill() -> None:
+    from omnigent.repl._repl import _question_prompts
+
+    questions = _question_prompts(
+        {
+            "questions": [
+                {"id": "0", "question": "Notes?", "options": [], "textInput": {"default": "draft"}}
+            ]
+        }
+    )
+    fis = _FieldInputState()
+    host = _FakeHost()
+    adapter = _prompt_adapter(fis, host)
+    assert _run(_feed_answers(fis, adapter._prompt_questions("e", questions), [""])) == {
+        "0": "draft"
+    }
+    assert "prefilled: draft" in _outputs_text(host)

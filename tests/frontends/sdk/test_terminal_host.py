@@ -1786,17 +1786,21 @@ async def test_escape_with_no_running_task_calls_the_idle_hook() -> None:
 
 @pytest.mark.asyncio
 async def test_open_prompt_receives_lines_exactly_as_typed() -> None:
-    # An editor answer keeps its whitespace, and a bare Enter reaches the
-    # prompt (it keeps the prefill) instead of being dropped as chat would.
+    # An editor answer keeps its whitespace, a bare Enter reaches the prompt
+    # (it keeps the prefill) instead of being dropped, and pastes still expand.
     host = TerminalHost(model_name="test")
     host.raw_input_wanted = lambda: True
-    lines = iter(["  spaced  ", ""])
+    lines = iter(["  spaced  ", "", "PASTE"])
 
     async def _read_input() -> str:
         try:
-            return next(lines)
+            line = next(lines)
         except StopIteration:
             raise EOFError from None
+        if line == "PASTE":  # pasted into this line's buffer, as bracketed paste does
+            pasted = host._register_pasted_block("line one\nline two\nline three\nline four")
+            line = f"see {pasted.placeholder}"
+        return line
 
     host._read_input = _read_input  # type: ignore[method-assign]
     received: list[str] = []
@@ -1807,4 +1811,6 @@ async def test_open_prompt_receives_lines_exactly_as_typed() -> None:
     with patch.object(host, "_output"):
         await host.run(_handler)
     await asyncio.sleep(0)
-    assert received == ["  spaced  ", ""]
+    # A long paste reaches the prompt as its content, not the placeholder.
+    assert received == ["  spaced  ", "", "see line one\nline two\nline three\nline four"]
+    assert host._pasted_blocks == []
