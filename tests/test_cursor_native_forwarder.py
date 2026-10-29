@@ -336,6 +336,22 @@ class TestDiscoverStore:
         self._seed_chat(tmp_path, "/path/b", "c2", 6_000)
         assert fwd._discover_store("/queried/workspace", launch_epoch_ms=4_000) is None
 
+    def test_fallback_ignores_other_workspace_chat_started_before_launch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path)
+        launch_ms = 1_000_000
+        self._seed_chat(tmp_path, "/repo/worktree-b", "independent", launch_ms - 3_000)
+        assert fwd._discover_store("/repo/worktree-a", launch_epoch_ms=launch_ms) is None
+
+    def test_exact_workspace_chat_within_launch_skew_still_binds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path)
+        launch_ms = 1_000_000
+        own = self._seed_chat(tmp_path, "/repo/worktree-a", "own", launch_ms - 3_000)
+        assert fwd._discover_store("/repo/worktree-a", launch_epoch_ms=launch_ms) == own
+
 
 class TestStateRoundTrip:
     def test_write_then_read(self, tmp_path: Path) -> None:

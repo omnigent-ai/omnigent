@@ -426,14 +426,15 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     the dir lazily on the first message, so we pick the newest chat created at or
     after this session's launch under the exact ``md5(workspace)`` dir. If that
     dir has nothing (a path-hash mismatch), we fall back to other workspace dirs
-    but bind ONLY when exactly one chat across them qualifies — never guessing
-    among multiple, so a concurrent session or unrelated workspace can't be
-    mirrored by mistake.
+    but bind ONLY when exactly one chat across them was created at or after the
+    launch itself (no skew) — never guessing among multiple, so a concurrent
+    session or unrelated workspace can't be mirrored by mistake.
 
     :param workspace: The session's working directory, exactly as passed to the
         cursor TUI.
     :param launch_epoch_ms: Wall-clock ms when this terminal launched; only
-        chats created at/after this (minus a small skew) are candidates.
+        chats created at/after this (minus a small skew in the exact
+        workspace dir) are candidates.
     :returns: The newest matching ``store.db`` path, or ``None`` if none yet.
     """
     root = _cursor_chats_root()
@@ -449,7 +450,7 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     # we can't tell which session owns which (concurrent sessions, or an
     # unrelated workspace), so we return None and retry rather than risk
     # mirroring the wrong conversation — silent cross-talk is worse than a brief
-    # delay.
+    # delay. Another workspace's chat that predates this launch is never ours.
     if not root.is_dir():
         return None
     matches: list[Path] = []
@@ -458,7 +459,7 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
             continue
         for chat_dir in hash_dir.iterdir():
             store = chat_dir / "store.db"
-            if store.is_file() and _chat_created_ms(chat_dir) >= floor_ms:
+            if store.is_file() and _chat_created_ms(chat_dir) >= launch_epoch_ms:
                 matches.append(store)
     return matches[0] if len(matches) == 1 else None
 
