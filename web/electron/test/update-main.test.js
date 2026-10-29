@@ -96,6 +96,7 @@ function loadMainHarness({
 
   const electron = {
     app: {
+      name: "Omnigent",
       isPackaged,
       getPath: (name) => (name === "userData" ? userData : userData),
       getVersion: () => "0.3.0",
@@ -419,6 +420,95 @@ describe("About menu wiring", () => {
 
     assert.equal(aboutItem.label, "About Omnigent");
     assert.equal(harness.calls.aboutOpens.length, 1);
+  });
+});
+
+function submenuIds(menu, label) {
+  const entry = menu.template.find((item) => item.label === label);
+  return plain(entry.submenu.map((item) => item.id ?? item.role ?? item.type));
+}
+
+function topLevelMenus(menu) {
+  return plain(
+    menu.template.map((item) => item.label ?? item.role).filter((label) => label !== "Debug"),
+  );
+}
+
+describe("application menu layout", () => {
+  it("keeps updates, Settings, and Quit in the macOS app menu", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.deepEqual(topLevelMenus(menu), [
+      "Omnigent",
+      "File",
+      "Edit",
+      "View",
+      "Server",
+      "windowMenu",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Omnigent"), [
+      "open_about",
+      "check_for_updates",
+      "restart_to_update",
+      "separator",
+      "open_settings",
+      "separator",
+      "services",
+      "separator",
+      "hide",
+      "hideOthers",
+      "unhide",
+      "separator",
+      "quit",
+    ]);
+    assert.deepEqual(submenuIds(menu, "File"), [
+      "new_session",
+      "new_window",
+      "new_server_window",
+      "separator",
+      "close",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Server"), [
+      "change_server",
+      "sign_out_server",
+      "separator",
+      "export_diagnostics",
+    ]);
+  });
+
+  it("keeps Settings and Quit in File and updates in Help on Windows and Linux", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+
+    harness.api.buildMenu();
+    const menu = harness.calls.setApplicationMenu.at(-1);
+
+    assert.deepEqual(topLevelMenus(menu), ["File", "Edit", "View", "Server", "windowMenu", "Help"]);
+    assert.deepEqual(submenuIds(menu, "File"), [
+      "new_session",
+      "new_window",
+      "new_server_window",
+      "separator",
+      "open_settings",
+      "separator",
+      "close",
+      "separator",
+      "quit",
+    ]);
+    assert.deepEqual(submenuIds(menu, "Help"), [
+      "check_for_updates",
+      "restart_to_update",
+      "separator",
+      "open_about",
+    ]);
+    const quit = findMenuItem(menu, "quit");
+    assert.equal(quit.accelerator, "CmdOrCtrl+Q");
+    quit.click();
+    assert.equal(harness.calls.appQuit, 1);
   });
 });
 
