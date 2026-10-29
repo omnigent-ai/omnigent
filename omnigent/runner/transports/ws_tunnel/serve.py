@@ -122,8 +122,8 @@ _REFRESHABLE_HTTP_STATUSES = {401, 403}
 # it reaches the server) and exiting would kill every conversation on the
 # runner. Mirrors the host tunnel's status classification.
 _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
-# A never-connected runner with no credential to send keeps re-minting for this long
-# before it exits as signed out; a transient mint failure clears within the window.
+# A never-connected runner keeps re-minting a missing or rejected credential for this
+# long before it exits; a transient mint failure or grant refresh clears within the window.
 _NO_CREDENTIAL_FATAL_WINDOW_S = 120.0
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
@@ -640,13 +640,17 @@ async def serve_tunnel(
                             or getattr(auth_token_factory, "declined_without_proxy_bearer", False)
                         )
                     )
+                    waited_s = (
+                        time.monotonic() - http_auth_rejection_started
+                        if http_auth_rejection_started is not None
+                        else 0.0
+                    )
+                    window_elapsed = (
+                        http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                        and waited_s >= _NO_CREDENTIAL_FATAL_WINDOW_S
+                    )
                     if not ever_connected and no_credential_to_send:
-                        assert http_auth_rejection_started is not None
-                        waited_s = time.monotonic() - http_auth_rejection_started
-                        if (
-                            http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
-                            and waited_s >= _NO_CREDENTIAL_FATAL_WINDOW_S
-                        ):
+                        if window_elapsed:
                             raise RunnerTunnelAuthRejectedError(
                                 f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
                                 f"(HTTP {http_status} persisted across "
@@ -660,14 +664,13 @@ async def serve_tunnel(
                         mark_sign_in_pending(
                             runner_id, http_auth_rejection_started + _NO_CREDENTIAL_FATAL_WINDOW_S
                         )
-                    elif (
-                        not ever_connected
-                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
-                    ):
+                    elif not ever_connected and window_elapsed:
+                        # A rejected token can be stale for a while (e.g. a grant that
+                        # the host is refreshing), so give the re-mint the same window.
                         raise RunnerTunnelAuthRejectedError(
                             f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
                             f"(HTTP {http_status} persisted across "
-                            f"{http_auth_rejection_streak} attempts); "
+                            f"{http_auth_rejection_streak} attempts over {int(waited_s)} s); "
                             f"{_reauth_hint(server_url)}"
                         ) from exc
                     # The rejection proves the server requires auth: drop the cached token
@@ -691,8 +694,6 @@ async def serve_tunnel(
                             http_status,
                             extra={"session_id": runner_primary_session_id()},
                         )
-                        if not no_credential_to_send:
-                            delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
                     close_code = _websocket_close_code(exc)
                     if close_code in _FATAL_SERVER_CLOSE_CODES:
@@ -876,7 +877,7 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
         return False
     try:
         return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
-    except Exception:  # noqa: BLE001 — optional status cannot prevent a tunnel upgrade.
+    except Exception:
         _logger.warning(
             "sign_in_pending read failed; continuing with the available credential",
             exc_info=True,

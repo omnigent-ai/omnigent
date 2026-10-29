@@ -582,11 +582,16 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
             await task
 
     assert pending[0] is False
-    assert all(pending[1:-1])
+    if outcome != "rejected":
+        assert all(pending[1:-1])
     if outcome in {"connected", "rejected"}:
         assert upgrades[-1] == "tok-recovered"
-        assert pending[-1] is False
-        assert 30 < sum(sleeps) < 120
+        if outcome == "connected":
+            assert pending[-1] is False
+            assert 30 < sum(sleeps) < 120
+        else:
+            # A refused token is retried for the whole window before the runner exits.
+            assert 120 <= sum(sleeps) < 150
     else:
         assert pending[-1] is True
     assert marker.exists() is (outcome == "connected")
@@ -645,6 +650,41 @@ async def test_serve_tunnel_no_credential_exits_only_after_the_window(
     assert max(sleeps) == serve_module._MAX_RECONNECT_DELAY_S
     assert len(set(deadlines)) == 1
     assert not sign_in_pending_marker_path(marker).exists()
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_rejected_token_exits_only_after_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A never-connected runner whose token is refused re-mints until the window elapses."""
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(tmp_path / "runner.connected"))
+    tokens_used: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        tokens_used.append(auth_token)
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_rejected_token_window",
+            runner_version="0.1.0",
+            auth_token_factory=lambda: "tok-refused",
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_REJECTION_PREFIX)
+    assert sum(sleeps) >= serve_module._NO_CREDENTIAL_FATAL_WINDOW_S
+    assert len(tokens_used) > serve_module._HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+    assert sleeps[:6] == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
 
 
 class _SignInFactory:

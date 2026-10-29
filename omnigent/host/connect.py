@@ -1505,7 +1505,7 @@ class HostProcess:
                 self._reap_orphans_once(child_pids)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — a reaper must never die on a stray error.
+            except Exception:
                 _logger.debug("orphan reaper sweep failed", exc_info=True)
 
     def _reap_orphans_once(self, child_pids: Iterable[int] | None = None) -> int:
@@ -2414,7 +2414,7 @@ class HostProcess:
         )
         try:
             await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
-        except Exception:  # noqa: BLE001 — detached cleanup must be observed.
+        except Exception:
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
                 proc.pid,
@@ -2482,7 +2482,7 @@ class HostProcess:
                     runner_id,
                     session_id,
                 )
-            except Exception:  # noqa: BLE001 — detached cleanup must never die unobserved.
+            except Exception:
                 _logger.warning(
                     "Failed to stop superseded runner %s for session %s; "
                     "the process may linger until it exits on its own",
@@ -2759,7 +2759,7 @@ class HostProcess:
             try:
                 await self._send_text(ws, encode_host_frame(report))
                 return
-            except Exception:  # noqa: BLE001 — any send failure parks the report.
+            except Exception:
                 _logger.debug(
                     "Could not send runner_exited for %s; queueing for reconnect",
                     runner_id,
@@ -3985,7 +3985,7 @@ class HostProcess:
 
         try:
             rows = await codex_launch_catalog()
-        except Exception:  # noqa: BLE001 — catalog failures must not crash the host.
+        except Exception:
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4012,7 +4012,7 @@ class HostProcess:
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
             rows = await claude_launch_catalog(config)
-        except Exception:  # noqa: BLE001 — catalog failures must not crash the host.
+        except Exception:
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4061,7 +4061,7 @@ class HostProcess:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
-            except Exception:  # noqa: BLE001 — catalog failures must not crash the host.
+            except Exception:
                 _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4091,7 +4091,7 @@ class HostProcess:
                     status="failed",
                     error=str(exc),
                 )
-            except Exception:  # noqa: BLE001 — catalog failures must not crash the host.
+            except Exception:
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4557,7 +4557,7 @@ class HostProcess:
                     explicit_refresh=explicit_refresh,
                 )
                 return harness, account
-            except Exception:  # noqa: BLE001 — account discovery must not block the host.
+            except Exception:
                 _logger.warning("Host %s account probe failed", harness, exc_info=True)
                 return harness, {"kind": "unknown"}
 
@@ -5387,7 +5387,7 @@ class HostProcess:
                     self._auth_token_factory_resolved = True
             if self._auth_token_factory is not None:
                 return self._auth_token_factory()
-        except Exception:  # noqa: BLE001 — credential lookup is best effort.
+        except Exception:
             _logger.debug("Could not obtain auth token", exc_info=True)
         return None
 

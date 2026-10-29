@@ -2216,7 +2216,7 @@ class ClaimedRunExecutor:
                 )
                 await self._fail_revoked_fire(task, recorder)
                 return
-            except Exception:  # noqa: BLE001 — identity failures must settle the fire.
+            except Exception:
                 _logger.warning(
                     "scheduled fire: could not act as the owner of task %s", task.id, exc_info=True
                 )
@@ -2233,7 +2233,7 @@ class ClaimedRunExecutor:
         # fire path does, instead of asking a deleted account to re-authorize.
         try:
             deleted = await _owner_is_deleted(self._deps, task)
-        except Exception:  # noqa: BLE001 — an unavailable owner check must not crash the fire.
+        except Exception:
             _logger.warning(
                 "scheduled fire: could not check the owner of task %s", task.id, exc_info=True
             )
