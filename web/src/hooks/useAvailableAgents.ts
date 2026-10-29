@@ -515,12 +515,13 @@ function applyAcpHarnessCatalog(
 export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   const enabled = options.enabled ?? true;
   const serverInfo = useServerInfo();
-  const includeUserAgents = serverInfo !== "loading" && serverInfo.agent_install === true;
-  const sessionAgents = useSessionAgents(enabled && !includeUserAgents);
+  const capabilitiesLoaded = serverInfo !== "loading";
+  const includeUserAgents = capabilitiesLoaded && serverInfo.agent_install === true;
+  const sessionAgents = useSessionAgents(enabled && capabilitiesLoaded && !includeUserAgents);
   // Normalized, order-stable pin key so equivalent pin sets share one cache
   // entry and a caller's fresh array literal doesn't churn the query. Agent
   // ids never contain "," so the join is unambiguous.
-  const pinnedIds = includeUserAgents ? undefined : options.pinnedAgentIds;
+  const pinnedIds = capabilitiesLoaded && !includeUserAgents ? options.pinnedAgentIds : undefined;
   const pinnedKey = useMemo(
     () =>
       Array.from(new Set(pinnedIds ?? []))
@@ -562,7 +563,12 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   }, [catalog, includeUserAgents]);
   const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
-    queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null, includeUserAgents],
+    queryKey: [
+      "available-agents",
+      pinnedKey,
+      sessionAgents.data ?? null,
+      capabilitiesLoaded ? includeUserAgents : null,
+    ],
     // fetchQuery dedupes with the catalog query's in-flight fetch, so the
     // merged fetch reuses (not repeats) the catalog request.
     queryFn: () =>
@@ -573,7 +579,9 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
         includeUserAgents,
       ),
     enabled:
-      enabled && (includeUserAgents || sessionAgents.data !== undefined || sessionAgents.isError),
+      enabled &&
+      capabilitiesLoaded &&
+      (includeUserAgents || sessionAgents.data !== undefined || sessionAgents.isError),
     staleTime: AVAILABLE_AGENTS_STALE_MS,
     placeholderData,
     select,

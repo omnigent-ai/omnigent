@@ -609,14 +609,15 @@ async def _run_fire_for_task(
     try:
         effective = await _own_task_agent(deps, effective)
         conv = await _create_session(deps, effective)
-    except OmnigentError as exc:
-        await recorder.finish("failed", error=exc.message, error_code=exc.code)
-        return
-    except Exception:
-        _logger.exception("scheduled fire: failed to create session for task %s", task.id)
-        await recorder.finish(
-            "failed", error="session creation failed", error_code="session_create_failed"
-        )
+    except Exception as exc:
+        if isinstance(exc, OmnigentError) and exc.code == ErrorCode.CONFLICT:
+            _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc.message)
+            await recorder.finish("failed", error=exc.message, error_code=exc.code)
+        else:
+            _logger.exception("scheduled fire: failed to create session for task %s", task.id)
+            await recorder.finish(
+                "failed", error="session creation failed", error_code="session_create_failed"
+            )
         return
     try:
         await _grant_owner(deps, effective, conv.id)

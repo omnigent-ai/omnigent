@@ -53,9 +53,11 @@ function wrapper({ children }: { children: ReactNode }) {
   });
   return (
     <QueryClientProvider client={client}>
-      <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
-        {children}
-      </SidebarDataProvider>
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <SidebarDataProvider config={{ ...sidebarConfig, sharedAvailable: false }}>
+          {children}
+        </SidebarDataProvider>
+      </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -167,7 +169,9 @@ describe("useAvailableAgents", () => {
       {
         wrapper: ({ children }: { children: ReactNode }) => (
           <QueryClientProvider client={client}>
-            <SidebarDataProvider>{children}</SidebarDataProvider>
+            <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+              <SidebarDataProvider>{children}</SidebarDataProvider>
+            </CapabilitiesProvider>
           </QueryClientProvider>
         ),
       },
@@ -1455,6 +1459,45 @@ describe("useAvailableAgents user agents (scope=user)", () => {
     object: "list",
     data: [{ id: "ag_orion", name: "orion", created_at: 5 }],
     has_more: false,
+  });
+
+  it("waits for capabilities before selecting a discovery mode", async () => {
+    routeFetch({
+      [BUILTINS_URL]: CATALOG,
+      [MINE_URL]: MINE,
+      [USER_AGENTS_URL]: mockResponse({ data: [], has_more: false }),
+    });
+    let loading = true;
+    const { result, rerender } = renderHook(
+      () => ({
+        ...useAvailableAgents({ pinnedAgentIds: ["ag_orion"] }),
+        history: useAgents().data,
+      }),
+      {
+        wrapper: ({ children }) =>
+          wrapper({
+            children: (
+              <CapabilitiesProvider
+                info={loading ? "loading" : { ...FALLBACK_SERVER_INFO, agent_install: true }}
+              >
+                {children}
+              </CapabilitiesProvider>
+            ),
+          }),
+      },
+    );
+    await waitFor(() =>
+      expect(result.current.history?.map((agent) => agent.id)).toContain("ag_orion"),
+    );
+    await waitFor(() =>
+      expect(result.current.data?.map((agent) => agent.id)).toEqual(["ag_polly"]),
+    );
+    expect(result.current.isPlaceholderData).toBe(true);
+    expect(result.current.fetchStatus).toBe("idle");
+    loading = false;
+    rerender();
+    await waitFor(() => expect(result.current.isPlaceholderData).toBe(false));
+    expect(result.current.data?.map((agent) => agent.id)).toEqual(["ag_polly"]);
   });
 
   it("uses the same owned catalog as Settings, including names shared with server agents", async () => {

@@ -32,7 +32,7 @@ from starlette.datastructures import Headers
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
-from omnigent.errors import ErrorCode
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location, save_user_agent
 from omnigent.server.scheduled import fire as fire_mod
@@ -260,7 +260,7 @@ class SequencedScheduledTaskStore(FakeScheduledTaskStore):
 
 
 class FakeConversationStore:
-    def __init__(self, *, fail_create: bool = False) -> None:
+    def __init__(self, *, fail_create: bool | Exception = False) -> None:
         self.created: list[dict[str, Any]] = []
         self.updated: list[dict[str, Any]] = []
         self.create_workspace_ids: list[int] = []
@@ -275,6 +275,8 @@ class FakeConversationStore:
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         self.create_workspace_ids.append(current_workspace_id())
+        if isinstance(self.fail_create, Exception):
+            raise self.fail_create
         if self.fail_create:
             raise RuntimeError("create failed")
         self._seq += 1
@@ -1364,14 +1366,19 @@ async def test_validation_failure_records_failed_without_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_failure_records_failed_without_session() -> None:
+@pytest.mark.parametrize(
+    "failure", [True, OmnigentError("internal details", code=ErrorCode.INTERNAL_ERROR)]
+)
+async def test_create_failure_records_failed_without_session(
+    failure: bool | Exception, caplog
+) -> None:
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
 
     async def _launch(conv: Any, task: Any) -> None:
         return None
 
     on_fire = build_on_fire(
-        _deps(store, conversation_store=FakeConversationStore(fail_create=True)),
+        _deps(store, conversation_store=FakeConversationStore(fail_create=failure)),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -1380,6 +1387,8 @@ async def test_create_failure_records_failed_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "session_create_failed"
+    assert store.runs[0]["error"] == "session creation failed"
+    assert "failed to create session" in caplog.text
     assert store.runs[0]["conversation_id"] is None
 
 
