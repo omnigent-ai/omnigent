@@ -280,6 +280,44 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     assert project_requests == 1
 
 
+def test_unanswered_session_list_offers_retry_instead_of_loading_forever(
+    page: Page, request: pytest.FixtureRequest
+) -> None:
+    base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
+    held: list[Route] = []
+    page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
+    page.route("**/v1/sessions?*", lambda route: held.append(route))
+    page.clock.install()
+    page.goto(base_url, wait_until="domcontentloaded")
+    sessions = page.locator("section").filter(
+        has=page.get_by_role("button", name="Sessions", exact=True)
+    )
+    expect(sessions.get_by_role("status")).to_have_text("Loading…")
+    for _ in range(60):
+        page.clock.run_for(2_000)
+    expect(sessions.get_by_role("button", name="Retry")).to_be_visible()
+    assert held
+
+    recovered = {
+        "id": f"{1:032x}",
+        "object": "conversation",
+        "title": "Recovered session",
+        "labels": {},
+        "permission_level": 4,
+        "created_at": 1,
+        "updated_at": 1,
+    }
+
+    def answer(route: Route) -> None:
+        pinned = "pinned" in parse_qs(urlparse(route.request.url).query)
+        route.fulfill(json={"data": [] if pinned else [recovered], "has_more": False})
+
+    page.route("**/v1/sessions?*", answer)
+    sessions.get_by_role("button", name="Retry").click()
+    expect(page.get_by_text("Recovered session", exact=True)).to_be_visible()
+    expect(sessions.get_by_role("status")).to_have_count(0)
+
+
 def test_templates_load_before_mine_and_discovery_reuses_its_request(
     page: Page, request: pytest.FixtureRequest
 ) -> None:

@@ -335,6 +335,27 @@ it("preserves loaded rows after a failed refresh and recovers on retry", async (
   await waitFor(() => expect(result.current.isError).toBe(false));
 });
 
+it.each(["mine", "shared"] as const)(
+  "replaces a pending %s first load when retried",
+  async (scope) => {
+    const stalled: AbortSignal[] = [];
+    fetchPage.mockImplementationOnce(({ signal }) => {
+      if (signal) stalled.push(signal);
+      return new Promise<ConversationsPage>(() => {});
+    });
+    const { result } = renderHook(() => useScopeCache(scope, 60_000), { wrapper });
+    await waitFor(() => expect(fetchPage).toHaveBeenCalledOnce());
+    expect(result.current.isLoading).toBe(true);
+    act(() => {
+      void result.current.refetch();
+    });
+    await waitFor(() => expect(fetchPage).toHaveBeenCalledTimes(2));
+    expect(stalled[0].aborted).toBe(true);
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.pages[0].data).toHaveLength(30);
+  },
+);
+
 it("recovers a stale pagination cursor by restarting the window", async () => {
   const { result } = renderHook(() => useScopeCache("mine", 60_000), { wrapper });
   await waitFor(() => expect(result.current.isSuccess).toBe(true));

@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+  type QueryKey,
+  type RefetchOptions,
+} from "@tanstack/react-query";
 import { appendScopePage, refreshScopeWindow, type ScopeCacheData } from "@/lib/sidebarData";
 import { filterSessionScope } from "@/lib/sessionVisibility";
 import { sidebarConfig } from "@/lib/sidebarConfig";
 import { useViewerId } from "./useViewerId";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import {
+  conversationsQueryKey,
   fetchConversationsPage,
   timeInitialConversationLoad,
   useConversations,
@@ -56,16 +64,20 @@ export function useScopeCache(
       const limit = current
         ? Math.min(current.windowSize ?? pageSize, maxRefreshSessions)
         : pageSize;
-      const page = await timeInitialConversationLoad(undefined, visibility, () =>
-        fetchConversationsPage({
-          searchQuery: "",
-          includeArchived: false,
-          visibility,
-          queryClient: client,
-          signal,
-          limit,
-          sortBy,
-        }),
+      const page = await timeInitialConversationLoad(
+        undefined,
+        visibility,
+        () =>
+          fetchConversationsPage({
+            searchQuery: "",
+            includeArchived: false,
+            visibility,
+            queryClient: client,
+            signal,
+            limit,
+            sortBy,
+          }),
+        signal,
       );
       return refreshScopeWindow(client.getQueryData<ScopeCacheData>(queryKey), page, limit, sortBy);
     },
@@ -159,11 +171,12 @@ export function useScopeCache(
       ? null
       : pagination.error;
   const { isError: pageFailed, reset: resetPage } = pagination;
+  const { isLoading: firstLoadPending } = query;
   const refetch = useCallback(() => {
     if (!enabled) return Promise.resolve();
     if (pageFailed) resetPage();
-    return refreshHead();
-  }, [enabled, pageFailed, resetPage, refreshHead]);
+    return retryList(client, queryKey, firstLoadPending, refreshHead);
+  }, [enabled, pageFailed, resetPage, client, queryKey, firstLoadPending, refreshHead]);
   return {
     ...query,
     refetch,
@@ -180,16 +193,40 @@ export function useScopeCache(
   };
 }
 
+/**
+ * Refetch a list. Without data, refetch rejoins the pending first load even with
+ * cancelRefetch, so that load is cancelled first.
+ */
+async function retryList<Result>(
+  client: QueryClient,
+  queryKey: QueryKey,
+  firstLoadPending: boolean,
+  refetch: () => Promise<Result>,
+): Promise<Result> {
+  if (firstLoadPending) await client.cancelQueries({ queryKey, exact: true });
+  return refetch();
+}
+
+// Shared by the archived list query and its retry's cache key so the two cannot drift.
+const ARCHIVED_LIST = {
+  searchQuery: "",
+  includeArchived: false,
+  project: undefined,
+  visibility: "archived",
+} as const;
+
 export function useArchivedSessions(enabled: boolean, sortBy: SessionSortBy = "updated_at") {
+  const client = useQueryClient();
+  const { searchQuery, includeArchived, project, visibility } = ARCHIVED_LIST;
   const query = useConversations(
-    "",
-    false,
+    searchQuery,
+    includeArchived,
     { enabled, snapshot: true, sortBy },
-    undefined,
-    "archived",
+    project,
+    visibility,
   );
   const previousEntry = useRef({ enabled: false, sortBy });
-  const { data, refetch } = query;
+  const { data, refetch, isLoading: firstLoadPending } = query;
   useEffect(() => {
     const opening =
       enabled && (!previousEntry.current.enabled || sortBy !== previousEntry.current.sortBy);
@@ -197,5 +234,15 @@ export function useArchivedSessions(enabled: boolean, sortBy: SessionSortBy = "u
     // The initial load is automatic; entries and sort changes refresh retained snapshots.
     if (opening && data) void refetch({ cancelRefetch: false });
   }, [enabled, sortBy, data, refetch]);
-  return query;
+  const retry = useCallback(
+    (options?: RefetchOptions) =>
+      retryList(
+        client,
+        conversationsQueryKey(searchQuery, includeArchived, project, visibility, sortBy),
+        firstLoadPending,
+        () => refetch(options),
+      ),
+    [client, searchQuery, includeArchived, project, visibility, sortBy, firstLoadPending, refetch],
+  );
+  return { ...query, refetch: retry };
 }
