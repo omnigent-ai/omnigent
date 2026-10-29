@@ -933,11 +933,10 @@ plain `uv run pytest`, which starts a private server for the test.
   the next server page, the slide and its reduced-motion skip, the open-session
   reveal, row-menu filing, the hidden-session badge, and the ⌘[ / ⌘] hotkey;
   `web/src/shell/Sidebar.shiftSelect.test.tsx` covers shift ranges, bulk
-  actions, bulk filing, and paging to a moved-in session. By hand: create a
-  project (`POST /v1/projects`) and six or more sessions, title them one
-  second apart with `PATCH /v1/sessions/{id}` (a title change sets
-  `updated_at`, which orders the folder; filing alone does not), file them
-  with `project_id`, then expand the folder and click Show more.
+  actions, and bulk filing. By hand: create a project
+  (`POST /v1/projects`), file six or more sessions into it with
+  `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
+  orders them, then expand the folder and click Show more.
 
 ## Gotchas
 

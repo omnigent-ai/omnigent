@@ -1566,15 +1566,6 @@ function ProjectFolder({
     query.fetchNextPage,
     expanded ? conversations.findLastIndex((c) => revealed.has(c.id)) : -1,
   );
-  // A just-filed session can sort below every loaded page, so keep fetching
-  // until it loads or the pages run out. Pinned sessions never list here.
-  const filedUnloaded =
-    expanded &&
-    (revealIds ?? []).some((id) => !pinnedSet.has(id) && !conversations.some((c) => c.id === id));
-  const { hasNextPage, isFetching, fetchNextPage } = query;
-  useEffect(() => {
-    if (filedUnloaded && hasNextPage && !isFetching) void fetchNextPage();
-  }, [filedUnloaded, hasNextPage, isFetching, fetchNextPage]);
   const visibleCount = display.rows.length;
   // A Show more click records the list's size; the rows it adds slide in once
   // they render (after the next server page, when one is needed).
@@ -2316,18 +2307,11 @@ function ConversationList({
   // user has expanded — persisted across reloads. A project shows its rows only
   // while its name is in this set.
   const [expandedProjects, setExpandedProjects] = useState<string[]>(readExpandedProjectSections);
-  // Sessions filed into each project from the sidebar since its folder was last
-  // toggled. Filing keeps their place in the order, so the folder lists down to them.
-  const [justFiled, setJustFiled] = useState<ReadonlyMap<string, readonly string[]>>(
-    () => new Map(),
-  );
+  // Sessions just filed into a project from the sidebar. Filing keeps their
+  // place in the order, so that folder lists down to them until it's toggled.
+  const [justFiled, setJustFiled] = useState<{ project: string; ids: string[] } | null>(null);
   const toggleProjectExpanded = useCallback((projectName: string) => {
-    setJustFiled((prev) => {
-      if (!prev.has(projectName)) return prev;
-      const next = new Map(prev);
-      next.delete(projectName);
-      return next;
-    });
+    setJustFiled((prev) => (prev?.project === projectName ? null : prev));
     setExpandedProjects((prev) => {
       const next = prev.includes(projectName)
         ? prev.filter((n) => n !== projectName)
@@ -2349,17 +2333,7 @@ function ConversationList({
   }, []);
   const handleSessionsFiled = useCallback(
     (projectName: string, sessionIds: string[]) => {
-      setJustFiled((prev) => {
-        const moved = new Set(sessionIds);
-        const next = new Map<string, readonly string[]>();
-        // A session lives in one folder, so filing it here drops it elsewhere.
-        for (const [name, ids] of prev) {
-          const kept = ids.filter((id) => !moved.has(id));
-          if (name !== projectName && kept.length > 0) next.set(name, kept);
-        }
-        const earlier = (prev.get(projectName) ?? []).filter((id) => !moved.has(id));
-        return next.set(projectName, [...earlier, ...sessionIds]);
-      });
+      setJustFiled({ project: projectName, ids: sessionIds });
       expandProject(projectName);
     },
     [expandProject],
@@ -2509,7 +2483,7 @@ function ConversationList({
     });
   }, []);
   const collapseAllProjects = useCallback(() => {
-    setJustFiled((prev) => (prev.size === 0 ? prev : new Map()));
+    setJustFiled(null);
     setExpandedProjects(() => {
       writeExpandedProjectSections([]);
       return [];
@@ -3040,7 +3014,9 @@ function ConversationList({
                             windowConversations={group.conversations}
                             archived={activeTab === "archived"}
                             activeConversationId={displayedActiveId}
-                            revealIds={justFiled.get(group.name)}
+                            revealIds={
+                              justFiled?.project === group.name ? justFiled.ids : undefined
+                            }
                             expanded={expandedProjects.includes(group.name)}
                             active={newSessionProjectName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}

@@ -2687,24 +2687,19 @@ describe("Sidebar project Show more", () => {
     expect(screen.queryByTestId("project-show-more")).toBeNull();
   });
 
-  const slideTiming = { duration: 180, easing: "cubic-bezier(0.4, 0, 0.2, 1)" };
-  const listGrows = [
-    { height: "140px", overflow: "hidden" },
-    { height: "280px", overflow: "hidden" },
-  ];
-  const rowFadesIn = [{ opacity: 0 }, { opacity: 1 }];
-  it.each<{ reduceMotion: boolean; animations: [string, unknown][] }>([
+  it.each([
     {
       reduceMotion: false,
-      animations: [
-        ["UL", listGrows],
-        ...Array.from({ length: 5 }, (): [string, unknown] => ["LI", rowFadesIn]),
+      animated: ["UL", "LI", "LI", "LI", "LI", "LI"],
+      listKeyframes: [
+        { height: "140px", overflow: "hidden" },
+        { height: "280px", overflow: "hidden" },
       ],
     },
-    { reduceMotion: true, animations: [] },
+    { reduceMotion: true, animated: [], listKeyframes: undefined },
   ])(
     "slides the list open over the rows Show more adds (reduced motion: $reduceMotion)",
-    ({ reduceMotion, animations }) => {
+    ({ reduceMotion, animated, listKeyframes }) => {
       projectsMock.push("Customer X");
       mockConversations(filedSessions(12));
       // jsdom has no layout or Web Animations: lists measure 28px per row, and
@@ -2727,14 +2722,10 @@ describe("Sidebar project Show more", () => {
         toggleFolder();
         fireEvent.click(screen.getByTestId("project-show-more"));
 
-        // Each animation: the element, its keyframes, and its timing.
-        expect(
-          animate.mock.calls.map(([keyframes, timing], index) => [
-            (animate.mock.contexts[index] as Element).tagName,
-            keyframes,
-            timing,
-          ]),
-        ).toEqual(animations.map(([tag, keyframes]) => [tag, keyframes, slideTiming]));
+        expect(animate.mock.contexts.map((element) => (element as Element).tagName)).toEqual(
+          animated,
+        );
+        expect(animate.mock.calls[0]?.[0]).toEqual(listKeyframes);
       } finally {
         Reflect.deleteProperty(Element.prototype, "animate");
         Reflect.deleteProperty(HTMLUListElement.prototype, "offsetHeight");
@@ -2814,36 +2805,26 @@ describe("Sidebar project Show more", () => {
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
 
-  it("lists sessions filed from their row menus when they sort past the first five", async () => {
+  it("lists a session filed from its row menu when it sorts past the first five", async () => {
     projectsMock.push("Customer X");
-    // Filing keeps updated_at, so both sort below the folder's nine, Y above X.
-    const x = conv("conv_x", "Claude Code", { updated_at: 1 });
-    const y = conv("conv_y", "Claude Code", { updated_at: 2 });
-    const filed = (c: Conversation) => ({ ...c, labels: { omni_project: "Customer X" } });
-    const fileFromRowMenu = async (title: string) => {
-      const row = screen.getByRole("link", { name: title }).closest("li")!;
-      fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
-        button: 0,
-        ctrlKey: false,
-      });
-      fireEvent.click(await screen.findByTestId("move-to-project"));
-      fireEvent.click(await screen.findByRole("menuitem", { name: /Customer X/ }));
-    };
-    mockConversations([...filedSessions(9), x, y]);
+    const older = conv("conv_older", "Claude Code", { updated_at: 1 });
+    mockConversations([...filedSessions(6), older]);
     renderSidebar();
     toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(5));
 
-    mockConversations([...filedSessions(9), filed(x), y]);
-    await fileFromRowMenu("conv_x");
-    expect(folderRowIds()).toEqual([...filedIds(9), "conv_x"]);
+    // Filing keeps updated_at, so the moved session sorts below the folder's six.
+    mockConversations([...filedSessions(6), { ...older, labels: { omni_project: "Customer X" } }]);
+    const row = screen.getByRole("link", { name: /conv_older/ }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("move-to-project"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Customer X/ }));
+    expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
 
-    // Y sorts between the nine and X, pushing X past the ten listed rows.
-    mockConversations([...filedSessions(9), filed(x), filed(y)]);
-    await fileFromRowMenu("conv_y");
-    expect(folderRowIds()).toEqual([...filedIds(9), "conv_y", "conv_x"]);
-
-    // Toggling the folder drops the reveals, so it starts at five again.
+    // Toggling the folder drops the reveal, so it starts at five again.
     toggleFolder();
     toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(5));

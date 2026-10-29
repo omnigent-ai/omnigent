@@ -48,28 +48,19 @@ describe("computeShiftSelectRange", () => {
 
 // ── Integration tests ───────────────────────────────────────────────────────
 
-const {
-  projectsMock,
-  conversationsRef,
-  projectSessionsMock,
-  projectSessionPagesMock,
-  bulkArchiveMock,
-  bulkMoveMock,
-} = vi.hoisted(() => ({
-  projectsMock: [] as string[],
-  conversationsRef: {
-    current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
-  },
-  projectSessionsMock: { current: {} as Record<string, unknown[]> },
-  // Per-project server pages: the folder serves one more per fetchNextPage call.
-  projectSessionPagesMock: { current: {} as Record<string, unknown[][]> },
-  bulkArchiveMock: { mutate: vi.fn() },
-  bulkMoveMock: { mutate: vi.fn() },
-}));
+const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock, bulkMoveMock } =
+  vi.hoisted(() => ({
+    projectsMock: [] as string[],
+    conversationsRef: {
+      current: [] as { id: string; labels?: Record<string, string>; archived?: boolean }[],
+    },
+    projectSessionsMock: { current: {} as Record<string, unknown[]> },
+    bulkArchiveMock: { mutate: vi.fn() },
+    bulkMoveMock: { mutate: vi.fn() },
+  }));
 
 vi.mock("@/hooks/useConversations", async () => {
   const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
-  const { useState } = await import("react");
   return {
     ...conversationHooksMock(),
     useBulkArchiveConversations: () => ({
@@ -80,31 +71,25 @@ vi.mock("@/hooks/useConversations", async () => {
     useBulkMoveToProject: () => ({ mutate: bulkMoveMock.mutate, isPending: false, isError: false }),
     useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
     useProjectSessions: (project: string, enabled: boolean) => {
-      const [loadedPages, setLoadedPages] = useState(1);
-      const pages = projectSessionPagesMock.current[project] ?? [
-        projectSessionsMock.current[project] ??
+      const override = projectSessionsMock.current[project];
+      const rows = !enabled
+        ? []
+        : (override ??
           conversationsRef.current.filter(
             (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
-          ),
-      ];
-      const served = enabled ? pages.slice(0, loadedPages) : [];
+          ));
       return {
         data: enabled
           ? {
-              pages: served.map((rows) => ({
-                data: rows,
-                first_id: null,
-                last_id: null,
-                has_more: false,
-              })),
-              pageParams: served.map(() => undefined),
+              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+              pageParams: [undefined],
             }
           : undefined,
         isLoading: false,
         isError: false,
         error: null,
-        fetchNextPage: () => setLoadedPages((count) => count + 1),
-        hasNextPage: enabled && loadedPages < pages.length,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
         isFetchingNextPage: false,
       };
     },
@@ -145,17 +130,6 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => conversationPage(convs));
 }
 
-/** The session ids an expanded project folder lists, in render order. */
-function folderRowIds(project: string) {
-  return Array.from(
-    document
-      .querySelector(`[data-project-order-name="${project}"]`)!
-      .closest("section")!
-      .querySelectorAll("[data-sidebar-session-id]"),
-    (row) => row.getAttribute("data-sidebar-session-id"),
-  );
-}
-
 beforeEach(() => {
   useConvMock.mockReset();
   bulkArchiveMock.mutate.mockReset();
@@ -163,7 +137,6 @@ beforeEach(() => {
   localStorage.clear();
   projectsMock.length = 0;
   projectSessionsMock.current = {};
-  projectSessionPagesMock.current = {};
 });
 afterEach(cleanup);
 
@@ -374,7 +347,15 @@ describe("Sidebar shift-click selection", () => {
     mockConversations([...alpha, ...older]);
     localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha"]));
     renderSidebar();
-    expect(folderRowIds("Alpha")).toEqual(["a0", "a1", "a2", "a3", "a4"]);
+    const alphaRowIds = () =>
+      Array.from(
+        document
+          .querySelector('[data-project-order-name="Alpha"]')!
+          .closest("section")!
+          .querySelectorAll("[data-sidebar-session-id]"),
+        (row) => row.getAttribute("data-sidebar-session-id"),
+      );
+    expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4"]);
 
     fireEvent.click(screen.getByTestId("toggle-selection-mode"));
     fireEvent.click(screen.getByRole("link", { name: "old1" }));
@@ -398,48 +379,7 @@ describe("Sidebar shift-click selection", () => {
       project: "Alpha",
     });
     await waitFor(() => {
-      expect(folderRowIds("Alpha")).toEqual(["a0", "a1", "a2", "a3", "a4", "a5", "old1", "old2"]);
-    });
-  });
-
-  it("pages a folder down to a session bulk-moved in from another folder", async () => {
-    projectsMock.push("Alpha", "Beta");
-    const alpha = Array.from({ length: 21 }, (_, i) =>
-      conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
-    );
-    // Only Beta's own query holds the old session, not the global window.
-    const old = conv("old", { labels: { omni_project: "Beta" }, updated_at: 1 });
-    const b0 = conv("b0", { labels: { omni_project: "Beta" }, updated_at: 50 });
-    mockConversations([alpha[0]!, b0]);
-    projectSessionPagesMock.current["Alpha"] = [alpha.slice(0, 20), alpha.slice(20)];
-    projectSessionsMock.current["Beta"] = [b0, old];
-    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Alpha", "Beta"]));
-    renderSidebar();
-
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
-    fireEvent.click(await screen.findByRole("link", { name: "old" }));
-    // The move succeeds, and "old" now sorts last on Alpha's second server page.
-    bulkMoveMock.mutate.mockImplementation(
-      (_variables: unknown, options?: { onSuccess?: () => void }) => options?.onSuccess?.(),
-    );
-    projectSessionPagesMock.current["Alpha"] = [
-      alpha.slice(0, 20),
-      [...alpha.slice(20), { ...old, labels: { omni_project: "Alpha" } }],
-    ];
-    projectSessionsMock.current["Beta"] = [b0];
-    fireEvent.pointerDown(screen.getByTestId("bulk-move-to-project"), {
-      button: 0,
-      ctrlKey: false,
-    });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Alpha" }));
-
-    expect(bulkMoveMock.mutate.mock.calls[0]?.[0]).toEqual({ ids: ["old"], project: "Alpha" });
-    await waitFor(() => {
-      expect(folderRowIds("Alpha")).toEqual([...alpha.map((c) => c.id), "old"]);
+      expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4", "a5", "old1", "old2"]);
     });
   });
 
