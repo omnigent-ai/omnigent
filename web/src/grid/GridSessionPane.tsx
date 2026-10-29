@@ -157,6 +157,10 @@ export function GridSessionPane({
     [sessionId],
   );
   const showTerminal = terminalFirst && view === "terminal";
+  const [terminalOpened, setTerminalOpened] = useState(showTerminal);
+  useEffect(() => {
+    if (showTerminal) setTerminalOpened(true);
+  }, [showTerminal]);
   const setChatRef = useInertRef(showTerminal, chatRef);
   const terminalInertRef = useInertRef<HTMLDivElement>(!showTerminal);
   // A connected terminal focuses itself as the cell activates; otherwise focus
@@ -392,7 +396,7 @@ export function GridSessionPane({
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
               <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
             </div>
-            {terminalFirst && (agentTerminal !== null || showTerminal) && (
+            {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
               <div
                 className={cn(
                   "absolute inset-0 flex flex-col",

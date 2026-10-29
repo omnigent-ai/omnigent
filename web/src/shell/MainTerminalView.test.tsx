@@ -330,6 +330,7 @@ describe("MainTerminalView — automatic recovery", () => {
     const { rerender } = renderView(props);
     const instance = (await screen.findByTestId("terminal-view")).getAttribute("data-instance");
 
+    rerender(viewTree({ ...props, visible: false }));
     rerender(viewTree({ ...props, runnerOnline: false }));
     expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
     expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-instance", instance);
@@ -348,31 +349,29 @@ describe("MainTerminalView — automatic recovery", () => {
     expect(onResume).toHaveBeenCalledTimes(2);
   });
 
-  it.each([500, 30_000])(
-    "only rearms recovery after sustained health (%i ms)",
-    async (healthyMs) => {
+  it.each([false, true])(
+    "does not revive an idle-reaped terminal without reopening (recovered=%s)",
+    async (recovered) => {
       vi.useFakeTimers();
       hostOnlineMock.mockReturnValue(true);
       const onResume = vi.fn().mockResolvedValue(undefined);
       const props = { terminals: [], runnerOnline: true, onResume };
       let rerender!: ReturnType<typeof renderView>["rerender"];
       await act(async () => {
-        ({ rerender } = renderView(props));
+        ({ rerender } = renderView({ ...props, terminals: recovered ? [] : [REPL_TERMINAL] }));
       });
       await act(async () => rerender(viewTree({ ...props, terminals: [REPL_TERMINAL] })));
       expect(screen.getByTestId("terminal-view")).toBeInTheDocument();
-      await act(async () => vi.advanceTimersByTime(healthyMs / 2));
-      rerender(viewTree({ ...props, terminals: [{ ...REPL_TERMINAL }] }));
-      await act(async () => vi.advanceTimersByTime(healthyMs / 2));
+      await act(async () => vi.advanceTimersByTime(30_000));
       await act(async () => rerender(viewTree(props)));
-      if (healthyMs === 30_000) {
-        expect(onResume).toHaveBeenCalledTimes(2);
-        expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
-      } else {
-        expect(onResume).toHaveBeenCalledTimes(1);
-        expect(screen.queryByRole("status")).toBeNull();
-        expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
-      }
+      expect(onResume).toHaveBeenCalledTimes(recovered ? 1 : 0);
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+
+      rerender(viewTree({ ...props, visible: false }));
+      await act(async () => rerender(viewTree(props)));
+      expect(onResume).toHaveBeenCalledTimes(recovered ? 2 : 1);
+      expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
     },
   );
 

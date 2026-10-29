@@ -247,18 +247,24 @@ export function MainTerminalView({
     !terminalsFetching &&
     resumeAvailable &&
     !recoveryRef.current.attempted;
-  const agentHealthy = agentTerminal !== null && !runnerOffline;
+  const agentHealthy = agentTerminal !== null && runnerOnline === true;
   useEffect(() => {
     const recovery = recoveryRef.current;
     if (resumePending) return;
     if (!visible && resumeError === null) recovery.attempted = false;
-    if (!agentHealthy || !recovery.attempted) return;
-    // A briefly restored terminal must not create a crash/restart loop.
-    const timeout = window.setTimeout(() => {
-      recovery.attempted = false;
-    }, 30_000);
-    return () => window.clearTimeout(timeout);
-  }, [conversationId, visible, resumePending, resumeError, agentHealthy]);
+    // Opening a live terminal consumes this opening's recovery allowance.
+    // Later idle reaping must not restart it without another user action.
+    else if (visible && agentHealthy && !terminalsLoading && !terminalsFetching)
+      recovery.attempted = true;
+  }, [
+    conversationId,
+    visible,
+    resumePending,
+    resumeError,
+    agentHealthy,
+    terminalsLoading,
+    terminalsFetching,
+  ]);
   useEffect(() => {
     if (autoResumeAvailable) void handleResume(true).catch(() => {});
   }, [autoResumeAvailable, handleResume]);

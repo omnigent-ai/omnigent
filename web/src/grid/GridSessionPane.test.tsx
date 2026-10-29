@@ -20,6 +20,7 @@ const fixture = vi.hoisted(() => ({
   terminals: [] as TerminalsModule.TerminalInfo[],
   terminalPending: false,
   composerDisabled: false,
+  hostOnline: undefined as boolean | undefined,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -52,7 +53,7 @@ vi.mock("@/hooks/useConversationEntryState", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
   useSessionRunnerOnline: () => true,
-  useSessionHostOnline: () => undefined,
+  useSessionHostOnline: () => fixture.hostOnline,
 }));
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
@@ -141,6 +142,7 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   fixture.composerDisabled = false;
+  fixture.hostOnline = undefined;
   vi.restoreAllMocks();
 });
 
@@ -306,6 +308,31 @@ it("uses the terminal default and changes startup into a scoped resume action", 
   rendered.rerender(tree());
   fireEvent.click(within(first).getByRole("button", { name: "Resume session" }));
   await waitFor(() => expect(retrySession).toHaveBeenCalledWith("first"));
+});
+
+it("keeps failed automatic recovery across grid view switches", async () => {
+  fixture.labels = { "omnigent.ui": "terminal" };
+  fixture.hostOnline = true;
+  vi.mocked(retrySession).mockClear().mockRejectedValueOnce(new Error("Recovery unavailable"));
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "recovery", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = screen.getByRole("region", { name: "first (active)" });
+  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  const failure = await within(first).findByRole("alert");
+  expect(failure).toHaveTextContent("Couldn't reconnect the terminal automatically.");
+  fireEvent.click(within(first).getByRole("button", { name: "Chat view" }));
+  fireEvent.click(within(first).getByRole("button", { name: "Terminal view" }));
+  await act(async () => {});
+  expect(within(first).getByRole("alert")).toBe(failure);
+  expect(within(first).getByRole("button", { name: "Resume session" })).toBeEnabled();
+  expect(retrySession).toHaveBeenCalledTimes(1);
 });
 
 it("shares one workspace, preserves per-session files and drafts, and persists grid width", () => {

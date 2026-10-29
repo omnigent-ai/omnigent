@@ -24,6 +24,7 @@ from tests.browser_ui.chat.session_contract import (
         ("shortcut", False, False),
         ("mobile", False, False),
         ("grid", False, False),
+        ("grid", True, False),
         ("switch", True, False),
         pytest.param("switch", True, True, id="cached-terminal"),
     ],
@@ -169,6 +170,12 @@ def test_terminal_view_recovers_on_open(
             expect(resume).to_be_enabled()
             expect(terminal.get_by_role("alert")).to_be_visible()
             assert len(pending) == 1
+            if entry == "grid":
+                surface.get_by_role("button", name="Chat view", exact=True).click()
+                surface.get_by_role("button", name="Terminal view", exact=True).click()
+                expect(terminal.get_by_role("alert")).to_be_visible()
+                expect(resume).to_be_enabled()
+                assert len(pending) == 1
             if cached_terminal:
                 expect(terminal.get_by_test_id("terminal-view")).to_have_attribute(
                     "data-recovery-original", "true"

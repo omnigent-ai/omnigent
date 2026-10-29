@@ -368,6 +368,15 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
             tmux = read_tmux_info(bridge_dir_for_bridge_id(session_id))
             assert tmux is not None
+            subprocess.run(
+                ["tmux", "-S", tmux["socket_path"], "kill-session", "-t", tmux["tmux_target"]],
+                check=True,
+                capture_output=True,
+            )
+            expect(
+                terminal_view.get_by_role("button", name="Resume session", exact=True)
+            ).to_be_enabled(timeout=30_000)
+            page.get_by_test_id("view-mode-chat").click()
             with page.expect_response(
                 lambda response: (
                     response.url.endswith(f"/v1/sessions/{session_id}/events")
@@ -376,11 +385,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 ),
                 timeout=60_000,
             ) as recovery:
-                subprocess.run(
-                    ["tmux", "-S", tmux["socket_path"], "kill-session", "-t", tmux["tmux_target"]],
-                    check=True,
-                    capture_output=True,
-                )
+                page.get_by_test_id("view-mode-terminal").click()
             assert recovery.value.ok
             assert recovery.value.json()["recovered"] is True
             expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
