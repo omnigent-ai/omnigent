@@ -1,0 +1,152 @@
+"""Tests for keeping Omnigent's ``/model`` switches out of the user's default model."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+from omnigent.harnesses.claude_native import bridge, default_model_guard
+from omnigent.harnesses.claude_native.bridge import claude_user_settings_path
+
+
+@pytest.fixture
+def paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+    """Settings file and state dir, with the background watcher off so tests settle by hand."""
+    monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
+    return tmp_path / "settings.json", tmp_path / "state"
+
+
+def _write(path: Path, payload: dict[str, object]) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _read(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ({"model": "opus", "theme": "dark"}, {"model": "opus", "theme": "dark"}),
+        ({"theme": "dark"}, {"theme": "dark"}),
+    ],
+    ids=["puts the previous default back", "removes a key that was absent"],
+)
+def test_undoes_the_save_of_a_switch_omnigent_typed(
+    paths: tuple[Path, Path], before: dict[str, object], after: dict[str, object]
+) -> None:
+    settings, state = paths
+    _write(settings, before)
+    assert default_model_guard.begin_model_switch(settings, "claude-sonnet-5-5", state_dir=state)
+
+    _write(settings, {**before, "model": "claude-sonnet-5-5"})  # Claude's save
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+
+    assert _read(settings) == after
+    assert not list(state.glob("*.json"))
+
+
+def test_keeps_a_users_own_change_and_restores_to_it(paths: tuple[Path, Path]) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+
+    _write(settings, {"model": "haiku"})  # the user picks a new default meanwhile
+    assert default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "haiku"}
+
+    _write(settings, {"model": "sonnet"})  # the queued switch lands later
+    default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "haiku"}
+
+
+def test_a_second_session_does_not_take_an_unsettled_save_for_the_default(
+    paths: tuple[Path, Path],
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    _write(settings, {"model": "sonnet"})  # the first session's save, not settled yet
+
+    default_model_guard.begin_model_switch(settings, "haiku", state_dir=state)
+    _write(settings, {"model": "haiku"})
+    default_model_guard.settle_default_model(settings, state_dir=state)
+
+    assert _read(settings) == {"model": "opus"}
+
+
+def test_registers_nothing_when_the_default_is_already_that_model(
+    paths: tuple[Path, Path],
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "Sonnet"})
+
+    assert default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state) is None
+    assert not list(state.glob("*.json"))
+
+
+def test_a_cancelled_or_expired_switch_leaves_a_later_save_alone(
+    paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    cancelled = default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    assert cancelled is not None
+    cancelled.cancel()
+    default_model_guard.begin_model_switch(settings, "haiku", state_dir=state)
+    now = time.time()
+    monkeypatch.setattr(
+        default_model_guard.time,
+        "time",
+        lambda: now + default_model_guard.PENDING_SWITCH_TTL_S + 1,
+    )
+
+    for model in ("sonnet", "haiku"):
+        _write(settings, {"model": model})
+        assert not default_model_guard.settle_default_model(settings, state_dir=state)
+        assert _read(settings) == {"model": model}
+
+
+def test_the_watcher_restores_the_default_on_its_own(tmp_path: Path) -> None:
+    settings, state = tmp_path / "settings.json", tmp_path / "state"
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+
+    _write(settings, {"model": "sonnet"})
+    deadline = time.monotonic() + 5
+    while _read(settings) != {"model": "opus"} and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    assert _read(settings) == {"model": "opus"}
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        ({"HOME": "/home/user"}, "/home/user/.claude/settings.json"),
+        ({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}, "/srv/claude/settings.json"),
+        ({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "cfg/../conf"}, "/repo/conf/settings.json"),
+    ],
+    ids=["home", "config dir", "relative config dir"],
+)
+def test_settings_path_follows_claudes_config_dir(env: dict[str, str], expected: str) -> None:
+    assert claude_user_settings_path(Path("/repo"), env) == Path(expected)
+
+
+def test_a_bridge_records_the_settings_file_of_its_launch_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(bridge, "claude_user_settings_path", claude_user_settings_path)
+
+    bridge_dir = bridge.prepare_bridge_dir(
+        "conv_abc",
+        workspace=tmp_path,
+        launch_env={"CLAUDE_CONFIG_DIR": "/srv/claude"},
+    )
+
+    assert bridge.read_user_settings_path(bridge_dir) == Path("/srv/claude/settings.json")

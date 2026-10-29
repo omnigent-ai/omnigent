@@ -73,6 +73,7 @@ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import (
     PEER_MESSAGE_WAKE_KIND,
     PEER_MESSAGE_WAKE_TEXT,
+    default_model_guard,
     delivery_diagnostics,
 )
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
@@ -234,6 +235,7 @@ def _pinned_temp_parent() -> Path | None:
 _TRUSTED_PARENT = Path(tempfile.gettempdir())
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
+_DEFAULT_MODEL_STATE_DIR = _BRIDGE_ROOT_PARENT / "claude-default-model"
 # Markers for permission hooks parked on a verdict, keyed by SESSION id: the
 # idle pane reaper's busy check holds a pane's conversation id, and resolving
 # that to a bridge id needs a session-label fetch no per-scan check can afford.
@@ -1953,6 +1955,9 @@ def prepare_bridge_dir(
             payload["model_env"] = model_env
         if picker_values is not None:
             payload["model_picker_values"] = list(picker_values)
+        payload["user_settings_path"] = str(
+            claude_user_settings_path(workspace, {**os.environ, **(launch_env or {})})
+        )
         if sandbox is not None:
             payload["sandbox"] = _bridge_sandbox_payload(sandbox)
         _write_json_file(bridge_dir / _CONFIG_FILE, payload)
@@ -2031,6 +2036,41 @@ def claude_global_config_path(
         return legacy_path
     suffix = "-custom-oauth" if env.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
     return _claude_joined_path(base, config_dir or home_value, f".claude{suffix}.json")
+
+
+def claude_user_settings_path(
+    cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """
+    Return the user ``settings.json`` Claude saves its default model to.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment. ``None`` uses this process's.
+    :returns: ``$CLAUDE_CONFIG_DIR/settings.json``, else
+        ``$HOME/.claude/settings.json``, resolved the way Claude joins paths.
+    """
+    env = os.environ if env is None else env
+    base = cwd if cwd is not None else Path.cwd()
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    if config_dir is None:
+        config_dir = os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
+    return _claude_joined_path(base, config_dir, "settings.json")
+
+
+def read_user_settings_path(bridge_dir: Path) -> Path:
+    """
+    Return the user ``settings.json`` this session's Claude saves to.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The path recorded at launch; for a session launched before the
+        record, the path for the runner's own environment.
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    recorded = config.get("user_settings_path") if isinstance(config, dict) else None
+    if isinstance(recorded, str) and recorded:
+        return Path(recorded)
+    return claude_user_settings_path()
 
 
 def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
@@ -5700,7 +5740,15 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Claude saves an interactive ``/model`` as the user's default; the guard
+    # undoes that save so the switch stays in this session.
+    switch = _begin_model_switch(bridge_dir, command)
+    try:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    except BaseException:
+        if switch is not None:
+            switch.cancel()
+        raise
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
         # is pending. A dialog replacing the composer counts as submission.
@@ -5711,6 +5759,8 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
         ):
+            if switch is not None:
+                switch.cancel()
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
                 f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "
@@ -5718,6 +5768,20 @@ def inject_slash_command(
             )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
+
+
+def _begin_model_switch(
+    bridge_dir: Path, command: str
+) -> default_model_guard.PendingModelSwitch | None:
+    """Register a ``/model <arg>`` *command* with the default-model guard."""
+    if not command.startswith("/model "):
+        return None
+    model_arg = command.removeprefix("/model").strip()
+    if not model_arg:
+        return None
+    return default_model_guard.begin_model_switch(
+        read_user_settings_path(bridge_dir), model_arg, state_dir=_DEFAULT_MODEL_STATE_DIR
+    )
 
 
 def _confirm_tui_dialog(

@@ -35,6 +35,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import default_model_guard
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     _BACKGROUND_TASK_FIELD_MAX_CHARS,
@@ -7181,6 +7182,56 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "claude:0.0",
         "Enter",
     ]
+
+
+@pytest.mark.parametrize("enter_fails", [False, True], ids=["submitted", "enter failed"])
+def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enter_fails: bool
+) -> None:
+    """
+    A typed ``/model`` save is put back; a switch whose Enter failed leaves nothing pending.
+
+    The fake Enter writes the save the way Claude Code does in an interactive
+    session, so the settle afterwards sees exactly what a real pane leaves.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
+    )
+    settings_path = claude_native_bridge.read_user_settings_path(bridge_dir)
+    state_dir = claude_native_bridge._DEFAULT_MODEL_STATE_DIR
+    settings_path.write_text('{"model": "opus"}', encoding="utf-8")
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
+        del kwargs
+        result = _FakeCompleted()
+        if "capture-pane" in cmd:
+            result.stdout = _composer_pane()
+        elif cmd[-1] == "Enter":
+            if enter_fails:
+                result.returncode = 1
+            else:
+                settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
+        return result
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+    monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
+
+    if enter_fails:
+        with pytest.raises(RuntimeError):
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
+    else:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
+        default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
+
+    assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}
+    assert not list(state_dir.glob("*.json"))
 
 
 def test_tmux_injections_are_serialized_per_bridge(

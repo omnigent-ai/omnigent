@@ -1617,10 +1617,6 @@ def build_native_controls(
             )
 
         try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
             await _drive_claude_pane(
                 deadline,
                 inject_slash_command,

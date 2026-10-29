@@ -201,11 +201,8 @@ class ClaudeNativeExecutor(Executor):
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
             if wanted_model_arg is not None:
-                # Accepted trade-off: ``/model <id>`` also saves the
-                # pick as the person's global default for new Claude
-                # sessions. Runs to completion before the message
-                # inject below (same lock), so its confirm Enter can't
-                # race the message.
+                # Runs to completion before the message inject below
+                # (same lock), so its confirm Enter can't race the message.
                 await self._inject(
                     partial(
                         inject_slash_command,

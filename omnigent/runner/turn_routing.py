@@ -1415,9 +1415,6 @@ async def _apply_routed_model(
     still delivered, on the pane's current model. Losing the prompt is
     worse, and the recorded decision already names the routed model.
 
-    Accepted trade-off: ``/model <id>`` also saves the pick as the person's
-    global default in ``~/.claude/settings.json``.
-
     :param session_id: Session/conversation identifier.
     :param bridge_dir: Session bridge directory.
     :param harness: Harness the blocked prompt came from.
