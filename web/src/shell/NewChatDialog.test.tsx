@@ -7934,7 +7934,22 @@ describe("NewChatLandingScreen", () => {
     const contextBar = screen.getByTestId("new-chat-landing-workspace-controls");
     expect(contextBar).toContainElement(screen.getByTestId("new-chat-landing-repo-chip"));
     expect(screen.queryByTestId("new-chat-landing-workspace-chip")).toBeNull();
-    expect(screen.queryByTestId("new-chat-landing-worktree-chip")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+    // The host chip is icon-only; its aria-label and hover tooltip are not visible text.
+    const composer = screen.getByTestId("new-chat-landing-composer-surface");
+    expect(within(composer).queryAllByText(/sandbox/i)).not.toHaveLength(0);
+    expect([
+      ...within(composer).queryAllByText(/worktree/i),
+      ...within(composer).queryAllByTitle(/worktree/i),
+    ]).not.toHaveLength(0);
+    const sandboxWorktreeChip = screen.getByTestId("new-chat-landing-sandbox-worktree-chip");
+    expect(contextBar).toContainElement(sandboxWorktreeChip);
+    expect(sandboxWorktreeChip.textContent).toContain("New Sandbox");
+    // Touch and keyboard users get the explanation without a hover title.
+    fireEvent.click(sandboxWorktreeChip);
+    expect(screen.getByTestId("new-chat-landing-sandbox-worktree-note").textContent).toMatch(
+      /worktrees aren't available\. To use a worktree, choose one of your machines/,
+    );
   });
 
   it("labels the sandbox option with the server's provider name", async () => {
@@ -7950,6 +7965,9 @@ describe("NewChatLandingScreen", () => {
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
     expect(screen.getByTestId("new-chat-landing-sandbox-option").textContent).toContain(
+      "Modal Sandbox",
+    );
+    expect(screen.getByTestId("new-chat-landing-sandbox-worktree-chip").textContent).toContain(
       "Modal Sandbox",
     );
   });

@@ -1044,6 +1044,9 @@ export function composeSandboxWorkspaces(repos: LastSandboxRepo[]): string[] {
 // `_MAX_MANAGED_WORKSPACES` so the picker stops adding before a create 422s.
 const MAX_SANDBOX_REPOS = 10;
 
+const SANDBOX_WORKTREE_NOTE =
+  "A sandbox already works on its own fresh copy of the repository, so worktrees aren't available. To use a worktree, choose one of your machines from the host menu.";
+
 /**
  * Derive a repository's display name from its URL.
  *
@@ -2785,6 +2788,7 @@ export function NewChatLandingScreen() {
   );
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
+  const [sandboxWorktreeNoteOpen, setSandboxWorktreeNoteOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [dbcertRequired, setDbcertRequired] = useState(false);
   const createAttemptRef = useRef<symbol | null>(null);
@@ -6700,6 +6704,27 @@ export function NewChatLandingScreen() {
                         : "Cloned into the sandbox at startup as the working directory. Leave empty for a blank workspace."}
                     </p>
                   </div>
+                </PopoverContent>
+              </Popover>
+              {/* Sandbox counterpart of the worktree chip: names the target and says why
+              worktrees are unavailable. */}
+              <Popover open={sandboxWorktreeNoteOpen} onOpenChange={setSandboxWorktreeNoteOpen}>
+                <PopoverTrigger asChild>
+                  <ComposerWorkspaceTrigger
+                    kind="worktree"
+                    label={selectedSandboxLabel}
+                    aria-label={`Worktrees unavailable in ${selectedSandboxLabel}`}
+                    title={sandboxWorktreeNoteOpen ? undefined : SANDBOX_WORKTREE_NOTE}
+                    data-testid="new-chat-landing-sandbox-worktree-chip"
+                  />
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-80 p-3">
+                  <p
+                    className="text-sm text-muted-foreground"
+                    data-testid="new-chat-landing-sandbox-worktree-note"
+                  >
+                    {SANDBOX_WORKTREE_NOTE}
+                  </p>
                 </PopoverContent>
               </Popover>
             </ComposerWorkspaceBar>

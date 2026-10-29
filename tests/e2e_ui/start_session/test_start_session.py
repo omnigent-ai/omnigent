@@ -1536,7 +1536,11 @@ async def _drive_managed_repository_workspace_bar(
                 "aria-label", "Sandbox repositories: None selected"
             )
             await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_have_count(0)
-            await expect(page.get_by_test_id("new-chat-landing-worktree-chip")).to_have_count(0)
+            await expect(page.get_by_test_id("new-chat-landing-branch-chip")).to_have_count(0)
+            sandbox_worktree = controls.get_by_test_id("new-chat-landing-sandbox-worktree-chip")
+            await expect(sandbox_worktree).to_have_attribute(
+                "aria-label", "Worktrees unavailable in Databricks Sandbox"
+            )
 
             await repository.click()
             await page.get_by_test_id("new-chat-landing-repo-input").fill(repo_url)
@@ -1545,13 +1549,20 @@ async def _drive_managed_repository_workspace_bar(
                 "aria-label", f"Sandbox repositories: {repo_name}"
             )
             repository_label = repository.locator("[data-workspace-collapse-label]")
+            sandbox_label = sandbox_worktree.locator("[data-workspace-collapse-label]")
             if viewport_width == 390:
                 await expect(controls).to_have_attribute("data-labels", "collapsed")
                 await expect(repository_label).to_be_hidden()
+                await expect(sandbox_label).to_be_hidden()
             else:
                 await expect(controls).not_to_have_attribute("data-labels", "collapsed")
                 await expect(repository_label).to_be_visible()
+                await expect(sandbox_label).to_have_text("Databricks Sandbox")
 
+            await page.keyboard.press("Escape")
+            await sandbox_worktree.click()
+            sandbox_note = page.get_by_test_id("new-chat-landing-sandbox-worktree-note")
+            await expect(sandbox_note).to_be_visible()
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
             await page.get_by_test_id("new-chat-landing-submit").click()
