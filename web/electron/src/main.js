@@ -2815,9 +2815,9 @@ function openFindBar(target) {
   });
 }
 
-/** The `/c/<id>` conversation a shell URL shows, or null. */
+/** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
 function findConversationId(url) {
-  return /\/c\/([^/?#]+)/.exec(url)?.[1] ?? null;
+  return /\/c\/([^/]+)\/?$/.exec(URL.parse(url)?.pathname ?? "")?.[1] ?? null;
 }
 
 /**
