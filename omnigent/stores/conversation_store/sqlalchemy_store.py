@@ -197,6 +197,9 @@ def _like_contains_pattern(query: str) -> str:
 # single statement it always was.
 _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 
+# Max stable ids bound per idempotency-probe statement; each can match a full row.
+_APPEND_STABLE_ID_PROBE_BATCH = _LIST_ITEMS_MAX_ROWS_PER_STATEMENT
+
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
@@ -2624,26 +2627,29 @@ class SqlAlchemyConversationStore(ConversationStore):
             # SQLite the database-level lock already serializes.
             self._lock_conversation(session, conversation_id)
 
-            # Idempotent-append probe: one query for the whole batch. Rows
-            # already persisted under a stable id ARE those items' append
-            # result; running under the lock just taken serializes with a
-            # concurrent retry (READ COMMITTED gives this statement a fresh
-            # snapshot after the lock wait), so it cannot double-insert.
-            stable_ids = [item.stable_id for item in items if item.stable_id is not None]
+            # Idempotent-append probe: rows already stored under a stable id are
+            # those items' result. Each id is a bind parameter, so probe in bounded
+            # batches; the lock just taken serializes concurrent retries.
+            stable_ids = list(
+                dict.fromkeys(item.stable_id for item in items if item.stable_id is not None)
+            )
             existing_by_id: dict[str, SqlConversationItem] = {}
             deduped_by_id: dict[str, ConversationItem] = {}
             if stable_ids:
-                existing_rows = (
-                    session.execute(
-                        select(SqlConversationItem).where(
-                            SqlConversationItem.workspace_id == current_workspace_id(),
-                            SqlConversationItem.conversation_id == conversation_id,
-                            SqlConversationItem.id.in_(stable_ids),
+                existing_rows: list[SqlConversationItem] = []
+                for start in range(0, len(stable_ids), _APPEND_STABLE_ID_PROBE_BATCH):
+                    batch = stable_ids[start : start + _APPEND_STABLE_ID_PROBE_BATCH]
+                    existing_rows.extend(
+                        session.execute(
+                            select(SqlConversationItem).where(
+                                SqlConversationItem.workspace_id == current_workspace_id(),
+                                SqlConversationItem.conversation_id == conversation_id,
+                                SqlConversationItem.id.in_(batch),
+                            )
                         )
+                        .scalars()
+                        .all()
                     )
-                    .scalars()
-                    .all()
-                )
                 replaced_ids = {item.replaces_pending_id for item in items}
                 existing_rows = [
                     row

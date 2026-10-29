@@ -914,20 +914,16 @@ async def test_codex_native_concurrent_settings_use_the_applied_model(
 
 
 @pytest.mark.asyncio
-async def test_events_codex_native_plan_mode_change_preserves_developer_instructions(
+async def test_events_codex_native_plan_mode_change_keeps_codex_plan_preset(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """
-    A plan-mode toggle must not silently wipe ``developer_instructions``.
+    A plan-mode toggle leaves ``settings.developer_instructions`` null.
 
-    Without the current-value read, the plan-mode collaboration-mode
-    settings send always carried
-    ``developer_instructions: null``, clearing whatever
-    ``build_codex_native_server`` had persisted into the bridge's private
-    ``config.toml`` the moment a user toggled Plan mode. This drives the
-    real HTTP path end-to-end and asserts the current value is read back
-    and threaded through to ``thread/settings/update``.
+    A value there replaces Codex's built-in Plan Mode prompt, so Codex keeps
+    coding. The agent's instructions stay in the private ``config.toml``'s
+    additive top-level key, which the toggle must not copy into the mode.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
@@ -1004,73 +1000,12 @@ async def test_events_codex_native_plan_mode_change_preserves_developer_instruct
                     "settings": {
                         "model": "gpt-5.4",
                         "reasoning_effort": None,
-                        "developer_instructions": "Be a concise coding assistant.",
+                        "developer_instructions": None,
                     },
                 },
             },
         ),
     ], fake_client.requests
-
-
-@pytest.mark.asyncio
-async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    A plan-mode toggle must fail loudly (503), not guess, when the private
-    ``config.toml`` holding ``developer_instructions`` can't be read.
-
-    Regression guard: collapsing "unreadable" into "genuinely absent" would
-    send ``developer_instructions: null`` on a transient read glitch,
-    silently wiping live state — the same class of bug this whole codex
-    plan-mode preservation feature exists to prevent. The tri-state read
-    must refuse to guess instead.
-    """
-    from omnigent.harnesses.codex_native.bridge import codex_home_for_bridge_dir
-
-    conv_id = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"
-    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
-    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
-    codex_home = codex_home_for_bridge_dir(bridge_dir)
-    codex_home.mkdir(parents=True)
-    (codex_home / "config.toml").write_bytes(b"\xff\xfe not valid utf-8")
-    codex_native_bridge.write_bridge_state(
-        bridge_dir,
-        codex_native_bridge.CodexNativeBridgeState(
-            session_id=conv_id,
-            socket_path="ws://127.0.0.1:43210",
-            thread_id="thread_codex",
-            codex_home=str(codex_home),
-            active_turn_id=None,
-        ),
-    )
-
-    codex_native_spec = _harness_spec("codex-native", model="gpt-5.4")
-
-    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-
-    monkeypatch.setattr(
-        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
-    )
-
-    app, _ = await _build_app_for_spec(codex_native_spec)
-
-    async with _runner_client(app) as client:
-        create_resp = await client.post(
-            "/v1/sessions",
-            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
-        )
-        assert create_resp.status_code == 201, create_resp.text
-
-        resp = await client.post(
-            f"/v1/sessions/{conv_id}/events",
-            json={"type": "plan_mode_change", "enabled": True},
-        )
-
-    assert resp.status_code == 503, resp.text
-    assert resp.json()["error"] == "codex_native_settings_update_failed"
 
 
 @pytest.mark.asyncio
@@ -3776,28 +3711,13 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "medium", "none", "ultra"])
 async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    effort: str | None,
 ) -> None:
-    """
-    POST ``/events`` ``model_change`` on a pi-native session queues a
-    ``model_change`` payload to the Pi extension inbox.
-
-    A pi-native turn runs inside the resident Pi TUI process, and the
-    ``--model`` launch flag is baked in at spawn. The dispatch must route to
-    ``_handle_pi_native_model_change``, which drops a ``model_change`` payload
-    the extension applies live via Pi's ``setModel``.
-
-    Regression guard: the ``model_change`` branch originally enumerated only
-    claude/codex/cursor/opencode/kiro, so pi-native fell through to the no-op
-    and a web-picked model never reached the running Pi process.
-
-    Pins:
-    1. 204 returned.
-    2. A ``model_change_*`` payload carrying the model id is written to the
-       session's bridge inbox.
-    """
+    """A live model switch carries the explicit session effort in Pi vocabulary."""
     import json as _json
 
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
@@ -3826,6 +3746,12 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
         )
         assert create_resp.status_code == 201, create_resp.text
 
+        if effort is not None:
+            effort_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "effort_change", "effort": effort},
+            )
+            assert effort_resp.status_code == 204
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={"type": "model_change", "model": "databricks-claude-opus-4-1"},
@@ -3846,6 +3772,9 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     )
     assert model_changes[0]["model"] == "databricks-claude-opus-4-1"
     assert model_changes[0]["id"].startswith("model_change_")
+
+    expected_level = {"none": "off", "ultra": "max"}.get(effort, effort)
+    assert model_changes[0].get("thinkingLevel") == expected_level
 
 
 def test_interrupted_sessions_isolated_per_app_instance() -> None:
