@@ -304,6 +304,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   /** Takes the next chord ahead of the page's shortcuts and the menu; null when cancelled. */
   recordGlobalShortcut?: () => Promise<string | null>;
   cancelGlobalShortcutRecording?: () => Promise<boolean>;
+  /** The attached browser page's view id if it has keyboard focus; absent on older shells. */
+  browserFocusedView?: () => Promise<string | null>;
 }
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
@@ -875,6 +877,15 @@ export function cancelGlobalShortcutRecording(): void {
   void electronApi()
     ?.cancelGlobalShortcutRecording?.()
     .catch(() => {});
+}
+
+/** The browser page (its view id) that has keyboard focus in this window, if any. */
+export async function focusedBrowserView(): Promise<string | null> {
+  try {
+    return (await electronApi()?.browserFocusedView?.()) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**

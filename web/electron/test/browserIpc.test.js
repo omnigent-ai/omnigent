@@ -424,6 +424,7 @@ function makeWebContents({
     getURL: () => url,
     getTitle: () => title,
     getZoomFactor: () => 1,
+    focus: () => calls.push("focus"),
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
       scripts.push(String(js));
@@ -585,6 +586,39 @@ it("does not mistake subframe loading for an initial main-frame navigation", () 
   assert.equal("pendingUrl" in result, false);
 });
 
+describe("browserIpc — set active", () => {
+  it("focuses the attached page only when asked", () => {
+    const { ipcMain, event, wc } = setup();
+    ipcMain.invoke("omnigent:browser-set-active", event, { conversationId: "conv_1" });
+    assert.deepEqual(wc.calls, []);
+    ipcMain.invoke("omnigent:browser-set-active", event, { conversationId: "conv_1", focus: true });
+    assert.deepEqual(wc.calls, ["focus"]);
+  });
+});
+
+describe("browserIpc — focused view", () => {
+  it("names the attached page only while it has keyboard focus", () => {
+    const webContents = makeWebContents();
+    let focused = true;
+    webContents.isFocused = () => focused;
+    const { ipcMain, event, registry } = setup({ webContents });
+    let active = "conv_1";
+    registry.activeConversationId = () => active;
+    assert.equal(ipcMain.invoke("omnigent:browser-focused-view", event), "conv_1");
+    focused = false;
+    assert.equal(ipcMain.invoke("omnigent:browser-focused-view", event), null);
+    focused = true;
+    active = null;
+    assert.equal(ipcMain.invoke("omnigent:browser-focused-view", event), null);
+  });
+
+  it("answers nothing to a page off the pinned server", () => {
+    const { ipcMain, event, registry } = setup({ pinned: false });
+    registry.activeConversationId = () => "conv_1";
+    assert.equal(ipcMain.invoke("omnigent:browser-focused-view", event), null);
+  });
+});
+
 describe("browserIpc — trust gate", () => {
   it("registers every browser-* channel", () => {
     const { ipcMain } = setup();
@@ -592,6 +626,7 @@ describe("browserIpc — trust gate", () => {
     for (const ch of [
       "omnigent:browser-open-or-navigate",
       "omnigent:browser-set-active",
+      "omnigent:browser-focused-view",
       "omnigent:browser-set-suppressed",
       "omnigent:browser-set-recent-session-switch-supported",
       "omnigent:browser-cancel-recent-session-switch",

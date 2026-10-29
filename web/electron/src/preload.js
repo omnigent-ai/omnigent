@@ -333,8 +333,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * active one). Pass null to detach everything (no pane mounted).
    * @param {string | null} conversationId
    */
-  browserSetActive: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-set-active", { conversationId }),
+  browserSetActive: (conversationId, options) =>
+    ipcRenderer.invoke("omnigent:browser-set-active", {
+      conversationId,
+      focus: options?.focus === true,
+    }),
+  /** The attached browser page's view id if it has keyboard focus, else null. */
+  browserFocusedView: () => ipcRenderer.invoke("omnigent:browser-focused-view"),
   /**
    * Hide (true) or show (false) the active browser view while a DOM overlay is
    * open, so the native layer doesn't cover dialogs/menus/tooltips/toasts.
