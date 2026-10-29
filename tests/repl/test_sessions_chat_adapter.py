@@ -286,6 +286,26 @@ def test_elicitation_request_event_preserves_target_session_id() -> None:
     assert out.target_session_id == "conv_child123"
 
 
+def test_elicitation_waiting_in_terminal_is_not_prompted() -> None:
+    """A prompt held in the agent's terminal can't be answered from the REPL.
+
+    Translating it would show a y/n prompt whose answer the server refuses.
+    """
+    from omnigent.server.schemas import (
+        ElicitationRequestEvent,
+        ElicitationRequestParams,
+    )
+
+    event = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_held",
+        params=ElicitationRequestParams.model_validate(
+            {"message": "Run ls?", "terminal_fallback": {"answer_undelivered": False}}
+        ),
+    )
+    assert _server_event_to_sdk_event(event) is None
+
+
 def test_elicitation_resolve_session_id_routes_mirrored_child_to_child() -> None:
     """Mirrored child prompt resolves against the child, own prompt against the stream.
 

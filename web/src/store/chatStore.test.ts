@@ -67,6 +67,7 @@ import type {
   StreamEvent,
   TerminalCommandEvent,
 } from "@/lib/events";
+import type { Session } from "@/lib/types";
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
@@ -1446,11 +1447,12 @@ describe("chatStore — switchTo", () => {
   });
 
   it.each([
-    { nativeDeliveryResolved: false, reopened: true },
-    { nativeDeliveryResolved: true, reopened: false },
+    { nativeDeliveryResolved: false, olderQueryInFlight: false, reopened: true },
+    { nativeDeliveryResolved: true, olderQueryInFlight: false, reopened: false },
+    { nativeDeliveryResolved: false, olderQueryInFlight: true, reopened: true },
   ])(
-    "reopens an answered card on tab focus once its prompt waits in the terminal (nativeDeliveryResolved=$nativeDeliveryResolved)",
-    async ({ nativeDeliveryResolved, reopened }) => {
+    "reopens an answered card on tab focus once its prompt waits in the terminal (nativeDeliveryResolved=$nativeDeliveryResolved, olderQueryInFlight=$olderQueryInFlight)",
+    async ({ nativeDeliveryResolved, olderQueryInFlight, reopened }) => {
       const prompt = {
         type: "response.elicitation_request",
         elicitation_id: "elic_vis_held",
@@ -1480,18 +1482,42 @@ describe("chatStore — switchTo", () => {
             : b,
         ),
       });
+      let snapshotRequests = 0;
+      let releaseOlderQuery = () => {};
+      if (olderQueryInFlight) {
+        // A snapshot taken before the hold is still loading when the tab regains focus.
+        const route = fetchMock.getMockImplementation()!;
+        const olderQueryHeld = new Promise<void>((resolve) => {
+          releaseOlderQuery = resolve;
+        });
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (!String(input).startsWith("/v1/sessions/conv_vis_held?")) return route(input, init);
+          snapshotRequests += 1;
+          const response = route(input, init);
+          if (snapshotRequests === 1) await olderQueryHeld;
+          return response;
+        });
+        void client.fetchQuery({
+          queryKey: ["session", "conv_vis_held"],
+          queryFn: () => getSessionSlim("conv_vis_held"),
+        });
+        await tick();
+      }
+      const held = {
+        ...prompt,
+        params: { ...prompt.params, terminal_fallback: { answer_undelivered: true } },
+      };
       // The hook exited before the answer reached it; the hidden tab missed the re-publish.
-      seedPendingElicitations("conv_vis_held", [
-        {
-          ...prompt,
-          params: { ...prompt.params, terminal_fallback: { answer_undelivered: true } },
-        },
-      ]);
+      seedPendingElicitations("conv_vis_held", [held]);
 
       document.dispatchEvent(new Event("visibilitychange"));
       await tick();
       await tick();
 
+      if (olderQueryInFlight) expect(snapshotRequests).toBe(2);
+      expect(
+        client.getQueryData<Session>(["session", "conv_vis_held"])?.pendingElicitations,
+      ).toEqual([held]);
       expect(cards()).toHaveLength(1);
       // A card the native delivery confirmed stays settled, as on reconnect.
       expect(cards()[0]).toMatchObject(
@@ -1499,6 +1525,7 @@ describe("chatStore — switchTo", () => {
           ? { status: "pending", response: null, terminalFallback: { answerUndelivered: true } }
           : { status: "responded", response: { action: "accept" } },
       );
+      releaseOlderQuery();
     },
   );
 

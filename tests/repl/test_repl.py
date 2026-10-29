@@ -2964,23 +2964,31 @@ async def test_sessions_adapter_contains_repeated_elicitation_transport_failure(
 
 
 @pytest.mark.asyncio
-async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict() -> None:
+@pytest.mark.parametrize("refused_in_terminal", [False, True])
+async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict(
+    refused_in_terminal: bool,
+) -> None:
     """An undeliverable verdict must reach the user, not just the log.
 
     Exhausted retries leave the elicitation parked server-side, so the turn
     waits on an answer that will never arrive. Without a rendered error the
     user sits at an apparently live prompt with no idea their approval was
-    dropped.
+    dropped. A prompt that moved to the agent's terminal refuses the answer
+    outright, and only that terminal can still answer it.
     """
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
 
     import httpx
-    from omnigent_client import StreamHooks
+    from omnigent_client import OmnigentError, StreamHooks
 
     client = MagicMock()
     client.sessions.resolve_elicitation = AsyncMock(
-        side_effect=httpx.ConnectError("connection dropped"),
+        side_effect=(
+            OmnigentError("Answer it in the agent's terminal.", 423, "prompt_in_terminal")
+            if refused_in_terminal
+            else httpx.ConnectError("connection dropped")
+        ),
     )
     adapter = _SessionsChatReplAdapter(
         client=client,
@@ -3003,14 +3011,19 @@ async def test_sessions_adapter_surfaces_undeliverable_elicitation_verdict() -> 
 
     await adapter._handle_elicitation("conv_abc", event)
 
+    assert client.sessions.resolve_elicitation.await_count == (1 if refused_in_terminal else 3)
     assert len(rendered) == 1, f"expected one rendered error event, got {rendered}"
     emitted = rendered[0]
     assert emitted.type == "response.error"
     assert emitted.error.code == "elicitation_resolve_failed"
-    # Names the surface that can still answer: the terminal prompt is gone
+    # Names the surface that can still answer: the REPL prompt is gone
     # by now, so pointing the user back at it would be a dead end.
-    assert "web UI" in emitted.error.message
-    assert "still waiting" in emitted.error.message
+    if refused_in_terminal:
+        assert "agent's terminal" in emitted.error.message
+        assert "web UI" not in emitted.error.message
+    else:
+        assert "web UI" in emitted.error.message
+        assert "still waiting" in emitted.error.message
 
 
 def test_is_recoverable_sse_transport_error_for_write_errors() -> None:

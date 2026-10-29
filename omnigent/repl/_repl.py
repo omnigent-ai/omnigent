@@ -1305,6 +1305,9 @@ def _server_event_to_sdk_event(event: object) -> object | None:
         return ReasoningSummaryDelta(delta=event.delta)
     if isinstance(event, ElicitationRequestEvent):
         params = event.params
+        if getattr(params, "terminal_fallback", None) is not None:
+            # Held in the agent's terminal; the server refuses answers sent from here.
+            return None
         return ElicitationRequest(
             elicitation_id=event.elicitation_id,
             message=params.message,
@@ -2121,7 +2124,9 @@ class _SessionsChatReplAdapter:
             )
         )
 
-    def _emit_elicitation_resolve_error(self, exc: Exception) -> None:
+    def _emit_elicitation_resolve_error(
+        self, exc: Exception, *, in_agent_terminal: bool = False
+    ) -> None:
         """
         Render an undeliverable elicitation verdict in the error panel.
 
@@ -2134,6 +2139,8 @@ class _SessionsChatReplAdapter:
 
         :param exc: Last transport failure raised by the resolve POST,
             e.g. an ``httpx.ConnectError``.
+        :param in_agent_terminal: The server refused the answer because
+            the prompt now waits in the agent's terminal.
         :returns: None.
         """
         if self._on_event is None:
@@ -2141,18 +2148,22 @@ class _SessionsChatReplAdapter:
 
         from omnigent.server.schemas import ErrorEvent, RetryErrorDetail
 
+        if in_agent_terminal:
+            message = (
+                "Your answer wasn't delivered: this prompt is waiting in the "
+                "agent's terminal, so answer it there."
+            )
+        else:
+            message = (
+                f"Could not deliver your answer to the server: {exc}. "
+                "The request is still waiting for an answer, and this "
+                "prompt is gone, so answer it from the web UI."
+            )
         self._on_event(
             ErrorEvent(
                 type="response.error",
                 source="execution",
-                error=RetryErrorDetail(
-                    code="elicitation_resolve_failed",
-                    message=(
-                        f"Could not deliver your answer to the server: {exc}. "
-                        "The request is still waiting for an answer, and this "
-                        "prompt is gone, so answer it from the web UI."
-                    ),
-                ),
+                error=RetryErrorDetail(code="elicitation_resolve_failed", message=message),
             )
         )
 
@@ -2791,6 +2802,9 @@ class _SessionsChatReplAdapter:
                 if exc.code == "not_found":
                     # Another client may have resolved it while the terminal
                     # prompt was open, or the first POST reached the server.
+                    return
+                if exc.code == "prompt_in_terminal":
+                    self._emit_elicitation_resolve_error(exc, in_agent_terminal=True)
                     return
                 raise
             except Exception as exc:

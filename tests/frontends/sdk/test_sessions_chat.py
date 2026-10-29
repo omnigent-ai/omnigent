@@ -137,6 +137,7 @@ class _FakeNamespace(SessionsNamespace):
         self._session_obj = session_obj
         self.post_event_calls: list[_PostEventCall] = []
         self.resolve_elicitation_calls: list[_ResolveElicitationCall] = []
+        self.resolve_elicitation_errors: dict[str, Exception] = {}
         self.interrupt_calls: list[str] = []
         self.create_calls: list[tuple[bytes, str]] = []
         self.get_calls: list[str] = []
@@ -181,6 +182,8 @@ class _FakeNamespace(SessionsNamespace):
                 result=result,
             )
         )
+        if elicitation_id in self.resolve_elicitation_errors:
+            raise self.resolve_elicitation_errors[elicitation_id]
         return {"queued": False}
 
     async def interrupt(self, session_id: str) -> None:  # type: ignore[override]
@@ -647,14 +650,19 @@ async def test_send_fires_stream_hooks_for_sessions_events() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_routes_elicitation_hook_to_resolve_endpoint() -> None:
+async def test_send_routes_elicitation_hook_to_resolve_endpoint(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     Elicitation hooks must resolve the sessions-native approval request.
 
     Without this, an SDK user who registers ``on_elicitation_request``
     through the sessions chat helper sees the prompt but the parked
-    workflow never receives the approval verdict.
+    workflow never receives the approval verdict. A prompt waiting in the
+    agent's terminal isn't offered, and a refused answer doesn't end the turn.
     """
+    from omnigent_client._errors import OmnigentError
+
     session = _make_session()
     calls: list[tuple[str, str, str]] = []
 
@@ -674,9 +682,28 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint() -> None:
             target_session_id="conv_child",
         ),
     )
+    held = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_held",
+        params=ElicitationRequestParams.model_validate(
+            {"message": "Run ls?", "terminal_fallback": {"answer_undelivered": False}}
+        ),
+    )
+    refused = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_refused",
+        params=ElicitationRequestParams(message="Run pwd?"),
+    )
     ns = _FakeNamespace(
-        stream_scripts=[_StreamScript(events=[_created_event(), request, _completed_event()])],
+        stream_scripts=[
+            _StreamScript(events=[_created_event(), request, held, refused, _completed_event()])
+        ],
         session_obj=session,
+    )
+    ns.resolve_elicitation_errors["elicit_refused"] = OmnigentError(
+        "This prompt is waiting in the agent's terminal. Answer it there.",
+        423,
+        "prompt_in_terminal",
     )
     chat = SessionsChat(
         namespace=ns,
@@ -686,16 +713,27 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint() -> None:
         hooks=StreamHooks(on_elicitation_request=on_elicitation_request),
     )
 
-    [event async for event in chat.send("hi")]
+    with caplog.at_level("WARNING", logger="omnigent_client.sessions_chat"):
+        events = [event async for event in chat.send("hi")]
 
-    assert calls == [("elicit_1", "Approve this?", "resp_1")]
+    assert "elicit_refused is waiting in the agent's terminal" in caplog.text
+    assert calls == [
+        ("elicit_1", "Approve this?", "resp_1"),
+        ("elicit_refused", "Run pwd?", "resp_1"),
+    ]
     assert ns.resolve_elicitation_calls == [
         _ResolveElicitationCall(
             session_id="conv_child",
             elicitation_id="elicit_1",
             result={"action": "accept"},
-        )
+        ),
+        _ResolveElicitationCall(
+            session_id="conv_abc",
+            elicitation_id="elicit_refused",
+            result={"action": "accept"},
+        ),
     ]
+    assert isinstance(events[-1], CompletedEvent)
 
 
 @pytest.mark.asyncio

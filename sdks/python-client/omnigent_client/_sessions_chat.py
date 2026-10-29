@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import inspect
 import json
+import logging
 import mimetypes
 import pathlib
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -82,6 +83,8 @@ from ._tool_handler import (
     ToolCallStartCtx,
 )
 from ._types import File, Response
+
+_log = logging.getLogger("omnigent_client.sessions_chat")
 
 # Text block types accepted when falling back from streamed deltas
 # to final assistant message content.
@@ -1108,9 +1111,13 @@ class SessionsChat:
 
         No registered hook means fail-closed decline, matching the
         deprecated responses client and avoiding a parked workflow that
-        waits forever for a decision the SDK will never send.
+        waits forever for a decision the SDK will never send. A prompt
+        held in the agent's terminal can only be answered there, so it
+        is skipped, and a refused answer is logged instead of ending the turn.
         """
         params = event.params
+        if getattr(params, "terminal_fallback", None) is not None:
+            return
         accepted = await _invoke_elicitation_hook(
             self._hooks,
             ElicitationRequestCtx(
@@ -1126,11 +1133,19 @@ class SessionsChat:
             ),
         )
         target_session_id = params.target_session_id or self._session.id
-        await self._namespace.resolve_elicitation(
-            target_session_id,
-            event.elicitation_id,
-            {"action": "accept" if accepted else "decline"},
-        )
+        try:
+            await self._namespace.resolve_elicitation(
+                target_session_id,
+                event.elicitation_id,
+                {"action": "accept" if accepted else "decline"},
+            )
+        except OmnigentError as exc:
+            if exc.code != "prompt_in_terminal":
+                raise
+            _log.warning(
+                "Elicitation %s is waiting in the agent's terminal; answer it there",
+                event.elicitation_id,
+            )
 
     @overload
     async def query(

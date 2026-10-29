@@ -3486,7 +3486,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       // The stream missed the prompt moving to the terminal; fetch the held card.
       if (err instanceof ApiError && err.code === PROMPT_IN_TERMINAL_CODE) {
-        void reconcilePendingElicitations(sessionId, { fresh: true });
+        void reconcilePendingElicitations(sessionId);
       }
     }
   },
@@ -4544,30 +4544,20 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  * including one answered locally, takes the snapshot's copy. Cards changed or
  * added during the fetch are kept. No-op when the session changed mid-fetch,
  * the fetch fails (transient — the next focus retries), or nothing is stale.
+ * Reads the server directly: a shared in-flight query may predate the change.
  *
  * @param id - Conversation/session id to reconcile.
- * @param options.fresh - Skip the shared query, whose in-flight fetch may predate a change
- *   the caller already knows happened.
  */
-async function reconcilePendingElicitations(
-  id: string,
-  { fresh = false }: { fresh?: boolean } = {},
-): Promise<void> {
+async function reconcilePendingElicitations(id: string): Promise<void> {
   if (queryClient === null) return;
   const cardsBeforeFetch = captureElicitationIdsByStatus(setterForState(id)?.blocks ?? []).cards;
   let session: Session;
   try {
-    session = fresh
-      ? await getSessionSlim(id)
-      : await queryClient.fetchQuery({
-          queryKey: ["session", id],
-          queryFn: () => getSessionSlim(id),
-          staleTime: 0,
-          retry: false,
-        });
+    session = await getSessionSlim(id);
   } catch {
     return;
   }
+  queryClient.setQueryData(["session", id], session);
   // Liveness, not foreground: every live conversation reconciles, so a
   // background one that missed `response.elicitation_resolved` doesn't keep
   // showing a card that was already answered elsewhere. Gating on the visible
