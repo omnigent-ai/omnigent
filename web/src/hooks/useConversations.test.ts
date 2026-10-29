@@ -1,7 +1,7 @@
 // Unit tests for the conversation-mutation HTTP helpers, plus the
 // query-invalidation contract of the stop mutation hook.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +28,7 @@ import {
   useProjects,
   useProjectConfig,
   useProjectSessions,
+  useProjectWriting,
   useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
@@ -575,6 +576,60 @@ describe("useRenameProject", () => {
     });
 
     expect(id).toBe("proj_1");
+  });
+});
+
+describe("project write lock", () => {
+  const toasts: string[] = [];
+  const onToast = (e: Event) =>
+    toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+  beforeEach(() => {
+    toasts.length = 0;
+    window.addEventListener("omnigent:toast", onToast);
+  });
+  afterEach(() => window.removeEventListener("omnigent:toast", onToast));
+
+  it("holds through the list refetch after a rename and refuses moves meanwhile", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "proj_1", name: "New" })); // PATCH rename
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }), // members
+    );
+    let listed!: (projects: { id: string; name: string }[]) => void;
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => ({
+        projects: useQuery({
+          queryKey: ["projects"],
+          queryFn: () =>
+            new Promise<{ id: string; name: string }[]>((resolve) => {
+              listed = resolve;
+            }),
+          initialData: [{ id: "proj_1", name: "old" }],
+          staleTime: Infinity,
+        }),
+        rename: useRenameProject(),
+        move: useMoveToProject(),
+        writing: useProjectWriting(),
+      }),
+      { wrapper },
+    );
+
+    act(() => result.current.rename.mutate({ id: "proj_1", oldName: "old", newName: "New" }));
+    await waitFor(() => expect(listed).toBeDefined());
+    expect(result.current.writing).toBe(true);
+    const moved = await result.current.move
+      .mutateAsync({ id: "conv_1", project: "old" })
+      .catch((error: Error) => error);
+
+    expect(moved).toEqual(new Error("Projects are still saving. Try again when they finish."));
+    expect(toasts).toEqual([
+      `Couldn't move the session to "old". Projects are still saving. Try again when they finish.`,
+    ]);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("conv_1"))).toBe(false);
+    act(() => listed([{ id: "proj_1", name: "New" }]));
+    await waitFor(() => expect(result.current.writing).toBe(false));
   });
 });
 
