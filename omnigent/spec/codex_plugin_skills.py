@@ -63,15 +63,19 @@ def _inventory_failure(exc: Exception) -> tuple[str, str]:
     return "`codex plugin list` could not be run", str(exc)
 
 
-def _without_inventory(summary: str, detail: str, warnings: list[str] | None) -> list[SkillSpec]:
-    """Omit plugin skills, telling the host log and the caller's menu why."""
-    message = f"Codex plugin skills unavailable: {summary}"
+def _report_plugin_skills(message: str, detail: str, warnings: list[str] | None) -> None:
+    """Tell the host log and the caller's menu why plugin skills are missing."""
     if detail:
         _log.warning("%s: %s", message, detail)
     else:
         _log.warning("%s", message)
     if warnings is not None:
         warnings.append(f"{message}; see the host log for details." if detail else f"{message}.")
+
+
+def _without_inventory(summary: str, detail: str, warnings: list[str] | None) -> list[SkillSpec]:
+    """Omit plugin skills, telling the host log and the caller's menu why."""
+    _report_plugin_skills(f"Codex plugin skills unavailable: {summary}", detail, warnings)
     return []
 
 
@@ -97,15 +101,21 @@ def _inventory_plugins(codex_path: str, codex_home: Path, cwd: Path | None) -> l
 
 
 def _loaded_plugin_skills(
-    codex_path: str, codex_home: Path, skills_filter: str | list[str], cwd: Path | None
+    codex_path: str,
+    codex_home: Path,
+    skills_filter: str | list[str],
+    cwd: Path | None,
+    errors: list[str],
 ) -> list[SkillSpec]:
     """Use Codex's effective configuration and version selection when inventory fails.
+
+    Failures Codex reports while loading skills are appended to ``errors``.
 
     :raises OSError, RuntimeError, TimeoutError, ValueError: Codex could not list its skills.
     """
     from omnigent.harnesses.codex_native.skill_discovery import loaded_codex_skills
 
-    skills = loaded_codex_skills(codex_path, codex_home, cwd or codex_home)
+    skills = loaded_codex_skills(codex_path, codex_home, cwd or codex_home, errors=errors)
     cache = (codex_home / "plugins" / "cache").resolve()
     filter_names = set(skills_filter) if isinstance(skills_filter, list) else None
     out: list[SkillSpec] = []
@@ -158,8 +168,11 @@ def discover_codex_plugin_skills(
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         summary, detail = _inventory_failure(exc)
         _log.info("Codex plugin inventory unavailable: %s", detail or summary)
+        catalog_errors: list[str] = []
         try:
-            return _loaded_plugin_skills(codex_path, codex_home, skills_filter, cwd)
+            loaded = _loaded_plugin_skills(
+                codex_path, codex_home, skills_filter, cwd, catalog_errors
+            )
         except (OSError, RuntimeError, TimeoutError, ValueError) as catalog_exc:
             catalog_detail = str(catalog_exc) or type(catalog_exc).__name__
             return _without_inventory(
@@ -167,6 +180,14 @@ def discover_codex_plugin_skills(
                 f"{detail}; {catalog_detail}" if detail else catalog_detail,
                 warnings,
             )
+        if catalog_errors:
+            _report_plugin_skills(
+                f"Codex plugin skills may be incomplete: {summary} and "
+                "`codex app-server` reported errors loading skills",
+                "; ".join([detail, *catalog_errors] if detail else catalog_errors),
+                warnings,
+            )
+        return loaded
     filter_names = set(skills_filter) if isinstance(skills_filter, list) else None
     out: list[SkillSpec] = []
     for plugin in plugins:
