@@ -418,7 +418,7 @@ class NativeInterruptRunner:
         spec = _UNIFORM_STOP.get(key)
         if spec is None:
             return None
-        return await self._uniform_stop(spec, conv_id)
+        return await self._uniform_stop(key, spec, conv_id)
 
     def _defer_parent_wake_after_native_interrupt(self, conv_id: str) -> None:
         """Record the interrupt instead of guessing a terminal status.
@@ -602,7 +602,7 @@ class NativeInterruptRunner:
             self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
-    async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
+    async def _uniform_stop(self, key: str, spec: _UniformStop, conv_id: str) -> Response:
         module = importlib.import_module(spec.module)
         try:
             await asyncio.to_thread(
@@ -614,10 +614,11 @@ class NativeInterruptRunner:
             # is already gone. Claude's genuine gone case is
             # ``TmuxSessionNotAdvertised`` and returns 204 from ``_claude_stop``.
             terminal_registry = self._resource_registry.terminal_registry
-            if terminal_registry is not None and not terminal_registry.list_for_conversation(
-                conv_id
+            if terminal_registry is not None and not any(
+                entry.terminal_name == key and entry.session_key == "main"
+                for entry in terminal_registry.list_for_conversation(conv_id)
             ):
-                # No pane is registered, so the kill had nothing to hit; the
+                # The harness pane is gone, so the kill had nothing to hit; the
                 # forwarder must still go, or it holds the session's chat claim.
                 await _cancel_auto_forwarder_task(conv_id)
             return JSONResponse(

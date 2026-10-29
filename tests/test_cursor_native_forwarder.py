@@ -725,6 +725,9 @@ class _FakePoster:
         self.delivered.append(item)
 
 
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
 async def _drive_forwarder(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -744,17 +747,16 @@ async def _drive_forwarder(
     *claim* overrides the default never-claimed stub (e.g. to inject failures).
     """
     bridge_dir = tmp_path / "cursor-native" / "sess"
-    bridge_dir.mkdir(parents=True)
+    bridge_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
     monkeypatch.setattr(fwd, "_chat_claimed_by_other", claim or (lambda *a, **k: False))
     monkeypatch.setattr(fwd, "_post_conversation_item", poster)
     # Answer the loop's other requests (e.g. the external_session_id PATCH)
     # in-process: resolving the fake host can stall past the tick budget.
-    real_client = httpx.AsyncClient
     monkeypatch.setattr(
         fwd.httpx,
         "AsyncClient",
-        lambda **kwargs: real_client(
+        lambda **kwargs: _REAL_ASYNC_CLIENT(
             transport=httpx.MockTransport(lambda request: httpx.Response(204)), **kwargs
         ),
     )
@@ -907,6 +909,90 @@ class TestForwardLoopPostFailures:
         # Retried well past the skip bound, yet never advanced — not quarantined.
         assert fwd._read_state(bridge).last_rowid == 0
         assert not poster.delivered
+
+    @staticmethod
+    def _workspace_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, chat_id: str) -> Path:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        store = chats_root / hashlib.md5(b"/ws").hexdigest() / chat_id / "store.db"
+        store.parent.mkdir(parents=True)
+        return store
+
+    @pytest.mark.asyncio
+    async def test_reply_pending_at_pane_exit_is_delivered_on_resume(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The server is unreachable when the reply lands, then the pane exits and
+        # its forwarder is retired. Resuming after recovery must still deliver
+        # that reply, from this session's chat rather than a newer one.
+        store = self._workspace_store(monkeypatch, tmp_path, _CHAT_ID)
+        self._seed(store, [("b1", "question"), ("b2", "pending reply")])
+        other_chat = self._workspace_store(monkeypatch, tmp_path, _CHAT_ID_2)
+        self._seed(other_chat, [("o1", "another session")])
+        req = httpx.Request("POST", "http://test")
+
+        def outage(item: fwd._MirrorItem):
+            return httpx.ConnectError("refused", request=req) if item.rowid == 2 else None
+
+        offline = _FakePoster(outage)
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            offline,
+            until=lambda b: sum(it.rowid == 2 for it in offline.calls) >= 2,
+        )
+        fwd.release_cursor_chat_claim(bridge)
+        assert fwd.preseed_resume_state(bridge, "/ws", _CHAT_ID, launch_epoch_ms=2_000)
+
+        online = _FakePoster(lambda item: None)
+        await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            other_chat,
+            online,
+            until=lambda b: fwd._read_state(b).last_rowid >= 2,
+        )
+
+        assert [it.rowid for it in offline.delivered] == [1]
+        assert [it.item_data["content"][0]["text"] for it in online.delivered] == ["pending reply"]
+        assert fwd._read_state(bridge).store_path == str(store)
+
+    @pytest.mark.asyncio
+    async def test_yielding_the_chat_drops_the_saved_cursor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Once an earlier session owns the chat, later rows are mirrored there;
+        # resuming the session that yielded must not replay them.
+        store = self._workspace_store(monkeypatch, tmp_path, _CHAT_ID)
+        self._seed(store, [("b1", "one")])
+        poster = _FakePoster(lambda item: None)
+        yields = 0
+
+        def claimed_after_first_delivery(*_args: object) -> bool:
+            nonlocal yields
+            yields += bool(poster.delivered)
+            return bool(poster.delivered)
+
+        bridge = await _drive_forwarder(
+            monkeypatch,
+            tmp_path,
+            store,
+            poster,
+            until=lambda b: yields >= 2,
+            claim=claimed_after_first_delivery,
+        )
+        assert fwd._read_state(bridge).store_path is None
+
+        writer = sqlite3.connect(store)
+        writer.execute(
+            "INSERT INTO blobs(id, data) VALUES(?, ?)",
+            ("b2", json.dumps(_user("<user_query>\ntwo\n</user_query>")).encode()),
+        )
+        writer.commit()
+        writer.close()
+        fwd.preseed_resume_state(bridge, "/ws", _CHAT_ID, launch_epoch_ms=2_000)
+        assert fwd._read_state(bridge).last_rowid == 2
 
 
 class TestFdExhaustionErrno:
@@ -1151,6 +1237,34 @@ class TestPreseedResumeState:
         fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID_2, launch_epoch_ms=1_000)
 
         assert fwd._read_state(bridge_dir).last_rowid == 0
+
+    @pytest.mark.parametrize(
+        ("same_chat", "saved_rowid", "expected"),
+        [(True, 3, 3), (True, 9, 5), (False, 3, 5)],
+        ids=["undelivered-rows", "past-store-end", "other-chat"],
+    )
+    def test_saved_cursor_applies_only_to_the_same_chat(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        same_chat: bool,
+        saved_rowid: int,
+        expected: int,
+    ) -> None:
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: tmp_path / "chats")
+        store = self._seed_chat(tmp_path / "chats", "/ws", _CHAT_ID, rows=5)
+        bridge_dir = tmp_path / "bridge"
+        bridge_dir.mkdir()
+        saved_store = str(store) if same_chat else "/cursor/chats/h/other/store.db"
+        fwd._persist_state(
+            bridge_dir,
+            fwd._ForwardState(store_path=saved_store, last_rowid=saved_rowid),
+            heartbeat_ms=0,
+        )
+
+        fwd.preseed_resume_state(bridge_dir, "/ws", _CHAT_ID, launch_epoch_ms=2_000)
+
+        assert fwd._read_state(bridge_dir).last_rowid == expected
 
 
 class TestForwardLoopPreseedResume:

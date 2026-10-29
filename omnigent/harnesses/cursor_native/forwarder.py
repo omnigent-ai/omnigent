@@ -365,6 +365,8 @@ def preseed_resume_state(
 
     Writing the known store path + current rowid here lets the forwarder skip
     discovery entirely and start tailing only messages posted after the resume.
+    When this session's saved cursor already names the store, resume continues
+    from it instead, so rows that were never delivered are still mirrored.
 
     External contract (verified empirically against the current cursor build):
     ``cursor-agent --resume`` reuses the SAME chat store and *appends* new turns
@@ -387,6 +389,9 @@ def preseed_resume_state(
     if not store_path.exists():
         return False
     last_rowid = _get_current_rowid(store_path)
+    saved = _read_state(bridge_dir)
+    if saved.store_path == str(store_path):
+        last_rowid = min(saved.last_rowid, last_rowid)
     _write_state(
         bridge_dir,
         _ForwardState(
@@ -445,12 +450,8 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     best, _best_created = _scan_hash_dir(exact_dir, floor_ms, None, -1)
     if best is not None:
         return best
-    # Fallback ONLY for a path-hash mismatch: scan the other workspace dirs, but
-    # bind only when EXACTLY ONE chat across them qualifies. With two candidates
-    # we can't tell which session owns which (concurrent sessions, or an
-    # unrelated workspace), so we return None and retry rather than risk
-    # mirroring the wrong conversation — silent cross-talk is worse than a brief
-    # delay. Another workspace's chat that predates this launch is never ours.
+    # Hash-mismatch fallback: bind only when exactly one chat in other dirs
+    # qualifies; with several we can't tell ownership, so retry instead.
     if not root.is_dir():
         return None
     matches: list[Path] = []
@@ -459,6 +460,7 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
             continue
         for chat_dir in hash_dir.iterdir():
             store = chat_dir / "store.db"
+            # No skew here: another workspace's pre-launch chat is never ours.
             if store.is_file() and _chat_created_ms(chat_dir) >= launch_epoch_ms:
                 matches.append(store)
     return matches[0] if len(matches) == 1 else None
@@ -1072,6 +1074,8 @@ async def forward_cursor_store_to_session(
                             store_path,
                             session_id,
                         )
+                        # The owner mirrors these rows, so a resume must not replay them.
+                        clear_cursor_bridge_state(bridge_dir)
                         store_path = None
                     else:
                         items = await asyncio.to_thread(
