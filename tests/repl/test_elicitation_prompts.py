@@ -562,3 +562,73 @@ def test_stream_reconnect_replays_pending_prompts_once_per_subscription() -> Non
     _run(_run_case())
     # Two events per subscription, but one replay each.
     assert replay.call_count == 2
+
+
+def _approval_event(elicitation_id: str = "elicit_approve") -> Any:
+    event = _form_event(elicitation_id, {})
+    event.message = "approve the tool call?"
+    return event
+
+
+def test_child_replay_does_not_settle_open_parent_approval() -> None:
+    # A child's snapshot never lists the parent's prompts, so viewing a child
+    # must not read the parent's open y/a/n approval as settled.
+    adapter, _, _, client, approval_hook = _adapter()
+    verdicts: list[asyncio.Future[bool]] = []
+
+    async def _wait_for_user(ctx: Any) -> bool:
+        verdicts.append(asyncio.get_running_loop().create_future())
+        return await verdicts[-1]
+
+    approval_hook.side_effect = _wait_for_user
+    client.sessions.get = AsyncMock(return_value=SimpleNamespace(pending_elicitations=[]))
+    released: list[Any] = []
+    adapter._on_event = released.append
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", _approval_event()))
+        await _until(lambda: approval_hook.await_count == 1, "the approval never opened")
+        adapter._session_id = "conv_child"  # the user dives into a sub-agent
+        await adapter._replay_pending_elicitations("conv_child")
+        assert not task.done(), "the parent approval was settled by a child snapshot"
+        verdicts[-1].set_result(True)
+        await task
+
+    _run(_run_case())
+    assert released == []
+    assert _posted(client) == [("conv_abc", "elicit_approve", {"action": "accept"})]
+
+
+def test_child_replay_does_not_settle_open_parent_form() -> None:
+    adapter, _, fis, client, _ = _adapter()
+    client.sessions.get = AsyncMock(return_value=SimpleNamespace(pending_elicitations=[]))
+    released: list[Any] = []
+    adapter._on_event = released.append
+    form = _form_event("elicit_form", {"properties": {"name": {"type": "string"}}})
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
+        await _until(lambda: fis.pending, "the field prompt never opened")
+        adapter._session_id = "conv_child"
+        await adapter._replay_pending_elicitations("conv_child")
+        assert fis.pending, "the parent form was released by a child snapshot"
+        fis.resolve("Ada")
+        await task
+
+    _run(_run_case())
+    assert released == []
+    assert _posted(client) == [
+        ("conv_abc", "elicit_form", {"action": "accept", "content": {"name": "Ada"}})
+    ]
+
+
+def test_approval_settled_elsewhere_posts_no_verdict() -> None:
+    adapter, _, _, client, approval_hook = _adapter()
+
+    async def _settled_elsewhere(ctx: Any) -> bool:
+        adapter.note_elicitation_resolved(ctx.elicitation_id)  # as run_repl does
+        return False
+
+    approval_hook.side_effect = _settled_elsewhere
+    _run(adapter._handle_elicitation("conv_abc", _approval_event()))
+    client.sessions.resolve_elicitation.assert_not_awaited()

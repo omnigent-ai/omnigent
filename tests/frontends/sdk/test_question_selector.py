@@ -11,15 +11,14 @@ to the input history.
 
 from __future__ import annotations
 
-import contextlib
 import sys
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
 import pexpect
-import pyte
 import pytest
+
+from tests._helpers.terminal_screen import TerminalScreen
 
 _DRIVER = Path(__file__).parent / "_question_selector_driver.py"
 _TERM = "xterm-256color"
@@ -29,20 +28,6 @@ _BOOT_TIMEOUT = 10.0
 _RENDER_TIMEOUT = 5.0
 _DOWN = "\x1b[B"
 _ESC = "\x1b"
-
-
-def _wait_for_screen(
-    child: pexpect.spawn, stream: pyte.Stream, screen: pyte.Screen, text: str
-) -> str:
-    """Feed PTY output into *screen* until *text* shows; fail with the screen otherwise."""
-    deadline = time.monotonic() + _RENDER_TIMEOUT
-    while time.monotonic() < deadline:
-        with contextlib.suppress(pexpect.TIMEOUT):
-            stream.feed(child.read_nonblocking(size=65536, timeout=0.1))
-        rendered = "\n".join(screen.display)
-        if text in rendered:
-            return rendered
-    raise AssertionError(f"did not see {text!r}. Rendered:\n" + "\n".join(screen.display))
 
 
 @pytest.fixture
@@ -61,11 +46,22 @@ def selector_child(tmp_path: Path) -> Iterator[tuple[pexpect.spawn, Path]]:
     child.close(force=True)
 
 
-def test_selector_answers_with_real_keystrokes(selector_child: tuple[pexpect.spawn, Path]) -> None:
+@pytest.fixture
+def selector_screen(selector_child: tuple[pexpect.spawn, Path]) -> TerminalScreen:
+    """Render the driver's output, attached right after spawning."""
+    return TerminalScreen(selector_child[0])
+
+
+def test_selector_answers_with_real_keystrokes(
+    selector_child: tuple[pexpect.spawn, Path], selector_screen: TerminalScreen
+) -> None:
     child, history = selector_child
-    screen = pyte.Screen(_COLS, _ROWS)
-    stream = pyte.Stream(screen)
-    wait = lambda text: _wait_for_screen(child, stream, screen, text)  # noqa: E731
+    screen = selector_screen
+
+    def wait(text: str) -> str:
+        return screen.wait_for(
+            lambda shown: text in shown, timeout=_RENDER_TIMEOUT, what=repr(text)
+        )
 
     wait("question 1 of 1 · Environment")
     wait("▸ 1. dev — Development")

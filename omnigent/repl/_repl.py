@@ -1559,8 +1559,10 @@ class _SessionsChatReplAdapter:
         # One terminal prompt at a time: they share the input line, and a
         # second prompt would otherwise take it from the first.
         self._prompt_lock = asyncio.Lock()
-        # Elicitation whose prompt holds ``_prompt_lock`` (shown to the user).
+        # Elicitation whose prompt holds ``_prompt_lock`` (shown to the user),
+        # and the session it resolves against.
         self._open_elicitation_id: str | None = None
+        self._open_elicitation_session: str | None = None
         self._replay_task: asyncio.Task[None] | None = None
         self._host = host
         self._fmt = fmt
@@ -2876,10 +2878,12 @@ class _SessionsChatReplAdapter:
             if elicitation_id in self._resolved_elicitation_ids:
                 return
             self._open_elicitation_id = elicitation_id
+            self._open_elicitation_session = session_id
             try:
                 resolve_payload = await self._collect_verdict(event, elicitation_id)
             finally:
                 self._open_elicitation_id = None
+                self._open_elicitation_session = None
         if resolve_payload is None:
             return  # another client answered it
         delivered = False
@@ -2986,6 +2990,9 @@ class _SessionsChatReplAdapter:
         if self._on_event is None:
             return
         open_before = self._open_elicitation_id
+        # Only this session's snapshot can show its own prompt settled: a
+        # child's snapshot never lists the parent's prompts.
+        open_here = self._open_elicitation_session == session_id
         try:
             snapshot = await self._client.sessions.get(session_id)
         except Exception:  # noqa: BLE001
@@ -2996,6 +3003,7 @@ class _SessionsChatReplAdapter:
         pending_ids = {raw.get("elicitation_id") for raw in snapshot.pending_elicitations}
         if (
             open_before is not None
+            and open_here
             and open_before == self._open_elicitation_id
             and open_before not in pending_ids
         ):
@@ -3049,6 +3057,8 @@ class _SessionsChatReplAdapter:
                 action = "accept" if result else "decline"
             except Exception:  # noqa: BLE001
                 action = "decline"
+        if elicitation_id in self._resolved_elicitation_ids:
+            return None  # settled elsewhere while the y/a/n card was open
         # Build the resolve payload. For accept with a requestedSchema,
         # populate ``content`` from the schema so the MCP server receives
         # the form data it expects. Simple schemas (boolean, enum) are
@@ -3061,8 +3071,6 @@ class _SessionsChatReplAdapter:
             if content is not None:
                 resolve_payload["content"] = content
             elif schema.get("properties"):
-                if elicitation_id in self._resolved_elicitation_ids:
-                    return None  # settled elsewhere while the y/a/n card was open
                 # Never leave the elicitation unresolved: any failure
                 # while prompting (or a user abort) declines, so the
                 # agent turn doesn't hang waiting on a verdict that the

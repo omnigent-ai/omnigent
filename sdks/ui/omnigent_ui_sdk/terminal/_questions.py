@@ -192,7 +192,7 @@ class QuestionPicker:
                 return "edit the answer in the input above · ⏎ send · esc dismiss"
             return "type the answer in the input above · ⏎ send · esc dismiss"
         if question.multi_select:
-            return "↑↓ move · space check · ⏎ send checked · esc dismiss"
+            return "↑↓ move · space check · ⏎ send checked (or the highlighted one) · esc dismiss"
         return "↑↓ move · ⏎ choose · esc dismiss"
 
 

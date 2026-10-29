@@ -951,8 +951,10 @@ class TerminalHost:
         # when the user is "inside" a sub-agent (active != tree root) so
         # Left-arrow can jump back to the top-level session.
         self.active_session_id_getter: Callable[[], str | None] | None = None
-        # Open inline question selector (see :meth:`ask_questions`), or None.
+        # Open inline question selector (see :meth:`ask_questions`), or None,
+        # and the chat draft (with its pastes) set aside while it is open.
         self._question_picker: QuestionPicker | None = None
+        self._question_draft: tuple[Any, list[_PastedBlock]] | None = None
         self._last_was_streaming: bool = False
         self._text_buffer: str = ""
         self._streamed_line_count: int = 0  # Lines printed from streaming text.
@@ -1698,7 +1700,7 @@ class TerminalHost:
         self._pasted_blocks.append(block)
         return block
 
-    def _expand_pasted_blocks(self, text: str) -> str:
+    def _expand_pasted_blocks(self, text: str, *, clear: bool = True) -> str:
         """
         Substitute placeholder markers with original content and clear
         the registry.
@@ -1707,6 +1709,7 @@ class TerminalHost:
         content is dropped — safer than guessing the splice point.
 
         :param text: The submitted prompt buffer string.
+        :param clear: Whether to clear the registry afterwards.
         :returns: ``text`` with each placeholder replaced by its content.
         """
         if not self._pasted_blocks:
@@ -1716,7 +1719,8 @@ class TerminalHost:
             # count=1 defends against two entries aliasing the same
             # content (impossible in practice given distinct ``#N``).
             expanded = expanded.replace(block.placeholder, block.content, 1)
-        self._pasted_blocks = []
+        if clear:
+            self._pasted_blocks = []
         return expanded
 
     async def run(self, handler: Callable[..., Awaitable[None]]) -> None:
@@ -3628,10 +3632,14 @@ class TerminalHost:
         """
         if not questions:
             return None
-        self.dismiss_questions()
-        picker = QuestionPicker(questions)
         buffer = self._prompt.default_buffer
-        draft = buffer.document
+        if self._question_picker is None:
+            self._question_draft = (buffer.document, self._pasted_blocks)
+            self._pasted_blocks = []
+        else:
+            # Replaced: the chat draft stays set aside for the new selector.
+            self._question_picker.cancel()
+        picker = QuestionPicker(questions)
         self._close_subagent_menu()
         self._question_picker = picker
         buffer.text = picker.current.text_default or ""
@@ -3642,7 +3650,9 @@ class TerminalHost:
         finally:
             if self._question_picker is picker:
                 self._question_picker = None
-                buffer.document = draft
+                if self._question_draft is not None:
+                    buffer.document, self._pasted_blocks = self._question_draft
+                    self._question_draft = None
                 self._invalidate_prompt()
 
     def dismiss_questions(self) -> None:
@@ -3677,7 +3687,12 @@ class TerminalHost:
         picker = self._question_picker
         if picker is None:
             return
-        if picker.answer(self._expand_pasted_blocks(buffer.text)) and not picker.future.done():
+        # Keep the pastes until an answer is taken, so a retry still expands them.
+        if not picker.answer(self._expand_pasted_blocks(buffer.text, clear=False)):
+            self._invalidate_prompt()
+            return
+        self._pasted_blocks = []
+        if not picker.future.done():
             # Next question: start its input line fresh (or with its prefill).
             buffer.text = picker.current.text_default or ""
             buffer.cursor_position = len(buffer.text)

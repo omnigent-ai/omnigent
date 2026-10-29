@@ -1858,13 +1858,57 @@ async def test_ask_questions_sets_the_draft_aside_and_restores_it() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dismiss_questions_returns_none() -> None:
+async def test_dismiss_questions_returns_none_and_restores_the_draft() -> None:
     host = TerminalHost(model_name="test")
+    buffer = host._prompt.default_buffer
+    buffer.text = "half-typed chat message"
     asking = asyncio.create_task(host.ask_questions([_env_question()]))
     await asyncio.sleep(0)
+    buffer.text = "typed into the selector"
     host.dismiss_questions()
     assert await asking is None
     assert host._question_picker is None
+    assert buffer.text == "half-typed chat message"
+
+
+@pytest.mark.asyncio
+async def test_draft_pastes_survive_a_question() -> None:
+    # The draft's pasted blocks belong to the draft: answering a question
+    # (or failing to) must not expand or drop them.
+    host = TerminalHost(model_name="test")
+    buffer = host._prompt.default_buffer
+    draft_paste = host._register_pasted_block("draft paste " * 30)
+    buffer.text = f"see {draft_paste.placeholder}"
+
+    asking = asyncio.create_task(host.ask_questions([_env_question()]))
+    await asyncio.sleep(0)
+    host._move_question_highlight(-1)  # "Type something"
+    answer_paste = host._register_pasted_block("answer paste " * 30)
+    buffer.text = ""
+    host._answer_question(buffer)  # empty custom answer: not taken
+    assert host._pasted_blocks == [answer_paste], "a rejected answer dropped its paste"
+    buffer.text = answer_paste.placeholder
+    host._answer_question(buffer)
+
+    assert await asking == {"Env?": ("answer paste " * 30).strip()}
+    assert buffer.text == f"see {draft_paste.placeholder}"
+    assert host._expand_pasted_blocks(buffer.text) == f"see {'draft paste ' * 30}"
+
+
+@pytest.mark.asyncio
+async def test_replacing_an_open_selector_keeps_the_original_draft() -> None:
+    host = TerminalHost(model_name="test")
+    buffer = host._prompt.default_buffer
+    buffer.text = "half-typed chat message"
+    first = asyncio.create_task(host.ask_questions([_env_question()]))
+    await asyncio.sleep(0)
+    buffer.text = "typed into the first selector"
+    second = asyncio.create_task(host.ask_questions([_env_question(key="Region?")]))
+    await asyncio.sleep(0)
+    assert await first is None
+    host._answer_question(buffer)
+    assert await second == {"Region?": "dev"}
+    assert buffer.text == "half-typed chat message"
 
 
 @pytest.mark.asyncio
