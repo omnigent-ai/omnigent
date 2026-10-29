@@ -21,7 +21,7 @@ import {
   parseNativePermissionDelivery,
   type NativePermissionDelivery,
 } from "@/lib/nativePermissionDelivery";
-import { parseTerminalFallback } from "@/lib/sse";
+import { NATIVE_REPARK_POLL_MS, TERMINAL_HOLD_POLL_MS, parseTerminalFallback } from "@/lib/sse";
 import type { ElicitationTerminalFallback } from "@/lib/events";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
@@ -83,7 +83,7 @@ export function ApprovePage() {
     }
     let cancelled = false;
     let polling = false;
-    let pollDelay = 1000;
+    let pollDelay = NATIVE_REPARK_POLL_MS;
     let nativeDeliverySeen = false;
     // Only the load this run starts reports the refusal; stale polls and later links don't.
     let unreportedRefusal = refusedResolveStatus.current;
@@ -112,8 +112,7 @@ export function ApprovePage() {
           (nativeDeliverySeen && data.resolution !== "confirmed") ||
           Boolean(data.terminal_fallback) ||
           (data.status !== "resolved" && revision !== submission.current.revision);
-        // A terminal hold lasts until the user answers there, so poll it more slowly.
-        pollDelay = data.terminal_fallback ? 5000 : 1000;
+        pollDelay = data.terminal_fallback ? TERMINAL_HOLD_POLL_MS : NATIVE_REPARK_POLL_MS;
         if (data.status === "resolved") {
           submission.current = { revision: submission.current.revision + 1, pending: false };
           setState({ kind: polling ? "recovering" : "resolved" });

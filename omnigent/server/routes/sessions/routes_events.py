@@ -3809,8 +3809,10 @@ def register_events_routes(
                 )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
-        await _release_deleted_session_prompts([session_id, *descendant_ids], conversation_store)
-        deleted = await conversation_store.delete_conversation(session_id)
+        async with _release_deleted_session_prompts(
+            [session_id, *descendant_ids], conversation_store
+        ):
+            deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
         # A relay still inside an offline runner's reconnect grace must not

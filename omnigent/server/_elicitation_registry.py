@@ -161,6 +161,9 @@ _harness_unparked_elicitations: WorkspaceScopedCache[str, _UnparkedHarnessElicit
     WorkspaceScopedCache()
 )
 
+# Counts the in-progress deletes of each session; no hook prompt parks meanwhile.
+_harness_deleting_sessions: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
 
 def reset_for_tests() -> None:
     """
@@ -178,12 +181,14 @@ def reset_for_tests() -> None:
     _harness_parked_elicitations.clear()
     _harness_pre_resolved_elicitations.clear()
     _harness_unparked_elicitations.clear()
+    _harness_deleting_sessions.clear()
 
 
 __all__ = [
     "_ParkedHarnessElicitation",
     "_PreResolvedHarnessElicitation",
     "_UnparkedHarnessElicitation",
+    "_harness_deleting_sessions",
     "_harness_elicitation_owners",
     "_harness_elicitation_registry",
     "_harness_parked_elicitations",

@@ -16,7 +16,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import httpx
@@ -127,6 +127,7 @@ from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
+    _harness_deleting_sessions,
     _harness_elicitation_owners,
     _harness_elicitation_registry,
     _harness_parked_elicitations,
@@ -520,8 +521,10 @@ async def _publish_and_wait_for_harness_elicitation(
         that is never re-parked keeps its card as waiting in the terminal
         for the rest of the turn instead of expiring it.
     :returns: Web verdict, or ``None`` on terminal-side resolution,
-        timeout, or disconnect.
+        timeout, disconnect, or a deleted session.
     """
+    if session_id in _harness_deleting_sessions:
+        return None  # The session is being deleted; leave the prompt to the harness.
     if elicitation_id is None:
         elicitation_id = f"elicit_{secrets.token_hex(16)}"
     future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
@@ -558,6 +561,11 @@ async def _publish_and_wait_for_harness_elicitation(
     # finally's resolved fan-out carries it (None = severed / terminal).
     settled_action: str | None = None
     try:
+        if conversation_store is not None:
+            # A hook that passed its session check before a delete must not park after it.
+            session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if session is None or parked.released:
+                return None
         if answered_in_terminal:
             # The terminal answered before this retry; clear the card instead of re-asking.
             published_request = settled = True
@@ -950,33 +958,46 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
             handle.task.cancel()
 
 
+@contextlib.asynccontextmanager
 async def _release_deleted_session_prompts(
     session_ids: list[str],
     conversation_store: ConversationStore,
-) -> None:
-    """Expire the harness prompts of sessions about to be deleted.
+) -> AsyncIterator[None]:
+    """Expire the harness prompts of sessions being deleted; run the delete inside this block.
 
     A deleted session's status may never leave mid-turn, so a terminal hold would poll forever.
-    Run it before the delete so the expiry still reaches surviving ancestors' mirrors.
+    Expiring before the delete still reaches surviving ancestors' mirrors.
     """
     deleted = set(session_ids)
-    released: list[tuple[str, str]] = []
-    # Mark parked hooks before any await so a later disconnect cannot open a hold.
-    for elicitation_id, parked in _harness_parked_elicitations.items():
-        if parked.session_id in deleted and not parked.released:
-            parked.released = True
-            parked.resolved_elsewhere.set()
-            released.append((parked.session_id, elicitation_id))
-    for session_id, elicitation_id in released:
-        await _expire_deleted_session_prompt(session_id, elicitation_id, conversation_store)
-    for elicitation_id, unparked in _harness_unparked_elicitations.items():
-        if unparked.session_id not in deleted:
-            continue
-        if _harness_unparked_elicitations.pop(elicitation_id, None) is None:
-            continue  # Cleared or re-parked while an earlier prompt was being released.
-        await _expire_deleted_session_prompt(
-            unparked.session_id, elicitation_id, conversation_store
-        )
+    # Fence before any await so a hook arriving during the delete cannot park.
+    for session_id in deleted:
+        _harness_deleting_sessions[session_id] = _harness_deleting_sessions.get(session_id, 0) + 1
+    try:
+        released: list[tuple[str, str]] = []
+        # Mark parked hooks before any await so a later disconnect cannot open a hold.
+        for elicitation_id, parked in _harness_parked_elicitations.items():
+            if parked.session_id in deleted and not parked.released:
+                parked.released = True
+                parked.resolved_elsewhere.set()
+                released.append((parked.session_id, elicitation_id))
+        for session_id, elicitation_id in released:
+            await _expire_deleted_session_prompt(session_id, elicitation_id, conversation_store)
+        for elicitation_id, unparked in _harness_unparked_elicitations.items():
+            if unparked.session_id not in deleted:
+                continue
+            if _harness_unparked_elicitations.pop(elicitation_id, None) is None:
+                continue  # Cleared or re-parked while an earlier prompt was being released.
+            await _expire_deleted_session_prompt(
+                unparked.session_id, elicitation_id, conversation_store
+            )
+        yield
+    finally:
+        for session_id in deleted:
+            remaining = _harness_deleting_sessions.get(session_id, 1) - 1
+            if remaining:
+                _harness_deleting_sessions[session_id] = remaining
+            else:
+                _harness_deleting_sessions.pop(session_id, None)
 
 
 async def _expire_deleted_session_prompt(

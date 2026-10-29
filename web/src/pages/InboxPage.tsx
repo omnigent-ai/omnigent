@@ -89,6 +89,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { approve, fetchSessionItemsPage, getSession } from "@/lib/sessionsApi";
+import { NATIVE_REPARK_POLL_MS, TERMINAL_HOLD_POLL_MS } from "@/lib/sse";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
@@ -186,9 +187,8 @@ export function InboxPage() {
           events?.some(
             (event) => (event.params as Record<string, unknown> | undefined)?.[name] !== undefined,
           );
-        if (events?.length === 0 || hasParam("native_delivery")) return 1000;
-        // A terminal hold lasts until the user answers there, so poll it more slowly.
-        return hasParam("terminal_fallback") ? 5000 : false;
+        if (events?.length === 0 || hasParam("native_delivery")) return NATIVE_REPARK_POLL_MS;
+        return hasParam("terminal_fallback") ? TERMINAL_HOLD_POLL_MS : false;
       },
     })),
   });

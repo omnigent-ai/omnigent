@@ -4549,15 +4549,24 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  * @param id - Conversation/session id to reconcile.
  */
 async function reconcilePendingElicitations(id: string): Promise<void> {
-  if (queryClient === null) return;
+  const client = queryClient;
+  if (client === null) return;
   const cardsBeforeFetch = captureElicitationIdsByStatus(setterForState(id)?.blocks ?? []).cards;
+  const sharedQuery = client
+    .getQueryCache()
+    .find<Session>({ queryKey: ["session", id], exact: true });
+  const olderRequest =
+    sharedQuery?.state.fetchStatus === "fetching" ? sharedQuery.promise : undefined;
   let session: Session;
   try {
     session = await getSessionSlim(id);
   } catch {
     return;
   }
-  queryClient.setQueryData(["session", id], session);
+  // Cache this read after an older shared request settles, so its result can't replace it.
+  void Promise.resolve(olderRequest)
+    .catch(() => undefined)
+    .then(() => client.setQueryData(["session", id], session));
   // Liveness, not foreground: every live conversation reconciles, so a
   // background one that missed `response.elicitation_resolved` doesn't keep
   // showing a card that was already answered elsewhere. Gating on the visible

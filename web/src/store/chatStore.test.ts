@@ -1515,9 +1515,6 @@ describe("chatStore — switchTo", () => {
       await tick();
 
       if (olderQueryInFlight) expect(snapshotRequests).toBe(2);
-      expect(
-        client.getQueryData<Session>(["session", "conv_vis_held"])?.pendingElicitations,
-      ).toEqual([held]);
       expect(cards()).toHaveLength(1);
       // A card the native delivery confirmed stays settled, as on reconnect.
       expect(cards()[0]).toMatchObject(
@@ -1526,6 +1523,10 @@ describe("chatStore — switchTo", () => {
           : { status: "responded", response: { action: "accept" } },
       );
       releaseOlderQuery();
+      await tick();
+      expect(
+        client.getQueryData<Session>(["session", "conv_vis_held"])?.pendingElicitations,
+      ).toEqual([held]);
     },
   );
 

@@ -3066,6 +3066,102 @@ async def test_deleting_session_releases_prompt_whose_hook_still_waits(
         pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("registers_during_delete", [False, True])
+async def test_hook_registering_around_session_delete_leaves_no_prompt(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    registers_during_delete: bool,
+) -> None:
+    """A hook that registers during or after its session's delete leaves no card or hold."""
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server import _elicitation_registry
+    from omnigent.server.routes.sessions import routes_hooks
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    async def _disconnect_at_once(_request: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _disconnect_at_once)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_POLL_S", 0.02)
+    pending_elicitations.reset_for_tests()
+    hook_paused, resume_hook = asyncio.Event(), asyncio.Event()
+    delete_paused, resume_delete = asyncio.Event(), asyncio.Event()
+    publish_and_wait = routes_hooks._publish_and_wait_for_harness_elicitation
+    delete_conversation = SqlAlchemyConversationStore.delete_conversation
+
+    async def _pause_after_session_check(*args: Any, **kwargs: Any) -> Any:
+        hook_paused.set()
+        await resume_hook.wait()
+        return await publish_and_wait(*args, **kwargs)
+
+    async def _pause_before_delete(store: Any, conversation_id: str) -> bool:
+        delete_paused.set()
+        await resume_delete.wait()
+        return await delete_conversation(store, conversation_id)
+
+    monkeypatch.setattr(
+        routes_hooks, "_publish_and_wait_for_harness_elicitation", _pause_after_session_check
+    )
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", _pause_before_delete)
+    name = f"test-hook-registers-around-delete-{registers_during_delete}"
+    agent = await create_test_agent(client, name)
+    parent_id = await _create_session(client, agent["id"])
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent_id, "title": f"{name}:child"},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+    hook_task: asyncio.Task[httpx.Response] | None = None
+    delete_task: asyncio.Task[httpx.Response] | None = None
+    try:
+        if registers_during_delete:
+            resume_hook.set()
+            delete_task = asyncio.create_task(client.delete(f"/v1/sessions/{session_id}"))
+            await asyncio.wait_for(delete_paused.wait(), timeout=5.0)
+            hook_task = asyncio.create_task(
+                client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+            )
+            hook = await asyncio.wait_for(hook_task, timeout=5.0)
+            resume_delete.set()
+            deleted = await asyncio.wait_for(delete_task, timeout=5.0)
+        else:
+            resume_delete.set()
+            hook_task = asyncio.create_task(
+                client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+            )
+            await asyncio.wait_for(hook_paused.wait(), timeout=5.0)
+            deleted = await client.delete(f"/v1/sessions/{session_id}")
+            resume_hook.set()
+            hook = await asyncio.wait_for(hook_task, timeout=5.0)
+        assert deleted.status_code == 200, deleted.text
+        assert hook.status_code == 200, hook.text
+        assert hook.content == b""
+        assert _REATTACH_ELICITATION_ID not in sessions_route._harness_parked_elicitations
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+        assert not sessions_route._deferred_elicitation_clear_tasks
+        assert pending_elicitations.count_for(session_id) == 0
+        assert pending_elicitations.count_for(parent_id) == 0
+        assert _elicitation_registry._harness_deleting_sessions.items() == []
+    finally:
+        resume_hook.set()
+        resume_delete.set()
+        for task in (hook_task, delete_task):
+            if task is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(task, timeout=5.0)
+        for clear_task in set(sessions_route._deferred_elicitation_clear_tasks):
+            clear_task.cancel()
+        _harness_unparked_elicitations.pop(_REATTACH_ELICITATION_ID, None)
+        pending_elicitations.reset_for_tests()
+
+
 @pytest.mark.parametrize("held_again", [False, True])
 async def test_deleting_session_expires_only_prompts_still_held(
     monkeypatch: pytest.MonkeyPatch,
@@ -3106,9 +3202,10 @@ async def test_deleting_session_expires_only_prompts_still_held(
     _harness_unparked_elicitations["elicit_first"] = held_prompt()
     _harness_unparked_elicitations["elicit_second"] = held_prompt()
     try:
-        await sessions_orchestration._release_deleted_session_prompts(
+        async with sessions_orchestration._release_deleted_session_prompts(
             ["conv_deleted"], cast(Any, None)
-        )
+        ):
+            pass
         assert expired == (["elicit_first", "elicit_second"] if held_again else ["elicit_first"])
         assert _harness_unparked_elicitations.items() == []
     finally:
