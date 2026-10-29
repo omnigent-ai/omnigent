@@ -28,7 +28,7 @@ from typing import cast
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from omnigent.debug_logging import debug_event, set_current_user_id
+from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
@@ -350,6 +350,7 @@ def create_runner_tunnel_router(
             and session.owner != user_id
         ):
             online = False
+        add_audit_attrs(runner_id=runner_id, runner_online=online)
         result: dict[str, str | bool] = {"runner_id": runner_id, "online": online}
         if not online and runner_exit_reports is not None:
             # Host-daemon report that the runner process died (exit code

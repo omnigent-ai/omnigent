@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import threading
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
@@ -349,3 +350,70 @@ def test_reserved_attr_keys_never_crash_and_session_id_binds(
         dl.audit_event_logger().removeHandler(sink)
         dl.sse_event_logger().removeHandler(sink)
         sink.close()
+
+
+@pytest.mark.asyncio
+async def test_attachment_requests_correlate_with_binding_change(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The real middleware joins status and unbind requests without trusting client identity."""
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+    from omnigent.host.launch_audit import launch_audit_headers
+    from omnigent.server import app as app_module
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import create_test_agent
+
+    agent = await create_test_agent(client, "attachment-audit")
+    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    HostStore(db_uri).upsert_on_connect("a" * 32, "owner-host", RESERVED_USER_LOCAL)
+    store.set_host_id(session_id, "a" * 32, workspace="/test")
+    store.replace_runner_id(session_id, "old_runner")
+    rows: list[dict[str, object]] = []
+
+    def capture(operation: str, phase: str, **fields: object) -> None:
+        rows.append({"operation": operation, "phase": phase, **fields})
+
+    monkeypatch.setattr(app_module, "_emit_audit_event", capture)
+    headers = launch_audit_headers(host_id="caller_b", fresh=False)
+    headers.update({"User-Agent": "test-launcher", OMNIGENT_SLICE_KEY_HEADER: "host:caller_b"})
+    status = await client.get("/v1/runners/old_runner/status", headers=headers)
+    assert status.status_code == 200, status.text
+    with caplog.at_level(logging.INFO):
+        cleared = await client.patch(
+            f"/v1/sessions/{session_id}", json={"runner_id": ""}, headers=headers
+        )
+    assert cleared.status_code == 200, cleared.text
+    assert all(r["client_launch_id"] == headers["X-Omnigent-Launch-Id"] for r in rows)
+    assert all(r["client_host_id"] == "caller_b" for r in rows)
+    assert all(r["client_user_agent"] == "test-launcher" for r in rows)
+    assert all(r["request_slice_key"] == "host:caller_b" for r in rows)
+    ended = [r for r in rows if r["phase"] == "ok"]
+    assert len(ended) == 2
+    assert ended[0]["runner_id"] == "old_runner"
+    assert ended[0]["runner_online"] == "False"
+    assert ended[1]["session_id"] == session_id
+    assert ended[1]["binding_action"] == "clear"
+    assert ended[1]["previous_runner_id"] == "old_runner"
+    assert ended[1]["previous_host_id"] == "a" * 32
+    assert ended[1]["requested_runner_id"] == ""
+    assert ended[0]["request_id"] == status.headers["X-Request-Id"]
+    assert ended[1]["request_id"] == cleared.headers["X-Request-Id"]
+    assert ended[0]["request_id"] != ended[1]["request_id"]
+    unbound = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_runner_unbound"
+    ]
+    assert len(unbound) == 1
+    assert unbound[0].attributes["previous_runner_id"] == "old_runner"
+    assert unbound[0].attributes["previous_host_id"] == "a" * 32
+    rows.clear()
+    response = await client.get(f"/v1/sessions/{session_id}")
+    assert response.status_code == 200
+    assert all("client_launch_id" not in r and "client_host_id" not in r for r in rows)

@@ -15,13 +15,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 from collections.abc import Iterator
 
 import click
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.claude_native.bridge import url_component
+from omnigent.host.launch_audit import launch_audit_headers, request_client_audit_attributes
 from omnigent.process_logging import display_log_path, process_log_dir
+
+_logger = logging.getLogger(__name__)
 
 # Steady-state poll cadence while waiting for a daemon-spawned runner to
 # connect its tunnel or for a resource to appear.
@@ -163,15 +169,18 @@ async def wait_for_host_online(
     raise click.ClickException(message)
 
 
-async def runner_is_online(client: httpx.AsyncClient, runner_id: str) -> bool:
+async def runner_is_online(
+    client: httpx.AsyncClient, runner_id: str, *, headers: dict[str, str] | None = None
+) -> bool:
     """
     Return whether a runner currently has an open tunnel to the server.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param runner_id: Runner id, e.g. ``"runner_abc123"``.
+    :param headers: Optional diagnostic context for an attachment attempt.
     :returns: ``True`` when the status endpoint reports ``online``.
     """
-    resp = await client.get(f"/v1/runners/{url_component(runner_id)}/status")
+    resp = await client.get(f"/v1/runners/{url_component(runner_id)}/status", headers=headers)
     return resp.status_code == 200 and bool(_json_body(resp).get("online"))
 
 
@@ -261,13 +270,49 @@ async def launch_or_reuse_daemon_runner(
     :returns: The bound runner id, e.g. ``"runner_abc123"``.
     :raises click.ClickException: If the launch request fails.
     """
+    headers = launch_audit_headers(host_id=host_id, fresh=fresh)
+    audit = request_client_audit_attributes(headers)
+    _logger.info(
+        "Daemon runner attachment started: session=%s launch=%s mode=%s command=%s "
+        "caller_host=%s pid=%s parent_pid=%s",
+        session_id,
+        audit["client_launch_id"],
+        audit["client_launch_mode"],
+        audit["client_launch_command"],
+        host_id,
+        os.getpid(),
+        os.getppid(),
+        extra=debug_event(
+            "daemon_attachment_started",
+            session_id=session_id,
+            client_pid=os.getpid(),
+            client_parent_pid=os.getppid(),
+            **audit,
+        ),
+    )
     if fresh:
         existing = None
     else:
-        snap = await client.get(f"/v1/sessions/{url_component(session_id)}")
+        snap = await client.get(f"/v1/sessions/{url_component(session_id)}", headers=headers)
         existing = _json_body(snap).get("runner_id") if snap.status_code == 200 else None
     if isinstance(existing, str) and existing:
-        if await runner_is_online(client, existing):
+        online = await runner_is_online(client, existing, headers=headers)
+        _logger.info(
+            "Daemon runner attachment decision: session=%s launch=%s runner=%s decision=%s",
+            session_id,
+            audit["client_launch_id"],
+            existing,
+            "reuse" if online else "replace",
+            extra=debug_event(
+                "daemon_attachment_decision",
+                session_id=session_id,
+                previous_runner_id=existing,
+                decision="reuse" if online else "replace",
+                reason="status_online" if online else "status_not_online",
+                **audit,
+            ),
+        )
+        if online:
             return existing
         # Stale binding (offline runner): clear it so the launch
         # endpoint's atomic ``UPDATE ... WHERE runner_id IS NULL`` can
@@ -275,6 +320,7 @@ async def launch_or_reuse_daemon_runner(
         await client.patch(
             f"/v1/sessions/{url_component(session_id)}",
             json={"runner_id": ""},
+            headers=headers,
         )
     # The host tunnel can be briefly absent from the server's in-memory
     # registry while it (re)connects — e.g. just after `omnigent host`
@@ -291,6 +337,7 @@ async def launch_or_reuse_daemon_runner(
         resp = await client.post(
             f"/v1/hosts/{url_component(host_id)}/runners",
             json={"session_id": session_id, "workspace": workspace},
+            headers=headers,
             timeout=60.0,
         )
         if resp.status_code < 400:
@@ -304,6 +351,15 @@ async def launch_or_reuse_daemon_runner(
     runner_id = resp.json().get("runner_id")
     if not isinstance(runner_id, str) or not runner_id:
         raise click.ClickException("Host launch response did not include a runner_id.")
+    _logger.info(
+        "Daemon runner launch completed: session=%s launch=%s runner=%s",
+        session_id,
+        audit["client_launch_id"],
+        runner_id,
+        extra=debug_event(
+            "daemon_attachment_launched", session_id=session_id, runner_id=runner_id, **audit
+        ),
+    )
     return runner_id
 
 

@@ -10,6 +10,7 @@ designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -58,8 +59,11 @@ async def test_launch_or_reuse_daemon_runner_reuses_online_runner() -> None:
     """
     posted: list[str] = []
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         """Route the reuse-path requests."""
+        requests.append(request)
         path = request.url.path
         if request.method == "GET" and path == "/v1/sessions/conv_a":
             return httpx.Response(200, json={"runner_id": "runner_live"})
@@ -80,6 +84,13 @@ async def test_launch_or_reuse_daemon_runner_reuses_online_runner() -> None:
     assert runner_id == "runner_live"
     # No launch POST fired — proves the online runner was reused, not respawned.
     assert posted == []
+
+    launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
+    assert len(launch_ids) == 1
+    assert len(next(iter(launch_ids))) == 32
+    assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
+    assert all(r.headers["X-Omnigent-Launch-Mode"] == "ensure_existing" for r in requests)
+    assert "X-Omnigent-Launch-Id" not in client.headers
 
 
 async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
@@ -112,7 +123,9 @@ async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
     assert launched["body"] == {"session_id": "conv_a", "workspace": "/work"}
 
 
-async def test_launch_or_reuse_daemon_runner_clears_stale_binding() -> None:
+async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     A bound-but-offline runner is cleared before launching a fresh one.
 
@@ -120,10 +133,14 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding() -> None:
     NULL``; without clearing the dead binding first it would 400. The
     clear must therefore precede the launch.
     """
+    caplog.set_level(logging.INFO, logger="omnigent.host.daemon_launch")
     events: list[tuple[str, object]] = []
+
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """Route the stale-binding-path requests, recording order."""
+        requests.append(request)
         path = request.url.path
         if request.method == "GET" and path == "/v1/sessions/conv_a":
             return httpx.Response(200, json={"runner_id": "runner_dead"})
@@ -150,6 +167,26 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding() -> None:
     assert ("patch", {"runner_id": ""}) in events
     assert events.index(("patch", {"runner_id": ""})) < events.index(("launch", None))
 
+    launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
+    assert len(launch_ids) == 1
+    assert len(next(iter(launch_ids))) == 32
+    assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
+    assert all(r.headers["X-Omnigent-Launch-Mode"] == "ensure_existing" for r in requests)
+    assert "X-Omnigent-Launch-Id" not in client.headers
+
+    from omnigent.process_logging import RedactingLogFormatter
+
+    records = [r for r in caplog.records if r.name == "omnigent.host.daemon_launch"]
+    assert [r.event_name for r in records] == [
+        "daemon_attachment_started",
+        "daemon_attachment_decision",
+        "daemon_attachment_launched",
+    ]
+    assert records[1].attributes["decision"] == "replace"
+    formatter = RedactingLogFormatter(use_colors=False)
+    assert all(next(iter(launch_ids)) in formatter.format(r) for r in records)
+    assert "parent_pid=" in formatter.format(records[0])
+
 
 async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
     """
@@ -161,8 +198,11 @@ async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
     """
     gets: list[str] = []
 
+    requests: list[httpx.Request] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         """Record any GET to sessions and serve the launch endpoint."""
+        requests.append(request)
         if request.method == "GET" and "/sessions/" in request.url.path:
             gets.append(request.url.path)
             return httpx.Response(200, json={})
@@ -180,6 +220,13 @@ async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
     assert runner_id == "runner_new"
     # No GET to /v1/sessions — the binding check was skipped.
     assert gets == []
+
+    launch_ids = {r.headers["X-Omnigent-Launch-Id"] for r in requests}
+    assert len(launch_ids) == 1
+    assert len(next(iter(launch_ids))) == 32
+    assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
+    assert all(r.headers["X-Omnigent-Launch-Mode"] == "fresh" for r in requests)
+    assert "X-Omnigent-Launch-Id" not in client.headers
 
 
 async def test_create_claude_session_persists_terminal_launch_args() -> None:
