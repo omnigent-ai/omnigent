@@ -18,7 +18,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, TypeAlias, cast
+from typing import TYPE_CHECKING, Literal, TypeAlias, cast
 
 import tomlkit
 import websockets
@@ -117,6 +117,7 @@ from omnigent.util.reasoning_effort import (
     EFFORT_ORDER,
     clamp_effort_for_model,
 )
+from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -859,6 +860,86 @@ def clamp_codex_effort_for_model(
 _effort_catalog_cache: TTLCache[str, list[_JsonObject]] = TTLCache(maxsize=128, ttl=60.0)
 # Models a fresh catalog lacked, so an unlisted model does not refetch on every turn.
 _effort_catalog_misses: TTLCache[str, set[str]] = TTLCache(maxsize=128, ttl=60.0)
+_EffortPhase = Literal["launch", "startup_repair", "turn", "settings", "resume", "side_chat"]
+_EffortSource = Literal[
+    "pinned", "config", "override", "unmirrored", "request", "model_switch", "session", "caller"
+]
+
+
+def _log_effort_resolution(
+    requested: str | None,
+    effective: str | None,
+    model: str | None,
+    catalog: object,
+    *,
+    phase: _EffortPhase,
+    effort_source: _EffortSource,
+    catalog_source: str,
+    discovery_error: Exception | None = None,
+    session_id: str | None = None,
+    cli_version: tuple[int, int, int] | None = None,
+) -> None:
+    """Retain the capability decision without config, model names, or exception text."""
+    with contextlib.suppress(Exception):
+        entry = _codex_model_catalog_entry(catalog, model) if model else None
+        levels = (
+            entry.get("supportedReasoningEfforts", entry.get("supported_reasoning_levels"))
+            if entry is not None
+            else None
+        )
+        advertised = (
+            [
+                level.get("reasoningEffort", level.get("effort"))
+                for level in levels
+                if isinstance(level, dict)
+            ]
+            if isinstance(levels, list)
+            else []
+        )
+        supported = [effort for effort in EFFORT_ORDER if effort in advertised]
+        if discovery_error is not None:
+            catalog_status = "discovery_failed"
+        elif model is None:
+            catalog_status = "model_unknown"
+        elif catalog is None:
+            catalog_status = "unavailable"
+        elif entry is None:
+            catalog_status = "model_missing"
+        else:
+            catalog_status = "matched" if supported else "capabilities_missing"
+        _logger.info(
+            "Codex reasoning effort capability decision",
+            extra=debug_event(
+                "codex_effort_resolution",
+                session_id=session_id,
+                diagnostic_version=1,
+                runtime_version=VERSION,
+                native_cli_version=_format_codex_version(cli_version),
+                phase=phase,
+                effort_source=effort_source,
+                requested_effort=requested
+                if requested in EFFORT_ORDER
+                else "default"
+                if requested is None
+                else "unrecognized",
+                effective_effort=effective
+                if effective in EFFORT_ORDER
+                else "unset"
+                if effective is None
+                else "unrecognized",
+                model_sha256=hashlib.sha256(model.encode()).hexdigest() if model else None,
+                catalog_source=catalog_source,
+                catalog_status=catalog_status,
+                supported_efforts=",".join(supported),
+                discovery_error_type=(
+                    type(discovery_error).__name__
+                    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", type(discovery_error).__name__)
+                    else "other"
+                )
+                if discovery_error
+                else None,
+            ),
+        )
 
 
 async def resolve_codex_effort_for_model(
@@ -867,6 +948,8 @@ async def resolve_codex_effort_for_model(
     model: str | None,
     *,
     transport: str | None = None,
+    phase: _EffortPhase = "settings",
+    effort_source: _EffortSource = "caller",
 ) -> str:
     """Resolve against live capabilities, reusing successful discovery for one minute.
 
@@ -876,7 +959,10 @@ async def resolve_codex_effort_for_model(
     fallback; resets raise without a discoverable model default because Codex
     treats a null effort in ``thread/settings/update`` as unchanged.
     """
+    requested_effort = effort
+    discovery_error = None
     catalog = _effort_catalog_cache.get(transport) if transport is not None else None
+    catalog_source = "cache" if catalog is not None else "live" if model else "not_requested"
     if (
         catalog is not None
         and transport is not None
@@ -885,6 +971,7 @@ async def resolve_codex_effort_for_model(
         and model not in _effort_catalog_misses.get(transport, ())
     ):
         catalog = None  # The cached rows may predate this model, so refetch them.
+        catalog_source = "live"
     if model and catalog is None:
         try:
             catalog = await asyncio.wait_for(
@@ -896,7 +983,8 @@ async def resolve_codex_effort_for_model(
                 _effort_catalog_cache[transport] = catalog
                 if _codex_model_catalog_entry(catalog, model) is None:
                     _effort_catalog_misses.setdefault(transport, set()).add(model)
-        except Exception:  # noqa: BLE001 — discovery must not prevent a turn
+        except Exception as exc:  # noqa: BLE001 — discovery must not prevent a turn
+            discovery_error = exc
             log_once(
                 _logger,
                 logging.WARNING,
@@ -906,6 +994,22 @@ async def resolve_codex_effort_for_model(
             )
     if effort is None:
         entry = _codex_model_catalog_entry(catalog, model) if model else None
+        default = (
+            entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
+            if entry is not None
+            else None
+        )
+        if not isinstance(default, str) or not default:
+            _log_effort_resolution(
+                requested_effort,
+                None,
+                model,
+                catalog,
+                phase=phase,
+                effort_source=effort_source,
+                catalog_source=catalog_source,
+                discovery_error=discovery_error,
+            )
         if entry is None:
             # Name the cause, since an unreachable server and an unlisted model differ.
             raise ValueError(
@@ -913,11 +1017,21 @@ async def resolve_codex_effort_for_model(
                 if model and catalog is None
                 else f"Codex model capabilities unavailable for {model!r}"
             )
-        default = entry.get("defaultReasoningEffort", entry.get("default_reasoning_level"))
         if not isinstance(default, str) or not default:
             raise ValueError("Codex model catalog did not provide a default reasoning effort")
         effort = default
-    return clamp_codex_effort_for_model(effort, model, catalog) or effort
+    effective = clamp_codex_effort_for_model(effort, model, catalog) or effort
+    _log_effort_resolution(
+        requested_effort,
+        effective,
+        model,
+        catalog,
+        phase=phase,
+        effort_source=effort_source,
+        catalog_source=catalog_source,
+        discovery_error=discovery_error,
+    )
+    return effective
 
 
 def _codex_model_upgrade_metadata_is_malformed(entry: dict[str, object]) -> bool:
@@ -2329,6 +2443,7 @@ class CodexNativeAppServer:
         )
         model_migration_target: str | None = None
         catalog: object = self.model_catalog_rows
+        catalog_source = "launch_snapshot"
         if self.trust_project and self.pinned_model:
             catalog_entry = _codex_model_catalog_entry(catalog, self.pinned_model)
             # ``model/list`` excludes hidden rows. A selected legacy model may
@@ -2341,6 +2456,7 @@ class CodexNativeAppServer:
                     config_source,
                     timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
                 )
+                catalog_source = "debug_models"
             model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
         # Off the loop: this copies/symlinks a home AND (on a Smart Routing
         # session) shells out to ``codex debug models`` with a 10s timeout. Run
@@ -2386,6 +2502,17 @@ class CodexNativeAppServer:
         effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
         requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
         effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
+        _log_effort_resolution(
+            requested_effort,
+            effective_effort,
+            effective_model,
+            catalog,
+            phase="launch",
+            effort_source="pinned" if self.pinned_effort else "config",
+            catalog_source=catalog_source,
+            session_id=self.session_id,
+            cli_version=codex_version,
+        )
         if effective_effort and (self.pinned_effort or effective_effort != requested_effort):
             _pin_codex_config_effort(self.codex_home, effective_effort, effective_model)
         _sync_codex_developer_instructions(
@@ -2498,6 +2625,8 @@ class CodexNativeAppServer:
                             effective_effort,
                             effective_model,
                             transport=effort_catalog_transport,
+                            phase="startup_repair",
+                            effort_source="pinned" if self.pinned_effort else "config",
                         )
                         if resolved_effort != effective_effort:
                             await asyncio.wait_for(
@@ -4923,7 +5052,7 @@ async def apply_codex_thread_effort(
                 read_codex_config_model, bridge_dir
             )
         applied_effort = await resolve_codex_effort_for_model(
-            client, effort, model, transport=transport
+            client, effort, model, transport=transport, phase="resume", effort_source="session"
         )
         await asyncio.wait_for(
             client.request(

@@ -297,6 +297,8 @@ async def parent_side_chat_settings(
             effort,
             model,
             transport=state.socket_path if state is not None else None,
+            phase="side_chat",
+            effort_source="unmirrored" if unmirrored.get("effort") else "config",
         )
     return settings
 

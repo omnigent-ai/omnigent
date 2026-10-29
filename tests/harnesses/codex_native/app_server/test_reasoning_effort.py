@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from cachetools import TTLCache
@@ -13,6 +16,7 @@ from cachetools import TTLCache
 from omnigent.harnesses.codex_native import app_server
 from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
 from omnigent.server.smart_routing import RoutingSettings, parse_routing_tables
+from omnigent.version import VERSION
 
 
 @pytest.fixture(autouse=True)
@@ -151,6 +155,73 @@ async def test_live_effort_validation_reads_hidden_models_and_later_pages() -> N
         call("model/list", {"includeHidden": True}),
         call("model/list", {"includeHidden": True, "cursor": "page2"}),
     ]
+
+
+@pytest.mark.parametrize(
+    "state", ["matched", "model_missing", "capabilities_missing", "discovery_failed"]
+)
+async def test_effort_diagnostics_preserve_safe_selection_evidence(
+    caplog: pytest.LogCaptureFixture, state: str
+) -> None:
+    model = "private-config-model"
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    entry: dict[str, object] = {"id": model}
+    if state == "matched":
+        entry["supportedReasoningEfforts"] = [{"reasoningEffort": "xhigh"}]
+    if state == "discovery_failed":
+        client.request.side_effect = ConnectionError("private-provider-error")
+    else:
+        client.request.return_value = {
+            "result": {"data": [] if state == "model_missing" else [entry]}
+        }
+    with caplog.at_level(logging.INFO, logger=app_server.__name__):
+        effective = await app_server.resolve_codex_effort_for_model(
+            client,
+            "max",
+            model,
+            transport="/private/transport.sock",
+            phase="turn",
+            effort_source="config",
+        )
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_effort_resolution"
+    ]
+    assert len(records) == 1
+    attributes = records[0].attributes
+    assert attributes["catalog_status"] == state
+    assert attributes["catalog_source"] == "live"
+    assert attributes["requested_effort"] == "max"
+    assert attributes["effective_effort"] == effective
+    assert attributes["effort_source"] == "config"
+    assert attributes["phase"] == "turn"
+    assert attributes["runtime_version"] == VERSION
+    assert attributes["model_sha256"] == hashlib.sha256(model.encode()).hexdigest()
+    assert attributes["discovery_error_type"] == (
+        "ConnectionError" if state == "discovery_failed" else None
+    )
+    assert "private" not in records[0].getMessage() + json.dumps(attributes)
+
+
+async def test_broken_effort_diagnostic_sink_does_not_change_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.return_value = {
+        "result": {
+            "data": [
+                {
+                    "id": "example-model",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "xhigh"}],
+                }
+            ]
+        }
+    }
+    monkeypatch.setattr(app_server._logger, "info", Mock(side_effect=RuntimeError("broken sink")))
+    assert (
+        await app_server.resolve_codex_effort_for_model(client, "max", "example-model") == "xhigh"
+    )
 
 
 @pytest.mark.parametrize("default", ["high", None])

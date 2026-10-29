@@ -364,7 +364,16 @@ async def _start_codex_turn(
     )
     if isinstance(model, str) and isinstance(effort, str):
         resolved_effort = await resolve_codex_effort_for_model(
-            client, effort, model, transport=state.socket_path
+            client,
+            effort,
+            model,
+            transport=state.socket_path,
+            phase="turn",
+            effort_source="override"
+            if settings_overrides.get("effort")
+            else "unmirrored"
+            if unmirrored.get("effort")
+            else "config",
         )
         if resolved_effort != effort:
             settings_overrides["effort"] = resolved_effort

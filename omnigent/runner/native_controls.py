@@ -618,6 +618,13 @@ def build_native_controls(
                     if "effort" in settings
                     else unmirrored.get("effort") or read_codex_config_effort(bridge_dir)
                 )
+                effort_source = (
+                    "request"
+                    if "effort" in settings
+                    else "unmirrored"
+                    if unmirrored.get("effort")
+                    else "config"
+                )
                 if (
                     "model" in settings
                     and "effort" not in settings
@@ -627,11 +634,17 @@ def build_native_controls(
                     effort = effort_for_model_switch(None, model)
                     if effort is not None:
                         settings["effort"] = effort
+                        effort_source = "model_switch"
                 if isinstance(model, str) and (
                     isinstance(effort, str) or ("effort" in settings and effort is None)
                 ):
                     resolved = await resolve_codex_effort_for_model(
-                        codex_client, effort, model, transport=state.socket_path
+                        codex_client,
+                        effort,
+                        model,
+                        transport=state.socket_path,
+                        phase="settings",
+                        effort_source=effort_source,
                     )
                     settings["effort"] = resolved
             update_pending = False
