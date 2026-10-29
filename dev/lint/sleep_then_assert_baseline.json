@@ -56,7 +56,7 @@
   "tests/runner/test_mcp_manager.py": 2,
   "tests/runner/test_native_interrupt_runner.py": 3,
   "tests/runner/test_pending_approvals.py": 5,
-  "tests/runner/test_resource_registry.py": 2,
+  "tests/runner/test_resource_registry.py": 4,
   "tests/runner/test_suppress_recovery_turn.py": 1,
   "tests/runner/transports/ws_tunnel/test_diagnostics.py": 3,
   "tests/runner/transports/ws_tunnel/test_registry_extended.py": 1,
