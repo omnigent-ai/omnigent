@@ -136,9 +136,24 @@ async def test_install_creates_a_user_agent_only_its_owner_lists(client, agent_s
     assert default.status_code == 200 and default.json()["data"] == []
 
 
-async def test_reinstall_updates_in_place(client) -> None:
+@pytest.mark.parametrize("blob_disappears", [False, True])
+async def test_reinstall_updates_in_place(
+    client, agent_store, artifact_store, monkeypatch, blob_disappears: bool
+) -> None:
     first = (await _install(client, ALICE, "orion", "v1")).json()
-    second = (await _install(client, ALICE, "orion", "v2")).json()
+    if blob_disappears:
+        original_get = artifact_store.get
+        old_location = agent_store.get(first["id"]).bundle_location
+
+        def get(location: str) -> bytes:
+            if location == old_location:
+                artifact_store.delete(location)
+            return original_get(location)
+
+        monkeypatch.setattr(artifact_store, "get", get)
+    response = await _install(client, ALICE, "orion", "v2")
+    assert response.status_code == 200, response.text
+    second = response.json()
     assert second["id"] == first["id"], "reinstall must keep the agent id stable"
     assert second["version"] == first["version"] + 1
     assert second["description"] == "v2", "reinstall must show the new bundle's description"

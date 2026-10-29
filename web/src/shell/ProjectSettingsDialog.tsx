@@ -114,9 +114,7 @@ export function ProjectSettingsDialog({
   );
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
-  // Pin the stored default agent into discovery so an already-configured
-  // session-scoped agent (archived / paginated out of the scan) still
-  // resolves here — matching what the composer's prefill will see.
+  // Pins resolve saved IDs on older servers; current catalogs hide legacy IDs.
   const { data: agents, isPlaceholderData: agentsArePlaceholder } = useAvailableAgents({
     pinnedAgentIds: [stored?.agent_id, launch?.agentId].filter((id): id is string => id != null),
   });
@@ -289,7 +287,7 @@ export function ProjectSettingsDialog({
   const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
-  const agentLabel = selectedAgent ? selectedAgent.display_name : "No default";
+  const agentLabel = selectedAgent?.display_name ?? (agentId ? "Agent unavailable" : "No default");
   // Like the composer, fall back to the stored agent when the last start's agent
   // no longer exists, while the field still holds it.
   const launchAgentGone =

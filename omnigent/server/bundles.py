@@ -339,11 +339,12 @@ def save_user_agent(
         if existing.kind != "user" or existing.created_by != owner or existing.name != name:
             raise OmnigentError("Agent identity conflict", code=ErrorCode.CONFLICT)
         current_location = location
-        if current_location != existing.bundle_location and artifact_store.exists(
-            existing.bundle_location
-        ):
-            current = artifact_store.get(existing.bundle_location)
-            if content_bundle_location(agent_id, current) == location:
+        if current_location != existing.bundle_location:
+            try:
+                current = artifact_store.get(existing.bundle_location)
+            except KeyError:
+                current = None
+            if current is not None and content_bundle_location(agent_id, current) == location:
                 current_location = existing.bundle_location
         if not replace_existing and current_location != existing.bundle_location:
             raise OmnigentError(

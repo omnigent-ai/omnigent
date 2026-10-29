@@ -120,5 +120,8 @@ requires `user_owned: true` and `agent_config_edit: true`.
   one, both web lists show the newest legacy original per exact name. Re-uploading a
   pre-fix agent can create the shared ID; sessions on legacy IDs retain their old agent.
   Direct legacy links keep working; no session bindings are migrated.
+- A saved project default outside the current catalog shows Agent unavailable and new
+  sessions require an explicit choice. Task details identify an agent outside the current
+  list while preserving the task's saved ID. Pins do not add legacy IDs to the picker.
 - Built-in harness wrappers belong in Harnesses settings. The older Create
   custom agent dialog in new-session composition still starts a session.

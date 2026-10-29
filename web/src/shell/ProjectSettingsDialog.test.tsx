@@ -410,7 +410,7 @@ describe("ProjectSettingsDialog", () => {
     // While agent discovery is loading/failing, the stored agent's model
     // capability is unknowable — an unrelated save in that window must not
     // silently delete a valid stored default.
-    availableAgentsMock.mockReturnValue({ data: [] });
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -421,6 +421,9 @@ describe("ProjectSettingsDialog", () => {
       expect((screen.getByTestId("project-settings-save") as HTMLButtonElement).disabled).toBe(
         false,
       ),
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+      "Agent unavailable",
     );
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>

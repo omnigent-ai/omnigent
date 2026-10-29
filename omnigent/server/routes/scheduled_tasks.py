@@ -555,15 +555,12 @@ def create_scheduled_tasks_router(
                 project_id=project_id,
                 execution_target=body.execution_target,
             )
-        except Exception as exc:
-            # Named agents can already be bound by another session or request.
-            if isinstance(exc, RRuleSearchError):
-                raise OmnigentError(
-                    "Could not calculate the next run time for this schedule. "
-                    "The task was not created.",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            raise
+        except RRuleSearchError as exc:
+            raise OmnigentError(
+                "Could not calculate the next run time for this schedule. "
+                "The task was not created.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False
@@ -889,15 +886,12 @@ def create_scheduled_tasks_router(
             updated = store.update(scheduled_task_id, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-        except Exception as exc:
-            # Named agents can already be bound by another session or request.
-            if isinstance(exc, RRuleSearchError):
-                raise OmnigentError(
-                    "Could not calculate the next run time for this schedule. "
-                    "Your changes were not saved.",
-                    code=ErrorCode.INVALID_INPUT,
-                ) from exc
-            raise
+        except RRuleSearchError as exc:
+            raise OmnigentError(
+                "Could not calculate the next run time for this schedule. "
+                "Your changes were not saved.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(
             request.app.state, "scheduled_task_dispatch_enabled", False

@@ -555,15 +555,11 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   // the discovery lands. Consumers that must not resolve stored ids against a
   // partial list read isPlaceholderData to tell this state apart.
   //
-  const placeholderData = useMemo(
-    () =>
-      catalog === undefined
-        ? undefined
-        : includeUserAgents
-          ? dedupeNativeAgents(catalog.agents)
-          : mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames),
-    [catalog, includeUserAgents],
-  );
+  const placeholderData = useMemo(() => {
+    if (catalog === undefined) return undefined;
+    if (includeUserAgents) return dedupeNativeAgents(catalog.agents);
+    return mergeAvailableAgents(catalog.agents, [], [], catalog.suppressedNames);
+  }, [catalog, includeUserAgents]);
   const query = useQuery({
     // Recompute when the first 30 Mine sessions change; hover patches match the prefix.
     queryKey: ["available-agents", pinnedKey, sessionAgents.data ?? null, includeUserAgents],

@@ -232,17 +232,18 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-state-pill")).toHaveTextContent("Active");
   });
 
-  it("keeps the task's agent in the catalog when another agent shares its name", () => {
-    // The catalog merges agents by name and keeps a pinned id; without the pin
-    // a session's same-named copy wins and the task's own agent drops out.
+  it.each([false, true])("labels a saved agent when the current catalog hides it: %s", (hidden) => {
     useAvailableAgents.mockImplementation((options) => ({
-      data: options?.pinnedAgentIds?.includes("ag_1")
-        ? [{ id: "ag_1", name: "polly", display_name: "Polly" }]
-        : [{ id: "ag_session_copy", name: "polly", display_name: "Polly (session copy)" }],
+      data:
+        !hidden && options?.pinnedAgentIds?.includes("ag_1")
+          ? [{ id: "ag_1", name: "polly", display_name: "Polly" }]
+          : [{ id: "ag_session_copy", name: "polly", display_name: "Polly (session copy)" }],
     }));
     setTask(task({ agentId: "ag_1" }));
     renderPage();
-    expect(screen.getByTestId("task-detail-agent")).toHaveTextContent(/^Polly$/);
+    expect(screen.getByTestId("task-detail-agent").textContent).toBe(
+      hidden ? "Agent not in current list (ag_1)" : "Polly",
+    );
   });
 
   it("names the sandbox for a task that runs in a new sandbox each time", () => {
