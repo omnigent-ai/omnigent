@@ -823,7 +823,7 @@ async def _hold_elicitation_for_terminal_answer(
     Claude keeps its picker open after the hook exits and the runner holds
     chat messages behind it, so mid-turn the card is re-published with a
     ``terminal_fallback`` param instead of expiring. It clears once the
-    terminal answers, a re-park takes over, or the turn ends.
+    terminal answers, a re-park takes over, the turn ends, or the session is gone.
 
     :param session_id: Session that owns the prompt, e.g. ``"conv_abc123"``.
     :param elicitation_id: The prompt's id, e.g. ``"elicit_claude_0f3a..."``.
@@ -854,6 +854,7 @@ async def _hold_elicitation_for_terminal_answer(
                 conversation_store,
                 answer_undelivered=answer_undelivered,
             )
+        next_session_check = time.monotonic() + _facade._HARNESS_TERMINAL_FALLBACK_SESSION_CHECK_S
         while not unparked.resolved_elsewhere.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
@@ -868,6 +869,14 @@ async def _hold_elicitation_for_terminal_answer(
                 return True  # Already cleared elsewhere.
             if _session_status_cache.get(session_id) not in _MID_TURN_STATUSES:
                 return False
+            if conversation_store is not None and time.monotonic() >= next_session_check:
+                next_session_check = (
+                    time.monotonic() + _facade._HARNESS_TERMINAL_FALLBACK_SESSION_CHECK_S
+                )
+                if await _expire_hold_of_deleted_session(
+                    session_id, elicitation_id, unparked, conversation_store
+                ):
+                    return True
             if not answer_undelivered and _holds_undelivered_answer(
                 session_id, elicitation_id, unparked
             ):
@@ -906,6 +915,41 @@ async def _hold_elicitation_for_terminal_answer(
                 session_id,
                 exc_info=True,
             )
+    return True
+
+
+async def _expire_hold_of_deleted_session(
+    session_id: str,
+    elicitation_id: str,
+    unparked: _UnparkedHarnessElicitation,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Expire a held prompt, and its mirrors, once its session is gone without a local delete.
+
+    :returns: ``True`` when the prompt was expired here.
+    """
+    try:
+        session = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — a failed read keeps the hold until the next check
+        _logger.warning(
+            "Could not check whether session %s still exists", session_id, exc_info=True
+        )
+        return False
+    if (
+        session is not None
+        or session_id in _harness_deleting_sessions
+        or _harness_unparked_elicitations.get(elicitation_id) is not unparked
+        or unparked.resolved_elsewhere.is_set()
+        or pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None
+    ):
+        return False
+    # A delete on another replica can't release this replica's hold.
+    await _expire_deleted_session_prompt(
+        session_id,
+        elicitation_id,
+        conversation_store,
+        _mirrored_prompt_session_ids(session_id, elicitation_id),
+    )
     return True
 
 

@@ -3329,6 +3329,67 @@ async def test_hook_retry_expires_card_of_session_deleted_on_another_replica(
         pending_elicitations.reset_for_tests()
 
 
+@pytest.mark.parametrize("first_read_fails", [False, True])
+async def test_card_waiting_in_terminal_expires_once_session_is_deleted_on_another_replica(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    first_read_fails: bool,
+) -> None:
+    """
+    A held card whose session was deleted on another replica expires without a hook retry.
+
+    A session read that fails keeps the card held until a later read finds the session gone.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_SESSION_CHECK_S", 0.0)
+    name = f"test-terminal-fallback-held-deleted-elsewhere-{first_read_fails}"
+    parent_agent = await create_test_agent(client, f"{name}-parent")
+    parent_id = await _create_session(client, parent_agent["id"])
+    parent_collector = await start_session_stream_collector(parent_id)
+    try:
+        session_id, _payload, collector = await _sever_hook_mid_turn(
+            client, monkeypatch, name, parent_session_id=parent_id
+        )
+    except BaseException:
+        await parent_collector.stop()
+        raise
+    try:
+        await _next_elicitation_event(parent_collector)
+        for stream in (collector, parent_collector):
+            held = await _next_elicitation_event(stream)
+            assert "terminal_fallback" in held["params"]
+        read_failed = threading.Event()
+        deleted_elsewhere = not first_read_fails
+        get_conversation = SqlAlchemyConversationStore.get_conversation
+
+        def _get_conversation(store: Any, conversation_id: str) -> Any:
+            if conversation_id != session_id:
+                return get_conversation(store, conversation_id)
+            if not deleted_elsewhere:
+                read_failed.set()
+                raise RuntimeError("store unavailable")
+            return None
+
+        monkeypatch.setattr(SqlAlchemyConversationStore, "get_conversation", _get_conversation)
+        if first_read_fails:
+            assert await asyncio.to_thread(read_failed.wait, 5.0)
+            await collector.assert_no_event(within=0.05)
+            assert pending_elicitations.count_for(session_id) == 1
+            deleted_elsewhere = True
+        for stream in (collector, parent_collector):
+            expired = await _next_elicitation_event(stream)
+            assert expired["type"] == "response.elicitation_resolved"
+            assert expired["reason"] == "unanswered"
+        assert pending_elicitations.count_for(session_id) == 0
+        assert pending_elicitations.count_for(parent_id) == 0
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+    finally:
+        await collector.stop()
+        await parent_collector.stop()
+
+
 @pytest.mark.parametrize(
     ("vendor", "delete_fails", "exits_during_delete"),
     [
