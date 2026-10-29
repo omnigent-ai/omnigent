@@ -414,7 +414,7 @@ async def _start_codex_turn(
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
-        update_active_turn_id(bridge_dir, turn_id)
+        update_active_turn_id(bridge_dir, turn_id, expected_state=state)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
 
 
@@ -441,7 +441,7 @@ async def _steer_codex_turn(
     result = _json_object(response.get("result"))
     turn_id = result.get("turnId") if result is not None else None
     if isinstance(turn_id, str) and turn_id:
-        update_active_turn_id(bridge_dir, turn_id)
+        update_active_turn_id(bridge_dir, turn_id, expected_state=state)
         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
 
 
@@ -733,7 +733,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # the local cancel above already took effect.
+                except Exception:
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:

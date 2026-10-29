@@ -15,7 +15,7 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -190,6 +190,9 @@ class CodexNativeBridgeState:
         ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
+    :param state_revision: Persisted unique write identity, excluded from logical equality.
+    :param file_revision: Observed inode and modification time for legacy writers;
+        excluded from logical equality and never persisted in the payload.
     """
 
     session_id: str
@@ -198,6 +201,8 @@ class CodexNativeBridgeState:
     codex_home: str
     active_turn_id: str | None = None
     cwd: str | None = None
+    file_revision: tuple[int, int] | None = field(default=None, compare=False, repr=False)
+    state_revision: str | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1062,6 +1067,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
+                    "state_revision": secrets.token_hex(16),
                 },
                 handle,
                 sort_keys=True,
@@ -1611,7 +1617,9 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     try:
         if not stat.S_ISREG(path.stat().st_mode):
             return CodexNativeBridgeStateRead(None, "not_file")
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        with path.open(encoding="utf-8") as handle:
+            state_stat = os.fstat(handle.fileno())
+            raw = json.load(handle)
     except FileNotFoundError as exc:
         return CodexNativeBridgeStateRead(None, "missing", exc.errno)
     except OSError as exc:
@@ -1628,6 +1636,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
     cwd = raw.get("cwd")
+    state_revision = raw.get("state_revision")
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -1637,6 +1646,10 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
         or not thread_id
         or not isinstance(codex_home, str)
         or not codex_home
+        or (
+            state_revision is not None
+            and (not isinstance(state_revision, str) or not state_revision)
+        )
     ):
         return CodexNativeBridgeStateRead(None, "invalid_state")
     parsed_active_turn_id = (
@@ -1650,6 +1663,8 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             codex_home=codex_home,
             active_turn_id=parsed_active_turn_id,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
+            file_revision=(state_stat.st_ino, state_stat.st_mtime_ns),
+            state_revision=state_revision,
         ),
         "ready",
     )
@@ -1674,13 +1689,21 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return state is not None and state.session_id == session_id
 
 
-def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
+def update_active_turn_id(
+    bridge_dir: Path,
+    active_turn_id: str | None,
+    *,
+    expected_state: CodexNativeBridgeState | None = None,
+) -> None:
     """
     Update the active Codex turn id in bridge state.
 
     :param bridge_dir: Native Codex bridge directory.
     :param active_turn_id: Active turn id, e.g. ``"turn_abc123"``,
         or ``None`` when no turn is running.
+    :param expected_state: RPC's original bridge snapshot. When provided,
+        preserve any file revision observed while its reply was pending,
+        including a completed turn whose fields are idle again.
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
@@ -1688,6 +1711,19 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
         # An accepted steer often returns the turn already saved here. Rewriting
         # it can fail on a full disk after Codex has accepted the message.
         if state is None or state.active_turn_id == active_turn_id:
+            return
+        if expected_state is not None and (
+            state.session_id != expected_state.session_id
+            or state.thread_id != expected_state.thread_id
+            or state.socket_path != expected_state.socket_path
+            or state.codex_home != expected_state.codex_home
+            or state.active_turn_id != expected_state.active_turn_id
+            or state.state_revision != expected_state.state_revision
+            or (
+                expected_state.file_revision is not None
+                and state.file_revision != expected_state.file_revision
+            )
+        ):
             return
         _write_bridge_state_unlocked(
             bridge_dir,
@@ -1776,7 +1812,7 @@ def clear_active_turn_id_if_matches(
             return
         try:
             on_cleared()
-        except Exception:  # the clear is written; a retry cannot re-run it.
+        except Exception:
             _logger.warning(
                 "Codex-native cleared-turn callback raised for %s", bridge_dir, exc_info=True
             )

@@ -120,15 +120,26 @@ def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
     )
 
 
-def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_state", [False, True], ids=["versioned", "legacy"])
+def test_bridge_state_preserves_native_working_directory(
+    tmp_path: Path, legacy_state: bool
+) -> None:
     """Bridge state retains the cwd used for web-driven Codex turns."""
     _seed_active_turn(tmp_path, "turn_1")
+    if legacy_state:
+        state_path = tmp_path / "state.json"
+        payload = json.loads(state_path.read_text())
+        payload.pop("state_revision", None)
+        state_path.write_text(json.dumps(payload))
 
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.cwd == str(tmp_path)
+    assert state.file_revision is not None
+    assert (state.state_revision is None) == legacy_state
     observation = codex_native_bridge.read_bridge_state_result(tmp_path)
     assert observation.state == state
+    assert observation.state.file_revision == state.file_revision
     assert observation.status == "ready"
     assert observation.os_errno is None
 
@@ -137,6 +148,9 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+    assert updated.file_revision != state.file_revision
+    assert updated.state_revision is not None
+    assert updated.state_revision != state.state_revision
 
 
 @pytest.mark.parametrize(
