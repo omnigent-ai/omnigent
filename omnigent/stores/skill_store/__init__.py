@@ -86,6 +86,9 @@ class SkillInstall:
     path: str
     bundle_location: str
     bundle_bytes: int
+    # From the skill's own frontmatter: false keeps it out of a user's menu
+    # while it is still delivered to the agent.
+    user_invocable: bool = True
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,7 @@ class SkillStore(ABC):
         bundle_location: str,
         bundle_bytes: int,
         installed_by: str | None,
+        user_invocable: bool = True,
     ) -> InstalledSkill:
         """Record one skill (see :meth:`install_many`)."""
         item = SkillInstall(
@@ -186,6 +190,7 @@ class SkillStore(ABC):
             path=path,
             bundle_location=bundle_location,
             bundle_bytes=bundle_bytes,
+            user_invocable=user_invocable,
         )
         return self.install_many(
             [item], scope=scope, owner_user_id=owner_user_id, installed_by=installed_by
@@ -220,6 +225,7 @@ class SkillStore(ABC):
         description: str,
         display_name: str | None,
         path: str | None = None,
+        user_invocable: bool = True,
         max_bytes: int | None = None,
     ) -> InstallResult | None:
         """Replace the stored package after a refetch; ``None`` when absent.

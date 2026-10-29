@@ -76,6 +76,48 @@ _CONTEXT_FILE_PRIORITY: tuple[str, ...] = ("AGENTS.md", "CLAUDE.md", ".cursorrul
 _FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)", re.DOTALL)
 
 
+class SkillFrontmatterLoader(yaml.SafeLoader):
+    """SafeLoader that refuses YAML anchors in a skill's frontmatter.
+
+    An alias expands as the document loads, so a few hundred bytes of nested
+    aliases can build an arbitrarily large structure: a byte limit on the file
+    bounds the input, not the expansion. Skill metadata is a flat mapping of
+    scalars, so anchors have no use here and the whole class is refused —
+    which matters because the marketplace parses frontmatter from repositories
+    it does not own.
+    """
+
+    def compose_node(self, parent: object, index: object) -> object:
+        if self.check_event(yaml.events.AliasEvent):
+            raise yaml.YAMLError("YAML anchors are not allowed in skill frontmatter")
+        return super().compose_node(parent, index)  # type: ignore[arg-type]
+
+
+def load_skill_frontmatter(frontmatter_str: str) -> object:
+    """Parse a skill's YAML frontmatter with anchors refused.
+
+    :raises yaml.YAMLError: On malformed YAML, or any anchor use.
+    """
+    return yaml.load(frontmatter_str, Loader=SkillFrontmatterLoader)
+
+
+def _scalar_metadata(value: object, field: str, skill_md: Path) -> str:
+    """One frontmatter field as text; a collection is refused, not stringified.
+
+    ``str()`` of a nested structure can be far larger than the YAML that
+    produced it, so only scalars are converted.
+
+    :raises OmnigentError: When *value* is a collection rather than a scalar.
+    """
+    if isinstance(value, list | dict | set | tuple | bytes | bytearray):
+        raise OmnigentError(
+            f"SKILL.md frontmatter field {field!r} must be a single value, "
+            f"not a {type(value).__name__}: {skill_md}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return str(value)
+
+
 class _ConfigYamlLoader(yaml.SafeLoader):
     """
     SafeLoader variant that does NOT treat ``on``/``off``/
@@ -2738,11 +2780,11 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         )
     frontmatter_str, content = match.groups()
     try:
-        frontmatter = yaml.safe_load(frontmatter_str)
+        frontmatter = load_skill_frontmatter(frontmatter_str)
     except yaml.YAMLError as exc:
         # Retry prose containing colons; diagnostics must not include file contents.
         try:
-            frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+            frontmatter = load_skill_frontmatter(_quote_description_with_colon(frontmatter_str))
         except yaml.YAMLError:
             raise OmnigentError(
                 f"SKILL.md has invalid YAML frontmatter: {skill_md} ({type(exc).__name__})",
@@ -2768,10 +2810,10 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
     # ``user-invocable: false`` marks an internal orchestration skill that
     # the user should not invoke directly; absent/true ⇒ invocable.
     user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
-    label = str(name)
+    label = _scalar_metadata(name, "name", skill_md)
     return SkillSpec(
         name=skill_md.parent.name,
-        description=str(description),
+        description=_scalar_metadata(description, "description", skill_md),
         content=content.strip(),
         skill_dir=skill_md.parent,
         user_invocable=user_invocable,

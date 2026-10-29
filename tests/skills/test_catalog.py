@@ -83,6 +83,47 @@ def test_links_are_never_followed(plain_repo: Path, tmp_path: Path) -> None:
     assert any("skills directory is a link" in note for note in skipped)
 
 
+def test_an_internal_skill_keeps_its_user_invocable_flag(plain_repo: Path) -> None:
+    # The flag has to survive indexing, or an installed orchestration skill
+    # would be advertised in the menu the way a bundled one never is.
+    (plain_repo / "skills" / "orchestrate").mkdir()
+    (plain_repo / "skills" / "orchestrate" / "SKILL.md").write_text(
+        "---\nname: orchestrate\ndescription: internal\nuser-invocable: false\n---\nDo it.\n"
+    )
+
+    entries = {entry.name: entry for entry in index_checkout(plain_repo)}
+
+    assert entries["orchestrate"].user_invocable is False
+    assert entries["review"].user_invocable is True
+
+
+def test_frontmatter_that_would_expand_or_stringify_a_structure_is_skipped(
+    plain_repo: Path,
+) -> None:
+    # A repository is untrusted input. Aliases expand as the document loads, so
+    # a few hundred bytes can build an enormous structure under a byte limit
+    # that only bounds the file; and str() of a structure is far larger than
+    # the YAML that produced it. Both are refused instead, which this pins with
+    # small payloads rather than a resource-hungry one.
+    (plain_repo / "skills" / "aliased").mkdir()
+    (plain_repo / "skills" / "aliased" / "SKILL.md").write_text(
+        "---\nname: aliased\nseed: &s [a, a]\ndescription: [*s, *s]\n---\nBoom.\n"
+    )
+    (plain_repo / "skills" / "listy").mkdir()
+    (plain_repo / "skills" / "listy" / "SKILL.md").write_text(
+        "---\nname: listy\ndescription:\n  - one\n  - two\n---\nNo.\n"
+    )
+
+    skipped: list[str] = []
+    names = [entry.name for entry in index_checkout(plain_repo, skipped=skipped)]
+
+    assert "aliased" not in names and "listy" not in names
+    assert any("skills/aliased" in line for line in skipped), skipped
+    assert any("skills/listy" in line and "must be a single value" in line for line in skipped)
+    # The well-formed skills in the same repository are still indexed.
+    assert "review" in names
+
+
 def test_oversized_or_multibyte_frontmatter_is_skipped(plain_repo: Path) -> None:
     from tests.skills.conftest import write_skill
 

@@ -277,10 +277,14 @@ def installed_skill_summaries(
 
     *installed* is already enabled-only and one per name
     (:func:`effective_installed_skills`); a bundled skill of the same name
-    wins, a host skill of the same name loses.
+    wins, a host skill of the same name loses. A skill whose frontmatter says
+    ``user-invocable: false`` is left out, as a bundled one is: the agent still
+    receives it, the user is just never offered it.
     """
     out: list[SkillSummary] = []
     for skill in installed:
+        if not skill.user_invocable:
+            continue
         if skill.name in bundled or not skill_allowed(spec, skill.name):
             continue
         out.append(

@@ -47,6 +47,8 @@ class CatalogEntry:
     :param path: The skill directory, relative to the checkout root, POSIX form.
     :param plugin: The marketplace plugin that carries it, or ``None`` for a
         root-level skill.
+    :param user_invocable: Whether its frontmatter offers it to the user;
+        ``user-invocable: false`` marks an internal orchestration skill.
     """
 
     name: str
@@ -54,6 +56,7 @@ class CatalogEntry:
     description: str
     path: str
     plugin: str | None = None
+    user_invocable: bool = True
 
 
 def _inside(root: Path, candidate: Path) -> bool:
@@ -189,6 +192,7 @@ def _entries_under(
             description=spec.description,
             path=str(PurePosixPath(rel)),
             plugin=plugin,
+            user_invocable=spec.user_invocable,
         )
 
 

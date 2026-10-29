@@ -441,6 +441,7 @@ def _install_personal_skill(
     *,
     description: str | None = None,
     scope: str = "user",
+    user_invocable: bool = True,
 ) -> None:
     """An install for *owner* (``None``: the local user, or everyone with ``scope="org"``)."""
     LocalArtifactStore(str(tmp_path / "artifacts")).put(
@@ -460,6 +461,7 @@ def _install_personal_skill(
         bundle_location=f"skills/{name}.tar.gz",
         bundle_bytes=1,
         installed_by=owner,
+        user_invocable=user_invocable,
     )
 
 
@@ -508,6 +510,8 @@ async def test_session_catalog_lists_the_owners_installed_skills_under_the_agent
     agent, conv = _child_session(skills_app, db_uri, tmp_path)
     _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
     _install_personal_skill(db_uri, tmp_path, "editor", "editors-skill")
+    # user-invocable: false in its own SKILL.md — delivered, never offered.
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-internal", user_invocable=False)
     # Collides with the child's own bundled skill: the bundle wins, as at delivery.
     _install_personal_skill(db_uri, tmp_path, "owner", "kid", description="Installed kid")
     loaded = app.state.agent_cache.load(agent.id, agent.bundle_location)
@@ -540,10 +544,62 @@ async def test_session_catalog_lists_the_owners_installed_skills_under_the_agent
     names = [s["name"] for s in listed]
     assert "child-review" in names and "editors-skill" not in names
     assert ("owners-skill" in names) is (skill_filter == "all")
+    # Left out under either filter, as a bundled internal skill is.
+    assert "owners-internal" not in names
     assert not any(s["name"] == "kid" and s["source"] == "acme/skills" for s in listed)
     if skill_filter == "all":
         owners = next(s for s in response.json()["skills"] if s["name"] == "owners-skill")
         assert owners["source"] == "acme/skills"
+
+
+async def test_the_runner_resolves_the_served_bundle_and_discovers_the_skill(
+    skills_app, db_uri: str, tmp_path: Path
+) -> None:
+    # The bytes the route serves, taken the rest of the way through the runner's
+    # own fetch, extract and cache path rather than parsed in the test.
+    from omnigent.runner._entry import _AgentSpecCache, _resolve_agent_spec_from_server
+
+    app, _, _, _, _, hosts = skills_app
+    agent, conv = _child_session(skills_app, db_uri, tmp_path)
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    hosts.register_managed_host(
+        host_id=conv.host_id,
+        name="sandbox",
+        user_id="owner",
+        token="valid",
+        provider="modal",
+        sandbox_id="sandbox",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        served = await client.get(
+            f"/v1/sessions/{conv.id}/agent/contents",
+            headers={MANAGED_HOST_TOKEN_HEADER: "valid"},
+        )
+    assert served.status_code == 200, served.text
+    carried = {
+        name: value
+        for name, value in served.headers.items()
+        if name.lower().startswith("x-agent-")
+    }
+
+    cache = _AgentSpecCache(tmp_path / "spec-cache")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=served.content, headers=carried)
+        ),
+        base_url="http://runner.test",
+    ) as runner_client:
+        resolved = await _resolve_agent_spec_from_server(runner_client, cache, agent.id, conv.id)
+        again = await _resolve_agent_spec_from_server(runner_client, cache, agent.id, conv.id)
+
+    assert resolved is not None and again is not None
+    # The second resolution reuses the extracted directory rather than re-extracting.
+    assert again.workdir == resolved.workdir
+    child = next(s for s in resolved.spec.sub_agents if s.name == "child")
+    assert "owners-skill" in {skill.name for skill in child.skills}
 
 
 async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_the_owner(
@@ -556,6 +612,7 @@ async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_t
     app, _, _, _, _, hosts = skills_app
     agent, conv = _child_session(skills_app, db_uri, tmp_path)
     _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-internal", user_invocable=False)
     _install_personal_skill(db_uri, tmp_path, None, "shared-skill", scope="org")
     _install_personal_skill(db_uri, tmp_path, None, "local-skill")
     # A session nobody owns (shared with an editor only) on the same child agent.
@@ -594,6 +651,10 @@ async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_t
             delivered = names(response.content)
             assert ("agents/child/skills/owners-skill/SKILL.md" in delivered) is expected, headers
             assert ("agents/child/skills/shared-skill/SKILL.md" in delivered) is expected, headers
+            # Hidden from the menu, still delivered: the agent is what uses it.
+            assert ("agents/child/skills/owners-internal/SKILL.md" in delivered) is expected, (
+                headers
+            )
             assert "skills/owners-skill/SKILL.md" not in delivered
             # The local user's own install is nobody's on a multi-user server.
             assert "agents/child/skills/local-skill/SKILL.md" not in delivered

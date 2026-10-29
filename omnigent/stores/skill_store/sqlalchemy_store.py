@@ -125,6 +125,7 @@ def _skill_entity(row: SqlInstalledSkill) -> InstalledSkill:
         bundle_location=row.bundle_location,
         bundle_bytes=row.bundle_bytes,
         enabled=bool(row.enabled),
+        user_invocable=bool(row.user_invocable),
         installed_by=row.installed_by,
         installed_at=row.installed_at,
         updated_at=row.updated_at,
@@ -375,6 +376,7 @@ class SqlAlchemySkillStore(SkillStore):
                         principal=principal,
                         owner_user_id=owner,
                         enabled=True,
+                        user_invocable=item.user_invocable,
                         installed_by=installed_by,
                         installed_at=now,
                     )
@@ -394,6 +396,7 @@ class SqlAlchemySkillStore(SkillStore):
                 row.path = item.path
                 row.bundle_location = item.bundle_location
                 row.bundle_bytes = item.bundle_bytes
+                row.user_invocable = item.user_invocable
                 session.flush()
                 results.append(InstallResult(skill=_skill_entity(row), replaced_location=replaced))
             lock.installed_count += len(adding)
@@ -482,6 +485,7 @@ class SqlAlchemySkillStore(SkillStore):
         description: str,
         display_name: str | None,
         path: str | None = None,
+        user_invocable: bool = True,
         max_bytes: int | None = None,
     ) -> InstallResult | None:
         max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
@@ -509,6 +513,7 @@ class SqlAlchemySkillStore(SkillStore):
             row.bundle_bytes = bundle_bytes
             row.description = description
             row.display_name = display_name
+            row.user_invocable = user_invocable
             if path is not None:
                 row.path = path
             row.updated_at = now_epoch()

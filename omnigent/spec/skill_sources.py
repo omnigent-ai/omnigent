@@ -34,6 +34,7 @@ from omnigent.spec.parser import (
     _parse_skill,
     _quote_description_with_colon,
     discover_host_skills,
+    load_skill_frontmatter,
     skill_matches_names,
 )
 from omnigent.spec.types import AgentSpec, SkillSpec
@@ -521,11 +522,13 @@ def _parse_command(
     if match:
         frontmatter_str, body = match.groups()
         try:
-            frontmatter = yaml.safe_load(frontmatter_str)
+            frontmatter = load_skill_frontmatter(frontmatter_str)
         except yaml.YAMLError:
             # Prose descriptions carry colons; recover them as SKILL.md parsing does.
             try:
-                frontmatter = yaml.safe_load(_quote_description_with_colon(frontmatter_str))
+                frontmatter = load_skill_frontmatter(
+                    _quote_description_with_colon(frontmatter_str)
+                )
             except yaml.YAMLError:
                 frontmatter = None
         if isinstance(frontmatter, dict):

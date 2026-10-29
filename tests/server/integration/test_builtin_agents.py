@@ -263,9 +263,16 @@ async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     # Both bundled skills traversed the load → AgentObject path with the
     # exact name + description the composer menu renders. A missing or
     # renamed entry means the landing "/" menu regressed to empty.
+    # `source` names the repository an installed marketplace skill came from;
+    # a bundled skill has none.
     assert entry["skills"] == [
-        {"name": "review-pr", "description": "Review a pull request", "display_name": None},
-        {"name": "triage", "description": "Triage issues", "display_name": None},
+        {
+            "name": "review-pr",
+            "description": "Review a pull request",
+            "display_name": None,
+            "source": None,
+        },
+        {"name": "triage", "description": "Triage issues", "display_name": None, "source": None},
     ]
     # SkillSummary is the safe subset — the SKILL.md body must not leak
     # into the catalog payload.

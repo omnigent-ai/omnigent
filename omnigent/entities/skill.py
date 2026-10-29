@@ -45,6 +45,8 @@ class InstalledSkill:
     :param bundle_location: Artifact-store key of the skill tarball.
     :param bundle_bytes: Size of that tarball, counted against the owner's delivery budget.
     :param enabled: Whether sessions receive it.
+    :param user_invocable: Whether its own ``SKILL.md`` offers it to the user;
+        an internal orchestration skill is delivered but never listed in a menu.
     :param installed_by: User who installed it, or ``None`` in single-user mode.
     :param installed_at: Unix epoch seconds.
     :param updated_at: Unix epoch seconds of the last update, or ``None``.
@@ -63,6 +65,7 @@ class InstalledSkill:
     bundle_location: str
     bundle_bytes: int
     enabled: bool
+    user_invocable: bool
     installed_by: str | None
     installed_at: int
     updated_at: int | None

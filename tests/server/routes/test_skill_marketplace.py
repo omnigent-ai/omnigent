@@ -21,12 +21,14 @@ from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.skill_injection import effective_installed_skills, with_installed_skills
+from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_PAGE
 from omnigent.skills.service import SkillFetcher
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.skill_store import SkillValueError
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 from tests._helpers.skill_repos import copying_cloner, skill_tarball, write_skill
 
@@ -263,6 +265,54 @@ async def test_update_cleans_up_after_a_removal_or_another_update_wins(market) -
     stored.clear()
     assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 404
     assert len(stored) == 1 and not artifact_store.exists(stored[0])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_install_leaves_no_object_it_created(market) -> None:
+    client, app, artifact_store = market
+    real_put = artifact_store.put
+    stored: list[str] = []
+
+    def put_then_fail_on_the_second(key: str, data: bytes) -> None:
+        if len(stored) == 1:
+            raise OSError("artifact store is full")
+        stored.append(key)
+        real_put(key, data)
+
+    # The second tarball cannot be stored: the first one is dropped rather than
+    # left behind, since no row was written for either.
+    artifact_store.put = put_then_fail_on_the_second  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="is full"):
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review", "triage"]}
+        )
+    assert len(stored) == 1 and not artifact_store.exists(stored[0])
+    assert (await client.get("/v1/installed-skills")).json()["data"] == []
+
+    # A reinstall of identical content targets an existing object. When the
+    # write is refused the object stays, because the committed row needs it.
+    artifact_store.put = real_put  # type: ignore[method-assign]
+    first = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    assert first.status_code == 201, first.text
+    location = await _location(app, first.json()["data"][0]["id"])
+    real_install = app.state.skill_store.install_many
+
+    def refuse(items, **kwargs):  # type: ignore[no-untyped-def]
+        del items, kwargs
+        raise SkillValueError("name is longer than 255 characters")
+
+    app.state.skill_store.install_many = refuse
+    refused = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    app.state.skill_store.install_many = real_install
+    assert refused.status_code == 400
+    assert artifact_store.exists(location)
+    assert (
+        await client.get(f"/v1/installed-skills/{first.json()['data'][0]['id']}/content")
+    ).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -549,6 +599,9 @@ def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
     from omnigent.stores.skill_store import SkillInstall
 
     store = SqlAlchemySkillStore(db_uri)
+    # The loop below pages; a principal's whole set has to be readable that way,
+    # so its row cap must fit in one page of the real limits.
+    assert MAX_INSTALLED_PER_OWNER <= MAX_PAGE
     monkeypatch.setattr(skill_injection, "MAX_PAGE", 2)
     monkeypatch.setattr(skill_injection, "MAX_DELIVERED_SKILLS", 5)
     items = [

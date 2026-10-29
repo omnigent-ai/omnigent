@@ -29,6 +29,7 @@ def _item(name: str, **over) -> SkillInstall:  # type: ignore[no-untyped-def]  #
         "path": f"skills/{name}",
         "bundle_location": f"skills/{name}.tar.gz",
         "bundle_bytes": 10,
+        "user_invocable": True,
     }
     fields.update(over)
     return SkillInstall(**fields)  # type: ignore[arg-type]
@@ -426,6 +427,27 @@ def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySk
             store.list_sources(after=bad)
         with pytest.raises(SkillValueError, match="invalid cursor"):
             store.list_for_user("alice", after=bad)
+
+
+def test_the_user_invocable_flag_is_stored_and_refetched(store: SqlAlchemySkillStore) -> None:
+    # An internal skill installs like any other; the menu is what filters it.
+    internal = _install(store, "orchestrate", user_invocable=False)
+    assert internal.user_invocable is False
+    assert _install(store, "review").user_invocable is True
+    assert store.get(internal.id).user_invocable is False
+    assert store.find_for_user("alice", ["orchestrate"])[0].user_invocable is False
+
+    # An update refetches the skill, so a frontmatter change takes effect.
+    result = store.update(
+        internal.id,
+        commit="b" * 40,
+        bundle_location="skills/orchestrate-2.tar.gz",
+        bundle_bytes=10,
+        description="now public",
+        display_name=None,
+        user_invocable=True,
+    )
+    assert result is not None and result.skill.user_invocable is True
 
 
 def test_page_size_is_clamped(store: SqlAlchemySkillStore) -> None:

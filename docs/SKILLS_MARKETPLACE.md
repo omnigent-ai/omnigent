@@ -24,7 +24,10 @@ Two layouts are read:
   contributes its `skills/`. A plugin that points at another repository is
   listed as skipped rather than followed.
 
-A root-level skill shadows a plugin skill of the same name. Only GitHub
+A root-level skill shadows a plugin skill of the same name. A skill whose
+frontmatter carries `user-invocable: false` installs and is delivered like any
+other, but is never offered in a slash menu, exactly as a bundled internal
+skill is not. Only GitHub
 repositories are supported, written as `owner/repo`, a `github.com` URL, or a
 URL on a GitHub Enterprise Server host the server knows (`GH_HOST`,
 `OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS`, or a host `gh` is signed in to),
@@ -155,6 +158,12 @@ repository holds, and the server keeps at most 64 catalogs in memory.
 Repository metadata that would not fit its column is rejected before
 anything is stored, and the served bundle is rebuilt with a fixed timestamp
 so the same skills give the same bytes and the runner's cache hits.
+Frontmatter is read with YAML anchors refused and a non-scalar `name` or
+`description` rejected rather than stringified, so a small manifest cannot
+expand into a large structure in the server's memory. An install stores its
+tarballs before writing rows; if a later store or the write is refused, the
+objects that request created are dropped, while an object an earlier row
+already points at is left alone.
 
 ## API
 

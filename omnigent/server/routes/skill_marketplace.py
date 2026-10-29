@@ -477,22 +477,37 @@ def create_skill_marketplace_router(
         # Every tarball is stored first; the rows then commit in one transaction
         # under the principal's lock, so a refusal leaves no row and no new object.
         items: list[SkillInstall] = []
-        for skill in packaged:
-            location = _skill_location(skill.entry.name, body.scope, user_id, skill.tarball)
-            await asyncio.to_thread(artifact_store.put, location, skill.tarball)
-            items.append(
-                SkillInstall(
-                    name=skill.entry.name,
-                    display_name=skill.entry.display_name,
-                    description=skill.entry.description,
-                    source_url=url,
-                    ref=ref,
-                    commit=commit,
-                    path=skill.entry.path,
-                    bundle_location=location,
-                    bundle_bytes=len(skill.tarball),
+        # Locations this request brought into existence. A location that already
+        # held an object is left out: the key is content-addressed, so an
+        # existing row may point at the identical bytes.
+        created: list[str] = []
+        try:
+            for skill in packaged:
+                location = _skill_location(skill.entry.name, body.scope, user_id, skill.tarball)
+                is_new = not await asyncio.to_thread(artifact_store.exists, location)
+                await asyncio.to_thread(artifact_store.put, location, skill.tarball)
+                if is_new:
+                    created.append(location)
+                items.append(
+                    SkillInstall(
+                        name=skill.entry.name,
+                        display_name=skill.entry.display_name,
+                        description=skill.entry.description,
+                        source_url=url,
+                        ref=ref,
+                        commit=commit,
+                        path=skill.entry.path,
+                        bundle_location=location,
+                        bundle_bytes=len(skill.tarball),
+                        user_invocable=skill.entry.user_invocable,
+                    )
                 )
-            )
+        except Exception:
+            # A later store failed: no row exists yet, so every object this
+            # request created is certainly unreferenced.
+            for location in created:
+                _drop_artifact(artifact_store, location)
+            raise
         try:
             results = await asyncio.to_thread(
                 skill_store.install_many,
@@ -502,8 +517,11 @@ def create_skill_marketplace_router(
                 installed_by=user_id,
             )
         except SkillValueError as exc:
-            for item in items:
-                _drop_artifact(artifact_store, item.bundle_location)
+            # A refusal is raised before the transaction commits. Anything else
+            # from here leaves the commit ambiguous, so its objects stay: a row
+            # that did commit must not lose the bytes it points at.
+            for location in created:
+                _drop_artifact(artifact_store, location)
             raise _invalid(exc) from None
         # A reinstall with changed content leaves its old object unreferenced.
         kept = {item.bundle_location for item in items}
@@ -575,6 +593,7 @@ def create_skill_marketplace_router(
                 description=fresh.entry.description,
                 display_name=fresh.entry.display_name,
                 path=fresh.entry.path,
+                user_invocable=fresh.entry.user_invocable,
             )
         except SkillValueError as exc:
             if location != skill.bundle_location:
