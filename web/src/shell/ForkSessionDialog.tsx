@@ -1360,12 +1360,12 @@ function SupportedForkSessionForm({
             // detached launch below swallows its failure.
             const repoProblem = await checkHostDirectory(selectedHostId, workspaceTrimmed);
             if (repoProblem !== null) {
-              setError(repoProblem);
+              if (!token.cancelled) setError(repoProblem);
               return;
             }
             recreateSourceWorktree = true;
           } else {
-            setError(problem);
+            if (!token.cancelled) setError(problem);
             return;
           }
         }

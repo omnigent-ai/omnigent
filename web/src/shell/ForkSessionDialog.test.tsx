@@ -219,12 +219,12 @@ function pendingFork(): { succeed: () => void; fail: (message: string) => void }
   return { succeed: () => succeed(), fail: (message) => fail(message) };
 }
 
-/** Holds the directory pre-flight open until the test passes it. */
-function pendingPreflight(): () => void {
+/** Holds the directory pre-flight open until the test settles it with `problem`. */
+function pendingPreflight(problem: string | null = null): () => void {
   let pass = () => {};
   checkHostDirectoryMock.mockReturnValue(
     new Promise<string | null>((resolve) => {
-      pass = () => resolve(null);
+      pass = () => resolve(problem);
     }),
   );
   return () => pass();
@@ -566,6 +566,19 @@ describe("ForkSessionDialog", () => {
       expect(toastMock).not.toHaveBeenCalled();
     });
 
+    it("keeps a cancelled directory preflight's problem off the reopened form", async () => {
+      const fail = pendingPreflight("Directory not found");
+      const { update } = renderDialog(CODING);
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      update({ visible: false });
+      update({ visible: true });
+      fail();
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy"),
+      );
+      expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
+    });
+
     it("reports a clone that succeeds after its form hides with an Open toast", async () => {
       const fork = pendingFork();
       const { update, onClose } = renderDialog({ bareForm: true });
@@ -681,8 +694,9 @@ describe("ForkSessionDialog", () => {
       expect(toastMock).not.toHaveBeenCalled();
     });
 
-    it("follows the running clone for the current cutoff", () => {
+    it("follows the running clone for the current cutoff and kind", () => {
       beginClone(cloneKey("conv_src", "resp_cut"), IDLE_LISTENER, vi.fn());
+      beginClone(cloneKey("conv_src", null, true), IDLE_LISTENER, vi.fn());
       const { update } = renderDialog({ bareForm: true });
       expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-busy");
       update({ upToResponseId: "resp_cut" });

@@ -78,6 +78,7 @@ the header menu), and each place is a separate entry point.
   shows creator headings; it has no search or collapsible groups.
   Closing the dialog mid-clone keeps the clone running: a toast reports it
   (with **Open** on success), and reopening the dialog shows it again.
+  Dismissing that toast stops tracking the clone, so a new one can start.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
