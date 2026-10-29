@@ -353,12 +353,7 @@ def test_running_agent_updates_do_not_reload_loaded_folder_pages(
                 f"tab A timeline:\n{_timeline_since(tab_a_traffic, start)}\n"
                 f"tab B timeline:\n{_timeline_since(tab_b_traffic, start)}"
             )
-            assert folder_requests["tab B"] == [], report
-            reloaded_pages = {
-                tab: [url for url in urls if "after=" in url]
-                for tab, urls in folder_requests.items()
-            }
-            assert reloaded_pages == {"tab A": [], "tab B": []}, report
+            assert folder_requests == {"tab A": [], "tab B": []}, report
     finally:
         for session_id in filler_ids:
             httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)

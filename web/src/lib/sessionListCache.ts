@@ -220,7 +220,7 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
 }
 
 /** Row fields the server filters list membership on (archive state, owner, project). */
-const MEMBERSHIP_FIELDS = ["archived", "owner", "project_id"];
+const MEMBERSHIP_FIELDS = ["archived", "owner", "project_id"] satisfies (keyof Conversation)[];
 
 /**
  * Decide whether a field change needs server-side list reconciliation.
