@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 import time
 from pathlib import Path
 
@@ -40,12 +41,14 @@ def test_undoes_the_save_of_a_switch_omnigent_typed(
 ) -> None:
     settings, state = paths
     _write(settings, before)
+    settings.chmod(0o640)
     assert default_model_guard.begin_model_switch(settings, "claude-sonnet-5-5", state_dir=state)
 
     _write(settings, {**before, "model": "claude-sonnet-5-5"})  # Claude's save
     assert not default_model_guard.settle_default_model(settings, state_dir=state)
 
     assert _read(settings) == after
+    assert stat.S_IMODE(settings.stat().st_mode) == 0o640
     assert not list(state.glob("*.json"))
 
 
@@ -133,26 +136,39 @@ def test_registers_nothing_when_the_default_is_already_that_model(
     assert not list(state.glob("*.json"))
 
 
-def test_a_cancelled_or_expired_switch_leaves_a_later_save_alone(
+def test_cancelling_forgets_only_that_switch(paths: tuple[Path, Path]) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    sonnet = default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    haiku = default_model_guard.begin_model_switch(settings, "haiku", state_dir=state)
+    assert sonnet is not None and haiku is not None
+    _write(settings, {"model": "sonnet"})
+    default_model_guard.settle_default_model(settings, state_dir=state)
+
+    sonnet.cancel()  # already settled while haiku keeps the record: a no-op
+    haiku.cancel()
+    _write(settings, {"model": "haiku"})
+
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "haiku"}
+
+
+def test_an_expired_switch_leaves_a_later_save_alone(
     paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings, state = paths
     _write(settings, {"model": "opus"})
-    cancelled = default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
-    assert cancelled is not None
-    cancelled.cancel()
-    default_model_guard.begin_model_switch(settings, "haiku", state_dir=state)
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
     now = time.time()
     monkeypatch.setattr(
         default_model_guard.time,
         "time",
         lambda: now + default_model_guard.PENDING_SWITCH_TTL_S + 1,
     )
+    _write(settings, {"model": "sonnet"})
 
-    for model in ("sonnet", "haiku"):
-        _write(settings, {"model": model})
-        assert not default_model_guard.settle_default_model(settings, state_dir=state)
-        assert _read(settings) == {"model": model}
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "sonnet"}
 
 
 def test_the_watcher_restores_the_default_on_its_own(tmp_path: Path) -> None:
@@ -193,5 +209,17 @@ def test_a_bridge_records_the_settings_file_of_its_launch_env(
         workspace=tmp_path,
         launch_env={"CLAUDE_CONFIG_DIR": "/srv/claude"},
     )
+
+    assert bridge.read_user_settings_path(bridge_dir) == Path("/srv/claude/settings.json")
+
+
+def test_a_bridge_from_before_the_record_uses_the_runners_settings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text('{"bridge_id": "b1"}', encoding="utf-8")
+    monkeypatch.setattr(bridge, "claude_user_settings_path", claude_user_settings_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/srv/claude")
 
     assert bridge.read_user_settings_path(bridge_dir) == Path("/srv/claude/settings.json")

@@ -68,8 +68,10 @@ class PendingModelSwitch:
                 if record is None:
                     return
                 pending = _live_pending(record)
-                with contextlib.suppress(ValueError):
-                    pending.remove(next(p for p in pending if p["model"] == self.model))
+                # Already settled when another switch keeps the record alive.
+                match = next((p for p in pending if p["model"] == self.model), None)
+                if match is not None:
+                    pending.remove(match)
                 _save_record(record_path, record, pending)
         except (OSError, FileLockTimeout):
             _logger.warning(
