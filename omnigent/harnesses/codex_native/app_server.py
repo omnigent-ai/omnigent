@@ -1097,6 +1097,29 @@ def is_missing_rollout_error(exc: BaseException) -> bool:
     )
 
 
+#: Substring in codex's ``-32600`` message when another app-server still holds
+#: the thread being resumed.
+_CODEX_ACTIVE_WRITER_ERROR = "already has an active writer"
+
+
+def is_active_writer_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure says another app-server holds the thread.
+
+    A runner replaced moments ago may still be starting its own app-server for
+    the same session, so the conflict clears once that process is reaped.
+
+    :param exc: The exception raised by the resume request.
+    :returns: ``True`` for codex's ``-32600 … already has an active writer``.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and _CODEX_ACTIVE_WRITER_ERROR in exc.message
+    )
+
+
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex explicitly refused this RPC before submitting its input."""
     return (
