@@ -141,7 +141,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Escape discards it. The button is absent when neither the browser nor the
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
-  Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+  Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
+  Inbox reply box follows the same shortcut.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
   dismissed or the missing setup is completed.

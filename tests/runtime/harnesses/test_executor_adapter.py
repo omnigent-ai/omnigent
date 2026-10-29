@@ -3119,6 +3119,7 @@ async def test_ask_question_handler_returns_answers_on_accept() -> None:
     ("action", "content", "expected"),
     [
         ("decline", None, "The user dismissed the question without answering."),
+        ("cancel", None, "The user dismissed the question without answering."),
         # A client without the question form (the terminal REPL) can only
         # approve, so the model must re-ask instead of hearing "dismissed".
         (
@@ -3128,7 +3129,7 @@ async def test_ask_question_handler_returns_answers_on_accept() -> None:
             "back. Ask the question again in plain text.",
         ),
     ],
-    ids=["dismissed", "accepted-without-answers"],
+    ids=["declined", "cancelled", "accepted-without-answers"],
 )
 async def test_ask_question_handler_explains_unanswered_question(
     action: str, content: dict[str, Any] | None, expected: str
@@ -3164,6 +3165,19 @@ async def test_ask_question_handler_denies_without_elicit_when_no_questions() ->
     out = await adapter._stable_ask_question_handler({"not": "questions"})
     assert isinstance(out, str)
     assert "nothing was shown to the user" in out
+
+
+@pytest.mark.asyncio
+async def test_ask_question_handler_denies_without_an_active_turn() -> None:
+    """An orphaned callback has no turn to ask in, so it denies without eliciting."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    assert adapter._current_ctx is None
+    out = await adapter._stable_ask_question_handler(
+        {"questions": [{"question": "Q", "options": ["a", "b"]}]}
+    )
+    assert out == "AskUserQuestion is unavailable outside an active Omnigent turn."
 
 
 @pytest.mark.asyncio

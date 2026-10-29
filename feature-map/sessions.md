@@ -117,6 +117,8 @@ the header menu), and each place is a separate entry point.
   progress after leaving Settings. Results stay compact, with expandable failure
   details and retry of the original selection.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
+  Pi imports retain readable history and compaction checkpoints; continuation
+  uses the latest summary, retained context and subsequent turns.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
@@ -217,6 +219,10 @@ or session ID. After starting, go Back to the session list; its heading shows
 progress and links back to Settings. Imported sessions appear in the normal list.
 On phones, the progress link opens the Import panel directly; its header arrow
 returns to the Settings menu.
+For a local Pi session, the CLI also accepts
+`omnigent import --harness pi --session <id> --server <url>`.
+Open the imported session and choose a host and working directory to resume it,
+then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
@@ -850,6 +856,20 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
+  covers the shared host picker with Claude. For Pi checkpoint conversion, run
+  `tests/test_session_import.py::test_pi_import_retains_compaction_for_resume`
+  with retries disabled; it covers legacy/current formats, retained tool pairs,
+  images and missing boundaries. Imported images remain in readable history;
+  resume snapshots use the same text-only representation as live Pi checkpoints.
+  This is component coverage, not a running Pi session.
+  For real Pi acceptance, create a session with enough history to compact,
+  compact it, then add another turn. Import it using the CLI and Settings
+  (exact ID and recent sessions), and check duplicate imports remain a single
+  session. Resume onto an isolated host and send from both Chat and Terminal.
+  Check that the full imported history remains readable and the original file
+  is unchanged. With a recording provider, verify that the outgoing context
+  contains the summary, retained context and later turns, omitting summarized
+  raw turns. Record the Pi version and mock/live provider scope separately.
 - **`recent-switcher` (manual Electron):** open at least six sessions, hold
   Control and press Tab to show the five most recent, cycle with Tab and
   Shift+Tab, release Control to switch, then reopen and press Escape to cancel.

@@ -105,6 +105,7 @@ from omnigent.inner.databricks_executor import (
     _read_databrickscfg_host,
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.native import policy_allow_cache
 from omnigent.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
@@ -2888,12 +2889,14 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
         via ``--bridge-dir``.
     :param python_executable: Python executable to run, e.g.
         ``"/path/to/python"``. ``None`` uses :data:`sys.executable`.
-    :returns: A shell-escaped command string, e.g.
-        ``"/path/python -I -m omnigent.harnesses.codex_native.hook evaluate-policy
-        --bridge-dir /home/u/.omnigent/codex-native/abc"``.
+    :returns: The shell command, the Python hook behind the allow-cache guard
+        (:func:`omnigent.native.policy_allow_cache.guarded_hook_command`).
+        The Python part is shell-escaped, e.g. ``"/path/python -I -m
+        omnigent.harnesses.codex_native.hook evaluate-policy --bridge-dir
+        /home/u/.omnigent/codex-native/abc"``.
     """
     python = python_executable or sys.executable
-    return shlex.join(
+    command = shlex.join(
         [
             python,
             "-I",
@@ -2904,6 +2907,7 @@ def _codex_policy_hook_command(bridge_dir: Path, python_executable: str | None) 
             str(bridge_dir),
         ]
     )
+    return policy_allow_cache.guarded_hook_command(bridge_dir, command)
 
 
 def _turn_router_advertised(bridge_dir: Path) -> bool:

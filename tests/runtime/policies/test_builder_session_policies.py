@@ -25,6 +25,7 @@ from omnigent.runtime.policies.builder import (
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
+    policy_specs_cache_age,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -835,3 +836,32 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
     ]
+
+
+def test_policy_specs_cache_age_tracks_the_older_store_read(db_uri: str) -> None:
+    """A no-policy answer is as old as the older of the two lists behind it.
+
+    A list no longer cached counts as a full TTL old, and without a store
+    there is nothing to go stale.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    from omnigent.db.db_models import current_workspace_id
+
+    store = SqlAlchemyPolicyStore(db_uri)
+    session_id = "0f4a9f8e7d6c5b4a39281706f5e4d3c2"
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    assert policy_specs_cache_age(session_id, None) == 0.0
+    assert policy_specs_cache_age(session_id, store) == 30.0
+
+    _load_default_policy_specs(store)
+    _load_session_policy_specs(session_id, store)
+    assert policy_specs_cache_age(session_id, store) < 1.0
+
+    specs, loaded_at = _SESSION_POLICY_SPECS_CACHE[session_id]
+    _SESSION_POLICY_SPECS_CACHE[session_id] = (specs, loaded_at - 20.0)
+    assert 20.0 <= policy_specs_cache_age(session_id, store) < 21.0
+    assert current_workspace_id() in _DEFAULT_POLICY_SPECS_CACHE
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
