@@ -760,9 +760,7 @@ def test_results_move_before_message_sent_during_the_call(
 )
 def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None) -> None:
     items = [_user_item("Read the file."), _output("orphan", "recovered contents")]
-    if call == "later":
-        items.append(_call("orphan"))
-    elif call == "malformed":
+    if call == "malformed":
         items.insert(1, _call("orphan", name=""))
     elif call == "interrupted":
         items.insert(1, _call("orphan", "cancelled"))
@@ -778,6 +776,8 @@ def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None)
             ),
         ]
     items.append(_output("orphan", "duplicate contents", item_id="duplicate"))
+    if call == "later":
+        items.append(_call("orphan"))
     messages = _rebuilt_messages(items)
     assert not any(m["role"] == "toolResult" for m in messages)
     recovered = messages[2 if call == "reused-by-interrupted-call" else 1]
@@ -794,21 +794,49 @@ def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None)
     assert [b["id"] for b in calls] == (["orphan"] if replayed else [])
 
 
-def test_call_reusing_an_interrupted_call_id_keeps_its_result() -> None:
+@pytest.mark.parametrize("earlier", ["interrupted", "interrupted-with-output", "completed"])
+def test_call_reusing_an_earlier_call_id_keeps_its_result(earlier: str) -> None:
+    items = [_call("c1", "first")]
+    if earlier == "completed":
+        items.append(_output("c1", "first contents", item_id="out-first"))
+    else:
+        items.append({**_assistant_item("partial", response_id="first"), "interrupted": True})
+    if earlier == "interrupted-with-output":
+        items.append(_output("c1", "first contents", item_id="out-first"))
     messages = _rebuilt_messages(
         [
-            _call("c1", "cancelled"),
-            {**_assistant_item("partial", response_id="cancelled"), "interrupted": True},
+            *items,
             _user_item("Try again.", response_id="retry"),
-            _call("c1", "retry", name="read"),
+            {**_call("c1", "retry", name="read"), "id": "c1-retry"},
             _output("c1", "contents"),
+            _output("c1", "mirrored contents", item_id="out-mirror"),
         ]
     )
     _assert_results_follow_calls(messages)
-    assert [m["role"] for m in messages] == ["user", "assistant", "toolResult"]
-    assert messages[2]["toolName"] == "read"
-    assert messages[2]["content"][0]["text"] == "contents"
-    assert "Recovered tool output" not in json.dumps(messages)
+    assert [m["role"] for m in messages][-3:] == ["user", "assistant", "toolResult"]
+    assert messages[-1]["toolName"] == "read"
+    assert messages[-1]["content"][0]["text"] == "contents"
+    rendered = json.dumps(messages)
+    assert "mirrored contents" not in rendered
+    assert ("first contents" in rendered) is (earlier != "interrupted")
+    assert ("Recovered tool output" in rendered) is (earlier == "interrupted-with-output")
+
+
+def test_interrupted_reuse_of_a_completed_call_id_keeps_its_late_output() -> None:
+    messages = _rebuilt_messages(
+        [
+            _call("c1", "first"),
+            _output("c1", "first contents", item_id="out-first"),
+            _user_item("Read it again.", response_id="again"),
+            {**_call("c1", "cancelled"), "id": "c1-cancelled"},
+            {**_assistant_item("partial", response_id="cancelled"), "interrupted": True},
+            _output("c1", "late contents", item_id="out-late"),
+        ]
+    )
+    _assert_results_follow_calls(messages)
+    assert [m["role"] for m in messages] == ["assistant", "toolResult", "user", "user"]
+    assert "its call was interrupted" in messages[3]["content"][0]["text"]
+    assert messages[3]["content"][-1]["text"] == "late contents"
 
 
 def test_missing_result_is_left_for_pi_to_mark_interrupted() -> None:

@@ -353,10 +353,12 @@ def pi_session_records_from_session_items(
         if isinstance(response_id, str) and response_id in skip_response_ids:
             if item_type == "function_call" and item_call_id:
                 skipped_call_ids.add(item_call_id)
+                replayed_call_ids.discard(item_call_id)
             continue
         blocks = _pi_assistant_blocks_from_item(item)
         if blocks and item_call_id:
             skipped_call_ids.discard(item_call_id)
+            replayed_call_ids.discard(item_call_id)
             tool_names[item_call_id] = cast(str, blocks[0]["name"])
         if blocks is None:
             if item_call_id:
