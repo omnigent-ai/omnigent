@@ -2073,6 +2073,27 @@ def read_user_settings_path(bridge_dir: Path) -> Path:
     return claude_user_settings_path()
 
 
+def write_user_settings_path(bridge_dir: Path, settings_path: Path) -> None:
+    """
+    Record the user ``settings.json`` this session's Claude saves to.
+
+    The runner calls this once the pane's final launch env and cwd are known;
+    :func:`prepare_bridge_dir` only sees the env it was handed.
+
+    :param bridge_dir: Bridge directory path.
+    :param settings_path: The pane's settings file, e.g.
+        ``Path("/srv/claude/settings.json")``.
+    :returns: None.
+    :raises RuntimeError: If the bridge config does not exist.
+    """
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not config:
+            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        config["user_settings_path"] = str(settings_path)
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
 def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
     """
     Return the file Claude opens for ``path.join(directory, name)`` from *cwd*.
@@ -5759,8 +5780,7 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
         ):
-            if switch is not None:
-                switch.cancel()
+            # Not cancelled: Enters queued in a stalled pane can still submit it.
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
                 f"{_SUBMIT_VERIFY_TIMEOUT_S}s (the command is still in the "

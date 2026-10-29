@@ -7184,14 +7184,15 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     ]
 
 
-@pytest.mark.parametrize("enter_fails", [False, True], ids=["submitted", "enter failed"])
+@pytest.mark.parametrize("outcome", ["submitted", "unconfirmed", "enter failed"])
 def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enter_fails: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
     """
-    A typed ``/model`` save is put back; a switch whose Enter failed leaves nothing pending.
+    A typed ``/model`` save is put back, even one that lands after submit
+    verification gave up; a switch whose Enter failed leaves nothing pending.
 
-    The fake Enter writes the save the way Claude Code does in an interactive
+    The fake pane writes the save the way Claude Code does in an interactive
     session, so the settle afterwards sees exactly what a real pane leaves.
     """
     bridge_dir = tmp_path / "bridge"
@@ -7211,11 +7212,12 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
         del kwargs
         result = _FakeCompleted()
         if "capture-pane" in cmd:
-            result.stdout = _composer_pane()
+            # A stalled pane keeps showing the typed command after Enter.
+            result.stdout = _composer_pane("/model sonnet" if outcome == "unconfirmed" else "")
         elif cmd[-1] == "Enter":
-            if enter_fails:
+            if outcome == "enter failed":
                 result.returncode = 1
-            else:
+            elif outcome == "submitted":
                 settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
         return result
 
@@ -7223,12 +7225,15 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     monkeypatch.setattr(default_model_guard, "_ensure_watcher", lambda *_args: None)
 
-    if enter_fails:
+    if outcome == "submitted":
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
+    else:
         with pytest.raises(RuntimeError):
             claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-    else:
-        claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-        default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
+    if outcome == "unconfirmed":
+        # A queued Enter submits the command once the pane recovers.
+        settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
+    default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
 
     assert json.loads(settings_path.read_text(encoding="utf-8")) == {"model": "opus"}
     assert not list(state_dir.glob("*.json"))

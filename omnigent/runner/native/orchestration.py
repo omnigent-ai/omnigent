@@ -9215,9 +9215,11 @@ async def _auto_create_claude_terminal(
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
         claude_terminal_relay_env,
+        claude_user_settings_path,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
+        write_user_settings_path,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -9976,10 +9978,11 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-        )
+        launch_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        launch_env = _claude_terminal_launch_env(env_spec)
+        ensure_claude_workspace_trusted(launch_cwd, env=launch_env)
+        # The default-model guard watches the settings file this Claude saves /model to.
+        write_user_settings_path(bridge_dir, claude_user_settings_path(launch_cwd, launch_env))
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.

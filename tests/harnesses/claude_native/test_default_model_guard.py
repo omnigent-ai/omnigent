@@ -49,6 +49,51 @@ def test_undoes_the_save_of_a_switch_omnigent_typed(
     assert not list(state.glob("*.json"))
 
 
+def test_a_failed_restore_stays_pending_and_is_retried(
+    paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    _write(settings, {"model": "sonnet"})
+    real_replace = default_model_guard.os.replace
+    calls: list[object] = []
+
+    def flaky_replace(src: object, dst: object) -> None:
+        calls.append(dst)
+        if len(calls) == 1:
+            raise PermissionError("settings.json is locked")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(default_model_guard.os, "replace", flaky_replace)
+
+    assert default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "sonnet"}
+    assert not default_model_guard.settle_default_model(settings, state_dir=state)
+    assert _read(settings) == {"model": "opus"}
+
+
+def test_an_edit_landing_mid_restore_is_kept(
+    paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    _write(settings, {"model": "sonnet"})
+    real_chmod = default_model_guard.os.chmod
+
+    def chmod_then_edit(path: object, mode: int) -> None:
+        real_chmod(path, mode)
+        if _read(settings) == {"model": "sonnet"}:  # another writer, once
+            _write(settings, {"model": "sonnet", "theme": "dark"})
+
+    monkeypatch.setattr(default_model_guard.os, "chmod", chmod_then_edit)
+
+    default_model_guard.settle_default_model(settings, state_dir=state)
+
+    assert _read(settings) == {"model": "opus", "theme": "dark"}
+
+
 def test_keeps_a_users_own_change_and_restores_to_it(paths: tuple[Path, Path]) -> None:
     settings, state = paths
     _write(settings, {"model": "opus"})

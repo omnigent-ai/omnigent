@@ -26,7 +26,7 @@ import stat
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ _logger = logging.getLogger(__name__)
 PENDING_SWITCH_TTL_S = 30 * 60
 _WATCH_POLL_S = 0.25
 _LOCK_TIMEOUT_S = 5.0
+_RESTORE_ATTEMPTS = 3
 
 
 _MISSING = object()
@@ -140,15 +141,19 @@ def settle_default_model(settings_path: Path, *, state_dir: Path) -> bool:
                 # Not a model Omnigent typed: the user's own pick is the default now.
                 record["default"] = _encode(current)
             else:
-                pending.remove(saved)
                 try:
                     _write_settings_model(settings_path, default)
                 except (OSError, ValueError):
-                    _logger.warning(
-                        "claude-native: could not restore the default model in %s",
-                        settings_path,
-                        exc_info=True,
-                    )
+                    # Kept pending, so the next pass retries; warn only once per switch.
+                    if not saved.get("restore_failed"):
+                        saved["restore_failed"] = True
+                        _logger.warning(
+                            "claude-native: could not restore the default model in %s; retrying",
+                            settings_path,
+                            exc_info=True,
+                        )
+                else:
+                    pending.remove(saved)
         _save_record(record_path, record, pending)
         return bool(pending)
 
@@ -278,20 +283,33 @@ def _write_settings_model(path: Path, value: object) -> None:
     :raises ValueError: If the file is not a JSON object.
     """
     target = path.resolve()
-    payload = json.loads(target.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError(f"{target} is not a JSON object")
-    if value is _MISSING:
-        payload.pop("model", None)
-    else:
-        payload["model"] = value
-    # Claude's own layout: two-space indent, raw UTF-8, trailing newline.
-    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-    _atomic_write(target, text, mode=stat.S_IMODE(target.stat().st_mode))
-    _logger.info("claude-native: kept the default model in %s", path)
+    for _attempt in range(_RESTORE_ATTEMPTS):
+        raw = target.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError(f"{target} is not a JSON object")
+        if value is _MISSING:
+            payload.pop("model", None)
+        else:
+            payload["model"] = value
+        # Claude's own layout: two-space indent, raw UTF-8, trailing newline.
+        text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        # Another writer's edit between the read and the replace is redone on, not lost.
+        if _atomic_write(
+            target,
+            text,
+            mode=stat.S_IMODE(target.stat().st_mode),
+            unchanged=lambda raw=raw: target.read_text(encoding="utf-8") == raw,
+        ):
+            _logger.info("claude-native: kept the default model in %s", path)
+            return
+    raise OSError(f"{target} kept changing while its default model was restored")
 
 
-def _atomic_write(target: Path, text: str, *, mode: int) -> None:
+def _atomic_write(
+    target: Path, text: str, *, mode: int, unchanged: Callable[[], bool] = lambda: True
+) -> bool:
+    """Replace *target* with *text*, unless *unchanged* reports another write first."""
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -300,8 +318,11 @@ def _atomic_write(target: Path, text: str, *, mode: int) -> None:
             tmp_path = Path(handle.name)
             handle.write(text)
         os.chmod(tmp_path, mode)
+        if not unchanged():
+            return False
         os.replace(tmp_path, target)
         tmp_path = None
+        return True
     finally:
         if tmp_path is not None:
             with contextlib.suppress(FileNotFoundError):

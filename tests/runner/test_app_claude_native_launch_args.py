@@ -22,6 +22,9 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import (
+    claude_user_settings_path as real_claude_user_settings_path,
+)
 from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
@@ -1391,12 +1394,15 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     A launch-only ``CLAUDE_CONFIG_DIR`` (here from an ``env`` wrapper) must
     reach the seeder, and seeding must happen before the terminal launches.
+    The default-model guard records the settings file in that same config dir.
     """
     from unittest.mock import Mock
 
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
     from omnigent.runner.resource_registry import SessionResourceRegistry
 
     seeded: list[tuple[Path, dict[str, str] | None]] = []
+    recorded_settings: list[Path] = []
     registry = Mock(spec=SessionResourceRegistry)
     registry.client_surface_env.return_value = {"OMNIGENT_CLIENT_SURFACE": "desktop"}
     registry.launch_required_terminal.side_effect = RuntimeError("stop after seeding")
@@ -1408,6 +1414,15 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
+    )
+    # The real resolver, in place of the suite-wide temp path.
+    monkeypatch.setattr(
+        claude_native_bridge, "claude_user_settings_path", real_claude_user_settings_path
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "write_user_settings_path",
+        lambda _bridge_dir, settings_path: recorded_settings.append(settings_path),
     )
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
@@ -1431,6 +1446,7 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     assert workspace == Path(bridge_dir).resolve()
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
+    assert recorded_settings == [Path("/launch/claude/settings.json")]
     registry.launch_required_terminal.assert_awaited_once()
 
 
