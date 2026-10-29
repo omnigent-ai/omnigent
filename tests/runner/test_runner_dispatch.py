@@ -2082,13 +2082,31 @@ def test_build_spawn_env_applies_model_override(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    base = _build_spawn_env_from_spec(spec, "claude-sdk")
-    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = SessionResourceRegistry()
+    registry.set_client_surface("desktop-session", "desktop")
+    base = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="desktop-session", resource_registry=registry
+    )
+    overridden = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        model_override="claude-sonnet-4-6",
+        session_id="desktop-session",
+        resource_registry=registry,
+    )
     assert base is not None and overridden is not None
     # Baseline uses the provider/catalog default (not the override) …
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    assert base["OMNIGENT_CLIENT_SURFACE"] == overridden["OMNIGENT_CLIENT_SURFACE"] == "desktop"
+    unknown = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="legacy-session", resource_registry=registry
+    )
+    assert unknown is not None
+    assert unknown["OMNIGENT_CLIENT_SURFACE"] == "unknown"
 
 
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -46,6 +46,7 @@ from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
+from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR, CLIENT_SURFACES
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
@@ -498,6 +499,7 @@ class SessionResourceRegistry:
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
+        self._client_surfaces: dict[str, str] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
@@ -546,6 +548,18 @@ class SessionResourceRegistry:
         # instead of polling. Entries self-remove on completion.
         self._terminal_exit_tasks: set[asyncio.Task[None]] = set()
         self._terminal_exit_scheduled: asyncio.Event = asyncio.Event()
+
+    def set_client_surface(self, session_id: str, surface: str | None) -> None:
+        """Retain the session's creating surface across harness and terminal relaunches."""
+        with self._lock:
+            self._client_surfaces[session_id] = (
+                surface if surface is not None and surface in CLIENT_SURFACES else "unknown"
+            )
+
+    def client_surface_env(self, session_id: str) -> dict[str, str]:
+        """Build launch metadata without inheriting another session's client identity."""
+        with self._lock:
+            return {CLIENT_SURFACE_ENV_VAR: self._client_surfaces.get(session_id, "unknown")}
 
     def set_terminal_activity_publisher(
         self,
@@ -1289,6 +1303,7 @@ class SessionResourceRegistry:
 
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
+        spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
         program_status_args = (
             {"program_status_app": "claude-code"}
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
@@ -2139,6 +2154,7 @@ class SessionResourceRegistry:
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
+            self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
             skills_directory = self._codex_skills_dirs.pop(session_id, None)

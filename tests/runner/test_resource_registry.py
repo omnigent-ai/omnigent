@@ -520,6 +520,7 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("codex", "main", tmp_path)
+    registry.set_client_surface("conv_codex", "desktop")
 
     async def _fake_launch(
         conversation_id: str,
@@ -538,7 +539,8 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         :param kwargs: Additional launch kwargs.
         :returns: The fake terminal instance.
         """
-        del spec, kwargs
+        del kwargs
+        assert spec.env == {"OMNIGENT_CLIENT_SURFACE": "desktop", "KEEP_ME": "present"}
         terminal_registry._by_conversation.setdefault(conversation_id, {})[
             (terminal_name, session_key)
         ] = instance
@@ -567,7 +569,11 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         "conv_codex",
         "codex",
         "main",
-        TerminalEnvSpec(command="codex", args=["--remote", "ws://127.0.0.1:1234"]),
+        TerminalEnvSpec(
+            command="codex",
+            args=["--remote", "ws://127.0.0.1:1234"],
+            env={"OMNIGENT_CLIENT_SURFACE": "cli", "KEEP_ME": "present"},
+        ),
         resource_role=CODEX_NATIVE_TERMINAL_ROLE,
     )
 
@@ -588,6 +594,8 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     assert record.session_id == "conv_codex"
     assert record.attributes["terminal_id"] == view.id
     assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
+    await registry.cleanup_session("conv_codex")
+    assert registry.client_surface_env("conv_codex") == {"OMNIGENT_CLIENT_SURFACE": "unknown"}
 
 
 @pytest.mark.asyncio
