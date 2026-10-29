@@ -1381,3 +1381,85 @@ async def test_interrupted_turn_keeps_launcher_certificate_record(tmp_path: Path
     )
 
     assert read_certificate_failure(tmp_path) is not None
+
+
+class _ContinuingCodexClient:
+    """App-server stand-in that answers ``turn/start`` with a fresh turn id."""
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, dict[str, object]]] = []
+
+    async def request(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        self.requests.append((method, params))
+        return {"result": {"turn": {"id": f"turn_{len(self.requests)}"}}}
+
+
+_OUTPUT_LIMIT_ERROR = {"message": "Incomplete response returned, reason: max_output_tokens"}
+
+
+async def _output_limit_stop(
+    client: _RecordingClient,
+    codex: _ContinuingCodexClient,
+    state: fwd._CodexForwarderState,
+    turn_id: str,
+    tmp_path: Path,
+) -> bool:
+    """Deliver one output-limit ``error`` notification for *turn_id*."""
+    _seed_active_turn(tmp_path, turn_id)
+    return await fwd._maybe_handle_turn_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        method="error",
+        params={
+            "threadId": "thread_x",
+            "turnId": turn_id,
+            "willRetry": False,
+            "error": _OUTPUT_LIMIT_ERROR,
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        delta_coalescer=None,
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        codex_client=codex,  # type: ignore[arg-type]
+        forwarder_state=state,
+    )
+
+
+@pytest.mark.asyncio
+async def test_output_limit_stop_continues_once_then_surfaces(tmp_path: Path) -> None:
+    """An output-limit stop continues the turn once; a second stop surfaces the error.
+
+    Failure on main: the first stop posts a failed status, and no turn/start is sent.
+    """
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    state = fwd._CodexForwarderState()
+
+    assert await _output_limit_stop(client, codex, state, "turn_a", tmp_path)
+    assert [method for method, _ in codex.requests] == ["turn/start"]
+    assert codex.requests[0][1]["threadId"] == "thread_x"
+    assert client.posts == []
+    assert "turn_a" in state.surfaced_terminal_error_turns
+
+    # The continuation (turn_1) stops again: no second continuation, failure posted.
+    assert await _output_limit_stop(client, codex, state, "turn_1", tmp_path)
+    assert len(codex.requests) == 1
+    statuses = [body["data"]["status"] for _, body in client.posts]
+    assert statuses == ["failed"]
+    assert client.posts[0][1]["data"]["output"] == _OUTPUT_LIMIT_ERROR["message"]
+
+
+@pytest.mark.asyncio
+async def test_output_limit_stop_with_open_tool_call_is_not_continued(tmp_path: Path) -> None:
+    """A stop with a tool item still open surfaces the error instead of continuing.
+
+    Continuing would leave Codex with a tool call and no output.
+    """
+    client = _RecordingClient()
+    codex = _ContinuingCodexClient()
+    state = fwd._CodexForwarderState()
+    state.open_tool_item_ids.add("item_cmd")
+
+    assert await _output_limit_stop(client, codex, state, "turn_b", tmp_path)
+    assert codex.requests == []
+    assert [body["data"]["status"] for _, body in client.posts] == ["failed"]

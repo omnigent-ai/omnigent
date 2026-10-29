@@ -487,6 +487,10 @@ class _CodexForwarderState:
     :param surfaced_terminal_error_turns: Turn ids whose standalone terminal
         ``error`` notification was already surfaced. Used to suppress a later
         terminal boundary for the same turn.
+    :param open_tool_item_ids: Tool items started but not yet completed, e.g.
+        ``{"item_1"}``. A turn that ends with one open is not auto-continued.
+    :param output_limit_chain: Continuation turn ids started after an output-limit
+        stop, mapped to how many continuations led to them, e.g. ``{"turn_2": 1}``.
     :param posted_user_turns: Turn ids whose ``userMessage`` has been
         posted to Omnigent this connection, e.g. ``{"turn_123"}``. Used to
         enforce user-before-assistant ordering: before posting a turn's
@@ -562,6 +566,8 @@ class _CodexForwarderState:
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
+    open_tool_item_ids: set[str] = field(default_factory=set)
+    output_limit_chain: dict[str, int] = field(default_factory=dict)
     posted_user_turns: set[str] = field(default_factory=set)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
@@ -3336,6 +3342,12 @@ async def _handle_event(
     # Child discovery remains connection-wide; output state is per thread.
     if method == "item/started" and forwarder_state is not None:
         item = params.get("item")
+        if (
+            isinstance(item, dict)
+            and item.get("type") in _CODEX_TOOL_ITEM_TYPES
+            and isinstance(item.get("id"), str)
+        ):
+            forwarder_state.open_tool_item_ids.add(item["id"])
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
         elif isinstance(item, dict) and item.get("type") == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE:
@@ -3424,6 +3436,8 @@ async def _handle_event(
         return
     if method == "item/completed":
         item = params.get("item")
+        if forwarder_state is not None and isinstance(item, dict):
+            forwarder_state.open_tool_item_ids.discard(str(item.get("id")))
         # Nested-spawn registration uses the connection's complete child map.
         # Transcript dedup and partial text belong only to the routed child.
         item_state = (
@@ -3927,6 +3941,74 @@ async def _maybe_fail_turn_on_certificate_failure(
     return True
 
 
+_CODEX_OUTPUT_LIMIT_REASON = "Incomplete response returned, reason: max_output_tokens"
+_OUTPUT_LIMIT_CONTINUE_TEXT = (
+    "The previous response stopped at its output limit. Continue from where it stopped."
+)
+_CODEX_TOOL_ITEM_TYPES = frozenset(
+    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+)
+_MAX_OUTPUT_LIMIT_CONTINUATIONS = 1
+
+
+async def _auto_continue_after_output_limit(
+    codex_client: CodexAppServerClient,
+    *,
+    bridge_dir: Path | None,
+    forwarder_state: _CodexForwarderState,
+    message: str,
+    turn_id: str,
+    thread_id: str,
+) -> bool:
+    """
+    Continue a turn that stopped at the model's output limit, once per user turn.
+
+    Only a stop with no open tool item is continued: a cut-off tool call would
+    leave Codex with a call and no output. The continuation is a normal user
+    message on the same thread, so it appears in the transcript.
+
+    :param codex_client: App-server client used to start the continuation turn.
+    :param bridge_dir: Native Codex bridge directory, or ``None`` for a child thread.
+    :param forwarder_state: Forwarder state holding the chain and open tool items.
+    :param message: The turn's error message.
+    :param turn_id: Id of the turn that stopped, e.g. ``"turn_1"``.
+    :param thread_id: Codex thread id, e.g. ``"thread_1"``.
+    :returns: ``True`` when a continuation turn was started and the stop is hidden.
+    """
+    if _CODEX_OUTPUT_LIMIT_REASON not in message or forwarder_state.open_tool_item_ids:
+        return False
+    chain_length = forwarder_state.output_limit_chain.get(turn_id, 0)
+    if chain_length >= _MAX_OUTPUT_LIMIT_CONTINUATIONS:
+        return False
+    try:
+        response = await codex_client.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": _OUTPUT_LIMIT_CONTINUE_TEXT}],
+            },
+        )
+    except Exception:  # noqa: BLE001 - the stop is surfaced as the original error.
+        _logger.warning("Codex output-limit continuation failed to start", exc_info=True)
+        return False
+    result = response.get("result")
+    turn = result.get("turn") if isinstance(result, dict) else None
+    continued_turn_id = turn.get("id") if isinstance(turn, dict) else None
+    if not isinstance(continued_turn_id, str) or not continued_turn_id:
+        return False
+    forwarder_state.output_limit_chain[continued_turn_id] = chain_length + 1
+    # The stopped turn's terminal boundary must not post a failure.
+    forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    if bridge_dir is not None:
+        update_active_turn_id(bridge_dir, continued_turn_id)
+    _logger.info(
+        "Codex forwarder continued turn %s after its output limit as %s",
+        turn_id,
+        continued_turn_id,
+    )
+    return True
+
+
 async def _maybe_handle_turn_event(
     client: httpx.AsyncClient,
     *,
@@ -4008,6 +4090,23 @@ async def _maybe_handle_turn_event(
                         ),
                     )
                     return True
+                thread_id = _thread_id_from_params(params)
+                if (
+                    codex_client is not None
+                    and turn_id is not None
+                    and thread_id is not None
+                    and await _auto_continue_after_output_limit(
+                        codex_client,
+                        bridge_dir=bridge_dir,
+                        forwarder_state=forwarder_state,
+                        message=error.message,
+                        turn_id=turn_id,
+                        thread_id=thread_id,
+                    )
+                ):
+                    forwarder_state.open_tool_item_ids.clear()
+                    return True
+                forwarder_state.open_tool_item_ids.clear()
                 if turn_id is not None:
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
             compaction_model: str | None = None
