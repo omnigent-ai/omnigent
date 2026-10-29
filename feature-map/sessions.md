@@ -95,6 +95,14 @@ the header menu), and each place is a separate entry point.
   which the server still lists the session's host offline (usually because Arca
   came back as a different host), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `switch-account`: when the server has a host account registry
+  (`OMNIGENT_HOST_ACCOUNTS_FILE`, see `docs/host-accounts.md`), the composer's
+  host menu shows **Switch model or account…** for a native session. One
+  dialog picks Machine, Account, then Model and Effort; the harness is the
+  session's own. The Machine control appears when an account runs on several
+  machines, and the button reads **Move session** when the machine changes. An
+  interrupted move offers **Cancel move**. Without a registry the menu keeps
+  **Switch host…**.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
