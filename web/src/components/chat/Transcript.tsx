@@ -57,6 +57,7 @@ import {
   computeIsWorking,
   extractUserText,
   isSystemBubble,
+  keyboardActiveQuestionId,
   mergePendingBubbles,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
@@ -169,6 +170,10 @@ function TranscriptImpl({
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const keyboardActiveElicitationId = useMemo(
+    () => keyboardActiveQuestionId(pendingElicitations),
+    [pendingElicitations],
+  );
   const streamBubbles = useMemo(
     () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
     [bubbles, pendingElicitations.length],
@@ -194,6 +199,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blockCount: blocks.length,
       committedUserIds,
       hasCommittedAnchor:
@@ -209,6 +215,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blocks,
       committedUserIds,
       hasTasks,
@@ -401,7 +408,10 @@ function TranscriptImpl({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard
+                        item={item}
+                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
+                      />
                     </MessageContent>
                   </Message>
                 ))}

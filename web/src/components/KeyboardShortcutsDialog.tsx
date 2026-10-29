@@ -76,6 +76,8 @@ interface Shortcut {
   lastKeySeparator?: string;
   /** Another chord for the same action, shown after "or". */
   alternateKeys?: string[];
+  /** Hidden on touch and narrow layouts, where Enter inserts a newline instead of submitting. */
+  desktopOnly?: boolean;
 }
 
 interface ShortcutGroup {
@@ -104,6 +106,9 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Next question, or submit all answers", keys: [ENTER_KEY], desktopOnly: true },
+      { label: "Pick a question option by number", keys: ["1…9"], desktopOnly: true },
+      { label: "Cancel pending question", keys: ["Esc"], desktopOnly: true },
       { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
       { label: "Cycle model", keys: [CTRL_KEY, ALT_KEY, "M"] },
       { label: "Cycle reasoning effort", keys: [CTRL_KEY, ALT_KEY, "E"] },
@@ -203,23 +208,28 @@ function shortcutGroupsFor(
         ],
       };
     }
-    if (group.title === "In chats" && !preventsKeyboardSubmit) {
+    if (group.title === "In chats") {
+      const chatItems = preventsKeyboardSubmit
+        ? group.items.filter((item) => !item.desktopOnly)
+        : group.items;
       return {
         ...group,
-        items: [
-          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
-          {
-            label: "Send now, with all queued messages",
-            keys: composerSteerAllShortcutKeys(submitWithModEnter),
-          },
-          {
-            label: "New line in message",
-            keys: composerNewLineShortcutKeys(submitWithModEnter),
-            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
-            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
-          },
-          ...group.items,
-        ],
+        items: preventsKeyboardSubmit
+          ? chatItems
+          : [
+              { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+              {
+                label: "Send now, with all queued messages",
+                keys: composerSteerAllShortcutKeys(submitWithModEnter),
+              },
+              {
+                label: "New line in message",
+                keys: composerNewLineShortcutKeys(submitWithModEnter),
+                // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
+                alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
+              },
+              ...chatItems,
+            ],
       };
     }
     if (group.title === "Navigation") {

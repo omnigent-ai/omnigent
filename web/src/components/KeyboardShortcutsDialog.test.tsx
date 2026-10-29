@@ -259,3 +259,26 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T", "Ctrl", "Alt", "B"]);
   });
 });
+
+describe("KeyboardShortcutsList question rows", () => {
+  it("lists the question keys with the chat shortcuts on desktop", () => {
+    render(<KeyboardShortcutsList />);
+
+    expect(keysFor("Next question, or submit all answers")).toEqual(["↵"]);
+    expect(keysFor("Pick a question option by number")).toEqual(["1…9"]);
+    expect(keysFor("Cancel pending question")).toEqual(["Esc"]);
+  });
+
+  it("hides the question keys on touch-primary devices", () => {
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...matchMedia(query),
+      matches: query.includes("pointer: coarse"),
+    }));
+    render(<KeyboardShortcutsList />);
+
+    expect(screen.queryByText("Next question, or submit all answers")).toBeNull();
+    expect(screen.queryByText("Pick a question option by number")).toBeNull();
+    expect(screen.queryByText("Cancel pending question")).toBeNull();
+  });
+});
