@@ -4300,7 +4300,9 @@ export function NewChatLandingScreen() {
               : [];
   // Unsaved custom agents launch through the host runners route, which cannot
   // refuse a host too old to start Codex in Plan mode.
+  const codexPlanLaunchEnabled = isFeatureEnabled(info, "codex_plan_at_launch");
   const codexPlanModeSelectable =
+    codexPlanLaunchEnabled &&
     !smartRoutingHarnessSelected &&
     selectedNativeHarness === "codex-native" &&
     effectiveAgentId !== PENDING_AGENT_ID;
@@ -7163,9 +7165,12 @@ export function NewChatLandingScreen() {
                         }
                         planLabel={codexPlanModeSelectable ? codexPlanToggleLabel : undefined}
                         planUnavailableReason={
-                          selectedNativeHarness === "codex-native" &&
-                          effectiveAgentId === PENDING_AGENT_ID
-                            ? "Turn Plan mode on after this custom agent's session starts"
+                          selectedNativeHarness === "codex-native"
+                            ? !codexPlanLaunchEnabled
+                              ? "This server does not support starting Codex in Plan mode"
+                              : effectiveAgentId === PENDING_AGENT_ID
+                                ? "Turn Plan mode on after this custom agent's session starts"
+                                : undefined
                             : undefined
                         }
                         projects={projectList ?? []}

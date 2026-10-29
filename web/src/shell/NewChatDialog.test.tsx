@@ -1381,7 +1381,10 @@ function renderLanding(
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
     smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    features: {
+      harness_install: infoOverrides.harness_install_enabled === true,
+      codex_plan_at_launch: true,
+    },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
@@ -6917,7 +6920,7 @@ describe("NewChatLandingScreen", () => {
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
-  it("preserves armed Codex Plan in a draft, resets on agent switch, and sends it at create", async () => {
+  it.each([true, false])("requires server support for Codex Plan (%s)", async (supported) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -6932,20 +6935,25 @@ describe("NewChatLandingScreen", () => {
     };
     togglePlan();
     cleanup();
-    renderLanding();
-    expect(screen.getByTestId("new-chat-landing-plan-mode")).toHaveTextContent("Plan mode");
-    togglePlan();
-    expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
-
-    togglePlan();
-    selectAgent("a1");
-    selectAgent("a2");
-    expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
-
-    togglePlan();
+    renderLanding({ features: supported ? { codex_plan_at_launch: true } : {} });
+    if (supported) {
+      expect(screen.getByTestId("new-chat-landing-plan-mode")).toHaveTextContent("Plan mode");
+      togglePlan();
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+      selectAgent("a1");
+      selectAgent("a2");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      togglePlan();
+    } else {
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
+      expect(screen.getByTestId("composer-plan-action")).toHaveAttribute("aria-disabled", "true");
+      expect(screen.queryByTestId("new-chat-landing-plan-mode")).toBeNull();
+      closeMenu();
+    }
     const { body } = await submitAndReadBody();
     const labels = body.labels as Record<string, string>;
-    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe("plan");
+    expect(labels["omnigent.codex_native.collaboration_mode"]).toBe(supported ? "plan" : undefined);
     expect(labels["omnigent.wrapper"]).toBe("codex-native-ui");
   });
 
@@ -10249,6 +10257,9 @@ describe("NewChatLandingScreen custom-agent sandbox gating", () => {
       expect(screen.getByTestId("new-chat-landing-host-chip").getAttribute("aria-label")).toContain(
         "Sandbox",
       ),
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain(
+      "my-agent",
     );
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
     expect(screen.queryByTestId("new-chat-landing-agent-pending")).toBeNull();

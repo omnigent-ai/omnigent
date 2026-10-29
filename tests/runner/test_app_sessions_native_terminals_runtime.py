@@ -572,6 +572,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
     )
     plan_mode = provider_profile is not None
+    plan_rejected = plan_mode and rotated
     if plan_mode:
         session_labels[CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY] = "plan"
     launch_snapshot = RunnerSessionInitSnapshot(
@@ -802,6 +803,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         plan_calls.append(
             (loaded_thread_id, model, effort, codex_native_bridge.read_bridge_state(bridge_dir))
         )
+        if plan_rejected:
+            raise RuntimeError("Plan settings update rejected")
 
     async def _fake_preload_thread(
         transport: str,
@@ -885,8 +888,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     monkeypatch.setattr(orchestration, "_shutdown_session_turn_router_async", stop_turn_router)
 
     try:
-        if cancel_launch:
-            with pytest.raises(asyncio.CancelledError):
+        if cancel_launch or plan_rejected:
+            with pytest.raises(RuntimeError if plan_rejected else asyncio.CancelledError):
                 await _auto_create_codex_terminal(
                     session_id,
                     _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -901,6 +904,11 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
             stop_subagent_router.assert_awaited_once_with(session_id, subagent_router)
             stop_turn_router.assert_awaited_once_with(session_id, turn_router)
+            if plan_rejected:
+                assert codex_native_bridge.read_bridge_state(bridge_dir) is None
+                failure = codex_native_bridge.read_bridge_startup_failure(bridge_dir)
+                assert failure is not None and failure.code == "codex_plan_mode_failed"
+                assert not launched_specs
             if rotated:
                 assert not session_dir.exists()
             return
