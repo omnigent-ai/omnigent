@@ -671,7 +671,7 @@ _EDIT_ERROR = "<tool_use_error>String to replace not found in file.</tool_use_er
 
 
 def _seed_edit_calls(chat: ChatSessionContract) -> None:
-    """One settled turn: a Codex patch over three files, a missed Claude edit, a declined patch."""
+    """One settled turn: a Codex patch, a Claude write, a missed Claude edit, a declined patch."""
     response_id = "edit-rows-response"
     chronological = [
         message_item("edit-rows-user", "user", "Rename the greeting.", response_id=response_id),
@@ -680,6 +680,13 @@ def _seed_edit_calls(chat: ChatSessionContract) -> None:
             "apply_patch",
             {"changes": _PATCH_CHANGES},
             _PATCH_OUTPUT,
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-write",
+            "Write",
+            {"file_path": "/repo/src/hello.py", "content": "def hello():\n    return 'hi'\n"},
+            "File created successfully at: /repo/src/hello.py",
             response_id=response_id,
         ),
         *tool_call_items(
@@ -718,7 +725,7 @@ def test_patch_row_counts_lines_across_its_files(
     chat_session_contract: ChatSessionContract,
     width: int,
 ) -> None:
-    """A Codex patch row shows its files' summed line counts and expands to per-file diffs."""
+    """Patch and new-file write rows show their line counts and expand to per-file diffs."""
     page.set_viewport_size({"width": width, "height": 720})
     _open_edit_rows(page, chat_session_contract)
 
@@ -737,6 +744,14 @@ def test_patch_row_counts_lines_across_its_files(
     expect(diffs.nth(2)).to_contain_text("-LEGACY = True")
     expect(body).not_to_contain_text("--- /repo/src")
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    # A write that created its file reads like an edit: counted, and all added lines.
+    write = page.get_by_role("button", name=re.compile(r"^Write .*hello\.py"))
+    expect(write.get_by_test_id("tool-line-counts")).to_have_text("+2")
+    write.click()
+    written = write.locator("xpath=..")
+    expect(written.get_by_text("/repo/src/hello.py (new file)")).to_be_visible()
+    expect(written.locator('[data-language="diff"]')).to_contain_text("+    return 'hi'")
 
 
 @pytest.mark.browser_context_args(record_video_size={"width": 1280, "height": 720})

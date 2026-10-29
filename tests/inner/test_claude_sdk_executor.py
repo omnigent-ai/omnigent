@@ -6209,3 +6209,149 @@ def test_tool_call_metadata_marks_only_omnigent_mcp_tools_as_dispatched() -> Non
     ):
         metadata = _tool_call_metadata(SimpleNamespace(id="toolu_1", name=name))  # type: ignore[arg-type]
         assert metadata == {"call_id": "toolu_1", "internally_executed": internal}, name
+
+
+class TestAskUserQuestionHook(unittest.TestCase):
+    """The in-process PreToolUse hook that renders AskUserQuestion as a
+    clickable form and feeds answers back via ``updatedInput``."""
+
+    def _fake_sdk(self):
+        class HookMatcher:
+            def __init__(self, matcher=None, timeout=None, hooks=None):
+                self.matcher = matcher
+                self.timeout = timeout
+                self.hooks = hooks
+
+        return SimpleNamespace(HookMatcher=HookMatcher)
+
+    def _aq_matcher(self, options):
+        for m in (getattr(options, "hooks", None) or {}).get("PreToolUse", []):
+            if getattr(m, "matcher", None) == "AskUserQuestion":
+                return m
+        return None
+
+    def _make_executor(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        return ClaudeSDKExecutor()
+
+    def test_no_matcher_registered_without_handler(self):
+        ex = self._make_executor()  # _ask_question_handler is None
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        self.assertIsNone(self._aq_matcher(opts))
+
+    def test_no_op_when_sdk_lacks_hook_matcher(self):
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value={"answers": {"q1": "a"}})
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(SimpleNamespace(), opts)  # no HookMatcher
+        self.assertIsNone(self._aq_matcher(opts))
+
+    def test_registers_matcher_with_long_human_timeout(self):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value={"answers": {"q1": "a"}})
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        m = self._aq_matcher(opts)
+        self.assertIsNotNone(m)
+        self.assertEqual(m.timeout, ClaudeSDKExecutor._ASK_QUESTION_HOOK_TIMEOUT_S)
+
+    def test_hook_allows_with_updated_input_on_answers(self):
+        ex = self._make_executor()
+        tool_input = {"questions": [{"question": "Env?", "options": ["dev", "prod"]}]}
+        ex._ask_question_handler = AsyncMock(return_value={**tool_input, "answers": {"q1": "dev"}})
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        cb = self._aq_matcher(opts).hooks[0]
+        out = _run(cb({"tool_input": tool_input}, "tuid", {}))
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        self.assertEqual(hso["permissionDecision"], "allow")
+        self.assertEqual(hso["updatedInput"], {**tool_input, "answers": {"q1": "dev"}})
+        ex._ask_question_handler.assert_awaited_once_with(tool_input)
+
+    def test_hook_denies_with_handler_reason(self):
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value="The user dismissed the question.")
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        cb = self._aq_matcher(opts).hooks[0]
+        out = _run(cb({"tool_input": {}}, None, {}))
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertEqual(hso["permissionDecisionReason"], "The user dismissed the question.")
+
+    def test_hook_runs_tool_call_policy_before_asking(self):
+        # The PreToolUse allow skips can_use_tool, so a policy DENY must be
+        # enforced here and the question never shown.
+        from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value={"answers": {"q1": "a"}})
+        ex._policy_evaluator = AsyncMock(
+            return_value=PolicyVerdictPayload(action="POLICY_ACTION_DENY", reason="no questions")
+        )
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        cb = self._aq_matcher(opts).hooks[0]
+        tool_input = {"questions": [{"question": "Q", "options": ["a"]}]}
+        out = _run(cb({"tool_input": tool_input}, None, {}))
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertEqual(hso["permissionDecisionReason"], "no questions")
+        ex._policy_evaluator.assert_awaited_once_with(
+            "PHASE_TOOL_CALL", {"name": "AskUserQuestion", "arguments": tool_input}
+        )
+        ex._ask_question_handler.assert_not_awaited()
+
+    def test_hook_denies_on_malformed_payload(self):
+        # A non-dict PreToolUse payload can't yield a tool_input, so the hook
+        # fails closed with an explicit deny (never falls through) and never
+        # invokes the bridge — consistent with the handler-None deny path.
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value={"answers": {"q1": "a"}})
+        opts = SimpleNamespace(hooks=None)
+        ex._install_ask_user_question_hook(self._fake_sdk(), opts)
+        cb = self._aq_matcher(opts).hooks[0]
+        out = _run(cb("not-a-dict", None, {}))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        ex._ask_question_handler.assert_not_awaited()
+
+    def test_base_tools_excludes_ask_user_question_without_handler(self):
+        # No bridge wired -> the tool must NOT be exposed (it would hang
+        # headless without the intercept hook).
+        ex = self._make_executor()
+        self.assertEqual(ex._base_tools(self._fake_sdk()), ["Skill", "ToolSearch"])
+
+    def test_base_tools_includes_ask_user_question_with_handler(self):
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value=None)
+        self.assertIn("AskUserQuestion", ex._base_tools(self._fake_sdk()))
+
+    def test_base_tools_excludes_ask_user_question_when_hook_matcher_missing(self):
+        # Handler wired, but the SDK exposes no HookMatcher -> exposing the
+        # tool would leave it without an intercept. _base_tools must gate on
+        # the SAME predicate as the hook install (handler AND HookMatcher).
+        ex = self._make_executor()
+        ex._ask_question_handler = AsyncMock(return_value=None)
+        self.assertNotIn("AskUserQuestion", ex._base_tools(SimpleNamespace()))
+
+
+@pytest.mark.parametrize("bridge_wired", [False, True], ids=["no-bridge", "bridge"])
+async def test_turn_options_expose_ask_user_question_only_with_its_hook(
+    bridge_wired: bool,
+) -> None:
+    # A built turn must expose the tool and install its intercept together:
+    # the tool without the hook would hang on a headless picker.
+    executor = _default_executor()
+    if bridge_wired:
+        executor._ask_question_handler = AsyncMock(return_value="unused")
+
+    options = await _turn_options(executor)
+
+    matchers = [m.matcher for m in (options.hooks or {}).get("PreToolUse", [])]
+    assert ("AskUserQuestion" in options.tools) is bridge_wired
+    assert ("AskUserQuestion" in matchers) is bridge_wired

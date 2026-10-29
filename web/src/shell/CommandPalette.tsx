@@ -26,6 +26,7 @@ import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { sessionRowsPage } from "@/lib/sidebarData";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -103,24 +104,30 @@ interface PaletteSession {
   id: string;
   label: string;
   agent: string;
+  archived: boolean;
   snippet: string | null;
 }
 
-/** Flatten list pages into palette rows, dropping archived and repeated ids. */
+/** Flatten list pages into palette rows, dropping repeated ids and, unless
+    `includeArchived`, archived sessions. */
 function paletteSessions(
   pages: readonly ConversationsPage[],
-  excludeIds: ReadonlySet<string> = new Set(),
+  {
+    includeArchived = false,
+    excludeIds = new Set(),
+  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string> } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
   for (const page of pages) {
     for (const c of page.data) {
-      if (c.archived || seen.has(c.id)) continue;
+      if ((c.archived && !includeArchived) || seen.has(c.id)) continue;
       seen.add(c.id);
       out.push({
         id: c.id,
         label: conversationDisplayLabel(c),
         agent: getConversationAgentType(c),
+        archived: c.archived === true,
         // Present only when the match was in chat content (not the title);
         // the server omits it otherwise. Shown as a dimmed second line.
         snippet: c.search_snippet ?? null,
@@ -272,11 +279,12 @@ export function CommandPalette({
   ]);
 
   const sessions = useMemo(() => {
-    if (searching) return paletteSessions(titleSearch.data?.pages ?? []);
+    if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
     // Pushed updates patch rows in place, so restore recency order locally.
     const recent = (data?.pages ?? [])
       .flatMap((page) => page.data)
       .sort((first, second) => second.updated_at - first.updated_at);
+    // Rows archived after they loaded are still cached here, so drop them.
     const out = paletteSessions([sessionRowsPage(recent)]);
     if (sessionsOnly) {
       if (!query.trim()) return out;
@@ -293,7 +301,10 @@ export function CommandPalette({
   const contentSessions = useMemo(
     () =>
       searching
-        ? paletteSessions(contentSearch.data?.pages ?? [], new Set(sessions.map((s) => s.id)))
+        ? paletteSessions(contentSearch.data?.pages ?? [], {
+            includeArchived: true,
+            excludeIds: new Set(sessions.map((s) => s.id)),
+          })
         : [],
     [contentSearch.data, searching, sessions],
   );
@@ -373,6 +384,11 @@ export function CommandPalette({
           </span>
         )}
       </div>
+      {s.archived && (
+        <Badge variant="outline" className="ml-2 text-muted-foreground">
+          Archived
+        </Badge>
+      )}
       <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
     </CommandItem>
   );

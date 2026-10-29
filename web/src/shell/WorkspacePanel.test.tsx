@@ -1,5 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import type { RefObject } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode, RefObject } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -8,10 +10,13 @@ import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import type * as UsePermissionsModule from "@/hooks/usePermissions";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
-import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { browserViewId } from "@/lib/browserTabs";
+import { subagentTabId } from "@/lib/subagentTabs";
+import type { Session } from "@/lib/types";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -88,9 +93,35 @@ vi.mock("@/hooks/useAgents", () => ({
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
 // A side chat's pane is covered by its own suite; the stub just names its child.
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => (
-    <div data-testid="side-chat-pane-stub">{childId}</div>
+  SideChatPane: ({
+    childId,
+    readOnly,
+    fullSession,
+    onStart,
+  }: {
+    childId: string;
+    readOnly?: boolean;
+    fullSession?: boolean;
+    onStart?: (text: string) => Promise<void>;
+  }) => (
+    <div
+      data-testid="side-chat-pane-stub"
+      data-read-only={String(readOnly ?? false)}
+      data-full-session={String(fullSession ?? false)}
+    >
+      {childId}
+      {childId.startsWith("pending:") && onStart && (
+        <button type="button" onClick={() => void onStart("question")}>
+          Start side chat
+        </button>
+      )}
+    </div>
   ),
+}));
+const canEditMock = vi.hoisted(() => vi.fn(() => true));
+vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UsePermissionsModule>()),
+  useCanEdit: () => canEditMock(),
 }));
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
@@ -109,6 +140,7 @@ afterEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
   isMobileMock.mockReturnValue(false);
+  canEditMock.mockReturnValue(true);
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -149,6 +181,8 @@ function renderWorkspace(
     resizing?: boolean;
     inert?: boolean;
     mobileSideChatsOpen?: boolean;
+    queryClient?: QueryClient;
+    initialPath?: string;
   } = {},
 ) {
   let overrides = initialOverrides;
@@ -161,6 +195,9 @@ function renderWorkspace(
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
   const onMobileSideChatsOpenChange = vi.fn();
+  const queryClient =
+    initialOverrides.queryClient ??
+    new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const tree = () => (
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
@@ -215,8 +252,15 @@ function renderWorkspace(
       />
     </TooltipProvider>
   );
-  const view = render(tree());
+  // The panel reads session snapshots and renders router links.
+  const Providers = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={[initialOverrides.initialPath ?? "/"]}>{children}</MemoryRouter>
+    </QueryClientProvider>
+  );
+  const view = render(tree(), { wrapper: Providers });
   return {
+    queryClient,
     rerender: (next: typeof overrides) => {
       overrides = { ...overrides, ...next };
       view.rerender(tree());
@@ -1412,6 +1456,204 @@ describe("WorkspacePanel mobile side chats", () => {
 
     expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+});
+
+describe("WorkspacePanel sub-agent tabs", () => {
+  const SUBAGENT_TAB = subagentTabId("conv_child");
+
+  function clientWithSubagent(title = "Research agent", labels: Record<string, string> = {}) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_child"], {
+      id: "conv_child",
+      parentSessionId: "conv_ws",
+      title,
+      labels,
+    } as unknown as Session);
+    return queryClient;
+  }
+
+  it("opens a requested sub-agent as a labeled tab without duplicating it", () => {
+    const { onRightRailTabChange } = renderWorkspace({ queryClient: clientWithSubagent() });
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      act(() => {
+        useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } });
+      });
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+    }
+
+    expect(within(rail).getAllByRole("tab", { name: "Research agent" })).toHaveLength(1);
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+  });
+
+  it("shows the sub-agent's whole session with a full-screen link", () => {
+    writeSessionWorkspaceState("conv_ws", { openSubagentTabs: [SUBAGENT_TAB] });
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side"],
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      queryClient: clientWithSubagent(),
+      initialPath: "/c/conv_ws?debug=1&file=notes.md",
+    });
+    const rail = screen.getByRole("complementary", { name: "Workspace" });
+
+    // Side chats keep their own numbering beside sub-agent tabs.
+    expect(within(rail).getByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
+    const pane = screen.getByTestId("subagent-tab-pane");
+    expect(pane).toHaveTextContent("Research agent");
+    expect(within(pane).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_child");
+    expect(within(pane).getByTestId("side-chat-pane-stub")).toHaveAttribute(
+      "data-read-only",
+      "false",
+    );
+    expect(within(pane).getByTestId("side-chat-pane-stub")).toHaveAttribute(
+      "data-full-session",
+      "true",
+    );
+    // Global params like debug carry over, the parent's file param does not, and it opens on Agents.
+    expect(within(pane).getByRole("link", { name: "Open full screen" })).toHaveAttribute(
+      "href",
+      "/c/conv_child?debug=1&panel=agents",
+    );
+  });
+
+  it("leaves a pending native side chat waiting for its own fork", async () => {
+    const before = useChatStore.getState();
+    const send = vi.fn(() => Promise.resolve());
+    useChatStore.setState({ sessionHarness: "codex-native", boundAgentId: "agent_x", send });
+    try {
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["pending:one"],
+        selectedSideChatId: "pending:one",
+      });
+      renderWorkspace({ rightRailTab: "sidechat", queryClient: clientWithSubagent() });
+      const rail = screen.getByRole("complementary", { name: "Workspace" });
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+      await waitFor(() => expect(send).toHaveBeenCalled());
+
+      act(() => {
+        useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } });
+      });
+      expect(within(rail).getByRole("tab", { name: "Research agent" })).toBeInTheDocument();
+      expect(within(rail).getByRole("tab", { name: "Side chat 1" })).toBeInTheDocument();
+
+      // The fork that arrives next still replaces the pending tab, not the sub-agent's.
+      act(() => {
+        useChatStore.setState({ sideChatToOpen: { childId: "conv_fork", parentId: "conv_ws" } });
+      });
+      expect(within(rail).getByRole("tab", { name: "Research agent" })).toBeInTheDocument();
+      fireEvent.click(within(rail).getByRole("tab", { name: "Side chat 1" }));
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork");
+    } finally {
+      useChatStore.setState({
+        sessionHarness: before.sessionHarness,
+        boundAgentId: before.boundAgentId,
+        send: before.send,
+      });
+    }
+  });
+
+  it("shows the transcript read-only without edit access", () => {
+    canEditMock.mockReturnValue(false);
+    writeSessionWorkspaceState("conv_ws", { openSubagentTabs: [SUBAGENT_TAB] });
+    writeSessionWorkspaceState("conv_ws", {
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({ rightRailTab: "sidechat", queryClient: clientWithSubagent() });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it.each([
+    [
+      "a Claude Code sub-agent",
+      { "omnigent.wrapper": "claude-code-native-ui-subagent" },
+      "Claude Code sub-agents are read-only",
+    ],
+    ["a closed sub-agent", { "omnigent.closed": "true" }, "This sub-agent session is closed"],
+  ])("keeps %s read-only, as its full-screen chat is", (_name, labels, reason) => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      queryClient: clientWithSubagent("Explore", labels),
+    });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "true");
+    expect(screen.getByTestId("subagent-tab-read-only")).toHaveTextContent(reason);
+  });
+
+  it("selects a session's open side-chat tab instead of adding a sub-agent tab for it", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_child"],
+      selectedSideChatId: null,
+    });
+    const { onRightRailTabChange } = renderWorkspace({ queryClient: clientWithSubagent() });
+
+    act(() => {
+      useChatStore.setState({ sideChatToOpen: { childId: SUBAGENT_TAB, parentId: "conv_ws" } });
+    });
+
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+    expect(readSessionWorkspaceState("conv_ws")).toEqual({
+      openSideChats: ["conv_child"],
+      selectedSideChatId: "conv_child",
+    });
+  });
+
+  it("closes the tab without stopping the sub-agent", () => {
+    const stop = vi.spyOn(sessionsApi, "stopSession");
+    writeSessionWorkspaceState("conv_ws", { openSubagentTabs: [SUBAGENT_TAB] });
+    writeSessionWorkspaceState("conv_ws", {
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({ rightRailTab: "sidechat", queryClient: clientWithSubagent() });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Research agent" }));
+
+    expect(screen.queryByRole("tab", { name: "Research agent" })).toBeNull();
+    expect(screen.queryByTestId("subagent-tab-pane")).toBeNull();
+    expect(stop).not.toHaveBeenCalled();
+  });
+
+  it("shows a generic label and no composer until the sub-agent's snapshot loads", () => {
+    vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(new Promise(() => {}));
+    writeSessionWorkspaceState("conv_ws", { openSubagentTabs: [SUBAGENT_TAB] });
+    writeSessionWorkspaceState("conv_ws", { selectedSideChatId: SUBAGENT_TAB });
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    expect(screen.getByRole("tab", { name: "Sub-agent" })).toBeInTheDocument();
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "true");
+  });
+
+  it("lists the sub-agent in the panel picker and the phone drawer", () => {
+    writeSessionWorkspaceState("conv_ws", { openSubagentTabs: [SUBAGENT_TAB] });
+    writeSessionWorkspaceState("conv_ws", {
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    const { onRightRailTabChange } = renderWorkspace({ queryClient: clientWithSubagent() });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Research agent" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+    cleanup();
+
+    isMobileMock.mockReturnValue(true);
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      mobileSideChatsOpen: true,
+      queryClient: clientWithSubagent(),
+    });
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    // Long sub-agent titles truncate instead of widening the drawer's tab row.
+    const drawerTab = within(drawer).getByRole("tab", { name: "Research agent" });
+    expect(within(drawerTab).getByText("Research agent")).toHaveClass("truncate");
+    expect(within(drawer).getByTestId("subagent-tab-pane")).toBeInTheDocument();
   });
 });
 

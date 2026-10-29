@@ -428,7 +428,7 @@ from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessi
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
 from omnigent.telemetry.installation_id import get_installation_id as _get_installation_id
-from omnigent.telemetry.surface import classify_surface as _classify_surface
+from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -3297,6 +3297,9 @@ async def _persist_external_conversation_item_unlocked(
     _publish_persisted_external_item(
         session_id, body, persisted, cleared_pending_id=cleared_pending_id
     )
+    await _drive_terminal_resolved_elicitation_from_store(
+        session_id, persisted, conversation_store
+    )
     await record_claude_subagent_return(session_id, persisted, conversation_store)
     return persisted.id
 
@@ -3392,6 +3395,9 @@ async def _persist_external_conversation_items(
     for body, persisted in zip(bodies[: len(items)], persisted_items, strict=True):
         if not persisted.deduplicated:
             _publish_persisted_external_item(session_id, body, persisted)
+            await _drive_terminal_resolved_elicitation_from_store(
+                session_id, persisted, conversation_store
+            )
         await record_claude_subagent_return(session_id, persisted, conversation_store)
     if error is not None:
         raise error
@@ -3924,20 +3930,92 @@ def _drive_terminal_resolved_elicitation(session_id: str, persisted: Conversatio
     """
     data = persisted.data
     if persisted.type == "function_call" and isinstance(data, FunctionCallData):
-        try:
-            parsed = json.loads(data.arguments) if data.arguments else {}
-        except json.JSONDecodeError:
-            parsed = {}
-        _recent_mirrored_tool_calls[data.call_id] = _MirroredToolCall(
-            tool_name=data.name,
-            tool_input=parsed if isinstance(parsed, dict) else {},
-        )
+        _recent_mirrored_tool_calls[data.call_id] = _mirrored_tool_call(data)
     elif persisted.type == "function_call_output" and isinstance(data, FunctionCallOutputData):
         identity = _recent_mirrored_tool_calls.get(data.call_id)
         if identity is not None:
             _signal_terminal_resolved_harness_elicitation(
                 session_id, identity.tool_name, identity.tool_input
             )
+
+
+def _mirrored_tool_call(data: FunctionCallData) -> _MirroredToolCall:
+    """
+    Tool identity of a mirrored ``function_call``, as cached by ``call_id``.
+
+    :param data: The mirrored call, e.g. ``name="Bash"`` with
+        ``arguments='{"command": "ls"}'``.
+    :returns: Its name and parsed arguments; ``{}`` when the arguments
+        are absent or not a JSON object.
+    """
+    try:
+        parsed = json.loads(data.arguments) if data.arguments else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    return _MirroredToolCall(
+        tool_name=data.name,
+        tool_input=parsed if isinstance(parsed, dict) else {},
+    )
+
+
+# How many of the session's newest ``function_call`` items to search for a
+# mirrored result's call. Its call is usually the newest one; parallel tool
+# calls put a few more in between.
+_MIRRORED_TOOL_CALL_STORE_LOOKBACK = 50
+
+
+async def _drive_terminal_resolved_elicitation_from_store(
+    session_id: str,
+    persisted: ConversationItem,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Resolve a parked prompt from a mirrored result whose call this replica never saw.
+
+    :data:`_recent_mirrored_tool_calls` is per process, so a result can arrive
+    on a replica that never cached its call (the session moved replicas in
+    between). On a process-cache miss, load the mirrored call only while this
+    session has a parked prompt. Best effort: a failed lookup is logged and
+    must not interrupt transcript delivery.
+
+    :param session_id: Omnigent conversation id the item was mirrored for,
+        e.g. ``"conv_abc123"``.
+    :param persisted: The stored conversation item the forwarder just
+        mirrored via ``external_conversation_item``.
+    :param conversation_store: Store holding the session's items.
+    """
+    data = persisted.data
+    if persisted.type != "function_call_output" or not isinstance(data, FunctionCallOutputData):
+        return
+    if data.call_id in _recent_mirrored_tool_calls:
+        return
+    if not any(
+        parked.session_id == session_id and not parked.resolved_elsewhere.is_set()
+        for parked in _harness_parked_elicitations.values()
+    ):
+        return
+    try:
+        page = await asyncio.to_thread(
+            conversation_store.list_items,
+            session_id,
+            limit=_MIRRORED_TOOL_CALL_STORE_LOOKBACK,
+            order="desc",
+            type="function_call",
+        )
+    except Exception:  # noqa: BLE001 — optional correlation must not interrupt delivery
+        _logger.warning(
+            "Could not load the mirrored call for a tool result in %s", session_id, exc_info=True
+        )
+        return
+    for item in page.data:
+        call = item.data
+        if isinstance(call, FunctionCallData) and call.call_id == data.call_id:
+            identity = _mirrored_tool_call(call)
+            _recent_mirrored_tool_calls[data.call_id] = identity
+            _signal_terminal_resolved_harness_elicitation(
+                session_id, identity.tool_name, identity.tool_input
+            )
+            return
 
 
 async def _publish_runner_recovered_status(*args: Any, **kwargs: Any) -> None:
@@ -11847,6 +11925,11 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    client_surface = resolve_client_surface(
+        request.headers,
+        parent_labels=_parent_for_routing.labels if _parent_for_routing is not None else None,
+    )
+    initial_labels[CLIENT_SURFACE_LABEL_KEY] = client_surface
     if created_by_session_id is not None:
         initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
@@ -12060,12 +12143,6 @@ async def _create_session_from_existing_agent(
         if not _host_opted_out:
             _install_id = _get_installation_id()
             _anon_uid = _tel_anon_user_id(user_id, _install_id)
-            _client_header = request.headers.get("x-omnigent-client")
-            _surface = (
-                _client_header
-                if _client_header in ("web", "desktop", "ios", "android", "cli")
-                else _classify_surface(request.headers.get("user-agent"))
-            )
             _host_install_id: str | None = None
             if _hr is not None and conv.host_id is not None:
                 _host_install_id = _hr.get_host_installation_id(conv.host_id)
@@ -12097,7 +12174,7 @@ async def _create_session_from_existing_agent(
                     session_id=conv.id,
                     agent_id=agent.id,
                     harness=_tel_harness,
-                    surface=_surface,
+                    surface=client_surface,
                     installation_id=_install_id,
                     anon_user_id=_anon_uid,
                     host_installation_id=_host_install_id,
@@ -13678,6 +13755,7 @@ __all__ = [
     "_detached_stop_tasks",
     "_dispatch_session_event_to_runner",
     "_drive_terminal_resolved_elicitation",
+    "_drive_terminal_resolved_elicitation_from_store",
     "_enrich_terminal_status_with_subagent_output",
     "_ensure_native_terminal_ready",
     "_ensure_runner_relay",

@@ -79,6 +79,7 @@ from omnigent.native._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1190,7 +1191,8 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     message for versions/shapes that omit it, unless the message is a 429.
 
     Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
-    for these, which the auth checks below would otherwise misclassify.
+    for these, which the auth checks below would otherwise misclassify. So is a
+    failed model provider token command, which ``codex login`` cannot renew.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
@@ -1198,7 +1200,9 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     lowered = message.lower()
-    if any(fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS):
+    if any(
+        fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS
+    ) or is_codex_provider_auth_failure(message):
         return _CODEX_ERROR_KIND_GENERIC
     info = error.get("codexErrorInfo")
     variant: str | None = None

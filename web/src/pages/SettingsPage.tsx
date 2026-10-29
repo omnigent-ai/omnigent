@@ -29,6 +29,7 @@
  *   Unarchive opens the restored session.
  */
 
+import { toast } from "sonner";
 import {
   type ComponentType,
   lazy,
@@ -211,6 +212,10 @@ import {
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  readOpenSubagentsInPanel,
+  writeOpenSubagentsInPanel,
+} from "@/lib/subagentPanelPreferences";
 import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
@@ -1774,6 +1779,40 @@ function BackgroundSessionTitlesControl() {
   );
 }
 
+function OpenSubagentsInPanelControl() {
+  const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    // Sub-agent clicks read the stored value, so only show what was saved.
+    if (writeOpenSubagentsInPanel(next)) setEnabled(next);
+    else toast.error("Couldn't save this setting. Check that your browser allows site storage.");
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Open sub-agents in the Workspace panel"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Show a sub-agent's chat as a tab beside the main chat instead of replacing it. On phones, sub-agents still open full screen."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-subagents-in-panel-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_subagents_in_panel"
+      />
+    </div>
+  );
+}
+
 function TerminalClipboardControl() {
   const labelId = useId();
   const descriptionId = useId();
@@ -1858,6 +1897,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <OpenSubagentsInPanelControl />
+          </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
