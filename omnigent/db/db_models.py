@@ -1705,15 +1705,42 @@ class SqlScheduledTaskRun(OmnigentBase):
     )
 
 
-def _exact_string(length: int) -> String:
-    """A ``String(n)`` compared byte for byte on MySQL too (``utf8mb4_bin``).
+class BoundedString(TypeDecorator[str]):
+    """A ``VARCHAR(n)`` whose limit holds on every engine and every write path.
 
-    Identity columns such as a git ref or a skill name are case-sensitive;
-    MySQL's default collation would fold ``Main`` and ``main`` into one key.
+    SQLite ignores a declared length, and an attribute validator is skipped by
+    a bulk write (``Session.execute(insert(Model), rows)``), so the check sits
+    at the bind boundary every write passes through. Lengths are characters, so
+    the widest column here (1024) stores at most 4 KiB of UTF-8, well under the
+    16 KiB stored-value limit.
+
+    ``exact=True`` also pins MySQL to ``utf8mb4_bin``, for an identity column
+    whose default collation would fold ``Main`` and ``main`` into one key: a
+    git ref, a repository path, a skill name and a principal are all
+    case-sensitive.
     """
-    return String(length).with_variant(
-        MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_bin"), "mysql"
-    )
+
+    impl = String
+    cache_ok = True
+
+    def __init__(self, length: int, *, exact: bool = False) -> None:
+        super().__init__(length)
+        self.exact = exact
+
+    def load_dialect_impl(self, dialect: Any) -> Any:
+        length = self.impl.length
+        if self.exact and dialect.name == "mysql":
+            return dialect.type_descriptor(
+                MySQLVarchar(length, charset="utf8mb4", collation="utf8mb4_bin")
+            )
+        return dialect.type_descriptor(String(length))
+
+    def process_bind_param(self, value: str | None, dialect: object) -> str | None:
+        del dialect
+        limit = self.impl.length
+        if value is not None and len(value) > limit:
+            raise ValueError(f"value of {len(value)} characters is longer than {limit}")
+        return value
 
 
 class SqlSkillSource(OmnigentBase):
@@ -1748,10 +1775,10 @@ class SqlSkillSource(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
-    url: Mapped[str] = mapped_column(_exact_string(255), nullable=False)
-    ref: Mapped[str] = mapped_column(_exact_string(255), nullable=False)
-    name: Mapped[str] = mapped_column(String(256), nullable=False)
-    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    url: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    ref: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    name: Mapped[str] = mapped_column(BoundedString(256), nullable=False)
+    created_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
     @validates("url", "ref", "name", "created_by")
@@ -1760,10 +1787,11 @@ class SqlSkillSource(OmnigentBase):
 
 
 def _within_declared_length(row: OmnigentBase, key: str, value: str | None) -> str | None:
-    """Enforce a ``String(n)`` column's length on every ORM write; SQLite would not.
+    """Name the offending field as soon as it is set, before any statement runs.
 
-    Lengths are characters; at four bytes a character the widest column here
-    (1024) stores at most 4,096 bytes, under the 16 KiB stored-value limit.
+    :class:`BoundedString` is what actually enforces the limit, on every write
+    path; this only turns the failure into a field-named error at construction
+    or assignment, where the caller can still see which value was too long.
     """
     limit = row.__table__.c[key].type.length
     if value is not None and len(value) > limit:
@@ -1826,20 +1854,20 @@ class SqlInstalledSkill(OmnigentBase):
         default=current_workspace_id,
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
-    name: Mapped[str] = mapped_column(_exact_string(255), nullable=False)
-    display_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    description: Mapped[str] = mapped_column(String(1024), nullable=False)
-    source_url: Mapped[str] = mapped_column(String(255), nullable=False)
-    ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    name: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(BoundedString(256), nullable=True)
+    description: Mapped[str] = mapped_column(BoundedString(1024), nullable=False)
+    source_url: Mapped[str] = mapped_column(BoundedString(255), nullable=False)
+    ref: Mapped[str | None] = mapped_column(BoundedString(255), nullable=True)
+    commit: Mapped[str | None] = mapped_column(BoundedString(64), nullable=True)
+    path: Mapped[str] = mapped_column(BoundedString(1024), nullable=False)
     scope: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    principal: Mapped[str] = mapped_column(_exact_string(133), nullable=False)
-    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    bundle_location: Mapped[str] = mapped_column(String(512), nullable=False)
+    principal: Mapped[str] = mapped_column(BoundedString(133, exact=True), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
+    bundle_location: Mapped[str] = mapped_column(BoundedString(512), nullable=False)
     bundle_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    installed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    installed_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
     installed_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -1884,7 +1912,7 @@ class SqlSkillPrincipal(OmnigentBase):
         primary_key=True,
         default=current_workspace_id,
     )
-    principal: Mapped[str] = mapped_column(_exact_string(133), primary_key=True)
+    principal: Mapped[str] = mapped_column(BoundedString(133, exact=True), primary_key=True)
     installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)

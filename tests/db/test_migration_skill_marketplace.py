@@ -11,22 +11,43 @@ from alembic import command
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlInstalledSkill, SqlSkillPrincipal, SqlSkillSource
-from omnigent.db.utils import _build_alembic_config, get_or_create_engine
+from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
 PREVIOUS = "d0a1f879a01d"
 TABLES = {"skill_sources", "installed_skills", "skill_principals"}
-INDEXES = {
-    "skill_sources": {"ix_skill_sources_order", "ux_skill_sources_identity"},
-    "installed_skills": {"ux_installed_skills_identity", "ix_installed_skills_principal_order"},
-    "skill_principals": set(),
+# Index name -> its columns in order. A prefix or tie-breaker lost from a
+# pagination index keeps the name and would pass a names-only check.
+INDEXES: dict[str, dict[str, list[str]]] = {
+    "skill_sources": {
+        "ix_skill_sources_order": ["workspace_id", "created_at", "id"],
+        "ux_skill_sources_identity": ["workspace_id", "url", "ref"],
+    },
+    "installed_skills": {
+        "ux_installed_skills_identity": ["workspace_id", "principal", "name"],
+        "ix_installed_skills_principal_order": [
+            "workspace_id",
+            "principal",
+            "installed_at",
+            "id",
+        ],
+    },
+    "skill_principals": {},
 }
 UNIQUE = {"ux_skill_sources_identity", "ux_installed_skills_identity"}
+PRIMARY_KEYS = {
+    "skill_sources": ["workspace_id", "id"],
+    "installed_skills": ["workspace_id", "id"],
+    "skill_principals": ["workspace_id", "principal"],
+}
 
 
-def _schema(connection: sa.Connection) -> tuple[set[str], dict[str, set[str]]]:
+def _schema(connection: sa.Connection) -> tuple[set[str], dict[str, dict[str, list[str]]]]:
     inspector = sa.inspect(connection)
     tables = TABLES & set(inspector.get_table_names())
-    indexes = {t: {ix["name"] for ix in inspector.get_indexes(t)} for t in tables}
+    indexes = {
+        t: {ix["name"]: list(ix["column_names"]) for ix in inspector.get_indexes(t)}
+        for t in tables
+    }
     return tables, indexes
 
 
@@ -34,13 +55,26 @@ def _assert_at_head(connection: sa.Connection) -> None:
     tables, indexes = _schema(connection)
     assert tables == TABLES
     for table, expected in INDEXES.items():
-        assert expected <= indexes[table], (table, indexes[table])
+        # Columns and their order, so a lost prefix or tie-breaker is caught.
+        assert {name: indexes[table].get(name) for name in expected} == expected, indexes[table]
+        assert (
+            sa.inspect(connection).get_pk_constraint(table)["constrained_columns"]
+            == PRIMARY_KEYS[table]
+        ), table
 
 
 def test_upgrade_creates_the_tables_and_downgrade_removes_them(tmp_path: Path) -> None:
     uri = f"sqlite:///{tmp_path / 'skills-migration.db'}"
     engine = get_or_create_engine(uri)  # migrates to head
     config = _build_alembic_config(uri)
+    try:
+        _assert_lifecycle(engine, config)
+    finally:
+        engine.dispose()
+        clear_engine_cache()
+
+
+def _assert_lifecycle(engine: sa.Engine, config: object) -> None:
     with engine.begin() as connection:
         config.attributes["connection"] = connection
         _assert_at_head(connection)
@@ -94,6 +128,29 @@ def test_upgrade_creates_the_tables_and_downgrade_removes_them(tmp_path: Path) -
         connection.execute(sa.text("CREATE TABLE skill_sources (workspace_id INTEGER, id BLOB)"))
         with pytest.raises(RuntimeError, match="skill_sources already exists"):
             command.upgrade(config, "head")
+
+
+def test_a_bulk_write_cannot_slip_past_a_declared_length(db_uri: str) -> None:
+    # A bulk insert skips the attribute validators, and SQLite enforces no
+    # declared length, so the column type is what has to refuse the value.
+    # 20,000 ASCII bytes would otherwise be stored, past the 16 KiB limit.
+    engine = get_or_create_engine(db_uri)
+    rows = [
+        {
+            "workspace_id": 0,
+            "id": uuid.uuid4().hex,
+            "url": "https://github.com/" + "a" * 20_000,
+            "ref": "HEAD",
+            "name": "x",
+            "created_by": None,
+            "created_at": 0,
+        }
+    ]
+    with Session(engine) as session:
+        with pytest.raises(sa.exc.StatementError, match="longer than 255"):
+            session.execute(sa.insert(SqlSkillSource), rows)
+        session.rollback()
+        assert session.scalar(sa.select(sa.func.count()).select_from(SqlSkillSource)) == 0
 
 
 def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
