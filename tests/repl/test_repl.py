@@ -3114,6 +3114,24 @@ async def test_prompt_held_in_terminal_retires_repl_approval_without_verdict(
         task.cancel()
 
 
+def test_run_repl_renderer_retires_approval_for_prompt_held_in_terminal() -> None:
+    """``run_repl``'s event renderer hands each event to the held-prompt retirer.
+
+    The renderer is a closure inside ``run_repl``, so only its source shows the wiring.
+    """
+    import inspect
+
+    from omnigent.repl import _repl
+
+    source = inspect.getsource(_repl.run_repl)
+    renderer = source[
+        source.index("def _render_session_event(") : source.index(
+            "session._on_event = _render_session_event"
+        )
+    ]
+    assert "_retire_prompt_held_in_terminal(event, host, fmt, approval_state)" in renderer
+
+
 def test_is_recoverable_sse_transport_error_for_write_errors() -> None:
     """A peer dropping the connection mid-request-send is transient too.
 
