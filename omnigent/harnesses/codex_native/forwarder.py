@@ -212,6 +212,11 @@ _GOAL_STOPPED_FAILURE_OUTPUT = {
     "usageLimited": "Codex stopped the goal: usage limit reached.",
     "budgetLimited": "Codex stopped the goal: token budget reached.",
 }
+_CODEX_BACKGROUND_TERMINALS_LIST_METHOD = "thread/backgroundTerminals/list"
+# A running background terminal is listed again at this interval until none is left.
+_BACKGROUND_TERMINAL_POLL_SECONDS = 3.0
+# A settled turn's terminal event waits on one listing, so the wait is bounded.
+_BACKGROUND_TERMINAL_LIST_TIMEOUT_SECONDS = 5.0
 _SYSTEM_ERROR_FAILURE_OUTPUT = (
     "Codex reported a system error on this thread. Open the terminal for details."
 )
@@ -564,6 +569,14 @@ class _CodexForwarderState:
         absorbed instead of replacing it with idle.
     :param turn_failure_surfaced: Whether a failed status already went out for
         the current turn. A later thread-level failure for that turn is skipped.
+    :param has_background_terminals: Whether the last listing of the thread's
+        background terminals found any still running.
+    :param background_terminals_supported: ``False`` once the Codex app-server
+        rejects the terminal listing, so later turns do not ask again.
+    :param background_terminal_poll: The task re-listing running background
+        terminals after a turn, or ``None`` when none is due.
+    :param goal_unknown: Whether the last goal read failed. Until a read or a
+        goal notification succeeds, the flag may be set but is never cleared.
     """
 
     model: str | None = None
@@ -641,6 +654,10 @@ class _CodexForwarderState:
     background_work_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     goal_failure_awaits_turn: bool = False
     turn_failure_surfaced: bool = False
+    has_background_terminals: bool = False
+    background_terminals_supported: bool = True
+    background_terminal_poll: asyncio.Task[None] | None = None
+    goal_unknown: bool = False
 
     def __post_init__(self) -> None:
         """
@@ -841,11 +858,14 @@ class _CodexForwarderState:
         """
         self.parent_session_id = session_id
         self.pending_child_threads.clear()
-        # The new thread has its own goal, read when it is subscribed. Its
-        # sidebar flag is unknown until that sync posts it, and a read still in
-        # flight for the old thread must not land on the new one.
+        # The new thread has its own goal and terminals, read when it is
+        # subscribed. Its sidebar flag is unknown until that sync posts it, and
+        # a read still in flight for the old thread must not land on the new one.
+        self.cancel_background_terminal_poll()
         self.goal_status = None
         self.goal_updates += 1
+        self.goal_unknown = False
+        self.has_background_terminals = False
         self.posted_background_work_running = None
         self.goal_failure_awaits_turn = False
         self.turn_failure_surfaced = False
@@ -855,9 +875,16 @@ class _CodexForwarderState:
         Return whether work on the forwarder's thread keeps the session working.
 
         :returns: ``True`` while the thread's goal is active, so Codex keeps
-            starting its turns between the ones that end.
+            starting its turns between the ones that end, or while a background
+            terminal of the thread is still running.
         """
-        return self.goal_status == "active"
+        return self.goal_status == "active" or self.has_background_terminals
+
+    def cancel_background_terminal_poll(self) -> None:
+        """Stop re-listing background terminals, e.g. when a turn starts."""
+        if self.background_terminal_poll is not None:
+            self.background_terminal_poll.cancel()
+            self.background_terminal_poll = None
 
     def note_pending_child_thread(
         self,
@@ -2540,6 +2567,8 @@ async def supervise_forwarder(
             background_tasks = [subscribe_task, side_chat_task]
             if mcp_settle_timer is not None:
                 background_tasks.append(mcp_settle_timer)
+            if forwarder_state.background_terminal_poll is not None:
+                background_tasks.append(forwarder_state.background_terminal_poll)
             for task in background_tasks:
                 task.cancel()
             results = await asyncio.gather(*background_tasks, return_exceptions=True)
@@ -3025,10 +3054,11 @@ async def _subscribe_until_ready_inner(
             await _sync_codex_approval_mode_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
-            await _resync_thread_goal(
+            await _resync_background_work(
                 client,
                 ap_client,
                 session_id=session_id,
+                bridge_dir=bridge_dir,
                 thread_id=thread_id,
                 forwarder_state=forwarder_state,
             )
@@ -3971,6 +4001,8 @@ async def _sync_background_work_running(
         if (
             forwarder_state.background_work_unsupported
             or running == forwarder_state.posted_background_work_running
+            # An unread goal may still be active, so only a running terminal is news.
+            or (not running and forwarder_state.goal_unknown)
         ):
             return
         response = await _post_session_event(
@@ -3993,24 +4025,21 @@ async def _sync_background_work_running(
             forwarder_state.posted_background_work_running = running
 
 
-async def _resync_thread_goal(
+async def _read_thread_goal(
     codex_client: CodexAppServerClient,
-    ap_client: httpx.AsyncClient,
     *,
-    session_id: str,
     thread_id: str,
     forwarder_state: _CodexForwarderState,
 ) -> None:
     """
-    Read the thread's goal after a (re)subscription and mirror it.
+    Read the thread's goal after a (re)subscription.
 
     Codex sends goal notifications only when a goal changes, so a reconnected
     forwarder reads the current goal. A Codex build without goals rejects the
-    request, and its threads have no goal.
+    request, and its threads have no goal. Any other failure keeps the goal
+    status the forwarder last saw.
 
     :param codex_client: Connected Codex app-server client.
-    :param ap_client: HTTP client for Omnigent event posts.
-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param thread_id: Codex thread id, e.g. ``"thread_123"``.
     :param forwarder_state: Mutable forwarder state holding the goal status.
     :returns: None.
@@ -4024,22 +4053,200 @@ async def _resync_thread_goal(
     except CodexAppServerResponseError as exc:
         if not codex_rejects_request_method(exc, _CODEX_THREAD_GOAL_GET_METHOD):
             _logger.warning("Codex thread goal read failed", exc_info=True)
+            forwarder_state.goal_unknown = True
             return
         log_info_once(
             _logger, "Codex app-server has no thread goals; treating the thread as goal-free"
         )
-    except Exception:  # the sidebar keeps its last value when the read fails.
+    except Exception:  # the goal status is kept when the read fails.
         _logger.warning("Codex thread goal read failed", exc_info=True)
+        forwarder_state.goal_unknown = True
         return
     if forwarder_state.goal_updates != updates:
         # A goal notification arrived during the read and already synced newer state.
         return
+    forwarder_state.goal_unknown = False
     result = response.get("result")
     goal = result.get("goal") if isinstance(result, dict) else None
     status = goal.get("status") if isinstance(goal, dict) else None
     forwarder_state.goal_status = status if isinstance(status, str) else None
+
+
+async def _resync_background_work(
+    codex_client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Read the thread's goal and background terminals after a (re)subscription.
+
+    Posts the flag once. With a turn active, that turn's terminal event settles
+    the terminals, so only the goal is posted here.
+
+    :param codex_client: Connected Codex app-server client.
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param forwarder_state: Mutable forwarder state for the connection.
+    :returns: None.
+    """
+    await _read_thread_goal(codex_client, thread_id=thread_id, forwarder_state=forwarder_state)
+    if _bridge_turn_is_active(bridge_dir):
+        await _sync_background_work_running(
+            ap_client, session_id=session_id, forwarder_state=forwarder_state
+        )
+        return
+    await _track_background_terminals(
+        ap_client,
+        codex_client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        thread_id=thread_id,
+        forwarder_state=forwarder_state,
+    )
+
+
+async def _refresh_background_terminals(
+    ap_client: httpx.AsyncClient,
+    codex_client: CodexAppServerClient,
+    *,
+    session_id: str,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> bool:
+    """
+    List the thread's background terminals once and post the flag.
+
+    A failed listing keeps the last known terminal state, and polling goes on
+    while that state has a terminal running. A Codex build that rejects the
+    listing is asked once per connection, then never again.
+
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param codex_client: Connected Codex app-server client.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param forwarder_state: Mutable forwarder state holding the terminal state.
+    :returns: ``True`` when a terminal is still running, or was before a
+        failed listing, so the caller should list again.
+    """
+    keep_listing = False
+    if forwarder_state.background_terminals_supported:
+        try:
+            response = await asyncio.wait_for(
+                codex_client.request(
+                    _CODEX_BACKGROUND_TERMINALS_LIST_METHOD, {"threadId": thread_id}
+                ),
+                timeout=_BACKGROUND_TERMINAL_LIST_TIMEOUT_SECONDS,
+            )
+        except CodexAppServerResponseError as exc:
+            if codex_rejects_request_method(exc, _CODEX_BACKGROUND_TERMINALS_LIST_METHOD):
+                forwarder_state.background_terminals_supported = False
+                forwarder_state.has_background_terminals = False
+                log_info_once(
+                    _logger,
+                    "Codex app-server cannot list background terminals; "
+                    "they do not keep sessions working",
+                )
+            else:
+                _logger.warning("Codex background terminal listing failed", exc_info=True)
+                keep_listing = forwarder_state.has_background_terminals
+        except Exception:  # the last known terminal state is kept.
+            _logger.warning("Codex background terminal listing failed", exc_info=True)
+            keep_listing = forwarder_state.has_background_terminals
+        else:
+            result = response.get("result")
+            data = result.get("data") if isinstance(result, dict) else None
+            forwarder_state.has_background_terminals = isinstance(data, list) and bool(data)
+            keep_listing = forwarder_state.has_background_terminals
     await _sync_background_work_running(
         ap_client, session_id=session_id, forwarder_state=forwarder_state
+    )
+    return keep_listing
+
+
+async def _poll_background_terminals(
+    ap_client: httpx.AsyncClient,
+    codex_client: CodexAppServerClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Re-list background terminals until none is left or a turn starts.
+
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param codex_client: Connected Codex app-server client.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory; a turn in progress stops
+        the polling.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param forwarder_state: Mutable forwarder state for the connection.
+    :returns: None. Ends on its own, or when a turn start or shutdown cancels it.
+    """
+    while True:
+        await _sleep(_BACKGROUND_TERMINAL_POLL_SECONDS)
+        if _bridge_turn_is_active(bridge_dir):
+            return
+        if not await _refresh_background_terminals(
+            ap_client,
+            codex_client,
+            session_id=session_id,
+            thread_id=thread_id,
+            forwarder_state=forwarder_state,
+        ):
+            return
+
+
+async def _track_background_terminals(
+    ap_client: httpx.AsyncClient,
+    codex_client: CodexAppServerClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    List background terminals now that a turn has settled, and keep listing while any run.
+
+    Replaces a polling task left by an earlier settled turn.
+
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param codex_client: Connected Codex app-server client.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param forwarder_state: Mutable forwarder state for the connection.
+    :returns: None.
+    """
+    forwarder_state.cancel_background_terminal_poll()
+    if not await _refresh_background_terminals(
+        ap_client,
+        codex_client,
+        session_id=session_id,
+        thread_id=thread_id,
+        forwarder_state=forwarder_state,
+    ):
+        return
+    # Another listing may have started a poll while this one awaited; keep one.
+    forwarder_state.cancel_background_terminal_poll()
+    forwarder_state.background_terminal_poll = asyncio.create_task(
+        _poll_background_terminals(
+            ap_client,
+            codex_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            thread_id=thread_id,
+            forwarder_state=forwarder_state,
+        ),
+        name="codex-native-background-terminals",
     )
 
 
@@ -4075,6 +4282,7 @@ async def _handle_thread_goal_notification(
         status = raw_status if isinstance(raw_status, str) else None
     forwarder_state.goal_status = status
     forwarder_state.goal_updates += 1
+    forwarder_state.goal_unknown = False
     await _sync_background_work_running(
         client, session_id=session_id, forwarder_state=forwarder_state
     )
@@ -4339,6 +4547,8 @@ async def _maybe_handle_turn_event(
                 forwarder_state.reasoning_stream_item_id = None
                 forwarder_state.turn_failure_surfaced = False
                 forwarder_state.goal_failure_awaits_turn = False
+                # The running turn reports the session's state until it ends.
+                forwarder_state.cancel_background_terminal_poll()
                 # An in-TUI ``/model`` switch writes config.toml (the cost-policy
                 # source of truth) but emits no notification. Re-read it at turn
                 # start so a switch made since the last turn lands ``model_override``
@@ -4655,6 +4865,22 @@ async def _handle_terminal_turn_boundary_inner(
         await _post_turn_status_edge(client, session_id, terminal.edge)
         if forwarder_state is not None and terminal.edge.status == "failed":
             forwarder_state.turn_failure_surfaced = True
+    terminal_thread_id = _thread_id_from_params(params)
+    if (
+        handled
+        and bridge_dir is not None
+        and codex_client is not None
+        and forwarder_state is not None
+        and terminal_thread_id is not None
+    ):
+        await _track_background_terminals(
+            client,
+            codex_client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            thread_id=terminal_thread_id,
+            forwarder_state=forwarder_state,
+        )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
