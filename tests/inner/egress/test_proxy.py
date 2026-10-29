@@ -3116,17 +3116,18 @@ def _mitm_client_read_until_close(
 
 
 @pytest.mark.parametrize(
-    ("path", "body", "status", "tail", "reaches_upstream"),
+    ("method", "path", "body", "status", "tail", "reaches_upstream"),
     [
-        ("/other/socket", b"", b"HTTP/1.1 403", None, False),
-        ("/backend-api/declined", b"", b"HTTP/1.1 426", b"nope", True),
-        ("/backend-api/chunked", b"", b"HTTP/1.1 426", b"5\r\nnope!\r\n0\r\n\r\n", True),
-        ("/backend-api/bodyless", b"", b"HTTP/1.1 204", b"", True),
-        ("/backend-api/other-protocol", b"", b"HTTP/1.1 502", None, True),
-        ("/backend-api/conflicting", b"", b"HTTP/1.1 502", None, True),
-        ("/backend-api/unparseable-length", b"", b"HTTP/1.1 502", None, True),
-        ("/backend-api/negative-length", b"", b"HTTP/1.1 502", None, True),
-        ("/backend-api/declined", b"abc", b"HTTP/1.1 403", None, False),
+        ("GET", "/other/socket", b"", b"HTTP/1.1 403", None, False),
+        ("GET", "/backend-api/declined", b"", b"HTTP/1.1 426", b"nope", True),
+        ("GET", "/backend-api/chunked", b"", b"HTTP/1.1 426", b"5\r\nnope!\r\n0\r\n\r\n", True),
+        ("GET", "/backend-api/bodyless", b"", b"HTTP/1.1 204", b"", True),
+        ("GET", "/backend-api/other-protocol", b"", b"HTTP/1.1 502", None, True),
+        ("GET", "/backend-api/conflicting", b"", b"HTTP/1.1 502", None, True),
+        ("GET", "/backend-api/unparseable-length", b"", b"HTTP/1.1 502", None, True),
+        ("GET", "/backend-api/negative-length", b"", b"HTTP/1.1 502", None, True),
+        ("GET", "/backend-api/declined", b"abc", b"HTTP/1.1 403", None, False),
+        ("HEAD", "/backend-api/head", b"", b"HTTP/1.1 426", b"", True),
     ],
     ids=[
         "denied-path",
@@ -3138,18 +3139,20 @@ def _mitm_client_read_until_close(
         "unparseable-length",
         "negative-length",
         "with-body",
+        "head",
     ],
 )
 @pytest.mark.asyncio
 async def test_refused_websocket_upgrade_closes_the_tunnel(
     ca_paths: tuple[Path, Path, Path],
+    method: str,
     path: str,
     body: bytes,
     status: bytes,
     tail: bytes | None,
     reaches_upstream: bool,
 ) -> None:
-    """Only a 101 that selects websocket opens a raw relay; any refusal ends the tunnel."""
+    """Only a 101 to a websocket GET opens a raw relay; any refusal ends the tunnel."""
     cert_path, key_path, bundle_path = ca_paths
     upstream_requests: list[bytes] = []
 
@@ -3157,9 +3160,12 @@ async def test_refused_websocket_upgrade_closes_the_tunnel(
         # Keep the connection alive so the proxy, not the upstream, must close the tunnel.
         while request_line := await reader.readline():
             upstream_requests.append(request_line)
-            while await reader.readline() not in (b"\r\n", b""):
-                pass
-            if b" /backend-api/bodyless " in request_line:
+            headers = b""
+            while (line := await reader.readline()) not in (b"\r\n", b""):
+                headers += line.lower()
+            if request_line.startswith(b"HEAD "):
+                writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4\r\n\r\n")
+            elif b" /backend-api/bodyless " in request_line:
                 writer.write(b"HTTP/1.1 204 No Content\r\n\r\n")
             elif b" /backend-api/other-protocol " in request_line:
                 writer.write(
@@ -3183,6 +3189,8 @@ async def test_refused_websocket_upgrade_closes_the_tunnel(
             else:
                 writer.write(b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 4\r\n\r\nnope")
             await writer.drain()
+            if b"connection: close" in headers:
+                break
         writer.close()
 
     upstream_ctx = HostCertCache(cert_path, key_path).get_ssl_context("localhost")
@@ -3198,7 +3206,7 @@ async def test_refused_websocket_upgrade_closes_the_tunnel(
     proxy_port = await proxy.start_tcp()
     framing = f"Content-Length: {len(body)}\r\n" if body else ""
     request = (
-        f"GET {path} HTTP/1.1\r\nHost: localhost\r\n"
+        f"{method} {path} HTTP/1.1\r\nHost: localhost\r\n"
         "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n"
         f"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{framing}\r\n"
     ).encode("latin-1") + body
@@ -3225,7 +3233,9 @@ async def test_refused_websocket_upgrade_closes_the_tunnel(
     assert not received.endswith(b"<tunnel open>"), received
     if tail is not None:
         assert response_body == tail, received
-    assert upstream_requests == ([f"GET {path} HTTP/1.1\r\n".encode()] if reaches_upstream else [])
+    assert upstream_requests == (
+        [f"{method} {path} HTTP/1.1\r\n".encode()] if reaches_upstream else []
+    )
 
 
 @pytest.mark.asyncio

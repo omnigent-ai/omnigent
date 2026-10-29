@@ -1111,6 +1111,18 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _drop_native_tool_settings(table: dict[str, Any]) -> bool:
+    """Remove settings in one config table that outrank ``CODEX_NATIVE_FEATURES_OFF``."""
+    removed = False
+    for key in ("web_search", "experimental_use_unified_exec_tool"):
+        removed |= table.pop(key, None) is not None
+    features = table.get("features")
+    if isinstance(features, dict):
+        for name in _NATIVE_FEATURE_KEYS:
+            removed |= features.pop(name, None) is not None
+    return removed
+
+
 def _strip_host_launched_config(
     codex_home: Path, router_bridge_dir: Path | None, *, session_id: str | None
 ) -> None:
@@ -1119,17 +1131,24 @@ def _strip_host_launched_config(
     ``[mcp_servers.*]``, ``notify`` and the user ``hooks.json`` launch processes
     that would share the worker's host network when its native tools are off.
     ``[projects.*]`` trust is dropped too, so a project ``.codex/config.toml``
-    cannot add them back. The router hooks, if any, are rewritten alone.
+    cannot add them back. Native-tool settings go from the root and every profile,
+    since a selected profile or a legacy feature alias outranks the ``-c`` overrides.
+    The router hooks, if any, are rewritten alone.
     """
     import tomlkit
 
     config_path = codex_home / "config.toml"
     if config_path.is_file():
         document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
-        launch_keys = ("mcp_servers", "notify", "projects")
-        if any(key in document for key in launch_keys):
-            for key in launch_keys:
-                document.pop(key, None)
+        changed = False
+        for key in ("mcp_servers", "notify", "projects"):
+            changed |= document.pop(key, None) is not None
+        profiles = document.get("profiles")
+        profile_tables = list(profiles.values()) if isinstance(profiles, dict) else []
+        for table in (document, *profile_tables):
+            if isinstance(table, dict):
+                changed |= _drop_native_tool_settings(table)
+        if changed:
             if config_path.is_symlink():
                 # Never write through to the user's real config.toml.
                 config_path.unlink()
@@ -2826,10 +2845,21 @@ CODEX_NATIVE_FEATURES_OFF = (
     "features.tool_search=false",
 )
 
-# Keeps the apply_patch writes Codex's sandbox still allows inside the workspace.
-_WORKSPACE_ONLY_PATCH_WRITES = (
-    "sandbox_workspace_write.exclude_slash_tmp=true",
-    "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+# Feature keys, including legacy aliases, that could switch those tools back on.
+_NATIVE_FEATURE_KEYS = frozenset(
+    {
+        override.split("=", 1)[0].removeprefix("features.")
+        for override in CODEX_NATIVE_FEATURES_OFF
+        if override.startswith("features.")
+    }
+    | {
+        "collab",
+        "connectors",
+        "experimental_use_unified_exec_tool",
+        "web_search",
+        "web_search_cached",
+        "web_search_request",
+    }
 )
 
 
@@ -3124,7 +3154,7 @@ class _CodexAppServerSession:
                 argv.extend(["-c", override])
             if not worker_launch.native_tools_allowed:
                 self._disable_native_tools = True
-                for override in (*CODEX_NATIVE_FEATURES_OFF, *_WORKSPACE_ONLY_PATCH_WRITES):
+                for override in CODEX_NATIVE_FEATURES_OFF:
                     argv.extend(["-c", override])
                 await asyncio.to_thread(
                     _strip_host_launched_config,
@@ -3707,6 +3737,10 @@ class _CodexAppServerSession:
         assert self._proc is not None
         if self._containment_confirmed:
             sandbox = "danger-full-access"
+        elif self._worker_launch is not None and not self._worker_launch.native_tools_allowed:
+            # A writable thread lets apply_patch use the user's writable roots and makes
+            # Codex record the project as trusted again.
+            sandbox = "read-only"
 
         self._native_progress_observed = self._reader_started_turn != self._reader_completed_turn
 

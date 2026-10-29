@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.inner.codex_executor import (
+    CODEX_NATIVE_FEATURES_OFF,
     _populate_codex_home_config,
     _strip_host_launched_config,
 )
@@ -183,14 +184,23 @@ def test_network_denied_codex_apply_patch_cannot_replace_shared_host_login(
     tmp_path: Path,
     isolated_mock_llm_server_url: str,
 ) -> None:
-    """Without native tools Codex keeps apply_patch, which must not reach the writable login."""
+    """Without native tools Codex refuses every apply_patch write and every project MCP server."""
     skip_if_harness_cli_missing("codex")
     home = tmp_path / "home"
     _seed_subscription_home(home, f"{isolated_mock_llm_server_url}/v1")
     host_login = home / ".codex" / "auth.json"
     original_login = host_login.read_text(encoding="utf-8")
+    with (home / ".codex" / "config.toml").open("a", encoding="utf-8") as user_config:
+        user_config.write(
+            f'\n[sandbox_workspace_write]\nwritable_roots = ["{host_login.parent}"]\n'
+        )
     workspace = home / "project"
-    workspace.mkdir()
+    (workspace / ".codex").mkdir(parents=True)
+    mcp_marker = workspace / "mcp-started"
+    (workspace / ".codex" / "config.toml").write_text(
+        f'[mcp_servers.projprobe]\ncommand = "touch"\nargs = ["{mcp_marker}"]\n', encoding="utf-8"
+    )
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
     linked_login = workspace / "linked-login.json"
     linked_login.symlink_to(host_login)
     configure_mock_llm(
@@ -226,6 +236,7 @@ def test_network_denied_codex_apply_patch_cannot_replace_shared_host_login(
         _kill_local_server(home)
 
     assert outcome == 0, output[-3000:]
+    assert not mcp_marker.exists()
     requests = get_mock_requests(isolated_mock_llm_server_url)
     inputs = [item for request in requests for item in request.get("input", [])]
     offered = _offered_tool_names(
@@ -236,12 +247,14 @@ def test_network_denied_codex_apply_patch_cannot_replace_shared_host_login(
             offered |= _offered_tool_names(item.get("tools"))
     assert "sys_os_shell" in offered, offered
     assert offered.isdisjoint({"exec_command", "shell", "local_shell", "web_search"}), offered
-    answered_calls = {
-        item.get("call_id")
+    outputs = {
+        item.get("call_id"): str(item.get("output"))
         for item in inputs
         if isinstance(item, dict) and item.get("type") == "custom_tool_call_output"
     }
-    assert {"patch-host-login", "patch-linked-login"} <= answered_calls
+    assert {"patch-host-login", "patch-linked-login"} <= outputs.keys()
+    # Codex's policy, not a failed write, must refuse the user's writable root.
+    assert "rejected" in outputs["patch-host-login"], outputs
     assert host_login.read_text(encoding="utf-8") == original_login
 
 
@@ -277,3 +290,39 @@ def test_stripped_codex_home_ignores_trusted_project_mcp_servers(tmp_path: Path)
     assert "projprobe" in listed_servers()
     _strip_host_launched_config(codex_home, None, session_id=None)
     assert "projprobe" not in listed_servers()
+
+
+@pytest.mark.timeout(180)
+def test_stripped_codex_home_keeps_apps_off_despite_legacy_alias(tmp_path: Path) -> None:
+    """A legacy ``connectors`` feature alias cannot turn Codex apps back on."""
+    skip_if_harness_cli_missing("codex")
+    user_home = tmp_path / "user-codex"
+    user_home.mkdir()
+    user_config = "[features]\nconnectors = true\n"
+    (user_home / "config.toml").write_text(user_config, encoding="utf-8")
+    codex_home = tmp_path / "private-codex"
+    codex_home.mkdir()
+    _populate_codex_home_config(codex_home, user_home)
+
+    def apps_state() -> str:
+        argv = [shutil.which("codex") or "codex"]
+        for override in CODEX_NATIVE_FEATURES_OFF:
+            argv.extend(["-c", override])
+        listed = subprocess.run(
+            [*argv, "features", "list"],
+            cwd=tmp_path,
+            env={**os.environ, "CODEX_HOME": str(codex_home)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        ).stdout
+        (state,) = [
+            line.split()[-1] for line in listed.splitlines() if line.split()[:1] == ["apps"]
+        ]
+        return state
+
+    assert apps_state() == "true"
+    _strip_host_launched_config(codex_home, None, session_id=None)
+    assert apps_state() == "false"
+    assert (user_home / "config.toml").read_text(encoding="utf-8") == user_config

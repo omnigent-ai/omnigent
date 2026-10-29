@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import logging
 import os
 import shutil
 import socket
@@ -12,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import tomllib
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -24,6 +26,7 @@ from omnigent.inner.codex_staging import CODEX_HOME_PREFIX, codex_home_staging_r
 from omnigent.inner.codex_worker import (
     _BROKERED_AUTH_SECRET_ENV,
     CodexWorkerLaunch,
+    _snapshot_sqlite,
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
@@ -289,6 +292,25 @@ def test_worker_grants_plain_host_login_and_snapshots_host_memories(
         assert (host_codex / "memories_1.sqlite").read_bytes() == b"host memories"
     finally:
         worker.close()
+
+
+def test_memories_snapshot_drops_a_partial_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source = tmp_path / "host-memories.sqlite"
+    source.write_bytes(b"not a database")
+    target = tmp_path / "memories_1.sqlite"
+
+    def _copy_partially(_source: Path, destination: Path) -> None:
+        destination.write_bytes(b"not a")
+        raise OSError("disk full")
+
+    monkeypatch.setattr("omnigent.inner.codex_worker.shutil.copyfile", _copy_partially)
+    with caplog.at_level(logging.WARNING, logger="omnigent.inner.codex_worker"):
+        _snapshot_sqlite(source, target)
+
+    assert not os.path.lexists(target)
+    assert "without memories" in caplog.text
 
 
 @pytest.mark.parametrize("allow_network", [True, False], ids=["allow-network", "no-route"])
@@ -867,7 +889,11 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
 
     def _inherit_user_config(target_dir: Path, *_args: object, **_kwargs: object) -> None:
         (target_dir / "config.toml").write_text(
-            'model = "gpt-5.4-mini"\nnotify = ["touch", "notified"]\n'
+            'model = "gpt-5.4-mini"\nprofile = "p"\nnotify = ["touch", "notified"]\n'
+            "[features]\nconnectors = true\nmemories = true\n"
+            '[profiles.p]\nmodel_provider = "openai"\nweb_search = "live"\n'
+            "experimental_use_unified_exec_tool = true\n"
+            "[profiles.p.features]\nshell_tool = true\ncollab = true\n"
             '[mcp_servers.probe]\ncommand = "touch"\nargs = ["mcp-started"]\n'
             f'[projects."{tmp_path}"]\ntrust_level = "trusted"\n'
         )
@@ -895,10 +921,12 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
     assert session._disable_native_tools is True
     assert not session._containment_confirmed
     assert session._codex_home_dir is not None
-    effective = (session._codex_home_dir / "config.toml").read_text()
+    effective = tomllib.loads((session._codex_home_dir / "config.toml").read_text())
     for inherited in ("mcp_servers", "notify", "projects"):
         assert inherited not in effective, effective
-    assert 'model = "gpt-5.4-mini"' in effective
+    assert effective["model"] == "gpt-5.4-mini"
+    assert effective["features"] == {"memories": True}
+    assert effective["profiles"] == {"p": {"model_provider": "openai", "features": {}}}
     assert not os.path.lexists(session._codex_home_dir / "hooks.json")
     assert user_hooks.read_text() == "{}"
     assert spawn.await_args is not None
@@ -908,14 +936,29 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
         "features.unified_exec=false",
         "features.browser_use=false",
         'web_search="disabled"',
-        "sandbox_workspace_write.exclude_slash_tmp=true",
-        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
     ):
         assert ("-c", feature) in overrides, spawn.await_args.args
     await session.close()
 
 
-async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> None:
+@pytest.mark.parametrize(
+    ("worker_launch", "containment_confirmed", "expected_sandbox"),
+    [
+        (None, False, "workspace-write"),
+        (CodexWorkerLaunch("/launcher", sandboxed=True), True, "danger-full-access"),
+        (
+            CodexWorkerLaunch("/launcher", sandboxed=True, native_tools_allowed=False),
+            False,
+            "read-only",
+        ),
+    ],
+    ids=["unconfirmed", "confirmed", "without-native-tools"],
+)
+async def test_nested_codex_sandbox_is_disabled_only_after_confirmation(
+    worker_launch: CodexWorkerLaunch | None,
+    containment_confirmed: bool,
+    expected_sandbox: str,
+) -> None:
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd="/tmp/workspace",
@@ -924,7 +967,8 @@ async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> Non
     )
     session.start = AsyncMock()
     session._proc = Mock()
-    session._containment_confirmed = True
+    session._worker_launch = worker_launch
+    session._containment_confirmed = containment_confirmed
     session._request = AsyncMock(
         side_effect=[
             {"result": {"thread": {"id": "thread-1"}}},
@@ -956,7 +1000,7 @@ async def test_nested_codex_sandbox_is_disabled_only_after_confirmation() -> Non
     await completion
 
     thread_params = session._request.await_args_list[0].args[1]
-    assert thread_params["sandbox"] == "danger-full-access"
+    assert thread_params["sandbox"] == expected_sandbox
 
 
 @pytest.mark.skipif(

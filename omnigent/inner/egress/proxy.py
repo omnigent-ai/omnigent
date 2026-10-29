@@ -649,7 +649,7 @@ class EgressProxy:
                     )
                     return
 
-                if self._is_websocket_upgrade(inner_headers_raw):
+                if inner_method == "GET" and self._is_websocket_upgrade(inner_headers_raw):
                     if content_length > 0 or "transfer-encoding" in self._parse_header_dict(
                         inner_headers_raw
                     ):

@@ -100,8 +100,13 @@ def _snapshot_sqlite(source: Path, target: Path) -> None:
             host.backup(private)
     except sqlite3.Error:
         # Hand Codex the same bytes the link would have shown it.
-        with contextlib.suppress(OSError):
+        try:
             shutil.copyfile(source, target)
+        except OSError:
+            target.unlink(missing_ok=True)
+            logger.warning(
+                "Starting Codex without memories: cannot copy %s", source, exc_info=True
+            )
 
 
 def _contain_host_codex_home_links(
