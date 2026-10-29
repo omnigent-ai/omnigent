@@ -424,6 +424,7 @@ function makeWebContents({
     getURL: () => url,
     getTitle: () => title,
     getZoomFactor: () => 1,
+    focus: () => calls.push("focus"),
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
       scripts.push(String(js));
@@ -582,6 +583,16 @@ it("does not mistake subframe loading for an initial main-frame navigation", () 
     conversationId: "conv_1",
   });
   assert.equal("pendingUrl" in result, false);
+});
+
+describe("browserIpc — set active", () => {
+  it("focuses the attached page only when asked", () => {
+    const { ipcMain, event, wc } = setup();
+    ipcMain.invoke("omnigent:browser-set-active", event, { conversationId: "conv_1" });
+    assert.deepEqual(wc.calls, []);
+    ipcMain.invoke("omnigent:browser-set-active", event, { conversationId: "conv_1", focus: true });
+    assert.deepEqual(wc.calls, ["focus"]);
+  });
 });
 
 describe("browserIpc — trust gate", () => {

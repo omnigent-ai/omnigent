@@ -240,6 +240,28 @@ describe("BrowserPane cold-start (no view yet)", () => {
   });
 });
 
+describe("BrowserPane focus requests", () => {
+  it("focuses the address bar once for a tab just opened", () => {
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_f" focus="address" onFocused={onFocused} />);
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveFocus();
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses the page of a tab returned to once its view is attached", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+    });
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_g" focus="page" onFocused={onFocused} />);
+    expect(onFocused).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_g", { focus: true }),
+    );
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("BrowserPane retained-view lifecycle", () => {
   it("does not reattach a view closed while the pane is hidden", async () => {
     let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;

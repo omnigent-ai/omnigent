@@ -724,7 +724,29 @@ describe("desktop command menu items", () => {
     assert.equal(harness.calls.webContentsFocuses, 1);
     assert.deepEqual(plain(harness.calls.sent), [
       { channel: "omnigent:desktop-command", payload: { command: "reload" } },
-      { channel: "omnigent:desktop-command", payload: { command: "focus-address-bar" } },
+      {
+        channel: "omnigent:desktop-command",
+        payload: { command: "focus-address-bar", browserViewId: null },
+      },
+    ]);
+  });
+
+  it("takes focus from a focused page for New Browser Tab and names that page", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.windows.get(harness.win).browserRegistry = {
+      activeConversationId: () => "browser-tab:session-1:tab-1",
+      get: () => ({ view: { webContents: { isFocused: () => true } } }),
+    };
+    const menu = reportState(harness, { commands: ["new-browser-tab"] });
+
+    findMenuItem(menu, "new_browser_tab").click();
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    assert.deepEqual(plain(harness.calls.sent), [
+      {
+        channel: "omnigent:desktop-command",
+        payload: { command: "new-browser-tab", browserViewId: "browser-tab:session-1:tab-1" },
+      },
     ]);
   });
 

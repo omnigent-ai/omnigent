@@ -202,6 +202,24 @@ describe("desktop command bridge", () => {
   });
 });
 
+describe("browser view bridge", () => {
+  it("asks main to focus a re-attached page only when told to", async () => {
+    const h = loadPreload();
+    await h.desktop.browserSetActive("browser-tab:s:t");
+    await h.desktop.browserSetActive("browser-tab:s:t", { focus: true });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.slice(-2))), [
+      {
+        channel: "omnigent:browser-set-active",
+        args: { conversationId: "browser-tab:s:t", focus: false },
+      },
+      {
+        channel: "omnigent:browser-set-active",
+        args: { conversationId: "browser-tab:s:t", focus: true },
+      },
+    ]);
+  });
+});
+
 describe("global show shortcut bridge", () => {
   it("reads the saved shortcut and forwards only plain setting values", async () => {
     const h = loadPreload();
