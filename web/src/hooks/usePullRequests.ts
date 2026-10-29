@@ -34,7 +34,6 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { useEffect } from "react";
 import {
   queryOptions,
   skipToken,
@@ -42,7 +41,6 @@ import {
   useQueries,
   useQuery,
   useQueryClient,
-  type QueryClient,
 } from "@tanstack/react-query";
 import {
   appendReviewReply,
@@ -155,7 +153,6 @@ export interface PullRequest {
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
-  review_threads?: ReviewThreadsPage;
   /** Assigned reviewers and their current review state; absent from older hosts. */
   reviewers?: PullRequestReviewer[];
   /** The PR's labels; absent from older hosts and providers that don't report them. */
@@ -407,12 +404,9 @@ export function pullRequestNotFoundReason(
 export async function fetchPullRequestInfo(
   conversationId: string,
   prUrl?: string,
-  includeReviewThreads = false,
 ): Promise<PullRequestInfo> {
-  const query = new URLSearchParams(prUrl ? { pr_url: prUrl } : {});
-  if (includeReviewThreads) query.set("include_review_threads", "true");
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${query.size ? `?${query}` : ""}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github${prQuery(prUrl)}`,
   );
   if (res.status === 404) {
     // Preserve the server's message so an outdated host (no github route) is
@@ -508,24 +502,16 @@ function usePullRequestQueryContext(rawConversationId: string | undefined) {
   const serveable = useWorkspaceServeable(conversationId);
   // Use the health poll so hovering sidebar rows does not load their session snapshots.
   const retry = useRunnerOfflineRetry(serveable !== false);
-  const queryClient = useQueryClient();
-  return { conversationId, enabled: !!conversationId && serveable !== false, retry, queryClient };
+  return { conversationId, enabled: !!conversationId && serveable !== false, retry };
 }
 
 function pullRequestInfoQueryOptions(
-  { conversationId, enabled, retry, queryClient }: ReturnType<typeof usePullRequestQueryContext>,
-  options?: { poll?: boolean | "list" | "linked"; prUrl?: string; includeReviewThreads?: boolean },
+  { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
   return queryOptions({
     queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () =>
-      fetchPullRequestInfo(
-        conversationId!,
-        options?.prUrl,
-        !!reviewThreadReaders
-          .get(queryClient)
-          ?.get(reviewReaderKey(conversationId!, options?.prUrl)),
-      ),
+    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
     enabled,
     retry,
     retryDelay: runnerOfflineRetryDelay,
@@ -535,9 +521,7 @@ function pullRequestInfoQueryOptions(
           const info = query.state.data;
           if (options.poll === "linked") return computeLinkedPullRequestPollInterval(info);
           if (options.poll === "list") return computePullRequestPollInterval(info, true);
-          return info?.tracking_available || options.includeReviewThreads
-            ? 10_000
-            : computePullRequestPollInterval(info);
+          return info?.tracking_available ? 10_000 : computePullRequestPollInterval(info);
         }
       : false,
     refetchIntervalInBackground: false,
@@ -563,38 +547,11 @@ function pullRequestInfoQueryOptions(
  *   - Composer: `{ poll: "linked" }` uses the list cadence for open or unknown
  *     PR states. Empty and terminal lists rest until a turn end or explicit refresh.
  */
-const reviewThreadReaders = new WeakMap<QueryClient, Map<string, number>>();
-
-function reviewReaderKey(conversationId: string, prUrl?: string) {
-  return JSON.stringify([conversationId, prUrl ?? ""]);
-}
-
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
-  options?: { poll?: boolean | "list" | "linked"; prUrl?: string; includeReviewThreads?: boolean },
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
   const context = usePullRequestQueryContext(rawConversationId);
-  const { conversationId, queryClient } = context;
-  const prUrl = options?.prUrl;
-  const includeReviewThreads = options?.includeReviewThreads;
-  useEffect(() => {
-    if (!conversationId || !includeReviewThreads) return;
-    let readers = reviewThreadReaders.get(queryClient);
-    if (!readers) reviewThreadReaders.set(queryClient, (readers = new Map()));
-    const key = reviewReaderKey(conversationId, prUrl);
-    const count = readers.get(key) ?? 0;
-    readers.set(key, count + 1);
-    if (!count)
-      void queryClient.invalidateQueries({
-        queryKey: ["github-info", conversationId, ...(prUrl ? [prUrl] : [])],
-        exact: true,
-      });
-    return () => {
-      const remaining = (readers.get(key) ?? 1) - 1;
-      if (remaining) readers.set(key, remaining);
-      else readers.delete(key);
-    };
-  }, [conversationId, prUrl, includeReviewThreads, queryClient]);
   // Prefix invalidation also refreshes usePullRequestInfos queries for this session.
   useTrailingInvalidate(
     context.conversationId,
@@ -1279,41 +1236,33 @@ export function usePullRequestCommentComposer(
       { comment },
       { conversationId: targetSessionId, prUrl: targetPrUrl, threadId: targetThreadId },
     ) => {
-      await queryClient.cancelQueries({ queryKey: ["github-info", targetSessionId] });
+      const queryKey = targetThreadId
+        ? ["github-review-threads", targetSessionId, targetPrUrl]
+        : ["github-info", targetSessionId];
+      await queryClient.cancelQueries({ queryKey });
       queryClient.setQueryData(commentDraftKey(targetSessionId, targetPrUrl, targetThreadId), {
         body: "",
         pending: false,
         error: null,
       });
-      queryClient.setQueriesData<PullRequestInfo>(
-        { queryKey: ["github-info", targetSessionId] },
-        (info) =>
+      if (targetThreadId) {
+        queryClient.setQueriesData<ReviewThreadsPage>(
+          { queryKey },
+          (page) => page && appendReviewReply(page, targetThreadId, comment as ReviewComment),
+        );
+        void queryClient.invalidateQueries({ queryKey });
+      } else {
+        queryClient.setQueriesData<PullRequestInfo>({ queryKey }, (info) =>
           info?.pr && info.selected_pr_url === targetPrUrl
             ? {
                 ...info,
                 pr: {
                   ...info.pr,
-                  ...(targetThreadId
-                    ? {
-                        review_threads:
-                          info.pr.review_threads &&
-                          appendReviewReply(
-                            info.pr.review_threads,
-                            targetThreadId,
-                            comment as ReviewComment,
-                          ),
-                      }
-                    : { comments: mergePostedComments(info.pr.comments ?? [], [comment]) }),
+                  comments: mergePostedComments(info.pr.comments ?? [], [comment]),
                 },
               }
             : info,
-      );
-      if (targetThreadId) {
-        queryClient.setQueriesData<ReviewThreadsPage>(
-          { queryKey: ["github-review-threads", targetSessionId, targetPrUrl] },
-          (page) => page && appendReviewReply(page, targetThreadId, comment as ReviewComment),
         );
-        void queryClient.invalidateQueries({ queryKey: ["github-info", targetSessionId] });
       }
     },
     onError: (
@@ -1373,7 +1322,9 @@ export function usePullRequestReviewThreadComposer(
         },
       ),
     onSuccess: async ({ thread }, target) => {
-      await queryClient.cancelQueries({ queryKey: ["github-info", target.conversationId] });
+      await queryClient.cancelQueries({
+        queryKey: ["github-review-threads", target.conversationId, target.prUrl],
+      });
       queryClient.setQueryData(target.key, { body: "", pending: false, error: null });
       queryClient.setQueriesData<ReviewThreadsPage>(
         { queryKey: ["github-review-threads", target.conversationId, target.prUrl] },
@@ -1387,7 +1338,9 @@ export function usePullRequestReviewThreadComposer(
               }
             : page,
       );
-      void queryClient.invalidateQueries({ queryKey: ["github-info", target.conversationId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["github-review-threads", target.conversationId, target.prUrl],
+      });
     },
     onError: (error: Error, target) =>
       queryClient.setQueryData<PullRequestCommentDraft>(

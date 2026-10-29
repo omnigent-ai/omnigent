@@ -630,11 +630,7 @@ class WorkspaceReader:
     # the git provider's CLI or API (``gh`` for GitHub).
 
     def github_info(
-        self,
-        session_id: str | None = None,
-        pr_url: str | None = None,
-        *,
-        include_review_threads: bool = False,
+        self, session_id: str | None = None, pr_url: str | None = None
     ) -> _WorkspacePayload:
         """PR context for an explicit session PR or the workspace branch."""
         return cast(
@@ -643,14 +639,13 @@ class WorkspaceReader:
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
-                include_review_threads=include_review_threads,
             ),
         )
 
     def github_review_threads(
         self, session_id: str, pr_url: str, after: str, head_sha: str, base_sha: str
     ) -> _WorkspacePayload:
-        """Additional review conversations at the requested PR revision."""
+        """Published review conversations, optionally paginated at a requested revision."""
         return cast(
             "_WorkspacePayload",
             pr_resource.pr_review_threads(

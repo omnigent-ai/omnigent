@@ -635,8 +635,10 @@ it.each(["unmount", "rerender"])(
     };
     client.setQueryData(INFO_KEY, {
       selected_pr_url: PR_URL,
-      pr: { comments: [], review_threads: page },
+      pr: { comments: [] },
     });
+    const threadKey = ["github-review-threads", "conv_1", PR_URL, "octocat", "base:head"];
+    client.setQueryData(threadKey, page);
     const tree = (prUrl: string, current: ReviewThread) => (
       <QueryClientProvider client={client}>
         <PullRequestReviewThread
@@ -700,12 +702,10 @@ it.each(["unmount", "rerender"])(
     await act(async () => edits[0].respond(json({ thread_id: thread.id, comment })));
     expect(screen.getByRole("textbox")).toHaveValue("Other draft");
     const info = client.getQueryData<PullRequestInfo>(INFO_KEY)!;
-    expect(info.pr!.review_threads!.data[0].comments.data.map(({ id }) => id)).toEqual([
-      "root",
-      "reply",
-    ]);
+    const updated = client.getQueryData<typeof page>(threadKey)!;
+    expect(updated.data[0].comments.data.map(({ id }) => id)).toEqual(["root", "reply"]);
     expect(info.pr!.comments).toEqual([]);
-    expect(info.pr!.review_threads!.data[1].comments.data.map(({ id }) => id)).toEqual(["root"]);
+    expect(updated.data[1].comments.data.map(({ id }) => id)).toEqual(["root"]);
   },
 );
 

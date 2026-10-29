@@ -3332,13 +3332,9 @@ def register_resources_routes(
         session_id: str,
         conv: Conversation,
         pr_url: str | None = None,
-        *,
-        include_review_threads: bool = False,
     ) -> dict[str, Any]:
         """Read PR context through the runner or host and store what it reports."""
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
-        if include_review_threads:
-            params["include_review_threads"] = True
         requested_at = time.time()
         info = await _fs_get_with_host_fallback(
             session_id,
@@ -3589,7 +3585,6 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
-        include_review_threads: bool = False,
     ) -> dict[str, Any]:
         """
         Return GitHub context (repo, branch, base ref, PR) for a session.
@@ -3603,9 +3598,7 @@ def register_resources_routes(
         :returns: The ``session.github.info`` object.
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
-        return await _github_info(
-            session_id, conv, pr_url, include_review_threads=include_review_threads
-        )
+        return await _github_info(session_id, conv, pr_url)
 
     @router.get(
         "/sessions/{session_id}/resources/github/changes",
@@ -3941,12 +3934,12 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str,
-        after: str,
-        head_sha: str,
-        base_sha: str,
+        after: str = "",
+        head_sha: str = "",
+        base_sha: str = "",
     ) -> dict[str, Any]:
-        """Load more review conversations for the displayed PR revision."""
-        conv = await _validate_session(session_id, request, LEVEL_READ)
+        """Read review conversations, with code excerpts subject to file sharing."""
+        conv = await _authorize_browse_read(session_id, request)
         params = await _github_params(
             session_id,
             {

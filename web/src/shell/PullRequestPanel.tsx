@@ -1519,7 +1519,6 @@ export function PullRequestPanel({
   const info = usePullRequestInfo(conversationId, {
     poll: active ? (selected && !showingDetails ? "list" : true) : false,
     prUrl: selected,
-    includeReviewThreads: active && activeTab === "changes",
   });
   const showPullRequestList = () => {
     setDetailsSession(undefined);
@@ -1539,9 +1538,13 @@ export function PullRequestPanel({
     setRefreshing(true);
     try {
       await Promise.all(
-        ["github-info", "github-changed-files", "github-pr-diff", "session-pull-requests"].map(
-          (key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
-        ),
+        [
+          "github-info",
+          "github-review-threads",
+          "github-changed-files",
+          "github-pr-diff",
+          "session-pull-requests",
+        ].map((key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] })),
       );
     } finally {
       setRefreshing(false);
@@ -1831,6 +1834,7 @@ export function PullRequestPanel({
             key={`${conversationId}:${selected ?? ""}`}
             conversationId={conversationId}
             info={detailsInfo}
+            active={active}
             activeTab={activeTab}
             setActiveTab={setActiveTab}
             storedPr={storesPrs && hostOffline ? selectedPr : undefined}
@@ -1957,6 +1961,7 @@ function StoredPullRequestDetails({
 }
 
 function PullRequestPanelDetails({
+  active,
   conversationId,
   info,
   storedPr,
@@ -1969,6 +1974,7 @@ function PullRequestPanelDetails({
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
+  active: boolean;
   /** The selected PR as the server stored it, passed while the host is offline. */
   storedPr?: PullRequestAssociation;
   /** Offline, and the server hasn't imported the session's PRs yet. */
@@ -1985,6 +1991,7 @@ function PullRequestPanelDetails({
   const baseSha = info.data?.pr?.base_sha;
   const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
   const hasPr = !!info.data?.pr;
+  const serveable = useWorkspaceServeable(conversationId);
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
@@ -1999,7 +2006,12 @@ function PullRequestPanelDetails({
     prUrl,
     info.data?.auth?.selected_account ?? info.data?.selected_account,
     revision,
-    info.data?.pr?.review_threads,
+    active &&
+      activeTab === "changes" &&
+      !sandboxAsleep &&
+      serveable !== false &&
+      !!info.data?.capabilities?.review_threads &&
+      hasPr,
   );
 
   const themeType = useResolvedThemeMode();

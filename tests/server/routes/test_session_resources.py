@@ -10452,9 +10452,7 @@ async def test_selected_pr_reaches_offline_host(
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
     url = "https://github.com/example/second/pull/42"
     params = {"pr_url": url}
-    if resource == "":
-        params["include_review_threads"] = "true"
-    elif resource.startswith("/review-threads"):
+    if resource.startswith("/review-threads"):
         params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
     response = await offline_env_client.get(
         f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
@@ -10463,9 +10461,7 @@ async def test_selected_pr_reaches_offline_host(
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"]["pr_url"] == url
-    if resource == "":
-        assert captured["params"]["include_review_threads"] is True
-    elif resource.startswith("/review-threads"):
+    if resource.startswith("/review-threads"):
         assert captured["params"]["after"] == "cursor"
         if resource.endswith("/comments"):
             assert captured["params"]["thread_id"] == "thread-1"

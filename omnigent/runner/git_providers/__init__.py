@@ -160,10 +160,6 @@ class ProviderCapabilities:
 class ReviewThreadsFacet(Protocol):
     """Optional review conversation support, independent of the base provider protocol."""
 
-    def reference_info_with_threads(
-        self, root: str, reference: PullRequestRef
-    ) -> dict[str, Any]: ...
-
     def review_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]: ...

@@ -48,14 +48,12 @@ function Probe({
   id,
   batch = false,
   poll,
-  includeReviewThreads,
 }: {
   id: string | undefined;
   batch?: boolean;
-  poll?: boolean | "list" | "linked";
-  includeReviewThreads?: boolean;
+  poll?: "linked";
 }) {
-  usePullRequestInfo(id, { poll, includeReviewThreads });
+  usePullRequestInfo(id, { poll });
   usePullRequestInfos(id, batch ? ["https://github.com/org/repo/pull/1"] : []);
   return null;
 }
@@ -76,51 +74,6 @@ afterEach(() => {
 });
 
 describe("usePullRequestInfo turn-end invalidate", () => {
-  it("shares one poll with lightweight observers and includes threads only while requested", async () => {
-    vi.useFakeTimers();
-    stubChatStore(null, "idle");
-    fetchMock.mockImplementation(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        object: "session.github.info",
-        available: true,
-        tracking_available: true,
-      }),
-    }));
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const tree = (include: boolean, poll: boolean | "list" = true) => (
-      <QueryClientProvider client={client}>
-        <Probe id="conv_shared" poll={poll} includeReviewThreads={include} />
-        <Probe id="conv_shared" />
-      </QueryClientProvider>
-    );
-    const view = render(tree(false));
-    await act(async () => vi.advanceTimersByTimeAsync(1));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    view.rerender(tree(true));
-    await act(async () => vi.advanceTimersByTimeAsync(1));
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toContain("include_review_threads=true");
-    await act(async () => vi.advanceTimersByTimeAsync(10_000));
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls[2][0]).toContain("include_review_threads=true");
-    view.rerender(tree(false));
-    await act(async () => vi.advanceTimersByTimeAsync(10_000));
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    expect(fetchMock.mock.calls[3][0]).toBe("/v1/sessions/conv_shared/resources/github");
-    view.rerender(tree(false, "list"));
-    await act(async () => vi.advanceTimersByTimeAsync(29_999));
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    await act(async () => vi.advanceTimersByTimeAsync(1));
-    expect(fetchMock).toHaveBeenCalledTimes(5);
-    expect(fetchMock.mock.calls[4][0]).toBe("/v1/sessions/conv_shared/resources/github");
-    view.rerender(tree(false, false));
-    await act(async () => vi.advanceTimersByTimeAsync(60_000));
-    expect(fetchMock).toHaveBeenCalledTimes(5);
-    client.clear();
-  });
-
   it.each([false, true])(
     "refetches info when the focused session goes running → idle (batch=%s)",
     async (batch) => {

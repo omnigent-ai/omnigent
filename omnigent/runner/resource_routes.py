@@ -1403,12 +1403,10 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
-        include_review_threads: bool = False,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_info",
-            include_review_threads=include_review_threads,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1584,9 +1582,9 @@ def register_resource_routes(
     async def read_review_threads_route(
         session_id: str,
         pr_url: str,
-        after: str,
-        head_sha: str,
-        base_sha: str,
+        after: str = "",
+        head_sha: str = "",
+        base_sha: str = "",
         server_tracked: bool = False,
         default_pr_url: str | None = None,
     ) -> JSONResponse:

@@ -70,6 +70,8 @@ export interface ReviewThread {
   can_reply: boolean;
   diff_hunk: string;
   comments: ReviewPage<ReviewComment>;
+  /** Locally posted replies awaiting confirmation by a read. */
+  pending_comment_ids?: string[];
 }
 
 export interface ReviewThreadsPage extends ReviewPage<ReviewThread> {
@@ -233,6 +235,7 @@ export function appendReviewReply(
       thread.id === threadId
         ? {
             ...thread,
+            pending_comment_ids: [...new Set([...(thread.pending_comment_ids ?? []), comment.id])],
             comments: {
               ...thread.comments,
               data: mergeReviewComments(thread.comments.data, [comment]),

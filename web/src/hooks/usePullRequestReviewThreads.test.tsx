@@ -2,17 +2,23 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import type { PropsWithChildren } from "react";
-import type { ReviewThreadsPage } from "@/lib/pullRequestReviewThreads";
+import { appendReviewReply, type ReviewThreadsPage } from "@/lib/pullRequestReviewThreads";
 import { usePullRequestReviewThreads } from "./usePullRequestReviewThreads";
 import { usePullRequestReviewThreadComposer } from "./usePullRequests";
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 it("retains a new range draft, requires reselection after a revision change, and isolates a late write", async () => {
-  const client = new QueryClient();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["github-review-threads", "session", "pr", "account", "base:head"], first);
+  client.setQueryData(["github-review-threads", "session", "pr", "account", "base:changed"], {
+    ...first,
+    head_sha: "changed",
+  });
   let respond!: (response: Response) => void;
   const fetch = vi.fn<(...args: Parameters<typeof globalThis.fetch>) => Promise<Response>>(
     () =>
@@ -25,9 +31,9 @@ it("retains a new range draft, requires reselection after a revision change, and
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
   const { result, rerender } = renderHook(
-    ({ url, head, page }) => ({
+    ({ url, head }) => ({
       composer: usePullRequestReviewThreadComposer("session", url, "app.py", head, "base"),
-      threads: usePullRequestReviewThreads("session", url, "account", `base:${head}`, page),
+      threads: usePullRequestReviewThreads("session", url, "account", `base:${head}`, false),
     }),
     { wrapper, initialProps: { url: "pr", head: "head", page: first } },
   );
@@ -68,16 +74,10 @@ it("retains a new range draft, requires reselection after a revision change, and
   await waitFor(() => expect(result.current.composer.draft.anchor).toBeUndefined());
   expect(result.current.threads.page?.data.map(({ id }) => id)).toEqual(["thread", "created"]);
   expect(result.current.threads.page?.next_cursor).toBe("threads-2");
-  rerender({
-    url: "pr",
-    head: "changed",
-    page: { ...first, head_sha: "changed", data: [...first.data, created] },
-  });
-  expect(result.current.threads.page?.data.filter(({ id }) => id === "created")).toHaveLength(1);
 });
 
 it("keeps text and coordinates after an uncertain creation without retrying", async () => {
-  const client = new QueryClient();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const fetch = vi.fn().mockRejectedValue(new TypeError("Network error"));
   vi.stubGlobal("fetch", fetch);
   const wrapper = ({ children }: PropsWithChildren) => (
@@ -122,43 +122,57 @@ const first: ReviewThreadsPage = {
   ],
 };
 
-it("preserves loaded reply cursors and canonical replies through polls and omitted thread data", async () => {
+it("preserves paginated history through polls and retains it when the read is incomplete", async () => {
   const client = new QueryClient();
-  const fetch = vi.fn().mockResolvedValue(
-    new Response(
-      JSON.stringify({
-        data: [{ id: "reply", author: "bob", body: "Because", created_at: null, url: null }],
-        has_more: false,
-        next_cursor: null,
-      }),
-    ),
+  const fetch = vi.fn().mockImplementation(
+    async (url: string) =>
+      new Response(
+        JSON.stringify(
+          url.includes("/comments?")
+            ? {
+                data: [
+                  { id: "reply", author: "bob", body: "Because", created_at: null, url: null },
+                ],
+                has_more: false,
+                next_cursor: null,
+              }
+            : first,
+        ),
+      ),
   );
   vi.stubGlobal("fetch", fetch);
   const wrapper = ({ children }: PropsWithChildren) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
-  const { result, rerender } = renderHook(
-    ({ page }: { page?: ReviewThreadsPage }) =>
-      usePullRequestReviewThreads("session", "pr", "account", "base:head", page),
-    { wrapper, initialProps: { page: first } as { page?: ReviewThreadsPage } },
+  const { result } = renderHook(
+    () => usePullRequestReviewThreads("session", "pr", "account", "base:head", true),
+    { wrapper },
   );
-  expect(fetch).not.toHaveBeenCalled();
+  await waitFor(() => expect(result.current.page?.data).toHaveLength(1));
   act(() => result.current.loadComments(first.data[0]));
   await waitFor(() => expect(result.current.page?.data[0].comments.data).toHaveLength(2));
-  rerender({ page: structuredClone(first) });
+  await act(async () => client.invalidateQueries({ queryKey: ["github-review-threads"] }));
   await waitFor(() => expect(result.current.historyStale).toBe(true));
   expect(result.current.page?.data[0].comments.next_cursor).toBeNull();
   expect(result.current.page?.data[0].comments.has_more).toBe(false);
-  rerender({ page: undefined });
-  expect(result.current.page?.data[0].comments.data).toHaveLength(2);
-  rerender({ page: { ...first, data: [], warning: "Could not load conversations." } });
+  fetch.mockImplementation(
+    async () =>
+      new Response(
+        JSON.stringify({ ...first, data: [], warning: "Could not load conversations." }),
+      ),
+  );
+  await act(async () => client.invalidateQueries({ queryKey: ["github-review-threads"] }));
   await waitFor(() => expect(result.current.page?.warning).toBe("Could not load conversations."));
   expect(result.current.page?.data[0].comments.data).toHaveLength(2);
-  expect(fetch).toHaveBeenCalledTimes(1);
+  fetch.mockImplementation(async () => new Response(JSON.stringify(first)));
+  act(() => result.current.refreshHistory());
+  await waitFor(() => expect(result.current.page?.data[0].comments.data).toHaveLength(1));
+  expect(result.current.historyStale).toBe(false);
 });
 
 it("keeps late pagination results with the original PR and isolates revisions and accounts", async () => {
-  const client = new QueryClient();
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(["github-review-threads", "session", "pr", "alice", "base:head"], first);
   let respond!: (response: Response) => void;
   vi.stubGlobal(
     "fetch",
@@ -173,8 +187,8 @@ it("keeps late pagination results with the original PR and isolates revisions an
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
   const { result, rerender } = renderHook(
-    ({ url, account, revision, page }) =>
-      usePullRequestReviewThreads("session", url, account, revision, page),
+    ({ url, account, revision }) =>
+      usePullRequestReviewThreads("session", url, account, revision, false),
     {
       wrapper,
       initialProps: {
@@ -204,4 +218,46 @@ it("keeps late pagination results with the original PR and isolates revisions an
   rerender({ url: "pr", account: "alice", revision: "base:head", page: first });
   await waitFor(() => expect(result.current.page?.data).toHaveLength(2));
   expect(result.current.page?.has_more).toBe(false);
+});
+
+it("fetches on opening Diff, polls only while active, and removes deleted comments after confirmation", async () => {
+  vi.useFakeTimers();
+  const client = new QueryClient();
+  const key = ["github-review-threads", "session", "pr", "account", "base:head"];
+  let serverPage = first;
+  const fetch = vi.fn().mockImplementation(async () => new Response(JSON.stringify(serverPage)));
+  vi.stubGlobal("fetch", fetch);
+  const wrapper = ({ children }: PropsWithChildren) => (
+    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+  );
+  const { result, rerender } = renderHook(
+    ({ enabled }) => usePullRequestReviewThreads("session", "pr", "account", "base:head", enabled),
+    { wrapper, initialProps: { enabled: false } },
+  );
+  expect(fetch).not.toHaveBeenCalled();
+  rerender({ enabled: true });
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(fetch).toHaveBeenCalledTimes(1);
+  const comment = { id: "reply", author: "bob", body: "Posted", created_at: null, url: null };
+  act(() =>
+    client.setQueryData<ReviewThreadsPage>(key, (page) =>
+      appendReviewReply(page!, "thread", comment),
+    ),
+  );
+  await act(async () => vi.advanceTimersByTimeAsync(10_010));
+  expect(result.current.page?.data[0].comments.data.map(({ id }) => id)).toEqual(["root", "reply"]);
+  serverPage = appendReviewReply(first, "thread", comment);
+  await act(async () => vi.advanceTimersByTimeAsync(10_010));
+  expect(result.current.page?.data[0].pending_comment_ids).toEqual([]);
+  serverPage = first;
+  await act(async () => vi.advanceTimersByTimeAsync(10_010));
+  expect(result.current.page?.data[0].comments.data.map(({ id }) => id)).toEqual(["root"]);
+  rerender({ enabled: false });
+  const count = fetch.mock.calls.length;
+  await act(async () => vi.advanceTimersByTimeAsync(60_000));
+  expect(fetch).toHaveBeenCalledTimes(count);
+  rerender({ enabled: true });
+  await act(async () => vi.advanceTimersByTimeAsync(1));
+  expect(fetch).toHaveBeenCalledTimes(count + 1);
+  client.clear();
 });

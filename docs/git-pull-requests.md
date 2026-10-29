@@ -149,16 +149,18 @@ GitHub advertises `review_threads`, `review_thread_replies` and
 false for other providers and older hosts. They use the optional `ReviewThreadsFacet`
 without changing the required methods of `PullRequestFacet`.
 
-While **Changes** is visible, the existing PR-info poll sends
-`include_review_threads=true`. Known PRs use one `gh api graphql` query for
-metadata, checks, top-level comments and the first 25 review threads, with up to
-20 published comments per thread. There is no separate thread timer. Additional
-pages use `GET review-threads` and `GET review-threads/{id}/comments` on demand.
-Loaded history is retained across ordinary polls and marked for manual reload.
+While **Changes** is visible, `GET review-threads` fetches the first 25 threads
+with up to 20 published comments each, then polls every 10 seconds. The existing
+PR metadata request continues to use `gh pr view`. Other subtabs and the closed
+panel stop thread polling. Replies and new conversations refresh the thread
+query immediately. Additional thread and comment pages load on demand.
 
-The optional `pr.review_threads` envelope carries `data`, `has_more`,
-`next_cursor`, `head_sha`, `base_sha` and an optional `warning`. Omission does not
-mean an empty collection. Patch reads verify the expected revisions before and
+The thread response carries `data`, `has_more`, `next_cursor`, `head_sha`,
+`base_sha` and an optional `warning`. Ordinary polls replace unpaginated comments,
+retaining locally posted replies until observed in a read. Explicitly loaded
+history is retained and marked for manual reload.
+
+Patch reads verify the expected revisions before and
 after fetching; mismatches withhold inline placement. Outdated, hidden-context,
 file-level and unavailable-diff threads remain accessible with their original
 code context. Resolved threads start collapsed.
@@ -174,7 +176,9 @@ shown without a comparison. Suggestions are display-only and add no requests.
 account. The host validates thread membership and replies to its published root
 comment. Expanded conversations show a compact **Write a reply…** input. Focus it
 to open the Markdown composer; **Cancel** collapses it while retaining the draft.
-Reads require session read permission; writes require edit permission.
+Thread reads include code excerpts and require the same file-sharing permission
+as diff reads. Reply pagination requires session read permission; writes require
+edit permission.
 Runner and host fallback use the same provider implementation. An uncertain
 write is never retried automatically. Drafts and pending/error state stay in
 memory per session, PR and thread, including through tab and layout switches.

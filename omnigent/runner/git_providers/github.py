@@ -88,14 +88,6 @@ class GitHubPullRequests:
 
         return github_resource._gh_installed()
 
-    def reference_info_with_threads(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
-        """Read metadata and published review conversations in the same request."""
-        from omnigent.runner import github_resource
-
-        return _with_provider_fields(
-            github_resource._reference_info(root, reference, include_review_threads=True)
-        )
-
     def review_diff(
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
@@ -109,7 +101,7 @@ class GitHubPullRequests:
     def review_threads(
         self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
     ) -> dict[str, Any]:
-        """Load another review-thread page on demand."""
+        """Read the first or a subsequent review-thread page."""
         from omnigent.runner import github_review_threads
 
         return github_review_threads.read_threads(

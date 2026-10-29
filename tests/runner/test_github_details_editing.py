@@ -597,8 +597,13 @@ def review_thread() -> dict:
 
 
 @pytest.mark.parametrize("transport", ["runner", "host"])
+@pytest.mark.parametrize("paginated", [False, True])
 async def test_review_pages_use_selected_pr_and_cursor(
-    tracked: str, monkeypatch: pytest.MonkeyPatch, review_thread: dict, transport: str
+    tracked: str,
+    monkeypatch: pytest.MonkeyPatch,
+    review_thread: dict,
+    transport: str,
+    paginated: bool,
 ) -> None:
     calls: list[GhCall] = []
     page = {
@@ -627,7 +632,10 @@ async def test_review_pages_use_selected_pr_and_cursor(
             workspace=str(Path(tracked) / "session") if transport == "runner" else tracked,
         ),
     )
-    params = {"pr_url": PR_URL, "after": "cursor", "head_sha": "a" * 40, "base_sha": "b" * 40}
+    params = {"pr_url": PR_URL}
+    if paginated:
+        params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
+    comment_params = {"pr_url": PR_URL, "after": "cursor"}
     if transport == "runner":
         app = create_runner_app(runner_workspace=Path(tracked), server_client=NullServerClient())  # type: ignore[arg-type]
         async with httpx.AsyncClient(
@@ -635,7 +643,7 @@ async def test_review_pages_use_selected_pr_and_cursor(
         ) as client:
             base = "/v1/sessions/session/resources/github/review-threads"
             threads = await client.get(base, params=params)
-            comments = await client.get(base + "/thread-1/comments", params=params)
+            comments = await client.get(base + "/thread-1/comments", params=comment_params)
         assert threads.status_code == comments.status_code == 200
         thread_data, comment_data = threads.json(), comments.json()
     else:
@@ -647,114 +655,76 @@ async def test_review_pages_use_selected_pr_and_cursor(
             reader, "github_review_threads", "session", params
         )
         comment_data = HostProcess._dispatch_fs_op(
-            reader, "github_review_thread_comments", "session", {**params, "thread_id": "thread-1"}
+            reader,
+            "github_review_thread_comments",
+            "session",
+            {**comment_params, "thread_id": "thread-1"},
         )
     assert thread_data["data"][0]["id"] == "thread-1"
     assert comment_data["data"][0]["id"] == "comment-1"
-    assert [json.loads(call.input)["variables"]["after"] for call in calls] == ["cursor", "cursor"]
+    assert [json.loads(call.input)["variables"]["after"] for call in calls] == [
+        "cursor" if paginated else None,
+        "cursor",
+    ]
 
 
-@pytest.mark.parametrize("include_threads", [False, True])
-def test_known_pr_combines_metadata_and_optional_threads_in_one_read(
+@pytest.mark.parametrize("partial_error", [False, True])
+def test_first_thread_page_is_independent_of_metadata(
     monkeypatch: pytest.MonkeyPatch,
     reference: PullRequestRef,
     review_thread: dict,
-    include_threads: bool,
+    partial_error: bool,
 ) -> None:
     calls: list[GhCall] = []
     pr = {
-        "title": "Combined PR",
         "headRefOid": "a" * 40,
         "baseRefOid": "b" * 40,
-        "comments": {"nodes": [{"body": "Top-level"}]},
-        "reviews": {"nodes": [{"body": "Review body", "submittedAt": "2026-10-28"}]},
-        "reviewRequests": {
-            "nodes": [{"requestedReviewer": {"__typename": "Team", "slug": "team"}}]
-        },
-        "latestReviews": {"nodes": [{"author": {"login": "reviewer"}, "state": "APPROVED"}]},
-        "commits": {
-            "nodes": [
-                {
-                    "commit": {
-                        "statusCheckRollup": {
-                            "contexts": {
-                                "nodes": [
-                                    {
-                                        "name": "unit",
-                                        "status": "COMPLETED",
-                                        "conclusion": "SUCCESS",
-                                    }
-                                ],
-                                "pageInfo": {"hasNextPage": True},
-                            }
-                        }
-                    }
-                }
-            ]
-        },
         "reviewThreads": {
             "nodes": [review_thread],
             "pageInfo": {"hasNextPage": True, "endCursor": "next"},
         },
     }
+    response = {"data": {"repository": {"pullRequest": pr}}}
+    if partial_error:
+        response["errors"] = [{"path": ["repository", "pullRequest", "reviewThreads"]}]
     monkeypatch.setattr(
-        github,
-        "_gh",
-        _fake_gh(calls, [(0, json.dumps({"data": {"repository": {"pullRequest": pr}}}), "")]),
+        github, "_gh", _fake_gh(calls, [(int(partial_error), json.dumps(response), "")])
     )
-    result = reviews.read_pr("/workspace", reference, include_threads=include_threads)
+    page = reviews.read_threads("/workspace", reference)
     [call] = calls
     assert call.token == "selected-token"
     payload = json.loads(call.input)
-    assert payload["variables"] == {"owner": "acme", "name": "widgets", "number": 17}
-    assert ("reviewThreads(first: 25)" in payload["query"]) == include_threads
-    assert "comments(last: 100)" in payload["query"]
-    assert result["comments"][0]["body"] == "Top-level"
-    assert result["reviewRequests"][0]["slug"] == "team"
-    assert result["statusCheckRollup"][0]["name"] == "unit"
-    assert result["checks_partial"] is True
-    if include_threads:
-        page = result["review_threads"]
-        assert (page["head_sha"], page["base_sha"], page["next_cursor"]) == (
-            "a" * 40,
-            "b" * 40,
-            "next",
-        )
-        [thread] = page["data"]
-        assert (thread["side"], thread["line"], thread["start_line"]) == ("LEFT", 12, 10)
-        assert thread["comments"]["next_cursor"] == "comments-next"
-    else:
-        assert "review_threads" not in result
+    assert payload["variables"] == {
+        "owner": "acme",
+        "name": "widgets",
+        "number": 17,
+        "after": None,
+    }
+    assert "statusCheckRollup" not in payload["query"]
+    assert (page["head_sha"], page["base_sha"], page["next_cursor"]) == (
+        "a" * 40,
+        "b" * 40,
+        "next",
+    )
+    assert bool(page.get("warning")) == partial_error
+    [thread] = page["data"]
+    assert (thread["side"], thread["line"], thread["start_line"]) == ("LEFT", 12, 10)
+    assert thread["comments"]["next_cursor"] == "comments-next"
 
 
-@pytest.mark.parametrize("partial_data", [False, True])
-@pytest.mark.parametrize("field_error", [False, True])
-def test_thread_field_failure_preserves_metadata_and_reports_unavailable(
+@pytest.mark.parametrize(
+    "response", [{"data": None}, {"errors": [{"message": "Forbidden"}]}, [], "invalid"]
+)
+def test_unavailable_threads_report_a_read_error(
     monkeypatch: pytest.MonkeyPatch,
     reference: PullRequestRef,
-    partial_data: bool,
-    field_error: bool,
+    response: object,
 ) -> None:
     calls: list[GhCall] = []
-    pr = {"title": "Still visible", "comments": {"nodes": []}}
-    response = {
-        "data": {"repository": {"pullRequest": pr if partial_data else None}},
-        "errors": [
-            {"extensions": {"fieldName": "viewerCanReply"}}
-            if field_error
-            else {"path": ["repository", "pullRequest", "reviewThreads"]}
-        ],
-    }
-    answers = [(1, json.dumps(response), "GraphQL error")]
-    if not partial_data:
-        answers.append((0, json.dumps({"data": {"repository": {"pullRequest": pr}}}), ""))
-    monkeypatch.setattr(github, "_gh", _fake_gh(calls, answers))
-    result = reviews.read_pr("/workspace", reference, include_threads=True)
-    assert result["title"] == "Still visible"
-    assert result["review_threads"]["warning"]
-    assert len(calls) == (1 if partial_data else 2)
-    if not partial_data:
-        assert "reviewThreads" not in json.loads(calls[1].input)["query"]
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(1, json.dumps(response), "")]))
+    with pytest.raises(ValueError, match="GitHub"):
+        reviews.read_threads("/workspace", reference)
+    assert len(calls) == 1
 
 
 def test_thread_shaping_keeps_minimized_placeholder_and_excludes_pending(
@@ -810,7 +780,19 @@ def test_thread_pagination_rejects_changed_revisions(
     assert json.loads(calls[0].input)["variables"]["after"] == "next"
 
 
-@pytest.mark.parametrize("failure", [None, "wrong_pr", "forbidden", "pending", "timeout"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "wrong_pr",
+        "missing_url",
+        "invalid_url",
+        "missing_pr",
+        "forbidden",
+        "pending",
+        "timeout",
+    ],
+)
 def test_inline_reply_checks_membership_and_posts_once_to_original_comment(
     monkeypatch: pytest.MonkeyPatch,
     reference: PullRequestRef,
@@ -820,6 +802,12 @@ def test_inline_reply_checks_membership_and_posts_once_to_original_comment(
     calls: list[GhCall] = []
     if failure == "wrong_pr":
         review_thread["pullRequest"]["url"] = PR_URL + "0"
+    if failure == "missing_url":
+        review_thread["pullRequest"]["url"] = None
+    if failure == "invalid_url":
+        review_thread["pullRequest"]["url"] = 123
+    if failure == "missing_pr":
+        review_thread["pullRequest"] = None
     if failure == "forbidden":
         review_thread["viewerCanReply"] = False
     if failure == "pending":

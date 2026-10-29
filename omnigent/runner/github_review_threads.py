@@ -1,4 +1,4 @@
-"""GitHub PR metadata and published review threads, read in one GraphQL query."""
+"""Published GitHub review conversations and inline comments."""
 
 from __future__ import annotations
 
@@ -19,39 +19,6 @@ _THREAD_FIELDS = f"""
   subjectType isResolved isOutdated viewerCanReply
   comments(first: 20) {{ nodes {{ {_COMMENT_FIELDS} }} {_PAGE_FIELDS} }}
 """
-_INFO_FIELDS = """
-  number title state url isDraft author { login } body
-  baseRefName headRefName baseRefOid headRefOid
-  labels(first: 100) { nodes { name color description } }
-  comments(last: 100) {
-    nodes { author { login } body createdAt url isMinimized }
-    pageInfo { hasPreviousPage }
-  }
-"""
-_OPTIONAL_FIELDS = {
-    "checks": """commits(last: 1) { nodes { commit { statusCheckRollup {
-      contexts(first: 100) {
-        nodes {
-          ... on CheckRun { name status conclusion detailsUrl }
-          ... on StatusContext { context state targetUrl }
-        }
-        pageInfo { hasNextPage }
-      }
-    } } } }""",
-    "reviews": """reviews(last: 100) {
-      nodes { author { login } body submittedAt state }
-      pageInfo { hasPreviousPage }
-    }""",
-    "reviewers": """latestReviews(first: 100) { nodes { author { login } state } }
-      reviewRequests(first: 100) { nodes { requestedReviewer {
-        __typename ... on User { login } ... on Bot { login }
-        ... on Team { name slug }
-      } } }""",
-    "merge": """mergeStateStatus autoMergeRequest {
-      mergeMethod enabledBy { login } enabledAt
-    }""",
-    "threads": f"reviewThreads(first: 25) {{ nodes {{ {_THREAD_FIELDS} }} {_PAGE_FIELDS} }}",
-}
 
 
 def _graphql(root: str, reference: PullRequestRef, query: str, **variables: Any) -> dict[str, Any]:
@@ -138,107 +105,17 @@ def _threads(pr: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _failed_groups(errors: list[Any]) -> set[str]:
-    failed = set()
-    for error in errors:
-        if not isinstance(error, dict):
-            continue
-        path = [str(part) for part in error.get("path") or []]
-        field = (error.get("extensions") or {}).get("fieldName")
-        if field:
-            path.append(field)
-        for name, fields in {
-            "checks": {"commits", "statusCheckRollup", "contexts"},
-            "reviews": {"reviews"},
-            "reviewers": {"latestReviews", "reviewRequests", "requestedReviewer"},
-            "merge": {"mergeStateStatus", "autoMergeRequest"},
-            "threads": {
-                "reviewThreads",
-                "fullDatabaseId",
-                "subjectType",
-                "diffSide",
-                "startDiffSide",
-                "originalLine",
-                "originalStartLine",
-                "viewerCanReply",
-                "isResolved",
-                "isOutdated",
-                "diffHunk",
-            },
-        }.items():
-            if any(part in fields for part in path):
-                failed.add(name)
-    return failed
-
-
-def read_pr(root: str, reference: PullRequestRef, *, include_threads: bool) -> dict[str, Any]:
-    """Read a known PR with bounded optional connections and field-specific fallbacks."""
-    owner, name = reference.repository.split("/", 1)
-    included = set(_OPTIONAL_FIELDS) - ({"threads"} if not include_threads else set())
-    failed: set[str] = set()
-    with github._gh_deadline_scope(time.monotonic() + github._PR_EDIT_REQUEST_SECONDS):
-        while True:
-            fields = _INFO_FIELDS + "\n".join(_OPTIONAL_FIELDS[key] for key in sorted(included))
-            query = f"""query($owner: String!, $name: String!, $number: Int!) {{
-              repository(owner: $owner, name: $name) {{
-                pullRequest(number: $number) {{ {fields} }}
-              }}
-            }}"""
-            response = _graphql(
-                root, reference, query, owner=owner, name=name, number=reference.number
-            )
-            errors = response.get("errors") or []
-            refused = _failed_groups(errors) & included
-            failed.update(refused)
-            repository = (response.get("data") or {}).get("repository") or {}
-            pr = repository.get("pullRequest")
-            if isinstance(pr, dict):
-                break
-            if not refused or github._gh_timed_out.get():
-                raise ValueError("GitHub could not load this pull request. Refresh to retry.")
-            included -= refused
-
-    result = dict(pr)
-    for field in ("labels", "comments", "reviews", "latestReviews"):
-        if isinstance(pr.get(field), dict):
-            result[field] = _nodes(pr[field])
-        else:
-            result.pop(field, None)
-    if "reviewRequests" in pr:
-        result["reviewRequests"] = [
-            row["requestedReviewer"]
-            for row in _nodes(pr["reviewRequests"])
-            if isinstance(row.get("requestedReviewer"), dict)
-        ]
-    if "checks" in included and "checks" not in failed:
-        commits = _nodes(pr.get("commits"))
-        rollup = (
-            ((commits[-1].get("commit") or {}).get("statusCheckRollup") or {}) if commits else {}
-        )
-        contexts = rollup.get("contexts")
-        result["statusCheckRollup"] = _nodes(contexts)
-        result["checks_partial"] = bool((contexts or {}).get("pageInfo", {}).get("hasNextPage"))
-    if "reviews" in failed:
-        result.pop("reviews", None)
-    if "reviewers" in failed:
-        result.pop("latestReviews", None)
-        result.pop("reviewRequests", None)
-    if "merge" in failed:
-        result.pop("mergeStateStatus", None)
-        result.pop("autoMergeRequest", None)
-    if include_threads:
-        result["review_threads"] = _threads(pr)
-        if "threads" in failed:
-            result["review_threads"]["warning"] = "GitHub could not load all review conversations."
-    return result
-
-
 def read_threads(
-    root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
+    root: str,
+    reference: PullRequestRef,
+    *,
+    after: str = "",
+    head_sha: str = "",
+    base_sha: str = "",
 ) -> dict[str, Any]:
-    """Read another thread page only for the displayed PR revision."""
+    """Read published threads; pagination must match the displayed revision."""
     owner, name = reference.repository.split("/", 1)
-    query = f"""query($owner: String!, $name: String!, $number: Int!, $after: String!) {{
+    query = f"""query($owner: String!, $name: String!, $number: Int!, $after: String) {{
       repository(owner: $owner, name: $name) {{ pullRequest(number: $number) {{
         headRefOid baseRefOid reviewThreads(first: 25, after: $after) {{
           nodes {{ {_THREAD_FIELDS} }} {_PAGE_FIELDS}
@@ -246,12 +123,18 @@ def read_threads(
       }} }}
     }}"""
     response = _graphql(
-        root, reference, query, owner=owner, name=name, number=reference.number, after=after
+        root,
+        reference,
+        query,
+        owner=owner,
+        name=name,
+        number=reference.number,
+        after=after or None,
     )
     pr = ((response.get("data") or {}).get("repository") or {}).get("pullRequest")
     if not isinstance(pr, dict):
-        raise ValueError("GitHub could not load more conversations.")
-    if pr.get("headRefOid") != head_sha or pr.get("baseRefOid") != base_sha:
+        raise ValueError("GitHub could not load review conversations.")
+    if after and (pr.get("headRefOid") != head_sha or pr.get("baseRefOid") != base_sha):
         raise ValueError("The pull request changed; refresh before loading more conversations.")
     result = _threads(pr)
     if response.get("errors"):
@@ -271,10 +154,13 @@ def _read_thread(
     }}"""
     response = _graphql(root, reference, query, id=thread_id, after=after)
     thread = (response.get("data") or {}).get("node")
+    pr = thread.get("pullRequest") if isinstance(thread, dict) else None
     if (
         response.get("errors")
         or not isinstance(thread, dict)
-        or (thread.get("pullRequest") or {}).get("url", "").casefold() != reference.url.casefold()
+        or not isinstance(pr, dict)
+        or not isinstance(pr.get("url"), str)
+        or pr["url"].casefold() != reference.url.casefold()
     ):
         raise ValueError("This review conversation is unavailable on the selected pull request.")
     return thread

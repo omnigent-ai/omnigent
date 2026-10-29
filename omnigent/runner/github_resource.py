@@ -977,11 +977,7 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
     )
 
 
-def _reference_info(
-    root: str, reference: PullRequestRef, *, include_review_threads: bool = False
-) -> dict[str, Any]:
-    from omnigent.runner import github_review_threads
-
+def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info: dict[str, Any] = {
         "object": "session.github.info",
         "available": True,
@@ -999,7 +995,9 @@ def _reference_info(
     info["selected_account"] = preferred or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
-    data = github_review_threads.read_pr(root, reference, include_threads=include_review_threads)
+    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    if data is None:
+        return info
     author = data.get("author")
     info.update(
         authenticated=True, branch=data.get("headRefName"), base_ref=data.get("baseRefName")
@@ -1024,11 +1022,6 @@ def _reference_info(
         info["pr"]["reviewers"] = _shape_reviewers(data)
     if "labels" in data:
         info["pr"]["labels"] = _shape_labels(data["labels"])
-    checks = info["pr"].get("checks")
-    if data.get("checks_partial") and isinstance(checks, dict):
-        checks["partial"] = True
-    if "review_threads" in data:
-        info["pr"]["review_threads"] = data["review_threads"]
     return info
 
 

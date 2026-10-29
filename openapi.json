@@ -17775,16 +17775,6 @@
               ],
               "title": "Pr Url"
             }
-          },
-          {
-            "in": "query",
-            "name": "include_review_threads",
-            "required": false,
-            "schema": {
-              "default": false,
-              "title": "Include Review Threads",
-              "type": "boolean"
-            }
           }
         ],
         "responses": {
@@ -18320,7 +18310,7 @@
     },
     "/v1/sessions/{session_id}/resources/github/review-threads": {
       "get": {
-        "description": "Load more review conversations for the displayed PR revision.",
+        "description": "Read review conversations, with code excerpts subject to file sharing.",
         "operationId": "get_session_review_threads_v1_sessions__session_id__resources_github_review_threads_get",
         "parameters": [
           {
@@ -18344,8 +18334,9 @@
           {
             "in": "query",
             "name": "after",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": "",
               "title": "After",
               "type": "string"
             }
@@ -18353,8 +18344,9 @@
           {
             "in": "query",
             "name": "head_sha",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": "",
               "title": "Head Sha",
               "type": "string"
             }
@@ -18362,8 +18354,9 @@
           {
             "in": "query",
             "name": "base_sha",
-            "required": true,
+            "required": false,
             "schema": {
+              "default": "",
               "title": "Base Sha",
               "type": "string"
             }

@@ -1,5 +1,4 @@
-import { useEffect } from "react";
-import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   mergeReviewComments,
@@ -19,9 +18,11 @@ async function fetchReviewPage<T>(
   conversationId: string,
   resource: string,
   params: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const response = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}?${new URLSearchParams(params)}`,
+    { signal },
   );
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
@@ -30,58 +31,78 @@ async function fetchReviewPage<T>(
   return response.json();
 }
 
-/** First-page updates arrive through PR info; only explicit pagination makes a request. */
+/** Only retain paginated history and replies not yet observed in a server read. */
+function reconcileThreads(firstPage: ReviewThreadsPage, previous?: CachedThreads): CachedThreads {
+  const old =
+    previous?.head_sha === firstPage.head_sha && previous?.base_sha === firstPage.base_sha
+      ? previous
+      : undefined;
+  if (firstPage.warning && firstPage.data.length === 0 && old) {
+    return { ...old, warning: firstPage.warning };
+  }
+  const firstIds = new Set(firstPage.data.map((thread) => thread.id));
+  const oldFirstIds = new Set(old?.first_page_ids ?? []);
+  const extra =
+    old?.data.filter((thread) => !firstIds.has(thread.id) && !oldFirstIds.has(thread.id)) ?? [];
+  const data = firstPage.data.map((thread) => {
+    const existing = old?.data.find((value) => value.id === thread.id);
+    if (!existing) return thread;
+    const paged = old?.paged_comment_ids?.includes(thread.id);
+    const pending = existing.pending_comment_ids?.filter(
+      (id) => !thread.comments.data.some((comment) => comment.id === id),
+    );
+    return {
+      ...thread,
+      pending_comment_ids: pending,
+      comments: {
+        ...(paged ? existing.comments : thread.comments),
+        warning: thread.comments.warning,
+        data: mergeReviewComments(
+          paged ? existing.comments.data : thread.comments.data,
+          paged
+            ? thread.comments.data
+            : existing.comments.data.filter((comment) => pending?.includes(comment.id)),
+        ),
+      },
+    };
+  });
+  return {
+    ...firstPage,
+    data: [...data, ...extra],
+    first_page_ids: [...firstIds],
+    paged_comment_ids: old?.paged_comment_ids,
+    history_stale: !!(extra.length || old?.paged_comment_ids?.length),
+    ...(extra.length && old ? { has_more: old.has_more, next_cursor: old.next_cursor } : {}),
+  };
+}
+
+/** Fetch and poll published threads only while the Diff view is active. */
 export function usePullRequestReviewThreads(
   conversationId: string,
   prUrl: string | undefined,
   account: string | null | undefined,
   revision: string,
-  firstPage: ReviewThreadsPage | undefined,
+  enabled: boolean,
 ) {
   const queryClient = useQueryClient();
   const key = ["github-review-threads", conversationId, prUrl ?? "", account ?? "", revision];
-  const { data: cached } = useQuery<CachedThreads>({ queryKey: key, queryFn: skipToken });
-  useEffect(() => {
-    if (!firstPage || !prUrl) return;
-    const cacheKey = ["github-review-threads", conversationId, prUrl, account ?? "", revision];
-    queryClient.setQueryData<CachedThreads>(cacheKey, (previous) => {
-      const sameRevision =
-        previous?.head_sha === firstPage.head_sha && previous?.base_sha === firstPage.base_sha;
-      const old = sameRevision ? previous : undefined;
-      if (firstPage.warning && firstPage.data.length === 0 && old) {
-        return { ...old, warning: firstPage.warning };
-      }
-      const firstIds = new Set(firstPage.data.map((thread) => thread.id));
-      const oldFirstIds = new Set(old?.first_page_ids ?? []);
-      const extra =
-        old?.data.filter((thread) => !firstIds.has(thread.id) && !oldFirstIds.has(thread.id)) ?? [];
-      const data = firstPage.data.map((thread) => {
-        const existing = old?.data.find((value) => value.id === thread.id);
-        return existing
-          ? {
-              ...thread,
-              comments: {
-                ...(old?.paged_comment_ids?.includes(thread.id)
-                  ? existing.comments
-                  : thread.comments),
-                warning: thread.comments.warning,
-                data: mergeReviewComments(existing.comments.data, thread.comments.data),
-              },
-            }
-          : thread;
-      });
-      return {
-        ...firstPage,
-        data: [...data, ...extra],
-        first_page_ids: [...firstIds],
-        paged_comment_ids: old?.paged_comment_ids,
-        history_stale: !!(extra.length || old?.paged_comment_ids?.length),
-        ...(extra.length && old ? { has_more: old.has_more, next_cursor: old.next_cursor } : {}),
-      };
-    });
-  }, [firstPage, conversationId, prUrl, account, revision, queryClient]);
-
-  const page = cached ?? firstPage;
+  const query = useQuery<CachedThreads>({
+    queryKey: key,
+    queryFn: async ({ signal }) => {
+      const firstPage = await fetchReviewPage<ReviewThreadsPage>(
+        conversationId,
+        "review-threads",
+        { pr_url: prUrl! },
+        signal,
+      );
+      return reconcileThreads(firstPage, queryClient.getQueryData<CachedThreads>(key));
+    },
+    enabled: enabled && !!prUrl,
+    retry: false,
+    refetchInterval: enabled ? 10_000 : false,
+    refetchIntervalInBackground: false,
+  });
+  const page = query.data;
   const moreThreads = useMutation({
     retry: false,
     mutationFn: async (current: ReviewThreadsPage) => ({
@@ -139,11 +160,8 @@ export function usePullRequestReviewThreads(
   });
   return {
     page,
-    historyStale: cached?.history_stale,
-    refreshHistory: () => {
-      queryClient.setQueryData(key, firstPage);
-      void queryClient.invalidateQueries({ queryKey: ["github-info", conversationId] });
-    },
+    historyStale: page?.history_stale,
+    refreshHistory: () => void queryClient.resetQueries({ queryKey: key, exact: true }),
     loadMore: () => {
       if (page?.next_cursor && !moreThreads.isPending) moreThreads.mutate(page);
     },
@@ -152,6 +170,6 @@ export function usePullRequestReviewThreads(
       if (thread.comments.next_cursor && !moreComments.isPending) moreComments.mutate(thread);
     },
     loadingComments: moreComments.isPending ? moreComments.variables.id : null,
-    error: moreThreads.error?.message ?? moreComments.error?.message,
+    error: query.error?.message ?? moreThreads.error?.message ?? moreComments.error?.message,
   };
 }

@@ -297,20 +297,12 @@ def _workspace_info(root: str, resolution: ProviderResolution | None = None) -> 
     return info
 
 
-def _reference_info(
-    root: str, reference: PullRequestRef, *, include_review_threads: bool = False
-) -> dict[str, Any]:
+def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     """Info for one tracked PR, or the unsupported payload when its provider has no facet."""
     try:
         facet = _facet(reference.provider)
         if facet is None:
             return {**unsupported_remote_info(reference.host), "selected_pr_url": reference.url}
-        if (
-            include_review_threads
-            and facet.capabilities.review_threads
-            and isinstance(facet, ReviewThreadsFacet)
-        ):
-            return facet.reference_info_with_threads(root, reference)
         return facet.reference_info(root, reference)
     except Exception:  # retain the selector and healthy providers on failure
         _logger.warning("Git provider %s failed PR lookup", reference.provider, exc_info=True)
@@ -492,7 +484,6 @@ def pr_info(
     *,
     session_id: str | None = None,
     pr_url: str | None = None,
-    include_review_threads: bool = False,
 ) -> dict[str, Any]:
     """Read the selected session PR and discover untracked providers from all remotes.
 
@@ -531,12 +522,12 @@ def pr_info(
     discovered: list[dict[str, Any]] = []
     if not resolutions:
         assert reference is not None
-        info = _reference_info(root, reference, include_review_threads=include_review_threads)
+        info = _reference_info(root, reference)
     elif reference is not None:
         pending = [
             (value, _background_discovery(root, session_id, value)) for value in resolutions
         ]
-        info = _reference_info(root, reference, include_review_threads=include_review_threads)
+        info = _reference_info(root, reference)
         # Collect quick results; slow forges will appear on a subsequent poll.
         deadline = time.monotonic() + 0.1
         for resolution, future in pending:
@@ -909,16 +900,20 @@ def pr_review_threads(
     *,
     session_id: str | None = None,
     pr_url: str | None = None,
-    after: str,
-    head_sha: str,
-    base_sha: str,
+    after: str = "",
+    head_sha: str = "",
+    base_sha: str = "",
 ) -> dict[str, Any]:
-    """Read an additional page of conversations at the displayed revision."""
+    """Read published conversations, requiring pinned revisions for pagination."""
     facet, reference = _review_target(session_id, pr_url)
-    if not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha):
+    if after and (not _COMMIT_SHA.fullmatch(head_sha) or not _COMMIT_SHA.fullmatch(base_sha)):
         raise ValueError("Expected full head and base commit SHAs")
     return facet.review_threads(
-        root, reference, after=_review_identifier(after), head_sha=head_sha, base_sha=base_sha
+        root,
+        reference,
+        after=_review_identifier(after) if after else "",
+        head_sha=head_sha,
+        base_sha=base_sha,
     )
 
 

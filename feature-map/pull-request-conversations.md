@@ -18,7 +18,7 @@ request's Changes subtab. Top-level comments remain in Comments.
   same-side range; independent conversations on lines with existing threads.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
   unresolved navigation and original context for unplaceable conversations.
-- `shared-refresh`: Threads join the existing info poll while Changes is open;
+- `thread-refresh`: Threads fetch separately and poll while Changes is open;
   other subtabs, the PR list and the collapsed rail stop requesting them.
 
 ## How to get to it (user POV)
@@ -65,7 +65,7 @@ under the displayed account on GitHub. Move the commented line in a new commit
 and confirm the discussion remains accessible. Click a line number and its plus
 to start another conversation; drag line numbers or Shift-click to select a range
 and choose **Comment on selected lines**. Confirm the range on GitHub. In browser Network, the existing
-info requests should include threads only while Changes is visible.
+thread requests should poll only while Changes is visible.
 For an existing comment with a fenced `suggestion`, compare its red removal and
 green addition rows to GitHub, including a multiline replacement. Expand an
 outdated thread and confirm the suggestion uses its labeled original context.

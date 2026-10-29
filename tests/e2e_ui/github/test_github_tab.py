@@ -26,7 +26,6 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from playwright.sync_api import Page, Route, expect
@@ -723,16 +722,14 @@ def test_reply_to_inline_review_conversation(
         },
         "pr": {**_INFO["pr"], "head_sha": "head", "base_sha": "base"},
     }
-    included_reads = []
+    thread_reads = []
 
     def read_info(route: Route) -> None:
-        include = parse_qs(urlsplit(route.request.url).query).get("include_review_threads") == [
-            "true"
-        ]
-        included_reads.append(include)
-        route.fulfill(
-            json={**info, "pr": {**info["pr"], **({"review_threads": threads} if include else {})}}
-        )
+        route.fulfill(json=info)
+
+    def read_threads(route: Route) -> None:
+        thread_reads.append(route.request.url)
+        route.fulfill(json=threads)
 
     posts = []
 
@@ -780,6 +777,7 @@ def test_reply_to_inline_review_conversation(
     )
     page.route(re.compile(r"/resources/github/review-threads/thread-1/replies$"), reply)
     page.route(re.compile(r"/resources/github/review-threads$"), create_thread)
+    page.route(re.compile(r"/resources/github/review-threads\?"), read_threads)
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1440, "height": 900})
     if entry == "canvas":
@@ -881,7 +879,7 @@ def test_reply_to_inline_review_conversation(
     expect(conversation.locator("li")).to_have_count(2)
     expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
     assert posts == [{"pr_url": pr_url, "body": "**This handles empty input.**"}]
-    assert any(included_reads)
+    assert thread_reads
     fallback = panel.locator('[data-review-thread="outdated"]')
     expect(fallback.get_by_role("button", expanded=False)).to_be_visible()
     fallback.get_by_role("button", expanded=False).click()

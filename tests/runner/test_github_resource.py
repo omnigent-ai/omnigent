@@ -1243,18 +1243,6 @@ def _gh_without_checks_permission(monkeypatch: pytest.MonkeyPatch) -> list[tuple
                 name: _PR_WITHOUT_CHECKS[name] for name in fields if name in _PR_WITHOUT_CHECKS
             }
             return (0, json.dumps(data), "")
-        if "graphql" in argv:
-            payload = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
-            if "statusCheckRollup" in payload["query"]:
-                return (
-                    1,
-                    json.dumps({"errors": [{"path": ["repository", "pullRequest", "commits"]}]}),
-                    "",
-                )
-            data = dict(_PR_WITHOUT_CHECKS)
-            for field in ("comments", "reviews"):
-                data[field] = {"nodes": data[field]}
-            return (0, json.dumps({"data": {"repository": {"pullRequest": data}}}), "")
         if argv[0] == "api" and "/commits/" in argv[1] and argv[1].endswith("/pulls"):
             row = {"number": 42, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}
             return (0, json.dumps([row]), "")
@@ -1318,20 +1306,20 @@ def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
 def test_review_field_unavailable_keeps_issue_comments(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unavailable review connection preserves issue comments and reports incompleteness."""
+    """An older gh still shows issue comments and marks the feed incomplete."""
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
-        if "graphql" not in argv:
+        if argv[:2] != ["pr", "view"]:
             return (1, "", "no stub")
-        query = json.loads(Path(argv[argv.index("--input") + 1]).read_text())["query"]
-        if "reviews(last:" in query:
-            return (1, json.dumps({"errors": [{"extensions": {"fieldName": "reviews"}}]}), "")
+        fields = argv[argv.index("--json") + 1].split(",")
+        if "reviews" in fields:
+            return (1, "", 'Unknown JSON field: "reviews"')
         data = dict(_PR_WITHOUT_CHECKS)
         data.pop("reviews")
-        data["comments"] = {"nodes": [{"author": {"login": "owner"}, "body": "hello"}]}
-        return (0, json.dumps({"data": {"repository": {"pullRequest": data}}}), "")
+        data["comments"] = [{"author": {"login": "owner"}, "body": "hello"}]
+        return (0, json.dumps(data), "")
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")

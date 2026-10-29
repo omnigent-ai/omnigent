@@ -953,26 +953,45 @@ _REVIEWER = {"login": "octocat", "kind": "user"}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("resource", ["", "/review-threads", "/review-threads/thread-1/comments"])
-async def test_review_conversation_reads_allow_viewers(
-    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient, resource: str
+@pytest.mark.parametrize("session", ["conv_share", "conv_open"])
+@pytest.mark.parametrize("caller", ["owner@example.com", "viewer@example.com"])
+@pytest.mark.parametrize(
+    "resource,code_context,after",
+    [
+        ("", False, None),
+        ("/review-threads", True, None),
+        ("/review-threads", True, "cursor"),
+        ("/review-threads/thread-1/comments", False, "cursor"),
+    ],
+)
+async def test_review_conversation_reads_follow_file_sharing(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    resource: str,
+    code_context: bool,
+    after: str | None,
+    session: str,
+    caller: str,
 ) -> None:
-    path = f"/v1/sessions/conv_share/resources/github{resource}"
+    path = f"/v1/sessions/{session}/resources/github{resource}"
     params = {"pr_url": _LABELS_PR_URL}
-    if resource:
-        params["after"] = "cursor"
+    if after:
+        params["after"] = after
         if resource == "/review-threads":
             params.update(head_sha="a" * 40, base_sha="b" * 40)
-    else:
-        params["include_review_threads"] = "true"
-    response = await client.get(
-        path, params=params, headers={"X-Forwarded-Email": "viewer@example.com"}
-    )
+    response = await client.get(path, params=params, headers={"X-Forwarded-Email": caller})
+    if code_context and session == "conv_share" and caller == "viewer@example.com":
+        assert response.status_code == 403, response.text
+        assert runner_client.gets == []
+        return
     assert response.status_code == 200, response.text
     assert runner_client.gets == [path]
-    assert runner_client.get_params == [
-        {**params, **({"include_review_threads": True} if not resource else {})}
-    ]
+    forwarded = (
+        {**params, "after": "", "head_sha": "", "base_sha": ""}
+        if code_context and not after
+        else params
+    )
+    assert runner_client.get_params == [forwarded]
 
 
 @pytest.mark.asyncio

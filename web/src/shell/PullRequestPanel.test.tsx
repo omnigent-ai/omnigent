@@ -629,39 +629,33 @@ describe("PullRequestPanel", () => {
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
-      includeReviewThreads: false,
     });
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
-      includeReviewThreads: true,
     });
     rerender(<PullRequestPanel conversationId="conv_1" active={false} />);
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: false,
       prUrl: url,
-      includeReviewThreads: false,
     });
     rerender(<PullRequestPanel conversationId="conv_1" active />);
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
-      includeReviewThreads: true,
     });
     await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", {
       poll: "list",
       prUrl: url,
-      includeReviewThreads: false,
     });
     await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
     expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute("aria-selected", "true");
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: url,
-      includeReviewThreads: false,
     });
   });
 
@@ -2157,6 +2151,7 @@ describe("PullRequestPanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
       "github-info",
+      "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
       "session-pull-requests",
@@ -2592,7 +2587,6 @@ describe("session PR selection", () => {
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: two,
-      includeReviewThreads: false,
     });
     expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
     expect(screen.getByRole("button", { name: "All pull requests (2)" })).toBeVisible();
@@ -2615,7 +2609,6 @@ describe("session PR selection", () => {
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", {
       poll: true,
       prUrl: one,
-      includeReviewThreads: false,
     });
 
     state.info = { isLoading: true, error: null, isFetching: true };
