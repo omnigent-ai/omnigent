@@ -614,6 +614,13 @@ class SqlSessionPermission(OmnigentBase):
             "conversation_id",
             "user_id",
         ),
+        Index(
+            "ix_session_permissions_write_access",
+            "workspace_id",
+            "conversation_id",
+            "level",
+            "user_id",
+        ),
     )
 
 
