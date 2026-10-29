@@ -119,6 +119,45 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        # npm's ENOENT text from a launcher's failed install also says "no such file".
+        (
+            0,
+            "npm error code ENOENT\n"
+            "npm error syscall rename\n"
+            "npm error enoent ENOENT: no such file or directory, rename "
+            "'/home/dev/.local/lib/node_modules/@anthropic-ai/claude-code'\n"
+            "Failed to install Claude Code version 2.1.400.\n"
+            "Claude Code exited with code 127",
+        ),
+        (1, "Error: claude native binary not installed.\nClaude Code exited with code 1"),
+        # Pane wrapping and borders can split the marker mid-word.
+        (
+            0,
+            "│ An error occurred while running Claude Code: [Errno 8] Exec form │\n"
+            "│ at error: '/home/dev/.local/bin/claude'                          │",
+        ),
+    ],
+)
+def test_classifies_broken_claude_install(exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code's install is broken"
+    assert diagnosis.remediation is not None
+    assert "reinstall Claude Code" in diagnosis.remediation
+
+
+def test_exec_format_error_of_another_program_is_not_a_broken_claude_install() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=1,
+        output="OSError: [Errno 8] Exec format error: '/home/dev/bin/helper'",
+    )
+    assert diagnosis is None
+
+
 def test_classifies_gateway_claude_version_failure() -> None:
     diagnosis = classify_terminal_failure(
         command="env",
