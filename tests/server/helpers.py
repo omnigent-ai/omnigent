@@ -1155,15 +1155,28 @@ def websocket_scope(path: str) -> dict[str, object]:
     }
 
 
-async def create_session_for_agent(client: httpx.AsyncClient, agent_id: str) -> str:
+async def create_session_for_agent(
+    client: httpx.AsyncClient,
+    agent_id: str,
+    *,
+    parent_session_id: str | None = None,
+    title: str | None = None,
+) -> str:
     """
     Create a session bound to an agent.
 
     :param client: Test HTTP client.
     :param agent_id: Agent to bind.
+    :param parent_session_id: Session to create this one under, if any.
+    :param title: Session title, if any.
     :returns: New session id.
     """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
+    body = {"agent_id": agent_id}
+    if parent_session_id is not None:
+        body["parent_session_id"] = parent_session_id
+    if title is not None:
+        body["title"] = title
+    resp = await client.post("/v1/sessions", json=body)
     assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
     return resp.json()["id"]
 

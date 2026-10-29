@@ -2570,19 +2570,12 @@ async def _sever_hook_mid_turn(
         _end_grace_on(monkeypatch, grace_s, release_grace)
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, agent_name, executor=executor)
-    if parent_session_id is None:
-        session_id = await _create_session(client, agent["id"])
-    else:
-        created = await client.post(
-            "/v1/sessions",
-            json={
-                "agent_id": agent["id"],
-                "parent_session_id": parent_session_id,
-                "title": f"{agent_name}:child",
-            },
-        )
-        assert created.status_code == 201, created.text
-        session_id = created.json()["id"]
+    session_id = await _create_session(
+        client,
+        agent["id"],
+        parent_session_id=parent_session_id,
+        title=None if parent_session_id is None else f"{agent_name}:child",
+    )
     monkeypatch.setitem(sessions_route._session_status_cache, session_id, turn_status)
     payload = {
         **(await _claude_permission_payload()),
@@ -3448,12 +3441,9 @@ async def test_deleting_session_releases_prompt_whose_hook_still_waits(
         client, name, executor={"type": "omnigent", "config": {"harness": f"{vendor}-native"}}
     )
     parent_id = await _create_session(client, agent["id"])
-    created = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "parent_session_id": parent_id, "title": f"{name}:child"},
+    session_id = await _create_session(
+        client, agent["id"], parent_session_id=parent_id, title=f"{name}:child"
     )
-    assert created.status_code == 201, created.text
-    session_id = created.json()["id"]
     monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
     elicitation_id = (
         _REATTACH_ELICITATION_ID if vendor == "claude" else f"elicit_{vendor}_" + "0" * 32
@@ -3570,12 +3560,9 @@ async def test_hook_registering_around_session_delete_leaves_no_prompt(
     name = f"test-hook-registers-around-delete-{registers_during_delete}"
     agent = await create_test_agent(client, name)
     parent_id = await _create_session(client, agent["id"])
-    created = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "parent_session_id": parent_id, "title": f"{name}:child"},
+    session_id = await _create_session(
+        client, agent["id"], parent_session_id=parent_id, title=f"{name}:child"
     )
-    assert created.status_code == 201, created.text
-    session_id = created.json()["id"]
     monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
     payload = {
         **(await _claude_permission_payload()),
