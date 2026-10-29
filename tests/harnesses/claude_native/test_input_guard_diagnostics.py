@@ -44,7 +44,7 @@ class _Terminal:
         monkeypatch.setattr(bridge, "_capture_pane", lambda *_: self.capture())
         monkeypatch.setattr(bridge, "_run_tmux", self.run)
         monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", lambda *_, **__: None)
-        monkeypatch.setattr(bridge, "_clear_composer", lambda *_: None)
+        monkeypatch.setattr(bridge, "_clear_composer", lambda *_, preserve_draft=False: None)
         monkeypatch.setattr(
             bridge,
             "_has_approval_wait",

@@ -25,6 +25,7 @@ from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from tests.harnesses.claude_native.test_claude_native_bridge import _EditableComposer
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -1850,27 +1851,30 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    composer = _EditableComposer("", cursor=0)
+    bridge_clock = claude_bridge.time
+    composer.install(monkeypatch)
+    monkeypatch.setattr(claude_bridge, "time", bridge_clock)
+    capture_lost = False
     enters = 0
     prompt_pending = False
     killed: list[Path] = []
 
     def run_tmux(socket_path: str, *args: str) -> None:
-        nonlocal pane, enters, prompt_pending
-        del socket_path
-        if args[-1] == "Space":
-            pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
-        elif args[0] == "paste-buffer":
-            pane = "❯ review this function"
-            prompt_pending = not submitted
-        elif args[-1] == "Enter":
+        nonlocal capture_lost, enters, prompt_pending
+        if args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
             enters += 1
             prompt_pending = refusal == "pending_prompt"
             if refusal == "capture_lost":
-                pane = ""
+                capture_lost = True
+        else:
+            composer._run_tmux(socket_path, *args)
+            if args[0] == "paste-buffer":
+                prompt_pending = not submitted
+
+    def capture_pane(socket_path: str, tmux_target: str) -> str:
+        return "" if capture_lost else composer._capture_pane(socket_path, tmux_target)
 
     if refusal == "missing_target":
         wait_for_target = claude_bridge._wait_for_tmux_info
@@ -1888,7 +1892,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
-    monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture_pane)
     monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
@@ -1912,7 +1916,8 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
     if refusal == "draft_persisted":
         assert enters >= 1
-        assert pane == "❯ review this function"
+        # The bracketed-paste transport appends a protective newline before Enter.
+        assert composer.text == "review this function\n"
     else:
         assert enters == int(submitted)
     assert killed == []

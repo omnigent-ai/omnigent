@@ -50,6 +50,7 @@ def test_delivery_diagnostics(
     pane = "❯ "
     enters = 0
     pending_checks = 0
+    cursor_offset = 0
 
     def pending_prompt(*args: object) -> bool:
         nonlocal pending_checks
@@ -71,15 +72,16 @@ def test_delivery_diagnostics(
             raise bridge.ClaudeInjectionCancelled(secret)
 
     def run_tmux(socket: str, *args: str) -> None:
-        nonlocal pane, enters
+        nonlocal pane, enters, cursor_offset
         assert not any(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
-        if args[-1] == "Space":
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
+            cursor_offset = 1
+        if args[-1] == "BSpace":
+            cursor_offset = 0
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
@@ -88,7 +90,11 @@ def test_delivery_diagnostics(
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            pane = {
+                "empty_capture": "",
+                "missing_glyph": "terminal output",
+                "unknown_command": "──────\n❯ \n──────\n",
+            }.get(scenario, "❯ ")
 
     monkeypatch.setattr(
         bridge,
@@ -104,6 +110,7 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(bridge, "_composer_cursor_offset", lambda *_: cursor_offset)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
     if scenario == "observation_error":
         monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
@@ -201,13 +208,14 @@ def test_delivery_diagnostics(
         assert attrs["draft_wait_ms"] == 0
         assert attrs["draft_pane_rows"] == 1
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
-        assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
-        assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
+        assert attrs["submit_polls"] == (7 if scenario == "empty_capture" else 1)
+        assert attrs["submit_wait_ms"] == (70 if scenario == "empty_capture" else 10)
         assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
         assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
-        assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
-        assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
+        assert attrs["stage_verifying_submit_ms"] == (70 if scenario == "empty_capture" else 10)
+        assert attrs["stage_pasting_ms"] == 20
+        assert attrs["elapsed_ms"] == (110 if scenario == "empty_capture" else 50)
         if scenario == "empty_capture":
             assert attrs["submit_sent"] is True
             assert attrs["error_type"] == "RuntimeError"

@@ -33,6 +33,7 @@ from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import TurnComplete
 from omnigent.runner.app import _resolve_forwarded_message_content
 from tests._helpers.live_server import find_free_port
+from tests.harnesses.claude_native._terminal import FAKE_CLAUDE_TUI
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -70,57 +71,6 @@ from omnigent.cli import main
 main()
 """
 
-# Render the composer expected by the bridge and record text submitted to it.
-_FAKE_CLAUDE_TUI = """\
-import os, sys, termios, tty
-
-PROMPT_GLYPH = "\\u276f"
-RULE = "\\u2500" * 30
-
-
-def render(draft, transcript):
-    sys.stdout.write("\\x1b[2J\\x1b[H")
-    for line in transcript:
-        sys.stdout.write(line + "\\r\\n")
-    sys.stdout.write(RULE + "\\r\\n")
-    sys.stdout.write(PROMPT_GLYPH + " " + draft + "\\r\\n")
-    sys.stdout.write(RULE + "\\r\\n")
-    sys.stdout.flush()
-
-
-def main():
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    tty.setraw(fd)
-    chars = []
-    transcript = []
-    render("", transcript)
-    try:
-        while True:
-            data = os.read(fd, 1)
-            if not data:
-                break
-            byte = data[0]
-            if byte == 3:  # Ctrl-C tears the pane down on teardown
-                break
-            if byte == 13:  # Enter submits a non-empty draft
-                if chars:
-                    transcript.append("sent: " + "".join(chars))
-                    chars = []
-                    render("", transcript)
-                continue
-            if byte < 0x20:
-                # Swallow control bytes (Escape, the ESC of bracketed-paste
-                # markers); the visible message content is printable.
-                continue
-            chars.append(chr(byte))
-            render("".join(chars), transcript)
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-main()
-"""
 
 _FILENAME = "protocol.md"
 _FILE_BYTES = b"# Zebra Protocol\nThe passphrase is MARSCRATE-7.\n"
@@ -273,7 +223,7 @@ def claude_pane() -> Iterator[Path]:
     # Keep the socket path short: a long path overflows the AF_UNIX limit.
     socket_path = work / "t.sock"
     tui_path = work / "fake_claude_tui.py"
-    tui_path.write_text(_FAKE_CLAUDE_TUI, encoding="utf-8")
+    tui_path.write_text(FAKE_CLAUDE_TUI, encoding="utf-8")
 
     subprocess.run(
         [
