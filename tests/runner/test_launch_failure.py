@@ -174,6 +174,44 @@ def test_classifies_gateway_databricks_cli_version_failure(probe_output: str) ->
     assert diagnosis.category is ErrorCategory.UPSTREAM
 
 
+_LAUNCHER_EXIT_BOX_OUTPUT = "│ Claude Code exited with code 1 │\nPane is dead (status 0)"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "CLI v1.22.1'",
+        "'Databricks CLI v1.22.1'",
+        "--version` output: 'Databricks CLI v1.22.1'",
+        "version: Command '['/usr/local/bin/databricks', '--version']' timed out "
+        'after 10 seconds>"',
+    ],
+)
+def test_classifies_a_clipped_gateway_cli_version_failure(tail: str) -> None:
+    # The capture kept only the end of the launcher's error, above its exit box.
+    diagnosis = classify_terminal_failure(
+        command="env", exit_status=0, output=f"{tail}\n{_LAUNCHER_EXIT_BOX_OUTPUT}"
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "The Databricks gateway launcher couldn't check the Databricks CLI"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        # The version alone, without the launcher's exit box, is not its failure.
+        "'Databricks CLI v1.22.1'",
+        # Version text in the middle of a line is ordinary output.
+        f"Using Databricks CLI v1.22.1' for this run\n{_LAUNCHER_EXIT_BOX_OUTPUT}",
+    ],
+)
+def test_cli_version_fragment_needs_the_launcher_exit_shape(output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=0, output=output)
+    assert diagnosis is None or diagnosis.title != (
+        "The Databricks gateway launcher couldn't check the Databricks CLI"
+    )
+
+
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     # Ordering guard: the root case also reads like a permission problem, so it
     # must be matched before any broader rule.
