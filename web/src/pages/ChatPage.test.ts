@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
@@ -18,6 +19,8 @@ import {
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasSentNativeInputPending,
+  useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
   failedSessionLastError,
@@ -978,6 +981,53 @@ describe("computeShowsWorking", () => {
     expect(computeShowsWorking("idle", opts({ runnerOnline: false, backgroundTaskCount: 2 }))).toBe(
       false,
     );
+  });
+
+  it("counts only input this tab sent to a native terminal as awaiting pickup", () => {
+    // A claude-native send's response completes once the message reaches the terminal,
+    // ~200ms before the agent reports running; the indicator must not drop in between.
+    const sent = { tempId: "pend_1", content: [], createdAtS: 1_700_000_000 };
+    const replayed = { tempId: "pi_1", content: [] };
+    expect(hasSentNativeInputPending(true, [sent])).toBe(true);
+    expect(hasSentNativeInputPending(false, [sent])).toBe(false);
+    // Snapshot-replayed input may wait on an offline runner; it doesn't count.
+    expect(hasSentNativeInputPending(true, [replayed])).toBe(false);
+    expect(
+      hasSentNativeInputPending(true, [{ ...sent, initialDraft: { text: "hi", files: [] } }]),
+    ).toBe(false);
+  });
+
+  describe("useWorkingSignals", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const signals = (overrides: Partial<Parameters<typeof useWorkingSignals>[0]> = {}) => ({
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      hasPendingInitialMessage: false,
+      nativeInputPending: false,
+      conversationId: "conv-a",
+      ...overrides,
+    });
+
+    it("keeps Working lit for a first message held past the terminal's ready idle", () => {
+      const { result } = renderHook(() =>
+        useWorkingSignals(signals({ hasPendingInitialMessage: true })),
+      );
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+
+    it("lights Working, not Stop, while a native agent picks up input, for at most 3s", () => {
+      const { result, rerender } = renderHook((props) => useWorkingSignals(props), {
+        initialProps: signals({ nativeInputPending: true }),
+      });
+      expect(result.current).toEqual({ isWorking: false, indicatorSendInFlight: true });
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(result.current.indicatorSendInFlight).toBe(false);
+
+      // Another session's pickup gets its own window.
+      rerender(signals({ nativeInputPending: true, conversationId: "conv-b" }));
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
   });
 
   it("an in-flight local send lights the indicator before any server edge", () => {
