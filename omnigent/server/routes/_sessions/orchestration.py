@@ -4238,13 +4238,13 @@ async def _drive_terminal_resolved_elicitation_from_store(
     conversation_store: ConversationStore,
 ) -> None:
     """
-    Resolve a parked prompt from a mirrored result whose call this replica never saw.
+    Resolve an open prompt from a mirrored result whose call this replica never saw.
 
     :data:`_recent_mirrored_tool_calls` is per process, so a result can arrive
     on a replica that never cached its call (the session moved replicas in
     between). On a process-cache miss, load the mirrored call only while this
-    session has a parked prompt. Best effort: a failed lookup is logged and
-    must not interrupt transcript delivery.
+    session has a prompt parked or held in the terminal. Best effort: a failed
+    lookup is logged and must not interrupt transcript delivery.
 
     :param session_id: Omnigent conversation id the item was mirrored for,
         e.g. ``"conv_abc123"``.
@@ -4257,9 +4257,13 @@ async def _drive_terminal_resolved_elicitation_from_store(
         return
     if data.call_id in _recent_mirrored_tool_calls:
         return
+    open_prompts = (
+        *_harness_parked_elicitations.values(),
+        *_harness_unparked_elicitations.values(),
+    )
     if not any(
-        parked.session_id == session_id and not parked.resolved_elsewhere.is_set()
-        for parked in _harness_parked_elicitations.values()
+        prompt.session_id == session_id and not prompt.resolved_elsewhere.is_set()
+        for prompt in open_prompts
     ):
         return
     try:

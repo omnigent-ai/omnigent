@@ -46,7 +46,9 @@ from omnigent.entities.conversation import (
 )
 from omnigent.server._elicitation_registry import (
     _harness_parked_elicitations,
+    _harness_unparked_elicitations,
     _ParkedHarnessElicitation,
+    _UnparkedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -125,6 +127,27 @@ def _park(
     )
     _harness_parked_elicitations[elicitation_id] = parked
     return parked
+
+
+def _hold(
+    elicitation_id: str,
+    tool_name: str | None,
+    tool_input: dict[str, Any] | None,
+    *,
+    session_id: str = SESSION,
+) -> _UnparkedHarnessElicitation:
+    """Register a prompt held in the terminal after its hook exited, and return it."""
+    held = _UnparkedHarnessElicitation(
+        session_id=session_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+        event_payload={},
+        request_fingerprint=None,
+        resolved_elsewhere=asyncio.Event(),
+        in_terminal=True,
+    )
+    _harness_unparked_elicitations[elicitation_id] = held
+    return held
 
 
 def _function_call_item(call_id: str, name: str, tool_input: dict[str, Any]) -> ConversationItem:
@@ -332,21 +355,24 @@ def _store_with_mirrored_call(
     return store, session_id
 
 
+@pytest.mark.parametrize("state", ["parked", "held"])
 async def test_store_fallback_resolves_prompt_whose_call_another_replica_mirrored(
     db_uri: str,
+    state: str,
 ) -> None:
     """
     A result arriving on a replica that never cached its call (the session
     moved replicas between the call and its result) still resolves the
-    prompt parked here, from the call persisted in the store.
+    prompt parked or held here, from the call persisted in the store.
     """
+    register = _hold if state == "held" else _park
     store, session_id = _store_with_mirrored_call(
         db_uri, "toolu_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}
     )
-    asked = _park(
+    asked = register(
         "e_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}, session_id=session_id
     )
-    other = _park(
+    other = register(
         "e_other",
         "AskUserQuestion",
         {"questions": [{"question": "Other?"}]},
