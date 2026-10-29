@@ -6113,8 +6113,8 @@ def create_runner_app(
                 nonlocal _held_refusal
                 if _held_refusal is None:
                     return
-                if turn_input_stable_id is not None:
-                    _held_refusal["input_stable_id"] = turn_input_stable_id
+                if turn_input_identity:
+                    _held_refusal.update(turn_input_identity)
                 _publish_event(conv_id, _held_refusal)
                 _held_refusal = None
 
