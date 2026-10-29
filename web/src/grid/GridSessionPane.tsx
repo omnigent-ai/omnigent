@@ -253,22 +253,23 @@ export function GridSessionPane({
     [navigateWorkspace, onOpenWorkspace],
   );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
+  const showTab = useCallback((rightRailTab: RightRailTab | null) => {
+    setWorkspace((previous) => ({
+      ...previous,
+      rightRailTab,
+      selectedFilePath: null,
+      selectedTerminalKey: null,
+      openPanels:
+        isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
+          ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
+          : previous.openPanels,
+    }));
+  }, []);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
-      navigateWorkspace("", undefined, () =>
-        setWorkspace((previous) => ({
-          ...previous,
-          rightRailTab,
-          selectedFilePath: null,
-          selectedTerminalKey: null,
-          openPanels:
-            isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
-              ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
-              : previous.openPanels,
-        })),
-      );
+      navigateWorkspace("", undefined, () => showTab(rightRailTab));
     },
-    [navigateWorkspace],
+    [navigateWorkspace, showTab],
   );
   const closeFile = useCallback(
     (path: string) => {
@@ -300,11 +301,12 @@ export function GridSessionPane({
         onOpenWorkspace();
       },
       openFolder: showFiles
-        ? (absolutePath: string) => {
-            revealFolderInFilesPanel(sessionId, absolutePath);
-            selectTab("files");
-            onOpenWorkspace();
-          }
+        ? (absolutePath: string) =>
+            navigateWorkspace(absolutePath, undefined, () => {
+              revealFolderInFilesPanel(sessionId, absolutePath);
+              showTab("files");
+              onOpenWorkspace();
+            })
         : undefined,
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
@@ -316,6 +318,8 @@ export function GridSessionPane({
       openFile,
       registerNavigationGuard,
       selectTab,
+      navigateWorkspace,
+      showTab,
       onOpenWorkspace,
       showFiles,
       sessionId,

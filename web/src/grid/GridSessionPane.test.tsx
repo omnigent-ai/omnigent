@@ -186,6 +186,11 @@ it("browses a chat-linked folder in the Files tab of that pane's workspace", () 
     </MemoryRouter>,
   );
 
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Block navigation"));
+  fireEvent.click(first.getByText("Open folder"));
+  expect(revealFolderInFilesPanel).not.toHaveBeenCalledWith("first", expect.anything());
+
   fireEvent.click(within(screen.getByRole("region", { name: "second" })).getByText("Open folder"));
 
   expect(revealFolderInFilesPanel).toHaveBeenCalledWith("second", "/workspace/experimental");

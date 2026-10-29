@@ -342,16 +342,6 @@ export function FilesPanel({
     [workspaceRoot, conversationId],
   );
 
-  useEffect(() => {
-    const listener = (revealedId: string, absolutePath: string) => {
-      if (revealedId === conversationId) navigateTo(absolutePath);
-    };
-    folderRevealListeners.add(listener);
-    return () => {
-      folderRevealListeners.delete(listener);
-    };
-  }, [conversationId, navigateTo]);
-
   const navigateToChild = useCallback(
     (relativePath: string) => {
       if (!workingDir) return;
@@ -425,6 +415,18 @@ export function FilesPanel({
     setTreeSearch("");
     setDebouncedTreeSearch("");
   }, []);
+
+  useEffect(() => {
+    const listener = (revealedId: string, absolutePath: string) => {
+      if (revealedId !== conversationId) return;
+      exitTreeSearch();
+      navigateTo(absolutePath);
+    };
+    folderRevealListeners.add(listener);
+    return () => {
+      folderRevealListeners.delete(listener);
+    };
+  }, [conversationId, navigateTo, exitTreeSearch]);
 
   // Only fire search queries on the Explore tab. The include/exclude globs
   // narrow an active text query; globs alone do not search.
