@@ -12,6 +12,8 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksPage } from "./TasksPage";
 import * as hooks from "@/hooks/useScheduledTasks";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
@@ -29,11 +31,15 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     open,
     initialName,
     initialPrompt,
+    initialTrigger,
+    sessionLink,
     editingTask,
   }: {
     open: boolean;
     initialName?: string;
     initialPrompt?: string;
+    initialTrigger?: string | null;
+    sessionLink?: string;
     editingTask?: ScheduledTask | null;
   }) =>
     open ? (
@@ -41,6 +47,8 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
         data-testid="manual-dialog-open"
         data-initial-name={initialName ?? ""}
         data-initial-prompt={initialPrompt ?? ""}
+        data-initial-trigger={initialTrigger ?? ""}
+        data-session-link={sessionLink ?? ""}
         data-editing-task-id={editingTask?.id ?? ""}
         data-editing-task-name={editingTask?.name ?? ""}
       />
@@ -383,5 +391,65 @@ describe("row actions", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByTestId("task-delete"));
     expect(deleteMutate).toHaveBeenCalledWith("st_1");
+  });
+});
+
+describe("trigger templates", () => {
+  const TRIGGER_INFO = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    scheduled_task_session_modes: true,
+    features: { session_orchestration: true },
+  };
+
+  function renderWithSessionModes(info: typeof SERVER_INFO_OFFLINE_FALLBACK = TRIGGER_INFO) {
+    return render(
+      <CapabilitiesProvider info={info}>
+        <MemoryRouter initialEntries={["/tasks"]}>
+          <TasksPage />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("adds the Jira, Slack and GitHub chips after the prompt suggestions", () => {
+    setTasks([task()]);
+    renderWithSessionModes();
+    const chips = within(screen.getByTestId("tasks-suggestions")).getAllByTestId(/^suggestion-/);
+    expect(chips.map((c) => c.getAttribute("data-testid"))).toEqual([
+      "suggestion-follow-up-monitor",
+      "suggestion-pr-sweep",
+      "suggestion-news-digest",
+      "suggestion-trigger-jira",
+      "suggestion-trigger-slack",
+      "suggestion-trigger-github",
+    ]);
+  });
+
+  it("opens the dialog on the picked template with an absolute session link", () => {
+    setTasks([]);
+    renderWithSessionModes();
+    fireEvent.click(screen.getByTestId("suggestion-trigger-slack"));
+    const dialog = screen.getByTestId("manual-dialog-open");
+    expect(dialog.getAttribute("data-initial-trigger")).toBe("slack");
+    expect(dialog.getAttribute("data-initial-prompt")).toBe("");
+    expect(dialog.getAttribute("data-session-link")).toBe(
+      `${window.location.origin}/c/CONVERSATION_ID`,
+    );
+
+    // A later plain open drops the template.
+    fireEvent.click(screen.getByTestId("new-task-button"));
+    expect(screen.getByTestId("manual-dialog-open").getAttribute("data-initial-trigger")).toBe("");
+  });
+
+  it.each([
+    ["can't keep one session per automation", { scheduled_task_session_modes: false }],
+    ["has session orchestration turned off", { features: { session_orchestration: false } }],
+    // Older servers don't report the feature at all.
+    ["doesn't report session orchestration", { features: {} }],
+  ])("hides the chips when the server %s", (_name, overrides) => {
+    setTasks([]);
+    renderWithSessionModes({ ...TRIGGER_INFO, ...overrides });
+    expect(screen.getByTestId("suggestion-follow-up-monitor")).toBeInTheDocument();
+    expect(screen.queryByTestId("suggestion-trigger-jira")).toBeNull();
   });
 });

@@ -134,6 +134,17 @@ Chat session as well as the local terminal.
 from Chat or type it into the native Pi terminal. Follow a completed tool call
 with a question about its result; verify the routed model and retained history.
 
+**Pi model and effort changes:** in an existing session, select Medium, switch
+to a non-reasoning model, then to a reasoning model from another family. Send
+immediately from Chat and repeat from Terminal. Verify the target request uses
+Medium and retains earlier conversation text. Repeat with a later effort change
+while the model switch is pending; the latest choice must win. With no explicit
+session effort, Pi keeps its native defaults. Component coverage:
+`tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_model_change_on_pi_native_enqueues_bridge_model_change`
+and
+`tests/harnesses/pi_native/test_pi_native_extension.py::test_input_waits_for_inbox_model_change_to_settle`.
+Real-provider history compatibility requires a separate live check.
+
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
 

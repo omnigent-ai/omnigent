@@ -20,6 +20,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runner.subagent_work import _format_subagent_wake_notice
 from omnigent.runtime.requester import (
     REQUESTER_FIELD,
     ExecutionRequester,
@@ -904,19 +905,38 @@ class _RefusingSteerHarnessClient(_HandshakeHarnessClient):
 
 
 @pytest.mark.asyncio
-async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
-    """A steer the harness refused is not lost: it runs as the continuation turn.
+@pytest.mark.parametrize("arrival", ["before-registration", "during-stream"])
+@pytest.mark.parametrize("wake_first", [True, False], ids=["wake-first", "wake-last"])
+async def test_refused_or_early_steer_is_delivered_as_fresh_continuation_turn(
+    arrival: str, wake_first: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Queued collaborator input and an owner wake arrive with unknown authority.
 
-    The harness refuses a steer whose turn already ended, so the buffered copy
-    is the only delivery. The continuation body must not carry the steer's
-    ``injection_id``, or the harness would refuse to start that turn too.
+    Before requester registration, forwarding must wait. A later refused steer
+    also stays buffered. Both paths must deliver the combined continuation without
+    an injection_id or borrowing either input's authority.
     """
     gate = asyncio.Event()
+    resolving = asyncio.Event()
+    setup_gate = asyncio.Event()
+    if arrival == "during-stream":
+        setup_gate.set()
     spec = AgentSpec(spec_version=1, name="t")
     hc = _RefusingSteerHarnessClient(gate)
+    hc.probe_tools = True
+    calls: dict[str, ToolRequester] = {}
+
+    async def capture_call(**kwargs):
+        calls[kwargs["call_id"]] = kwargs["requester"]
+        return "{}"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", capture_call)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
+        # Background setup resolves the spec before registering ExecutionRequester.
+        resolving.set()
+        await setup_gate.wait()
         return spec
 
     app = create_runner_app(
@@ -924,33 +944,88 @@ async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    sid = "5c0b6f1e2d3a4b5c6d7e8f9a0b1c2d3e"
+    sid = uuid4().hex
+    owner = InputRequester(user_id="bryan", account_generation="owner-generation")
+    collaborator = InputRequester(user_id="pat", account_generation="collaborator-generation")
     message = {
         "type": "message",
         "role": "user",
         "model": "test-agent",
+        "agent_id": "a" * 32,
         "harness": "openai-agents",
     }
+    wake_notice = _format_subagent_wake_notice(
+        agent="researcher", title="owner work", status="completed", pending=1
+    )
+    queued_inputs = [(wake_notice, owner), ("collaborator steer", collaborator)]
+    if not wake_first:
+        queued_inputs.reverse()
     async with _runner_client(app) as client:
-        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": "a" * 32})
-        first = {**message, "content": [{"type": "input_text", "text": "first"}]}
+        first = {
+            **message,
+            "content": [{"type": "input_text", "text": "first"}],
+            REQUESTER_FIELD: owner.model_dump(),
+        }
         assert (await client.post(f"/v1/sessions/{sid}/events", json=first)).status_code == 202
-        await asyncio.sleep(0.05)
-        second = {**message, "content": [{"type": "input_text", "text": "second"}]}
-        resp2 = await client.post(f"/v1/sessions/{sid}/events", json=second)
-        assert resp2.json()["status"] == "buffered"
-        gate.set()
-        for _ in range(200):
-            if len(hc.posted_bodies) >= 2:
-                break
-            await asyncio.sleep(0.01)
+        try:
+            if arrival == "before-registration":
+                await asyncio.wait_for(resolving.wait(), timeout=5)
+                assert sid in app.state.active_turns
+                assert sid not in app.state.live_response_id
+                assert not hc.posted_bodies
+                assert not calls
+            else:
+                await poll_until_async(lambda: "1_before" in calls)
+                assert calls["1_before"].origin == owner
 
-    assert len(hc.patched_events) == 1
-    assert hc.patched_events[0].get("injection_id"), "the steer forward carries its id"
+            # These are runner-facing envelopes after the server forwards each input.
+            for text, origin in queued_inputs:
+                response = await client.post(
+                    f"/v1/sessions/{sid}/events",
+                    json={
+                        **message,
+                        "content": [{"type": "input_text", "text": text}],
+                        REQUESTER_FIELD: origin.model_dump(),
+                    },
+                )
+                assert response.status_code == 202
+                assert response.json()["status"] == "buffered"
+
+            buffered = app.state.session_message_buffers[sid]
+            assert [InputRequester.from_body(body) for body in buffered] == [
+                origin for _, origin in queued_inputs
+            ]
+            if arrival == "before-registration":
+                assert not hc.patched_events
+                assert all("injection_id" not in body for body in buffered)
+            else:
+                assert len(hc.patched_events) == 2
+                assert all(body.get("injection_id") for body in hc.patched_events)
+                assert [_ordered_user_texts(body) for body in hc.patched_events] == [
+                    [text] for text, _ in queued_inputs
+                ]
+
+            setup_gate.set()
+            await poll_until_async(lambda: "1_before" in calls)
+            assert _ordered_user_texts(hc.posted_bodies[0]) == ["first"]
+        finally:
+            setup_gate.set()
+            gate.set()
+        await poll_until_async(lambda: "2_after" in calls and not app.state.active_turns)
+        assert not app.state.session_message_buffers.get(sid)
+
     assert len(hc.posted_bodies) == 2, f"expected a continuation turn: {hc.posted_bodies}"
     continuation = hc.posted_bodies[1]
-    assert _body_contains_text(continuation, "second")
+    assert _ordered_user_texts(continuation) == ["first", *(text for text, _ in queued_inputs)]
     assert "injection_id" not in continuation, continuation
+    continuation_origin = InputRequester.from_body(continuation)
+    assert continuation_origin.user_id is None
+    assert continuation_origin.account_generation is None
+    assert calls["2_before"].execution_id != calls["1_before"].execution_id
+    for phase in ("before", "pending", "after"):
+        assert calls[f"1_{phase}"].origin == owner
+        assert calls[f"2_{phase}"].origin == continuation_origin
+        assert calls[f"2_{phase}"].delegation_policy == "requester"
 
 
 @pytest.mark.asyncio

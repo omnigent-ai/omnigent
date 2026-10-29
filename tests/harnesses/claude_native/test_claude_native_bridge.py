@@ -72,10 +72,6 @@ from omnigent.harnesses.claude_native.bridge import (
     stop_hook_seen_since,
     write_tmux_target,
 )
-from omnigent.harnesses.claude_native.execution import (
-    ClaudeExecutionIdentity,
-    current_claude_execution,
-)
 from omnigent.harnesses.codex_native.execution import (
     CodexExecutionIdentity,
     current_codex_execution,
@@ -6876,35 +6872,10 @@ def test_post_tools_changed_preserves_programming_errors(
         post_tools_changed(tmp_path)
 
 
-@pytest.mark.parametrize("identifier", [None, "", " ", True, 12, {}, [], "x" * 257])
-def test_claude_execution_identity_rejects_malformed_locator(identifier: object) -> None:
-    assert ClaudeExecutionIdentity.from_mcp_meta({"claudecode/toolUseId": identifier}) is None
-    assert ClaudeExecutionIdentity.from_wire({"tool_use_id": identifier}) is None
-
-
-def test_claude_execution_identity_copies_only_retained_tool_id() -> None:
-    identity = ClaudeExecutionIdentity("toolu_original")
-    meta = {
-        "claudecode/toolUseId": identity.tool_use_id,
-        "prompt_id": "not-an-execution",
-        "requester": "not-authority",
-    }
-    decoded = ClaudeExecutionIdentity.from_mcp_meta(meta)
-    meta["claudecode/toolUseId"] = "toolu_later"
-    assert decoded == identity
-    assert decoded.to_wire() == {"tool_use_id": "toolu_original"}
-    assert ClaudeExecutionIdentity.from_wire(decoded.to_wire()) == identity
-    for malformed in (None, [], "toolu_original", {}, {"prompt_id": "not-a-tool"}):
-        assert ClaudeExecutionIdentity.from_mcp_meta(malformed) is None
-        assert ClaudeExecutionIdentity.from_wire(malformed) is None
-
-
 @pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["claude", "codex"])
 @pytest.mark.parametrize("result_kind", ["text", "images", "image_error"])
 @pytest.mark.parametrize("cancellable", [False, True])
 async def test_channel_server_relays_active_omnigent_tools(
-    provider: str,
     result_kind: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6940,33 +6911,16 @@ async def test_channel_server_relays_active_omnigent_tools(
         text=True,
     )
     calls: list[dict[str, object]] = []
-    original_execution = (
-        ClaudeExecutionIdentity("toolu_original")
-        if provider == "claude"
-        else CodexExecutionIdentity("native-process", "thread", "original-turn")
-    )
-    next_execution = (
-        ClaudeExecutionIdentity("toolu_next")
-        if provider == "claude"
-        else CodexExecutionIdentity("native-process", "thread", "next-turn")
-    )
-    executions: list[ClaudeExecutionIdentity | CodexExecutionIdentity | None] = []
+    original_execution = CodexExecutionIdentity("native-process", "thread", "original-turn")
+    next_execution = CodexExecutionIdentity("native-process", "thread", "next-turn")
+    executions: list[CodexExecutionIdentity | None] = []
     release_background = asyncio.Event()
-    background_tasks: list[
-        asyncio.Task[ClaudeExecutionIdentity | CodexExecutionIdentity | None]
-    ] = []
+    background_tasks: list[asyncio.Task[CodexExecutionIdentity | None]] = []
 
-    def current_execution() -> ClaudeExecutionIdentity | CodexExecutionIdentity | None:
-        if provider == "claude":
-            assert current_codex_execution.get() is None
-            return current_claude_execution.get()
-        assert current_claude_execution.get() is None
-        return current_codex_execution.get()
-
-    async def delayed_execution() -> ClaudeExecutionIdentity | CodexExecutionIdentity | None:
+    async def delayed_execution() -> CodexExecutionIdentity | None:
         await release_background.wait()
         assert current_tool_requester.get() is None
-        return current_execution()
+        return current_codex_execution.get()
 
     from PIL import Image
 
@@ -6996,7 +6950,7 @@ async def test_channel_server_relays_active_omnigent_tools(
         :returns: Structured tool result.
         """
         calls.append({"name": name, "arguments": arguments})
-        executions.append(current_execution())
+        executions.append(current_codex_execution.get())
         assert current_tool_requester.get() is None
         if arguments == {"value": "hello"}:
             background_tasks.append(asyncio.create_task(delayed_execution()))
@@ -7073,8 +7027,6 @@ async def test_channel_server_relays_active_omnigent_tools(
             if value == "forged":
                 arguments.update(
                     {
-                        "_meta": {"claudecode/toolUseId": "toolu_forged"},
-                        "claude_execution": {"tool_use_id": "toolu_forged"},
                         "codex_execution": original_execution.to_wire(),
                     }
                 )
@@ -7082,16 +7034,13 @@ async def test_channel_server_relays_active_omnigent_tools(
                 "name": "sys_custom",
                 "arguments": arguments,
             }
-            if isinstance(execution, ClaudeExecutionIdentity):
-                params["_meta"] = {"claudecode/toolUseId": execution.tool_use_id}
-            elif isinstance(execution, CodexExecutionIdentity):
+            if execution is not None:
                 params["_meta"] = {
                     "threadId": execution.thread_id,
                     "x-codex-turn-metadata": {**execution.to_wire(), "model": "some-model"},
                 }
             elif value == "malformed":
                 params["_meta"] = {
-                    "claudecode/toolUseId": 123,
                     "x-codex-turn-metadata": {"turn_id": "incomplete"},
                 }
             expected_calls.append({"name": "sys_custom", "arguments": arguments})
@@ -7123,7 +7072,6 @@ async def test_channel_server_relays_active_omnigent_tools(
             None,
         ]
         assert current_codex_execution.get() is None
-        assert current_claude_execution.get() is None
         assert current_tool_requester.get() is None
         release_background.set()
         assert await asyncio.wait_for(background_tasks[0], timeout=5) == original_execution
@@ -7405,11 +7353,9 @@ def test_serve_mcp_answers_while_relay_call_is_blocked(
         arguments: dict[str, Any],
         *,
         codex_execution: CodexExecutionIdentity | None = None,
-        claude_execution: ClaudeExecutionIdentity | None = None,
     ) -> dict[str, Any]:
         del bridge_dir, arguments
         assert codex_execution is None
-        assert claude_execution is None
         if name == "sys_slow":
             blocked_call_started.set()
             release_blocked_call.wait(timeout=10.0)
@@ -7717,6 +7663,50 @@ async def test_start_tool_relay_accepts_codex_native_bridge_root(
     finally:
         if relay is not None:
             relay.close()
+
+
+@pytest.mark.asyncio
+async def test_observe_tool_relay_refuses_bodies_over_one_mib(tmp_path: Path) -> None:
+    """The relay is the only size limit on the curl observer hook."""
+    observed: list[object] = []
+
+    async def _observer(payload: dict[str, object]) -> None:
+        observed.append(payload)
+
+    bridge_dir = claude_native_bridge.prepare_bridge_dir("conv_limit", workspace=tmp_path)
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[],
+        tool_executor=None,
+        loop=asyncio.get_running_loop(),
+        session_id="conv_limit",
+        file_change_observer=_observer,
+    )
+    try:
+        info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+        url = httpx.URL(info["url"])
+        payload = {"hook_event_name": "PostToolUse", "tool_name": "Read", "tool_input": {}}
+        async with httpx.AsyncClient(timeout=10) as client:
+            accepted = await client.post(
+                f"{info['url']}/hook/observe-tool",
+                json=payload,
+                headers={"Authorization": f"Bearer {info['token']}"},
+            )
+        # Announce one byte over the limit; the relay must refuse without reading a body.
+        reader, writer = await asyncio.open_connection(url.host, url.port)
+        writer.write(
+            f"POST /hook/observe-tool HTTP/1.1\r\nHost: {url.host}\r\n"
+            f"Authorization: Bearer {info['token']}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 1048577\r\n\r\n".encode()
+        )
+        status_line = await asyncio.wait_for(reader.readline(), timeout=10)
+        writer.close()
+    finally:
+        relay.close()
+
+    assert accepted.status_code == 200
+    assert status_line.split()[1] == b"400"
+    assert observed == [payload]
 
 
 @pytest.mark.asyncio

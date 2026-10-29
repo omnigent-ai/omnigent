@@ -930,17 +930,8 @@ class ExecutorAdapter(HarnessApp):
         Other producers must supply an explicit requester; inherited reader-task context
         and display call IDs cannot establish authority.
 
-        Claude SDK MCP binds raw producer tool IDs to registered submissions before
-        the SDK parses them. Its persistent reader's context is never authority.
-        Codex SDK binds dynamic calls to the exact turn/start reply, independently
-        of display event correlation. Currently unbound paths are Pi tool callbacks,
-        Cursor/Copilot/Antigravity custom tools, and the generic ACP/Goose/Qwen Omnigent
-        MCP relay. Their callbacks retain unknown origin and require no edit sharing
-        at the server. The producing executor fixes this policy for its callback.
-
-        Restoring authority requires trusted producer execution/call metadata and a
-        typed binding to this context. Native Codex uses ``native_tool_requester``
-        separately; native relay paths outside this callback have their own contracts.
+        Unbound calls retain unknown origin. The producing executor fixes their
+        delegation policy through :func:`_executor_delegation_policy`.
         """
         if _executor is not None and _executor is not self._executor:
             return {"error": "tool callback belongs to a retired executor"}

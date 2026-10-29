@@ -68,7 +68,7 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
-from omnigent.runtime.requester import ToolRequester
+from omnigent.runtime.requester import InputRequester, ToolRequester
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
@@ -3643,6 +3643,8 @@ class _CodexAppServerSession:
             sandbox = "danger-full-access"
 
         self._native_progress_observed = self._reader_started_turn != self._reader_completed_turn
+        # A known completed turn cannot be a rewrite of the next turn.
+        previous_completed_turn_id = self._reader_completed_turn
 
         # Fresh turn: forget any prior turn's gateway-error signals and clear
         # the shared watchdog slot so a resolved earlier failure can't be
@@ -3948,11 +3950,19 @@ class _CodexAppServerSession:
                     continue
 
                 if method == "item/tool/call":
-                    # Display events may adopt a rewritten ID; authority must match
-                    # the original turn/start reply from this app-server connection.
+                    callback_requester = requester
+                    callback_turn_id = params.get("turnId")
                     if requester is not None and (
-                        params.get("turnId") != raw_active_turn_id
-                        or params.get("threadId", self.thread_id) != self.thread_id
+                        params.get("threadId", self.thread_id) != self.thread_id
+                        or not isinstance(callback_turn_id, str)
+                        or not callback_turn_id
+                        or (
+                            callback_turn_id != raw_active_turn_id
+                            and (
+                                callback_turn_id == previous_completed_turn_id
+                                or not _event_turn_matches(params)
+                            )
+                        )
                     ):
                         await self._send_response(
                             int(message["id"]),
@@ -3964,6 +3974,11 @@ class _CodexAppServerSession:
                             ),
                         )
                         continue
+                    if requester is not None and callback_turn_id != raw_active_turn_id:
+                        # A supported rewrite establishes correlation, not requester identity.
+                        callback_requester = ToolRequester(
+                            execution_id=requester.execution_id, origin=InputRequester()
+                        )
                     if requester is None and not _event_turn_matches(params):
                         continue
                     raw_call_id = params.get("callId")
@@ -3986,7 +4001,7 @@ class _CodexAppServerSession:
                         metadata={"call_id": call_id},
                     )
                     result = await self._execute_dynamic_tool(
-                        tool_name, tool_args, call_id=call_id, requester=requester
+                        tool_name, tool_args, call_id=call_id, requester=callback_requester
                     )
                     classification = classify_tool_result(result)
                     duration_ms = (time.monotonic() - started) * 1000

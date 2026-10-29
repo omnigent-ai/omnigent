@@ -181,10 +181,8 @@ def test_handle_mcp_request_emits_progress_notifications(
         arguments: dict,
         *,
         codex_execution: object | None = None,
-        claude_execution: object | None = None,
     ) -> dict:
         assert codex_execution is None
-        assert claude_execution is None
         call_started.set()
         release_call.wait(timeout=5.0)
         return {"content": [{"type": "text", "text": "done"}]}

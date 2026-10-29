@@ -26,9 +26,12 @@ separate compatibility gap. Do not infer support from another harness's passing 
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
   another session". `sys_session_list` and `sys_session_get_info` expose
-  `created_by_session_id` so managers can identify their workers across restarts.
+  `created_by_session_id` so managers can identify their workers across restarts;
+  `sys_session_list` with `include_archived` also lists archived workers, each
+  marked `archived`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
-  creates, even if an enable is also listed. Restart every server replica to
+  creates, even if an enable is also listed, and hides the Automations page's
+  trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
@@ -46,9 +49,14 @@ separate compatibility gap. Do not infer support from another harness's passing 
   earlier work; this does not prove the owner read it. Original requester
   metadata remains unchanged, and unknown origins remain unknown. A strict
   receiver therefore cannot use this fallback as proof of an owner execution.
+  The fallback requires the `ix_session_permissions_write_access` schema
+  prerequisite: each session lookup reads at most two write grants through the
+  permission-level index, independently of its read-only audience size.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
-  automation can message the owner's other sessions or start workers.
+  automation can message the owner's other sessions or start workers. The
+  Automations page's Jira/Slack/GitHub trigger templates rely on this: their
+  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
 - `refusal`: disabled flag, another owner or wrong runner binding refuses the
   operation. Requester-aware harnesses also refuse unverified executions; fallback
   harnesses refuse edit sharing. Missing policy envelopes remain strict. Unknown
@@ -69,6 +77,10 @@ separate compatibility gap. Do not infer support from another harness's passing 
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
+- On Automations, pick the *Jira tickets*, *Slack messages*, or *GitHub issues*
+  chip, fill in the trigger builder, and save: the hourly automation's kept
+  session starts one worker per new match with `sys_session_create`. Covered by
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
 
 ## Driving it with the repro environment
 
@@ -119,7 +131,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   surviving the runner's idle timer. Initial-launch success does not cover recovery.
   It also checks that unconfigured managed creation gives a clear
   refusal without creating a session. Codex and tmux are required for the native row.
-  All three harnesses also exercise a server restart with the explicit kill switch:
+  All four harnesses (OpenAI Agents SDK, Codex native, Claude SDK and Claude native)
+  also exercise a server restart with the explicit kill switch:
   existing runners remain opted in, but their subsequent peer sends and independent
   creates are refused without writes; session-info reads still work.
   It also fires an owner-created schedule through the real server/host and checks
@@ -217,6 +230,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   `tests/test_sessions_native_messages.py` cover other affected consumers of
   shared dispatch metadata. Run these as ordinary pytest targets, with retries
   disabled; they do not replace process or terminal evidence.
+  `tests/stores/test_permission_store.py` checks public/edit/manage grants,
+  workspace/session isolation, and the actual indexed query plan and SQLite work
+  with 0 versus 2,000 read-only grants.
 - Native compatibility check for each supported requester path: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager and repeat as owner, then collaborator: only the

@@ -11,8 +11,9 @@ SQLite file and tears it down automatically.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, insert
 
+from omnigent.db.db_models import SqlSessionPermission, current_workspace_id, workspace_scope
 from omnigent.entities import SessionPermission
 from omnigent.server.auth import RESERVED_USER_PUBLIC
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -304,6 +305,90 @@ def test_list_for_session_empty(store: SqlAlchemyPermissionStore, db_uri: str) -
 
     assert grants == [], f"Expected [] for a session with no grants, got {grants!r}"
     assert next_cursor is None
+
+
+def test_has_other_write_grants(store: SqlAlchemyPermissionStore, db_uri: str) -> None:
+    """Only another user's write grant in this workspace/session blocks delegation."""
+    conv_id = _create_conversation(db_uri)
+    other_id = _create_conversation(db_uri)
+    owner = "a-owner@test.com"
+    editor = "z-editor@test.com"
+    for user in (owner, editor, RESERVED_USER_PUBLIC):
+        _ensure_user(store, user)
+    assert not store.has_other_write_grants(conv_id, owner)
+    store.grant(owner, conv_id, level=4)
+    store.grant(editor, other_id, level=2)
+    with workspace_scope(current_workspace_id() + 1):
+        _ensure_user(store, editor)
+        store.grant(editor, conv_id, level=2)
+    assert not store.has_other_write_grants(conv_id, owner)
+    for writer in (editor, RESERVED_USER_PUBLIC):
+        store.grant(writer, conv_id, level=1)
+        assert not store.has_other_write_grants(conv_id, owner)
+        for level in (2, 3, 4):
+            store.grant(writer, conv_id, level=level)
+            assert store.has_other_write_grants(conv_id, owner)
+        store.grant(writer, conv_id, level=1)
+        assert not store.has_other_write_grants(conv_id, owner)
+        store.revoke(writer, conv_id)
+        assert not store.has_other_write_grants(conv_id, owner)
+
+
+def test_write_grant_lookup_skips_read_only_grants(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """The production query's plan and executed work stay bounded as readers grow."""
+    if store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite execution-plan and VM-step evidence")
+    conv_id = _create_conversation(db_uri)
+    _ensure_user(store, "owner")
+    store.grant("owner", conv_id, level=4)
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    for reader_count in (0, 2000):
+        if reader_count:
+            with store._session("seed_read_only_grants") as session:
+                session.execute(
+                    insert(SqlSessionPermission),
+                    [
+                        {"user_id": f"reader-{index}", "conversation_id": conv_id, "level": 1}
+                        for index in range(reader_count)
+                    ],
+                )
+        queries.clear()
+        event.listen(store._engine, "before_cursor_execute", capture)
+        try:
+            assert not store.has_other_write_grants(conv_id, "owner")
+        finally:
+            event.remove(store._engine, "before_cursor_execute", capture)
+        assert len(queries) == 1
+        statement, parameters = queries[0]
+        with store._engine.connect() as connection:
+            plan = connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            assert any(
+                "COVERING INDEX ix_session_permissions_write_access" in row[3]
+                and "level>?" in row[3]
+                for row in plan
+            ), plan
+            assert not any("TEMP B-TREE" in row[3] for row in plan), plan
+            steps = 0
+
+            def count_step():
+                nonlocal steps
+                steps += 1
+                return 0
+
+            raw = connection.connection.driver_connection
+            raw.set_progress_handler(count_step, 1)
+            try:
+                assert connection.exec_driver_sql(statement, parameters).all() == [("owner",)]
+            finally:
+                raw.set_progress_handler(None, 0)
+            assert steps < 200, (reader_count, steps, plan)
 
 
 def test_list_for_session_isolation(store: SqlAlchemyPermissionStore, db_uri: str) -> None:

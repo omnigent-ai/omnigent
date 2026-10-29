@@ -545,7 +545,8 @@ class SysSessionListTool(Tool):
             "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
             "for children or sys_session_message for independent sessions. "
             "Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "sessions running that agent, and include_archived to also list "
+            "archived sessions (marked archived). Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
@@ -575,6 +576,14 @@ class SysSessionListTool(Tool):
                                 "list to sessions whose bound agent has "
                                 "this name, e.g. 'researcher'. Does not "
                                 "affect the 'sub_agents' view."
+                            ),
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: also list archived sessions in the "
+                                "global 'sessions' view; each row then carries "
+                                "'archived'. Defaults to false."
                             ),
                         },
                         "limit": {

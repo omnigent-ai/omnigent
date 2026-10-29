@@ -11,7 +11,7 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.requester import tool_requester
 from omnigent.server.schemas import SessionStartupInput
@@ -102,12 +102,7 @@ def require_orchestration_source(
         )
     requester = tool_requester(request, source)
     if requester is not None and requester.delegation_policy == "no_edit_sharing":
-        grants = permissions.list_for_sessions([session.id for session in chain])
-        if any(
-            grant.user_id != user_id and grant.level >= LEVEL_EDIT
-            for session_grants in grants.values()
-            for grant in session_grants
-        ):
+        if any(permissions.has_other_write_grants(session.id, user_id) for session in chain):
             raise OmnigentError(
                 "This harness can delegate only while the sending session and its source chain "
                 "have no edit sharing. Read-only sharing is allowed.",

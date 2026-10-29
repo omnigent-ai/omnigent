@@ -6243,9 +6243,9 @@ def test_tool_call_metadata_marks_only_omnigent_mcp_tools_as_dispatched() -> Non
     ],
 )
 async def test_claude_requester_transport_never_guesses_missing_or_conflicting_provenance(
-    fault, monkeypatch
+    fault,
 ):
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeRequesterTransport
+    from omnigent.inner.claude_sdk_executor import _ClaudeRequesterTransport
     from omnigent.runtime.requester import InputRequester, ToolRequester
 
     transport = _ClaudeRequesterTransport(options=None)
@@ -6301,9 +6301,27 @@ async def test_claude_requester_transport_never_guesses_missing_or_conflicting_p
     }
     assert transport._observe(callback) is None
 
-    if fault != "capacity":
-        return
 
+async def test_claude_requester_transport_rotates_at_capacity(monkeypatch):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeRequesterTransport
+    from omnigent.runtime.requester import InputRequester, ToolRequester
+
+    frame = {
+        "type": "assistant",
+        "parent_tool_use_id": None,
+        "message": {
+            "content": [{"type": "tool_use", "id": "call", "name": "mcp__omnigent__echo"}]
+        },
+    }
+    params = {"name": "echo", "_meta": {"claudecode/toolUseId": "call"}, "arguments": {}}
+    callback = {
+        "type": "control_request",
+        "request": {
+            "subtype": "mcp_message",
+            "server_name": "omnigent",
+            "message": {"method": "tools/call", "params": params},
+        },
+    }
     # Completed turns retain IDs, including native tools, until the client rotates.
     monkeypatch.setattr(_ClaudeRequesterTransport, "_MAX_RECORDS", 3)
     monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)

@@ -70,10 +70,6 @@ from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
 from omnigent.harnesses.claude_native import delivery_diagnostics
-from omnigent.harnesses.claude_native.execution import (
-    ClaudeExecutionIdentity,
-    current_claude_execution,
-)
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -2525,8 +2521,12 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
-    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    observer_hook = hook_settings(
+        bridge_dir,
+        python,
+        "omnigent.harnesses.claude_native.hook",
+        wrap_python=_pin_runner_tmpdir,
+    )
     hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
@@ -7662,9 +7662,6 @@ def _tool_relay_handler_factory(
                     codex_execution=CodexExecutionIdentity.from_wire(
                         payload.get("codex_execution")
                     ),
-                    claude_execution=ClaudeExecutionIdentity.from_wire(
-                        payload.get("claude_execution")
-                    ),
                 )
             self._send_json(result)
 
@@ -7931,7 +7928,6 @@ def _run_relay_tool(
     arguments: _JsonObject,
     *,
     codex_execution: CodexExecutionIdentity | None = None,
-    claude_execution: ClaudeExecutionIdentity | None = None,
 ) -> _JsonObject:
     """
     Execute one relay tool call on the harness event loop.
@@ -7942,17 +7938,14 @@ def _run_relay_tool(
     :param name: Tool name, e.g. ``"sys_os_shell"``.
     :param arguments: Decoded tool arguments.
     :param codex_execution: Provider locator for this call, not requester authority.
-    :param claude_execution: Retained Claude tool-use locator, not requester authority.
     :returns: MCP tool-call response.
     """
 
     async def execute() -> object:
         token = current_codex_execution.set(codex_execution)
-        claude_token = current_claude_execution.set(claude_execution)
         try:
             return await tool_executor(name, arguments)
         finally:
-            current_claude_execution.reset(claude_token)
             current_codex_execution.reset(token)
 
     future = asyncio.run_coroutine_threadsafe(execute(), loop)
@@ -8370,13 +8363,11 @@ def _call_mcp_tool(
         arguments = {}
     if name in _read_relay_tool_names(bridge_dir):
         codex_execution = CodexExecutionIdentity.from_mcp_meta(params.get("_meta"))
-        claude_execution = ClaudeExecutionIdentity.from_mcp_meta(params.get("_meta"))
         return _call_relay_tool(
             bridge_dir,
             name,
             arguments,
             codex_execution=codex_execution,
-            claude_execution=claude_execution,
         )
     if name not in tools:
         return _mcp_error(f"unknown tool: {name!r}")
@@ -8431,7 +8422,6 @@ def _call_relay_tool(
     arguments: _JsonObject,
     *,
     codex_execution: CodexExecutionIdentity | None = None,
-    claude_execution: ClaudeExecutionIdentity | None = None,
 ) -> _JsonObject:
     """
     Call the active harness turn's tool relay.
@@ -8441,7 +8431,6 @@ def _call_relay_tool(
     :param name: Tool name, e.g. ``"sys_terminal_launch"``.
     :param arguments: Decoded tool arguments.
     :param codex_execution: Provider locator captured from this MCP request.
-    :param claude_execution: Retained Claude tool-use locator from this MCP request.
     :returns: MCP tool-call result.
     """
     relay = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
@@ -8452,8 +8441,6 @@ def _call_relay_tool(
     body: _JsonObject = {"name": name, "arguments": arguments}
     if codex_execution is not None:
         body["codex_execution"] = codex_execution.to_wire()
-    if claude_execution is not None:
-        body["claude_execution"] = claude_execution.to_wire()
     payload = json.dumps(body).encode("utf-8")
     req = request.Request(
         f"{url}/tool",

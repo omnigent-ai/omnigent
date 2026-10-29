@@ -36,6 +36,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "grid_sessions_display_ui": False,
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
+        "session_orchestration": True,
     }
 
 
@@ -104,13 +105,19 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
-@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS, Feature.SESSION_ORCHESTRATION])
+@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS])
 def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: feature.value})
 
     assert flags.enabled(feature)
     assert feature.value in flags.enabled_names()
     assert feature.value not in flags.frontend_dict()
+
+
+def test_session_orchestration_is_frontend_visible_so_trigger_templates_can_gate_on_it() -> None:
+    assert resolve_feature_flags({}).frontend_dict()["session_orchestration"] is True
+    disabled = resolve_feature_flags({FEATURES_ENV_VAR: "-session_orchestration"})
+    assert disabled.frontend_dict()["session_orchestration"] is False
 
 
 @pytest.mark.parametrize("name", ["usage-pgae", "-usage-pgae", "-", "--claude_osc_status"])
