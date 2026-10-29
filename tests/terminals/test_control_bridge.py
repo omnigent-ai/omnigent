@@ -636,15 +636,16 @@ async def test_control_bridge_lists_tmux_answers_before_any_pane_output() -> Non
             ws, socket_path=str(sock), tmux_target=target, read_only=False
         )
     )
-    await asyncio.sleep(1.0)
+    await poll_until_async(
+        lambda: b"SEEDED-LINE" in b"".join(frame for frame in frames if isinstance(frame, bytes)),
+        timeout_s=10,
+    )
 
-    assert frames, "the bridge sent nothing"
     first = frames[0]
     assert isinstance(first, str), f"pane output reached the browser first: {first!r}"
     message = json.loads(first)
     assert message["type"] == "tmux-replies"
     assert {"da1", "dsr:6"} <= set(message["queries"])
-    assert b"SEEDED-LINE" in b"".join(frame for frame in frames if isinstance(frame, bytes))
 
     await _kill_and_join(sock, task)
 

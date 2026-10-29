@@ -624,7 +624,7 @@ def test_shell_program_gets_one_reply_to_a_cursor_position_query(
 
     poll_until(lambda: _cursor_position_reports(log) >= 1, timeout_s=15)
     # A duplicate from the browser trails tmux's reply by a WebSocket round trip.
-    page.wait_for_timeout(1_500)
+    page.wait_for_timeout(1_500)  # custom-lint: disable=sleep-then-assert -- duplicate window
     reports = _cursor_position_reports(log)
     assert reports == 1, (
         f"expected one cursor position report, got {reports} (log: {log.read_bytes()[:200]!r})"
