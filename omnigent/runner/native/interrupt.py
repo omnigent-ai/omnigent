@@ -643,7 +643,7 @@ class NativeInterruptRunner:
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         try:
-            await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
+            stopped = await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=1.0)
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=503,
@@ -651,6 +651,20 @@ class NativeInterruptRunner:
                     "error": "claude_native_interrupt_failed",
                     "detail": self._client_safe_error_detail(
                         exc, context="claude-native interrupt"
+                    ),
+                },
+            )
+        if stopped is False:
+            # Claude still shows a running turn after the retried Escapes: the turn
+            # keeps running, so the session must not read as idle.
+            self._logger.warning("claude-native interrupt unconfirmed; session=%s", conv_id)
+            self._publish_event(conv_id, {"type": "session.status", "status": "running"})
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "claude_native_interrupt_unconfirmed",
+                    "detail": (
+                        "Claude is still working after the interrupt; the turn keeps running."
                     ),
                 },
             )

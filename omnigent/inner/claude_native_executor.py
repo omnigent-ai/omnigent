@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
+    ClaudeTerminalBusy,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
@@ -362,7 +363,7 @@ class ClaudeNativeExecutor(Executor):
                 undelivered=True,
             )
             return
-        except ClaudeTerminalDialog as exc:
+        except (ClaudeTerminalDialog, ClaudeTerminalBusy) as exc:
             # The pane is parked on a surface the person clears from the
             # embedded terminal; reaping it would destroy that. Both raisers
             # (the readiness gate, and the slash-command refusal ahead of a

@@ -153,6 +153,7 @@ def test_explicit_interrupt_can_cancel_a_pending_question(
     _park_hook(native_bridge)
     sent = []
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_, **__: "❯ \n")
     bridge.inject_interrupt(native_bridge)
     assert sent == [("/tmp/example.sock", "send-keys", "-t", "main", "Escape")]
 
