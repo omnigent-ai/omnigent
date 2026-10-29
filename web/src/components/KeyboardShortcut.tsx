@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
-import { TooltipContent } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
@@ -15,7 +15,12 @@ export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
 export const CTRL_KEY = IS_MAC ? "⌃" : "Ctrl";
 export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
+export const ESC_KEY = "Esc";
 export const SHIFT_KEY = "⇧";
+export const ARROW_UP_KEY = "↑";
+export const ARROW_DOWN_KEY = "↓";
+export const ARROW_LEFT_KEY = "←";
+export const ARROW_RIGHT_KEY = "→";
 export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
 export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
 export const SPLIT_TERMINAL_KEYS: Record<TerminalSplitAxis, string[]> = {
@@ -31,6 +36,10 @@ export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
 export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
 export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
 export const QUIT_KEYS = [MOD_KEY, "Q"] as const;
+export const COMMAND_PALETTE_KEYS = [MOD_KEY, "K"] as const;
+export const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
+export const RIGHT_SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
+export const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
   return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
@@ -86,5 +95,32 @@ export function KeyboardShortcutTooltipContent({ label, keys }: { label: string;
     <TooltipContent side="top" shortcut={keys}>
       <span>{label}</span>
     </TooltipContent>
+  );
+}
+
+/**
+ * Hover and focus tooltip for one trigger: the action name, plus its chord
+ * when `keys` is given. Omit `keys` when the chord is inactive in this state.
+ */
+export function KeyboardShortcutTooltip({
+  label,
+  keys,
+  side = "top",
+  children,
+}: {
+  label: string;
+  keys?: readonly string[];
+  side?: "top" | "right" | "bottom" | "left";
+  children: ReactNode;
+}) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>{children}</TooltipTrigger>
+        <TooltipContent side={side} shortcut={keys}>
+          {label}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
