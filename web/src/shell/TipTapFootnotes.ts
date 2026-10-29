@@ -6,6 +6,7 @@ import { Extension, Node, type JSONContent, type MarkdownToken } from "@tiptap/c
 import type { MarkdownManager } from "@tiptap/markdown";
 import { NodeSelection, Plugin, TextSelection, type EditorState } from "@tiptap/pm/state";
 import { interruptsParagraph } from "./markdownSetextHeading";
+import { startsTable } from "./tiptapBoundedTokenizers";
 
 /** A footnote definition line, e.g. `[^1]: https://example.com`. */
 const DEFINITION = /^ {0,3}\[\^[^\]\s]+\]:/;
@@ -25,6 +26,9 @@ const BREAK_OR_HTML_BLOCK = new RegExp(
     "track|ul)(?:\\s|/?>|$))",
   "i",
 );
+
+/** A footnote label, e.g. `1` or `long-name`. */
+const LABEL = /^[^\]\s]+$/;
 
 /** A footnote reference; `[^1](url)` is an ordinary link and is left alone. */
 const REFERENCE = /^\[\^([^\]\s]+)\](?!\()/;
@@ -157,7 +161,9 @@ export function scanFootnoteDefinitions(source: string): string | null {
     } else if (
       !DEFINITION.test(line) &&
       !CONTINUATION.test(line) &&
-      (interruptsParagraph(`${line}\n`) || BREAK_OR_HTML_BLOCK.test(line))
+      (interruptsParagraph(`${line}\n`) ||
+        BREAK_OR_HTML_BLOCK.test(line) ||
+        startsTable(source.slice(start)))
     ) {
       // A line that would end a paragraph starts its own block.
       break;
@@ -264,7 +270,11 @@ export const FootnoteDefinitions = Node.create({
     return [
       {
         tag: "div[data-footnote-definitions]",
-        getAttrs: (element) => ({ raw: element.textContent ?? "" }),
+        // Reject pasted text that would not read back as a definition run.
+        getAttrs: (element) => {
+          const raw = element.textContent ?? "";
+          return scanFootnoteDefinitions(raw)?.replace(/\n+$/, "") === raw ? { raw } : false;
+        },
       },
     ];
   },
@@ -319,7 +329,10 @@ export const FootnoteReference = Node.create({
     return [
       {
         tag: "sup[data-footnote-reference]",
-        getAttrs: (element) => ({ label: element.textContent ?? "" }),
+        getAttrs: (element) => {
+          const label = element.textContent ?? "";
+          return LABEL.test(label) ? { label } : false;
+        },
       },
     ];
   },

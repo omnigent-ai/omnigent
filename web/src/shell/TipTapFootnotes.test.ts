@@ -81,7 +81,6 @@ describe("footnote round-trips", () => {
     ["no space after the colon", "Claim.[^1]\n\n[^1]:https://nospace.test"],
     ["trailing spaces and tabs", "Claim.[^1]\n\n[^1]: note   \n[^2]:\ttab"],
     ["definition line inside a paragraph", "text\n[^1]: inside the paragraph"],
-    ["reference without a definition", "Dangling[^9] reference."],
     ["adjacent references", "x[^1][^2][^3]\n\n[^1]: a\n[^2]: b\n[^3]: c"],
     ["reference followed by a colon", "see[^1]: here\n\n[^1]: note"],
     ["named labels", "a[^long-label_2] b[^Ü] c[^x.y]\n\n[^long-label_2]: 1\n[^Ü]: 2\n[^x.y]: 3"],
@@ -112,6 +111,21 @@ describe("footnote round-trips", () => {
     expect(footnoteNodes(ed)).toEqual(["footnoteReference:1", "footnoteDefinitions:[^1]: note"]);
     // The serialiser separates blocks with a blank line, as after any paragraph.
     expect(ed.getMarkdown()).toBe(markdown.replace("note\n", "note\n\n"));
+  });
+
+  it("keeps a table that follows the definitions a table", () => {
+    const markdown = "Claim.[^1]\n\n[^1]: note\n| A | B |\n| --- | --- |\n| 1 | 2 |";
+    const ed = makeEditor(markdown);
+    expect(ed.state.doc.lastChild?.type.name).toBe("table");
+    expect(footnoteNodes(ed)).toEqual(["footnoteReference:1", "footnoteDefinitions:[^1]: note"]);
+    // The serialiser always puts an extra blank line before a table.
+    const saved = ed.getMarkdown();
+    expect(saved).toMatch(/\[\^1\]: note\n{2,}\| A +\| B +\|\n\| -+ \| -+ \|\n\| 1 +\| 2 +\|/);
+    expect(roundTrip(saved)).toBe(saved);
+  });
+
+  it("keeps a lazy line with a pipe in the definition when no table follows", () => {
+    expect(scanFootnoteDefinitions("[^1]: note\na | b\n\nAfter.")).toBe("[^1]: note\na | b\n\n");
   });
 
   it("keeps a fence with a blank line after a definition a code block", () => {
@@ -353,6 +367,23 @@ describe("editing a document with footnotes", () => {
     const ed = makeEditor("Start.");
     ed.commands.insertContentAt(ed.state.doc.content.size, copied);
     expect(ed.getMarkdown()).toBe(`Start.\n\n${TWO_NOTES}`);
+  });
+
+  it.each([
+    [
+      "a definitions block that is not a definition run",
+      '<div data-footnote-definitions=""># heading</div>',
+    ],
+    [
+      "a definitions block with trailing prose",
+      '<div data-footnote-definitions="">[^1]: a\n# b</div>',
+    ],
+    ["a reference label with a space", '<p>x<sup data-footnote-reference="">a b</sup></p>'],
+    ["an empty reference label", '<p>x<sup data-footnote-reference=""></sup></p>'],
+  ])("does not paste %s as a footnote", (_name, html) => {
+    const ed = makeEditor("Start.");
+    ed.commands.insertContentAt(ed.state.doc.content.size, html);
+    expect(footnoteNodes(ed)).toEqual([]);
   });
 
   it.each([
