@@ -50,7 +50,13 @@ const showToast = vi.fn();
 vi.mock("@/components/ui/toast", () => ({ showToast: (...args: unknown[]) => showToast(...args) }));
 
 // Agent / host catalogs — return simple lists so labels resolve.
-const defaultAgentCatalog = (_options?: { pinnedAgentIds?: string[] }) => ({
+const defaultAgentCatalog = (_options?: {
+  pinnedAgentIds?: string[];
+}): {
+  data?: { id: string; name: string; display_name: string }[];
+  isPlaceholderData?: boolean;
+  isError?: boolean;
+} => ({
   data: [{ id: "ag_1", name: "polly", display_name: "Polly" }],
 });
 const useAvailableAgents = vi.fn(defaultAgentCatalog);
@@ -232,19 +238,29 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-state-pill")).toHaveTextContent("Active");
   });
 
-  it.each([false, true])("labels a saved agent when the current catalog hides it: %s", (hidden) => {
-    useAvailableAgents.mockImplementation((options) => ({
-      data:
-        !hidden && options?.pinnedAgentIds?.includes("ag_1")
-          ? [{ id: "ag_1", name: "polly", display_name: "Polly" }]
-          : [{ id: "ag_session_copy", name: "polly", display_name: "Polly (session copy)" }],
-    }));
-    setTask(task({ agentId: "ag_1" }));
-    renderPage();
-    expect(screen.getByTestId("task-detail-agent").textContent).toBe(
-      hidden ? "Agent not in current list (ag_1)" : "Polly",
-    );
-  });
+  it.each(["legacy", "hidden", "loading", "partial", "failed"])(
+    "labels a saved agent with a %s catalog",
+    (state) => {
+      useAvailableAgents.mockImplementation((options) => {
+        const rows =
+          state === "legacy" && options?.pinnedAgentIds?.includes("ag_1")
+            ? [{ id: "ag_1", name: "polly", display_name: "Polly" }]
+            : [{ id: "ag_session_copy", name: "polly", display_name: "Polly (session copy)" }];
+        return {
+          data: state === "loading" ? undefined : rows,
+          isPlaceholderData: state === "partial",
+          isError: state === "failed",
+        };
+      });
+      setTask(task({ agentId: "ag_1" }));
+      renderPage();
+      const labels: Record<string, string> = {
+        legacy: "Polly",
+        hidden: "Agent not in current list (ag_1)",
+      };
+      expect(screen.getByTestId("task-detail-agent").textContent).toBe(labels[state] ?? "ag_1");
+    },
+  );
 
   it("names the sandbox for a task that runs in a new sandbox each time", () => {
     setTask(task({ executionTarget: "managed_sandbox" }));

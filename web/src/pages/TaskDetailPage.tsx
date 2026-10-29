@@ -174,7 +174,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   // Older servers resolve pins through session discovery; current catalogs
   // can hide legacy IDs that existing tasks still use.
-  const { data: agents } = useAvailableAgents({
+  const {
+    data: agents,
+    isPlaceholderData: agentsArePartial,
+    isError: agentsError,
+  } = useAvailableAgents({
     pinnedAgentIds: task != null ? [task.agentId] : [],
   });
   const { data: hosts } = useHosts();
@@ -182,11 +186,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const sandboxLabel = sandboxOptionLabel(info !== "loading" ? info.sandbox_provider : null);
   const agentLabel = useMemo(() => {
     if (!task) return "";
-    return (
-      agents?.find((a) => a.id === task.agentId)?.display_name ??
-      `Agent not in current list (${task.agentId})`
-    );
-  }, [agents, task]);
+    const agent = agents?.find((a) => a.id === task.agentId);
+    if (agent) return agent.display_name;
+    if (agents === undefined || agentsArePartial || agentsError) return task.agentId;
+    return `Agent not in current list (${task.agentId})`;
+  }, [agents, agentsArePartial, agentsError, task]);
   const hostLabel = useMemo(() => {
     if (!task) return "";
     if (task.executionTarget === "managed_sandbox") return sandboxLabel;

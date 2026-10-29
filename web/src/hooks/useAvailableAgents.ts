@@ -585,6 +585,9 @@ export function useAvailableAgents(options: UseAvailableAgentsOptions = {}) {
   return {
     ...query,
     data,
+    isPlaceholderData:
+      query.isPlaceholderData ||
+      (query.isError && query.data === undefined && placeholderData !== undefined),
     isLoading: query.isLoading || (enabled && query.isPending && catalogQuery.isPending),
   };
 }

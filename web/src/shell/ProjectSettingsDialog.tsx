@@ -115,7 +115,11 @@ export function ProjectSettingsDialog({
   const updateConfig = useUpdateProjectConfig();
   const hosts = useHosts();
   // Pins resolve saved IDs on older servers; current catalogs hide legacy IDs.
-  const { data: agents, isPlaceholderData: agentsArePlaceholder } = useAvailableAgents({
+  const {
+    data: agents,
+    isPlaceholderData: agentsArePartial,
+    isError: agentsError,
+  } = useAvailableAgents({
     pinnedAgentIds: [stored?.agent_id, launch?.agentId].filter((id): id is string => id != null),
   });
   const info = useServerInfo();
@@ -287,14 +291,20 @@ export function ProjectSettingsDialog({
   const harnessEntries = useMemo(() => agentList.filter(isNativeCodingAgent), [agentList]);
   const agentEntries = useMemo(() => agentList.filter((a) => !isNativeCodingAgent(a)), [agentList]);
   const selectedAgent = agentList.find((a) => a.id === agentId) ?? null;
-  const agentLabel = selectedAgent?.display_name ?? (agentId ? "Agent unavailable" : "No default");
+  let agentLabel = selectedAgent?.display_name ?? "No default";
+  if (agentId && !selectedAgent) {
+    agentLabel = "Agent unavailable";
+    if (agents === undefined || agentsArePartial) agentLabel = "Loading agent…";
+    if (agentsError) agentLabel = "Agent list unavailable";
+  }
   // Like the composer, fall back to the stored agent when the last start's agent
   // no longer exists, while the field still holds it.
   const launchAgentGone =
     launch?.agentId != null &&
     agentId === launch.agentId &&
     agents !== undefined &&
-    !agentsArePlaceholder &&
+    !agentsArePartial &&
+    !agentsError &&
     selectedAgent === null;
   useEffect(() => {
     if (!launchAgentGone) return;

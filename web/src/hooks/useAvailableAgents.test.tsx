@@ -1718,6 +1718,7 @@ describe("useAvailableAgents user agents (scope=user)", () => {
       });
 
       expect(result.current.data?.map((a) => a.id)).toEqual(["ag_polly"]);
+      expect(result.current.isPlaceholderData).toBe(true);
       expect(fetchMock.mock.calls.some(([url]) => url === USER_AGENTS_URL)).toBe(true);
     },
   );

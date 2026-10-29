@@ -406,11 +406,19 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1" }));
   });
 
-  it("preserves a stored model when the default agent hasn't resolved from discovery", async () => {
+  it.each([
+    ["hidden", "Agent unavailable"],
+    ["partial", "Loading agent…"],
+    ["failed", "Agent list unavailable"],
+  ])("preserves stored defaults with a %s agent catalog", async (state, label) => {
     // While agent discovery is loading/failing, the stored agent's model
     // capability is unknowable — an unrelated save in that window must not
     // silently delete a valid stored default.
-    availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
+    availableAgentsMock.mockReturnValue({
+      data: [pickerAgent()],
+      isPlaceholderData: state === "partial",
+      isError: state === "failed",
+    });
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
@@ -422,9 +430,7 @@ describe("ProjectSettingsDialog", () => {
         false,
       ),
     );
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
-      "Agent unavailable",
-    );
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(label);
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", {
