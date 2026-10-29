@@ -14,6 +14,9 @@ const DEFINITION = /^ {0,3}\[\^[^\]\s]+\]:/;
 /** The label of each definition line in a definitions block, e.g. `1` in `[^1]: url`. */
 const DEFINITION_LABELS = /^ {0,3}\[\^([^\]\s]+)\]:/gm;
 
+/** Text that could hold a definition, possibly inside a quote or list. */
+const DEFINITION_ANYWHERE = /\[\^[^\]\s]+\]:/;
+
 /** An indented line that continues a definition. */
 const CONTINUATION = /^(?: {4}|\t)/;
 
@@ -78,9 +81,13 @@ export function definedFootnoteLabels(
   marked: MarkdownManager["instance"],
   markdown: string,
 ): Set<string> {
-  if (!markdown.includes("[^")) return new Set();
+  if (!DEFINITION_ANYWHERE.test(markdown)) return new Set();
+  // Definitions are block tokens, so the inline pass is skipped. Building a
+  // Lexer re-targets marked's shared tokenizer; the real parse that follows
+  // builds its own Lexer, which targets it back.
+  const lexer = new marked.Lexer(marked.defaults);
   const tokens = withFootnoteLabels(new Set(), () =>
-    new marked.Lexer(marked.defaults).lex(markdown),
+    lexer.blockTokens(markdown.replace(/\r\n?/g, "\n"), []),
   );
   const raws: string[] = [];
   const visit = (token: MarkdownToken) => {
@@ -140,6 +147,13 @@ export function escapeFootnoteReferences(text: string): string {
  * :returns: The run including its trailing newlines, or null when *source*
  *     does not start with a definition.
  */
+/** End of the line after the one ending at *end* (a newline index, or -1). */
+function lineEndAfter(source: string, end: number): number {
+  if (end === -1) return source.length;
+  const next = source.indexOf("\n", end + 1);
+  return next === -1 ? source.length : next;
+}
+
 export function scanFootnoteDefinitions(source: string): string | null {
   let end = source.indexOf("\n");
   if (end === -1) end = source.length;
@@ -163,7 +177,7 @@ export function scanFootnoteDefinitions(source: string): string | null {
       !CONTINUATION.test(line) &&
       (interruptsParagraph(`${line}\n`) ||
         BREAK_OR_HTML_BLOCK.test(line) ||
-        startsTable(source.slice(start)))
+        startsTable(source.slice(start, lineEndAfter(source, next))))
     ) {
       // A line that would end a paragraph starts its own block.
       break;
@@ -197,7 +211,10 @@ export function prepareFootnoteReferences(node: JSONContent): JSONContent {
     } else if (child.type === "text" && !child.marks?.length) {
       if (siblings[index - 1]?.type === "footnoteReference") {
         const text = child.text ?? "";
-        const opensBlock = index === 1;
+        // Only whitespace before the reference: it starts the block's first line.
+        const opensBlock = siblings
+          .slice(0, index - 1)
+          .every((sibling) => sibling.type === "text" && !sibling.text?.trim());
         if (text.startsWith("(") || (opensBlock && text.startsWith(":"))) {
           prepared = { ...child, text: `\\${text}` };
         }

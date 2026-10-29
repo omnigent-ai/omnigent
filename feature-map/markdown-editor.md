@@ -238,7 +238,8 @@ instead of treating one comparison clip as complete feature verification.
   them, and definition lines as read-only source text; edit definitions in
   Source. Typing, pasting or Enter over a selected footnote keeps it;
   Backspace or Delete removes it. Saves keep footnotes and the final newline,
-  except a reference inside bold, italic or link text moves just outside it.
+  except a reference inside bold or italic moves just outside those marks;
+  reference syntax in link text stays literal, so the link is kept.
 - Load measurements do not establish typing latency. Dirty detection compares
   immutable editor documents; autosave still serializes the whole document.
   Changes that serialize identically become clean when autosave checks them.

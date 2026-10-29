@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
-import { prepareFootnoteReferences, scanFootnoteDefinitions } from "./TipTapFootnotes";
+import { scanFootnoteDefinitions } from "./TipTapFootnotes";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -237,18 +237,14 @@ describe("editing a document with footnotes", () => {
     );
   });
 
-  it("deletes a reference as one unit", () => {
+  it.each([
+    ["reference", "footnoteReference", TWO_NOTES.replace("one.[^1]", "one.")],
+    ["definition block", "footnoteDefinitions", "Claim one.[^1] Claim two.[^2]\n\nAfter."],
+  ])("deletes a %s as one unit", (_name, type, expected) => {
     const ed = makeEditor(TWO_NOTES);
-    const at = nodePosition(ed, "footnoteReference");
-    ed.commands.deleteRange({ from: at, to: at + 1 });
-    expect(ed.getMarkdown()).toBe(TWO_NOTES.replace("one.[^1]", "one."));
-  });
-
-  it("deletes the definition block as one unit", () => {
-    const ed = makeEditor(TWO_NOTES);
-    const at = nodePosition(ed, "footnoteDefinitions");
+    const at = nodePosition(ed, type);
     ed.commands.deleteRange({ from: at, to: at + ed.state.doc.nodeAt(at)!.nodeSize });
-    expect(ed.getMarkdown()).toBe("Claim one.[^1] Claim two.[^2]\n\nAfter.");
+    expect(ed.getMarkdown()).toBe(expected);
   });
 
   it.each([
@@ -347,6 +343,16 @@ describe("editing a document with footnotes", () => {
     ]);
   });
 
+  it("keeps a paragraph whose text before a reference becomes whitespace", () => {
+    const ed = makeEditor("x[^1]: y\n\n[^1]: n");
+    ed.commands.insertContentAt({ from: 1, to: 2 }, " ");
+    const saved = ed.getMarkdown().replace(/\n+$/, "");
+    expect(saved).toBe(" [^1]\\: y\n\n[^1]: n");
+    const blocks: string[] = [];
+    makeEditor(saved).state.doc.forEach((block) => blocks.push(block.type.name));
+    expect(blocks).toEqual(["paragraph", "footnoteDefinitions"]);
+  });
+
   it("keeps a colon after a reference mid-paragraph unescaped", () => {
     const markdown = "see[^1]: here\n\n[^1]: n";
     const ed = makeEditor(markdown);
@@ -378,11 +384,6 @@ describe("editing a document with footnotes", () => {
     ed.commands.setNodeSelection(nodePosition(ed, "footnoteReference"));
     ed.view.dom.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     expect(ed.getMarkdown()).toBe(TWO_NOTES.replace("[^1] Claim", "[^1]\n\n Claim"));
-  });
-
-  it("returns the document itself when no reference carries marks", () => {
-    const json = makeEditor(TWO_NOTES).getJSON();
-    expect(prepareFootnoteReferences(json)).toBe(json);
   });
 
   it("keeps references and definitions through copy and paste", () => {
