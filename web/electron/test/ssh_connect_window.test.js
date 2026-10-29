@@ -136,6 +136,28 @@ describe("createSshConnectFlow", () => {
     assert.equal((await result).canceled, true);
   });
 
+  it("takes down a prompt that ssh stopped waiting for", { timeout: 5000 }, async () => {
+    const { world, flow } = harness();
+    void flow.run(null, SERVER, "my-ec2");
+    const [win] = world.windows;
+    world.sendFrom(win.webContents.id, "ssh-connect:confirm");
+    const [connect] = world.connects;
+    const asked = new AbortController();
+    const pending = connect.hooks.prompt({
+      kind: "secret",
+      text: "password: ",
+      signal: asked.signal,
+    });
+
+    asked.abort();
+
+    assert.equal(await pending, null);
+    assert.deepEqual(world.sent(win, "ssh-connect:prompt-closed"), [{ id: 1 }]);
+    // An answer typed just too late goes nowhere.
+    world.sendFrom(win.webContents.id, "ssh-connect:answer", { id: 1, answer: "pw" });
+    assert.deepEqual(world.sent(win, "ssh-connect:prompt-closed"), [{ id: 1 }]);
+  });
+
   it("treats closing before Connect as a decline and refuses a second target meanwhile", async () => {
     const { world, flow } = harness();
     const first = flow.run(null, SERVER, "my-ec2");
@@ -174,7 +196,7 @@ function renderConsole(t) {
     answer: (payload) => page.answers.push(payload),
     resizeToContent() {},
   };
-  for (const event of ["Init", "Started", "Status", "Prompt", "Output", "Done"]) {
+  for (const event of ["Init", "Started", "Status", "Prompt", "PromptClosed", "Output", "Done"]) {
     dom.window.sshConnect[`on${event}`] = (listener) => {
       page.events[event] = listener;
     };
@@ -235,6 +257,14 @@ describe("SSH connect console page", () => {
     promptEl.dispatchEvent(new document.defaultView.Event("submit", { cancelable: true }));
 
     events.Prompt({ id: 3, kind: "text", text: "Which project?" });
+    document.getElementById("prompt-cancel").click();
+
+    // ssh gave up on prompt 4; a stale close for another prompt changes nothing.
+    events.Prompt({ id: 4, kind: "secret", text: "Passphrase: " });
+    events.PromptClosed({ id: 3 });
+    assert.equal(promptEl.hidden, false);
+    events.PromptClosed({ id: 4 });
+    assert.equal(promptEl.hidden, true);
     document.getElementById("prompt-cancel").click();
 
     // Built in the page's realm, so compare plain copies.

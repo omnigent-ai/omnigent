@@ -162,12 +162,18 @@ function createSshConnectFlow({
       activeRun = null;
       resolveRun(result);
     };
-    const ask = (kind, text) =>
+    const ask = (kind, text, signal) =>
       new Promise((resolve) => {
         const id = nextPromptId;
         nextPromptId += 1;
         pending.set(id, resolve);
         send("ssh-connect:prompt", { id, kind, text });
+        // ssh stopped waiting, so take the question down instead of leaving it up.
+        signal?.addEventListener("abort", () => {
+          if (!pending.delete(id)) return;
+          resolve(null);
+          send("ssh-connect:prompt-closed", { id });
+        });
       });
     const answerAll = () => {
       for (const resolve of pending.values()) resolve(null);
@@ -177,7 +183,7 @@ function createSshConnectFlow({
     const hooks = {
       onOutput: (text) => send("ssh-connect:output", text),
       onStatus: (status) => send("ssh-connect:status", status),
-      prompt: ({ kind, text }) => ask(kind, text),
+      prompt: ({ kind, text, signal }) => ask(kind, text, signal),
       askInstall: async () =>
         (await ask(
           "install",

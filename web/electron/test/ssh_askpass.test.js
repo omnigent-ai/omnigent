@@ -46,13 +46,51 @@ describe("createAskpass", () => {
       (await askLikeSsh(askpass.env, "Trust?", { SSH_ASKPASS_PROMPT: "confirm" })).code,
       1,
     );
-    assert.deepEqual(seen, [
-      { prompt: "pat@my-ec2's password: ", hint: "" },
-      { prompt: "Trust?", hint: "confirm" },
-    ]);
+    assert.deepEqual(
+      seen.map(({ prompt, hint }) => ({ prompt, hint })),
+      [
+        { prompt: "pat@my-ec2's password: ", hint: "" },
+        { prompt: "Trust?", hint: "confirm" },
+      ],
+    );
     assert.equal(askpass.env.SSH_ASKPASS_REQUIRE, "force");
     assert.equal(fs.statSync(askpass.env.OMNIGENT_SSH_ASKPASS_SOCKET).mode & 0o077, 0);
   });
+
+  // Without the withdrawal the wait never ends, so the timeout makes it a failure.
+  it(
+    "withdraws the question when ssh's helper exits before an answer",
+    { timeout: 10000 },
+    async (t) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "askpass-test-"));
+      t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+      let prompted;
+      const asked = new Promise((resolve) => {
+        prompted = resolve;
+      });
+      const askpass = await createAskpass({
+        dir,
+        execPath: process.execPath,
+        // The user never answers.
+        onPrompt: (request) => {
+          prompted(request);
+          return new Promise(() => {});
+        },
+      });
+      t.after(() => askpass.close());
+      const helper = execFile(askpass.env.SSH_ASKPASS, ["password: "], {
+        env: { ...process.env, ...askpass.env },
+      });
+
+      const { signal } = await asked;
+      assert.equal(signal.aborted, false);
+      helper.kill();
+
+      await new Promise((resolve) => {
+        signal.addEventListener("abort", resolve);
+      });
+    },
+  );
 
   it("refuses a caller without the token", async (t) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "askpass-test-"));

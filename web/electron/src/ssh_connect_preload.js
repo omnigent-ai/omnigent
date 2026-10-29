@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld("sshConnect", {
   onStatus: (callback) => on("ssh-connect:status", callback),
   /** `{ id, kind, text }`; kind is confirm, secret, text or install. */
   onPrompt: (callback) => on("ssh-connect:prompt", callback),
+  /** `{ id }`: ssh stopped waiting for that prompt's answer. */
+  onPromptClosed: (callback) => on("ssh-connect:prompt-closed", callback),
   onOutput: (callback) => on("ssh-connect:output", callback),
   /** `{ ok, error }`. */
   onDone: (callback) => on("ssh-connect:done", callback),

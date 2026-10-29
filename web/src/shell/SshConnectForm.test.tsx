@@ -1,7 +1,14 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { fetchHosts, type Host } from "@/hooks/useHosts";
 import { SshConnectForm } from "./SshConnectForm";
+
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
+
+function online(...hostIds: string[]): Host[] {
+  return hostIds.map((hostId) => ({ host_id: hostId, status: "online" }) as Host);
+}
 
 interface Desktop {
   kind: "electron";
@@ -34,6 +41,8 @@ function connect(destination: string) {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
+  vi.mocked(fetchHosts).mockReset().mockResolvedValue([]);
   delete (window as unknown as { omnigentDesktop?: Desktop }).omnigentDesktop;
 });
 
@@ -74,6 +83,30 @@ describe("SshConnectForm", () => {
 
     expect(await screen.findByTestId("ssh-connect-message")).toHaveTextContent(
       "my-ec2 was already connected to this server.",
+    );
+    expect(onConnected).not.toHaveBeenCalled();
+  });
+
+  it("selects the host that came online when the shell couldn't read its id", async () => {
+    // Before the connect, then once the new machine registered.
+    vi.mocked(fetchHosts).mockResolvedValueOnce(online("h1")).mockResolvedValue(online("h1", "h2"));
+    const { onConnected } = renderForm({ ok: true, alreadyRunning: false, identity: null });
+
+    connect("my-ec2");
+
+    await waitFor(() => expect(onConnected).toHaveBeenCalledWith("h2"));
+  });
+
+  it("stays open, keeping the previous host, when the new one never appears", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.mocked(fetchHosts).mockResolvedValue(online("h1"));
+    const { onConnected } = renderForm({ ok: true, alreadyRunning: false, identity: null });
+
+    connect("my-ec2");
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    expect(await screen.findByTestId("ssh-connect-message")).toHaveTextContent(
+      "my-ec2 is connected, but its host hasn't appeared yet.",
     );
     expect(onConnected).not.toHaveBeenCalled();
   });

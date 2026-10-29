@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { connectSshHost, getDesktopFeatures, supportsSshConnect } from "@/lib/nativeBridge";
+import { fetchOnlineHostIds, waitForNewOnlineHost } from "./waitForNewOnlineHost";
 
 /**
  * Whether to offer the SSH connect form: the desktop shell can connect over SSH,
@@ -32,8 +33,8 @@ export function useSshConnectAvailable(): boolean {
 export function SshConnectForm({
   onConnected,
 }: {
-  /** Called with the new host's id, or null when the shell couldn't read it. */
-  onConnected?: (hostId: string | null) => void;
+  /** Called with the new host's id, once it is known. */
+  onConnected?: (hostId: string) => void;
 }) {
   const queryClient = useQueryClient();
   const inputId = useId();
@@ -47,6 +48,8 @@ export function SshConnectForm({
     if (!target || connecting) return;
     setConnecting(true);
     setMessage(null);
+    // Taken before the host can register, to find it if the shell can't read its id.
+    const onlineBefore = fetchOnlineHostIds(queryClient).catch(() => null);
     try {
       const res = await connectSshHost(target);
       if (!res.ok) {
@@ -57,15 +60,31 @@ export function SshConnectForm({
         return;
       }
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-      if (!res.identity && res.alreadyRunning) {
-        // Stay open: closing the dialog would hide this message.
+      if (res.identity) {
+        onConnected?.(res.identity.hostId);
+        return;
+      }
+      // Stay open whenever the host isn't known: closing would keep the previous host
+      // selected, so the next session would run there.
+      if (res.alreadyRunning) {
         setMessage({
           kind: "info",
           text: `${target} was already connected to this server. Pick it from the host list.`,
         });
         return;
       }
-      onConnected?.(res.identity?.hostId ?? null);
+      const before = await onlineBefore;
+      const hostId = before
+        ? await waitForNewOnlineHost(queryClient, before).catch(() => null)
+        : null;
+      if (hostId) {
+        onConnected?.(hostId);
+        return;
+      }
+      setMessage({
+        kind: "info",
+        text: `${target} is connected, but its host hasn't appeared yet. Pick it from the host list when it does.`,
+      });
     } finally {
       setConnecting(false);
     }

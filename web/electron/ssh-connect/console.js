@@ -152,6 +152,13 @@ promptEl.addEventListener("submit", (event) => {
   finishPrompt({ answer: kind === "confirm" || kind === "install" ? "yes" : promptInput.value });
 });
 promptCancel.addEventListener("click", () => finishPrompt({ cancel: true }));
+window.sshConnect.onPromptClosed(({ id }) => {
+  if (id !== activePromptId) return;
+  activePromptId = null;
+  promptInput.value = "";
+  promptEl.hidden = true;
+  resizeToContent();
+});
 promptEl.addEventListener("keydown", (event) => {
   if (event.key === "Escape") finishPrompt({ cancel: true });
 });

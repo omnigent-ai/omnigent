@@ -782,8 +782,8 @@ function startSshConnect(serverUrl, destination, deps) {
       fs.chmodSync(dir, 0o700);
       askpass = await (deps.createAskpass ?? createAskpass)({
         dir,
-        onPrompt: ({ prompt, hint }) =>
-          hooks.prompt({ kind: classifyPrompt(prompt, hint), text: prompt }),
+        onPrompt: ({ prompt, hint, signal }) =>
+          hooks.prompt({ kind: classifyPrompt(prompt, hint), text: prompt, signal }),
       });
       session = (deps.createSession ?? createSshSession)({
         destination: target,

@@ -74,10 +74,11 @@ function tokensMatch(given, expected) {
  *
  * @param {{
  *   dir: string,
- *   onPrompt: (request: { prompt: string, hint: string }) => Promise<string | null>,
+ *   onPrompt: (request: { prompt: string, hint: string, signal: AbortSignal }) => Promise<string | null>,
  *   execPath?: string,
  * }} options `dir` must be private to this user (mode 0700). `onPrompt`
- *   resolves with the answer, or null when the user cancels.
+ *   resolves with the answer, or null when the user cancels; `signal` aborts
+ *   when ssh stops waiting for the answer.
  * @returns {Promise<{ env: Record<string, string>, close: () => void }>} The
  *   environment to give ssh, and a function that stops the socket.
  */
@@ -95,6 +96,9 @@ async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
 
   const server = net.createServer((socket) => {
     let request = "";
+    // The helper exits when ssh gives up (say, a timeout), so its question is moot.
+    const asked = new AbortController();
+    socket.on("close", () => asked.abort());
     socket.setEncoding("utf8");
     socket.on("error", () => {});
     const onData = (chunk) => {
@@ -118,7 +122,11 @@ async function createAskpass({ dir, onPrompt, execPath = process.execPath }) {
       }
       Promise.resolve()
         .then(() =>
-          onPrompt({ prompt: String(parsed.prompt ?? ""), hint: String(parsed.hint ?? "") }),
+          onPrompt({
+            prompt: String(parsed.prompt ?? ""),
+            hint: String(parsed.hint ?? ""),
+            signal: asked.signal,
+          }),
         )
         .catch(() => null)
         .then((answer) => {

@@ -540,6 +540,7 @@ describe("startSshConnect", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ssh-connect-test-"));
     let onPrompt;
     const prompts = [];
+    const asked = new AbortController();
     const { promise } = startSshConnect(SERVER, "my-ec2", {
       hooks: {
         onOutput: () => {},
@@ -559,7 +560,8 @@ describe("startSshConnect", () => {
       },
       createSession: () => ({
         open: async () => {
-          assert.equal(await onPrompt({ prompt: "pat@my-ec2's password: ", hint: "" }), "pw");
+          const request = { prompt: "pat@my-ec2's password: ", hint: "", signal: asked.signal };
+          assert.equal(await onPrompt(request), "pw");
           throw new SshConnectError(describeSshFailure(255, "Permission denied", "my-ec2"));
         },
         close: async () => {},
@@ -569,7 +571,10 @@ describe("startSshConnect", () => {
 
     const result = await promise;
 
-    assert.deepEqual(prompts, [{ kind: "secret", text: "pat@my-ec2's password: " }]);
+    assert.deepEqual(prompts, [
+      { kind: "secret", text: "pat@my-ec2's password: ", signal: asked.signal },
+    ]);
+    assert.equal(prompts[0].signal, asked.signal);
     assert.equal(result.ok, false);
     assert.match(result.error, /didn't accept your sign-in/);
     assert.equal(fs.existsSync(dir), false);
