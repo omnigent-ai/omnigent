@@ -1,6 +1,6 @@
 // ⌘[ / ⌘] (Ctrl+[ / Ctrl+] on Win/Linux), the desktop Go menu, trackpad swipes,
-// and the mouse back/forward buttons step back and forward through in-app
-// navigation history. Bind ONCE.
+// the mouse back/forward buttons, and the sidebar's Back/Forward buttons step
+// back and forward through in-app navigation history. Bind ONCE.
 
 import { useCallback, useEffect, useState } from "react";
 
@@ -8,10 +8,14 @@ import { useDesktopCommand } from "@/lib/desktopCommands";
 import { useIsEmbedded } from "@/lib/embedded";
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
 import { isElectronShell } from "@/lib/nativeBridge";
-import { useNavigate } from "@/lib/routing";
+import { useLocation, useNavigate, useNavigationType } from "@/lib/routing";
 
 /** Surfaces that keep bracket chords (Monaco outdent/indent, the PTY, the palette). */
 const BRACKET_OWNING_SURFACES = ".xterm, .monaco-editor, [cmdk-input]";
+/** Sent by the Back/Forward buttons; the bound hook takes the step. */
+const HISTORY_NAVIGATION_REQUEST_EVENT = "omnigent:history-navigation";
+
+export type HistoryNavigationDirection = -1 | 1;
 
 /** React Router's position in the history stack. */
 function historyIndex(): number {
@@ -25,6 +29,24 @@ function historyIndex(): number {
  */
 let firstAppEntry = 0;
 
+/** The last entry Forward can reach; a push drops the entries after it. */
+let lastReachableIndex: number | null = null;
+
+/** Whether Back and Forward have an in-app entry to step to, for the buttons. */
+export function useHistoryNavigationAvailability(): { canGoBack: boolean; canGoForward: boolean } {
+  useLocation();
+  const navigationType = useNavigationType();
+  const index = historyIndex();
+  if (lastReachableIndex === null || navigationType === "PUSH") lastReachableIndex = index;
+  else lastReachableIndex = Math.max(lastReachableIndex, index);
+  return { canGoBack: index > firstAppEntry, canGoForward: index < lastReachableIndex };
+}
+
+/** Step back or forward the way ⌘[ / ⌘] do. */
+export function requestHistoryNavigation(direction: HistoryNavigationDirection): void {
+  window.dispatchEvent(new CustomEvent(HISTORY_NAVIGATION_REQUEST_EVENT, { detail: direction }));
+}
+
 export function useHistoryNavigation(isMac = isMacPlatform()): void {
   const navigate = useNavigate();
   const embedded = useIsEmbedded();
@@ -34,7 +56,7 @@ export function useHistoryNavigation(isMac = isMacPlatform()): void {
   });
   // Back stops at the first in-app entry rather than leaving for a sign-in or setup page.
   const go = useCallback(
-    (delta: -1 | 1) => {
+    (delta: HistoryNavigationDirection) => {
       if (delta === -1 && historyIndex() <= firstAppEntry) return;
       void navigate(delta);
     },
@@ -60,11 +82,15 @@ export function useHistoryNavigation(isMac = isMacPlatform()): void {
       event.preventDefault();
       go(delta);
     };
+    const onRequest = (event: Event) =>
+      go((event as CustomEvent<HistoryNavigationDirection>).detail);
     const electron = isElectronShell();
     window.addEventListener("keydown", onKeyDown);
+    window.addEventListener(HISTORY_NAVIGATION_REQUEST_EVENT, onRequest);
     if (electron) window.addEventListener("mouseup", onMouseUp);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener(HISTORY_NAVIGATION_REQUEST_EVENT, onRequest);
       if (electron) window.removeEventListener("mouseup", onMouseUp);
     };
   }, [go, isMac]);

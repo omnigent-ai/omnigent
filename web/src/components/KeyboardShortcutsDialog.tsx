@@ -1,7 +1,7 @@
 // A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
 // exist in the chat surface. It is intentionally a mirror of the live
 // behavior — every row here corresponds to a handler that ships today
-// (composer `handleKeyDown`, the global session-switch / message-nav hotkeys,
+// (composer `handleKeyDown`, the global history / message-nav hotkeys,
 // and the approve hotkey). Nothing here binds new behavior except the dialog's
 // own opener (⌘/Ctrl + /), which this component registers.
 //
