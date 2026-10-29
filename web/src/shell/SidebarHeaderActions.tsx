@@ -1,8 +1,17 @@
-import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ArrowRightIcon,
+  PanelLeftOpenIcon,
+  PanelRightOpenIcon,
+  SearchIcon,
+  SettingsIcon,
+} from "lucide-react";
 
 import {
   ARIA_MOD_KEY,
+  BACK_KEYS,
   COMMAND_PALETTE_KEYS,
+  FORWARD_KEYS,
   settingsAriaShortcut,
   settingsShortcutKeys,
   sidebarToggleAriaShortcut,
@@ -11,13 +20,17 @@ import {
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  requestHistoryNavigation,
+  useHistoryNavigationAvailability,
+} from "@/hooks/useHistoryNavigation";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "./MobileHeaderButton";
 
 /**
- * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
+ * Navigation, Search, Settings, and sidebar-toggle controls from the header row.
  *
  * Extracted so it can render in TWO places without duplicating the markup:
  * inside the sidebar (every browser and non-mac platform, and the macOS shell
@@ -70,6 +83,9 @@ export function SidebarHeaderActions({
   onTogglePointerDown?: () => void;
   onTogglePointerLeave?: () => void;
 }) {
+  const { canGoBack, canGoForward } = useHistoryNavigationAvailability();
+  const hasNavigationHistory = canGoBack || canGoForward;
+
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
       <Tooltip>
@@ -108,6 +124,49 @@ export function SidebarHeaderActions({
         <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       )}
       <SidebarSearchButton onOpenSearch={onOpenSearch} />
+      <div
+        className={cn("flex items-center gap-1 max-md:hidden", !hasNavigationHistory && "hidden")}
+        data-testid="history-navigation-buttons"
+      >
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Back"
+              aria-keyshortcuts={`${ARIA_MOD_KEY}+[`}
+              disabled={!canGoBack}
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={() => requestHistoryNavigation(-1)}
+            >
+              <ArrowLeftIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" shortcut={BACK_KEYS}>
+            <span>Back</span>
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Forward"
+              aria-keyshortcuts={`${ARIA_MOD_KEY}+]`}
+              disabled={!canGoForward}
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={() => requestHistoryNavigation(1)}
+            >
+              <ArrowRightIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" shortcut={FORWARD_KEYS}>
+            <span>Forward</span>
+          </TooltipContent>
+        </Tooltip>
+      </div>
     </div>
   );
 }
