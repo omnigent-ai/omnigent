@@ -67,7 +67,7 @@ from omnigent.runner.resource_registry import (
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
-from omnigent.runner.slow_io import run_slow_io
+from omnigent.runner.slow_io import run_provider_cli, run_slow_io
 from omnigent.spec.types import AgentSpec
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
 from omnigent.terminals.ws_common import WS_CLOSE_TERMINAL_NOT_FOUND
@@ -1369,7 +1369,7 @@ def register_resource_routes(
                 return function(root, session_id=session_id, **kwargs)
 
         try:
-            result = await run_slow_io(call)
+            result = await run_provider_cli(call)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(status_code=200, content=result)
