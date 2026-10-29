@@ -14,7 +14,7 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer, webFrame } = require("electron");
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
@@ -120,6 +120,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory: (defaultPath) => ipcRenderer.invoke("omnigent:choose-directory", defaultPath),
+  /**
+   * This machine's path for a File dropped from the OS file manager. Resolves
+   * "" when it has none or the page isn't the pinned server.
+   */
+  getPathForFile: (file) =>
+    ipcRenderer.invoke("omnigent:dropped-file-path", webUtils.getPathForFile(file)),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
@@ -151,7 +159,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
    * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
    */
-  refreshDbcert: () => ipcRenderer.invoke("omnigent:dbcert-refresh"),
+  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
+  /** Check the laptop's dbcert without starting sign-in. */
+  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
@@ -324,7 +334,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Whether a view already exists for a conversation — lets a re-mounting pane
    * re-attach it without waiting for a fresh create event.
    * @param {string} conversationId
-   * @returns {Promise<{ exists: boolean }>}
+   * @returns {Promise<{ exists: boolean, url?: string, pendingUrl?: string, title?: string, canGoBack?: boolean, canGoForward?: boolean }>}
    */
   browserHasView: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-has-view", { conversationId }),
@@ -374,9 +384,36 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
   /**
-   * Subscribe to the real url of a view as it navigates (redirects, links,
-   * back/forward) so the URL bar stays honest. Returns an unsubscribe.
-   * @param {(payload: { conversationId: string, url: string }) => void} callback
+   * Inspect the user's local Google Chrome profiles for cookies in the site
+   * tree the conversation's view is currently on. Metadata only (profile name +
+   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * @param {string} conversationId
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   */
+  browserChromeCookiePreview: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
+  /**
+   * Copy ONLY that site's cookies out of one Chrome profile into the
+   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
+   * first import shows a system approval prompt. `expectedHost` must still match
+   * the view's site.
+   * @param {string} conversationId
+   * `scope` is the site tree to copy (the page's host or a parent domain); main
+   * rejects anything that isn't an ancestor of the page.
+   * @param {{ profileId: string, expectedHost: string, scope?: string }} args
+   * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
+   */
+  browserChromeCookieImport: (conversationId, args) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-import", {
+      conversationId,
+      profileId: args?.profileId,
+      expectedHost: args?.expectedHost,
+      scope: args?.scope,
+    }),
+  /**
+   * Subscribe to URL and title changes, including background views, so the
+   * address bar and tab labels stay current. Returns an unsubscribe.
+   * @param {(payload: { conversationId: string, url: string, title?: string }) => void} callback
    * @returns {() => void}
    */
   onBrowserUrlChanged: (callback) => {

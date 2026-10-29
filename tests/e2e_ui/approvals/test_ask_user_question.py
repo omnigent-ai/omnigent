@@ -30,11 +30,12 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _log = logging.getLogger(__name__)
 
@@ -59,16 +60,6 @@ def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
     return resp.json().get("pending_elicitations") or []
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 def _post_ask_user_question(base_url: str, session_id: str, holder: dict) -> threading.Thread:
@@ -151,7 +142,7 @@ def test_ask_user_question_form_renders_and_submits(
             "error"
         ]
 
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
 
 
 @pytest.mark.timeout(180)
@@ -185,7 +176,7 @@ def test_answered_question_stays_outside_the_worked_fold(
 
     # The turn is now blocked on the mock gate, its first tool call already
     # rendered — the window the question lands in.
-    _wait_for(lambda: httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"])
+    poll_until(lambda: httpx.get(f"{mock_url}/gate/pending", timeout=5.0).json()["pending"])
 
     result_holder: dict = {}
     hook_thread = _post_ask_user_question(base_url, session_id, result_holder)

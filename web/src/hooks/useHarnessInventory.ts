@@ -87,24 +87,30 @@ export interface HarnessInventory {
 }
 
 /** Wire shape of `GET /v1/hosts/{host_id}/mcp-servers`. */
-interface McpServerWire {
+export interface HostMcpServer {
   name: string;
   harness: string;
   transport: "stdio" | "http";
   scope: "user";
+  /** Pinned for every user on the host by an organization; not the user's to edit. */
+  managed?: boolean;
   plugin?: string | null;
   source_id?: string | null;
   url_host?: string | null;
+  /** Account state from the host's sign-in manager; absent when nothing reports one. */
+  auth_status?: "connected" | "sign_in_required" | null;
+  /** Where to finish signing in; only present with `sign_in_required`. */
+  sign_in_url?: string | null;
 }
 
-async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<McpServerWire[]> {
+async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<HostMcpServer[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers`, {
     signal,
   });
   if (!response.ok) {
     throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
   }
-  const body = (await response.json()) as { mcp_servers?: McpServerWire[] };
+  const body = (await response.json()) as { mcp_servers?: HostMcpServer[] };
   if (!Array.isArray(body.mcp_servers)) throw new Error("Invalid host MCP servers response");
   return body.mcp_servers;
 }
@@ -132,7 +138,7 @@ export function installedHarnesses(host: Host): BrandHarness[] {
   });
 }
 
-function isBrandHarness(value: string): value is BrandHarness {
+export function isBrandHarness(value: string): value is BrandHarness {
   return (BRAND_HARNESSES as readonly string[]).includes(value);
 }
 
@@ -157,7 +163,7 @@ export function buildInventoryContext(
   host: Host,
   harnesses: BrandHarness[],
   skillsByHarness: Partial<Record<BrandHarness, SkillSummary[]>>,
-  mcpServers: McpServerWire[],
+  mcpServers: HostMcpServer[],
 ): HarnessInventoryContext {
   const context: HarnessInventoryContext = { credentials: [], mcps: [], skills: [], plugins: [] };
   for (const harness of harnesses) {
@@ -195,6 +201,22 @@ export function buildInventoryContext(
     }
   }
   return context;
+}
+
+/** Read the user-level MCP servers a connected host exposes to its native harnesses. */
+export function useHostMcpServers(
+  hostId: string | null,
+  enabled = true,
+  /** Re-read while this says so, judged from the servers last read (default: never). */
+  refetchInterval: (servers: HostMcpServer[] | undefined) => number | false = () => false,
+) {
+  return useQuery({
+    queryKey: ["host-mcp-servers", hostId],
+    queryFn:
+      enabled && hostId !== null ? ({ signal }) => fetchMcpServers(hostId, signal) : skipToken,
+    staleTime: 30_000,
+    refetchInterval: (query) => refetchInterval(query.state.data),
+  });
 }
 
 /** The server answers 409 while the host's tunnel isn't connected yet. */

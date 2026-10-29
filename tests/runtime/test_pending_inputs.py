@@ -151,6 +151,35 @@ def test_cancelled_lifecycle_is_drained_as_interrupted_not_missing() -> None:
     assert interrupted.reason_code == "response_cancelled"
 
 
+@pytest.mark.parametrize("mismatch", [None, "session", "pending", "attempt", "stable", "missing"])
+def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
+    mismatch: str | None,
+) -> None:
+    first = pending_inputs.record("conv", [_text_block("first")])
+    second = pending_inputs.record("conv", [_text_block("second")])
+    identity = pending_inputs.delivery_attributes_for("conv", first)
+    attempt = str(identity["delivery_attempt_id"])
+
+    matched = pending_inputs.mark_lifecycle(
+        "other" if mismatch == "session" else "conv",
+        "a" * 32 if mismatch == "stable" else None,
+        pending_id=second if mismatch == "pending" else first,
+        delivery_attempt_id=(
+            "b" * 32 if mismatch == "attempt" else None if mismatch == "missing" else attempt
+        ),
+        stage="native_turn_completed",
+    )
+
+    assert matched == (first if mismatch is None else None)
+    assert pending_inputs.delivery_attributes_for("conv", first)["last_delivery_stage"] == (
+        "native_turn_completed" if mismatch is None else "server_queued"
+    )
+    assert (
+        pending_inputs.delivery_attributes_for("conv", second)["last_delivery_stage"]
+        == "server_queued"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """
@@ -765,6 +794,33 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert matched.matched is not None and matched.matched.pending_id == third
     assert matched.skipped == []
     assert [entry.pending_id for entry in matched.uncertain] == [second]
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_restoring_a_removed_entry_preserves_its_missing_record_disposition(
+    hold: bool, uncertain: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eviction or non-held drain must not turn an ambiguous receipt into a loss."""
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    if uncertain:
+        pending_inputs.mark_uncertain("conv_a")
+    drained = pending_inputs.resolve_oldest("conv_a", hold=hold)
+    assert drained is not None
+    if hold:
+        now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+    pending_inputs.restore("conv_a", drained)
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_a", "later")
+
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert [entry.pending_id for entry in matched.uncertain] == ([first] if uncertain else [])
+    assert [entry.pending_id for entry in matched.skipped] == ([] if uncertain else [first])
     assert pending_inputs.snapshot_for("conv_a") == []
 
 

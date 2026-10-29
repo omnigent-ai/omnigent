@@ -17,18 +17,24 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
-/** True when `id` is the focused conversation and its agent loop is live. */
+/** True while this session’s agent loop is live, including visible grid panes. */
 export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  if (!conversationId || conversationId !== focusedId) return false;
-  return sessionStatus === "running" || sessionStatus === "waiting";
+  const gridEnabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
+  const scoped = useConversationEntryState(gridEnabled ? (conversationId ?? null) : null);
+  const status =
+    conversationId === focusedId ? sessionStatus : gridEnabled ? scoped.sessionStatus : null;
+  return !!conversationId && (status === "running" || status === "waiting");
 }
 
 /**
@@ -185,6 +191,37 @@ function useRunnerRecovering(conversationId: string | undefined): boolean {
   return isLoading || liveness.kind === "starting";
 }
 
+/**
+ * The `retry` option for a runner-backed query: retry a runner-offline error
+ * only while `allowed`, read when each retry is decided. TanStack keeps the
+ * `retry` a fetch started with for its whole chain, so a gate captured in that
+ * closure kept its page-load value ("snapshot still loading → retry") and
+ * retried an asleep sandbox for two minutes.
+ */
+export function useRunnerOfflineRetry(allowed: boolean) {
+  const allowedRef = useRef(allowed);
+  allowedRef.current = allowed;
+  return useCallback(
+    (failureCount: number, error: Error) =>
+      allowedRef.current && shouldRetryRunnerOffline(failureCount, error),
+    [],
+  );
+}
+
+/**
+ * Whether the session's resumable managed sandbox is asleep (`host_asleep`):
+ * neither its runner nor its host can serve the workspace until a message
+ * wakes it.
+ */
+export function useWorkspaceAsleep(conversationId: string | undefined): boolean {
+  const { session } = useSession(conversationId);
+  const turnActive = useSessionActive(conversationId);
+  const liveness = useSessionLiveness(conversationId, livenessRowFromSession(session), {
+    turnActive,
+  });
+  return liveness.kind === "host_asleep";
+}
+
 /** Whether `res` is the app's runner-offline 503 response. */
 export async function isRunnerUnavailable503(res: Response): Promise<boolean> {
   if (res.status !== 503) return false;
@@ -269,7 +306,7 @@ export function useWorkspaceChangedFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
-  const recovering = useRunnerRecovering(conversationId);
+  const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -283,7 +320,7 @@ export function useWorkspaceChangedFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     // No polling: the SSE ``session.changed_files.invalidated`` event
     // (runner-emitted after file-mutating tools, throttled) drives
@@ -410,7 +447,7 @@ export function useWorkspaceAllFiles(
 ) {
   const queryEnabled = options.enabled ?? true;
   const serveable = useWorkspaceServeable(conversationId);
-  const recovering = useRunnerRecovering(conversationId);
+  const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   const environmentQuery = useWorkspaceEnvironment(conversationId, {
     enabled: queryEnabled,
   });
@@ -424,7 +461,7 @@ export function useWorkspaceAllFiles(
       !!conversationId &&
       serveable !== false &&
       environmentQuery.data?.available === true,
-    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     // Keep the tree warm on revisits: within staleTime a return to a
     // previously-loaded conversation/location paints its cached tree with no
@@ -720,6 +757,8 @@ export function resolveChatFilePath(
   // any stripping so a "trusted" absolute path doesn't carry these markers
   // past the existence-check heuristic and trigger a fetch that can't match.
   if (text.includes("://") || text.includes("?") || text.includes("#")) return null;
+  // Windows paths (`C:\x`, `\\host\x`) would otherwise pass as one relative segment.
+  if (/^[A-Za-z]:/.test(text) || text.includes("\\")) return null;
   let p = text;
   if (home && (p === "~" || p.startsWith("~/"))) {
     // Strip a trailing slash off home so "/" home (root user) doesn't
@@ -980,12 +1019,12 @@ export function useWorkspaceEnvironment(
   // that gate on its result) hits `/v1/sessions/temp:*/resources/*`.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
-  const recovering = useRunnerRecovering(conversationId);
+  const retry = useRunnerOfflineRetry(useRunnerRecovering(conversationId));
   return useQuery({
     queryKey: ["workspace-environment", conversationId],
     queryFn: () => fetchWorkspaceEnvironment(conversationId!),
     enabled: (options.enabled ?? true) && !!conversationId && serveable !== false,
-    retry: (failureCount, error) => recovering && shouldRetryRunnerOffline(failureCount, error),
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 60_000,
   });

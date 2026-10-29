@@ -39,6 +39,8 @@ const STATUS_TIMEOUT_MS = 60_000;
 const EXTEND_TIMEOUT_MS = 120_000;
 /** A dbcert refresh waits for the user to finish its browser sign-in. */
 const DBCERT_REFRESH_TIMEOUT_MS = 5 * 60 * 1000;
+const DBCERT_STATUS_TIMEOUT_MS = 10_000;
+const DBCERT_ARCA_SYNC_TIMEOUT_MS = 60_000;
 const ARCA_EXTEND_MODES = Object.freeze(["overnight", "workweek"]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
 const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
@@ -382,7 +384,7 @@ function parseArcaStatus(stdout) {
  * Run a headless Arca command and capture both output streams.
  * @param {string} arcaPath
  * @param {string[]} args
- * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number }} options
+ * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number, env?: NodeJS.ProcessEnv }} options
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
  */
 function runArca(arcaPath, args, options) {
@@ -392,6 +394,7 @@ function runArca(arcaPath, args, options) {
       child = (options.spawn || spawn)(arcaPath, args, {
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
+        ...(options.env ? { env: options.env } : {}),
       });
     } catch (error) {
       resolve({ code: null, stdout: "", stderr: "", spawnError: error });
@@ -855,27 +858,43 @@ function resolveDbcertPathAsync(deps = {}) {
 
 /**
  * Renew this machine's dbcert with `dbcert --force`, which signs in through
- * the browser. dbcert then syncs the primary Arca itself, and Arca Companion,
- * which watches `~/.dbcert`, copies the new certificate to the user's other
- * Arcas and Arclets. `--force` mints a new certificate even while this
+ * the browser. Unless skipped, dbcert syncs the primary Arca itself. Arca Companion
+ * watches `~/.dbcert` and copies the certificate to the user's Arcas and Arclets.
+ * `--force` mints a new certificate even while this
  * machine's is valid, so a box that missed the last copy gets one too.
  *
- * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
+ * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number, skipArcaSync?: boolean }} [deps]
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
 async function runDbcertRefresh(deps = {}) {
+  return runDbcertCommand(
+    ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
+    "sign-in",
+    deps,
+  );
+}
+
+async function runDbcertArcaSync(deps = {}) {
+  return runDbcertCommand(["sync-arca"], "Arca sync", {
+    ...deps,
+    timeoutMs: deps.timeoutMs ?? DBCERT_ARCA_SYNC_TIMEOUT_MS,
+  });
+}
+
+async function runDbcertCommand(args, action, deps) {
   try {
     const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
     if (!dbcertPath) return { ok: false, error: "dbcert was not found on this machine." };
-    const run = await runArca(dbcertPath, ["--force", "--caller-name", "omnigent"], {
+    const run = await runArca(dbcertPath, args, {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? DBCERT_REFRESH_TIMEOUT_MS,
       killGraceMs: deps.killGraceMs,
       maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
+      ...(deps.skipArcaSync ? { env: { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } } : {}),
     });
     if (run.spawnError)
       return { ok: false, error: `Couldn't run dbcert: ${run.spawnError.message}` };
-    if (run.timedOut) return { ok: false, error: "The dbcert sign-in timed out." };
+    if (run.timedOut) return { ok: false, error: `The dbcert ${action} timed out.` };
     if (run.code !== 0) {
       const output = run.stderr.trim() || run.stdout.trim();
       return {
@@ -889,12 +908,54 @@ async function runDbcertRefresh(deps = {}) {
   }
 }
 
+/** Check both SSH and X.509 credentials without starting an interactive login. */
+async function readDbcertStatus(dbcertPath, deps) {
+  const run = await runArca(dbcertPath, ["status"], {
+    spawn: deps.spawn,
+    timeoutMs: deps.timeoutMs ?? DBCERT_STATUS_TIMEOUT_MS,
+    killGraceMs: deps.killGraceMs,
+    maxOutputBytes: 0,
+  });
+  if (run.spawnError || run.code === null || run.timedOut) {
+    return {
+      ok: false,
+      error: "Couldn't check your laptop's dbcert. Try again, or check dbcert in Arca Companion.",
+    };
+  }
+  if (run.code !== 0 && run.code !== 1) {
+    return { ok: false, error: `Couldn't check your laptop's dbcert (exit ${run.code}).` };
+  }
+  return { ok: true, valid: run.code === 0 };
+}
+
+/**
+ * Check local credentials before provisioning an Arclet without starting sign-in.
+ * @param {Parameters<typeof runDbcertRefresh>[0]} [deps]
+ * @returns {Promise<{ ok: true, valid: boolean } | { ok: false, error: string }>}
+ */
+async function checkDbcert(deps = {}) {
+  try {
+    const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
+    if (!dbcertPath) {
+      return {
+        ok: false,
+        error: "dbcert is not installed on this laptop. Install dbcert, then try again.",
+      };
+    }
+    return await readDbcertStatus(dbcertPath, deps);
+  } catch {
+    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
+  }
+}
+
 module.exports = {
   ARCA_EXTEND_MODES,
   STATUS_TIMEOUT_MS,
   EXTEND_TIMEOUT_MS,
   DBCERT_REFRESH_TIMEOUT_MS,
   runDbcertRefresh,
+  runDbcertArcaSync,
+  checkDbcert,
   parseArcaStatus,
   readArcaStatus,
   runArcaExtend,

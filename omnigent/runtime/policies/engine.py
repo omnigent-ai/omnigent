@@ -18,6 +18,8 @@ from typing import Any
 
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.policies.base import Policy
+from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.schema import AUTOMATIC_RUNTIME_STATE_KEYS, is_reserved_state_key
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
@@ -466,6 +468,11 @@ class PolicyEngine:
             caller can see what *would* have been written.
         :returns: Composed DENY :class:`PolicyResult`.
         """
+        accumulated_state = [
+            op
+            for op in accumulated_state
+            if not is_reserved_state_key(op.key) or op.key in AUTOMATIC_RUNTIME_STATE_KEYS
+        ]
         if not read_only:
             self.apply_state_updates(accumulated_state)
             self.apply_label_writes(accumulated)
@@ -539,7 +546,7 @@ class PolicyEngine:
         self._store.set_labels(self._conversation_id, filtered)
         self._labels.update(filtered)
 
-    def apply_state_updates(self, updates: list[StateUpdate]) -> None:
+    def apply_state_updates(self, updates: list[StateUpdate], *, approved: bool = False) -> None:
         """
         Apply structured :class:`StateUpdate` operations to the
         hot session-state cache and persist the result.
@@ -556,11 +563,22 @@ class PolicyEngine:
         persisted to the conversation store so session state
         survives across turns.
 
+        :param approved: True only after an ASK has received human approval.
         :param updates: Ordered list of :class:`StateUpdate`
             operations, e.g.
             ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
             Empty list returns immediately.
         """
+        # Validate the entire batch before writing any state or approval store.
+        for op in updates:
+            if not isinstance(op.key, str):
+                raise TypeError("Policy state keys must be strings")
+            if (
+                is_reserved_state_key(op.key)
+                and op.key not in AUTOMATIC_RUNTIME_STATE_KEYS
+                and not approved
+            ):
+                raise ValueError("Reserved policy state requires an approved ASK")
         if not updates:
             return
         from omnigent.policies.schema import (
@@ -1079,6 +1097,17 @@ async def _dispatch_policy(
     """
     try:
         result = await policy.evaluate(ctx, context)
+        for op in result.state_updates or []:
+            if not isinstance(op.key, str):
+                raise TypeError("Policy state keys must be strings")
+            if op.key in AUTOMATIC_RUNTIME_STATE_KEYS:
+                if (
+                    not isinstance(policy, FunctionPolicy)
+                    or op.key not in policy.runtime_state_keys
+                ):
+                    raise ValueError("Runtime counters require their builtin policy")
+            elif is_reserved_state_key(op.key) and result.action != PolicyAction.ASK:
+                raise ValueError("Reserved policy state requires an ASK")
     except Exception as exc:
         return PolicyResult(
             action=PolicyAction.DENY,

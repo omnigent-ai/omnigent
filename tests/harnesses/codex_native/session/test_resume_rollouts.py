@@ -537,32 +537,40 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     )
 
 
-def _replayed_function_calls(arguments: str) -> list[dict[str, Any]]:
+def _replayed_function_calls(arguments: str, *, compacted: bool = False) -> list[dict[str, Any]]:
     """Rebuild a rollout holding one call with ``arguments`` and its output."""
+    call = {
+        "id": "fc_patch",
+        "response_id": "codex_turn_1",
+        "type": "function_call",
+        "name": "apply_patch",
+        "namespace": "functions",
+        "arguments": arguments,
+        "call_id": "call_patch",
+    }
+    items = [
+        call,
+        {
+            "id": "fco_patch",
+            "response_id": "codex_turn_1",
+            "type": "function_call_output",
+            "call_id": "call_patch",
+            "output": "delete /workspace/fixtures/big.json",
+        },
+    ]
+    if compacted:
+        items = [{"type": "compaction", "compacted_messages": items}]
     records = codex_native._codex_rollout_records_from_session_items(
-        [
-            {
-                "id": "fc_patch",
-                "response_id": "codex_turn_1",
-                "type": "function_call",
-                "name": "apply_patch",
-                "arguments": arguments,
-                "call_id": "call_patch",
-            },
-            {
-                "id": "fco_patch",
-                "response_id": "codex_turn_1",
-                "type": "function_call_output",
-                "call_id": "call_patch",
-                "output": "delete /workspace/fixtures/big.json",
-            },
-        ],
+        items,
         session_id="conv_codex",
         external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
         cwd=Path("/workspace"),
         model_provider="omnigent_databricks",
         cli_version="0.154.0",
     )
+    assert call["arguments"] == arguments
+    if compacted:
+        return records[1]["payload"]["replacement_history"]
     return [
         record["payload"]
         for record in records
@@ -571,7 +579,10 @@ def _replayed_function_calls(arguments: str) -> list[dict[str, Any]]:
     ]
 
 
-def test_rollout_records_replay_oversized_function_call_arguments_as_a_stub() -> None:
+@pytest.mark.parametrize("compacted", [False, True])
+def test_rollout_records_replay_oversized_function_call_arguments_as_a_stub(
+    compacted: bool,
+) -> None:
     """
     A call too large for the Responses API replays as a stub, paired with its output.
 
@@ -591,10 +602,12 @@ def test_rollout_records_replay_oversized_function_call_arguments_as_a_stub() ->
         }
     )
 
-    call, output = _replayed_function_calls(arguments)
+    call, output = _replayed_function_calls(arguments, compacted=compacted)
 
     assert call["name"] == "apply_patch"
     assert call["call_id"] == "call_patch"
+    assert call["namespace"] == "functions"
+    assert call["id"] == "fc_patch"
     assert json.loads(call["arguments"]) == {
         "omitted": f"{len(arguments)} characters of arguments, too large to replay"
     }
@@ -602,7 +615,8 @@ def test_rollout_records_replay_oversized_function_call_arguments_as_a_stub() ->
     assert output["call_id"] == "call_patch"
 
 
-def test_rollout_records_replay_arguments_at_the_limit_verbatim() -> None:
+@pytest.mark.parametrize("compacted", [False, True])
+def test_rollout_records_replay_arguments_at_the_limit_verbatim(compacted: bool) -> None:
     """Arguments exactly at the replay cap are kept as written."""
     prefix = '{"command":"'
     suffix = '"}'
@@ -610,7 +624,7 @@ def test_rollout_records_replay_arguments_at_the_limit_verbatim() -> None:
     arguments = prefix + filler + suffix
     assert len(arguments) == codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
 
-    call, _output = _replayed_function_calls(arguments)
+    call, _output = _replayed_function_calls(arguments, compacted=compacted)
 
     assert call["arguments"] == arguments
 
@@ -1131,8 +1145,25 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
 
 
-def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
-    """Outputs of parallel calls that finished out of order replay in call order."""
+@pytest.mark.parametrize(
+    "separator_type",
+    [
+        None,
+        "resource_event",
+        "error",
+        "routing_decision",
+        "slash_command",
+        "terminal_command",
+        "interrupted_user",
+        "interrupted_assistant",
+        "interrupted_call",
+        "interrupted_output",
+    ],
+)
+def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
+    separator_type: str | None,
+) -> None:
+    """Omitted metadata and interrupted turns cannot split a replayed output run."""
 
     def call(call_id: str) -> dict[str, Any]:
         return {
@@ -1153,21 +1184,59 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
             "output": f"{call_id} done",
         }
 
-    records = codex_native._codex_rollout_records_from_session_items(
-        [
-            call("call_a"),
-            call("call_b"),
-            output("call_b"),
-            output("call_orphan"),
-            output("call_a"),
-            {
-                "id": "msg_1",
-                "response_id": "codex_turn_1",
+    separators: list[dict[str, Any]] = []
+    interrupted = separator_type is not None and separator_type.startswith("interrupted_")
+    if interrupted:
+        if separator_type == "interrupted_call":
+            separator = call("call_cancelled")
+        elif separator_type == "interrupted_output":
+            separator = output("call_cancelled")
+        else:
+            role = "user" if separator_type == "interrupted_user" else "assistant"
+            separator = {
                 "type": "message",
+                "role": role,
+                "content": [
+                    {
+                        "type": f"{'input' if role == 'user' else 'output'}_text",
+                        "text": "cancelled",
+                    }
+                ],
+            }
+        separators.append({**separator, "response_id": "codex_cancelled"})
+    elif separator_type is not None:
+        separators.append({"type": separator_type})
+    items = [
+        call("call_a"),
+        call("call_b"),
+        output("call_b"),
+        *separators,
+        output("call_orphan"),
+        output("call_a"),
+        {
+            "id": "msg_1",
+            "response_id": "codex_turn_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "both finished"}],
+        },
+    ]
+    if interrupted:
+        items.append(
+            {
+                "type": "message",
+                "response_id": "codex_cancelled",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "both finished"}],
-            },
-        ],
+                "interrupted": True,
+                "content": [{"type": "output_text", "text": "cancelled"}],
+            }
+        )
+    ordered = codex_native._codex_items_with_outputs_in_call_order(items)
+    if separator_type is not None and not interrupted:
+        assert ordered[3] is items[3]
+    assert items[2]["call_id"] == "call_b"
+    records = codex_native._codex_rollout_records_from_session_items(
+        items,
         session_id="conv_codex",
         external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
         cwd=Path("/workspace"),
@@ -1188,3 +1257,28 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
         ("function_call_output", "call_orphan"),
         ("message", None),
     ]
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        {"type": "message", "role": "user", "content": [{"type": "input_image"}]},
+        {"type": "message", "role": "developer", "content": "instructions"},
+        {"type": "reasoning", "summary": []},
+        {"type": "native_tool", "name": "view_image"},
+        {"type": "compaction", "summary": "compacted"},
+        {"type": "unknown_future_item"},
+    ],
+    ids=["image", "developer", "reasoning", "native_tool", "compaction", "unknown"],
+)
+def test_replay_output_order_preserves_content_boundaries(boundary: dict[str, Any]) -> None:
+    """Output ordering never moves results across content or a compaction snapshot."""
+    items = [
+        {"type": "function_call", "call_id": "call_a"},
+        {"type": "function_call", "call_id": "call_b"},
+        {"type": "function_call_output", "call_id": "call_b"},
+        boundary,
+        {"type": "function_call_output", "call_id": "call_a"},
+    ]
+
+    assert codex_native._codex_items_with_outputs_in_call_order(items) == items
