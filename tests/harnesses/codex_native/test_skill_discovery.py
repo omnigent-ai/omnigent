@@ -24,7 +24,16 @@ async def test_catalog_query_closes_client_and_process(
     start = AsyncMock()
     stop = AsyncMock()
     client = Mock(connect=AsyncMock(), close=AsyncMock(), request=AsyncMock())
-    client.request.return_value = {"result": {"data": [{"skills": [{"name": "plugin:skill"}]}]}}
+    client.request.return_value = {
+        "result": {
+            "data": [
+                {
+                    "skills": [{"name": "plugin:skill"}],
+                    "errors": [{"path": "/test/config.toml", "message": "bad config"}],
+                }
+            ]
+        }
+    }
     if isinstance(failure, ValueError):
         client.request.return_value = {"result": {"data": None}}
     elif failure is not None:
@@ -35,9 +44,11 @@ async def test_catalog_query_closes_client_and_process(
     monkeypatch.setattr(skill_discovery, "CodexAppServerClient", Mock(return_value=client))
 
     if failure is None:
-        assert skill_discovery.loaded_codex_skills("/test/codex", tmp_path, tmp_path) == [
-            {"name": "plugin:skill"}
-        ]
+        errors: list[str] = []
+        assert skill_discovery.loaded_codex_skills(
+            "/test/codex", tmp_path, tmp_path, errors=errors
+        ) == [{"name": "plugin:skill"}]
+        assert errors == ["/test/config.toml: bad config"]
     else:
         with pytest.raises(type(failure)):
             skill_discovery.loaded_codex_skills("/test/codex", tmp_path, tmp_path)
@@ -109,3 +120,14 @@ def test_installed_plugin_survives_marketplace_failure(
     assert selected_version() == "local"
     config.write_text("")
     assert selected_version() is None
+    # An unreadable config still answers skills/list, with the failure in its errors.
+    config.write_text(f'{enabled_config}model = "unterminated\n')
+    warnings: list[str] = []
+    broken = SkillSourceContext(
+        (workspace,), tmp_path, "all", None, codex_home=home, warnings=warnings
+    )
+    assert resolve_harness_skills(broken, "codex-native") == []
+    assert warnings == [
+        "Codex plugin skills may be incomplete: `codex plugin list` exited 1 and "
+        "`codex app-server` reported errors loading skills; see the host log for details."
+    ]
