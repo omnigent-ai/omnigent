@@ -29,7 +29,7 @@ function setup() {
 beforeEach(() => vi.resetAllMocks());
 
 describe("saving project order", () => {
-  it("previews a move immediately and restores confirmed order after a failed save", async () => {
+  it("previews a move immediately and refetches the confirmed order after a failed save", async () => {
     let reject!: (reason: Error) => void;
     vi.mocked(saveProjectOrder).mockReturnValue(
       new Promise((_resolve, rejectPromise) => {
@@ -42,8 +42,30 @@ describe("saving project order", () => {
     expect(client.getQueryData(["projects"])).toEqual([...projects].reverse());
     act(() => reject(new Error("offline")));
     await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(client.getQueryData(["projects"])).toEqual(projects);
+    expect(client.getQueryState(["projects"])?.isInvalidated).toBe(true);
     expect(showToast).toHaveBeenCalledWith("Couldn't save project order", { duration: 0 });
+  });
+
+  it("queues a move made while another saves and reconciles after the last", async () => {
+    const settle: (() => void)[] = [];
+    vi.mocked(saveProjectOrder).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settle.push(() => resolve({ ordered_project_ids: null, sort_mode: "manual" }));
+        }),
+    );
+    const { result, client } = setup();
+    act(() => result.current.mutate([...projects].reverse()));
+    act(() => result.current.mutate(projects));
+    await waitFor(() => expect(saveProjectOrder).toHaveBeenCalledTimes(1));
+    expect(client.getQueryData(["projects"])).toEqual(projects);
+
+    act(() => settle[0]());
+    await waitFor(() => expect(saveProjectOrder).toHaveBeenLastCalledWith(["a", "b"]));
+    expect(client.getQueryState(["projects"])?.isInvalidated).toBe(false);
+
+    act(() => settle[1]());
+    await waitFor(() => expect(client.getQueryState(["projects"])?.isInvalidated).toBe(true));
   });
 
   it("promotes legacy folders while preserving the intended order", async () => {

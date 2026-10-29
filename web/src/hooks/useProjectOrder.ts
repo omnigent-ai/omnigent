@@ -11,6 +11,8 @@ export function useSaveProjectOrder() {
   const client = useQueryClient();
   return useMutation({
     mutationKey: ["project-order"],
+    // Saves run one at a time in submit order, so moves made while one saves compose.
+    scope: { id: "project-order" },
     mutationFn: async (projects: ProjectSummary[] | null) => {
       if (projects === null) return saveProjectOrder(null);
       const ids = await Promise.all(
@@ -20,16 +22,16 @@ export function useSaveProjectOrder() {
     },
     onMutate: async (projects) => {
       await client.cancelQueries({ queryKey: ["projects"] });
-      const previous = client.getQueryData<ProjectSummary[]>(["projects"]);
       // Reset waits for the server's canonical alphabetical comparison.
       if (projects !== null) client.setQueryData(["projects"], projects);
-      return { previous };
     },
-    onError: (_error, _projects, context) => {
-      if (context?.previous) client.setQueryData(["projects"], context.previous);
+    onError: () => {
       showToast("Couldn't save project order", { duration: 0 });
     },
     onSettled: async () => {
+      // A queued save would be overwritten by the refetch; the last one reconciles,
+      // which also rolls back a failed save.
+      if (client.isMutating({ mutationKey: ["project-order"] }) > 1) return;
       await Promise.all([
         client.invalidateQueries({ queryKey: ["projects"] }),
         client.invalidateQueries({ queryKey: ["project-order"] }),

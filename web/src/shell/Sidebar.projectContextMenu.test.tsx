@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
     isError: false,
     error: null,
   },
+  writePending: false,
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -42,6 +43,7 @@ vi.mock("@/hooks/useConversations", async () => {
       isFetchingNextPage: false,
     }),
     useDeleteProject: () => mocks.deleteProject,
+    useProjectWritePending: () => mocks.writePending,
     useRenameProject: () => mocks.renameProject,
     useProjectConfig: () => ({ data: {}, isLoading: false, isError: false }),
     useUpdateProjectConfig: () => ({
@@ -123,6 +125,7 @@ function expectProjectMenuActions() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.writePending = false;
   useConversationsMock.mockReset();
   localStorage.clear();
   mockConversations([FILED_CONVERSATION]);
@@ -217,10 +220,18 @@ describe("project folder header context menu", () => {
     fireEvent.click(screen.getByTestId("delete-project"));
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
 
-    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith(
-      { id: PROJECT_ID, name: PROJECT_NAME },
-      expect.anything(),
-    );
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith({ id: PROJECT_ID, name: PROJECT_NAME });
+  });
+
+  it("shows progress and locks folder writes while one is saving", () => {
+    mocks.writePending = true;
+    renderSidebar();
+
+    expect(screen.getByTestId("project-write-pending")).toBeInTheDocument();
+    fireEvent.contextMenu(folderHeader());
+    for (const testId of ["rename-project", "project-settings", "delete-project"]) {
+      expect(screen.getByTestId(testId)).toHaveAttribute("data-disabled");
+    }
   });
 
   it("keeps New session reachable when a touch opens the menu on hover-capable hardware", () => {

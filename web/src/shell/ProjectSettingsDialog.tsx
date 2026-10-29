@@ -252,16 +252,15 @@ export function ProjectSettingsDialog({
     if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
     else if (!agentUnresolved) delete config.effort;
 
-    updateConfig.mutate(
-      { id: projectId, name: projectName, config },
-      {
-        onSuccess: () => {
-          // The saved settings replace the last start, even when they match the
-          // settings it was recorded against.
-          if (projectId !== null) clearProjectLaunchDefaults(projectId);
-          onOpenChange(false);
-        },
+    onOpenChange(false);
+    // Saves in the background (the hook toasts failures); the promise outlives this dialog.
+    updateConfig.mutateAsync({ id: projectId, name: projectName, config }).then(
+      () => {
+        // The saved settings replace the last start, even when they match the
+        // settings it was recorded against.
+        if (projectId !== null) clearProjectLaunchDefaults(projectId);
       },
+      () => {},
     );
   };
 
@@ -673,25 +672,14 @@ export function ProjectSettingsDialog({
               disabled so your existing defaults aren't overwritten.
             </p>
           )}
-          {updateConfig.isError && (
-            <p className="text-destructive text-ui" role="alert">
-              {(updateConfig.error as Error).message}
-            </p>
-          )}
 
           <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={updateConfig.isPending}
-            >
+            <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>
               Cancel
             </Button>
             <Button
               type="submit"
               data-testid="project-settings-save"
-              loading={updateConfig.isPending}
               disabled={isLoading || loadFailed}
             >
               Save

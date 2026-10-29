@@ -28,6 +28,7 @@ import {
   useProjects,
   useProjectConfig,
   useProjectSessions,
+  useProjectWritePending,
   useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
@@ -575,6 +576,34 @@ describe("useRenameProject", () => {
     });
 
     expect(id).toBe("proj_1");
+  });
+
+  it("marks the folder pending until a failed rename settles, then toasts", async () => {
+    let reject!: (error: Error) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise((_resolve, rejectFetch) => {
+        reject = rejectFetch;
+      }),
+    );
+    const toasts: string[] = [];
+    const onToast = (e: Event) =>
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    window.addEventListener("omnigent:toast", onToast);
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(
+      () => ({ rename: useRenameProject(), pending: useProjectWritePending("old") }),
+      { wrapper },
+    );
+
+    act(() => result.current.rename.mutate({ id: "proj_1", oldName: "old", newName: "New" }));
+    await waitFor(() => expect(result.current.pending).toBe(true));
+    act(() => reject(new Error("offline")));
+    await waitFor(() => expect(result.current.pending).toBe(false));
+
+    expect(toasts).toEqual([`Couldn't rename "old". offline`]);
+    window.removeEventListener("omnigent:toast", onToast);
   });
 });
 

@@ -47,6 +47,8 @@ export function conversationHooksMock() {
     useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useProjectConfig: () => ({ data: undefined, isLoading: false }),
     useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useProjectWritePending: () => false,
+    PROJECT_WRITE_KEY: ["project-write"],
     fetchProjectSessionIds: () => Promise.resolve([]),
     PROJECT_LABEL_KEY,
   };
