@@ -218,7 +218,8 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
-import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { PINNED_HOTKEY_DIGITS, usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
+import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
@@ -310,14 +311,16 @@ import {
   CompactShortcutKeys,
   newSessionAriaShortcut,
   newSessionShortcutKeys,
+  pinnedSessionAriaShortcut,
+  pinnedSessionShortcutKeys,
 } from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
 // + kebab take its place; on mobile those controls are gone, so the badge holds
-// that edge.
+// that edge. A held pinned-row shortcut hint fades it the same way.
 const SESSION_STATE_SLOT_CLASS =
-  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0";
+  "-translate-y-1/2 pointer-events-none absolute flex h-5 items-center transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-pinned-shortcut-hint]]:opacity-0";
 
 // Small markers (running/starting/unseen dot, or the draft pencil when there's
 // no session state) get a fixed size-6 centered box so their glyph lands 16px
@@ -2513,6 +2516,20 @@ function ConversationList({
     [sections.pinned, collapsedSections],
   );
   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
+  // Holding the command modifier shows each pinned row's jump number. The slots
+  // come from the hotkey's own list, so a badge exists only where the key works.
+  useCommandHoldTracking();
+  const pinnedShortcutSlots = useMemo(
+    () =>
+      new Map<string, number>(
+        isMobile
+          ? []
+          : pinnedSessionIds
+              .slice(0, PINNED_HOTKEY_DIGITS.length)
+              .map((id, slot): [string, number] => [id, slot]),
+      ),
+    [isMobile, pinnedSessionIds],
+  );
   const pinOrder = useMemo(
     () =>
       pinReorderEnabled && !pinWriting
@@ -2780,6 +2797,7 @@ function ConversationList({
                           conversations={sections.pinned}
                           activeConversationId={displayedActiveId}
                           pinnedConversationIds={pinnedConversationIds}
+                          pinnedShortcutSlots={pinnedShortcutSlots}
                           collapsed={effectiveCollapsedSections.includes("Pinned")}
                           onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
                           onRowClick={onRowClick}
@@ -3717,6 +3735,7 @@ function ConversationSection({
   persistentHeaderAction,
   afterHeader,
   footer,
+  pinnedShortcutSlots,
   onProjectAssigned,
 }: {
   headerDrag?: ProjectHeaderDrag;
@@ -3733,6 +3752,8 @@ function ConversationSection({
       list owner so a row never runs the (multi-step) active-root query itself. */
   activeConversationId: string | null;
   pinnedConversationIds: string[];
+  /** Jump slot per pinned row; only the Pinned section passes it. */
+  pinnedShortcutSlots?: ReadonlyMap<string, number>;
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
@@ -3875,6 +3896,7 @@ function ConversationSection({
                   gridSelected={conv.id === grids?.selectedSessionId}
                   gridsEnabled={grids?.enabled ?? false}
                   isPinned={pinnedConversationIds.includes(conv.id)}
+                  pinnedSlot={pinnedShortcutSlots?.get(conv.id)}
                   onClick={onRowClick}
                   onTogglePinned={onTogglePinned}
                   selectionMode={selectionMode}
@@ -4662,6 +4684,7 @@ function ConversationRowImpl({
   gridSelected,
   gridsEnabled,
   isPinned,
+  pinnedSlot,
   onClick,
   onTogglePinned,
   selectionMode,
@@ -4678,6 +4701,8 @@ function ConversationRowImpl({
   gridSelected: boolean;
   gridsEnabled: boolean;
   isPinned: boolean;
+  /** Jump slot of a pinned row that has a number hint; undefined elsewhere. */
+  pinnedSlot?: number;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -5090,6 +5115,11 @@ function ConversationRowImpl({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      aria-keyshortcuts={
+        pinnedSlot !== undefined
+          ? pinnedSessionAriaShortcut(PINNED_HOTKEY_DIGITS[pinnedSlot])
+          : undefined
+      }
       draggable={gridsEnabled ? false : undefined}
       onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
       className={cn(
@@ -5123,6 +5153,8 @@ function ConversationRowImpl({
         // under it.
         !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
         !selectionMode && menuOpen && "md:pr-20",
+        // Same room as the hover controls, so a held hint never covers the title.
+        pinnedSlot !== undefined && "group-has-[[data-pinned-shortcut-hint]]:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
         !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
@@ -5367,7 +5399,7 @@ function ConversationRowImpl({
           aria-label="Shared session"
           title="Shared with you"
           className={cn(
-            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
+            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0 group-has-[[data-pinned-shortcut-hint]]:opacity-0",
             overlayTop,
             hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
           )}
@@ -5388,6 +5420,7 @@ function ConversationRowImpl({
               className={cn(
                 "-translate-y-1/2 absolute right-1 flex items-center gap-0.5",
                 overlayTop,
+                "group-has-[[data-pinned-shortcut-hint]]:hidden",
               )}
             >
               {/* Archived rows omit the pin entirely: pinning is meaningless there
@@ -5532,6 +5565,7 @@ function ConversationRowImpl({
           </ContextMenuContent>
         </ContextMenu>
       )}
+      {pinnedSlot !== undefined && <PinnedShortcutHint slot={pinnedSlot} overlayTop={overlayTop} />}
       {/* Mount only while open — one per row, its hook tree + JSX would
           otherwise run closed on every row re-render. */}
       {shareOpen && (
@@ -5752,6 +5786,7 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.gridSelected === next.gridSelected &&
     prev.gridsEnabled === next.gridsEnabled &&
     prev.isPinned === next.isPinned &&
+    prev.pinnedSlot === next.pinnedSlot &&
     prev.selectionMode === next.selectionMode &&
     prev.isSelected === next.isSelected &&
     prev.onClick === next.onClick &&
@@ -5761,6 +5796,27 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     conversationRenderEqual(prev.conversation, next.conversation)
   );
 });
+
+/**
+ * Jump-number chip for a pinned row, shown only while the command modifier is
+ * held. It subscribes to the hold store alone, so a hold re-renders the chips,
+ * not the list. The row hides its trailing controls while a chip is mounted.
+ */
+function PinnedShortcutHint({ slot, overlayTop }: { slot: number; overlayTop: string }) {
+  const held = useCommandHoldStore((state) => state.held);
+  if (!held) return null;
+  return (
+    <span
+      data-pinned-shortcut-hint
+      className={cn("-translate-y-1/2 pointer-events-none absolute right-1", overlayTop)}
+    >
+      <CompactShortcutKeys
+        keys={pinnedSessionShortcutKeys(PINNED_HOTKEY_DIGITS[slot])}
+        className="[&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px]"
+      />
+    </span>
+  );
+}
 
 /**
  * Hover flyout body for a pinned, project-owned conversation row.
