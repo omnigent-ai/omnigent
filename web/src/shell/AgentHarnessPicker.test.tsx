@@ -196,6 +196,37 @@ describe("AgentHarnessPicker Agents group header", () => {
     expect(selected).toEqual([server.id, owned.id]);
   });
 
+  it("distinguishes pinned legacy session copies from server templates", async () => {
+    const template = agent({
+      id: "server-orion",
+      name: "Orion",
+      display_name: "Orion",
+      harness: "claude-sdk",
+      builtin: false,
+    });
+    const recent = { ...template, id: "recent-orion", sessionId: "recent-session" };
+    const pinned = { ...template, id: "pinned-orion", sessionId: "pinned-session" };
+    const selected: string[] = [];
+    renderPicker({
+      harnessEntries: [claude],
+      agentEntries: [template, recent, pinned],
+      effectiveAgentId: pinned.id,
+      onSelectAgent: (entry) => selected.push(entry.id),
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+      "Orion (session pinned-orion)",
+    );
+    await openPicker();
+    await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    for (const entry of [template, recent, pinned]) {
+      expect(screen.getByTestId(`new-chat-landing-agent-${entry.id}`)).toHaveTextContent(
+        `Orion (${entry.id === template.id ? "server" : `session ${entry.id}`})`,
+      );
+    }
+    await userEvent.click(screen.getByTestId(`new-chat-landing-agent-${pinned.id}`));
+    expect(selected).toEqual([pinned.id]);
+  });
+
   it("renders the header when a bundle agent is present", async () => {
     renderPicker({ harnessEntries: [claude], agentEntries: [polly] });
     await openPicker();

@@ -1579,7 +1579,7 @@ export function AgentHarnessPicker({
   }, [harnessEntries, agentEntries]);
   const entryLabel = (agent: AvailableAgent) =>
     duplicateAgentNames.has(agent.name)
-      ? `${agent.display_name} (${agent.mine ? "yours" : "server"})`
+      ? `${agent.display_name} (${agent.mine ? "yours" : agent.sessionId ? `session ${agent.id}` : "server"})`
       : agent.display_name;
   const selectedLabel =
     !autoHarnessActive && selectedEntry && duplicateAgentNames.has(selectedEntry.name)
