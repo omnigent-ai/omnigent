@@ -521,6 +521,11 @@ def _connection_refused(exc: BaseException) -> bool:
     return bool(errnos) and all(int(n) == errno.ECONNREFUSED for n in errnos)
 
 
+# Host-name uniqueness violations as SQLite and the named-constraint dialects report them.
+_HOST_NAME_CONFLICT = re.compile(
+    r"UNIQUE constraint failed: [\w., ]*\bhosts\.name\b|\buq_hosts_workspace_user_id_name\b"
+)
+
 _RECONNECT_BASE_S = 0.5
 _RECONNECT_CAP_S = 3.0
 _RECONNECT_JITTER = 0.5
@@ -5542,7 +5547,11 @@ class HostProcess:
         """Raise the lifecycle exception requested by a server error frame."""
         message = f"Host connection failed during {frame.stage}: {frame.error}"
         fallback_name = self._identity.fallback_name
-        if frame.stage == "registration" and fallback_name is not None:
+        if (
+            frame.stage == "registration"
+            and fallback_name is not None
+            and _HOST_NAME_CONFLICT.search(frame.error)
+        ):
             # Older servers fail registration when another host already holds the new name.
             _print_host_status(
                 f"⚠ Registering as {self._identity.name!r} failed; retrying as {fallback_name!r}.",

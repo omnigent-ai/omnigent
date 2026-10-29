@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.host.connect import _HOST_NAME_CONFLICT
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
@@ -897,7 +898,7 @@ async def test_renaming_to_a_held_name_without_the_check_is_a_retryable_registra
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server without the held-name check refuses it with a retryable registration error."""
+    """A server without the held-name check refuses it with a name-conflict registration error."""
     app, registry, store = host_app
     store.upsert_on_connect(
         host_id="2555c28ab2a433488edd86d08ade2ce3", name="ip-10-90-37-46", user_id="local"
@@ -911,6 +912,7 @@ async def test_renaming_to_a_held_name_without_the_check_is_a_retryable_registra
     error = decode_host_frame(sent["text"])
     assert isinstance(error, HostConnectionErrorFrame)
     assert (error.stage, error.retryable) == ("registration", True)
+    assert _HOST_NAME_CONFLICT.search(error.error)
     assert registry.get(_HOST_ID) is None
 
 

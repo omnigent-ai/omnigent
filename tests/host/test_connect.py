@@ -8319,17 +8319,27 @@ async def test_retryable_connection_error_escapes_live_receive_path() -> None:
     assert host._frame_tasks == set()
 
 
-async def test_registration_error_retries_with_stored_name_after_hostname_refresh() -> None:
+@pytest.mark.parametrize(
+    "conflict",
+    [
+        "(sqlite3.IntegrityError) UNIQUE constraint failed: "
+        "hosts.workspace_id, hosts.user_id, hosts.name",
+        "(psycopg.errors.UniqueViolation) duplicate key value violates unique constraint "
+        '"uq_hosts_workspace_user_id_name"',
+        "(pymysql.err.IntegrityError) (1062, \"Duplicate entry 'ws-local-ip-10-90-37-46' "
+        "for key 'hosts.uq_hosts_workspace_user_id_name'\")",
+    ],
+    ids=["sqlite", "postgres", "mysql"],
+)
+async def test_registration_error_retries_with_stored_name_after_hostname_refresh(
+    conflict: str,
+) -> None:
     """A server that refuses a refreshed name gets the stored name on the next hello."""
     identity = HostIdentity(
         host_id="host_test_connect", name="ip-10-90-37-46", fallback_name="ip-10-90-45-193"
     )
     host = HostProcess(identity, "https://app.example.databricks.com")
-    refusal = HostConnectionErrorFrame(
-        stage="registration",
-        error="UNIQUE constraint failed: hosts.workspace_id, hosts.user_id, hosts.name",
-        retryable=True,
-    )
+    refusal = HostConnectionErrorFrame(stage="registration", error=conflict, retryable=True)
     tunnels = [_ConnectionErrorTunnel(refusal), _ConnectionErrorTunnel(refusal)]
 
     for tunnel in tunnels:
@@ -8340,6 +8350,41 @@ async def test_registration_error_retries_with_stored_name_after_hostname_refres
     assert [hello.name for hello in hellos if isinstance(hello, HostHelloFrame)] == [
         "ip-10-90-37-46",
         "ip-10-90-45-193",
+    ]
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [
+        "database unavailable",
+        "(sqlite3.OperationalError) database is locked\n"
+        "[SQL: SELECT hosts.name FROM hosts WHERE hosts.host_id = ?]",
+    ],
+    ids=["unavailable", "locked"],
+)
+async def test_unrelated_registration_error_keeps_refreshed_name(transient: str) -> None:
+    """Only a name conflict gives up the refreshed name; other failures retry it."""
+    identity = HostIdentity(
+        host_id="host_test_connect", name="ip-10-90-37-46", fallback_name="ip-10-90-45-193"
+    )
+    host = HostProcess(identity, "https://app.example.databricks.com")
+    failed = _ConnectionErrorTunnel(
+        HostConnectionErrorFrame(stage="registration", error=transient, retryable=True)
+    )
+    with pytest.raises(HostRetryableConnectionError):
+        await host._serve_frames(failed)  # type: ignore[arg-type]
+
+    recovered = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(recovered))  # type: ignore[arg-type]
+    try:
+        await asyncio.wait_for(recovered.first_send.wait(), timeout=1.0)
+    finally:
+        await _cancel(serve_task)
+
+    hellos = [decode_host_frame(tunnel.sent[0]) for tunnel in (failed, recovered)]
+    assert [hello.name for hello in hellos if isinstance(hello, HostHelloFrame)] == [
+        "ip-10-90-37-46",
+        "ip-10-90-37-46",
     ]
 
 
