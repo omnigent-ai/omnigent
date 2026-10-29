@@ -190,6 +190,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   updates?: ElectronUpdateBridge;
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile?: (hostId: string, path: string) => Promise<boolean>;
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
+  /** This machine's path for a dropped File; "" if none or off the pinned server. */
+  getPathForFile?: (file: File) => Promise<string>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -200,6 +204,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
+  /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
+  connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
@@ -1088,6 +1094,11 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   }
 }
 
+/** Whether this desktop shell can connect the user's Arca instance as a host. */
+export function supportsArcaConnect(): boolean {
+  return typeof electronApi()?.connectArcaHost === "function";
+}
+
 /**
  * Connect the user's Arca instance (Databricks-internal sandbox) to the
  * window's server as a host, via the desktop shell. The shell asks native
@@ -1103,6 +1114,29 @@ export async function connectArcaHost(): Promise<ArcaConnectResult> {
     return await electron.connectArcaHost();
   } catch (err) {
     console.warn("[nativeBridge] electron connectArcaHost failed:", err);
+    return { ok: false, error: String(err) };
+  }
+}
+
+/** Whether this desktop shell can connect a machine the user reaches over SSH. */
+export function supportsSshConnect(): boolean {
+  return typeof electronApi()?.connectSshHost === "function";
+}
+
+/**
+ * Connect `destination` (an ssh alias, host or user@host) to the window's
+ * server as a host. The shell asks consent and handles ssh prompts and the
+ * browser sign-in in its own window. A no-op `{ ok: false }` outside the shell.
+ */
+export async function connectSshHost(destination: string): Promise<ArcaConnectResult> {
+  const electron = electronApi();
+  if (!electron?.connectSshHost) {
+    return { ok: false, error: "not running under the desktop shell" };
+  }
+  try {
+    return await electron.connectSshHost(destination);
+  } catch (err) {
+    console.warn("[nativeBridge] electron connectSshHost failed:", err);
     return { ok: false, error: String(err) };
   }
 }
@@ -1222,5 +1256,35 @@ export async function revealFile(hostId: string, path: string): Promise<boolean>
     return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
   } catch {
     return false;
+  }
+}
+
+/** True when the desktop shell can open the OS folder chooser for this machine. */
+export function supportsDirectoryChooser(): boolean {
+  return typeof electronApi()?.chooseDirectory === "function";
+}
+
+/** Open the OS folder chooser; resolves the chosen path, or null on cancel or failure. */
+export async function chooseDirectory(defaultPath?: string): Promise<string | null> {
+  try {
+    return (await electronApi()?.chooseDirectory?.(defaultPath)) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron chooseDirectory failed:", err);
+    return null;
+  }
+}
+
+/** True when the desktop shell can resolve paths of files dropped from the OS. */
+export function supportsDroppedFilePaths(): boolean {
+  return typeof electronApi()?.getPathForFile === "function";
+}
+
+/** This machine's path for a dropped ``file``, or null when the shell can't resolve one. */
+export async function droppedFilePath(file: File): Promise<string | null> {
+  try {
+    return (await electronApi()?.getPathForFile?.(file)) || null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getPathForFile failed:", err);
+    return null;
   }
 }

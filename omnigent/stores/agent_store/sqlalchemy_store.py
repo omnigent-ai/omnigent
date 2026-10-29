@@ -286,6 +286,19 @@ class SqlAlchemyAgentStore(AgentStore):
                 has_more=has_more,
             )
 
+    def get_many(self, agent_ids: builtins.list[str]) -> dict[str, Agent]:
+        """Batch-fetch agents in the current workspace, omitting missing ids."""
+        if not agent_ids:
+            return {}
+        with self._session("load_agents") as session:
+            rows = session.execute(
+                select(SqlAgent).where(
+                    SqlAgent.workspace_id == current_workspace_id(),
+                    SqlAgent.id.in_(agent_ids),
+                )
+            ).scalars()
+            return {row.id: sql_agent_to_entity(row) for row in rows}
+
     def get_names(self, agent_ids: builtins.list[str]) -> dict[str, str]:
         """
         Batch-fetch agent names for a list of IDs.
