@@ -1436,6 +1436,35 @@ describe("ForkSessionDialog", () => {
       expect(screen.queryByTestId("fork-session-error")).not.toBeInTheDocument();
     });
 
+    it("selects a machine the desktop app connects over SSH", async () => {
+      setHosts([host({ host_id: "host_1" }), host({ host_id: "host_2", name: "devbox" })]);
+      const desktop = {
+        kind: "electron",
+        connectSshHost: vi.fn().mockResolvedValue({
+          ok: true,
+          identity: { serverUrl: "https://example.com", hostId: "host_2" },
+          shownInConsole: true,
+        }),
+      };
+      (window as { omnigentDesktop?: unknown }).omnigentDesktop = desktop;
+      try {
+        renderDialog(CODING);
+        fireEvent.click(screen.getByTestId("fork-session-connect-host-toggle"));
+        fireEvent.change(await screen.findByTestId("ssh-connect-destination"), {
+          target: { value: "devbox" },
+        });
+        fireEvent.click(screen.getByTestId("ssh-connect-submit"));
+
+        await waitFor(() =>
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("devbox"),
+        );
+        expect(desktop.connectSshHost).toHaveBeenCalledWith("devbox");
+        expect(screen.queryByTestId("ssh-connect-form")).not.toBeInTheDocument();
+      } finally {
+        delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+      }
+    });
+
     it("reveals connect-host instructions via the collapsible toggle when a host is online", () => {
       // Mirrors NewChatDialog: with a host online the picker shows, and the
       // CLI command for connecting ANOTHER host hides behind a toggle.

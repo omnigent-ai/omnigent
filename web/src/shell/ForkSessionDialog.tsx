@@ -1524,6 +1524,7 @@ function SupportedForkSessionForm({
                     ? "No hosts connected yet. Connect one from your terminal:"
                     : "No hosts online. Reconnect from your terminal to start the clone:"
                 }
+                onSshConnected={selectHost}
               />
             ) : (
               <>
@@ -1626,7 +1627,15 @@ function SupportedForkSessionForm({
                         ? "Connect a host from your terminal"
                         : "Connect another host from your terminal"}
                     </button>
-                    {showConnect && <ConnectHostInstructions serverUrl={serverUrl} />}
+                    {showConnect && (
+                      <ConnectHostInstructions
+                        serverUrl={serverUrl}
+                        onSshConnected={(hostId) => {
+                          setShowConnect(false);
+                          selectHost(hostId);
+                        }}
+                      />
+                    )}
                   </>
                 )}
               </>
