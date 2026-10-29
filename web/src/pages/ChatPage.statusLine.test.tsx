@@ -99,6 +99,10 @@ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHostsModule>()),
   useHosts: (opts: unknown) => useHostsMock(opts),
 }));
+// The host menu reads the account registry; this suite has no query client.
+vi.mock("@/hooks/useExecutionTopology", () => ({
+  useExecutionTopology: () => ({ data: undefined }),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),

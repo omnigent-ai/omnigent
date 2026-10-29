@@ -115,12 +115,18 @@ export function useHosts(options: UseHostsOptions = {}) {
   });
 }
 
-async function fetchHostModelOptions(
+/**
+ * Fetch one host's pre-launch catalog for a harness; throws on probe failure.
+ * ``accountId`` asks for the catalog of that account.
+ */
+export async function fetchHostModelOptions(
   hostId: string,
   harness: string,
+  accountId?: string,
 ): Promise<NativeModelOption[]> {
   const res = await authenticatedFetch(
-    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options` +
+      (accountId ? `?account_id=${encodeURIComponent(accountId)}` : ""),
   );
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;
@@ -147,11 +153,11 @@ export function useHostModelOptions(
   hostId: string | null,
   harness: string,
   enabled = true,
-  { poll = true }: { poll?: boolean } = {},
+  { poll = true, accountId }: { poll?: boolean; accountId?: string } = {},
 ) {
   const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
-  const pollerKey = JSON.stringify([hostId, harness]);
+  const pollerKey = JSON.stringify([hostId, harness, accountId ?? null]);
   // Only committed selections participate; suspended renders leave retries alone.
   useLayoutEffect(() => {
     if (!canRefresh) return;
@@ -169,8 +175,10 @@ export function useHostModelOptions(
     };
   }, [queryClient, pollerKey, canRefresh]);
   const query = useQuery({
-    queryKey: ["host-model-options", hostId, harness],
-    queryFn: () => fetchHostModelOptions(hostId as string, harness),
+    queryKey: accountId
+      ? ["host-model-options", hostId, harness, accountId]
+      : ["host-model-options", hostId, harness],
+    queryFn: () => fetchHostModelOptions(hostId as string, harness, accountId),
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.

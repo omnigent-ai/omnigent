@@ -375,6 +375,7 @@ export function ReconnectSessionDialog({
           onOpenChange={setSwitchOpen}
           sessionId={conversationId}
           currentHostId={sourceHostId ?? null}
+          currentWorkspace={sourceWorkspace}
         />
       )}
     </>

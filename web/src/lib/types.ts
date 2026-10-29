@@ -254,6 +254,17 @@ export interface ModelUsage {
   totalCostUsd: number | null;
 }
 
+/** An account move recorded but not yet launched; the dialog resumes or cancels it. */
+export interface AccountTransition {
+  id: string;
+  account_id: string;
+  host_id: string;
+  workspace?: string | null;
+  harness: string;
+  model: string;
+  effort: string | null;
+}
+
 /**
  * One still-running background shell reported by the claude-native `Stop`
  * hook, backing the composer pill's "N background tasks" tally. Every field
@@ -283,6 +294,8 @@ export interface Session {
    * when the agent row cannot be found (deleted or orphaned session).
    */
   agentName: string | null;
+  /** Pending account move awaiting its runner launch; absent when none. */
+  accountTransition?: AccountTransition | null;
   runnerId?: string | null;
   /** Current runner reachability; absent when the snapshot omits liveness. */
   runnerOnline?: boolean;

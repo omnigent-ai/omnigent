@@ -29,6 +29,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  AccountTransition,
 } from "./types";
 
 /** Returns the client surface label for the X-Omnigent-Client telemetry header. */
@@ -108,6 +109,7 @@ interface SessionResponseWire {
   agent_id: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
+  account_transition?: AccountTransition | null;
   runner_id?: string | null;
   /**
    * Host that launched (or should launch) the runner, e.g. ``"host_a1b2"``.
@@ -325,6 +327,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     id: wire.id,
     agentId: wire.agent_id,
     agentName: wire.agent_name ?? null,
+    accountTransition: wire.account_transition ?? undefined,
     runnerId: wire.runner_id,
     runnerOnline: wire.runner_online ?? undefined,
     hostId: wire.host_id ?? null,
@@ -970,10 +973,13 @@ export async function launchRunner(
     existingWorktree?: boolean;
     existingBranch?: boolean;
   },
+  route?: { accountId: string; transitionId?: string },
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
     workspace: string;
+    account_id?: string;
+    transition_id?: string;
     git?: {
       branch_name: string;
       base_branch?: string;
@@ -981,6 +987,10 @@ export async function launchRunner(
       existing_branch?: boolean;
     };
   } = { session_id: sessionId, workspace };
+  if (route !== undefined) {
+    body.account_id = route.accountId;
+    if (route.transitionId) body.transition_id = route.transitionId;
+  }
   if (git !== undefined) {
     // `existing_worktree` binds a pre-existing worktree (no worktree is
     // created; the branch is recorded for the sidebar + delete flow) and
@@ -1037,6 +1047,18 @@ export async function launchRunner(
 export async function updateSession(
   sessionId: string,
   updates: {
+    /** Account the move goes to; sent with ``runnerId: ""`` and the ``target*`` fields. */
+    accountId?: string;
+    /** Pending account move this update belongs to. */
+    transitionId?: string;
+    /** With ``transitionId``, drop the pending move and leave the session detached. */
+    abandonTransition?: boolean;
+    /** With ``runnerId: ""``, records the move; the session reports it as ``accountTransition``. */
+    targetHostId?: string;
+    targetHarness?: string;
+    targetModel?: string;
+    targetEffort?: string | null;
+    targetWorkspace?: string;
     reasoningEffort?: string | null;
     modelOverride?: string | null;
     codexPlanMode?: boolean;
@@ -1070,6 +1092,14 @@ export async function updateSession(
   },
 ): Promise<Session> {
   const body: Record<string, string | boolean | null | Record<string, string>> = {};
+  if (updates.accountId) body.account_id = updates.accountId;
+  if (updates.transitionId) body.transition_id = updates.transitionId;
+  if (updates.abandonTransition) body.abandon_transition = true;
+  if (updates.targetHostId) body.target_host_id = updates.targetHostId;
+  if (updates.targetHarness) body.target_harness = updates.targetHarness;
+  if (updates.targetModel) body.target_model = updates.targetModel;
+  if ("targetEffort" in updates) body.target_effort = updates.targetEffort ?? null;
+  if (updates.targetWorkspace) body.target_workspace = updates.targetWorkspace;
   if ("reasoningEffort" in updates) {
     body.reasoning_effort = updates.reasoningEffort ?? "default";
   }
