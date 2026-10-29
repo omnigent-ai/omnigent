@@ -691,6 +691,24 @@ describe("MainTerminalView — split panes", () => {
     expect(screen.getByRole("separator", { name: "Resize terminal panes" })).toBeInTheDocument();
   });
 
+  it("moves focus between panes with the pane-cycle chord", async () => {
+    writeSessionWorkspaceState("conv_split_cycle", { terminalSplit: savedSplit });
+    render(splitTree("conv_split_cycle", [REPL_TERMINAL, BASH_SHELL]));
+    await waitFor(() => expect(screen.getAllByTestId("terminal-view")).toHaveLength(2));
+
+    fireEvent.keyDown(window, {
+      code: "BracketRight",
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: true,
+    });
+
+    const [agentPane, bashPane] = screen.getAllByTestId("terminal-view");
+    expect(agentPane).toHaveAttribute("data-active", "true");
+    expect(bashPane).toHaveAttribute("data-active", "false");
+    expect(readSessionWorkspaceState("conv_split_cycle").terminalSplit?.focusedKey).toBe(AGENT_KEY);
+  });
+
   it("ignores a saved split while the feature is off", async () => {
     writeSessionWorkspaceState("conv_split_off", { terminalSplit: savedSplit });
     render(splitTree("conv_split_off", [REPL_TERMINAL, BASH_SHELL], false));

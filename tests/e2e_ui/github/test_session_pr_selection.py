@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.e2e_ui.conftest import stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO
 
 
@@ -20,9 +21,8 @@ def _expect_pr_tooltip(page: Page, label: str, trigger: Locator) -> Locator:
     expect(content).to_be_visible()
     expect(content).to_have_accessible_name(label)
     expect(content).to_have_attribute("data-slot", "tooltip-content")
-    expect(content).to_have_class(re.compile(r"\bbg-neutral-900\b"))
-    expect(content).to_have_class(re.compile(r"\btext-white\b"))
-    expect(content).to_have_css("color", "rgb(255, 255, 255)")
+    expect(content).to_have_class(re.compile(r"\bmenu-surface\b"))
+    expect(content).to_have_class(re.compile(r"\btext-popover-foreground\b"))
     content.evaluate("""element => Promise.all(
         element.getAnimations().map(animation => animation.finished.catch(() => {}))
     )""")
@@ -34,7 +34,7 @@ def _expect_pr_tooltip(page: Page, label: str, trigger: Locator) -> Locator:
         context.fillRect(0, 0, 1, 1);
         return [...context.getImageData(0, 0, 1, 1).data];
     }""")
-    assert max(background[:3]) < 64 and background[3] == 255
+    assert background[3] == 255
     box, anchor, viewport = content.bounding_box(), trigger.bounding_box(), page.viewport_size
     assert box and anchor and viewport
     assert box["x"] >= -1 and box["x"] + box["width"] <= viewport["width"] + 1
@@ -141,6 +141,7 @@ def test_session_pr_selection_and_unlink(
                 route.fulfill(json=info(url))
 
     page.route(re.compile(r"/resources/github(?:/|\?|$)"), respond)
+    stub_session_pull_requests(page, lambda: info(None)["prs"], urls.remove)
     page.goto(f"{base_url}/c/{session_id}")
     indicator = page.get_by_test_id("composer-pr-link")
     expect(indicator).to_have_accessible_name("2 PRs", timeout=30_000)
@@ -319,6 +320,7 @@ def test_session_pr_picker_long_title(
         "pr": {**_INFO["pr"], "url": url, "number": 42, "title": title},
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
@@ -406,6 +408,7 @@ def test_session_pr_account_fallback(
         "selected_account": "personal",
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
+    stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.goto(f"{base_url}/c/{session_id}")
     page.get_by_test_id("composer-pr-link").click()
     rail = page.get_by_role("complementary", name="Workspace")
