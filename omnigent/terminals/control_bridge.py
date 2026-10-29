@@ -25,6 +25,9 @@ Design notes learned from the protocol (see ``control_bridge`` spike):
   a ``send-keys -l`` command line corrupts the line-based command parser and
   the client exits; the hex channel is byte-exact for ESC sequences, control
   chars, and UTF-8 multibyte alike.
+- ``%output`` carries pane bytes before tmux parses them, so escapes tmux
+  consumes itself still arrive. xterm.js would print the name in a screen/tmux
+  window-name escape (``ESC k <name> ESC \\``), so the bridge drops those.
 
 The browser-facing stream uses binary frames for raw pane bytes, text JSON
 frames for resize controls, and binary frames for input. A typed text JSON
@@ -41,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import enum
 import json
 import logging
 import os
@@ -73,6 +77,13 @@ __all__ = [
 
 # tmux octal-escapes bytes < 0x20 and backslash in %output values as ``\ooo``.
 _OCTAL_ESCAPE_RE: Final = re.compile(rb"\\([0-7]{3})")
+
+_ESC: Final = b"\x1b"
+_STRING_TERMINATOR: Final = b"\x1b\\"
+# Opens a screen/tmux window-name escape (see _WindowNameFilter).
+_WINDOW_NAME_START: Final = b"\x1bk"
+# tmux's parser ends a window name at ESC, CAN, or SUB.
+_WINDOW_NAME_END_RE: Final = re.compile(rb"[\x18\x1a\x1b]")
 
 # ``capture-pane -p`` joins rows with a bare LF. Match an LF not already
 # preceded by CR so the CRLF rewrite is idempotent (a future tmux emitting
@@ -148,6 +159,113 @@ def unescape_control_output(value: bytes) -> bytes:
     :returns: The raw bytes, e.g. ``b"\\x1b[31mRED\\x1b[0m\\r\\n"``.
     """
     return _OCTAL_ESCAPE_RE.sub(lambda m: bytes([int(m.group(1), 8)]), value)
+
+
+class _WindowNameState(enum.Enum):
+    """Where :class:`_WindowNameFilter` is in the pane byte stream."""
+
+    # Ordinary output, forwarded.
+    OUTPUT = enum.auto()
+    # An ESC not yet forwarded; it starts a window name if ``k`` follows.
+    HELD_ESCAPE = enum.auto()
+    # Inside a window name, which is dropped.
+    NAME = enum.auto()
+    # An ESC ended the name; a following ``\`` completes its ST.
+    NAME_ESCAPE = enum.auto()
+
+
+class _WindowNameFilter:
+    """Drop screen/tmux window-name escapes (``ESC k <name> ESC \\``) from pane output.
+
+    Panes run with a tmux ``TERM`` (``tmux-256color`` or ``screen``), so shell
+    title hooks such as oh-my-zsh's name the window with ``ESC k`` before every
+    command. tmux consumes the sequence, so a tmux client never shows it, but
+    ``%output`` carries the pane's bytes before tmux parses them. xterm.js has
+    no ``ESC k``: it ignores the two-byte escape and prints the name, so each
+    command's name lands in front of its output (``echo $TERM`` renders
+    ``echotmux-256color``).
+
+    The name runs until ESC, CAN, or SUB, as in tmux's parser. Each sequence
+    becomes a bare ST, which xterm.js ignores, so a string sequence that the
+    dropped ESC would have ended (an unterminated OSC, say) still ends there.
+    State carries across :meth:`feed` calls because tmux can split a sequence
+    between ``%output`` lines.
+    """
+
+    def __init__(self) -> None:
+        self._state = _WindowNameState.OUTPUT
+
+    def feed(self, data: bytes) -> bytes:
+        """Return the next chunk of pane output without window-name escapes.
+
+        :param data: Raw pane bytes from one ``%output`` line, e.g.
+            ``b"\\x1bkecho\\x1b\\\\tmux-256color\\r\\n"``.
+        :returns: The bytes to forward, e.g. ``b"\\x1b\\\\tmux-256color\\r\\n"``.
+        """
+        if (
+            self._state is _WindowNameState.OUTPUT
+            and _WINDOW_NAME_START not in data
+            and not data.endswith(_ESC)
+        ):
+            return data
+        forwarded = bytearray()
+        pos = 0
+        while pos < len(data):
+            state = self._state
+            if state is _WindowNameState.OUTPUT:
+                start = data.find(_WINDOW_NAME_START, pos)
+                if start == -1:
+                    if data.endswith(_ESC):
+                        forwarded += data[pos:-1]
+                        self._state = _WindowNameState.HELD_ESCAPE
+                    else:
+                        forwarded += data[pos:]
+                    break
+                forwarded += data[pos:start]
+                pos = start + len(_WINDOW_NAME_START)
+                self._state = _WindowNameState.NAME
+            elif state is _WindowNameState.HELD_ESCAPE:
+                if data[pos : pos + 1] == b"k":
+                    pos += 1
+                    self._state = _WindowNameState.NAME
+                else:
+                    forwarded += _ESC
+                    self._state = _WindowNameState.OUTPUT
+            elif state is _WindowNameState.NAME:
+                end = _WINDOW_NAME_END_RE.search(data, pos)
+                if end is None:
+                    break
+                pos = end.end()
+                if end.group() == _ESC:
+                    self._state = _WindowNameState.NAME_ESCAPE
+                else:
+                    forwarded += _STRING_TERMINATOR
+                    self._state = _WindowNameState.OUTPUT
+            else:
+                # The ESC that ended the name completes ST with ``\``, or else
+                # starts the next sequence.
+                forwarded += _STRING_TERMINATOR
+                if data[pos : pos + 1] == b"\\":
+                    pos += 1
+                    self._state = _WindowNameState.OUTPUT
+                else:
+                    self._state = _WindowNameState.HELD_ESCAPE
+        return bytes(forwarded)
+
+    def finish(self) -> bytes:
+        """Flush what the filter still holds when the pane stream ends.
+
+        :returns: A held ESC, or the ST that replaces a name the stream's last
+            ESC ended; ``b""`` otherwise. An unterminated name stays dropped,
+            as tmux never shows it either.
+        """
+        state = self._state
+        self._state = _WindowNameState.OUTPUT
+        if state is _WindowNameState.HELD_ESCAPE:
+            return _ESC
+        if state is _WindowNameState.NAME_ESCAPE:
+            return _STRING_TERMINATOR
+        return b""
 
 
 async def _read_tmux_buffer(
@@ -596,6 +714,8 @@ async def bridge_tmux_control_to_websocket(
     # one bounded ``send_bytes``, so when the browser send lags tmux's firehose
     # a backlog of tiny per-line payloads collapses into a few large frames.
     output_chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+    # Drops window-name escapes before they reach xterm.js (see _WindowNameFilter).
+    window_name_filter = _WindowNameFilter()
     # Keep at most the newest pending clipboard buffer plus the EOF sentinel.
     # A noisy pane cannot build an unbounded queue of names/subprocess reads.
     clipboard_buffers: asyncio.Queue[str | None] = asyncio.Queue(maxsize=2)
@@ -652,7 +772,9 @@ async def bridge_tmux_control_to_websocket(
             # %output %<pane-id> <escaped-bytes>
             parts = line.split(b" ", 2)
             if len(parts) == 3:
-                output_chunks.put_nowait(unescape_control_output(parts[2]))
+                output = window_name_filter.feed(unescape_control_output(parts[2]))
+                if output:
+                    output_chunks.put_nowait(output)
             return True
         buffer_name = _clipboard_buffer_name(line)
         if buffer_name is not None:
@@ -682,8 +804,9 @@ async def bridge_tmux_control_to_websocket(
         Reads with ``stdout.read()`` rather than ``readline()`` so one wakeup
         can pull many buffered ``%output`` lines at once — letting the
         forwarder coalesce them — and so an oversized line can't raise
-        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit
-        so the forwarder terminates.
+        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit,
+        after any bytes the window-name filter still holds, so the forwarder
+        terminates.
         """
         buffer = b""
         try:
@@ -699,6 +822,9 @@ async def bridge_tmux_control_to_websocket(
                     if not _handle_control_line(raw_line.rstrip(b"\r")):
                         return
         finally:
+            tail = window_name_filter.finish()
+            if tail:
+                output_chunks.put_nowait(tail)
             output_chunks.put_nowait(None)
             clipboard_buffers.put_nowait(None)
             if reader_done is not None:

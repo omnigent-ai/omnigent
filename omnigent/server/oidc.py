@@ -188,6 +188,11 @@ class OIDCConfig:
         the user's email identity, e.g. ``"preferred_username"`` for
         IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
         ``"email"``. Only affects the generic-OIDC path.
+    :param require_reauth: When ``False``, forced re-authentication
+        logins (CLI tickets, device consent) still send
+        ``prompt=login``/``max_age=0`` but skip verifying the
+        id_token's ``auth_time``. Validated for every provider, but
+        GitHub never forces re-authentication, so it has no effect there.
     """
 
     issuer: str
@@ -207,6 +212,7 @@ class OIDCConfig:
     allow_invites: bool
     skip_email_verification: bool = False
     email_claim: str = "email"
+    require_reauth: bool = True
 
     @property
     def base_url(self) -> str:
@@ -370,6 +376,22 @@ class OIDCConfig:
                     "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is also set."
                 )
 
+        # Some IdPs (e.g. Cloudflare Access) omit auth_time or ignore
+        # max_age, so forced re-authentication can never be verified.
+        # Only an explicit false value waives the check; typos fail startup.
+        raw_require_reauth = os.environ.get("OMNIGENT_OIDC_REQUIRE_REAUTH", "").strip().lower()
+        if raw_require_reauth not in {"", "1", "true", "yes", "0", "false", "no"}:
+            raise RuntimeError("OMNIGENT_OIDC_REQUIRE_REAUTH must be 1/true/yes or 0/false/no")
+        require_reauth = raw_require_reauth not in {"0", "false", "no"}
+        if not require_reauth and not is_github:
+            _logger.warning(
+                "OMNIGENT_OIDC_REQUIRE_REAUTH is disabled: CLI, host, and "
+                "device-approval logins still ask %s to re-authenticate, but "
+                "the id_token's auth_time is not verified. If the IdP reuses "
+                "its session, only the consent screen confirms the request.",
+                issuer,
+            )
+
         # Determine provider type and resolve endpoints.
         endpoints = {
             name: os.environ.get(f"OMNIGENT_OIDC_{name.upper()}", "").strip()
@@ -429,6 +451,7 @@ class OIDCConfig:
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
+                require_reauth=require_reauth,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -475,4 +498,5 @@ class OIDCConfig:
             allow_invites=allow_invites,
             skip_email_verification=skip_email_verification,
             email_claim=email_claim,
+            require_reauth=require_reauth,
         )

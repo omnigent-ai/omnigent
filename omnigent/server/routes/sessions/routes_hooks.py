@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from typing import Any, NamedTuple
 
 from fastapi import (
@@ -22,6 +23,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.native.policy_allow_cache import ALLOW_CACHE_FIELD, MAX_ALLOW_CACHE_SECONDS
 from omnigent.pi_extension_ui import timeout_seconds, to_elicitation_params, to_ui_response
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runtime import (
@@ -31,10 +33,12 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.caps import RuntimeCaps
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.runtime.policies.builder import (
     any_policies_apply,
     build_policy_engine,
+    policy_specs_cache_age,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.server._elicitation_registry import (
@@ -105,11 +109,47 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.policy_store import PolicyStore
 
 #: Policy-name vendor for a native agent key, where the two differ. Mirrors
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
 #: a card's glyph and name from the ``<vendor>_native_`` prefix.
 _NATIVE_POLICY_VENDORS: dict[str, str] = {"antigravity": "agy"}
+
+
+def _no_policy_allow_body(
+    caps: RuntimeCaps, session_id: str, policy_store: PolicyStore | None
+) -> dict[str, object]:
+    """Build the ALLOW body for an evaluation where no policies apply.
+
+    When the operator enables the allow cache, the body says how long the
+    session's native hooks may reuse this answer instead of asking again: the
+    configured window, capped, minus the age of the policy lists behind the
+    answer. A policy change therefore reaches native hooks within the window.
+
+    :param caps: The server's runtime caps.
+    :param session_id: The evaluated session, e.g. ``"conv_abc123"``.
+    :param policy_store: The policy store the no-policy answer read.
+    :returns: The response body, e.g.
+        ``{"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 42.5}``.
+    """
+    body: dict[str, object] = {"result": "POLICY_ACTION_ALLOW"}
+    resolver = caps.native_hook_allow_cache_seconds
+    if resolver is None:
+        return body
+    try:
+        seconds = float(resolver())
+    except Exception:  # A broken resolver must not fail the gate.
+        _logger.warning("native hook allow-cache resolver failed; not caching", exc_info=True)
+        return body
+    if not math.isfinite(seconds):
+        _logger.warning("native hook allow-cache window %r is not finite; not caching", seconds)
+        return body
+    seconds = min(seconds, MAX_ALLOW_CACHE_SECONDS)
+    seconds -= policy_specs_cache_age(session_id, policy_store)
+    if seconds > 0:
+        body[ALLOW_CACHE_FIELD] = seconds
+    return body
 
 
 def _create_route_decision_id(
@@ -884,13 +924,15 @@ def register_hooks_routes(
         # entirely. This avoids conversation-store reads for labels/state/usage
         # on every tool call for the common no-policy case. Session policies are
         # LRU-cached so this check is cheap after the first call per session.
-        # Users can add policies mid-session — the cache is invalidated on
-        # mutation, so newly added policies are visible on the very next call.
+        # Mutations invalidate that cache, so a newly added policy applies on
+        # the next call, or once a native hook's allow window (see
+        # _no_policy_allow_body) expires.
+        policy_store = get_policy_store()
         if not any_policies_apply(
             spec=loaded.spec,
             conversation_id=session_id,
             default_policies=_caps.default_policies,
-            policy_store=get_policy_store(),
+            policy_store=policy_store,
             phase=phase,
             tool_name=data.get("name") if isinstance(data, dict) else None,
             # A sub-agent conversation's own guardrails live on the CHILD
@@ -899,7 +941,7 @@ def register_hooks_routes(
             conversation=conv,
         ):
             return Response(
-                content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                content=json.dumps(_no_policy_allow_body(_caps, session_id, policy_store)),
                 media_type="application/json",
             )
 

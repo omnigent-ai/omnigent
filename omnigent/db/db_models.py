@@ -617,6 +617,11 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+# MySQL stores these documents as BLOB (at most 65,535 bytes), so writes that
+# compress past that fail before reaching MySQL. Other dialects keep the uncapped codec.
+_MYSQL_BLOB_TEXT = CompressedText().with_variant(CompressedText(max_stored_bytes=65_535), "mysql")
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -645,12 +650,12 @@ class SqlConversationMetadata(OmnigentBase):
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    session_state: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
-    session_usage: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    session_state: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
+    session_usage: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # JSON-encoded provider binding and model catalog captured at session creation.
     inference_snapshot: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
     # JSON-encoded list of strings. NULL for non-native sessions.
-    terminal_launch_args: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    terminal_launch_args: Mapped[str | None] = mapped_column(_MYSQL_BLOB_TEXT, nullable=True)
     # Required when host_id is set; enforced by check constraint below.
     workspace: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     git_branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -670,6 +675,10 @@ class SqlConversationMetadata(OmnigentBase):
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
     project_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # JSON document of the session's linked pull requests and pending unlinks,
+    # kept under 16,384 stored bytes by SessionPullRequestStore; NULL = none
+    # reported. Deferred so whole-row reads (e.g. the session list) skip it.
+    pull_requests: Mapped[str | None] = mapped_column(CompressedText, nullable=True, deferred=True)
 
     __table_args__ = (
         CheckConstraint("kind IN (1, 2)", name="ck_conversation_metadata_kind"),
@@ -1463,8 +1472,9 @@ class SqlScheduledTask(OmnigentBase):
         deterministic id at fire time, so there is nothing to pin).
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
-    :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-        The scheduler only dispatches ``active`` tasks.
+    :param state: Lifecycle state — ``active``/``paused``/``deleted``/``completed``.
+        The scheduler only dispatches ``active`` tasks; ``completed`` schedules
+        have no remaining occurrences.
         Stored as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_STATE); the store converts to/from the string name at the
         row↔entity boundary. Defaults to ``active``.
@@ -1474,6 +1484,14 @@ class SqlScheduledTask(OmnigentBase):
         firing (relates to ``conversations.id``). ``None`` if never fired or the
         referenced conversation was deleted (application-owned SET-NULL cleanup;
         no DB foreign key).
+    :param session_mode: Which session each firing uses — ``new`` (a new session
+        per firing) or ``continue`` (one session, ``session_id``, across
+        firings). Stored as a stable int code (see omnigent.db.enum_codecs
+        SCHEDULED_TASK_SESSION_MODE). Defaults to ``new``.
+    :param session_id: For ``session_mode=continue``, the session firings
+        continue (relates to ``conversations.id``; no DB foreign key, Rule R032).
+        ``None`` until the first such firing creates it, unless a session was
+        chosen.
     :param created_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
@@ -1538,19 +1556,26 @@ class SqlScheduledTask(OmnigentBase):
     host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
+    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3, completed=4). The
     # store converts to/from the string name at the row↔entity boundary.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     last_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Relates to conversations.id. No DB foreign key (Rule R032); the
     # application nulls this out when the referenced conversation is deleted.
     last_run_conversation_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
+    # Stable int code (see omnigent.db.enum_codecs SCHEDULED_TASK_SESSION_MODE:
+    # new=1, continue=2). Defaults to new so existing tasks keep a new session
+    # per firing.
+    session_mode: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
+    # Relates to conversations.id. No DB foreign key (Rule R032).
+    session_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger)
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
+        CheckConstraint("session_mode IN (1, 2)", name="ck_scheduled_tasks_session_mode"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.
         Index(
@@ -1661,9 +1686,20 @@ class SqlScheduledTaskRun(OmnigentBase):
         # Reverse lookup conversation_id -> run for the event-driven completion
         # hook (get_running_run_by_conversation), which fires on every turn's
         # terminal edge; without this the lookup is a full-table scan.
+        # Superseded by ix_scheduled_task_runs_conversation_status; a later
+        # migration drops it after an observation period.
         Index(
             "ix_scheduled_task_runs_conversation_id",
             "workspace_id",
             "conversation_id",
+        ),
+        # The same lookup once a continued session has collected one run per
+        # firing: status keeps it to the running run.
+        Index(
+            "ix_scheduled_task_runs_conversation_status",
+            "workspace_id",
+            "conversation_id",
+            "status",
+            "id",
         ),
     )

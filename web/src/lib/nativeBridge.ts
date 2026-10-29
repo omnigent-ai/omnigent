@@ -190,6 +190,10 @@ interface ElectronDesktopApi extends NativeShellApi {
   updates?: ElectronUpdateBridge;
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile?: (hostId: string, path: string) => Promise<boolean>;
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
+  /** This machine's path for a dropped File; "" if none or off the pinned server. */
+  getPathForFile?: (file: File) => Promise<string>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -1088,6 +1092,11 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   }
 }
 
+/** Whether this desktop shell can connect the user's Arca instance as a host. */
+export function supportsArcaConnect(): boolean {
+  return typeof electronApi()?.connectArcaHost === "function";
+}
+
 /**
  * Connect the user's Arca instance (Databricks-internal sandbox) to the
  * window's server as a host, via the desktop shell. The shell asks native
@@ -1222,5 +1231,35 @@ export async function revealFile(hostId: string, path: string): Promise<boolean>
     return (await electronApi()?.revealFile?.(hostId, path)) ?? false;
   } catch {
     return false;
+  }
+}
+
+/** True when the desktop shell can open the OS folder chooser for this machine. */
+export function supportsDirectoryChooser(): boolean {
+  return typeof electronApi()?.chooseDirectory === "function";
+}
+
+/** Open the OS folder chooser; resolves the chosen path, or null on cancel or failure. */
+export async function chooseDirectory(defaultPath?: string): Promise<string | null> {
+  try {
+    return (await electronApi()?.chooseDirectory?.(defaultPath)) ?? null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron chooseDirectory failed:", err);
+    return null;
+  }
+}
+
+/** True when the desktop shell can resolve paths of files dropped from the OS. */
+export function supportsDroppedFilePaths(): boolean {
+  return typeof electronApi()?.getPathForFile === "function";
+}
+
+/** This machine's path for a dropped ``file``, or null when the shell can't resolve one. */
+export async function droppedFilePath(file: File): Promise<string | null> {
+  try {
+    return (await electronApi()?.getPathForFile?.(file)) || null;
+  } catch (err) {
+    console.warn("[nativeBridge] electron getPathForFile failed:", err);
+    return null;
   }
 }

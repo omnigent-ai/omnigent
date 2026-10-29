@@ -90,6 +90,22 @@ describe("MarkdownSearchBar", () => {
     expect(screen.getByText(`1 / ${highlighted}`)).toBeDefined();
   });
 
+  it("recounts when another writer's update replaces the document", async () => {
+    renderBar();
+    await act(async () => {
+      type("the");
+    });
+    expect(screen.getByText("1 / 2")).toBeDefined();
+    // External updates are applied without an "update" event (see applyExternalMarkdown).
+    await act(async () => {
+      editor!.commands.setContent("A story about the end.", {
+        emitUpdate: false,
+        contentType: "markdown",
+      });
+    });
+    expect(screen.getByText("1 / 1")).toBeDefined();
+  });
+
   it("shows 'No results' when nothing matches", async () => {
     renderBar();
     await act(async () => {
