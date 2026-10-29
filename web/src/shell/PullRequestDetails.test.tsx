@@ -604,8 +604,19 @@ it.each(["unmount", "rerender"])(
     const mount = (prUrl: string, current: ReviewThread) => render(tree(prUrl, current));
     const first = mount(PR_URL, thread);
     expect(screen.queryByRole("button", { name: "Reply…" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Write" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reply" })).not.toBeInTheDocument();
+    fireEvent.focus(screen.getByRole("textbox"));
+    expect(screen.getByRole("textbox")).toHaveFocus();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "**Because**" } });
     await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("**Because**"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("tab", { name: "Write" })).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
+    expect(screen.getByRole("textbox").closest("form")).toHaveFocus();
+    fireEvent.focus(screen.getByRole("textbox"));
+    expect(screen.getByRole("textbox")).toHaveFocus();
+    expect(screen.getByRole("textbox")).toHaveValue("**Because**");
     fireEvent.click(screen.getByRole("button", { expanded: true }));
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { expanded: false }));
@@ -616,6 +627,7 @@ it.each(["unmount", "rerender"])(
     fireEvent.submit(screen.getByRole("textbox").closest("form")!);
     fireEvent.submit(screen.getByRole("textbox").closest("form")!);
     await waitFor(() => expect(edits).toHaveLength(1));
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
     expect(edits[0].body).toEqual({ pr_url: PR_URL, body: "**Because**" });
     if (switchMode === "unmount") {
       restored.unmount();

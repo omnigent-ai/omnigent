@@ -7,8 +7,9 @@ request's Changes subtab. Top-level comments remain in Comments.
 
 - `inline-threads`: Published conversations on old/new lines, both diff layouts,
   separate conversations at the same line and multiline range labels.
-- `inline-reply`: Always-visible composers in expanded threads, Markdown preview,
-  account attribution, immediate posting and drafts retained across navigation.
+- `inline-reply`: Compact reply inputs expand on focus; Cancel collapses the
+  composer and retains the draft. Markdown preview, account attribution and
+  immediate posting remain available in the expanded composer.
 - `new-conversation`: Gutter plus and line-selection actions for a single line or
   same-side range; independent conversations on lines with existing threads.
 - `history`: On-demand pages, incomplete/error states, resolved collapse,
@@ -40,6 +41,8 @@ the real diff, its draft survives the PR list, tabs and layout switching, previe
 renders Markdown, and exactly one reply remains after refresh. Each variant also
 creates a separate conversation on an occupied new-side line and a range on the
 old side, verifying coordinates, placement and deduplication after refresh.
+It checks focus-to-expand, Cancel and keyboard reopening, collapse after posting,
+and the gutter plus centered over the line-number/code divider in both layouts.
 
 The existing
 `tests/e2e_ui/github/test_github_tab.py::test_post_top_level_pr_comment`
@@ -47,8 +50,9 @@ covers the separate Comments composer. Component and runner tests carry the
 pagination, old-side placement, revision, permission and failure matrices.
 
 For a live check, use a disposable GitHub PR with current, old-side, resolved
-and outdated threads. Open Changes, compare both layouts to GitHub, type and
-preview a reply, switch tabs and back, post, then refresh. Confirm one reply
+and outdated threads. Open Changes, compare both layouts to GitHub, focus the
+reply input and type a draft. Cancel, reopen and confirm the text survives.
+Preview the reply, switch tabs and back, post, then refresh. Confirm one reply
 under the displayed account on GitHub. Move the commented line in a new commit
 and confirm the discussion remains accessible. Click a line number and its plus
 to start another conversation; drag line numbers or Shift-click to select a range

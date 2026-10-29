@@ -165,7 +165,8 @@ code context. Resolved threads start collapsed.
 
 `POST review-threads/{id}/replies` publishes immediately with the selected host
 account. The host validates thread membership and replies to its published root
-comment. Expanded conversations show the reply composer immediately.
+comment. Expanded conversations show a compact **Write a reply…** input. Focus it
+to open the Markdown composer; **Cancel** collapses it while retaining the draft.
 Reads require session read permission; writes require edit permission.
 Runner and host fallback use the same provider implementation. An uncertain
 write is never retried automatically. Drafts and pending/error state stay in
@@ -173,6 +174,8 @@ memory per session, PR and thread, including through tab and layout switches.
 
 Select a line number and use the gutter **+** or **Comment on selected lines**
 to start a separate conversation, even when that line already has a thread.
+The **+** overlays the divider between line numbers and code without widening
+the gutter.
 Drag line numbers or Shift-click to select a range on the same side within one
 diff hunk. `POST review-threads` accepts `pr_url`, `body` and an `anchor` with
 `path`, `side`, `line`, optional `start_line`, `head_sha` and `base_sha`.

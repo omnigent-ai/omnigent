@@ -42,9 +42,9 @@ the patch snapshot gap a prerequisite.
   PR's Changes subtab, in both unified and split layouts.
 - R2: Show the author, Markdown body, timestamp, GitHub permalink, replies, and
   resolved/outdated state. Preserve independent threads at the same location.
-- R3: Reply directly below an existing thread, with Markdown preview and the
-  posting account visible and no opener button. A reply publishes immediately
-  to that GitHub thread.
+- R3: Show a compact reply input below an existing thread. Focus expands the
+  Markdown composer with the posting account visible; Cancel collapses it while
+  retaining the draft. A reply publishes immediately to that GitHub thread.
 - R4: Preserve drafts and pending/error state across tab, file-collapse, PR,
   layout, and session switches. Deduplicate submissions and retain text after
   failure. Page-reload persistence is not required.
@@ -66,7 +66,7 @@ the patch snapshot gap a prerequisite.
 ## Clarifications
 
 - Q1: What is the recommended delivery boundary?
-  A1: Deliver R1–R8 and R10: existing threads with visible reply composers and
+  A1: Deliver R1–R8 and R10: existing threads with compact reply inputs and
   new line/range conversations. Resolve/reopen (R9) remains follow-up work.
 - Q2: Should “Changes” be renamed to “Diff”?
   A2: Retain the current label; this plan uses Changes to identify the existing
@@ -158,7 +158,8 @@ the patch snapshot gap a prerequisite.
 
 **Interaction.** Expand unresolved, current threads beneath the relevant line.
 Each card shows the original comment and replies, a GitHub link, and a compact
-“Reply…” affordance that opens an inline Write/Preview composer. Resolved threads
+“Write a reply…” input that expands on focus. Cancel collapses the Write/Preview
+composer while retaining its text; a successful post also collapses it. Resolved threads
 start collapsed and can be expanded. Add a conversation count to each file header
 and a compact next/previous unresolved-thread navigator in the diff toolbar.
 Qualify counts while pages remain unloaded. On mobile, thread cards use the
@@ -263,7 +264,9 @@ reaches fallback cards.
 
 **New conversations and resolution.** Use the gutter utility or selected-lines
 action to open the composer beneath an eligible line or same-side range within
-one diff hunk. Publish via GraphQL `addPullRequestReview` with `event: COMMENT`,
+one diff hunk. Center the gutter plus over the divider between line numbers and
+code as an absolute overlay, without adding gutter space.
+Publish via GraphQL `addPullRequestReview` with `event: COMMENT`,
 the displayed `commitOID`, and one thread carrying `body`, `path`, `side`, `line`
 and optional `startLine`/`startSide`. Recheck both expected revisions before
 dispatch. Preserve text and request reselection if the revision is stale.
@@ -420,7 +423,7 @@ store. Render a targeted unavailable state if an older server lacks the routes.
 
 Implemented the first release on main `424e96b1c`. Published threads, inline
 replies, pagination, revision checks, shared polling and the four browser entry
-points are covered. The extension adds visible reply composers and new line/range
+points are covered. The extension adds compact reply inputs and new line/range
 conversations. Resolve/reopen remains deferred; hidden-context threads use the
 explicit original-snippet fallback.
 

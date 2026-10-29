@@ -816,7 +816,18 @@ def test_reply_to_inline_review_conversation(
     expect(conversation).to_be_focused()
     expect(conversation.get_by_text("Why add this line?", exact=True)).to_be_visible()
     textbox = conversation.get_by_role("textbox", name="Reply to review conversation")
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-compact.png"))
+    textbox.focus()
+    expect(textbox).to_be_focused()
     textbox.fill("**This handles empty input.**")
+    conversation.get_by_role("button", name="Cancel", exact=True).click()
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
+    expect(textbox).to_have_value("**This handles empty input.**")
+    page.keyboard.press("Tab")
+    expect(textbox).to_be_focused()
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_be_visible()
+    expect(textbox).to_have_value("**This handles empty input.**")
     tabs.get_by_role("tab", name="Summary", exact=True).click()
     tabs.get_by_role("tab", name="Changes", exact=False).click()
     expect(textbox).to_have_value("**This handles empty input.**")
@@ -851,6 +862,7 @@ def test_reply_to_inline_review_conversation(
     page.screenshot(path=str(tmp_path / f"inline-{entry}-preview.png"))
     conversation.get_by_role("button", name="Reply", exact=True).click()
     expect(conversation.locator("li")).to_have_count(2)
+    expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(conversation.locator("li")).to_have_count(2)
     expect(conversation.get_by_text("This handles empty input.", exact=True)).to_be_visible()
@@ -866,7 +878,18 @@ def test_reply_to_inline_review_conversation(
     file = panel.locator('[data-github-file="src/app/main.py"]')
     line = file.locator('[data-column-number="2"][data-line-type="change-addition"]')
     line.locator("[data-line-number-content]").click()
-    file.get_by_role("button", name="Start a new review conversation", exact=True).click()
+    plus = file.get_by_role("button", name="Start a new review conversation", exact=True)
+    expect(plus).to_be_visible()
+    line_box, plus_box = line.bounding_box(), plus.bounding_box()
+    assert line_box and plus_box
+    assert plus_box["x"] + plus_box["width"] / 2 == pytest.approx(
+        line_box["x"] + line_box["width"], abs=2
+    )
+    assert plus_box["y"] + plus_box["height"] / 2 == pytest.approx(
+        line_box["y"] + line_box["height"] / 2, abs=1
+    )
+    page.screenshot(path=str(tmp_path / f"inline-{entry}-gutter.png"))
+    plus.click()
     draft = file.get_by_role("region", name="New review conversation", exact=True)
     expect(draft.get_by_text("New conversation · New line 2", exact=True)).to_be_visible()
     draft.get_by_role("textbox", name="New review comment").fill("**Separate conversation.**")
@@ -897,6 +920,13 @@ def test_reply_to_inline_review_conversation(
     file.locator(
         '[data-code][data-deletions] [data-column-number="2"] [data-line-number-content]'
     ).click(modifiers=["Shift"])
+    old_line = file.locator('[data-code][data-deletions] [data-column-number="2"]')
+    expect(plus).to_be_visible()
+    line_box, plus_box = old_line.bounding_box(), plus.bounding_box()
+    assert line_box and plus_box
+    assert plus_box["x"] + plus_box["width"] / 2 == pytest.approx(
+        line_box["x"] + line_box["width"], abs=2
+    )
     file.get_by_role("button", name="Comment on selected lines", exact=True).click()
     expect(draft.get_by_text("New conversation · Old lines 1–2", exact=True)).to_be_visible()
     draft.get_by_role("textbox", name="New review comment").fill("Consider these lines together.")

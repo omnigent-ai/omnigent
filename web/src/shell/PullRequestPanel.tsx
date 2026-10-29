@@ -725,13 +725,6 @@ function PullRequestFileSection({
                 ...options,
                 enableLineSelection: !!threadContext.canCreate,
                 enableGutterUtility: !!threadContext.canCreate,
-                unsafeCSS: threadContext.canCreate
-                  ? `${options?.unsafeCSS ?? ""}
-                    [data-column-number] { padding-left: 28px; }
-                    [data-gutter-utility-slot] {
-                      left: 4px; right: auto; justify-content: flex-start;
-                    }`
-                  : options?.unsafeCSS,
                 onLineSelected: (range) => setSelection({ revision, range }),
               }}
               selectedLines={selectedLines}
@@ -743,7 +736,7 @@ function PullRequestFileSection({
                         type="button"
                         aria-label="Start a new review conversation"
                         title="Start a new review conversation"
-                        className="relative z-10 flex size-5 cursor-pointer items-center justify-center rounded bg-primary text-primary-foreground"
+                        className="absolute -right-px top-1/2 z-10 flex size-5 -translate-y-1/2 translate-x-1/2 cursor-pointer items-center justify-center rounded bg-primary text-primary-foreground"
                         disabled={composer.draft.pending}
                         onClick={() => {
                           const hovered = getHoveredLine();
