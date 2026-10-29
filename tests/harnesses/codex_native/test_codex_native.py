@@ -2249,10 +2249,14 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     asyncio.run(run())
 
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    # Only the startup background-work sync reaches the server; no dead letter is replayed.
+    assert [json.loads(request.content)["type"] for request in ap_requests] == [
+        "external_background_work"
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -2299,7 +2303,8 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
     assert fake_client.connected
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
 
@@ -6076,9 +6081,10 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    # The cleared session gets only the /clear notice and redirect, never a
-    # stale child-thread event.
+    # The cleared session gets only the startup flag sync, the /clear notice and
+    # redirect, never a stale child-thread event.
     assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",

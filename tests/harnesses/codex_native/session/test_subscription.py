@@ -321,10 +321,14 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     asyncio.run(run())
 
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    # Only the startup background-work sync reaches the server; no dead letter is replayed.
+    assert [json.loads(request.content)["type"] for request in ap_requests] == [
+        "external_background_work"
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -371,7 +375,8 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
     assert fake_client.connected
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
 
@@ -840,7 +845,10 @@ def _replay_then_live_user_posts(
 
     asyncio.run(run())
 
-    assert fake_client.requests == [("thread/resume", {"threadId": "thread_123"})]
+    assert fake_client.requests == [
+        ("thread/resume", {"threadId": "thread_123"}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+    ]
     return [
         payload
         for payload in posted

@@ -1,6 +1,6 @@
 // Per-row state derivation for the sidebar badge.
 // Priority: awaiting (web prompts, then terminal prompts) > running > disconnected
-// > error > background shells > no badge.
+// > error > background work > no badge.
 //
 // Liveness (runner / host reachability) is no longer a sidebar state:
 // it surfaces in the open-session view (see `useSessionLiveness`), so the
@@ -16,7 +16,7 @@ import type { LatestSessionError } from "@/lib/sessionError";
 export type SessionState =
   // `terminalReason`: no web card; the agent is parked on a prompt in its terminal.
   | { kind: "awaiting"; count: number; terminalReason?: string }
-  // `background`: the turn ended but a background shell is still running.
+  // `background`: the turn ended but work outlives it (a background shell or a Codex goal).
   | { kind: "running"; background?: true }
   | { kind: "error" }
   | { kind: "disconnected" }
