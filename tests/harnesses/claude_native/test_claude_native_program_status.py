@@ -21,6 +21,13 @@ from omnigent.terminals.program_status import ProgramStatusReader
 # The production grace period, from ERROR_HOOK_GRACE_S.
 _GRACE_S = 5.0
 _ERROR_REPORT = {"state": "error", "app": "claude-code", "message": "API Error: 499"}
+# What Claude reports after a turn fails authentication, until the user signs in.
+_AUTH_BLOCKED_REPORT = {
+    "state": "blocked",
+    "app": "claude-code",
+    "kind": "auth",
+    "message": "Invalid API key · Please run /login",
+}
 
 
 class _FakeClock:
@@ -64,10 +71,13 @@ def _poller(
     )
 
 
-def test_error_report_without_a_hook_edge_fails_the_turn_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize("report", [_ERROR_REPORT, _AUTH_BLOCKED_REPORT])
+def test_error_report_without_a_hook_edge_fails_the_turn_once(
+    tmp_path: Path, report: dict[str, object]
+) -> None:
     """A turn the runner still counts in flight fails once when its hook never lands."""
     path = tmp_path / "program-status.json"
-    _write_report(path, _ERROR_REPORT)
+    _write_report(path, report)
     clock = _FakeClock()
     published: list[str] = []
     poller = _poller(tmp_path, path, published, turn_is_active=lambda: True, clock=clock)
@@ -80,6 +90,36 @@ def test_error_report_without_a_hook_edge_fails_the_turn_once(tmp_path: Path) ->
     poller.tick()
     poller.tick()
     assert published == ["failed"]
+
+
+def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path) -> None:
+    """Only a dialog block keeps the turn running; an auth block, even resynced, publishes none."""
+    path = tmp_path / "program-status.json"
+    reasons: list[tuple[str, str | None]] = []
+
+    def on_status(status: str, reason: str | None) -> None:
+        reasons.append((status, reason))
+
+    poller = ClaudeProgramStatusPoller(
+        ProgramStatusReader(path),
+        SessionStatusPoller(
+            on_status=on_status,
+            pane_pid_getter=lambda: None,
+            session_id_getter=lambda: None,
+            config_dir=tmp_path,
+        ),
+        on_status,
+    )
+    _write_report(path, {"state": "blocked", "app": "claude-code", "kind": "permission"})
+    poller.tick()
+    _write_report(path, _AUTH_BLOCKED_REPORT)
+    poller.tick()
+    poller.resync()
+    poller.tick()
+    assert reasons == [("running", "permission prompt")]
+    _write_report(path, {"state": "idle", "app": "claude-code"})
+    poller.tick()
+    assert reasons == [("running", "permission prompt"), ("idle", None)]
 
 
 def test_forwarded_hook_edge_cancels_the_grace_period(tmp_path: Path) -> None:
