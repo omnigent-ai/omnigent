@@ -369,6 +369,27 @@ def register_native_commands(cli: click.Group) -> None:
             "you type in the TUI is what gets routed, so this takes no -p."
         ),
     )
+    @click.option(
+        "--exec-server-url",
+        default=None,
+        metavar="WS_URL",
+        help=("Run Codex shell/file tools through this exec-server URL. Requires --exec-cwd."),
+    )
+    @click.option(
+        "--exec-cwd",
+        default=None,
+        metavar="SHARED_PATH",
+        help=(
+            "Absolute working directory that exists at the same path on this host and "
+            "in the exec-server environment."
+        ),
+    )
+    @click.option(
+        "--local-execution",
+        is_flag=True,
+        default=False,
+        help="Clear a saved exec-server binding and run tools on this host.",
+    )
     @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
     @observe_native_startup("codex-native")
     def codex(
@@ -378,6 +399,9 @@ def register_native_commands(cli: click.Group) -> None:
         model: str | None,
         prompt: str | None,
         smart_routing: bool,
+        exec_server_url: str | None,
+        exec_cwd: str | None,
+        local_execution: bool,
         codex_args: tuple[str, ...],
     ) -> None:
         # Param docs live in comments — Click uses the docstring for --help.
@@ -388,6 +412,9 @@ def register_native_commands(cli: click.Group) -> None:
         # :param prompt: Optional first prompt.
         # :param smart_routing: When True, arm Smart Routing for the session so
         #     the first typed message picks the model.
+        # :param exec_server_url: Optional Codex exec-server WebSocket URL.
+        # :param exec_cwd: Absolute working directory inside the exec-server.
+        # :param local_execution: Clear any saved exec-server binding.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
         """Launch Codex with Omnigent.
 
@@ -417,6 +444,19 @@ def register_native_commands(cli: click.Group) -> None:
                 or session_id is not None
             )
         _reject_reserved_codex_transport_args(codex_args)
+
+        from omnigent.harnesses.codex_native.execution_environment import (
+            resolve_execution_selection,
+        )
+
+        try:
+            execution_selection = resolve_execution_selection(
+                exec_server_url=exec_server_url,
+                exec_cwd=exec_cwd,
+                local_execution=local_execution,
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
 
         from omnigent.harness_startup_config import resolve_harness_command
         from omnigent.harnesses.codex_native.main import run_codex_native
@@ -459,6 +499,7 @@ def register_native_commands(cli: click.Group) -> None:
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
             command=resolved_command,
+            execution_selection=execution_selection,
         )
 
     @cli.command(

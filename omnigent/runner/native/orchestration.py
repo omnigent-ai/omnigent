@@ -4868,14 +4868,13 @@ async def _launch_codex_native_tui(
     from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
-    codex_ws_url = app_server.listen_url
-    assert codex_ws_url is not None
+    codex_tui_url = app_server.tui_url
     workspace = str(launch_config.workspace)
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     codex_remote_args = build_codex_remote_args(
         codex_args=tuple(launch_config.terminal_launch_args or ()),
         thread_id=thread_id,
-        remote_url=codex_ws_url,
+        remote_url=codex_tui_url,
         bypass_sandbox=launch_config.bypass_sandbox,
         # The remote TUI needs the app-server's provider and cannot answer an update prompt.
         config_overrides=(

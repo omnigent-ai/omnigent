@@ -32,6 +32,10 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
+from omnigent.harnesses.codex_native.execution_environment import (
+    CodexRemoteExecution,
+    write_remote_execution,
+)
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,
@@ -973,6 +977,59 @@ def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(
                 "threadId": "thread_123",
                 "input": [{"type": "text", "text": "first"}],
                 "environments": [{"environmentId": "local", "cwd": str(tmp_path)}],
+            },
+        )
+    ]
+
+
+def test_web_started_codex_turn_selects_only_configured_remote_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A forwarded phone/web turn cannot fall back to the laptop environment."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_remote",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_remote",
+            codex_home=str(tmp_path / "codex-home"),
+            cwd=str(tmp_path),
+        ),
+    )
+    shared_cwd = tmp_path / "shared-cwd"
+    shared_cwd.mkdir()
+    write_remote_execution(
+        tmp_path,
+        CodexRemoteExecution(
+            exec_server_url="ws://127.0.0.1:43111",
+            cwd=str(shared_cwd),
+        ),
+    )
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "run remotely")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert _FakeCodexNativeClient.requests == [
+        (
+            "turn/start",
+            {
+                "threadId": "thread_remote",
+                "input": [{"type": "text", "text": "run remotely"}],
+                "environments": [
+                    {
+                        "environmentId": "remote",
+                        "cwd": str(shared_cwd),
+                        "runtimeWorkspaceRoots": [str(shared_cwd)],
+                    }
+                ],
             },
         )
     ]

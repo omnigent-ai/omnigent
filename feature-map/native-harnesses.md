@@ -14,6 +14,12 @@ implements them separately, so a fix for one harness does not reach the others.
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
+- `codex-remote-execution`: a CLI-launched Codex session can keep its Omnigent
+  conversation and UI on the host while shell and file tools use one bound
+  exec-server environment. The host-local binding survives a same-host cold
+  resume while its bridge is retained, fails closed on connection loss, and
+  can be cleared explicitly. Its cwd must be a real directory at the same
+  absolute path on both hosts because Codex executes command hooks locally.
 - `gemini-gateways`: configure native Gemini URL/key or Databricks profile routing,
   repair conflicting defaults, and keep the connection across tool turns.
 - `needs-auth`: a harness without usable credentials is shown as needing
@@ -164,6 +170,13 @@ restore them. The entry drops from the New Chat, New automation and
 project-default pickers. This is the user's own per-device choice, unlike "Hide
 unconfigured harnesses" next to it, which only drops rows that cannot launch on
 the selected host.
+
+**Codex remote execution:** create an empty local directory and a real remote
+checkout at the same absolute path, then run `omnigent codex --exec-server-url
+<ws-url> --exec-cwd <shared-absolute-path>`. Send turns from the native terminal
+and the existing-session Chat composer, including Chat at phone width. Stop the
+Codex terminal before changing the URL or path. Resume without execution flags
+to preserve the binding, or resume with `--local-execution` to clear it.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
@@ -781,6 +794,22 @@ Cross-harness journeys:
   retain their endpoint; history, model, effort and permissions survive.
   `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_resumes_with_launch_provider`
   covers the CLI resume call site with configured and unpinned launches.
+- **`codex-remote-execution` (component and manual live checks):**
+  `tests/harnesses/codex_native/test_execution_environment.py`,
+  `tests/harnesses/codex_native/app_server/test_launch_config.py::test_build_codex_native_server_scopes_exec_server_url_to_bound_session`,
+  `tests/harnesses/codex_native/session/test_terminal_prepare.py::test_prepare_codex_terminal_via_daemon_checks_live_execution_change`,
+  and
+  `tests/inner/test_codex_native_executor.py::test_web_started_codex_turn_selects_only_configured_remote_execution`
+  cover the private atomic binding, launch environment, live-terminal guard,
+  and Chat turn selection. For live acceptance, use an isolated Omnigent stack
+  and a disposable exec server. Launch through the CLI flags above, then issue
+  a harmless `pwd` and OS-identification tool call from both the native terminal
+  and Chat at phone width. The output must identify the remote cwd/host. Stop
+  the exec server and send another tool turn; it must fail without creating the
+  marker locally. Restart the executor and confirm a follow-up on the same
+  conversation retains history and again executes remotely. Also confirm the
+  local path may be empty and contains no copied remote files. Record the exact
+  Codex version and keep the exec-server URL redacted.
 - **`resume`, Codex `/new` followed by Stop session and a new message:**
   `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
   (own environment, real server, host, runner, Codex and tmux; local model replies)
@@ -1085,6 +1114,15 @@ checks do not prove live providers, browser rendering or thought-signature parit
 - Codex's background title requests can echo the user's prompt on another model.
   Identify the user thread when checking its outgoing model and effort, and
   script repeatable replies so title generation cannot exhaust the turn's reply.
+- Codex remote execution routes shell and file tools; it does not copy a laptop
+  checkout or stage Chat attachments into the remote cwd. The exec-server URL
+  is resolved by the host running the Codex app-server, not by the phone or web
+  browser. Treat a browser-only reply as insufficient evidence: inspect the
+  tool output and confirm no local marker was created.
+- Codex command hooks still run on the app-server host and inherit the selected
+  cwd. Remote execution therefore requires a searchable local directory and a
+  real remote directory at the same absolute path. An empty local placeholder
+  is sufficient. A symlinked remote workspace root can fail sandbox setup.
 - A transport check is not a full reconnect journey. To verify that claim,
   use an isolated configured harness, interrupt only its test connection, then
   resume and send another turn; check both terminal and chat for missing or

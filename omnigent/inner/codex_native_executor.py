@@ -60,6 +60,10 @@ from omnigent.harnesses.codex_native.shell_input import (
 from omnigent.harnesses.codex_native.shell_input import (
     shell_command_from_content as _shell_command_from_content,
 )
+from omnigent.harnesses.codex_native.execution_environment import (
+    codex_remote_environment_request,
+    read_remote_execution,
+)
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,
     goal_objective_length_error,
@@ -421,18 +425,24 @@ async def _start_codex_turn(
         failed = await asyncio.to_thread(mirror_applied_codex_settings, bridge_dir, switched)
         for key, value in failed.items():
             _logger.warning("Failed to mirror codex %s switch into config.toml: %s", key, value)
+    remote_execution = await asyncio.to_thread(read_remote_execution, bridge_dir)
+    environments: list[dict[str, object]]
+    if remote_execution is not None:
+        environments = [codex_remote_environment_request(remote_execution)]
+    else:
+        environments = [
+            {
+                "environmentId": "local",
+                "cwd": state.cwd or str(Path.cwd()),
+            }
+        ]
     response = await _native_delivery_request(
         client,
         "turn/start",
         {
             "threadId": state.thread_id,
             "input": input_items,
-            "environments": [
-                {
-                    "environmentId": "local",
-                    "cwd": state.cwd or str(Path.cwd()),
-                }
-            ],
+            "environments": environments,
         },
         state,
         bridge_dir=bridge_dir,

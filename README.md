@@ -298,6 +298,30 @@ omnigent pi                          # Pi
 omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigent run`)
 ```
 
+Codex can keep its app-server and per-session `CODEX_HOME` on the Omnigent host
+while an exec-server runs shell and file tools elsewhere. For example, the host
+can be a laptop reached through Omnigent's phone UI:
+
+```bash
+mkdir -p /tmp/omnigent-workspace  # empty local hook cwd is enough
+omnigent codex \
+  --exec-server-url ws://127.0.0.1:43111 \
+  --exec-cwd /tmp/omnigent-workspace
+```
+
+Create the remote checkout as a real directory at that same absolute path.
+Codex runs tools through the exec server but runs command hooks on the Omnigent
+host, so both hosts must be able to enter the path. The local directory can
+remain empty; avoid using a remote symlink as the workspace root because the
+remote sandbox can reject writable symlink crossings.
+
+The binding stays private to this host's Omnigent bridge and is reused on a
+same-host resume while that bridge is retained. It routes tools but does not
+copy `CODEX_HOME`, memory, or local workspace files into the remote cwd. If the
+exec server disconnects, the turn fails instead of running locally. After the
+Codex terminal stops, use `--local-execution` to move tool execution back to
+this computer.
+
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.
 

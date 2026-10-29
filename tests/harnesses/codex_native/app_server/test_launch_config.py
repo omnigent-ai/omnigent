@@ -24,6 +24,10 @@ from omnigent.harnesses.codex_native.app_server import (
     build_codex_native_server,
     codex_terminal_env,
 )
+from omnigent.harnesses.codex_native.execution_environment import (
+    CodexRemoteExecution,
+    write_remote_execution,
+)
 from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
@@ -417,6 +421,47 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
         assert {key: value for key, value in env.items() if key.startswith("OTEL_")} == {
             "OTEL_RESOURCE_ATTRIBUTES": "deployment=example,launch_mode=omni"
         }
+
+
+def test_build_codex_native_server_scopes_exec_server_url_to_bound_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only an explicitly bound session app-server receives the remote URL."""
+    monkeypatch.setenv("CODEX_EXEC_SERVER_URL", "ws://ambient.example:9999")
+    remote_bridge = tmp_path / "remote-bridge"
+    write_remote_execution(
+        remote_bridge,
+        CodexRemoteExecution(
+            exec_server_url="ws://127.0.0.1:43111",
+            cwd=str(tmp_path),
+        ),
+    )
+
+    remote = build_codex_native_server(
+        socket_path=tmp_path / "remote.sock",
+        codex_home=tmp_path / "remote-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=remote_bridge,
+        codex_path=sys.executable,
+    )
+    local = build_codex_native_server(
+        socket_path=tmp_path / "local.sock",
+        codex_home=tmp_path / "local-home",
+        cwd=tmp_path,
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "local-bridge",
+        codex_path=sys.executable,
+    )
+
+    assert remote.env["CODEX_EXEC_SERVER_URL"] == "ws://127.0.0.1:43111"
+    assert remote.remote_execution is not None
+    assert remote.remote_execution.cwd == str(tmp_path)
+    assert "CODEX_EXEC_SERVER_URL" not in local.env
+    assert local.remote_execution is None
 
 
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(

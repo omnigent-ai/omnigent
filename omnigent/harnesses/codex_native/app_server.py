@@ -24,6 +24,7 @@ import tomlkit
 import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from omnigent.models import model_catalog
@@ -49,6 +50,12 @@ from omnigent.harnesses.codex_native.bridge import (
     write_policy_hook_config,
 )
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
+from omnigent.harnesses.codex_native.execution_environment import (
+    CODEX_EXEC_SERVER_URL_ENV_VAR,
+    CodexRemoteExecution,
+    codex_remote_environment_request,
+    read_remote_execution,
+)
 from omnigent.harnesses.codex_native.launch_args import (
     _merge_tables,
     _write_private_config,
@@ -2208,7 +2215,10 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
+    remote_execution: CodexRemoteExecution | None = None
     app_server_command: tuple[str, ...] = ()
+    tui_listen_url: str | None = field(default=None, init=False)
+    _tui_proxy_server: Server | None = field(default=None, init=False, repr=False)
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2538,11 +2548,129 @@ class CodexNativeAppServer:
                     await startup_client.close()
                 except Exception:  # a dead control socket cannot undo trust
                     _logger.warning("Could not close Codex startup client", exc_info=True)
+            await self.start_tui_execution_proxy()
         except BaseException as exc:
             if isinstance(exc, Exception):
                 self._log_startup_failure_snapshot(exc)
             await self.close()
             raise
+
+    @property
+    def tui_url(self) -> str:
+        """Return the transport exposed to the native Codex TUI."""
+        if self.remote_execution is not None:
+            if self.tui_listen_url is None:
+                raise RuntimeError("Codex remote-execution TUI proxy is not running")
+            return self.tui_listen_url
+        return self.listen_url or f"unix://{self.socket_path}"
+
+    def project_tui_request(self, message: str | bytes) -> str | bytes:
+        """Project TUI lifecycle requests onto the bound remote executor.
+
+        Keep the TUI's display cwd as host-owned thread metadata, but replace
+        every executable environment selection with the persisted remote
+        binding. The binding constructor already requires its cwd to exist on
+        the host as well, which lets Codex launch host-side command hooks there.
+        Only the bound remote environment is selected, so a disconnected
+        executor cannot fall back to laptop tools.
+        """
+        if self.remote_execution is None or isinstance(message, bytes):
+            return message
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            return message
+        if not isinstance(payload, dict):
+            return message
+        method = payload.get("method")
+        if method not in {
+            "thread/start",
+            "thread/resume",
+            "thread/fork",
+            "thread/settings/update",
+            "turn/start",
+        }:
+            return message
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            return message
+        projected = copy.deepcopy(payload)
+        projected_params = cast(dict[str, object], projected["params"])
+        projected_params["cwd"] = str(self.cwd)
+        projected_params.pop("runtimeWorkspaceRoots", None)
+        if method in {"thread/start", "turn/start"}:
+            projected_params["environments"] = [
+                codex_remote_environment_request(self.remote_execution)
+            ]
+        return json.dumps(projected, separators=(",", ":"), ensure_ascii=False)
+
+    async def _proxy_tui_connection(self, downstream: ServerConnection) -> None:
+        """Relay one native TUI connection to the owned Codex app-server."""
+        upstream_transport = self.listen_url or f"unix://{self.socket_path}"
+        if upstream_transport.startswith("unix://"):
+            connector = websockets.unix_connect(
+                path=upstream_transport.removeprefix("unix://"),
+                uri=_UDS_WEBSOCKET_HANDSHAKE_URI,
+                max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
+                compression=None,
+            )
+        else:
+            connector = websockets.connect(
+                upstream_transport,
+                max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
+                compression=None,
+            )
+        async with connector as upstream:
+
+            async def to_upstream() -> None:
+                async for frame in downstream:
+                    await upstream.send(self.project_tui_request(frame))
+
+            async def to_downstream() -> None:
+                async for frame in upstream:
+                    await downstream.send(frame)
+
+            tasks = {
+                asyncio.create_task(to_upstream(), name="codex-tui-proxy-to-app-server"),
+                asyncio.create_task(to_downstream(), name="codex-tui-proxy-to-terminal"),
+            }
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            for task in done:
+                task.result()
+
+    async def start_tui_execution_proxy(self) -> None:
+        """Start the loopback TUI shim when this session has a remote binding."""
+        if self.remote_execution is None or self._tui_proxy_server is not None:
+            return
+        server = await serve(
+            self._proxy_tui_connection,
+            "127.0.0.1",
+            0,
+            compression=None,
+            max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
+        )
+        socket = next(iter(server.sockets), None)
+        if socket is None:
+            server.close()
+            await server.wait_closed()
+            raise RuntimeError("Codex TUI execution proxy did not bind a loopback socket")
+        self._tui_proxy_server = server
+        self.tui_listen_url = f"ws://127.0.0.1:{socket.getsockname()[1]}"
+
+    async def stop_tui_execution_proxy(self) -> None:
+        """Stop the loopback TUI shim without affecting the app-server."""
+        server = self._tui_proxy_server
+        self._tui_proxy_server = None
+        self.tui_listen_url = None
+        if server is None:
+            return
+        server.close()
+        await server.wait_closed()
 
     def _startup_snapshot_event(
         self, event_name: str, exc: Exception, **attributes: object
@@ -2719,6 +2847,7 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        await self.stop_tui_execution_proxy()
         if self.proc is not None and self.proc.returncode is None:
             _terminate_process_tree(self.proc)
             try:
@@ -3764,6 +3893,9 @@ def build_codex_native_server(
             "nvm-managed bin dir), set OMNIGENT_CODEX_PATH=/path/to/codex."
         )
     env = _clean_codex_env()
+    remote_execution = read_remote_execution(bridge_dir)
+    if remote_execution is not None:
+        env[CODEX_EXEC_SERVER_URL_ENV_VAR] = remote_execution.exec_server_url
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
@@ -3822,6 +3954,7 @@ def build_codex_native_server(
         trust_all_hooks=trust_all_hooks,
         reconcile_process_registry=reconcile_process_registry,
         writable_roots=tuple(codex_workspace_roots(terminal_launch_args, cwd)[1]),
+        remote_execution=remote_execution,
         app_server_command=_configured_app_server_command(),
     )
 
@@ -5249,9 +5382,21 @@ def build_codex_remote_args(
     if thread_id is None:
         # Codex refuses --add-dir with --remote; app-server startup writes
         # those roots into the private config (see CodexNativeAppServer.start).
-        return [*override_args, *without_codex_add_dirs(passthrough), "--remote", remote_url]
+        return [
+            *override_args,
+            *without_codex_add_dirs(passthrough),
+            "--remote",
+            remote_url,
+        ]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
-        return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+        return [
+            *override_args,
+            *passthrough,
+            "resume",
+            "--remote",
+            remote_url,
+            thread_id,
+        ]
     # Codex rejects explicit permission overrides on remote resume, even
     # when they match the app-server policy. config_overrides went to server
     # startup; codex_args went to preload's thread/resume call.

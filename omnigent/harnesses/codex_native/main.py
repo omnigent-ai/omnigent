@@ -70,6 +70,14 @@ from omnigent.harnesses.codex_native.bridge import (
     socket_path_for_bridge_dir,
     write_bridge_state,
 )
+from omnigent.harnesses.codex_native.execution_environment import (
+    CodexExecutionMode,
+    CodexExecutionSelection,
+    CodexRemoteExecutionConfigError,
+    apply_execution_selection,
+    project_remote_execution,
+    read_remote_execution,
+)
 from omnigent.harnesses.codex_native.forwarder import (
     _replay_dead_letters_before_resume,
     codex_rollout_last_turn_model,
@@ -422,6 +430,30 @@ def _require_codex_app_server_url(prepared: PreparedCodexTerminal) -> str:
     return prepared.app_server_url
 
 
+def _configure_execution_environment(
+    bridge_dir: Path,
+    selection: CodexExecutionSelection,
+    *,
+    terminal_running: bool,
+) -> None:
+    """Apply a cold-launch binding or reject a warm-terminal change."""
+    try:
+        if terminal_running:
+            current = read_remote_execution(bridge_dir)
+            projected = project_remote_execution(current, selection)
+            if projected != current:
+                raise click.ClickException(
+                    "Stop the running Codex terminal before changing its execution "
+                    "environment, then resume it with the new execution flags."
+                )
+            return
+        apply_execution_selection(bridge_dir, selection)
+    except CodexRemoteExecutionConfigError as exc:
+        raise click.ClickException(
+            f"Codex remote-execution configuration is invalid: {exc}"
+        ) from exc
+
+
 def run_codex_native(
     *,
     server: str | None,
@@ -433,6 +465,7 @@ def run_codex_native(
     model: str | None = None,
     prompt: str | None = None,
     auto_open_conversation: bool = False,
+    execution_selection: CodexExecutionSelection = CodexExecutionMode.PRESERVE,
 ) -> None:
     """
     Launch Codex TUI in an Omnigent terminal.
@@ -448,6 +481,8 @@ def run_codex_native(
     :param prompt: Optional first prompt to send after launch.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
+    :param execution_selection: Host-local Codex tool execution binding
+        requested for this session.
     :returns: None after the terminal attach session ends.
     :raises click.ClickException: If setup fails.
     """
@@ -474,6 +509,7 @@ def run_codex_native(
             model=model,
             prompt=prompt,
             auto_open_conversation=auto_open_conversation,
+            execution_selection=execution_selection,
         )
 
 
@@ -683,6 +719,7 @@ def _run_with_local_server(
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
+    execution_selection: CodexExecutionSelection = CodexExecutionMode.PRESERVE,
 ) -> None:
     """
     Start a local Omnigent server, launch Codex, and attach to it.
@@ -696,6 +733,8 @@ def _run_with_local_server(
     :param prompt: Optional first prompt.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
+    :param execution_selection: Host-local Codex tool execution binding
+        requested for this session.
     :returns: None.
     """
     from omnigent.chat import (
@@ -741,6 +780,7 @@ def _run_with_local_server(
                     model=model,
                     startup_progress=progress,
                     developer_instructions=_wrapper_spec_raw_instructions(spec_path),
+                    execution_selection=execution_selection,
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -784,6 +824,7 @@ def _run_with_remote_server(
     model: str | None,
     prompt: str | None,
     auto_open_conversation: bool = False,
+    execution_selection: CodexExecutionSelection = CodexExecutionMode.PRESERVE,
 ) -> None:
     """
     Launch Codex on an Omnigent server via a daemon-spawned runner.
@@ -798,6 +839,8 @@ def _run_with_remote_server(
     :param prompt: Optional first prompt.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is prepared.
+    :param execution_selection: Host-local Codex tool execution binding
+        requested for this session.
     :returns: None.
     """
     from omnigent.chat import _bundle_agent, _remote_headers, _server_auth
@@ -842,6 +885,7 @@ def _run_with_remote_server(
                     host_id=host_id,
                     workspace=str(Path.cwd().resolve()),
                     startup_progress=progress,
+                    execution_selection=execution_selection,
                 )
             if resolved_session_id is None:
                 _record_launch_for_fresh_session(prepared.session_id)
@@ -910,6 +954,7 @@ async def _prepare_codex_terminal_via_daemon(
     host_id: str,
     workspace: str,
     startup_progress: RunnerStartupProgress | None = None,
+    execution_selection: CodexExecutionSelection = CodexExecutionMode.PRESERVE,
 ) -> PreparedCodexTerminal:
     """
     Create or resume a Codex-native session through a daemon runner.
@@ -934,6 +979,8 @@ async def _prepare_codex_terminal_via_daemon(
         ``"/Users/me/repo"``.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param execution_selection: Host-local Codex tool execution binding
+        requested for this session.
     :returns: Prepared terminal details for attaching.
     :raises click.ClickException: If setup fails.
     """
@@ -955,6 +1002,7 @@ async def _prepare_codex_terminal_via_daemon(
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
+            bridge_id = session_id
         else:
             _update_startup_progress(startup_progress, "Loading Codex session...")
             payload = await _fetch_codex_session(client, session_id)
@@ -967,8 +1015,15 @@ async def _prepare_codex_terminal_via_daemon(
                 raise click.ClickException(
                     f"Conversation {session_id!r} is not a codex-native session."
                 )
+            bridge_id = str(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id)
             existing_terminal = await _find_running_codex_terminal(client, session_id)
             if existing_terminal is not None:
+                bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+                _configure_execution_environment(
+                    bridge_dir,
+                    execution_selection,
+                    terminal_running=True,
+                )
                 external_session_id = payload.get("external_session_id")
                 thread_id = external_session_id if isinstance(external_session_id, str) else None
                 if persist_args or model is not None:
@@ -984,7 +1039,7 @@ async def _prepare_codex_terminal_via_daemon(
                     terminal_id=existing_terminal.terminal_id,
                     tmux_socket=existing_terminal.tmux_socket,
                     tmux_target=existing_terminal.tmux_target,
-                    bridge_dir=bridge_dir_for_bridge_id(session_id),
+                    bridge_dir=bridge_dir,
                     thread_id=thread_id,
                     app_server_url=None,
                     app_server=None,
@@ -1008,6 +1063,12 @@ async def _prepare_codex_terminal_via_daemon(
                         f"({resp.status_code}): {error_text(resp)}"
                     )
 
+        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        _configure_execution_environment(
+            bridge_dir,
+            execution_selection,
+            terminal_running=False,
+        )
         if not fresh_session:
             await wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S)
         _update_startup_progress(startup_progress, "Starting runner...")
@@ -1042,7 +1103,7 @@ async def _prepare_codex_terminal_via_daemon(
         terminal_id=terminal.terminal_id,
         tmux_socket=terminal.tmux_socket,
         tmux_target=terminal.tmux_target,
-        bridge_dir=bridge_dir_for_bridge_id(session_id),
+        bridge_dir=bridge_dir,
         thread_id=None,
         app_server_url=None,
         app_server=None,
@@ -1114,6 +1175,7 @@ async def _prepare_codex_terminal(
     model: str | None,
     startup_progress: RunnerStartupProgress | None = None,
     developer_instructions: str | None = None,
+    execution_selection: CodexExecutionSelection = CodexExecutionMode.PRESERVE,
 ) -> PreparedCodexTerminal:
     """
     Create/bind a session, start app-server, and launch Codex TUI.
@@ -1132,6 +1194,8 @@ async def _prepare_codex_terminal(
         Codex's private per-session config, applied on fresh launch and
         cold resume only — the reattach branch below returns before this
         is used, so it never relaunches or duplicates the value.
+    :param execution_selection: Host-local Codex tool execution binding
+        requested for this session.
     :returns: Prepared terminal details.
     """
     timeout = httpx.Timeout(30.0, read=120.0)
@@ -1163,6 +1227,11 @@ async def _prepare_codex_terminal(
             thread_id = external_session_id if isinstance(external_session_id, str) else None
             if existing_terminal is not None and thread_id is not None:
                 reattach_bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+                _configure_execution_environment(
+                    reattach_bridge_dir,
+                    execution_selection,
+                    terminal_running=True,
+                )
                 reattach_unix_socket = socket_path_for_bridge_dir(reattach_bridge_dir)
                 # The running terminal's real transport lives in its bridge
                 # state (``ws://`` for terminals launched by current code).
@@ -1194,6 +1263,11 @@ async def _prepare_codex_terminal(
                 )
 
         bridge_dir = prepare_bridge_dir(bridge_id)
+        _configure_execution_environment(
+            bridge_dir,
+            execution_selection,
+            terminal_running=False,
+        )
         socket_path = socket_path_for_bridge_dir(bridge_dir)
         codex_home = codex_home_for_bridge_dir(bridge_dir)
         clear_bridge_state(bridge_dir)
@@ -1284,7 +1358,7 @@ async def _prepare_codex_terminal(
                 codex_args=codex_args,
                 command=command,
                 thread_id=thread_id,
-                remote_url=codex_ws_url,
+                remote_url=app_server.tui_url,
                 env=codex_terminal_env(app_server),
                 # Give the --remote TUI the same provider overrides as
                 # the app-server so it resolves the Omnigent provider

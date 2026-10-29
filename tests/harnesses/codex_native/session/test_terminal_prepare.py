@@ -15,6 +15,11 @@ import pytest
 
 from omnigent._runner_startup import RunnerStartupProgress
 from omnigent.harnesses.codex_native import main as codex_native
+from omnigent.harnesses.codex_native.execution_environment import (
+    CodexRemoteExecution,
+    read_remote_execution,
+    write_remote_execution,
+)
 from tests.harnesses.codex_native.session._support import (
     _write_source_rollout,
 )
@@ -242,6 +247,8 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
         config_overrides=[],
         env={},
         codex_home=tmp_path / "codex-home",
+        remote_execution=None,
+        tui_url="ws://127.0.0.1:9877",
     )
     preload = AsyncMock(return_value=client)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
@@ -435,6 +442,7 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     ensure_status: int,
+    tmp_path: Path,
 ) -> None:
     """
     Daemon preparation owns session create, runner launch, and terminal ensure.
@@ -451,6 +459,13 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
     from omnigent import _startup_events as startup
 
     caplog.set_level("INFO", logger="omnigent.startup")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    remote_execution = CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd=str(tmp_path),
+    )
     original_async_client = httpx.AsyncClient
     calls: list[tuple[str, str, object]] = []
 
@@ -529,7 +544,12 @@ async def test_prepare_codex_terminal_via_daemon_creates_runner_and_ensures_term
                 host_id="host_local",
                 workspace="/repo",
                 startup_progress=RunnerStartupProgress(update=progress_updates.append),
+                execution_selection=remote_execution,
             )
+    assert (
+        read_remote_execution(codex_native.bridge_dir_for_bridge_id("conv_new"))
+        == remote_execution
+    )
     if ensure_status != 200:
         events = [r.attributes["event"] for r in caplog.records if r.name == "omnigent.startup"]
         assert events[-1] == "launch_failed"
@@ -797,6 +817,88 @@ async def test_prepare_codex_terminal_via_daemon_live_resume_skips_config_patch(
     assert not any(method == "PATCH" for method, _path, _body in calls)
     assert live_rollout.read_bytes() == before
     assert "Ignoring Codex launch args/model" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("requested_name", "should_reject"), [("old", False), ("new", True)])
+async def test_prepare_codex_terminal_via_daemon_checks_live_execution_change(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    requested_name: str,
+    should_reject: bool,
+) -> None:
+    """A warm terminal accepts its exact binding but rejects an execution change."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    old_cwd = tmp_path / "old"
+    new_cwd = tmp_path / "new"
+    old_cwd.mkdir()
+    new_cwd.mkdir()
+    bridge_dir = codex_native.bridge_dir_for_bridge_id("bridge_live")
+    write_remote_execution(
+        bridge_dir,
+        CodexRemoteExecution(
+            exec_server_url="ws://127.0.0.1:43111",
+            cwd=str(old_cwd),
+        ),
+    )
+
+    @asynccontextmanager
+    async def fake_open_daemon_client(*_args: object, **_kwargs: object):
+        yield object()
+
+    monkeypatch.setattr(codex_native, "open_daemon_client", fake_open_daemon_client)
+    monkeypatch.setattr(
+        codex_native,
+        "_fetch_codex_session",
+        AsyncMock(
+            return_value={
+                "labels": {
+                    codex_native._WRAPPER_LABEL_KEY: codex_native._WRAPPER_LABEL_VALUE,
+                    codex_native.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge_live",
+                },
+                "external_session_id": "019e96aa-0be2-7343-8d3b-6f914d60936b",
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        codex_native,
+        "_find_running_codex_terminal",
+        AsyncMock(
+            return_value=codex_native.LaunchedCodexTerminal(
+                terminal_id="terminal_codex_main",
+                tmux_socket=None,
+                tmux_target=None,
+            )
+        ),
+    )
+
+    async def prepare() -> codex_native.PreparedCodexTerminal:
+        return await codex_native._prepare_codex_terminal_via_daemon(
+            base_url="https://example.com",
+            headers={},
+            session_id="conv_live",
+            session_bundle=None,
+            codex_args=(),
+            model=None,
+            host_id="host_local",
+            workspace="/repo",
+            execution_selection=CodexRemoteExecution(
+                exec_server_url="ws://127.0.0.1:43111",
+                cwd=str(tmp_path / requested_name),
+            ),
+        )
+
+    if should_reject:
+        with pytest.raises(click.ClickException, match="Stop the running Codex terminal"):
+            await prepare()
+    else:
+        prepared = await prepare()
+        assert prepared.reattached is True
 
 
 @pytest.mark.asyncio

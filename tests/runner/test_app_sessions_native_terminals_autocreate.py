@@ -5698,6 +5698,8 @@ async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
         codex_path="/opt/codex/bin/codex",
         codex_home=tmp_path / "codex-home",
         env={},
+        remote_execution=None,
+        tui_url="ws://127.0.0.1:9876",
     )
     await _launch_codex_native_tui(
         "conv_codex_cwd_gone",
@@ -5724,6 +5726,65 @@ async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
     assert spec.command == "user-codex"
     assert spec.args[0] == "--user-arg"
     assert spec.os_env.cwd == str(workspace)
+
+
+@pytest.mark.asyncio
+async def test_codex_tui_launch_uses_remote_execution_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A remote-bound TUI connects through the app-server's projection shim."""
+    from omnigent.harnesses.codex_native.execution_environment import CodexRemoteExecution
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    remote_execution = CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd=str(workspace),
+    )
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        tui_url="ws://127.0.0.1:9877",
+        config_overrides=[],
+        codex_cli_version=(0, 163, 0),
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+        remote_execution=remote_execution,
+    )
+
+    await _launch_codex_native_tui(
+        "conv_codex_remote",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=None,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=None,
+        agent_spec=None,
+    )
+
+    args = captured["spec"].args
+    assert "--cd" not in args
+    assert args[args.index("--remote") + 1] == app_server.tui_url
 
 
 @pytest.mark.asyncio

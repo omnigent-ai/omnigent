@@ -800,6 +800,90 @@ def test_codex_command_resume_binds_session_and_passes_unknown_args(
     assert captured["resume_picker"] is False
 
 
+def test_codex_command_passes_atomic_remote_execution_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The Codex wrapper carries one validated remote binding into launch."""
+    from omnigent.harnesses.codex_native.execution_environment import CodexRemoteExecution
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "codex",
+            "--exec-server-url",
+            "ws://127.0.0.1:43111",
+            "--exec-cwd",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["execution_selection"] == CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd=str(tmp_path),
+    )
+
+
+def test_codex_command_passes_explicit_local_execution_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Local execution is an explicit binding reset, not an absent remote half."""
+    from omnigent.harnesses.codex_native.execution_environment import CodexExecutionMode
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr("omnigent.cli._ensure_backend", lambda *_: "http://localhost:0")
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native",
+        _fake_run_codex_native_capture(captured),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", "--local-execution"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["execution_selection"] is CodexExecutionMode.LOCAL
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--exec-server-url", "ws://127.0.0.1:43111"],
+        ["--exec-cwd", "/home/agent/workspace"],
+        [
+            "--local-execution",
+            "--exec-server-url",
+            "ws://127.0.0.1:43111",
+            "--exec-cwd",
+            "/home/agent/workspace",
+        ],
+    ],
+)
+def test_codex_command_rejects_invalid_execution_selection_before_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+) -> None:
+    """Partial or conflicting execution flags have no backend side effects."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", *args])
+
+    assert result.exit_code == 2, result.output
+    assert "execution" in result.output.lower() or "--exec" in result.output
+
+
 def test_codex_command_bare_resume_requests_picker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
