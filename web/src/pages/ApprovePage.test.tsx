@@ -372,6 +372,21 @@ describe("ApprovePage submission", () => {
     expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
   });
 
+  it("drops the previous prompt's controls while the next approval link loads", async () => {
+    vi.mocked(identity.authenticatedFetch).mockImplementation(async (url) =>
+      String(url).endsWith("/eli_2")
+        ? new Promise<Response>(() => {})
+        : jsonResponse({ status: "pending", message: "Run the migration?" }),
+    );
+    renderPage("sess_1", "eli_1", { withNextLink: true });
+    expect(await screen.findByRole("button", { name: /Approve/ })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next link" }));
+    expect(await screen.findByText("Loading elicitation…")).toBeInTheDocument();
+    expect(screen.queryByText("Run the migration?")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
+  });
+
   it("shows a network error when the resolve POST throws", async () => {
     // WHY: a thrown resolve POST routes to the `error` branch (network error).
     vi.mocked(identity.authenticatedFetch)

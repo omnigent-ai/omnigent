@@ -71,8 +71,9 @@ export function ApprovePage() {
   });
 
   useEffect(() => {
-    // A new link never takes the previous prompt's in-flight answer as its own.
+    // A new link never takes the previous prompt's in-flight answer or controls as its own.
     submission.current = { revision: submission.current.revision + 1, pending: false };
+    setState({ kind: "loading" });
   }, [sessionId, elicitationId]);
 
   useEffect(() => {
