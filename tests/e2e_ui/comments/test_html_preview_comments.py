@@ -156,7 +156,8 @@ def test_html_preview_add_comment(
         timeout_s=10,
         interval_s=0.1,
     )
-    preview.locator("body").evaluate("() => new Promise((resolve) => setTimeout(resolve, 500))")
+    # Outlast the frame's 150 ms selection debounce before checking the button stays gone.
+    page.wait_for_timeout(500)
     expect(page.locator("[data-add-comment-btn]")).to_have_count(0)
     selection_text = preview.locator("body").evaluate("() => window.getSelection().toString()")
     assert selection_text == _ANCHOR_SENTENCE, "fresh draft selection should remain visible"

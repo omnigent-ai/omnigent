@@ -15,10 +15,10 @@ Regression coverage for two bugs in the HTML artifact preview
     be able to cancel such a click.
 
 It also covers zoom shortcuts pressed inside the preview, which scale only the
-rendered file instead of the whole app, and the "Open in new tab" toolbar button, which pops the
-artifact into a blank, app-controlled tab and renders it inside the same
-sandboxed (opaque-origin) iframe — full-window viewing without giving the
-artifact the app's own origin.
+rendered file instead of the whole app, and the "Open in new tab" toolbar
+button, which pops the artifact into a blank, app-controlled tab and renders it
+inside the same sandboxed (opaque-origin) iframe — full-window viewing without
+giving the artifact the app's own origin.
 
 The file is seeded via the filesystem PUT endpoint (no agent run), so the test
 is deterministic, and the fixture's JavaScript is self-contained (no network),
