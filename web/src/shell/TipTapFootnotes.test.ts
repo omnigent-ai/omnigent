@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
-import { scanFootnoteDefinitions, stripFootnoteReferenceMarks } from "./TipTapFootnotes";
+import { prepareFootnoteReferences, scanFootnoteDefinitions } from "./TipTapFootnotes";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -52,12 +52,12 @@ function footnoteNodes(ed: Editor): string[] {
   return found;
 }
 
-const PR_DESCRIPTION = `Title: [BSS] Update limits
+const PR_DESCRIPTION = `Title: Update limits
 
-This change updates the limits so every value passes.[^1] It uses the same rule as PR 2829149.[^2]
+This change updates the limits so every value passes.[^1] It uses the same rule as PR 42.[^2]
 
-[^1]: https://databricks.atlassian.net/browse/LKB-17647?focusedCommentId=10206636
-[^2]: https://github.com/databricks-eng/universe/pull/2829149
+[^1]: https://example.com/issues/1?focusedCommentId=2
+[^2]: https://example.com/pulls/42
 
 There is no behavior change.
 `;
@@ -122,6 +122,9 @@ describe("footnote round-trips", () => {
 
   it.each([
     ["without a definition", "Dangling[^9] reference.", []],
+    ["defined only in prose", "Explanation [^x]: inline prose.\n\nA **literal [^x] marker**.", []],
+    ["defined only in a code block", "```\n[^1]: x\n```\n\nSee [^1].", []],
+    ["in a task item before the definition", "- [ ] task[^1]\n\n[^1]: n", ["footnoteReference:1"]],
     [
       "matching a definition case-insensitively",
       "x[^Note]\n\n[^note]: n",
@@ -132,6 +135,16 @@ describe("footnote round-trips", () => {
       n.startsWith("footnoteReference"),
     );
     expect(found).toEqual(references);
+    expect(roundTrip(markdown)).toBe(markdown);
+  });
+
+  it.each([
+    ["thematic break", "[^1]: n\n***\nText", "horizontalRule"],
+    ["HTML block", '[^1]: n\n<div class="x">\n\nText', "htmlPassthrough"],
+  ])("leaves the paragraph after a %s editable", (_name, markdown, type) => {
+    const blocks: string[] = [];
+    makeEditor(markdown).state.doc.forEach((block) => blocks.push(block.type.name));
+    expect(blocks).toEqual(["footnoteDefinitions", type, "paragraph"]);
   });
 
   it("keeps CRLF footnotes, normalising only the line endings", () => {
@@ -283,6 +296,46 @@ describe("editing a document with footnotes", () => {
     expect(footnoteNodes(makeEditor(ed.getMarkdown()))).toEqual(["footnoteDefinitions:[^1]: note"]);
   });
 
+  it.each([
+    ["an opening parenthesis", "a[^1]\n\n[^1]: n", "(x)", "a[^1]\\(x)"],
+    ["a colon at the start of a paragraph", "[^1] b\n\n[^1]: n", ": a", "[^1]\\: a b"],
+  ])("keeps a reference when %s is typed after it", (_name, markdown, typed, line) => {
+    const ed = makeEditor(markdown);
+    ed.commands.insertContentAt(nodePosition(ed, "footnoteReference") + 1, typed);
+    const saved = ed.getMarkdown().replace(/\n+$/, "");
+    expect(saved.split("\n")[0]).toBe(line);
+    expect(footnoteNodes(makeEditor(saved))).toEqual([
+      "footnoteReference:1",
+      "footnoteDefinitions:[^1]: n",
+    ]);
+  });
+
+  it("keeps a colon after a reference mid-paragraph unescaped", () => {
+    const markdown = "see[^1]: here\n\n[^1]: n";
+    const ed = makeEditor(markdown);
+    ed.commands.insertContentAt(1, "x");
+    expect(ed.getMarkdown().replace(/\n+$/, "")).toBe(`x${markdown}`);
+  });
+
+  it.each([
+    ["Backspace", "footnoteReference", TWO_NOTES.replace("one.[^1] Claim", "one. Claim")],
+    ["Delete", "footnoteDefinitions", "Claim one.[^1] Claim two.[^2]\n\nAfter."],
+  ])("removes a selected footnote with %s", (key, type, expected) => {
+    const ed = makeEditor(TWO_NOTES);
+    ed.commands.setNodeSelection(nodePosition(ed, type));
+    ed.view.dom.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+    expect(ed.getMarkdown()).toBe(expected);
+  });
+
+  it("adds a paragraph instead of replacing a selected definitions block on Enter", () => {
+    const ed = makeEditor(TWO_NOTES);
+    ed.commands.setNodeSelection(nodePosition(ed, "footnoteDefinitions"));
+    ed.view.dom.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(footnoteNodes(ed)).toContain(
+      "footnoteDefinitions:[^1]: https://a.test\n[^2]: https://b.test",
+    );
+  });
+
   it("splits after a selected reference on Enter instead of deleting it", () => {
     const ed = makeEditor(TWO_NOTES);
     ed.commands.setNodeSelection(nodePosition(ed, "footnoteReference"));
@@ -292,7 +345,7 @@ describe("editing a document with footnotes", () => {
 
   it("returns the document itself when no reference carries marks", () => {
     const json = makeEditor(TWO_NOTES).getJSON();
-    expect(stripFootnoteReferenceMarks(json)).toBe(json);
+    expect(prepareFootnoteReferences(json)).toBe(json);
   });
 
   it("keeps references and definitions through copy and paste", () => {
@@ -369,6 +422,12 @@ describe("scanFootnoteDefinitions", () => {
     ["keeps a tab-indented continuation", "[^1]: one\n\n\ttwo\n\nAfter.", "[^1]: one\n\n\ttwo\n\n"],
     ["ends at the end of the source", "[^1]: one\n[^2]: two", "[^1]: one\n[^2]: two"],
     ["stops at trailing blank lines", "[^1]: one\n\n\n", "[^1]: one\n\n\n"],
+    ["stops before a *** break", "[^1]: one\n***\nText", "[^1]: one\n"],
+    ["stops before a _ _ _ break", "[^1]: one\n_ _ _\nText", "[^1]: one\n"],
+    ["stops before a --- break", "[^1]: one\n---\nText", "[^1]: one\n"],
+    ["stops before an HTML block", '[^1]: one\n<div class="x">text', "[^1]: one\n"],
+    ["stops before an HTML comment", "[^1]: one\n<!-- note -->", "[^1]: one\n"],
+    ["keeps an inline HTML line", "[^1]: one\n<span>two</span>", "[^1]: one\n<span>two</span>"],
   ])("%s", (_name, source, expected) => {
     expect(scanFootnoteDefinitions(source)).toBe(expected);
   });

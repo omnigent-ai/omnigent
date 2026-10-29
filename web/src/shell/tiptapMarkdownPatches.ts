@@ -23,10 +23,10 @@ import { MarkdownManager } from "@tiptap/markdown";
 import { marksEqual, type JSONContent } from "@tiptap/core";
 
 import {
+  definedFootnoteLabels,
   documentFootnoteLabels,
   escapeFootnoteReferences,
-  footnoteLabels,
-  stripFootnoteReferenceMarks,
+  prepareFootnoteReferences,
   withFootnoteLabels,
 } from "./TipTapFootnotes";
 import { toBlockContent } from "./TipTapGitHubAlert";
@@ -120,7 +120,7 @@ export function installMarkdownSerializerPatch(): void {
       const joined = hasSoftBreakNode(this) ? joinSoftBreaks(content) : content;
       // Literal `[^x]` text needs escaping only when `[^x]:` is defined.
       return withFootnoteLabels(documentFootnoteLabels(joined), () =>
-        originalSerialize.call(this, stripFootnoteReferenceMarks(joined), ...rest),
+        originalSerialize.call(this, prepareFootnoteReferences(joined), ...rest),
       );
     };
   }
@@ -249,7 +249,7 @@ export function installMarkdownParserPatch(): void {
   proto.parse = function (this: MarkdownManager, markdown: string): JSONContent {
     installIterativeSetextHeadings(this.instance);
     // `[^x]` is a footnote reference only when the file defines `[^x]:`.
-    const doc = withFootnoteLabels(footnoteLabels(markdown), () =>
+    const doc = withFootnoteLabels(definedFootnoteLabels(this.instance, markdown), () =>
       wrapLooseInlineRuns(originalParse.call(this, markdown)),
     );
     if (!hasSoftBreakNode(this)) return doc;

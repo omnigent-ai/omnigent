@@ -2,18 +2,29 @@
 // `[^1]: url` as a link definition, and saves drop the definitions and inline
 // every reference as `[^1](url)`. Both are kept verbatim and read-only here.
 
-import { Extension, Node, type JSONContent } from "@tiptap/core";
+import { Extension, Node, type JSONContent, type MarkdownToken } from "@tiptap/core";
+import type { MarkdownManager } from "@tiptap/markdown";
 import { NodeSelection, Plugin, TextSelection, type EditorState } from "@tiptap/pm/state";
 import { interruptsParagraph } from "./markdownSetextHeading";
 
 /** A footnote definition line, e.g. `[^1]: https://example.com`. */
 const DEFINITION = /^ {0,3}\[\^[^\]\s]+\]:/;
 
-/** Definition labels in a source, including inside quotes and lists, e.g. `1` in `> [^1]: url`. */
-const DEFINITION_LABELS = /(?:^|[\s>])\[\^([^\]\s]+)\]:/g;
+/** The label of each definition line in a definitions block, e.g. `1` in `[^1]: url`. */
+const DEFINITION_LABELS = /^ {0,3}\[\^([^\]\s]+)\]:/gm;
 
 /** An indented line that continues a definition. */
 const CONTINUATION = /^(?: {4}|\t)/;
+
+/** A thematic break or HTML block start (CommonMark types 1-6); both end a paragraph. */
+const BREAK_OR_HTML_BLOCK = new RegExp(
+  "^ {0,3}(?:([-*_])(?:[ \\t]*\\1){2,}[ \\t]*$|<(?:script|pre|style|textarea)(?:[\\s>]|$)|<!--|<\\?|<![A-Za-z]|<!\\[CDATA\\[|" +
+    "</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|" +
+    "fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|" +
+    "menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|" +
+    "track|ul)(?:\\s|/?>|$))",
+  "i",
+);
 
 /** A footnote reference; `[^1](url)` is an ordinary link and is left alone. */
 const REFERENCE = /^\[\^([^\]\s]+)\](?!\()/;
@@ -28,18 +39,9 @@ const LITERAL_REFERENCE = /\[(?=\^([^\]\s]+)\](?!\())/g;
  */
 let definedLabels: Set<string> | null = null;
 
-/**
- * Collect the footnote labels defined in *markdown*.
- *
- * GitHub matches labels case-insensitively, so they are lower-cased.
- *
- * :param markdown: Markdown source, or the raw text of definition blocks.
- * :returns: The defined labels, e.g. `{"1", "note"}`.
- */
-export function footnoteLabels(markdown: string): Set<string> {
-  return new Set(
-    Array.from(markdown.matchAll(DEFINITION_LABELS), (match) => match[1].toLowerCase()),
-  );
+/** Labels of the definition lines in *raw* definition blocks, lower-cased as GitHub matches them. */
+function footnoteLabels(raw: string): Set<string> {
+  return new Set(Array.from(raw.matchAll(DEFINITION_LABELS), (match) => match[1].toLowerCase()));
 }
 
 /**
@@ -55,6 +57,35 @@ export function documentFootnoteLabels(node: JSONContent): Set<string> {
     current.content?.forEach(visit);
   };
   visit(node);
+  return footnoteLabels(raws.join("\n"));
+}
+
+/**
+ * Collect the labels a markdown source defines, from its parsed definition blocks.
+ *
+ * Block-level parsing decides what is a definition, so `[^1]:` inside code or
+ * mid-paragraph defines nothing, matching both the editor and GitHub.
+ *
+ * :param marked: The editor's configured marked instance.
+ * :param markdown: Markdown source about to be parsed.
+ * :returns: The defined labels, e.g. `{"1", "note"}`.
+ */
+export function definedFootnoteLabels(
+  marked: MarkdownManager["instance"],
+  markdown: string,
+): Set<string> {
+  if (!markdown.includes("[^")) return new Set();
+  const tokens = withFootnoteLabels(new Set(), () =>
+    new marked.Lexer(marked.defaults).lex(markdown),
+  );
+  const raws: string[] = [];
+  const visit = (token: MarkdownToken) => {
+    if (token.type === "footnoteDefinitions") raws.push(token.raw ?? "");
+    for (const children of [token.tokens, token.items, token.nestedTokens]) {
+      if (Array.isArray(children)) children.forEach(visit);
+    }
+  };
+  tokens.forEach((token) => visit(token as MarkdownToken));
   return footnoteLabels(raws.join("\n"));
 }
 
@@ -126,9 +157,9 @@ export function scanFootnoteDefinitions(source: string): string | null {
     } else if (
       !DEFINITION.test(line) &&
       !CONTINUATION.test(line) &&
-      interruptsParagraph(`${line}\n`)
+      (interruptsParagraph(`${line}\n`) || BREAK_OR_HTML_BLOCK.test(line))
     ) {
-      // A heading, list, fence, quote or table starts its own block.
+      // A line that would end a paragraph starts its own block.
       break;
     }
     end = next === -1 ? source.length : next;
@@ -140,26 +171,36 @@ export function scanFootnoteDefinitions(source: string): string | null {
 }
 
 /**
- * Drop marks from footnote references before serialising.
+ * Prepare footnote references for serialising, so the saved text reads back the same.
  *
- * Bolding a selection marks the references inside it too, and the serialiser
- * closes and reopens marks around a marked atom (`**a**[^1]** b**`), which
- * breaks the emphasis. Unmarked references keep it valid (`**a**[^1] **b**`).
+ * - Marks are dropped: the serialiser closes and reopens marks around a marked
+ *   atom (`**a**[^1]** b**`), which breaks the emphasis.
+ * - Text right after a reference is escaped when it would re-parse the
+ *   reference: `(` as an inline link, `:` at the start of a block as a definition.
  *
  * :param node: Document JSON about to be serialised.
- * :returns: *node* itself when nothing changed, else a copy with unmarked
- *     footnote references.
+ * :returns: *node* itself when nothing changed, else a prepared copy.
  */
-export function stripFootnoteReferenceMarks(node: JSONContent): JSONContent {
-  if (node.type === "footnoteReference") {
-    return node.marks?.length ? { ...node, marks: undefined } : node;
-  }
+export function prepareFootnoteReferences(node: JSONContent): JSONContent {
   if (node.content == null) return node;
   let changed = false;
-  const content = node.content.map((child) => {
-    const stripped = stripFootnoteReferenceMarks(child);
-    changed ||= stripped !== child;
-    return stripped;
+  const content = node.content.map((child, index, siblings) => {
+    let prepared = child;
+    if (child.type === "footnoteReference") {
+      if (child.marks?.length) prepared = { ...child, marks: undefined };
+    } else if (child.type === "text" && !child.marks?.length) {
+      if (siblings[index - 1]?.type === "footnoteReference") {
+        const text = child.text ?? "";
+        const opensBlock = index === 1;
+        if (text.startsWith("(") || (opensBlock && text.startsWith(":"))) {
+          prepared = { ...child, text: `\\${text}` };
+        }
+      }
+    } else {
+      prepared = prepareFootnoteReferences(child);
+    }
+    changed ||= prepared !== child;
+    return prepared;
   });
   return changed ? { ...node, content } : node;
 }

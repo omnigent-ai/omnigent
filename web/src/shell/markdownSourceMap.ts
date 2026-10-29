@@ -1,7 +1,7 @@
 import { decodeHtmlEntities, type MarkdownToken } from "@tiptap/core";
 import type { MarkdownManager } from "@tiptap/markdown";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
-import { footnoteLabels, withFootnoteLabels } from "./TipTapFootnotes";
+import { definedFootnoteLabels, withFootnoteLabels } from "./TipTapFootnotes";
 import { ALERT_MARKER } from "./TipTapGitHubAlert";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 
@@ -58,7 +58,7 @@ function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken
   let tokens: MarkdownToken[] | null = null;
   try {
     // Match the editor's parse, which reads references against the definitions.
-    tokens = withFootnoteLabels(footnoteLabels(source), () =>
+    tokens = withFootnoteLabels(definedFootnoteLabels(marked, source), () =>
       new marked.Lexer(marked.defaults).lex(source),
     );
   } finally {
