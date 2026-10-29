@@ -1770,6 +1770,29 @@ describe("FileViewer view-settings menu", () => {
     },
   );
 
+  it("offers Wrap lines for a deleted file only in the diff view", async () => {
+    const changed = vi.mocked(useWorkspaceChangedFiles);
+    const original = changed.getMockImplementation();
+    const entry = { path: "file1.py", name: "file1.py", bytes: 0, modified_at: null };
+    changed.mockReturnValue({
+      data: { available: true, data: [{ ...entry, status: "deleted" }] },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    try {
+      const first = render(viewerTree({ open: true }));
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
+      first.unmount();
+
+      render(viewerTree({ open: true, initialSearch: "diff=1" }));
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+    } finally {
+      changed.mockImplementation(original!);
+    }
+  });
+
   it("offers the file manager reveal for a file on this machine", async () => {
     const revealFile = vi.fn(() => Promise.resolve(true));
     vi.stubGlobal("omnigentDesktop", {
