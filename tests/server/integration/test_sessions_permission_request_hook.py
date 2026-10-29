@@ -2686,7 +2686,8 @@ async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_ret
     A client without the terminal-fallback header keeps the contract it had before holds.
 
     It saw the prompt expire, so a late answer is accepted and kept for a hook
-    retry, as for any prompt with no parked hook, and the held card stays up.
+    retry, as for any prompt with no parked hook. The held card stays up and
+    warns the clients that show it that the answer hasn't reached the agent.
     """
     from omnigent.runtime import pending_elicitations
 
@@ -2721,6 +2722,17 @@ async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_ret
         assert _harness_unparked_elicitations.get(_REATTACH_ELICITATION_ID) is held
         saved = _harness_pre_resolved_elicitations[_REATTACH_ELICITATION_ID]
         assert saved.request_fingerprint == held.request_fingerprint
+        undelivered = await _next_elicitation_event(collector)
+        assert undelivered["type"] == "response.elicitation_request"
+        assert undelivered["params"]["terminal_fallback"] == {"answer_undelivered": True}
+        snapshot = await client.get(
+            f"/v1/sessions/{session_id}", headers=_TERMINAL_FALLBACK_HEADERS
+        )
+        assert [
+            event["params"]["terminal_fallback"]
+            for event in snapshot.json()["pending_elicitations"]
+        ] == [{"answer_undelivered": True}]
+        assert pending_elicitations.count_for(session_id) == 1
 
         retry = await client.post(
             f"/v1/sessions/{session_id}/hooks/permission-request", json=payload

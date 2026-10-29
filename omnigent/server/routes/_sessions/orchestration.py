@@ -813,46 +813,24 @@ async def _hold_elicitation_for_terminal_answer(
     from omnigent.server.routes import sessions as _facade
 
     try:
+        answer_undelivered = False
         if not unparked.resolved_elsewhere.is_set():
             # A cold status cache keeps the normal unanswered expiry.
             if _session_status_cache.get(session_id) not in _MID_TURN_STATUSES:
                 return False
-            tombstone = _harness_pre_resolved_elicitations.get(elicitation_id)
-            answer_undelivered = (
-                tombstone is not None
-                and tombstone.session_id == session_id
-                and tombstone.result is not None
-                and tombstone.request_fingerprint == unparked.request_fingerprint
-            )
+            answer_undelivered = _holds_undelivered_answer(session_id, elicitation_id, unparked)
             if (
                 not answer_undelivered
                 and pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None
             ):
                 return False
-            terminal_event = {
-                **unparked.event_payload,
-                "params": {
-                    **unparked.event_payload["params"],
-                    "terminal_fallback": {"answer_undelivered": answer_undelivered},
-                },
-            }
-            unparked.in_terminal = True
-            session_stream.publish(session_id, terminal_event)
-            if conversation_store is not None:
-                try:
-                    await asyncio.to_thread(
-                        _publish_elicitation_request_to_ancestors,
-                        conversation_store,
-                        session_id,
-                        terminal_event,
-                    )
-                except Exception:  # noqa: BLE001 — the session's own card still works
-                    _logger.warning(
-                        "Could not mirror terminal prompt %s to ancestors of %s",
-                        elicitation_id,
-                        session_id,
-                        exc_info=True,
-                    )
+            await _publish_prompt_held_in_terminal(
+                session_id,
+                elicitation_id,
+                unparked,
+                conversation_store,
+                answer_undelivered=answer_undelivered,
+            )
         while not unparked.resolved_elsewhere.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(
@@ -867,6 +845,18 @@ async def _hold_elicitation_for_terminal_answer(
                 return True  # Already cleared elsewhere.
             if _session_status_cache.get(session_id) not in _MID_TURN_STATUSES:
                 return False
+            if not answer_undelivered and _holds_undelivered_answer(
+                session_id, elicitation_id, unparked
+            ):
+                # An older client answered during the hold; the answer waits for a hook retry.
+                answer_undelivered = True
+                await _publish_prompt_held_in_terminal(
+                    session_id,
+                    elicitation_id,
+                    unparked,
+                    conversation_store,
+                    answer_undelivered=True,
+                )
     finally:
         if _harness_unparked_elicitations.get(elicitation_id) is unparked:
             _harness_unparked_elicitations.pop(elicitation_id, None)
@@ -888,6 +878,65 @@ async def _hold_elicitation_for_terminal_answer(
                 exc_info=True,
             )
     return True
+
+
+def _holds_undelivered_answer(
+    session_id: str, elicitation_id: str, unparked: _UnparkedHarnessElicitation
+) -> bool:
+    """Return whether an answer to this prompt is saved for a hook retry that hasn't come."""
+    tombstone = _harness_pre_resolved_elicitations.get(elicitation_id)
+    return (
+        tombstone is not None
+        and tombstone.session_id == session_id
+        and tombstone.result is not None
+        and tombstone.request_fingerprint == unparked.request_fingerprint
+    )
+
+
+async def _publish_prompt_held_in_terminal(
+    session_id: str,
+    elicitation_id: str,
+    unparked: _UnparkedHarnessElicitation,
+    conversation_store: ConversationStore | None,
+    *,
+    answer_undelivered: bool,
+) -> None:
+    """
+    Publish a prompt's card as waiting in the agent's terminal, mirrored to ancestors.
+
+    :param session_id: Session that owns the prompt, e.g. ``"conv_abc123"``.
+    :param elicitation_id: The prompt's id, e.g. ``"elicit_claude_0f3a..."``.
+    :param unparked: The prompt's registered unparked state.
+    :param conversation_store: Store used to mirror the card into ancestor
+        streams, or ``None`` to keep it session-local.
+    :param answer_undelivered: Whether an answer is saved that the agent never received.
+    :returns: None.
+    """
+    terminal_event = {
+        **unparked.event_payload,
+        "params": {
+            **unparked.event_payload["params"],
+            "terminal_fallback": {"answer_undelivered": answer_undelivered},
+        },
+    }
+    unparked.in_terminal = True
+    session_stream.publish(session_id, terminal_event)
+    if conversation_store is None:
+        return
+    try:
+        await asyncio.to_thread(
+            _publish_elicitation_request_to_ancestors,
+            conversation_store,
+            session_id,
+            terminal_event,
+        )
+    except Exception:  # noqa: BLE001 — the session's own card still works
+        _logger.warning(
+            "Could not mirror terminal prompt %s to ancestors of %s",
+            elicitation_id,
+            session_id,
+            exc_info=True,
+        )
 
 
 async def _best_effort_stop(
