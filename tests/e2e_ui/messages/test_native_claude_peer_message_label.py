@@ -3,11 +3,12 @@
 import json
 from pathlib import Path
 
+import httpx
 from playwright.sync_api import Page, expect
 
-from omnigent.entities import MessageData, NewConversationItem
 from omnigent.harnesses.claude_native.bridge import read_transcript_items_from_offset
-from tests.e2e_ui.conftest import seed_committed_items, seed_committed_turn
+from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
+from tests.e2e_ui.conftest import seed_committed_turn
 
 from .test_message_render_parity import _ASSISTANT, _USER
 
@@ -39,17 +40,12 @@ def test_native_claude_peer_wake_label_survives_reload(
         current_response_id=response_id,
         settled_response_id=response_id,
     )
-    seed_committed_items(
-        session_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id=item.response_id,
-                data=MessageData.model_validate(item.data),
-            )
-            for item in peer.items
-        ],
-    )
+    with httpx.Client(base_url=base_url, timeout=15) as client:
+        for item in peer.items:
+            client.post(
+                f"/v1/sessions/{session_id}/events",
+                json=_external_conversation_item_event(item),
+            ).raise_for_status()
 
     page.goto(f"{base_url}/c/{session_id}")
     for reload_history in (False, True):

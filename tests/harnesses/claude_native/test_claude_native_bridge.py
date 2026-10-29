@@ -1396,7 +1396,12 @@ _TASK_COMPLETION = (
 
 
 def _read_native_user(
-    tmp_path: Path, content: Any, *, queued: str | None = None, **metadata: Any
+    tmp_path: Path,
+    content: Any,
+    *,
+    queued: str | None = None,
+    timestamp: str | None = None,
+    **metadata: Any,
 ) -> tuple[int, str | None, list[Any]]:
     entry = (
         {
@@ -1411,6 +1416,8 @@ def _read_native_user(
         if queued
         else {"type": "user", "message": {"role": "user", "content": content}, **metadata}
     )
+    if timestamp is not None:
+        entry["timestamp"] = timestamp
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(_transcript_line(entry), encoding="utf-8")
     return read_transcript_items_since(
@@ -2156,6 +2163,7 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(
                 "type": "user",
                 "uuid": "compact-1",
                 "isCompactSummary": True,
+                "timestamp": "1970-01-01T00:00:02Z",
                 **({"origin": {"kind": "peer"}} if peer else {}),
                 "message": {"role": "user", "content": "Summary of the prior context."},
             }
@@ -2165,6 +2173,7 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(
                 {
                     "type": "user",
                     "origin": {"kind": "peer"},
+                    "timestamp": "1970-01-01T00:00:02Z",
                     "message": {"role": "user", "content": _TEAMMATE_MESSAGE},
                 }
             )
@@ -2188,6 +2197,7 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(
         current_response_id="resp_prev_turn",
         settled_response_id=None if pending else "resp_prev_turn",
         pending_settled_response_id="resp_prev_turn" if pending else None,
+        pending_settled_at=1.0 if pending else None,
     )
 
     texts = [
@@ -2211,6 +2221,8 @@ def _read_peer_turn(
     transcript: Path,
     turn: str,
     prior: claude_native_bridge.TranscriptReadResult | None = None,
+    *,
+    stopped_at: float | None = 1.0,
 ) -> claude_native_bridge.TranscriptReadResult:
     """Read a peer turn from the start or the previous poll's cursor."""
     return read_transcript_items_from_offset(
@@ -2221,12 +2233,13 @@ def _read_peer_turn(
         current_response_id=prior.current_response_id if prior else "active",
         settled_response_id="active" if turn == "settled" else None,
         pending_settled_response_id="active" if turn == "pending" else None,
+        pending_settled_at=stopped_at if turn == "pending" else None,
     )
 
 
 @pytest.mark.parametrize("shape", ["string", "blocks", "queued"])
 @pytest.mark.parametrize("provenance", ["peer", "handback", "meta-envelope"])
-@pytest.mark.parametrize("turn", ["active", "settled", "pending"])
+@pytest.mark.parametrize("turn", ["settled", "pending"])
 def test_peer_message_wake_label_across_batches(
     tmp_path: Path, shape: str, provenance: str, turn: str
 ) -> None:
@@ -2241,19 +2254,21 @@ def test_peer_message_wake_label_across_batches(
     text = _TEAMMATE_MESSAGE if provenance == "meta-envelope" else "The other session finished."
     content = [{"type": "text", "text": text}] if shape == "blocks" else text
     _read_native_user(
-        tmp_path, content, queued="prompt" if shape == "queued" else None, **metadata
+        tmp_path,
+        content,
+        queued="prompt" if shape == "queued" else None,
+        timestamp="1970-01-01T00:00:02Z",
+        **metadata,
     )
     transcript = tmp_path / "session.jsonl"
     original = _read_peer_turn(transcript, "active")
+    assert original.current_response_id == "active"
     first = _read_peer_turn(transcript, turn)
-    if turn == "active":
-        assert first == original
-        assert first.current_response_id == "active"
-    else:
-        marker, *hidden = first.items
-        assert marker.data["content"][0]["text"] == "[System: Message from another session]"
-        assert marker.response_id == first.current_response_id != "active"
-        assert hidden == original.items
+    marker, *hidden = first.items
+    assert marker.data["content"][0]["text"] == "[System: Message from another session]"
+    assert marker.data["is_meta"] is True
+    assert marker.response_id == first.current_response_id != "active"
+    assert hidden == original.items
     with transcript.open("a", encoding="utf-8") as handle:
         handle.write(_transcript_line(_assistant_text_entry("peer-reply", "Continuing.")))
     tail = _read_peer_turn(transcript, turn, first)
@@ -2263,6 +2278,26 @@ def test_peer_message_wake_label_across_batches(
     assert tail.items[0].data["content"] == [{"type": "output_text", "text": "Continuing."}]
     assert tail.items[0].response_id == tail.current_response_id
     assert tail.current_response_id == first.current_response_id == whole.current_response_id
+
+
+@pytest.mark.parametrize(
+    "timestamp,stopped_at",
+    [
+        ("1970-01-01T00:00:00Z", 1.0),
+        ("1970-01-01T00:00:01Z", 1.0),
+        (None, 1.0),
+        ("invalid", 1.0),
+        ("1970-01-01T00:00:02Z", None),
+    ],
+)
+def test_pending_peer_label_requires_input_after_stop(
+    tmp_path: Path, timestamp: str | None, stopped_at: float | None
+) -> None:
+    _read_native_user(tmp_path, _TEAMMATE_MESSAGE, timestamp=timestamp, origin={"kind": "peer"})
+    transcript = tmp_path / "session.jsonl"
+    assert _read_peer_turn(transcript, "pending", stopped_at=stopped_at) == _read_peer_turn(
+        transcript, "active"
+    )
 
 
 @pytest.mark.parametrize("shape", ["string", "blocks", "queued"])

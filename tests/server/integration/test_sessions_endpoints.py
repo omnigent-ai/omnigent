@@ -2803,9 +2803,19 @@ async def test_skill_slash_command_missing_session_agent_returns_typed_410(
     assert "no longer exists" in message
 
 
+@pytest.mark.parametrize(
+    ("text", "source_id"),
+    [
+        ("<skill>hidden</skill>", "codex-skill-meta"),
+        ("<skill>hidden</skill>", "peer-input:0:peer_message_wake"),
+        ("[System: Message from another session]", "user-input:0:message"),
+    ],
+)
 async def test_external_meta_user_message_persists_and_publishes_flagged_input_event(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    text: str,
+    source_id: str,
 ) -> None:
     """
     External bridge meta messages are durable and reach live subscribers flagged.
@@ -2830,11 +2840,11 @@ async def test_external_meta_user_message_persists_and_publishes_flagged_input_e
                 "item_type": "message",
                 "item_data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "<skill>hidden</skill>"}],
+                    "content": [{"type": "input_text", "text": text}],
                     "is_meta": True,
                 },
                 "response_id": "codex_turn_123",
-                "source_id": "codex-skill-meta",
+                "source_id": source_id,
             },
         },
     )
@@ -2843,7 +2853,7 @@ async def test_external_meta_user_message_persists_and_publishes_flagged_input_e
     items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
     meta = next(item for item in items if item["type"] == "message")
     assert meta["is_meta"] is True
-    assert meta["content"][0]["text"] == "<skill>hidden</skill>"
+    assert meta["content"][0]["text"] == text
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.status_code == 200
     assert snap.json()["title"] is None
@@ -3025,17 +3035,20 @@ async def test_external_user_message_drain_publishes_cleared_pending_id(
 
 
 @pytest.mark.parametrize(
-    ("marker_text", "source_id"),
+    ("marker_text", "source_id", "is_meta"),
     [
-        ("[Request interrupted by user]", None),
-        ("[Request interrupted by user for tool use]", None),
-        ("[System: Message from another session]", "peer-input:0:peer_message_wake"),
+        ("[Request interrupted by user]", None, False),
+        ("[Request interrupted by user for tool use]", None, False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", False),
+        ("[System: Message from another session]", "peer-input:0:peer_message_wake", True),
     ],
 )
 async def test_external_native_marker_leaves_pending_input_for_real_message(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
     marker_text: str,
     source_id: str | None,
+    is_meta: bool,
 ) -> None:
     """
     Regression: steering with an upload must not feed it to a native marker.
@@ -3054,7 +3067,10 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     Bridge-generated peer labels also have no pending input of their own.
     """
     from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import _drains_pending_inputs
 
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
     pending_inputs.reset_for_tests()
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -3065,20 +3081,27 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
         [{"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"}],
     )
     try:
-        for text, item_source_id in (
-            (marker_text, source_id),
-            ("[Attached: /tmp/uploads/shot.png]", None),
+        for text, item_source_id, item_is_meta in (
+            (marker_text, source_id, is_meta),
+            ("[Attached: /tmp/uploads/shot.png]", None, False),
         ):
+            item_data = MessageData(
+                role="user", content=[{"type": "input_text", "text": text}], is_meta=item_is_meta
+            )
+            if item_is_meta:
+                # Older servers' metadata gate must also preserve queued uploads.
+                assert not _drains_pending_inputs(
+                    NewConversationItem(
+                        type="message", response_id="native_turn_1", data=item_data
+                    )
+                )
             resp = await client.post(
                 f"/v1/sessions/{session['id']}/events",
                 json={
                     "type": "external_conversation_item",
                     "data": {
                         "item_type": "message",
-                        "item_data": {
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": text}],
-                        },
+                        "item_data": item_data.model_dump(),
                         "response_id": "native_turn_1",
                         **({"source_id": item_source_id} if item_source_id else {}),
                     },
@@ -3087,6 +3110,11 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
             assert resp.status_code == 202, resp.text
             if text == marker_text:
                 assert len(pending_inputs.snapshot_for(session["id"])) == 1
+                consumed = next(
+                    ev["data"] for _sid, ev in published if ev["type"] == "session.input.consumed"
+                )
+                assert consumed["cleared_pending_id"] is None
+                assert not consumed["data"].get("is_meta")
 
         items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
         messages = [item for item in items if item["type"] == "message"]
@@ -3095,6 +3123,7 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
         # The marker stays text-only, so the UI still classifies it as a
         # system marker instead of rendering it as user text beside an image.
         assert marker["content"] == [{"type": "input_text", "text": marker_text}]
+        assert not marker.get("is_meta")
         # The upload landed on the message that actually queued it.
         assert steered["content"][0] == {
             "type": "input_image",

@@ -55,6 +55,7 @@ from omnigent.harness_availability import (
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
 )
+from omnigent.harnesses.claude_native import PEER_MESSAGE_WAKE_KIND, PEER_MESSAGE_WAKE_TEXT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -3072,15 +3073,17 @@ async def _persist_external_conversation_item_unlocked(
     source_id = body.data.get("source_id")
     is_peer_wake_marker = (
         isinstance(source_id, str)
-        and source_id.strip().endswith(":0:peer_message_wake")
+        and source_id.strip().endswith(f":0:{PEER_MESSAGE_WAKE_KIND}")
         and item.type == "message"
         and isinstance(item.data, MessageData)
         and item.data.role == "user"
-        and item.data.content
-        == [{"type": "input_text", "text": "[System: Message from another session]"}]
+        and item.data.content == [{"type": "input_text", "text": PEER_MESSAGE_WAKE_TEXT}]
     )
     # Bridge-generated peer labels have no queued input; literal user text still does.
     drains_pending_inputs = _drains_pending_inputs(item) and not is_peer_wake_marker
+    if is_peer_wake_marker and isinstance(item.data, MessageData):
+        # The wire marker is hidden so older servers also preserve pending uploads.
+        item = item.model_copy(update={"data": item.data.model_copy(update={"is_meta": False})})
     if item.stable_id is not None and drains_pending_inputs:
         # A forwarder retry of a mirror already persisted under its source-derived
         # id: nothing to drain, persist or publish. Draining again could match a
