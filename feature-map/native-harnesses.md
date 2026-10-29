@@ -158,7 +158,8 @@ before entering the harness menu. Then start a new CLI or web session.
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices. A Claude prompt waiting in its
-terminal shows read-only there too.
+terminal shows read-only there too; with several server replicas, only when the
+list comes from the replica hosting that session.
 
 **Approval links:** open a pending permission's standalone approval link.
 Claude directory requests show the exact directories in Chat, Inbox, and the

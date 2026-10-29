@@ -579,6 +579,21 @@ async def _publish_and_wait_for_harness_elicitation(
                 event_payload = reclaimed_event_payload
                 published_request = event_payload is not None
                 raise
+            reclaimed_card_orphaned = (
+                session is None
+                and reclaimed_event_payload is not None
+                and not parked.released
+                and pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+                is not None
+            )
+            if reclaimed_card_orphaned:
+                # A delete on another replica couldn't release this replica's card.
+                await _expire_deleted_session_prompt(
+                    session_id,
+                    elicitation_id,
+                    conversation_store,
+                    _mirrored_prompt_session_ids(session_id, elicitation_id),
+                )
             if session is None or parked.released:
                 return None
         tombstone = _consume_pre_resolved_harness_elicitation(

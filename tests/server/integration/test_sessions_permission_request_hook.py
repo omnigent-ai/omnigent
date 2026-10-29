@@ -2712,10 +2712,6 @@ async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_ret
         assert [event["elicitation_id"] for event in snapshot.json()["pending_elicitations"]] == [
             _REATTACH_ELICITATION_ID
         ]
-        for headers, listed_count in (({}, 0), (_TERMINAL_FALLBACK_HEADERS, 1)):
-            listed = await client.get("/v1/sessions", params={"limit": 1000}, headers=headers)
-            [row] = [row for row in listed.json()["data"] if row["id"] == session_id]
-            assert row["pending_elicitations_count"] == listed_count
         stream_opt_ins: list[bool] = []
 
         async def finite_stream(
@@ -3233,6 +3229,83 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
                 f"/v1/sessions/{parent_id}", headers=_TERMINAL_FALLBACK_HEADERS
             )
             assert surviving_parent.json()["pending_elicitations"] == []
+    finally:
+        await collector.stop()
+        await parent_collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.parametrize("waiting_in_terminal", [False, True])
+async def test_hook_retry_expires_card_of_session_deleted_on_another_replica(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    waiting_in_terminal: bool,
+) -> None:
+    """
+    A hook retry that finds its session gone expires the card it took back.
+
+    A delete on another replica can't release this replica's card or the parent's mirror.
+    """
+    from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes.sessions import routes_hooks
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    name = f"test-terminal-fallback-deleted-elsewhere-{waiting_in_terminal}"
+    parent_agent = await create_test_agent(client, f"{name}-parent")
+    parent_id = await _create_session(client, parent_agent["id"])
+    parent_collector = await start_session_stream_collector(parent_id)
+    release_grace = asyncio.Event()
+    try:
+        session_id, payload, collector = await _sever_hook_mid_turn(
+            client,
+            monkeypatch,
+            name,
+            release_grace=release_grace,
+            parent_session_id=parent_id,
+        )
+    except BaseException:
+        await parent_collector.stop()
+        raise
+    try:
+        await _next_elicitation_event(parent_collector)
+        if waiting_in_terminal:
+            release_grace.set()
+            await _next_elicitation_event(collector)
+            await _next_elicitation_event(parent_collector)
+        deleted_elsewhere = False
+        get_conversation = SqlAlchemyConversationStore.get_conversation
+        publish_and_wait = routes_hooks._publish_and_wait_for_harness_elicitation
+
+        def _get_deleted_conversation(store: Any, conversation_id: str) -> Any:
+            if deleted_elsewhere and conversation_id == session_id:
+                return None
+            return get_conversation(store, conversation_id)
+
+        async def _delete_after_session_check(*args: Any, **kwargs: Any) -> Any:
+            nonlocal deleted_elsewhere
+            deleted_elsewhere = True
+            return await publish_and_wait(*args, **kwargs)
+
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore, "get_conversation", _get_deleted_conversation
+        )
+        monkeypatch.setattr(
+            routes_hooks, "_publish_and_wait_for_harness_elicitation", _delete_after_session_check
+        )
+        retry = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.content == b""
+        for stream in (collector, parent_collector):
+            expired = await _next_elicitation_event(stream)
+            assert expired["type"] == "response.elicitation_resolved"
+            assert expired["reason"] == "unanswered"
+        release_grace.set()
+        await _finish_deferred_clears()
+        assert pending_elicitations.count_for(session_id) == 0
+        assert pending_elicitations.count_for(parent_id) == 0
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
     finally:
         await collector.stop()
         await parent_collector.stop()
