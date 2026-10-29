@@ -19,7 +19,7 @@ from omnigent.inner.codex_executor import (
     _strip_host_launched_config,
 )
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
-from tests.e2e.conftest import configure_mock_llm
+from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 from tests.e2e.test_polly_codex_subscription_login_e2e import (
     _kill_local_server,
     _polly_env,
@@ -147,6 +147,102 @@ def test_codex_agent_answers_with_subscription_login(
         _kill_local_server(home)
 
     assert outcome == 0, output[-3000:]
+
+
+def _offered_tool_names(tools: object) -> set[str]:
+    names: set[str] = set()
+    for tool in tools if isinstance(tools, list) else []:
+        if isinstance(tool, dict):
+            names.add(str(tool.get("name", tool.get("type"))))
+            names |= _offered_tool_names(tool.get("tools"))
+    return names
+
+
+def _apply_patch_turn(call_id: str, target: Path) -> dict[str, object]:
+    patch = f'*** Begin Patch\n*** Add File: {target}\n+{{"replaced": true}}\n*** End Patch\n'
+    return {
+        "text": "",
+        "native_items": [
+            {
+                "type": "custom_tool_call",
+                "id": f"ctc-{call_id}",
+                "call_id": call_id,
+                "name": "apply_patch",
+                "input": patch,
+            }
+        ],
+    }
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="requires Linux bubblewrap",
+)
+def test_network_denied_codex_apply_patch_cannot_replace_shared_host_login(
+    tmp_path: Path,
+    isolated_mock_llm_server_url: str,
+) -> None:
+    """Without native tools Codex keeps apply_patch, which must not reach the writable login."""
+    skip_if_harness_cli_missing("codex")
+    home = tmp_path / "home"
+    _seed_subscription_home(home, f"{isolated_mock_llm_server_url}/v1")
+    host_login = home / ".codex" / "auth.json"
+    original_login = host_login.read_text(encoding="utf-8")
+    workspace = home / "project"
+    workspace.mkdir()
+    linked_login = workspace / "linked-login.json"
+    linked_login.symlink_to(host_login)
+    configure_mock_llm(
+        isolated_mock_llm_server_url,
+        [
+            _apply_patch_turn("patch-host-login", host_login),
+            _apply_patch_turn("patch-linked-login", linked_login),
+            *({"text": "OK"} for _ in range(20)),
+        ],
+    )
+    agent_dir = tmp_path / "agent"
+    _write_codex_agent(
+        agent_dir, "    type: linux_bwrap\n    write_paths: [.]\n    allow_network: false\n"
+    )
+
+    child = pexpect.spawn(
+        sys.executable,
+        ["-m", "omnigent.cli", "run", str(agent_dir), "-p", _PROMPT],
+        cwd=str(workspace),
+        env=_polly_env(home),
+        encoding="utf-8",
+        codec_errors="replace",
+        dimensions=(50, 160),
+        timeout=_REPLY_TIMEOUT_S,
+    )
+    try:
+        outcome = child.expect(
+            [r"(?m)^\s*(?:[●⏺•]\s*)?OK\s*$", r"Error:[^\r\n]*", pexpect.EOF, pexpect.TIMEOUT]
+        )
+        output = _strip_ansi(child.before + (child.after if isinstance(child.after, str) else ""))
+    finally:
+        child.close(force=True)
+        _kill_local_server(home)
+
+    assert outcome == 0, output[-3000:]
+    requests = get_mock_requests(isolated_mock_llm_server_url)
+    inputs = [item for request in requests for item in request.get("input", [])]
+    offered = _offered_tool_names(
+        [tool for request in requests for tool in request.get("tools") or []]
+    )
+    for item in inputs:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            offered |= _offered_tool_names(item.get("tools"))
+    assert "sys_os_shell" in offered, offered
+    assert offered.isdisjoint({"exec_command", "shell", "local_shell", "web_search"}), offered
+    answered_calls = {
+        item.get("call_id")
+        for item in inputs
+        if isinstance(item, dict) and item.get("type") == "custom_tool_call_output"
+    }
+    assert {"patch-host-login", "patch-linked-login"} <= answered_calls
+    assert host_login.read_text(encoding="utf-8") == original_login
 
 
 @pytest.mark.timeout(180)

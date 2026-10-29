@@ -891,6 +891,7 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
     await session.start()
 
     assert session._disable_native_tools is True
+    assert not session._containment_confirmed
     assert session._codex_home_dir is not None
     effective = (session._codex_home_dir / "config.toml").read_text()
     for inherited in ("mcp_servers", "notify", "projects"):
@@ -905,6 +906,8 @@ async def test_session_disables_native_tools_for_worker_without_model_route(
         "features.unified_exec=false",
         "features.browser_use=false",
         'web_search="disabled"',
+        "sandbox_workspace_write.exclude_slash_tmp=true",
+        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
     ):
         assert ("-c", feature) in overrides, spawn.await_args.args
     await session.close()

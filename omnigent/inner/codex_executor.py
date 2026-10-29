@@ -2826,6 +2826,12 @@ CODEX_NATIVE_FEATURES_OFF = (
     "features.tool_search=false",
 )
 
+# Keeps the apply_patch writes Codex's sandbox still allows inside the workspace.
+_WORKSPACE_ONLY_PATCH_WRITES = (
+    "sandbox_workspace_write.exclude_slash_tmp=true",
+    "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+)
+
 
 class _CodexAppServerSession:
     def __init__(
@@ -3118,7 +3124,7 @@ class _CodexAppServerSession:
                 argv.extend(["-c", override])
             if not worker_launch.native_tools_allowed:
                 self._disable_native_tools = True
-                for override in CODEX_NATIVE_FEATURES_OFF:
+                for override in (*CODEX_NATIVE_FEATURES_OFF, *_WORKSPACE_ONLY_PATCH_WRITES):
                     argv.extend(["-c", override])
                 await asyncio.to_thread(
                     _strip_host_launched_config,
@@ -3191,7 +3197,11 @@ class _CodexAppServerSession:
             self._supports_direct_tool_namespaces = version is not None and tuple(
                 int(part) for part in version.groups()
             ) >= (0, 142, 0)
-            self._containment_confirmed = self._worker_launch.sandboxed
+            # A worker without native tools can write the host login, so Codex's
+            # own sandbox must keep confining apply_patch there.
+            self._containment_confirmed = (
+                self._worker_launch.sandboxed and self._worker_launch.native_tools_allowed
+            )
             self._started = True
             if router_bridge_dir is not None:
                 # App-server threads run persisted-trusted hooks only, so the

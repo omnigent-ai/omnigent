@@ -232,7 +232,8 @@ def prepare_codex_worker(
         if host_login is not None and _login_rotates(host_login):
             logger.warning(
                 "Sharing the host's Codex login with the sandboxed worker so token "
-                "refreshes reach it; disabling Codex's native tools so they cannot read it."
+                "refreshes reach it; disabling Codex's native tools and keeping its file "
+                "edits in the workspace so they cannot reach it."
             )
             native_tools_allowed = False
 
