@@ -4663,33 +4663,43 @@ describe("Composer placeholder", () => {
   });
 
   it.each([
-    ["running", false, "Send a follow-up (queued) — Esc to stop"],
-    ["running", true, "Send a follow-up — Esc to stop"],
-    ["waiting", false, "Send a message…"],
-    ["idle", false, "Send a message…"],
+    ["idle", "running", false, false, "Send a follow-up (queued) — Esc to stop"],
+    ["idle", "running", true, false, "Send a follow-up — Esc to stop"],
+    ["idle", "running", true, true, "Send a follow-up (queued) — Esc to stop"],
+    ["streaming", "idle", true, false, "Send a follow-up — Esc to stop"],
+    ["idle", "waiting", false, false, "Send a message…"],
+    ["idle", "idle", false, false, "Send a message…"],
   ] as const)(
-    "follows a %s session after this client's send settles (always steer: %s)",
-    (sessionStatus, alwaysSteer, placeholder) => {
+    "matches the send decision for a %s stream and %s session (always steer: %s, queued: %s)",
+    (status, sessionStatus, alwaysSteer, queued, placeholder) => {
       const {
-        conversationId,
+        conversationId: previousConversationId,
         queuedMessages,
         sessionStatus: previousStatus,
       } = useChatStore.getState();
       onTestFinished(() =>
-        useChatStore.setState({ conversationId, queuedMessages, sessionStatus: previousStatus }),
+        useChatStore.setState({
+          conversationId: previousConversationId,
+          queuedMessages,
+          sessionStatus: previousStatus,
+        }),
       );
       const previousAlwaysSteer = readAlwaysSteer();
       onTestFinished(() => writeAlwaysSteer(previousAlwaysSteer));
       writeAlwaysSteer(alwaysSteer);
+      // A reused entry would skip mirroring an unchanged status onto the root store.
+      const conversationId = `conv_placeholder_${status}_${sessionStatus}_${alwaysSteer}_${queued}`;
       useChatStore.setState({
-        // A reused entry would skip mirroring an unchanged status onto the root store.
-        conversationId: `conv_placeholder_${sessionStatus}_${alwaysSteer}`,
-        queuedMessages: [],
+        conversationId,
+        queuedMessages: queued ? [{ queueId: "q_held", text: "held", conversationId }] : [],
         sessionStatus,
       });
-      render(
+      renderWithTooltips(
         <Composer
-          {...composerProps({ status: "idle", isWorking: computeIsWorking(sessionStatus) })}
+          {...composerProps({
+            status,
+            isWorking: status === "streaming" || computeIsWorking(sessionStatus),
+          })}
         />,
       );
       expect(textarea().placeholder).toBe(placeholder);
