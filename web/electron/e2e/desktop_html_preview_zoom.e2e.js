@@ -115,9 +115,8 @@ it(
           `preview zoom ${percent}%`,
         );
         // The frame sees its new width once the resize reaches its document.
-        let ratio = 0;
         await eventually(async () => {
-          ratio = baseWidth / (await frameWidth());
+          const ratio = baseWidth / (await frameWidth());
           return Math.abs(ratio - percent / 100) < 0.02;
         }, `preview scaled to ${percent}%`);
         assert.equal(await windowZoom(), 1, "the app window must not zoom");
@@ -130,7 +129,7 @@ it(
       step("click into the preview");
       await heading.click();
       await pause();
-      // Ctrl+Plus is the chord that zooms the whole window through the View menu.
+      // Ctrl+Shift+= types Ctrl+Plus, the View menu's window-zoom accelerator.
       step("ctrl+plus");
       pressKeys("ctrl+shift+equal");
       await expectPreview(110);

@@ -119,6 +119,7 @@ const MINIMAL_NB = JSON.stringify({
 });
 
 interface ViewerOptions {
+  conversationId?: string;
   viewMode?: "editor" | "preview" | "source" | "diff";
   truncated?: boolean;
   markdownSourceFallback?: boolean;
@@ -145,7 +146,7 @@ function viewerElement(content: string, panelOpen: boolean, path: string, opts: 
     <CodeViewer
       markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
-      conversationId="conv_1"
+      conversationId={opts.conversationId ?? "conv_1"}
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
       comments={[]}
@@ -841,7 +842,10 @@ describe("CodeViewer HTML preview sandbox", () => {
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
 
-  it("opens another file at 100% zoom", async () => {
+  it.each([
+    ["another file", "b.html", "conv_1"],
+    ["the same path in another conversation", "a.html", "conv_2"],
+  ])("opens %s at 100% zoom", async (_, nextPath, nextConversationId) => {
     const html = "<html><head></head><body><p>report</p></body></html>";
     const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
     const { port, send } = await connectHtmlPreviewBridge(
@@ -851,7 +855,13 @@ describe("CodeViewer HTML preview sandbox", () => {
     const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
     await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
 
-    rerender(viewerElement(html, true, "b.html", { viewMode: "preview" }));
+    // The content stays loaded, as it does for a cached file.
+    rerender(
+      viewerElement(html, true, nextPath, {
+        viewMode: "preview",
+        conversationId: nextConversationId,
+      }),
+    );
     expect(zoomBox().style.transform).toBe("");
     port.close();
   });
