@@ -23,8 +23,8 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_STARTUP_DELAY_S = 3.0
 _DEFAULT_LOCK_RETRY_S = 0.5
-# Runner process logs are never rotated; one file per runner start accumulates.
-_RUNNER_LOG_RETENTION_S = 14 * 24 * 3600.0
+# Process logs are never rotated; one file per runner or host start accumulates.
+_PROCESS_LOG_RETENTION_S = 14 * 24 * 3600.0
 
 MaintenanceStage = tuple[str, Callable[[], Awaitable[object]]]
 _LockOutcome = Literal["acquired", "busy", "failed"]
@@ -89,18 +89,20 @@ def _paths_held_open() -> set[Path]:
     return held
 
 
-def prune_stale_runner_logs(
+def prune_stale_process_logs(
     log_dir: Path,
+    pattern: str,
     *,
-    max_age_s: float = _RUNNER_LOG_RETENTION_S,
+    max_age_s: float = _PROCESS_LOG_RETENTION_S,
     now: float | None = None,
 ) -> int:
-    """Delete ``runner-*.log`` files untouched for *max_age_s* and not held open.
+    """Delete files matching *pattern* that are untouched for *max_age_s* and not held open.
 
     A live runner writes its log through an inherited descriptor, so an open
     file is always kept even when its mtime is old.
 
-    :param log_dir: Runner process-log directory, e.g. ``~/.omnigent/logs/runner``.
+    :param log_dir: Process-log directory, e.g. ``~/.omnigent/logs/runner``.
+    :param pattern: Glob for the logs to consider, e.g. ``"runner-*.log"``.
     :param max_age_s: Minimum idle age before a log can be removed.
     :param now: Reference time as epoch seconds; defaults to the current time.
     :returns: Number of files removed.
@@ -109,7 +111,7 @@ def prune_stale_runner_logs(
         return 0
     cutoff = (time.time() if now is None else now) - max_age_s
     candidates: list[Path] = []
-    for path in log_dir.glob("runner-*.log"):
+    for path in log_dir.glob(pattern):
         mtime = _mtime_or_none(path)
         if mtime is not None and mtime < cutoff and path.is_file() and not path.is_symlink():
             candidates.append(path)
@@ -205,12 +207,15 @@ class HostMaintenanceJanitor:
 
             return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
 
-        async def _prune_runner_logs() -> object:
+        async def _prune_process_logs() -> object:
             from omnigent.process_logging import process_log_dir
 
-            return await _run_sync_stage(
-                lambda: prune_stale_runner_logs(process_log_dir("runner"))
-            )
+            def _prune_all() -> int:
+                return prune_stale_process_logs(
+                    process_log_dir("runner"), "runner-*.log"
+                ) + prune_stale_process_logs(process_log_dir("host"), "host-*.log")
+
+            return await _run_sync_stage(_prune_all)
 
         return cls(
             stages=(
@@ -218,7 +223,7 @@ class HostMaintenanceJanitor:
                 ("codex_process_registry", _reconcile_codex_processes),
                 ("terminal_orphans", _reap_terminals),
                 ("native_bridge_orphans", _reap_native_bridge_dirs),
-                ("runner_log_retention", _prune_runner_logs),
+                ("process_log_retention", _prune_process_logs),
             ),
             lock_path=data_dir().resolve() / "locks" / "host-maintenance.lock",
             stage_skip_reasons={"native_bridge_orphans": {"runner_superseded"}},
