@@ -154,6 +154,7 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 function OpenTerminalAction({ onOpen }: { onOpen: () => void }) {
   const conversationId = useScopedConversationId();
   const isOwner = useIsSessionOwner(conversationId ?? "");
+  if (isOwner === null) return null; // Neither offer nor refuse the terminal before ownership loads.
   if (!isOwner) {
     return (
       <span data-testid="approval-card-terminal-owner-only" className="text-sm">

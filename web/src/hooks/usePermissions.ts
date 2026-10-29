@@ -77,20 +77,24 @@ export function useRevokePermission(sessionId: string) {
   });
 }
 
-/** The current user's permission level on a session, as `derivePermissionLevel` resolves it. */
-function useSessionPermissionLevel(conversationId: string): number | null {
+/**
+ * The current user's permission level on a session, as `derivePermissionLevel` resolves it,
+ * or `undefined` while unresolved: only a loaded snapshot confirms a single-user `null` level.
+ */
+function useSessionPermissionLevel(conversationId: string): number | null | undefined {
   const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);
     const activeConv = conversations?.find((c) => c.id === conversationId) ?? null;
-    return derivePermissionLevel(
+    const permissionLevel = derivePermissionLevel(
       activeSession,
       sessionLoading,
       activeConv,
       conversationId,
       conversationsData !== undefined,
     );
+    return permissionLevel == null && activeSession == null ? undefined : permissionLevel;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
 }
 
@@ -104,11 +108,12 @@ export function useCanEdit(conversationId: string): boolean {
 }
 
 /**
- * Returns whether the current user owns a session, which terminal input requires.
- * `null` permission level is treated as owner, matching `isOwnerLevel`.
+ * Returns whether the current user owns a session, which terminal input requires,
+ * or `null` until that's known. A loaded single-user (`null` level) session counts as owned.
  */
-export function useIsSessionOwner(conversationId: string): boolean {
-  return isOwnerLevel(useSessionPermissionLevel(conversationId));
+export function useIsSessionOwner(conversationId: string): boolean | null {
+  const permissionLevel = useSessionPermissionLevel(conversationId);
+  return permissionLevel === undefined ? null : isOwnerLevel(permissionLevel);
 }
 
 export type { Permission };

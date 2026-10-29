@@ -145,4 +145,21 @@ describe("useIsSessionOwner — terminal input boundary", () => {
     setHooks({ session: makeSession(level), conversations: [makeConv(4)] });
     expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBe(expected);
   });
+
+  it.each([
+    ["the snapshot loads", { session: null, sessionLoading: true, conversations: [] }],
+    [
+      "the sidebar row has no level",
+      { session: null, sessionLoading: true, conversations: [makeConv(null)] },
+    ],
+    ["nothing has loaded", { session: null, sessionLoading: false, conversations: undefined }],
+  ])("is unknown while %s", (_state, hooks) => {
+    setHooks(hooks);
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBeNull();
+  });
+
+  it("uses the sidebar row's level before the snapshot loads", () => {
+    setHooks({ session: null, sessionLoading: true, conversations: [makeConv(2)] });
+    expect(renderHook(() => useIsSessionOwner("conv_1")).result.current).toBe(false);
+  });
 });

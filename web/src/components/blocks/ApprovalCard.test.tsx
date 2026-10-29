@@ -1924,6 +1924,15 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       ownerOnlyNote: true,
     },
     {
+      viewer: "a viewer whose ownership is still loading",
+      requester: null,
+      sideChatId: null,
+      isTerminalFirst: true,
+      isOwner: null,
+      opensTerminal: false,
+      ownerOnlyNote: false,
+    },
+    {
       viewer: "the session itself without a terminal view",
       requester: null,
       sideChatId: null,
@@ -1992,7 +2001,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
 
       const ownerOnly = screen.queryByTestId("approval-card-terminal-owner-only");
       expect(ownerOnly !== null).toBe(ownerOnlyNote);
-      if (opensTerminal || ownerOnlyNote) {
+      if (opensTerminal || ownerOnlyNote || isOwner === null) {
         expect(vi.mocked(useIsSessionOwner)).toHaveBeenCalledWith("conv_parent");
       }
       if (!opensTerminal) {
