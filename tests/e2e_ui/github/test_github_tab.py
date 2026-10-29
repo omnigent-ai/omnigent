@@ -662,7 +662,9 @@ def test_reply_to_inline_review_conversation(
                 {
                     "id": "root",
                     "author": "alice",
-                    "body": "Why add this line?",
+                    "body": (
+                        "Why add this line?\n\n```suggestion\nimproved line\nanother line\n```"
+                    ),
                     "created_at": "2026-10-26T12:00:00Z",
                     "url": pr_url + "#discussion_r1",
                 }
@@ -697,6 +699,7 @@ def test_reply_to_inline_review_conversation(
                 "resolved": True,
                 "outdated": True,
                 "original_line": 2,
+                "original_start_line": None,
                 "comments": {
                     **thread["comments"],
                     "data": [{**thread["comments"]["data"][0], "id": "outdated-root"}],
@@ -815,6 +818,12 @@ def test_reply_to_inline_review_conversation(
     panel.get_by_role("button", name="Next unresolved conversation", exact=True).click()
     expect(conversation).to_be_focused()
     expect(conversation.get_by_text("Why add this line?", exact=True)).to_be_visible()
+    suggestion = conversation.get_by_role("region", name="Suggested change", exact=True)
+    expect(suggestion.locator('[data-suggestion-line="removed"]')).to_have_text("2−added line")
+    expect(suggestion.locator('[data-suggestion-line="added"]')).to_have_text(
+        ["2+improved line", "3+another line"]
+    )
+    assert suggestion.evaluate("element => element.scrollWidth <= element.clientWidth")
     textbox = conversation.get_by_role("textbox", name="Reply to review conversation")
     expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
     page.screenshot(path=str(tmp_path / f"inline-{entry}-compact.png"))
@@ -872,6 +881,7 @@ def test_reply_to_inline_review_conversation(
     expect(fallback.get_by_role("button", expanded=False)).to_be_visible()
     fallback.get_by_role("button", expanded=False).click()
     expect(fallback.get_by_text("Original code context", exact=True)).to_be_visible()
+    expect(fallback.get_by_text("Original context", exact=True)).to_be_visible()
     conversation.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
 

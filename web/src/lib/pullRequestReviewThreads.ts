@@ -1,4 +1,9 @@
-import type { DiffLineAnnotation, FileDiffMetadata, SelectedLineRange } from "@pierre/diffs";
+import {
+  parsePatchFiles,
+  type DiffLineAnnotation,
+  type FileDiffMetadata,
+  type SelectedLineRange,
+} from "@pierre/diffs";
 
 export interface ReviewThreadAnchor {
   path: string;
@@ -56,6 +61,7 @@ export interface ReviewThread {
   start_line: number | null;
   start_side?: "LEFT" | "RIGHT" | null;
   original_line?: number | null;
+  original_start_line?: number | null;
   subject_type: "LINE" | "FILE";
   resolved: boolean;
   outdated: boolean;
@@ -67,6 +73,81 @@ export interface ReviewThread {
 export interface ReviewThreadsPage extends ReviewPage<ReviewThread> {
   head_sha: string;
   base_sha: string;
+}
+
+export interface ReviewSuggestionSource {
+  line: number;
+  lines: string[];
+  original: boolean;
+}
+
+/** Read only a complete range from one side of a patch or an expanded file. */
+function reviewRangeLines(
+  file: FileDiffMetadata,
+  side: ReviewThread["side"],
+  start: number,
+  end: number,
+): string[] | null {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start)
+    return null;
+  const left = side === "LEFT";
+  const lines = left ? file.deletionLines : file.additionLines;
+  let index = start - 1;
+  if (file.isPartial) {
+    const hunk = file.hunks.find((value) => {
+      const offset = left ? value.deletionStart : value.additionStart;
+      const count = left ? value.deletionCount : value.additionCount;
+      return start >= offset && end < offset + count;
+    });
+    if (!hunk) return null;
+    index =
+      (left ? hunk.deletionLineIndex : hunk.additionLineIndex) +
+      start -
+      (left ? hunk.deletionStart : hunk.additionStart);
+  }
+  const selected = lines.slice(index, index + end - start + 1);
+  return selected.length === end - start + 1
+    ? selected.map((line) => line.replace(/\r?\n$/, ""))
+    : null;
+}
+
+/** Prefer the displayed revision; label a comment's saved snippet as original context. */
+export function reviewSuggestionSource(
+  thread: ReviewThread,
+  file: FileDiffMetadata | undefined,
+): ReviewSuggestionSource | null {
+  if (
+    thread.subject_type !== "LINE" ||
+    (thread.side !== "LEFT" && thread.side !== "RIGHT") ||
+    (thread.start_side && thread.start_side !== thread.side)
+  )
+    return null;
+  const end = thread.line;
+  if (
+    file &&
+    !thread.outdated &&
+    end !== null &&
+    (file.name === thread.path || file.prevName === thread.path)
+  ) {
+    const start = thread.start_line ?? end;
+    const lines = reviewRangeLines(file, thread.side, start, end);
+    if (lines) return { line: start, lines, original: false };
+  }
+  // Older hosts omit the original range, so its length cannot be inferred safely.
+  if (!thread.original_line || thread.original_start_line === undefined || !thread.diff_hunk)
+    return null;
+  try {
+    const hunk = thread.diff_hunk.endsWith("\n") ? thread.diff_hunk : `${thread.diff_hunk}\n`;
+    const original = parsePatchFiles(
+      `diff --git a/review b/review\n--- a/review\n+++ b/review\n${hunk}`,
+    )[0]?.files[0];
+    if (!original) return null;
+    const start = thread.original_start_line ?? thread.original_line;
+    const lines = reviewRangeLines(original, thread.side, start, thread.original_line);
+    return lines ? { line: start, lines, original: true } : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Keep identity separate from position: several conversations can share a line. */

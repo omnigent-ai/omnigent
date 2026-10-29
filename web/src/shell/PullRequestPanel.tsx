@@ -689,6 +689,7 @@ function PullRequestFileSection({
               key={thread.id}
               thread={thread}
               context={threadContext}
+              fileDiff={matchingRevision ? fileDiff : undefined}
               showContext
             />
           ))}
@@ -772,6 +773,7 @@ function PullRequestFileSection({
                       key={thread.id}
                       thread={thread}
                       context={threadContext}
+                      fileDiff={matchingRevision ? fileDiff : undefined}
                     />
                   ))}
                 </div>

@@ -4,6 +4,7 @@ import {
   mergeReviewComments,
   reviewThreadAnnotations,
   reviewSelection,
+  reviewSuggestionSource,
   type ReviewThread,
 } from "./pullRequestReviewThreads";
 
@@ -107,5 +108,79 @@ describe("review thread placement", () => {
     expect(mergeReviewComments([comment], [{ ...comment, body: "Updated" }])).toEqual([
       { ...comment, body: "Updated" },
     ]);
+  });
+});
+
+describe("review suggestion source", () => {
+  it.each([
+    ["RIGHT", null, ["after"]],
+    ["LEFT", null, ["before"]],
+    ["RIGHT", 5, ["context", "after"]],
+    ["LEFT", 5, ["context", "before"]],
+    ["RIGHT", 6, ["after"]],
+  ] as const)("reads %s lines from %s to the thread endpoint", (side, start_line, expected) => {
+    expect(reviewSuggestionSource(thread({ side, start_line }), file)).toEqual({
+      line: start_line ?? 6,
+      lines: expected,
+      original: false,
+    });
+  });
+
+  it("uses hunk offsets rather than file line numbers as array indexes", () => {
+    const patch = parsePatchFiles(
+      "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -5 +5 @@\n-old\n+first\n@@ -20,2 +20,2 @@\n-before\n+\tcurrent  \n \n",
+    )[0].files[0];
+    expect(reviewSuggestionSource(thread({ line: 21, start_line: 20 }), patch)).toEqual({
+      line: 20,
+      lines: ["\tcurrent  ", ""],
+      original: false,
+    });
+  });
+
+  it("can read expanded context and the current name of a renamed file", () => {
+    const expanded = {
+      ...file,
+      name: "renamed.py",
+      prevName: "app.py",
+      isPartial: false,
+      additionLines: ["outside\r\n", "context\n"],
+    };
+    expect(reviewSuggestionSource(thread({ line: 1 }), expanded)).toEqual({
+      line: 1,
+      lines: ["outside"],
+      original: false,
+    });
+  });
+
+  it.each([
+    { line: 99 },
+    { start_line: 1 },
+    { start_line: 7 },
+    { start_side: "LEFT" as const, start_line: 5 },
+    { subject_type: "FILE" as const },
+    { path: "unrelated.py" },
+    { outdated: true },
+  ])("does not invent before text when the range is unavailable: %j", (overrides) => {
+    expect(reviewSuggestionSource(thread(overrides), file)).toBeNull();
+  });
+
+  it("labels the saved hunk and uses original coordinates for an outdated range", () => {
+    const original = thread({
+      outdated: true,
+      line: 99,
+      original_line: 12,
+      original_start_line: 11,
+      diff_hunk: "@@ -10,4 +10,4 @@\n context\n-first\n+original first\n original second",
+    });
+    expect(reviewSuggestionSource(original, file)).toEqual({
+      line: 11,
+      lines: ["original first", "original second"],
+      original: true,
+    });
+    expect(reviewSuggestionSource({ ...original, original_line: 13 }, file)).toBeNull();
+    expect(
+      reviewSuggestionSource({ ...original, original_start_line: undefined }, file),
+    ).toBeNull();
+    expect(reviewSuggestionSource({ ...original, diff_hunk: "unavailable" }, file)).toBeNull();
   });
 });

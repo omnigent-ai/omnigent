@@ -118,6 +118,7 @@ def _thread(thread: dict[str, Any]) -> dict[str, Any] | None:
         "start_line": thread.get("startLine"),
         "start_side": thread.get("startDiffSide"),
         "original_line": thread.get("originalLine"),
+        "original_start_line": thread.get("originalStartLine"),
         "subject_type": thread.get("subjectType"),
         "resolved": bool(thread.get("isResolved")),
         "outdated": bool(thread.get("isOutdated")),

@@ -7,6 +7,9 @@ request's Changes subtab. Top-level comments remain in Comments.
 
 - `inline-threads`: Published conversations on old/new lines, both diff layouts,
   separate conversations at the same line and multiline range labels.
+- `suggestions`: Fenced suggestions show referenced lines as removals and the
+  replacement as additions. Saved snippets are labeled as original context;
+  unavailable ranges show the replacement without a comparison.
 - `inline-reply`: Compact reply inputs expand on focus; Cancel collapses the
   composer and retains the draft. Markdown preview, account attribution and
   immediate posting remain available in the expanded composer.
@@ -43,6 +46,10 @@ creates a separate conversation on an occupied new-side line and a range on the
 old side, verifying coordinates, placement and deduplication after refresh.
 It checks focus-to-expand, Cancel and keyboard reopening, collapse after posting,
 and the gutter plus centered over the line-number/code divider in both layouts.
+Suggestion assertions verify the before/after lines and numbers, mobile sizing,
+and original-context labeling on outdated threads. Component tests cover empty
+replacements, ordinary Markdown/code and unavailable context; mapping tests
+cover side/range selection, partial patches and historical coordinates.
 
 The existing
 `tests/e2e_ui/github/test_github_tab.py::test_post_top_level_pr_comment`
@@ -58,6 +65,9 @@ and confirm the discussion remains accessible. Click a line number and its plus
 to start another conversation; drag line numbers or Shift-click to select a range
 and choose **Comment on selected lines**. Confirm the range on GitHub. In browser Network, the existing
 info requests should include threads only while Changes is visible.
+For an existing comment with a fenced `suggestion`, compare its red removal and
+green addition rows to GitHub, including a multiline replacement. Expand an
+outdated thread and confirm the suggestion uses its labeled original context.
 
 ## Gotchas
 
@@ -74,3 +84,5 @@ info requests should include threads only while Changes is visible.
   base/head revision preserves the draft but requires selecting its lines again.
 - New conversations publish immediately as a submitted comment review. They do
   not append to an existing thread or submit an existing pending review.
+- Suggestion diffs reuse loaded patches and saved snippets; applying a suggestion
+  is not supported.

@@ -760,12 +760,14 @@ def test_thread_field_failure_preserves_metadata_and_reports_unavailable(
 def test_thread_shaping_keeps_minimized_placeholder_and_excludes_pending(
     review_thread: dict,
 ) -> None:
+    review_thread["originalStartLine"] = 10
     review_thread["comments"]["nodes"] += [
         {"id": "pending", "state": "PENDING", "body": "Unpublished"},
         {"id": "hidden", "state": "SUBMITTED", "isMinimized": True, "body": "Hidden body"},
     ]
     shaped = reviews._thread(review_thread)
     assert shaped is not None
+    assert shaped["original_start_line"] == 10
     assert [comment["id"] for comment in shaped["comments"]["data"]] == ["comment-1", "hidden"]
     assert shaped["comments"]["data"][-1]["body"] == ""
     assert shaped["comments"]["data"][-1]["minimized"] is True

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import type { FileDiffMetadata } from "@pierre/diffs";
 import {
   ChevronDownIcon,
   ChevronRightIcon,
@@ -6,12 +7,11 @@ import {
   MessageSquareIcon,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { MessageResponse } from "@/components/ai-elements/message";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { usePullRequestCommentComposer } from "@/hooks/usePullRequests";
 import { PullRequestCommentForm } from "./PullRequestCommentComposer";
-import { PULL_REQUEST_MARKDOWN_COMPONENTS } from "./PullRequestDetails";
+import { PullRequestReviewBody } from "./PullRequestReviewBody";
 
 export interface ReviewThreadContext {
   conversationId: string;
@@ -28,10 +28,12 @@ export interface ReviewThreadContext {
 export function PullRequestReviewThread({
   thread,
   context,
+  fileDiff,
   showContext = false,
 }: {
   thread: ReviewThread;
   context: ReviewThreadContext;
+  fileDiff?: FileDiffMetadata;
   showContext?: boolean;
 }) {
   const composer = usePullRequestCommentComposer(context.conversationId, context.prUrl, thread.id);
@@ -40,8 +42,9 @@ export function PullRequestReviewThread({
   );
   const open = expanded;
   const line = thread.outdated ? thread.original_line : thread.line;
+  const startLine = thread.outdated ? thread.original_start_line : thread.start_line;
   const lineLabel = line
-    ? `${thread.side === "LEFT" ? "Old" : "New"} line ${thread.start_line && !thread.outdated ? `${thread.start_line}–` : ""}${line}`
+    ? `${thread.side === "LEFT" ? "Old" : "New"} line ${startLine && startLine < line ? `${startLine}–` : ""}${line}`
     : "File conversation";
   const ToggleIcon = open ? ChevronDownIcon : ChevronRightIcon;
   return (
@@ -107,12 +110,11 @@ export function PullRequestReviewThread({
                     <p className="text-muted-foreground">Comment hidden on GitHub.</p>
                   ) : (
                     <div className="break-words [overflow-wrap:anywhere]">
-                      <MessageResponse
-                        allowGitHubAttachmentImages
-                        components={PULL_REQUEST_MARKDOWN_COMPONENTS}
-                      >
-                        {comment.body}
-                      </MessageResponse>
+                      <PullRequestReviewBody
+                        body={comment.body}
+                        thread={thread}
+                        fileDiff={fileDiff}
+                      />
                     </div>
                   )}
                 </li>

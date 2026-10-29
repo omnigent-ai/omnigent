@@ -4,6 +4,8 @@
 
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { PullRequestReviewThread } from "./PullRequestReviewThread";
+import { PullRequestReviewBody } from "./PullRequestReviewBody";
+import { parsePatchFiles } from "@pierre/diffs";
 import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
@@ -553,28 +555,69 @@ function mountCommentComposer(client: QueryClient, prUrl = PR_URL) {
   );
 }
 
+function inlineReviewThread(): ReviewThread {
+  return {
+    id: "thread-1",
+    path: "app.py",
+    side: "RIGHT",
+    line: 2,
+    start_line: 2,
+    subject_type: "LINE",
+    resolved: false,
+    outdated: false,
+    can_reply: true,
+    diff_hunk: "",
+    comments: {
+      data: [{ id: "root", author: "reviewer", body: "Why?", created_at: null, url: null }],
+      has_more: false,
+      next_cursor: null,
+    },
+  };
+}
+
+it("renders suggestions as replacement diffs while keeping ordinary Markdown and code", async () => {
+  const thread = inlineReviewThread();
+  const fileDiff = parsePatchFiles(
+    "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1,2 +1,2 @@\n context\n-old\n+current\n",
+  )[0].files[0];
+  const body = [
+    "**Explanation** with `suggestion` as inline code.",
+    "```suggestion\nfirst\n<script>literal()</script>\n```",
+    "```suggestion\n```",
+    "````text\n```suggestion\nthis is ordinary code\n```\n````",
+  ].join("\n\n");
+  const view = render(<PullRequestReviewBody body={body} thread={thread} fileDiff={fileDiff} />);
+  const suggestions = await screen.findAllByRole("region", { name: "Suggested change" });
+  expect(suggestions).toHaveLength(2);
+  const rows = suggestions[0].querySelectorAll("tr");
+  expect([...rows].map((row) => row.textContent)).toEqual([
+    "2−current",
+    "2+first",
+    "3+<script>literal()</script>",
+  ]);
+  expect(suggestions[1].querySelectorAll("tr")).toHaveLength(1);
+  expect(suggestions[1]).toHaveTextContent("2−current");
+  expect(view.container.querySelector("script")).toBeNull();
+  expect(screen.getByText("Explanation")).toHaveAttribute("data-streamdown", "strong");
+  expect(screen.getAllByRole("button", { name: "Copy Code" })).toHaveLength(1);
+  expect(view.container.querySelector(".chat-code-block")).toHaveTextContent(
+    "this is ordinary code",
+  );
+
+  view.rerender(<PullRequestReviewBody body={body} thread={thread} />);
+  expect(screen.getAllByText("Original lines are unavailable for comparison.")).toHaveLength(2);
+  expect(view.container.querySelectorAll("tr")).toHaveLength(0);
+  expect(
+    screen.getByText("first\n<script>literal()</script>", { normalizer: (text) => text }),
+  ).toBeVisible();
+});
+
 it.each(["unmount", "rerender"])(
   "keeps an inline reply with its thread across %s",
   async (switchMode) => {
     const { edits } = stubFetch();
     const client = new QueryClient();
-    const thread: ReviewThread = {
-      id: "thread-1",
-      path: "app.py",
-      side: "RIGHT",
-      line: 2,
-      start_line: null,
-      subject_type: "LINE",
-      resolved: false,
-      outdated: false,
-      can_reply: true,
-      diff_hunk: "",
-      comments: {
-        data: [{ id: "root", author: "reviewer", body: "Why?", created_at: null, url: null }],
-        has_more: false,
-        next_cursor: null,
-      },
-    };
+    const thread = inlineReviewThread();
     const page = {
       data: [thread, { ...thread, id: "untouched" }],
       has_more: false,
@@ -603,6 +646,8 @@ it.each(["unmount", "rerender"])(
     );
     const mount = (prUrl: string, current: ReviewThread) => render(tree(prUrl, current));
     const first = mount(PR_URL, thread);
+    expect(screen.getByRole("button", { expanded: true })).toHaveTextContent("New line 2");
+    expect(screen.getByRole("button", { expanded: true })).not.toHaveTextContent("2–2");
     expect(screen.queryByRole("button", { name: "Reply…" })).not.toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "Write" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Reply" })).not.toBeInTheDocument();

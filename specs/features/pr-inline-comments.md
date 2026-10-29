@@ -62,12 +62,15 @@ the patch snapshot gap a prerequisite.
 - R9: Allow resolve/reopen where GitHub reports that the selected account can do so.
 - R10: Keep controls usable by keyboard and touch and in the narrow mobile drawer.
   Retain the diff's lazy rendering and large-file protections.
+- R11: Render fenced suggestions as numbered replacement diffs using the loaded
+  patch or labeled original snippet, without additional network requests.
 
 ## Clarifications
 
 - Q1: What is the recommended delivery boundary?
   A1: Deliver R1–R8 and R10: existing threads with compact reply inputs and
-  new line/range conversations. Resolve/reopen (R9) remains follow-up work.
+  new line/range conversations, plus suggestion diffs (R11). Resolve/reopen (R9)
+  remains follow-up work.
 - Q2: Should “Changes” be renamed to “Diff”?
   A2: Retain the current label; this plan uses Changes to identify the existing
   subtab. A rename is not needed for inline conversations.
@@ -124,6 +127,11 @@ the patch snapshot gap a prerequisite.
   PR-info poll runs THEN its single coordinated request includes a bounded thread
   page, its selected-PR data comes from one combined GitHub query, and no separate
   thread poll runs. WHEN Changes closes THEN periodic thread reads stop.
+- AC14: GIVEN a fenced suggestion WHEN its referenced lines are available THEN
+  render those lines as removals and the replacement as additions, preserving
+  whitespace and ordinary Markdown. Empty replacements show removals only.
+  Outdated suggestions use labeled original context; unavailable ranges show
+  the replacement with an explanation instead of inventing before text.
 
 ## Constraints
 
@@ -418,14 +426,18 @@ store. Render a targeted unavailable state if an older server lacks the routes.
   frontend type checks/build, applicable pre-commit hooks, and
   `cd web && pnpm exec prettier --check .` before pushing web changes. Capture
   UI evidence outside the tracked tree and attach it to the implementation PR.
+- [x] T14: Render review suggestions with the existing Markdown and diff parsers,
+  preserving original range coordinates. Extend the mapping/component scenarios
+  and four-entry browser journey for source selection and visual rendering.
+  Covers AC14.
 
 ### Verification results
 
 Implemented the first release on main `424e96b1c`. Published threads, inline
 replies, pagination, revision checks, shared polling and the four browser entry
 points are covered. The extension adds compact reply inputs and new line/range
-conversations. Resolve/reopen remains deferred; hidden-context threads use the
-explicit original-snippet fallback.
+conversations and suggestion diffs. Resolve/reopen remains deferred;
+hidden-context threads use the explicit original-snippet fallback.
 
 - Provider, runner, host fallback, permission, workspace and OpenAPI checks pass.
 - Frontend component/hook tests pass, including shared request counts, cursor
@@ -466,3 +478,6 @@ Human verification:
    visible, confirm one regular info poll carrying thread inclusion and no
    periodic `/review-threads` request. Switch to Summary and confirm subsequent
    info polls omit thread inclusion. “Load more” may issue one-off page requests.
+8. Open a comment containing a fenced `suggestion`. Compare the numbered removal
+   and addition rows to GitHub, including a multiline replacement. Expand an
+   outdated thread and confirm the comparison is labeled **Original context**.
