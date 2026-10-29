@@ -1167,7 +1167,8 @@ def _parse_question_answer(text: str, question: _QuestionPrompt) -> str | list[s
     option label, or free text when the question allows a custom answer.
     """
     if question.text_default is not None:
-        return text if text.strip() else question.text_default
+        # Only a bare Enter keeps the prefill; typed whitespace is an answer.
+        return text if text else question.text_default
     stripped = text.strip()
     if not stripped:
         return None
@@ -1599,6 +1600,11 @@ class _SessionsChatReplAdapter:
         # Prompts already handed to the terminal. A prompt can arrive twice:
         # live on the stream and from the snapshot replayed on subscribe.
         self._seen_elicitation_ids: set[str] = set()
+        # Ids another client settled, so a stale snapshot replay can't reopen them.
+        self._resolved_elicitation_ids: set[str] = set()
+        # One terminal prompt at a time: they share the input line, and a
+        # second prompt would otherwise take it from the first.
+        self._prompt_lock = asyncio.Lock()
         self._replay_task: asyncio.Task[None] | None = None
         self._host = host
         self._fmt = fmt
@@ -2898,18 +2904,51 @@ class _SessionsChatReplAdapter:
         """
         elicitation_id = getattr(event, "elicitation_id", "")
         if elicitation_id:
-            if elicitation_id in self._seen_elicitation_ids:
+            if (
+                elicitation_id in self._seen_elicitation_ids
+                or elicitation_id in self._resolved_elicitation_ids
+            ):
                 return
             self._seen_elicitation_ids.add(elicitation_id)
-        # Question prompts get a numbered picker instead of y/a/n: an accept
-        # without answers would reach the agent as an empty reply.
-        questions = _question_prompts(getattr(event, "ask_user_question", None))
-        if questions and self._field_input_state is not None:
-            resolve_payload = await self._question_payload(elicitation_id, questions)
-            if resolve_payload is None:
-                return  # another client answered it
-        else:
-            resolve_payload = await self._approval_payload(event, elicitation_id)
+        async with self._prompt_lock:
+            # Another client may have settled it while this waited its turn.
+            if elicitation_id in self._resolved_elicitation_ids:
+                return
+            # Question prompts get a numbered picker instead of y/a/n: an
+            # accept without answers would reach the agent as an empty reply.
+            questions = _question_prompts(getattr(event, "ask_user_question", None))
+            if questions and self._field_input_state is not None:
+                resolve_payload = await self._question_payload(elicitation_id, questions)
+            else:
+                resolve_payload = await self._approval_payload(event, elicitation_id)
+        if resolve_payload is None:
+            return  # another client answered it
+        delivered = False
+        try:
+            delivered = await self._post_elicitation_verdict(
+                session_id, elicitation_id, resolve_payload
+            )
+        finally:
+            if not delivered:
+                # Still parked server-side: let a later snapshot replay offer it again.
+                self._seen_elicitation_ids.discard(elicitation_id)
+
+    def note_elicitation_resolved(self, elicitation_id: str) -> None:
+        """Record that a client settled *elicitation_id* so it is never prompted again."""
+        if elicitation_id:
+            self._resolved_elicitation_ids.add(elicitation_id)
+
+    async def _post_elicitation_verdict(
+        self,
+        session_id: str,
+        elicitation_id: str,
+        resolve_payload: dict[str, object],
+    ) -> bool:
+        """POST the verdict, retrying transport errors.
+
+        :returns: ``True`` once the server has the verdict (or reports it
+            already resolved); ``False`` when every attempt failed.
+        """
 
         # URL-based elicitation: deliver the verdict to the elicitation's
         # dedicated resolve URL rather than as an in-band ``approval`` event.
@@ -2923,12 +2962,12 @@ class _SessionsChatReplAdapter:
                     elicitation_id,
                     resolve_payload,
                 )
-                return
+                return True
             except OmnigentError as exc:
                 if exc.code == "not_found":
                     # Another client may have resolved it while the terminal
                     # prompt was open, or the first POST reached the server.
-                    return
+                    return True
                 raise
             except Exception as exc:
                 if not _is_recoverable_sse_transport_error(exc):
@@ -2945,8 +2984,9 @@ class _SessionsChatReplAdapter:
                     # turn waits on a verdict that will never arrive. Say so
                     # instead of leaving an apparently live prompt.
                     self._emit_elicitation_resolve_error(exc)
-                    return
+                    return False
                 await asyncio.sleep(0.1 * (2**attempt))
+        return False
 
     async def _replay_pending_elicitations(self) -> None:
         """Feed prompts raised before this subscription opened through the live path."""
@@ -2966,12 +3006,15 @@ class _SessionsChatReplAdapter:
                 continue
             self._on_event(event)
 
-    async def _approval_payload(self, event: object, elicitation_id: str) -> dict[str, object]:
+    async def _approval_payload(
+        self, event: object, elicitation_id: str
+    ) -> dict[str, object] | None:
         """Run the y/a/n approval hook and build the resolve payload.
 
         :param event: The translated :class:`ElicitationRequest`.
         :param elicitation_id: Id of the elicitation being answered.
-        :returns: ``{"action": ..., "content"?: ...}`` for the resolve POST.
+        :returns: ``{"action": ..., "content"?: ...}`` for the resolve POST, or
+            ``None`` when another client answered its form mid-prompt.
         """
         import inspect
 
@@ -3019,6 +3062,9 @@ class _SessionsChatReplAdapter:
                     prompted = await self._prompt_schema_fields(schema, elicitation_id)
                 except Exception:  # noqa: BLE001
                     prompted = None
+                fis = self._field_input_state
+                if fis is not None and fis.resolved_elsewhere:
+                    return None
                 if prompted is not None:
                     resolve_payload["content"] = prompted
                 else:
@@ -4047,6 +4093,7 @@ async def run_repl(
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
+            session.note_elicitation_resolved(event.elicitation_id)
             label = _settle_resolved_elsewhere(
                 approval_state, field_input_state, event.elicitation_id, event.action, event.reason
             )

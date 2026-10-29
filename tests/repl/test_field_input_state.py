@@ -7,6 +7,7 @@ schema fields interactively in the REPL.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
@@ -361,6 +362,7 @@ def _question(**overrides: Any) -> Any:
         ("qa", {"allow_custom": False}, None),
         ("", {"options": (), "text_default": "draft"}, "draft"),
         ("  keep spaces ", {"options": (), "text_default": "draft"}, "  keep spaces "),
+        ("   ", {"options": (), "text_default": "draft"}, "   "),
     ],
     ids=[
         "number",
@@ -376,6 +378,7 @@ def _question(**overrides: Any) -> Any:
         "custom-not-allowed",
         "editor-keeps-default",
         "editor-exact-text",
+        "editor-whitespace-is-an-answer",
     ],
 )
 def test_parse_question_answer(typed: str, overrides: dict[str, Any], expected: Any) -> None:
@@ -606,3 +609,148 @@ def test_a_prompt_seen_live_and_in_replay_is_handled_once() -> None:
     client.sessions.resolve_elicitation.assert_awaited_once_with(
         "conv_abc", "elicit_q", {"action": "accept", "content": {"Env?": "dev"}}
     )
+
+
+async def _until(condition: Any, message: str) -> None:
+    """Yield to the loop until *condition()* holds; fail rather than hang."""
+    for _ in range(200):
+        if condition():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(message)
+
+
+def test_concurrent_prompts_are_asked_one_at_a_time() -> None:
+    # Two pickers sharing the input line used to take it from each other in a
+    # loop, and an editor question could submit its prefill unasked.
+    adapter, fis, client, _ = _question_adapter()
+    editor = _question_event()
+    editor.elicitation_id = "elicit_editor"
+    editor.ask_user_question = {
+        "questions": [
+            {"id": "0", "question": "Notes?", "options": [], "textInput": {"default": "draft"}}
+        ]
+    }
+
+    async def _answer_both() -> None:
+        first = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        second = asyncio.create_task(adapter._handle_elicitation("conv_abc", editor))
+        await _until(lambda: fis.pending, "the first question never opened")
+        for _ in range(50):
+            await asyncio.sleep(0)
+        client.sessions.resolve_elicitation.assert_not_awaited()
+        fis.resolve("2")
+        await _until(lambda: fis.pending and first.done(), "the second question never opened")
+        fis.resolve("my notes")
+        await asyncio.gather(first, second)
+
+    _run(_answer_both())
+    assert [c.args for c in client.sessions.resolve_elicitation.await_args_list] == [
+        ("conv_abc", "elicit_q", {"action": "accept", "content": {"Env?": "prod"}}),
+        ("conv_abc", "elicit_editor", {"action": "accept", "content": {"0": "my notes"}}),
+    ]
+
+
+def test_prompt_resolved_elsewhere_before_its_turn_is_never_shown() -> None:
+    # A stale snapshot replay, or a prompt still queued behind another one,
+    # must not open after another client settled it.
+    adapter, fis, client, _ = _question_adapter()
+    queued = _question_event()
+    queued.elicitation_id = "elicit_queued"
+
+    async def _run_case() -> None:
+        first = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        await _until(lambda: fis.pending, "the first question never opened")
+        second = asyncio.create_task(adapter._handle_elicitation("conv_abc", queued))
+        adapter.note_elicitation_resolved("elicit_queued")
+        fis.resolve("1")
+        await _until(lambda: second.done(), "the settled prompt opened anyway")
+        await first
+        # Replay of an already-settled id is a no-op too.
+        replay = asyncio.create_task(adapter._handle_elicitation("conv_abc", queued))
+        await _until(lambda: replay.done(), "the settled prompt reopened from replay")
+
+    _run(_run_case())
+    assert [c.args[1] for c in client.sessions.resolve_elicitation.await_args_list] == ["elicit_q"]
+
+
+def test_undelivered_answer_can_be_retried_from_a_later_replay() -> None:
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    adapter, fis, client, _ = _question_adapter()
+    client.sessions.resolve_elicitation = AsyncMock(
+        side_effect=[httpx.ConnectError("down")] * 3 + [None]
+    )
+
+    async def _run_case() -> None:
+        for _ in range(2):  # live delivery, then the reconnect replay
+            task = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+            await _until(lambda: fis.pending, "the question did not reopen after a failed send")
+            fis.resolve("1")
+            await task
+
+    _run(_run_case())
+    assert client.sessions.resolve_elicitation.await_count == 4
+
+
+def test_schema_prompt_resolved_elsewhere_stops_without_posting() -> None:
+    from types import SimpleNamespace
+
+    adapter, fis, client, approval_hook = _question_adapter()
+    event = SimpleNamespace(
+        elicitation_id="elicit_form",
+        message="Fill in",
+        requested_schema={"properties": {"name": {"type": "string"}}, "required": ["name"]},
+        mode="form",
+        phase="tool_call",
+        policy_name="p",
+        content_preview="",
+        url=None,
+    )
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", event))
+        await _until(lambda: fis.pending, "the schema field prompt never opened")
+        assert fis.resolve_elsewhere("elicit_form")
+        await task
+
+    _run(_run_case())
+    approval_hook.assert_awaited_once()
+    client.sessions.resolve_elicitation.assert_not_awaited()
+
+
+def test_stream_reconnect_replays_pending_prompts_once_per_subscription() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    adapter, _, client, _ = _question_adapter()
+    subscriptions = 0
+
+    async def _stream(session_id: str) -> Any:
+        nonlocal subscriptions
+        subscriptions += 1
+        yield SimpleNamespace()
+        yield SimpleNamespace()
+
+    client.sessions.stream = _stream
+    replay = AsyncMock()
+    adapter._replay_pending_elicitations = replay  # type: ignore[method-assign]
+    adapter._on_event = lambda event: None
+
+    async def _run_case() -> None:
+        pump = asyncio.create_task(adapter._stream_pump())
+        for _ in range(60):  # the pump backs off 0.5s between subscriptions
+            if subscriptions >= 2:
+                break
+            await asyncio.sleep(0.05)
+        for _ in range(20):
+            await asyncio.sleep(0)
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+
+    _run(_run_case())
+    assert subscriptions >= 2
+    assert replay.call_count == subscriptions
