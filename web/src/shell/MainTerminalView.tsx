@@ -27,6 +27,7 @@ import {
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import {
   reconcileTerminalSplit,
@@ -111,11 +112,25 @@ export function MainTerminalView({
   onSurfaceElement,
   splittable = false,
 }: MainTerminalViewProps) {
+  const [resumeState, setResumeState] = useState<{
+    conversationId: string;
+    phase: "idle" | "resuming" | "connecting";
+    error: string | null;
+  }>({ conversationId, phase: "idle", error: null });
+  const resumePhase = resumeState.conversationId === conversationId ? resumeState.phase : "idle";
+  const resumePending = resumePhase !== "idle";
+  const resumeError = resumeState.conversationId === conversationId ? resumeState.error : null;
+  const recoveryRef = useRef({ conversationId, attempted: false, pending: false });
+  if (recoveryRef.current.conversationId !== conversationId) {
+    recoveryRef.current = { conversationId, attempted: false, pending: false };
+  }
+  const hostOnline = useSessionHostOnline(conversationId);
   const {
     terminals,
+    isLoading: terminalsLoading,
     isFetching: terminalsFetching = false,
     listCompleteAt = 0,
-  } = useTerminals(conversationId);
+  } = useTerminals(conversationId, { reconcileWhilePending: resumePending });
   const terminalFirstCtx = useTerminalFirst();
   // The agent's own terminal (SDK REPL / native vendor pane) — the
   // auto-selection target and the pane the pill's Terminal view shows.
@@ -126,10 +141,14 @@ export function MainTerminalView({
   // with the initial "" in the validity closure, and its
   // terminals[0] fallback would win).
   const [activeKey, setActiveKey] = useState(initialTerminalKey || "");
+  // Apply a rail retarget before recovery effects can act on the old selection.
+  const [previousInitialTerminalKey, setPreviousInitialTerminalKey] = useState(initialTerminalKey);
+  if (previousInitialTerminalKey !== initialTerminalKey) {
+    setPreviousInitialTerminalKey(initialTerminalKey);
+    if (initialTerminalKey) setActiveKey(initialTerminalKey);
+  }
   const { getStatus, setTerminalConnectionState, markTerminalActive } =
     useTerminalStatuses(terminals);
-  const [resumePending, setResumePending] = useState(false);
-  const [resumeError, setResumeError] = useState<string | null>(null);
   const runnerOffline = runnerOnline === false;
   const resumeTarget = sandboxOffline ? "sandbox" : "session";
   // A session whose terminal is coming up (fresh cold boot, relaunch, or
@@ -140,37 +159,45 @@ export function MainTerminalView({
   // empty, non-starting inventory is therefore resumable even before liveness
   // has caught up and explicitly reported the runner offline.
   const resumeAvailable =
-    onResume !== undefined && !startingUp && (runnerOffline || terminals.length === 0);
+    onResume !== undefined && !startingUp && (runnerOffline || agentTerminal === null);
   // Mirror the chat error pill's actionable cause on the stopped-terminal state.
   const failureCauseMessage =
     typeof lastTaskError?.message === "string" && lastTaskError.message.trim().length > 0
       ? lastTaskError.message
       : null;
-  const handleResume = useCallback(async () => {
-    if (!onResume) return;
-    setResumeError(null);
-    setResumePending(true);
-    try {
-      await onResume();
-    } catch (error) {
-      setResumeError(resumeErrorText(error, resumeTarget));
-      throw error;
-    } finally {
-      setResumePending(false);
-    }
-  }, [onResume, resumeTarget]);
+  const handleResume = useCallback(
+    async (automatic = false) => {
+      const recovery = recoveryRef.current;
+      if (!onResume || recovery.pending) return;
+      recovery.attempted = true;
+      recovery.pending = true;
+      setResumeState({ conversationId, phase: "resuming", error: null });
+      try {
+        await onResume();
+        if (recoveryRef.current === recovery) {
+          setResumeState({ conversationId, phase: "connecting", error: null });
+        }
+      } catch (error) {
+        if (recoveryRef.current === recovery) {
+          setResumeState({
+            conversationId,
+            phase: "idle",
+            error: automatic
+              ? "Couldn't reconnect the terminal automatically."
+              : resumeErrorText(error, resumeTarget),
+          });
+        }
+        throw error;
+      } finally {
+        recovery.pending = false;
+      }
+    },
+    [conversationId, onResume, resumeTarget],
+  );
   // No manual keyboard padding here: this view is flow content inside the
   // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
   // terminal already sits above the keyboard. (Fixed overlays like the mobile
   // TerminalsPanel still pad themselves with useIOSNativeKeyboardInset.)
-
-  // Honor a retarget while already open (a rail shell click can point
-  // an open view at a different terminal); the validity effect below
-  // corrects unknown / closed keys to the first terminal once the
-  // list is loaded.
-  useEffect(() => {
-    if (initialTerminalKey) setActiveKey(initialTerminalKey);
-  }, [initialTerminalKey]);
 
   // Auto-select on mount / when the active terminal disappears. The
   // fallback prefers the agent's own terminal so a closed shell drops
@@ -209,6 +236,39 @@ export function MainTerminalView({
     (terminalFirstCtx?.isTerminalFirst ?? false) &&
     activeTerminal !== null &&
     !AGENT_TERMINAL_IDS.has(activeTerminal.id);
+  const autoResumeAvailable =
+    visible &&
+    !readOnly &&
+    !isShellView &&
+    hostOnline === true &&
+    !terminalsLoading &&
+    !terminalsFetching &&
+    resumeAvailable &&
+    !recoveryRef.current.attempted;
+  useEffect(() => {
+    const recovery = recoveryRef.current;
+    if (!resumePending && (!visible || (agentTerminal !== null && !runnerOffline))) {
+      recovery.attempted = false;
+    }
+    if (autoResumeAvailable) void handleResume(true).catch(() => {});
+  }, [autoResumeAvailable, handleResume, visible, resumePending, agentTerminal, runnerOffline]);
+  useEffect(() => {
+    if (resumePhase !== "connecting") return;
+    if (agentTerminal !== null) {
+      setResumeState({ conversationId, phase: "idle", error: null });
+      return;
+    }
+    const recovery = recoveryRef.current;
+    const timeout = window.setTimeout(() => {
+      if (recoveryRef.current !== recovery) return;
+      setResumeState({
+        conversationId,
+        phase: "idle",
+        error: "The terminal didn't reconnect. Try resuming the session.",
+      });
+    }, 10_000);
+    return () => window.clearTimeout(timeout);
+  }, [conversationId, resumePhase, agentTerminal]);
   const serverInfo = useServerInfo();
   const isMobile = useIsMobileViewport();
   // Splits are managed only by desktop owners, so only they see them.
@@ -280,6 +340,17 @@ export function MainTerminalView({
   const geometry = terminalLayoutGeometry(splitLayout ?? singlePaneKey);
   // Saved panes keep rendering while the agent terminal is missing but shells are live.
   const showPanes = activeTerminal !== null || (split !== undefined && terminals.length > 0);
+  const reconnecting = !isShellView && (resumePending || autoResumeAvailable);
+  const showResumeError = resumeError !== null && resumeAvailable && !isShellView;
+  const showLoading =
+    reconnecting ||
+    (!showPanes &&
+      (startingUp ||
+        (visible &&
+          !readOnly &&
+          hostOnline === true &&
+          !recoveryRef.current.attempted &&
+          (terminalsLoading || terminalsFetching))));
 
   const setSurfaceElement = useCallback(
     (element: HTMLDivElement | null) => {
@@ -306,8 +377,8 @@ export function MainTerminalView({
       className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
-        {!showPanes ? (
-          startingUp ? (
+        {!showPanes || showLoading || showResumeError ? (
+          showLoading ? (
             // Passive startup state: same centered geometry as the stopped
             // state so the swap doesn't jump, and nothing actionable — the
             // terminal connects on its own. role=status announces the wait.
@@ -319,7 +390,9 @@ export function MainTerminalView({
             >
               <Loader2Icon className="size-7 animate-spin text-muted-foreground" aria-hidden />
               <div className="space-y-1">
-                <p className="font-medium text-foreground text-ui">Starting up…</p>
+                <p className="font-medium text-foreground text-ui">
+                  {reconnecting ? "Reconnecting…" : "Starting up…"}
+                </p>
                 <p className="text-muted-foreground text-sm">
                   The terminal will connect automatically.
                 </p>
@@ -356,7 +429,11 @@ export function MainTerminalView({
                 {resumePending && <Loader2Icon className="size-3.5 animate-spin" aria-hidden />}
                 {resumePending ? "Resuming…" : `Resume ${resumeTarget}`}
               </Button>
-              {resumeError && <p className="text-destructive text-sm">{resumeError}</p>}
+              {resumeError && (
+                <p role="alert" className="text-destructive text-sm">
+                  {resumeError}
+                </p>
+              )}
             </div>
           ) : (
             <div className="flex flex-1 items-center justify-center text-muted-foreground text-ui">
@@ -416,7 +493,7 @@ export function MainTerminalView({
                           readOnly={readOnly}
                           active={visible && active && focused}
                           directAttachUrl={terminal.directAttachUrl}
-                          onResume={runnerOffline && onResume ? handleResume : undefined}
+                          onResume={runnerOffline && onResume ? () => handleResume() : undefined}
                           resumeTarget={resumeTarget}
                           resumePending={resumePending}
                           onStateChange={(state) => {

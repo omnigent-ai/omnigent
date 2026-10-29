@@ -52,6 +52,7 @@ vi.mock("@/hooks/useConversationEntryState", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useRunnerHealthRegistration: () => {},
   useSessionRunnerOnline: () => true,
+  useSessionHostOnline: () => undefined,
 }));
 vi.mock("@/hooks/useBrowserAgentRelay", () => ({ useBrowserAgentRelay: () => {} }));
 vi.mock("@/hooks/useSessionLiveness", () => ({
