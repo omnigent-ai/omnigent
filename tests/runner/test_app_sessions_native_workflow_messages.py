@@ -20,6 +20,8 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.conftest import (
     _BlockingHarnessClient,
     _build_lifecycle_app,
@@ -759,6 +761,58 @@ async def test_native_buffered_messages_each_delivered_once_in_order(
         f"means intermediate messages were dropped from the terminal.\n"
         f"turn_latest_texts={hc.turn_latest_texts}"
     )
+
+
+@pytest.mark.asyncio
+async def test_repeated_forward_of_a_queued_or_running_message_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-forward under the same pending id reaches the terminal once, not twice.
+
+    The server forwards a message again under its pending id after its own wait
+    for the first forward gives up, while the runner may still hold that first
+    forward. A repeat of the running message, or of one queued behind it, is
+    dropped; the same id after its turn has ended is a new send.
+    """
+    monkeypatch.setattr(claude_native_bridge, "post_tools_changed", lambda *_a, **_k: None)
+    gate = asyncio.Event()
+    app, _pm, harness = _build_native_app(gate)
+    running_id = "pending_" + "a" * 32
+    queued_id = "pending_" + "b" * 32
+
+    async def post(client: httpx.AsyncClient, text: str, pending_id: str) -> str:
+        response = await client.post(
+            "/v1/sessions/11b4a5755857531509b492c3f9a7a1a6/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "agent_id": "0c5de81a62eeb73d54466214cf37e5db",
+                "content": [{"type": "input_text", "text": text}],
+                "pending_id": pending_id,
+            },
+        )
+        assert response.status_code == 202, response.text
+        return response.json()["status"]
+
+    def settled(turns: int) -> bool:
+        return len(harness.turn_latest_texts) == turns and not app.state.active_turns
+
+    async with _runner_client(app) as client:
+        assert await post(client, "1", running_id) == "accepted"
+        await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=budget(5))
+        assert await post(client, "1", running_id) == "duplicate"
+        assert await post(client, "2", queued_id) == "buffered"
+        assert await post(client, "2", queued_id) == "duplicate"
+
+        gate.set()
+        await poll_until_async(lambda: settled(2), timeout_s=budget(5))
+        assert harness.turn_latest_texts == ["1", "2"]
+
+        assert await post(client, "1", running_id) == "accepted"
+        await poll_until_async(lambda: settled(3), timeout_s=budget(5))
+
+    assert harness.turn_latest_texts == ["1", "2", "1"]
 
 
 class _GatedFileServerClient:
