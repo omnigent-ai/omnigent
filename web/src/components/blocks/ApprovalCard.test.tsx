@@ -1066,14 +1066,42 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
   });
 
   it.each([
-    { vendor: "Cursor", policyName: "cursor_native_permission", title: "Cursor has questions" },
-    { vendor: "Devin", policyName: "devin_native_ask_question", title: "Devin needs your input" },
-  ])("labels $vendor structured input prompts with their producer", ({ policyName, title }) => {
+    {
+      name: "Cursor policy",
+      policyName: "cursor_native_permission",
+      phase: "pre_tool_use",
+      title: "Cursor has questions",
+    },
+    {
+      name: "Devin policy",
+      policyName: "devin_native_ask_question",
+      phase: "pre_tool_use",
+      title: "Devin needs your input",
+    },
+    {
+      name: "Devin phase without a policy",
+      policyName: "",
+      phase: "devin_ask_question",
+      title: "Devin needs your input",
+    },
+    {
+      name: "Antigravity phase ahead of Cursor policy",
+      policyName: "cursor_native_permission",
+      phase: "agy_ask_question",
+      title: "Antigravity needs your input",
+    },
+    {
+      name: "the legacy default for unknown prefixes",
+      policyName: "question_policy",
+      phase: "pre_tool_use",
+      title: "Claude has questions",
+    },
+  ])("labels structured input prompts using $name", ({ policyName, phase, title }) => {
     render(
       <ApprovalCard
         elicitationId="elic_question_label"
         message="AskQuestion Demo"
-        phase="pre_tool_use"
+        phase={phase}
         policyName={policyName}
         contentPreview=""
         requestedSchema={{}}
@@ -1093,7 +1121,6 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.getByText(title)).toBeDefined();
-    expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
   it.each([
