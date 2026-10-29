@@ -273,7 +273,7 @@ def test_unavailable_plugin_inventory_keeps_standalone_and_enabled_plugin_skills
         assert warnings == [f"{message}."]
         assert logged == [(logging.WARNING, message)]
     else:
-        loaded_skills.assert_called_once_with("/test/codex", codex_home, codex_home)
+        loaded_skills.assert_called_once_with("/test/codex", codex_home, codex_home, errors=[])
         # Codex's loaded catalog stands in for the inventory, so nothing is missing.
         assert warnings == []
         assert [level for level, _ in logged] == [logging.INFO]
@@ -348,6 +348,34 @@ def test_unavailable_plugin_sources_keep_standalone_skills_and_warn(
     ]
 
 
+def test_loaded_skill_errors_keep_found_skills_and_warn(
+    tmp_path: Path, codex_cli: Mock, loaded_skills: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    codex_home = tmp_path / ".codex"
+    enabled = _skill(_plugin(codex_home) / "skills")
+    codex_cli.side_effect = subprocess.CalledProcessError(1, "codex", stderr="Error: bad\n")
+    config_error = "/Users/alice/.codex/config.toml: failed to reload config"
+
+    def partial_catalog(*_args: object, errors: list[str]) -> list[dict[str, object]]:
+        errors.append(config_error)
+        return [{"name": "toolkit:review", "path": str(enabled / "SKILL.md"), "enabled": True}]
+
+    loaded_skills.side_effect = partial_catalog
+    warnings: list[str] = []
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.spec.codex_plugin_skills"):
+        assert _discover(tmp_path, warnings=warnings) == {"toolkit:review": enabled}
+
+    message = (
+        "Codex plugin skills may be incomplete: `codex plugin list` exited 1 and "
+        "`codex app-server` reported errors loading skills"
+    )
+    assert warnings == [f"{message}; see the host log for details."]
+    assert [record.getMessage() for record in caplog.records] == [
+        f"{message}: Error: bad; {config_error}"
+    ]
+
+
 @pytest.mark.parametrize("failure", [OSError(), TimeoutError(), RuntimeError(), ValueError()])
 def test_failed_loaded_skill_query_keeps_standalone_skills(
     tmp_path: Path, codex_cli: Mock, loaded_skills: Mock, failure: Exception
@@ -404,7 +432,7 @@ def test_loaded_skill_query_uses_workspace_and_preserves_healthy_inventory(
     loaded_skills.assert_not_called()
     codex_cli.side_effect = subprocess.CalledProcessError(1, "codex")
     assert resolve_harness_skills(ctx, "codex-native") == []
-    loaded_skills.assert_called_once_with("/test/codex", codex_home, workspace)
+    loaded_skills.assert_called_once_with("/test/codex", codex_home, workspace, errors=[])
 
 
 def test_loaded_skill_query_skips_unreadable_plugin(
