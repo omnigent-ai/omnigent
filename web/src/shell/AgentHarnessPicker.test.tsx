@@ -156,45 +156,50 @@ describe("AgentHarnessPicker inline harness list", () => {
 
 describe("AgentHarnessPicker Agents group header", () => {
   it.each([
-    ["server", false],
-    ["yours", false],
-    ["server", true],
-    ["yours", true],
-  ])("distinguishes same-named agents with %s selected (native=%s)", async (source, native) => {
-    const server = agent({
-      id: "server-orion",
-      name: "Orion",
-      display_name: "Orion",
-      harness: native ? "codex-native" : "claude-sdk",
-      builtin: false,
-    });
-    const owned = { ...server, id: "owned-orion", mine: true as const };
-    const selected: string[] = [];
-    renderPicker({
-      harnessEntries: native ? [server] : [claude],
-      agentEntries: native ? [owned] : [server, owned],
-      effectiveAgentId: source === "server" ? server.id : owned.id,
-      onSelectAgent: (entry) => selected.push(entry.id),
-    });
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
-      `Orion (${source})`,
-    );
-    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
-      `Orion (${source})`,
-    );
-    async function selectEntry(entry: AvailableAgent, expectedSource: string) {
-      await openPicker();
-      if (!native || entry.mine) {
-        await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    ["server", false, false],
+    ["yours", false, false],
+    ["server", true, false],
+    ["yours", true, false],
+    ["server", false, true],
+    ["yours", false, true],
+  ])(
+    "distinguishes agent labels with %s selected (native=%s, distinct names=%s)",
+    async (source, native, distinctNames) => {
+      const server = agent({
+        id: "server-orion",
+        name: distinctNames ? "orion" : "Orion",
+        display_name: "Orion",
+        harness: native ? "codex-native" : "claude-sdk",
+        builtin: false,
+      });
+      const owned = { ...server, id: "owned-orion", name: "Orion", mine: true as const };
+      const selected: string[] = [];
+      renderPicker({
+        harnessEntries: native ? [server] : [claude],
+        agentEntries: native ? [owned] : [server, owned],
+        effectiveAgentId: source === "server" ? server.id : owned.id,
+        onSelectAgent: (entry) => selected.push(entry.id),
+      });
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+        `Orion (${source})`,
+      );
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        `Orion (${source})`,
+      );
+      async function selectEntry(entry: AvailableAgent, expectedSource: string) {
+        await openPicker();
+        if (!native || entry.mine) {
+          await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+        }
+        const row = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
+        expect(row).toHaveTextContent(`Orion (${expectedSource})`);
+        await userEvent.click(row);
       }
-      const row = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
-      expect(row).toHaveTextContent(`Orion (${expectedSource})`);
-      await userEvent.click(row);
-    }
-    await selectEntry(server, "server");
-    await selectEntry(owned, "yours");
-    expect(selected).toEqual([server.id, owned.id]);
-  });
+      await selectEntry(server, "server");
+      await selectEntry(owned, "yours");
+      expect(selected).toEqual([server.id, owned.id]);
+    },
+  );
 
   it("distinguishes pinned legacy session copies from server templates", async () => {
     const template = agent({

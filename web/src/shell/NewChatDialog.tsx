@@ -1568,21 +1568,21 @@ export function AgentHarnessPicker({
   const selectedEntry = [...harnessEntries, ...agentEntries].find(
     (agent) => agent.id === effectiveAgentId,
   );
-  const duplicateAgentNames = useMemo(() => {
+  const duplicateAgentLabels = useMemo(() => {
     const seen = new Set<string>();
     const duplicates = new Set<string>();
     for (const agent of [...harnessEntries, ...agentEntries]) {
-      if (seen.has(agent.name)) duplicates.add(agent.name);
-      seen.add(agent.name);
+      if (seen.has(agent.display_name)) duplicates.add(agent.display_name);
+      seen.add(agent.display_name);
     }
     return duplicates;
   }, [harnessEntries, agentEntries]);
   const entryLabel = (agent: AvailableAgent) =>
-    duplicateAgentNames.has(agent.name)
+    duplicateAgentLabels.has(agent.display_name)
       ? `${agent.display_name} (${agent.mine ? "yours" : agent.sessionId ? `session ${agent.id}` : "server"})`
       : agent.display_name;
   const selectedLabel =
-    !autoHarnessActive && selectedEntry && duplicateAgentNames.has(selectedEntry.name)
+    !autoHarnessActive && selectedEntry && duplicateAgentLabels.has(selectedEntry.display_name)
       ? entryLabel(selectedEntry)
       : agentLabel;
   const selectedReadiness = harnessReadinessOnHost(selectedEntry?.harness, host);

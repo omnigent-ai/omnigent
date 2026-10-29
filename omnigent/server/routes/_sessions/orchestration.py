@@ -11978,17 +11978,14 @@ async def _create_session_from_existing_agent(
     )
     from omnigent.stores.conversation_store.overrides import encode_session_overrides
 
-    # A new session from another user's agent runs on the caller's own copy, so
-    # that user can never change code running here. A child reusing its parent's
-    # agent stays on it: collaborators act in the owner's session. A failed create
-    # below keeps the copy: it is listed to its owner from the start, so another of
-    # their requests may already be using it.
-    if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
-        agent = await asyncio.to_thread(
-            agent_for_user, agent_store, artifact_store, agent, user_id
-        )
-
     try:
+        # Copy conflicts roll back the new worktree. Retain shared agents because
+        # another request may already use them; children sharing their parent's stay bound.
+        if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
+            agent = await asyncio.to_thread(
+                agent_for_user, agent_store, artifact_store, agent, user_id
+            )
+
         # Include spec-seeded defaults before create; overflow must not leave a session.
         encode_session_overrides(
             {
