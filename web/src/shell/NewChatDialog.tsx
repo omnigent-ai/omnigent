@@ -1571,12 +1571,12 @@ export function AgentHarnessPicker({
   const duplicateAgentNames = useMemo(() => {
     const seen = new Set<string>();
     const duplicates = new Set<string>();
-    for (const agent of agentEntries) {
+    for (const agent of [...harnessEntries, ...agentEntries]) {
       if (seen.has(agent.name)) duplicates.add(agent.name);
       seen.add(agent.name);
     }
     return duplicates;
-  }, [agentEntries]);
+  }, [harnessEntries, agentEntries]);
   const entryLabel = (agent: AvailableAgent) =>
     duplicateAgentNames.has(agent.name)
       ? `${agent.display_name} (${agent.mine ? "yours" : "server"})`
