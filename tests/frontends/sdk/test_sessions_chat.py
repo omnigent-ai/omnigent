@@ -737,13 +737,17 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
 
 
 @pytest.mark.asyncio
-async def test_client_asks_for_prompts_held_in_terminal() -> None:
-    """The client opts into held prompts, which ``send()`` skips; older clients see them expire."""
-    from omnigent_client._client import OmnigentClient
+@pytest.mark.parametrize("opted_in", [False, True])
+async def test_client_asks_for_prompts_held_in_terminal_only_when_told(opted_in: bool) -> None:
+    """Raw ``stream()`` callers keep seeing a held prompt expire unless they send the header."""
+    from omnigent_client._client import TERMINAL_FALLBACK_HEADER, OmnigentClient
 
     from omnigent.server.routes._sessions.helpers import _client_supports_terminal_fallback
 
-    client = OmnigentClient("http://example.invalid", headers={"Authorization": "Bearer token"})
+    headers = {"Authorization": "Bearer token"}
+    if opted_in:
+        headers[TERMINAL_FALLBACK_HEADER] = "on"
+    client = OmnigentClient("http://example.invalid", headers=headers)
     try:
         request = client._http.build_request(
             "POST", "http://example.invalid/v1/sessions/conv_abc/elicitations/elicit_1/resolve"
@@ -751,7 +755,7 @@ async def test_client_asks_for_prompts_held_in_terminal() -> None:
     finally:
         await client.close()
 
-    assert _client_supports_terminal_fallback(request.headers)
+    assert _client_supports_terminal_fallback(request.headers) is opted_in
     assert request.headers["authorization"] == "Bearer token"
 
 

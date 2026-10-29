@@ -3932,6 +3932,29 @@ def test_run_repl_ephemeral_defaults_to_false(
     assert captured["ephemeral"] is False
 
 
+def test_run_repl_client_asks_for_prompts_held_in_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The REPL opts into held prompts; other SDK clients keep seeing them expire."""
+    from omnigent.server.routes._sessions.helpers import _client_supports_terminal_fallback
+
+    client_kwargs: list[dict[str, object]] = []
+
+    class _RecordingClientCtx(_FakeClientCtx):
+        def __init__(self, **kwargs: object) -> None:
+            client_kwargs.append(kwargs)
+
+    _stub_run_repl_deps(monkeypatch, conversation_id="conv_1")
+    monkeypatch.setattr("omnigent.chat.OmnigentClient", _RecordingClientCtx)
+
+    chat_module._run_repl("http://127.0.0.1:9999", "hello_world", None)
+
+    [kwargs] = client_kwargs
+    headers = kwargs["headers"]
+    assert isinstance(headers, dict)
+    assert _client_supports_terminal_fallback(httpx.Headers(headers))
+
+
 class _FakeSessionsForResume:
     """Minimal sessions namespace for resume lookup tests."""
 

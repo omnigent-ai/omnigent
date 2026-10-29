@@ -42,6 +42,7 @@ from omnigent_client import (
 from omnigent_client import (
     OmnigentError as ClientOmnigentError,
 )
+from omnigent_client._client import TERMINAL_FALLBACK_HEADER
 from omnigent_client._http import is_loopback_url
 from omnigent_client._sessions import Session as SessionSnapshot
 from rich.console import Console
@@ -4366,7 +4367,8 @@ def _run_repl(
         server_auth = _server_auth(server_url=base_url, session_id=resume_conversation_id)
         async with OmnigentClient(
             base_url=base_url,
-            headers=_server_headers(runner_id=runner_id),
+            # The REPL skips prompts held in the agent's terminal and explains refused answers.
+            headers={**_server_headers(runner_id=runner_id), TERMINAL_FALLBACK_HEADER: "on"},
             auth=server_auth,
             request_hooks=[route_session_request],
         ) as client:
