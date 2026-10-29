@@ -55,7 +55,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
-  when rebuilding tool results, as required by Gemini. Unmatched outputs become
+  when rebuilding tool results, as required by Gemini. Results stay after their
+  calls, ahead of messages sent while a tool ran. Unmatched outputs become
   labeled recovery text so missing calls do not block continuation.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
@@ -963,9 +964,9 @@ persistence deduplication. These checks do not establish desktop rendering parit
 
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
-and duplicate results, plus missing calls and outputs arriving across user turns.
-Unmatched outputs retain their content as labeled, untrusted tool data without inventing a call;
-same-turn results retain their names and pairing. The existing
+and duplicate results, results stored after a message sent during their call,
+and missing calls. Unmatched outputs retain their content as labeled, untrusted
+tool data without inventing a call; matched results retain their names and pairing. The existing
 `tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
 checks real server/runner serialization with a stub Pi process.
 `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
@@ -973,6 +974,9 @@ uses real Pi with scripted providers: an Anthropic tool turn forks onto Anthropi
 or OpenAI Responses with an unmatched stored output. The Responses case also
 stops Pi, removes its isolated local history file and cold-resumes. Both retain
 parallel results and recovery text, and the follow-up succeeds.
+`tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool`
+steers a message into a running real Pi `bash` call, then cold-resumes; the provider
+receives the real result before that message instead of a synthetic missing result.
 
 For a manual check, fork an affected session onto a Responses model and send a
 follow-up; expect retained output without an orphan-call HTTP 400. Reload Chat
