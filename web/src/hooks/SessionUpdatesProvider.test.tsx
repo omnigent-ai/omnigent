@@ -475,26 +475,6 @@ describe("SessionUpdatesProvider archive tombstone", () => {
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {
-  it("invalidates the archived-project-names scan on a remote removal", () => {
-    // Another client archiving/relabeling/deleting must refresh the Archived
-    // view's project picker — only local mutations invalidate it otherwise.
-    vi.useFakeTimers();
-    try {
-      const client = new QueryClient();
-      seedConversations(client, ["conv_a"]);
-      renderProvider(client, ["/"]);
-      const invalidate = vi.spyOn(client, "invalidateQueries");
-      const handler = frameHandler();
-
-      act(() => handler({ type: "removed", ids: ["conv_a"] }));
-      act(() => vi.advanceTimersByTime(300)); // past the debounce
-
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   function renameInvalidatesLists(searchCached: boolean): boolean {
     vi.useFakeTimers();
     try {
@@ -563,6 +543,57 @@ describe("SessionUpdatesProvider list invalidation", () => {
       vi.useRealTimers();
     }
   });
+
+  it("keeps a pushed row's status and updated_at in the loaded folder page", async () => {
+    vi.useFakeTimers();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const folder = observeTwoPageFolder(client);
+    try {
+      renderProvider(client, ["/"]);
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [{ ...folderRow("conv_mid"), status: "running", updated_at: 10 }],
+        }),
+      );
+      await act(() => vi.advanceTimersByTimeAsync(300));
+
+      const cached = client.getQueryData<ConversationsInfiniteData>([
+        "project-sessions",
+        "Sprint 42",
+        "updated_at",
+        false,
+      ]);
+      const rows = cached?.pages.flatMap((page) => page.data);
+      expect(rows?.find((row) => row.id === "conv_mid")).toMatchObject({
+        status: "running",
+        updated_at: 10,
+      });
+    } finally {
+      folder.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("invalidates the archived-project-names scan on a remote removal", () => {
+    // Another client archiving/relabeling/deleting must refresh the Archived
+    // view's project picker — only local mutations invalidate it otherwise.
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const handler = frameHandler();
+
+      act(() => handler({ type: "removed", ids: ["conv_a"] }));
+      act(() => vi.advanceTimersByTime(300)); // past the debounce
+
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["archived-project-names"] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 function folderRow(id: string): Conversation {
@@ -604,13 +635,7 @@ describe("SessionUpdatesProvider loaded folder pages", () => {
       renderProvider(client, ["/"]);
       act(() => frameHandler()({ type: "changed", items: [item] }));
       await act(() => vi.advanceTimersByTimeAsync(300));
-      const cached = client.getQueryData<ConversationsInfiniteData>([
-        "project-sessions",
-        "Sprint 42",
-        "updated_at",
-        false,
-      ]);
-      return { fetched: folder.fetchedCursors, rows: cached?.pages.flatMap((page) => page.data) };
+      return folder.fetchedCursors;
     } finally {
       folder.stop();
       vi.useRealTimers();
@@ -618,12 +643,8 @@ describe("SessionUpdatesProvider loaded folder pages", () => {
   }
 
   it("patches a cached row's status and updated_at without refetching the folder", async () => {
-    const { fetched, rows } = await folderFetchesAfterFrame({
+    const fetched = await folderFetchesAfterFrame({
       ...folderRow("conv_mid"),
-      status: "running",
-      updated_at: 10,
-    });
-    expect(rows?.find((row) => row.id === "conv_mid")).toMatchObject({
       status: "running",
       updated_at: 10,
     });
@@ -631,7 +652,7 @@ describe("SessionUpdatesProvider loaded folder pages", () => {
   });
 
   it("does not refetch the folder for a sub-agent row the list never returns", async () => {
-    const { fetched } = await folderFetchesAfterFrame({
+    const fetched = await folderFetchesAfterFrame({
       ...folderRow("conv_child"),
       parent_session_id: "conv_new",
       status: "running",
