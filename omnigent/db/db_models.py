@@ -1827,6 +1827,10 @@ class SqlInstalledSkill(OmnigentBase):
     :param bundle_bytes: Size of that tarball, so a principal's delivery budget
         is a bounded sum rather than a read of every artifact.
     :param enabled: Whether sessions receive the skill.
+    :param user_invocable: Whether the skill's own ``SKILL.md`` offers it to the
+        user (``user-invocable: false`` marks an internal orchestration skill).
+        Stored so a menu can filter without opening every stored tarball; the
+        skill is delivered to the agent either way.
     :param installed_by: User who installed it, or ``None`` in single-user mode.
     :param installed_at: Unix epoch seconds at row creation.
     :param updated_at: Unix epoch seconds of the last write, or ``None``.
@@ -1867,6 +1871,7 @@ class SqlInstalledSkill(OmnigentBase):
     bundle_location: Mapped[str] = mapped_column(BoundedString(512), nullable=False)
     bundle_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    user_invocable: Mapped[bool] = mapped_column(Boolean, nullable=False)
     installed_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
     installed_at: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[int | None] = mapped_column(Integer, nullable=True)

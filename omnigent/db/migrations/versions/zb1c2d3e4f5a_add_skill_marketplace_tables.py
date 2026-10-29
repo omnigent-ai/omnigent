@@ -76,6 +76,9 @@ def _installed_skills_columns() -> list[sa.Column]:
         sa.Column("bundle_location", sa.String(512), nullable=False),
         sa.Column("bundle_bytes", sa.Integer(), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False),
+        # From the skill's own SKILL.md: false keeps it out of the user's menu
+        # while it is still delivered to the agent.
+        sa.Column("user_invocable", sa.Boolean(), nullable=False),
         sa.Column("installed_by", sa.String(128), nullable=True),
         sa.Column("installed_at", sa.Integer(), nullable=False),
         sa.Column("updated_at", sa.Integer(), nullable=True),

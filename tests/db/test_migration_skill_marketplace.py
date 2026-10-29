@@ -83,7 +83,15 @@ def _assert_lifecycle(engine: sa.Engine, config: object) -> None:
             for index in inspector.get_indexes(table):
                 assert index["unique"] == (index["name"] in UNIQUE), index
         columns = {c["name"]: c for c in inspector.get_columns("installed_skills")}
-        assert {"principal", "owner_user_id", "bundle_bytes", "scope", "enabled"} <= set(columns)
+        assert {
+            "principal",
+            "owner_user_id",
+            "bundle_bytes",
+            "scope",
+            "enabled",
+            "user_invocable",
+        } <= set(columns)
+        assert columns["user_invocable"]["nullable"] is False
         assert columns["principal"]["nullable"] is False
         assert columns["owner_user_id"]["nullable"] is True
         sources = {c["name"]: c for c in inspector.get_columns("skill_sources")}
@@ -184,6 +192,7 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
             bundle_location="skills/review.tar.gz",
             bundle_bytes=1,
             enabled=True,
+            user_invocable=True,
             installed_by="alice",
             installed_at=0,
         )
@@ -216,6 +225,7 @@ def _installed(name: str, principal: str, *, scope: int = 2) -> SqlInstalledSkil
         bundle_location=f"skills/{name}.tar.gz",
         bundle_bytes=1,
         enabled=True,
+        user_invocable=True,
         installed_by=None,
         installed_at=0,
     )
