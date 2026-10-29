@@ -1797,18 +1797,19 @@ async def _run_tunnel_from_env() -> None:
 
     :returns: None.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     from omnigent.runner.identity import get_stable_runner_id
     from omnigent.runner.transports.ws_tunnel.serve import serve_tunnel
+    from omnigent.util.thread_pool_watchdog import MonitoredThreadPoolExecutor
 
     # Bound the asyncio default executor before anything uses it (create_app,
     # telemetry, and every to_thread offload). Setting it here means Python's
-    # lazy min(32, cpu+4)-thread default pool is never created.
+    # lazy min(32, cpu+4)-thread default pool is never created. The monitored
+    # pool logs its occupants when offloads wait too long for a worker.
     asyncio.get_running_loop().set_default_executor(
-        ThreadPoolExecutor(
+        MonitoredThreadPoolExecutor(
             max_workers=_runner_threadpool_max_workers(),
             thread_name_prefix="runner",
+            process_role="runner",
         )
     )
 
