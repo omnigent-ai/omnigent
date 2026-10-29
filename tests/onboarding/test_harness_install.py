@@ -57,8 +57,10 @@ def _stub_cli_fallback_dirs(monkeypatch: pytest.MonkeyPatch) -> None:
     the stub explicitly.
     """
     monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
-    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
-    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
+    # Keep ambient executable overrides out of resolution assertions.
+    for var in list(os.environ):
+        if var.endswith("_PATH") and var.startswith(("OMNIGENT_", "HARNESS_")):
+            monkeypatch.delenv(var, raising=False)
 
     def _stub_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
         if len(argv) >= 2 and argv[1] == "--version":
@@ -1158,8 +1160,8 @@ def test_harness_login_skips_when_already_logged_in(monkeypatch: pytest.MonkeyPa
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "login", "--claudeai"]),
-        (OPENAI_FAMILY, ["codex", "login"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "login", "--claudeai"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "login"]),
         (GEMINI_FAMILY, ["/usr/bin/agy"]),
     ],
 )
@@ -1335,8 +1337,8 @@ def test_harness_login_false_for_harness_without_login(monkeypatch: pytest.Monke
 @pytest.mark.parametrize(
     "key,expected_argv",
     [
-        (ANTHROPIC_FAMILY, ["claude", "auth", "logout"]),
-        (OPENAI_FAMILY, ["codex", "logout"]),
+        (ANTHROPIC_FAMILY, ["/usr/bin/claude", "auth", "logout"]),
+        (OPENAI_FAMILY, ["/usr/bin/codex", "logout"]),
     ],
 )
 def test_harness_logout_runs_cli_logout_then_verifies(
@@ -1921,3 +1923,110 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+def _write_executable(path: Path) -> str:
+    """Create an executable stub at *path* and return its string path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\necho 9.9.9\n", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_custom_path_only_install_counts_as_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Credit an install reachable only through ``OMNIGENT_KIMI_PATH``."""
+    shim = _write_executable(tmp_path / "custom-tools" / "kimi")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", shim)
+
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+    assert hi.harness_cli_binary(hi.KIMI_KEY) == shim
+
+
+def test_legacy_path_override_counts_as_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Honor the legacy ``HARNESS_KIMI_PATH`` launch alias."""
+    shim = _write_executable(tmp_path / "legacy-tools" / "kimi")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("HARNESS_KIMI_PATH", shim)
+
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is True
+
+
+@pytest.mark.parametrize(
+    "key,env_var,binary,expected",
+    [
+        (ANTHROPIC_FAMILY, "OMNIGENT_CLAUDE_PATH", "claude", "/usr/bin/claude"),
+        (OPENAI_FAMILY, "OMNIGENT_CODEX_PATH", "codex", "/usr/bin/codex"),
+        (hi.KIMI_KEY, "OMNIGENT_KIMI_PATH", "kimi", None),
+        (hi.PI_KEY, "OMNIGENT_PI_PATH", "pi", None),
+    ],
+)
+def test_unresolvable_override_matches_launch_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    key: str,
+    env_var: str,
+    binary: str,
+    expected: str | None,
+) -> None:
+    """Match each launcher's handling of a configured missing executable."""
+    monkeypatch.setenv(env_var, str(tmp_path / "missing" / binary))
+    monkeypatch.setattr(
+        hi.shutil, "which", lambda name: f"/usr/bin/{binary}" if name == binary else None
+    )
+
+    assert hi.harness_cli_binary(key) == expected
+    assert hi.harness_cli_installed(key) is (expected is not None)
+
+
+@pytest.mark.parametrize(
+    "key,env_var,binary",
+    [
+        (ANTHROPIC_FAMILY, "OMNIGENT_CLAUDE_PATH", "claude"),
+        (OPENAI_FAMILY, "OMNIGENT_CODEX_PATH", "codex"),
+    ],
+)
+def test_family_keys_resolve_their_cli_override_vars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, env_var: str, binary: str
+) -> None:
+    """Map family install keys to their CLI override variables."""
+    shim = _write_executable(tmp_path / "override" / binary)
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv(env_var, shim)
+
+    assert hi.harness_cli_installed(key) is True
+    assert hi.harness_cli_binary(key) == shim
+
+
+def test_gemini_has_no_path_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep Agy resolution on the launch path, which has no override."""
+    shim = _write_executable(tmp_path / "override" / "agy")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("OMNIGENT_GEMINI_PATH", shim)
+    monkeypatch.setenv("OMNIGENT_ANTIGRAVITY_PATH", shim)
+
+    assert hi.harness_cli_binary(GEMINI_FAMILY) is None
+    assert hi.harness_cli_installed(GEMINI_FAMILY) is False
+
+
+def test_custom_path_install_outside_version_range_reads_outdated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Report an old custom-path install as outdated rather than missing."""
+    shim = _write_executable(tmp_path / "custom-tools" / "kimi")
+    monkeypatch.setattr(hi.shutil, "which", lambda name: shim if name == shim else None)
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", shim)
+
+    def _old_version_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if len(argv) >= 2 and argv[1] == "--version":
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="0.1.0", stderr="")
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _old_version_run)
+
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+    assert hi.harness_cli_binary(hi.KIMI_KEY) == shim

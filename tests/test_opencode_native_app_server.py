@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,64 @@ def test_find_opencode_cli_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_find_opencode_cli_resolved(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert find_opencode_cli() == "/usr/bin/opencode"
+
+
+@pytest.mark.parametrize("source", ["env", "config", "explicit"])
+async def test_native_server_uses_selected_executable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+) -> None:
+    from omnigent.config import save_global_config
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv("OMNIGENT_OPENCODE_PATH", raising=False)
+    selected = tmp_path / "custom-tools" / "opencode"
+    selected.parent.mkdir()
+    selected.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('1.18.0')\n"
+        "    raise SystemExit\n"
+        "Path('native-opencode-launched.txt').write_text(__file__)\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b'[]')\n"
+        "HTTPServer(('127.0.0.1', int(sys.argv[sys.argv.index('--port') + 1])), Handler)"
+        ".serve_forever()\n"
+    )
+    selected.chmod(0o755)
+    save_global_config({"harness": {"opencode-native": {"command": str(selected)}}})
+    explicit = None
+    if source == "env":
+        save_global_config({"harness": {"opencode-native": {"command": "/wrong/config"}}})
+        monkeypatch.setenv("OMNIGENT_OPENCODE_PATH", str(selected))
+    elif source == "explicit":
+        monkeypatch.setenv("OMNIGENT_OPENCODE_PATH", "/wrong/env")
+        explicit = str(selected)
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        opencode_path=explicit,
+    )
+    try:
+        await server.start()
+        assert server.build_argv()[0] == str(selected)
+        assert (tmp_path / "native-opencode-launched.txt").read_text() == str(selected)
+    finally:
+        await server.close()
+
+
+def test_find_opencode_cli_rejects_missing_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_OPENCODE_PATH", "/missing/custom-opencode")
+    monkeypatch.setattr(
+        appsrv.shutil, "which", lambda name: "/usr/bin/opencode" if name == "opencode" else None
+    )
+    with pytest.raises(OpenCodeCliNotFoundError):
+        find_opencode_cli()
 
 
 def test_build_serve_args_has_explicit_host_port() -> None:

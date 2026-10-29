@@ -4842,6 +4842,9 @@ def test_host_settings_survive_daemon_and_runner_hops(
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
+        "OMNIGENT_KIMI_PATH": str(tmp_path / "custom-tools" / "kimi"),
+        "HARNESS_KIMI_PATH": str(tmp_path / "legacy-tools" / "kimi"),
+        "OMNIGENT_OPENCODE_PATH": str(tmp_path / "custom-tools" / "opencode"),
     }
     for name, value in selectors.items():
         monkeypatch.setenv(name, value)

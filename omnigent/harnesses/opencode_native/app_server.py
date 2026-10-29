@@ -39,6 +39,9 @@ from pathlib import Path
 import httpx
 from packaging.version import InvalidVersion, Version
 
+from omnigent._platform import resolve_cli_binary
+from omnigent.config import load_global_config
+from omnigent.harness_startup_config import resolve_harness_command
 from omnigent.harnesses.opencode_native.bridge import (
     OPENCODE_DEFAULT_USERNAME,
     OPENCODE_SERVER_PASSWORD_ENV_VAR,
@@ -115,21 +118,17 @@ def find_opencode_cli(opencode_path: str | None = None) -> str:
     """
     Resolve the ``opencode`` executable.
 
-    :param opencode_path: Explicit path override; ``None`` searches ``PATH``.
+    :param opencode_path: Explicit override; otherwise use host env/config or ``PATH``.
     :returns: Absolute path to the ``opencode`` binary.
     :raises OpenCodeCliNotFoundError: When no binary can be resolved.
     """
-    if opencode_path:
-        if os.path.isabs(opencode_path) and os.access(opencode_path, os.X_OK):
-            return opencode_path
-        resolved = shutil.which(opencode_path)
-        if resolved:
-            return resolved
-        raise OpenCodeCliNotFoundError(f"opencode executable not found: {opencode_path!r}")
-    resolved = shutil.which("opencode")
+    command = resolve_harness_command(
+        "opencode-native", default="opencode", explicit=opencode_path, cfg=load_global_config()
+    )
+    resolved = resolve_cli_binary(command, which=shutil.which)
     if not resolved:
         raise OpenCodeCliNotFoundError(
-            "opencode CLI not found on PATH; install the 'opencode-ai' npm package"
+            f"opencode executable not found: {command!r}; install the 'opencode-ai' npm package"
         )
     return resolved
 
