@@ -82,6 +82,8 @@ _SENTINEL_ID = "da1"
 
 # A probe takes well under 0.1s; past this its result is treated as unknown.
 _PROBE_TIMEOUT_S = 2.0
+# Cleanup after a timeout has its own bound, so a hung tmux can't hold the attach.
+_CLEANUP_TIMEOUT_S = 1.0
 
 _cache: dict[tuple[str, int, int], frozenset[str] | None] = {}
 _cache_lock = asyncio.Lock()
@@ -111,7 +113,7 @@ def answered_queries(replies: bytes, query_ids: list[str]) -> frozenset[str] | N
     return frozenset(answered)
 
 
-async def _tmux(tmux: str, socket: str, *args: str) -> int:
+async def _tmux(tmux: str, socket: str, *args: str, capture: bool = False) -> tuple[int, bytes]:
     proc = await asyncio.create_subprocess_exec(
         tmux,
         "-S",
@@ -120,10 +122,18 @@ async def _tmux(tmux: str, socket: str, *args: str) -> int:
         os.devnull,
         *args,
         stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.DEVNULL,
     )
-    return await proc.wait()
+    try:
+        out, _ = await proc.communicate()
+        return await proc.wait(), out or b""
+    finally:
+        # A cancelled probe must not leave the command running.
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
 
 
 async def _probe(tmux: str, client_env: Mapping[str, str]) -> frozenset[str] | None:
@@ -150,7 +160,10 @@ async def _probe(tmux: str, client_env: Mapping[str, str]) -> frozenset[str] | N
         # Run sh directly: tmux would run a single-string command through the
         # user's $SHELL, which may not be POSIX (nushell, PowerShell).
         sh_command = ("--", "/bin/sh", "-c", pane_command)
-        if await _tmux(tmux, socket, "new-session", "-d", "-x", "80", "-y", "24", *sh_command):
+        code, _ = await _tmux(
+            tmux, socket, "new-session", "-d", "-x", "80", "-y", "24", *sh_command
+        )
+        if code:
             return None
         client = await asyncio.create_subprocess_exec(
             tmux,
@@ -168,19 +181,12 @@ async def _probe(tmux: str, client_env: Mapping[str, str]) -> frozenset[str] | N
         # The control client registers asynchronously; wait for it to show up
         # before releasing the pane.
         while True:
-            listed = await asyncio.create_subprocess_exec(
-                tmux,
-                "-S",
-                socket,
-                "list-clients",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            out, _ = await listed.communicate()
-            if out.strip():
+            _, clients = await _tmux(tmux, socket, "list-clients", capture=True)
+            if clients.strip():
                 break
             await asyncio.sleep(0.02)
-        if await _tmux(tmux, socket, "wait-for", "-S", "go"):
+        code, _ = await _tmux(tmux, socket, "wait-for", "-S", "go")
+        if code:
             return None
         while True:
             replies = replies_path.read_bytes() if replies_path.exists() else b""
@@ -188,8 +194,8 @@ async def _probe(tmux: str, client_env: Mapping[str, str]) -> frozenset[str] | N
                 return answered_queries(replies, query_ids)
             await asyncio.sleep(0.02)
     finally:
-        with contextlib.suppress(OSError):
-            await _tmux(tmux, socket, "kill-server")
+        with contextlib.suppress(OSError, TimeoutError):
+            await asyncio.wait_for(_tmux(tmux, socket, "kill-server"), _CLEANUP_TIMEOUT_S)
         if client is not None and client.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 client.kill()

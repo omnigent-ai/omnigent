@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -78,3 +80,30 @@ async def test_probe_failure_leaves_every_reply_to_the_browser(tmp_path: Path) -
     broken.chmod(0o755)
 
     assert await tmux_answered_queries(str(broken), {}) is None
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.mark.asyncio
+async def test_probe_gives_up_on_a_hanging_tmux_and_reaps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux that never exits yields ``None`` in bounded time and leaves nothing running."""
+    query_replies._cache.clear()
+    monkeypatch.setattr(query_replies, "_PROBE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(query_replies, "_CLEANUP_TIMEOUT_S", 0.5)
+    pids = tmp_path / "pids"
+    hanging = tmp_path / "tmux"
+    hanging.write_text(f"#!/bin/sh\necho $$ >> '{pids}'\nexec sleep 60\n")
+    hanging.chmod(0o755)
+
+    started = time.monotonic()
+    assert await tmux_answered_queries(str(hanging), {}) is None
+    assert time.monotonic() - started < 5
+    assert [pid for pid in map(int, pids.read_text().split()) if _running(pid)] == []
