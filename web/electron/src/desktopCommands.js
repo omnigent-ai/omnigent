@@ -14,6 +14,8 @@ const DESKTOP_COMMANDS = Object.freeze([
   "new-browser-tab",
   "archive-session",
   "toggle-pin-session",
+  "go-back",
+  "go-forward",
 ]);
 
 /**
