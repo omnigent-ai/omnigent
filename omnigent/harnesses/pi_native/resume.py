@@ -322,8 +322,9 @@ def pi_session_records_from_session_items(
     # A result pairs with the latest replayed call with its id, so it takes that name.
     tool_names: dict[str, str] = {}
     replayed_call_ids: set[str] = set()
-    # A reused id must not pair a skipped call's output with an older call.
-    skipped_call_ids: set[str] = set()
+    # Each call supersedes earlier ones with its id, so an output for a call that
+    # is not replayed stays text instead of pairing with an older call.
+    unreplayed_call_reasons: dict[str, str] = {}
     group: _AssistantResponseGroup | None = None
 
     def flush_group() -> None:
@@ -350,16 +351,19 @@ def pi_session_records_from_session_items(
             item_call_id, str
         ):
             item_call_id = ""
-        if isinstance(response_id, str) and response_id in skip_response_ids:
-            if item_type == "function_call" and item_call_id:
-                skipped_call_ids.add(item_call_id)
-                replayed_call_ids.discard(item_call_id)
-            continue
-        blocks = _pi_assistant_blocks_from_item(item)
-        if blocks and item_call_id:
-            skipped_call_ids.discard(item_call_id)
+        skipped = isinstance(response_id, str) and response_id in skip_response_ids
+        blocks = None if skipped else _pi_assistant_blocks_from_item(item)
+        if item_type == "function_call" and item_call_id:
             replayed_call_ids.discard(item_call_id)
-            tool_names[item_call_id] = cast(str, blocks[0]["name"])
+            if blocks:
+                tool_names[item_call_id] = cast(str, blocks[0]["name"])
+                unreplayed_call_reasons.pop(item_call_id, None)
+            else:
+                unreplayed_call_reasons[item_call_id] = (
+                    "its call was interrupted" if skipped else "no matching earlier call"
+                )
+        if skipped:
+            continue
         if blocks is None:
             if item_call_id:
                 # Replay one result per call: a repeated output would make the
@@ -375,9 +379,9 @@ def pi_session_records_from_session_items(
                 timestamp=timestamp,
                 tool_names=tool_names,
             )
-            if entry is not None and item_call_id in skipped_call_ids:
+            if entry is not None and item_call_id in unreplayed_call_reasons:
                 entry["message"] = _recovered_tool_output_message(
-                    cast(_JsonObject, entry["message"]), "its call was interrupted"
+                    cast(_JsonObject, entry["message"]), unreplayed_call_reasons[item_call_id]
                 )
             if entry is not None:
                 # Only a replayable entry ends the open response. An item that maps

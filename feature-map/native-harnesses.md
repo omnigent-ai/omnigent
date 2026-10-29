@@ -965,7 +965,7 @@ persistence deduplication. These checks do not establish desktop rendering parit
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
 and duplicate results, results stored after a message sent during their call,
-missing calls, and calls, including interrupted ones, that reuse an earlier call's id. Unmatched outputs retain their content as labeled, untrusted
+missing calls, and calls, including interrupted or malformed ones, that reuse an earlier call's id. Unmatched outputs retain their content as labeled, untrusted
 tool data without inventing a call; matched results retain their names and pairing. The existing
 `tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
 checks real server/runner serialization with a stub Pi process.

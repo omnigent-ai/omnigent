@@ -756,7 +756,15 @@ def test_results_move_before_message_sent_during_the_call(
 
 
 @pytest.mark.parametrize(
-    "call", [None, "later", "malformed", "interrupted", "reused-by-interrupted-call"]
+    "call",
+    [
+        None,
+        "later",
+        "malformed",
+        "interrupted",
+        "reused-by-interrupted-call",
+        "reused-by-malformed-call",
+    ],
 )
 def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None) -> None:
     items = [_user_item("Read the file."), _output("orphan", "recovered contents")]
@@ -766,11 +774,18 @@ def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None)
         items.insert(1, _call("orphan", "cancelled"))
         items.append({**_assistant_item("partial", response_id="cancelled"), "interrupted": True})
     elif call == "reused-by-interrupted-call":
+        latest = [
+            _call("orphan", "cancelled", name="read"),
+            {**_assistant_item("partial", response_id="cancelled"), "interrupted": True},
+        ]
+    elif call == "reused-by-malformed-call":
+        latest = [{**_call("orphan", "malformed", name=""), "id": "orphan-malformed"}]
+    reused = call in ("reused-by-interrupted-call", "reused-by-malformed-call")
+    if reused:
         items = [
             _call("orphan", "earlier"),
             _user_item("Read the file.", response_id="user"),
-            _call("orphan", "cancelled", name="read"),
-            {**_assistant_item("partial", response_id="cancelled"), "interrupted": True},
+            *latest,
             _function_output_item(
                 call_id="orphan", output="recovered contents", response_id="result"
             ),
@@ -780,7 +795,7 @@ def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None)
         items.append(_call("orphan"))
     messages = _rebuilt_messages(items)
     assert not any(m["role"] == "toolResult" for m in messages)
-    recovered = messages[2 if call == "reused-by-interrupted-call" else 1]
+    recovered = messages[2 if reused else 1]
     assert recovered["role"] == "user"
     assert "Recovered tool output" in recovered["content"][0]["text"]
     interrupted = call in ("interrupted", "reused-by-interrupted-call")
@@ -790,7 +805,7 @@ def test_orphan_output_preserves_text_without_inventing_a_call(call: str | None)
     assert recovered["content"][-1]["text"] == "recovered contents"
     assert "duplicate contents" not in json.dumps(messages)
     calls = [b for m in messages for b in m["content"] if b["type"] == "toolCall"]
-    replayed = call in ("later", "reused-by-interrupted-call")
+    replayed = call == "later" or reused
     assert [b["id"] for b in calls] == (["orphan"] if replayed else [])
 
 
