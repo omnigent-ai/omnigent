@@ -1111,11 +1111,14 @@ def codex_minimal_config_requested() -> bool:
     return os.environ.get(_CODEX_MINIMAL_CONFIG_ENV, "").strip().lower() in {"1", "true", "yes"}
 
 
-def _strip_host_launched_config(codex_home: Path) -> None:
+def _strip_host_launched_config(
+    codex_home: Path, router_bridge_dir: Path | None, *, session_id: str | None
+) -> None:
     """Drop inherited config that would start user commands beside the app-server.
 
     ``[mcp_servers.*]``, ``notify`` and the user ``hooks.json`` launch processes
     that would share the worker's host network when its native tools are off.
+    The router hooks, if any, are rewritten without the user's hooks.
     """
     import tomlkit
 
@@ -1133,6 +1136,8 @@ def _strip_host_launched_config(codex_home: Path) -> None:
     hooks_path = codex_home / _CODEX_HOOKS_FILENAME
     if hooks_path.is_symlink() or hooks_path.exists():
         hooks_path.unlink()
+    if router_bridge_dir is not None:
+        write_codex_router_hooks_file(codex_home, router_bridge_dir, session_id=session_id)
 
 
 def _populate_codex_home_config(
@@ -3113,13 +3118,12 @@ class _CodexAppServerSession:
                 self._disable_native_tools = True
                 for override in CODEX_NATIVE_FEATURES_OFF:
                     argv.extend(["-c", override])
-                _strip_host_launched_config(self._codex_home_dir)
-                if router_bridge_dir is not None:
-                    write_codex_router_hooks_file(
-                        self._codex_home_dir,
-                        router_bridge_dir,
-                        session_id=codex_router_session_id(self._env),
-                    )
+                await asyncio.to_thread(
+                    _strip_host_launched_config,
+                    self._codex_home_dir,
+                    router_bridge_dir,
+                    session_id=codex_router_session_id(self._env),
+                )
             spawn_argv = argv
             pass_fds: tuple[int, ...] = ()
             liveness_read_fd: int | None = None

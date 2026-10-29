@@ -224,7 +224,7 @@ def test_network_denied_worker_without_model_route_keeps_files_contained(
 def test_worker_grants_plain_host_login_and_snapshots_host_memories(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, layout: str
 ) -> None:
-    """Only a plain host login file is granted; the memories DB becomes a private copy."""
+    """With native tools off, only a plain host login file is granted; memories are copied."""
     host_codex = tmp_path / "host-codex"
     host_codex.mkdir()
     outside = tmp_path / "outside.json"
@@ -250,7 +250,7 @@ def test_worker_grants_plain_host_login_and_snapshots_host_memories(
     create_launcher = Mock(return_value=str(tmp_path / "launcher"))
     monkeypatch.setattr(
         "omnigent.inner.codex_worker.resolve_sandbox",
-        Mock(return_value=_active_policy(tmp_path)),
+        Mock(return_value=replace(_active_policy(tmp_path), allow_network=False)),
     )
     monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
     monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
@@ -287,6 +287,54 @@ def test_worker_grants_plain_host_login_and_snapshots_host_memories(
         assert not private_memories.is_symlink()
         assert private_memories.read_bytes() == b"host memories"
         assert (host_codex / "memories_1.sqlite").read_bytes() == b"host memories"
+    finally:
+        worker.close()
+
+
+def test_worker_with_native_tools_gets_private_copy_of_host_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Native tools share the worker sandbox, so they never get the host login file."""
+    host_codex = tmp_path / "host-codex"
+    host_codex.mkdir()
+    host_login = host_codex / "auth.json"
+    host_login.write_text('{"auth_mode": "chatgpt"}')
+    host_login.chmod(0o600)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    _populate_codex_home_config(codex_home, host_codex)
+    codex = tmp_path / "bin" / "codex"
+    codex.parent.mkdir()
+    codex.touch()
+    backend = Mock()
+    backend.wrap_launcher_argv.return_value = ["/usr/bin/sandbox-exec", str(codex)]
+    create_launcher = Mock(return_value=str(tmp_path / "launcher"))
+    monkeypatch.setattr(
+        "omnigent.inner.codex_worker.resolve_sandbox",
+        Mock(return_value=_active_policy(tmp_path)),
+    )
+    monkeypatch.setattr("omnigent.inner.codex_worker.get_backend", Mock(return_value=backend))
+    monkeypatch.setattr("omnigent.inner.codex_worker.create_exec_launcher", create_launcher)
+
+    worker = prepare_codex_worker(
+        codex_path=str(codex),
+        cwd=tmp_path,
+        codex_home=codex_home,
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
+        spawn_env_names=["PATH", "CODEX_HOME"],
+    )
+    try:
+        assert worker.native_tools_allowed
+        for policy in (
+            backend.wrap_launcher_argv.call_args.args[1],
+            create_launcher.call_args.args[1],
+        ):
+            assert policy.write_files == []
+        private_login = codex_home / "auth.json"
+        assert not private_login.is_symlink()
+        assert private_login.stat().st_mode & 0o777 == 0o600
+        private_login.write_text('{"auth_mode": "changed"}')
+        assert host_login.read_text() == '{"auth_mode": "chatgpt"}'
     finally:
         worker.close()
 

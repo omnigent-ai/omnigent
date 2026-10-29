@@ -2987,6 +2987,7 @@ def _mitm_client_upgrade_and_echo(
                 break
             established += chunk
         ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
         with contextlib.closing(tls):
             tls.sendall(upgrade_request)
@@ -3096,8 +3097,12 @@ def _mitm_client_read_until_close(
         raw.sendall(connect.encode("latin-1"))
         established = b""
         while b"\r\n\r\n" not in established:
-            established += raw.recv(4096)
+            chunk = raw.recv(4096)
+            if not chunk:
+                break
+            established += chunk
         ctx = ssl.create_default_context(cafile=str(ca_bundle))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         tls = ctx.wrap_socket(raw, server_hostname=server_hostname)
         with contextlib.closing(tls):
             tls.sendall(request)

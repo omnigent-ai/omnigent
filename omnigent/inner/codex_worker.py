@@ -92,7 +92,9 @@ def _snapshot_sqlite(source: Path, target: Path) -> None:
             shutil.copyfile(source, target)
 
 
-def _contain_host_codex_home_links(policy: SandboxPolicy, codex_home: Path) -> SandboxPolicy:
+def _contain_host_codex_home_links(
+    policy: SandboxPolicy, codex_home: Path, *, share_host_login: bool
+) -> SandboxPolicy:
     """Repair private-home links into the host Codex home, which the sandbox does not mount."""
     # SQLite needs writable sidecars beside the database, so start from a private copy.
     memories = codex_home / "memories_1.sqlite"
@@ -104,6 +106,11 @@ def _contain_host_codex_home_links(policy: SandboxPolicy, codex_home: Path) -> S
     login = codex_home / "auth.json"
     host_login = _host_link_target(login)
     if host_login is None:
+        return policy
+    if not share_host_login:
+        # Native tools share this sandbox; keep them away from the host login file.
+        login.unlink()
+        shutil.copy(host_login, login)
         return policy
     granted = with_additional_write_files(policy, [host_login])
     # The grant resolves the path again; drop it if the login was swapped for a link meanwhile.
@@ -199,7 +206,7 @@ def prepare_codex_worker(
     native_tools_allowed = True
     if signer_readiness is None and not egress_rules and not policy.allow_network:
         # Tools then run only through the separately sandboxed sys_os_* tools.
-        logger.info(
+        logger.warning(
             "os_env.sandbox denies network and gives the Codex app-server no model "
             "route; sharing the host network with the worker and disabling Codex's "
             "native tools. Add egress_rules for the model host to filter its traffic."
@@ -217,7 +224,9 @@ def prepare_codex_worker(
             raise ValueError("signer relay and public CA must share one public directory")
         policy = with_additional_read_roots(policy, [signer_readiness.ca_bundle_path.parent])
     else:
-        policy = _contain_host_codex_home_links(policy, codex_home)
+        policy = _contain_host_codex_home_links(
+            policy, codex_home, share_host_login=not native_tools_allowed
+        )
     staged_env = dict(worker_env) if worker_env is not None else None
     if signer_readiness is not None:
         assert staged_env is not None
