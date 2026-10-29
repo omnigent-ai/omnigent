@@ -112,7 +112,13 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
-import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
+import {
+  forgetUnsentSend,
+  peekQueuedSends,
+  peekUnsentSend,
+  rememberQueuedSends,
+  rememberUnsentSend,
+} from "@/lib/unsentSends";
 import {
   isSideChatCommand,
   sideChatSettingsMutationKey,
@@ -645,6 +651,11 @@ export interface QueuedMessage {
   requiresRetry?: boolean;
   /** The session's host was offline; held until it reconnects, then sent. */
   waitingForHost?: boolean;
+  /**
+   * Queued beside the session on screen (a side chat), whose composer takes no
+   * text back after a reload.
+   */
+  offScreen?: boolean;
 }
 
 /**
@@ -2198,6 +2209,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
+    const offScreen = targetId !== undefined && targetId !== get().conversationId;
     target.write((s) => ({
       // Queueing consumes the composer like a send does: a restored failed
       // send is no longer what the composer holds, and the queued message
@@ -2217,6 +2229,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(files && files.length > 0 ? { files } : {}),
           ...(replyDraft ? { replyDraft } : {}),
           ...(waitingForHost ? { waitingForHost } : {}),
+          ...(offScreen ? { offScreen } : {}),
         },
       ],
     }));
@@ -2949,6 +2962,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(agentId ? { agentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          ...(sentOnScreen ? {} : { offScreen: true }),
         });
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
@@ -4374,6 +4388,29 @@ conversationRegistry.subscribe(scheduleEntryFlush);
 useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
   for (const id of entryDrainedQueues) scheduleEntryFlush(id);
+});
+// The queue lives only in memory; keep each session's queued messages for a reload (see
+// `unsentSendToRestore`). Attachments stay behind, as for an unanswered send.
+useChatStore.subscribe((state, previous) => {
+  if (state.queuedMessages === previous.queuedMessages) return;
+  const authorId = getCurrentUserId();
+  const touched = [...previous.queuedMessages, ...state.queuedMessages];
+  const queuedHere = new Set(touched.map((m) => m.stableId));
+  for (const id of new Set(touched.map((m) => m.conversationId))) {
+    // A record this page never queued is an earlier page's, kept for its session's next load.
+    const earlier = peekQueuedSends(id).filter((send) => !queuedHere.has(send.stableId));
+    const kept = state.queuedMessages.flatMap((m) =>
+      authorId === null ||
+      m.conversationId !== id ||
+      m.stableId === undefined ||
+      m.command !== undefined ||
+      m.offScreen ||
+      !m.text.trim()
+        ? []
+        : [{ stableId: m.stableId, text: m.text, authorId, replyDraft: m.replyDraft }],
+    );
+    rememberQueuedSends(id, [...earlier, ...kept]);
+  }
 });
 // Without a live entry there's no status to watch; the queue waits until the side chat reopens.
 conversationRegistry.subscribeDisposed((id) => entryDrainedQueues.delete(id));
@@ -7412,7 +7449,8 @@ async function sendVerdictFromServer(
  * sandbox wake, which persists nothing until the wake ends. Only the sender
  * gets the text back, and only if the snapshot holds no item under its stable
  * id. Matching text is no proof: `pending_inputs` entries and native mirrors
- * carry no stable id, and another message can say the same thing.
+ * carry no stable id, and another message can say the same thing. Messages the
+ * page still held in its queue come back the same way, joined after any such send.
  *
  * @param conversationId - The session being bound.
  * @param items - The snapshot's committed items.
@@ -7424,23 +7462,39 @@ function unsentSendToRestore(
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
-  if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  if (unsent !== null && inFlightSends.has(unsent.stableId)) return null;
+  // Messages this page still queues aren't lost; only a reload empties the queue.
+  const queuedHere = new Set(useChatStore.getState().queuedMessages.map((m) => m.stableId));
+  const stored = peekQueuedSends(conversationId);
+  const queued = stored.filter((send) => !queuedHere.has(send.stableId));
+  if (unsent === null && queued.length === 0) return null;
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
     restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
-  forgetUnsentSend(conversationId, unsent.stableId);
-  // Another account has signed in to this tab since.
-  if (unsent.authorId !== viewerId) return null;
-  if (items.some((item) => item.id === unsent.stableId)) return null;
+  if (unsent !== null) forgetUnsentSend(conversationId, unsent.stableId);
+  if (queued.length > 0) {
+    rememberQueuedSends(
+      conversationId,
+      stored.filter((send) => queuedHere.has(send.stableId)),
+    );
+  }
+  const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
+    // Another account may have signed in to this tab since.
+    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+  );
+  const [first] = sends;
+  if (first === undefined) return null;
   return {
     conversationId,
-    text: unsent.text,
+    text: sends.map((send) => send.text).join("\n\n"),
     files: [],
-    stableId: unsent.stableId,
-    ...(unsent.replyDraft ? { replyDraft: unsent.replyDraft } : {}),
+    // A resend of one message reuses its id, which the server dedupes; joined text is a new message.
+    ...(sends.length === 1
+      ? { stableId: first.stableId, ...(first.replyDraft ? { replyDraft: first.replyDraft } : {}) }
+      : {}),
     serverRefused: false,
   };
 }

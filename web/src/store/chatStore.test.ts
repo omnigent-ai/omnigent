@@ -39,7 +39,13 @@ import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
-import { clearUnsentSends, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
+import {
+  clearUnsentSends,
+  peekQueuedSends,
+  peekUnsentSend,
+  rememberQueuedSends,
+  rememberUnsentSend,
+} from "@/lib/unsentSends";
 import {
   clearSessionDrafts,
   getSessionDraft,
@@ -20900,6 +20906,202 @@ describe("a send cut off by a reload", () => {
       serverRefused: false,
     });
     expect(peekUnsentSend("conv_reload")).toBeNull();
+  });
+
+  it("keeps each queued message for the next load until it leaves the queue", async () => {
+    seedSession("conv_queue", []);
+    await useChatStore.getState().switchTo("conv_queue");
+    useChatStore.setState({ sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("run the linter next");
+    useChatStore.getState().enqueueMessage("then the type checker");
+
+    const [first, second] = useChatStore.getState().queuedMessages;
+    expect(peekQueuedSends("conv_queue")).toEqual([
+      { stableId: first!.stableId, text: "run the linter next", authorId: "user_a" },
+      { stableId: second!.stableId, text: "then the type checker", authorId: "user_a" },
+    ]);
+    useChatStore.getState().dequeueMessage(first!.queueId);
+    expect(peekQueuedSends("conv_queue").map((send) => send.text)).toEqual([
+      "then the type checker",
+    ]);
+    // Signed out: the record follows the queue but takes no new text.
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    useChatStore.getState().enqueueMessage("and the formatter");
+    expect(peekQueuedSends("conv_queue")).toEqual([]);
+  });
+
+  it("doesn't keep a side chat's queue, which its composer can't take back", () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
+
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(peekQueuedSends("conv_side")).toEqual([]);
+  });
+
+  it("doesn't keep a side chat's send held for its offline host", async () => {
+    seedSession("conv_child");
+    seedSession("conv_parent");
+    await useChatStore.getState().switchTo("conv_child");
+    await useChatStore.getState().switchTo("conv_parent");
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_child/events")) {
+        return mockResponse(
+          { error: { code: "host_offline", message: "The host is offline." } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("side follow-up", "agent_xyz", undefined, {
+      pinnedConversationId: "conv_child",
+    });
+
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { conversationId: "conv_child", waitingForHost: true },
+    ]);
+    expect(peekQueuedSends("conv_child")).toEqual([]);
+  });
+
+  it("hands queued text back to the composer on the next load", async () => {
+    seedSession("conv_reload", []);
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_reload",
+      text: "run the linter next",
+      files: [],
+      stableId: "stable_queued",
+      serverRefused: false,
+    });
+    expect(peekQueuedSends("conv_reload")).toEqual([]);
+  });
+
+  it("restores only the queued messages the snapshot doesn't hold", async () => {
+    // The head's POST failed after the server persisted it, so it stayed queued for a retry.
+    seedSession("conv_reload", [
+      { ...userMessage("resp_reload", "rerun the failing test"), id: "stable_delivered" },
+    ]);
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_delivered", text: "rerun the failing test", authorId: "user_a" },
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "run the linter next",
+      stableId: "stable_queued",
+    });
+  });
+
+  it("joins an unanswered send and the queue behind it into one new message", async () => {
+    seedSession("conv_reload", []);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    const restored = "rerun the failing test\n\nrun the linter next";
+    expect(useChatStore.getState().failedSendDraft).toEqual({
+      conversationId: "conv_reload",
+      text: restored,
+      files: [],
+      serverRefused: false,
+    });
+    expect(peekUnsentSend("conv_reload")).toBeNull();
+    // Queued again while the agent works, the joined text is kept whole.
+    useChatStore.setState({ sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage(restored);
+    expect(peekQueuedSends("conv_reload").map((send) => send.text)).toEqual([restored]);
+  });
+
+  it("restores the queue once the unanswered send ahead of it proves delivered", async () => {
+    seedSession("conv_reload", [
+      { ...userMessage("resp_reload", "rerun the failing test"), id: "stable_reload" },
+    ]);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "run the linter next",
+      stableId: "stable_queued",
+    });
+    expect(peekUnsentSend("conv_reload")).toBeNull();
+    expect(peekQueuedSends("conv_reload")).toEqual([]);
+  });
+
+  it("keeps an earlier page's queue while this page queues before restoring it", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    seedSession("conv_reload", []);
+    rememberQueuedSends("conv_reload", [
+      { stableId: "stable_queued", text: "run the linter next", authorId: "user_a" },
+    ]);
+    let identityChanged: (() => void) | undefined;
+    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+      identityChanged = listener;
+      return () => {};
+    });
+    await useChatStore.getState().switchTo("conv_reload");
+    useChatStore.setState({ sessionStatus: "running" });
+
+    useChatStore.getState().enqueueMessage("then the type checker");
+    expect(peekQueuedSends("conv_reload").map((send) => send.text)).toEqual([
+      "run the linter next",
+    ]);
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+    identityChanged!();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      text: "run the linter next",
+      stableId: "stable_queued",
+    });
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "then the type checker",
+    ]);
+  });
+
+  it("leaves messages this page still queues where they are", async () => {
+    seedSession("conv_reload", []);
+    useChatStore.setState({
+      queuedMessages: [
+        {
+          queueId: "q_held",
+          text: "run the linter next",
+          conversationId: "conv_reload",
+          stableId: "stable_held",
+          requiresRetry: true,
+        },
+      ],
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    expect(peekQueuedSends("conv_reload").map((send) => send.stableId)).toEqual(["stable_held"]);
   });
 
   it("drops a send the snapshot shows persisted", async () => {
