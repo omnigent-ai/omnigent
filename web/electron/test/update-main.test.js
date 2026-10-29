@@ -20,6 +20,7 @@ function loadMainHarness({
   platform = process.platform,
   developerMode = false,
   desktopVersionOverride,
+  runningWork = { hosts: 0, localServer: false },
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-update-test-"));
   fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify(settings), "utf8");
@@ -67,6 +68,7 @@ function loadMainHarness({
     },
     isMinimized: () => false,
     restore: () => {},
+    show: () => {},
     focus: () => {},
     close: () => {
       calls.windowCloses += 1;
@@ -221,6 +223,7 @@ function loadMainHarness({
     },
     "./server_manager": {
       shutdown: () => serverShutdown(),
+      runningWork: () => runningWork,
       onChange: () => {},
       ensureServerAuth: async () => ({ ok: true }),
       ensureHostConnected: async () => ({ ok: true }),
@@ -446,7 +449,7 @@ function topLevelMenus(menu) {
 }
 
 describe("application menu layout", () => {
-  it("keeps updates, Settings, and Quit in the macOS app menu", (t) => {
+  it("keeps updates, Settings, and the confirming Quit in the macOS app menu", (t) => {
     const harness = loadMainHarness({ platform: "darwin" });
     t.after(harness.cleanup);
 
@@ -476,6 +479,7 @@ describe("application menu layout", () => {
       "hideOthers",
       "unhide",
       "separator",
+      "confirm_before_quit",
       "quit",
     ]);
     assert.deepEqual(submenuIds(menu, "File"), [
@@ -536,6 +540,7 @@ describe("application menu layout", () => {
       "close",
       "close_window",
       "separator",
+      "confirm_before_quit",
       "quit",
     ]);
     // Electron's Window role adds its own CmdOrCtrl+W Close off macOS.
@@ -546,10 +551,7 @@ describe("application menu layout", () => {
       "separator",
       "open_about",
     ]);
-    const quit = findMenuItem(menu, "quit");
-    assert.equal(quit.accelerator, "CmdOrCtrl+Q");
-    quit.click();
-    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(findMenuItem(menu, "confirm_before_quit").label, "Warn Before Quitting (Ctrl+Q)");
   });
 });
 
@@ -854,6 +856,76 @@ describe("global show shortcut IPC", () => {
       false,
     );
     assert.equal(harness.readSettings().global_shortcut, undefined);
+  });
+});
+
+describe("Quit confirmation wiring", () => {
+  function quitItem(harness) {
+    return findMenuItem(harness.calls.setApplicationMenu.at(-1), "quit");
+  }
+
+  it("asks in the window's page, naming what stops, and quits once it confirms", async (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      runningWork: { hosts: 1, localServer: false },
+    });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(harness.events.pinned, {
+      commands: ["quit"],
+    });
+
+    assert.equal(quitItem(harness).accelerator, "CmdOrCtrl+Q");
+    quitItem(harness).click();
+    assert.deepEqual(plain(harness.calls.sent), [
+      {
+        channel: "omnigent:desktop-command",
+        payload: {
+          command: "quit",
+          quitDetail: "Sessions running on this computer will go offline.",
+        },
+      },
+    ]);
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(harness.calls.showMessageBox.length, 0);
+
+    const confirm = harness.ipcHandlers.get("omnigent:confirm-quit");
+    assert.equal(await confirm(harness.events.unpinned, { dontAskAgain: true }), false);
+    assert.equal(harness.calls.appQuit, 0);
+    assert.equal(await confirm(harness.events.pinned, { dontAskAgain: true }), true);
+    assert.equal(harness.calls.appQuit, 1);
+    assert.equal(harness.readSettings().confirm_before_quit, false);
+  });
+
+  it("quits at once when no page can ask", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    quitItem(harness).click();
+    assert.equal(harness.calls.appQuit, 1);
+    assert.deepEqual(harness.calls.sent, []);
+  });
+
+  it("does not prompt from the before-quit path that Dock Quit and logout take", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    assert.deepEqual(harness.calls.sent, []);
+    assert.equal(harness.calls.showMessageBox.length, 0);
+  });
+
+  it("quits without asking when Quit is pressed again during shutdown", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    harness.ipcListeners.get("omnigent:set-desktop-command-state")(harness.events.pinned, {
+      commands: ["quit"],
+    });
+    // Dock Quit starts shutdown; Cmd+Q during it must not offer a Cancel.
+    harness.appEvents.get("before-quit")({ preventDefault: () => {} });
+    quitItem(harness).click();
+    assert.deepEqual(harness.calls.sent, []);
+    assert.equal(harness.calls.appQuit, 1);
   });
 });
 

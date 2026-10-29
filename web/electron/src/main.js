@@ -123,6 +123,7 @@ const {
   macApplicationMenu,
   settingsMenuItem,
 } = require("./settingsNavigation");
+const { createQuitConfirmation } = require("./quitConfirmation");
 const { createGlobalShowShortcut } = require("./globalShowShortcut");
 const {
   registerDesktopCommandStateReset,
@@ -1624,6 +1625,26 @@ const updater = createDesktopUpdater({
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
   updatesEnabled: !app.isPackaged || !isDevBuild,
+});
+
+// The Quit menu item asks first, in a window's page; every other quit path
+// calls app.quit().
+const quitConfirmation = createQuitConfirmation({
+  isMac: process.platform === "darwin",
+  appName: () => app.name,
+  loadSettings,
+  saveSettings,
+  runningWork: () => serverManager.runningWork(),
+  ask: (detail) => {
+    const win = quitPromptWindow();
+    if (!win) return false;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    sendDesktopCommand(win, "quit", { quitDetail: detail });
+    return true;
+  },
+  quit: () => app.quit(),
 });
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
@@ -3523,9 +3544,7 @@ function buildMenu() {
       },
     },
   ];
-  const quitItems = [
-    { id: "quit", label: `Quit ${app.name}`, accelerator: "CmdOrCtrl+Q", click: () => app.quit() },
-  ];
+  const quitItems = quitConfirmation.menuItems();
   // Commands the focused window's SPA performs. Their items stay disabled
   // until that SPA reports it can run them (see desktopCommands.js).
   const commandWindow = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
@@ -4681,6 +4700,13 @@ function registerIpc() {
     return true;
   });
 
+  // Quit (⌘Q), once the page's own dialog confirmed it.
+  ipcMain.handle("omnigent:confirm-quit", (event, options) => {
+    if (!isPinnedOriginSender(event)) return false;
+    quitConfirmation.confirmQuit({ dontAskAgain: options?.dontAskAgain === true });
+    return true;
+  });
+
   // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
   ipcMain.handle("omnigent:get-global-shortcut", (event) => {
     if (!isPinnedOriginSender(event)) {
@@ -5484,11 +5510,27 @@ function desktopCommandTarget(command) {
 }
 
 /**
+ * The window to ask in before quitting: the focused one, else any other whose
+ * SPA can ask.
+ *
+ * @returns {BrowserWindow | null}
+ */
+function quitPromptWindow() {
+  return (
+    [BrowserWindow.getFocusedWindow(), ...windows.keys()].find(
+      (win) =>
+        focusedConnectedWindow(win, windows) &&
+        windows.get(win).desktopCommands?.commands.has("quit"),
+    ) ?? null
+  );
+}
+
+/**
  * Hand a native menu command to a window's SPA (see desktopCommands.js).
  *
  * @param {BrowserWindow | null} win
  * @param {string} command
- * @param {{ browserViewId?: string | null }} [extra]
+ * @param {{ browserViewId?: string | null, closingQuits?: boolean, quitDetail?: string | null }} [extra]
  */
 function sendDesktopCommand(win, command, extra = {}) {
   if (!win || win.isDestroyed()) return;
@@ -5939,6 +5981,7 @@ if (!gotLock) {
   };
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
+    quitConfirmation.quitStarted();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first
