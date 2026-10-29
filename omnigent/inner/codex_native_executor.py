@@ -99,6 +99,12 @@ _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
     title="Codex is compacting",
     remediation="Wait for compaction to finish, then send your message again.",
 )
+_CODEX_DELIVERY_UNCONFIRMED_FAILURE = CodexStartupFailure(
+    message="Codex disconnected while submitting this message. It may already be running.",
+    code="codex_delivery_unconfirmed",
+    title="Codex delivery is unconfirmed",
+    remediation="Check the native terminal for the message before sending it again.",
+)
 
 
 class _CodexNativeInputUndelivered(RuntimeError):
@@ -259,8 +265,8 @@ async def _native_delivery_request(
                     remediation="Send the message again in the current session.",
                 )
             ) from error
-        # A second refusal still proves non-delivery. Any other failure after
-        # this submission is ambiguous and must reach the caller unchanged.
+        # A second refusal still proves non-delivery. Transport failure after
+        # this submission remains ambiguous and cannot authorize another retry.
         return await _native_delivery_request_once(client, method, params, state)
 
 
@@ -310,6 +316,8 @@ async def _native_delivery_request_once(
             exception_type=type(exc).__name__,
             rpc_error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
         )
+        if isinstance(exc, (OSError, WebSocketException)):
+            raise InjectionDeliveryAmbiguous(str(exc)) from exc
         raise
     result = _json_object(response.get("result"))
     if method == "turn/start":
@@ -818,6 +826,7 @@ class CodexNativeExecutor(Executor):
         error_msg: str | None = None
         startup_failure: CodexStartupFailure | None = None
         undelivered = False
+        delivery_unconfirmed = False
         while True:
             if state is None:
                 (
@@ -935,7 +944,10 @@ class CodexNativeExecutor(Executor):
                                 settings_overrides=settings_overrides,
                             )
                     except Exception as exc:
-                        if isinstance(exc, _CodexNativeInputUndelivered):
+                        if isinstance(exc, InjectionDeliveryAmbiguous):
+                            startup_failure = _CODEX_DELIVERY_UNCONFIRMED_FAILURE
+                            delivery_unconfirmed = True
+                        elif isinstance(exc, _CodexNativeInputUndelivered):
                             startup_failure = exc.failure
                             undelivered = True
                         elif isinstance(
@@ -990,6 +1002,9 @@ class CodexNativeExecutor(Executor):
                 # Transport loss after submission stays ambiguous unless Codex
                 # explicitly rejected the input.
                 undelivered=undelivered,
+                # Failed delivery does not own cancellation of an independent native turn.
+                preserve_session=delivery_unconfirmed
+                or (undelivered and state is not None and state.active_turn_id is not None),
             )
         else:
             yield TurnComplete(response=None)

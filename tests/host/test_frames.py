@@ -20,6 +20,13 @@ from omnigent.host.frames import (
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
+    HostHarnessLoginCancelFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -45,6 +52,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostProbeAccountsFrame,
+    HostProbeAccountsResultFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -1036,6 +1045,88 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
 
 
+def test_hello_and_readiness_frames_round_trip_harness_accounts() -> None:
+    accounts = {
+        "codex": {
+            "kind": "chatgpt",
+            "email": "person@example.test",
+            "plan": "pro",
+            "expired": False,
+        }
+    }
+    hello = decode_host_frame(
+        encode_host_frame(
+            HostHelloFrame(
+                version="0.1.0",
+                frame_protocol_version=1,
+                name="laptop",
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.harness_accounts == accounts
+
+    readiness = decode_host_frame(
+        encode_host_frame(
+            HostHarnessReadinessFrame(
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(readiness, HostHarnessReadinessFrame)
+    assert readiness.harness_accounts == accounts
+
+
+def test_legacy_hello_without_harness_accounts_decodes_to_none() -> None:
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "old-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.harness_accounts is None
+
+
+def test_harness_login_frames_round_trip() -> None:
+    frames = [
+        HostHarnessLoginFrame(request_id="start-1", harness="codex", login_id="login-1"),
+        HostHarnessLoginResultFrame(
+            request_id="start-1",
+            status="ok",
+            login_id="login-1",
+            verification_url="https://example.test/device",
+            user_code="ABCD-EFGH",
+            expires_at=1234,
+        ),
+        HostHarnessLoginCancelFrame(request_id="cancel-1", login_id="login-1"),
+        HostHarnessLoginCancelResultFrame(request_id="cancel-1", status="ok"),
+        HostHarnessLoginCompletedFrame(
+            login_id="login-1",
+            success=True,
+            expired=False,
+            configured_harnesses={"codex": True},
+            harness_accounts={"codex": {"kind": "chatgpt", "expired": False}},
+        ),
+        HostHarnessLogoutFrame(request_id="logout-1", harness="codex"),
+        HostHarnessLogoutResultFrame(
+            request_id="logout-1",
+            status="ok",
+            configured_harnesses={"codex": "needs-auth"},
+            harness_accounts={"codex": {"kind": "unknown", "expired": True}},
+        ),
+    ]
+
+    assert [decode_host_frame(encode_host_frame(frame)) for frame in frames] == frames
+
+
 def test_connection_error_frame_round_trip() -> None:
     """Connection errors preserve the server stage and exception message."""
     original = HostConnectionErrorFrame(
@@ -1290,6 +1381,37 @@ def test_launch_runner_result_frame_legacy_payload_decodes_error_code_none() -> 
     decoded = decode_host_frame(legacy)
     assert isinstance(decoded, HostLaunchRunnerResultFrame)
     assert decoded.error_code is None
+
+
+def test_launch_runner_result_frame_workspace_recreated_round_trip() -> None:
+    """
+    Verify ``workspace_recreated`` survives encode → decode and reads as
+    False from an OLDER host that never sends the key.
+
+    The server persists its "workspace was recreated" notice off this flag;
+    if it is dropped, the user is never told their directory is now empty.
+    """
+    original = HostLaunchRunnerResultFrame(
+        request_id="req_001",
+        status="launched",
+        runner_id="runner_token_abc",
+        workspace_recreated=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostLaunchRunnerResultFrame)
+    assert decoded.workspace_recreated is True
+
+    legacy = json.dumps(
+        {
+            "kind": "host.launch_runner_result",
+            "request_id": "req_001",
+            "status": "launched",
+            "runner_id": "runner_token_abc",
+        }
+    )
+    decoded_legacy = decode_host_frame(legacy)
+    assert isinstance(decoded_legacy, HostLaunchRunnerResultFrame)
+    assert decoded_legacy.workspace_recreated is False
 
 
 def test_stop_runner_frame_round_trip() -> None:
@@ -1759,13 +1881,15 @@ def test_create_worktree_frame_round_trip() -> None:
     """Verify HostCreateWorktreeFrame survives encode → decode.
 
     A garbled repo_path or branch_name would create the worktree in
-    the wrong place or with the wrong branch.
+    the wrong place or with the wrong branch; a lost timeout_s would cut
+    a large checkout short.
     """
     original = HostCreateWorktreeFrame(
         request_id="req_wt_1",
         repo_path="/Users/alice/myrepo",
         branch_name="feature/login",
         base_branch="main",
+        timeout_s=3600.0,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
@@ -1815,6 +1939,34 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
     decoded = decode_host_frame(json.dumps(msg))
     assert isinstance(decoded, HostCreateWorktreeFrame)
     assert decoded.existing_branch is False
+
+
+def test_create_worktree_frame_timeout_absent_defaults_none() -> None:
+    """A frame from an older server, without ``timeout_s``, decodes as ``None``."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_6", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("timeout_s")
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.timeout_s is None
+
+
+@pytest.mark.parametrize(
+    "raw_timeout",
+    ["0", "-1", "true", '"60"', "Infinity", "NaN", "1" + "0" * 400],
+    ids=["zero", "negative", "bool", "string", "infinity", "nan", "overflow"],
+)
+def test_create_worktree_frame_timeout_rejects_unusable_values(raw_timeout: str) -> None:
+    """A budget the host cannot wait on is a malformed frame, not silently kept."""
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_7", repo_path="/repo", branch_name="wip")
+    )
+    with pytest.raises(ValueError, match="timeout_s"):
+        decode_host_frame(encoded.replace('"timeout_s": null', f'"timeout_s": {raw_timeout}'))
 
 
 def test_create_worktree_result_frame_round_trip() -> None:
@@ -2144,6 +2296,28 @@ def test_refresh_harnesses_frames_round_trip() -> None:
     assert isinstance(result, HostRefreshHarnessesResultFrame)
     assert result.configured_harnesses == {"codex-native": True}
     assert result.gateway_inference == {"codex-native": False}
+
+
+def test_probe_harness_accounts_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True))
+    )
+    assert request == HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True)
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostProbeAccountsResultFrame(
+                request_id="accounts-1",
+                status="ok",
+                harness_accounts={"codex": {"kind": "chatgpt"}},
+            )
+        )
+    )
+    assert result == HostProbeAccountsResultFrame(
+        request_id="accounts-1",
+        status="ok",
+        harness_accounts={"codex": {"kind": "chatgpt"}},
+    )
 
 
 def test_result_frames_round_trip_gateway_inference() -> None:

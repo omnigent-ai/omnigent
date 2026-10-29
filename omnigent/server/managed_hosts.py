@@ -331,6 +331,10 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
+# Deadline for reading a sandbox's logs before teardown, so a hung exec channel
+# cannot stall the delete or leave the sandbox running.
+SANDBOX_LOG_CAPTURE_TIMEOUT_S = 15.0
+
 # How long a message POST waits for an in-flight managed launch to
 # settle before giving up (see ManagedLaunchTracker). Covers the full
 # launch/wake pipeline ON TOP OF the host-registration wait
@@ -572,10 +576,14 @@ class ManagedLaunch:
     :param error: Failure detail once settled unsuccessfully, e.g.
         ``"managed sandbox launch failed: …"``. ``None`` while
         in flight and on success.
+    :param bound: Set once the session row records its new host. From
+        then on the host's replica can finish the launch and deliver
+        saved inputs, so a scheduled fire can hand off at this point.
     """
 
     settled: asyncio.Event
     error: str | None = None
+    bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
 
 
 class ManagedLaunchTracker:
@@ -4504,6 +4512,8 @@ async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
@@ -4520,6 +4530,8 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
+    :param capture_logs: Log the in-sandbox host and runner log tails before
+        terminating, e.g. after a client saw the session's turn fail.
     """
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
@@ -4528,6 +4540,10 @@ async def terminate_managed_host(
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:
+            if capture_logs and launcher is not None:
+                await _log_sandbox_logs_best_effort(
+                    launcher, sandbox_id, host_id=tombstone.host_id
+                )
             terminated = await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
@@ -4540,6 +4556,39 @@ async def terminate_managed_host(
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
                 )
+
+
+async def _log_sandbox_logs_best_effort(
+    launcher: SandboxHostLauncher, sandbox_id: str, *, host_id: str
+) -> None:
+    """Log a sandbox's host and runner log tails; never raises."""
+    try:
+        logs = await asyncio.wait_for(
+            asyncio.to_thread(launcher.capture_logs, sandbox_id),
+            timeout=SANDBOX_LOG_CAPTURE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        _logger.warning(
+            "Timed out after %ss capturing logs from managed sandbox %s for host %s",
+            SANDBOX_LOG_CAPTURE_TIMEOUT_S,
+            sandbox_id,
+            host_id,
+        )
+        return
+    except Exception:  # diagnostics must not block teardown.
+        _logger.warning(
+            "Failed to capture logs from managed sandbox %s for host %s",
+            sandbox_id,
+            host_id,
+            exc_info=True,
+        )
+        return
+    _logger.error(
+        "Managed sandbox %s logs before teardown (host %s):\n%s",
+        sandbox_id,
+        host_id,
+        logs or "<no logs captured>",
+    )
 
 
 async def _terminate_sandbox_best_effort(

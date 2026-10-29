@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 
 # Sentinel meaning "caller did not supply this argument; leave the column unchanged."
 # Distinct from None, which means "set the column to NULL."
 _UNSET: Any = object()
+
+# How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
+# the session, another session got there first, or the task changed under the run.
+AdoptOutcome = Literal["adopted", "taken", "stale"]
 
 
 class ScheduledTaskStore(ABC):
@@ -52,8 +56,11 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
         max_cost_usd: float | None = None,
+        session_mode: str = "new",
+        session_id: str | None = None,
         workspace: str | None = None,
         host_id: str | None = None,
+        project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
     ) -> ScheduledTask:
@@ -74,12 +81,19 @@ class ScheduledTaskStore(ABC):
         :param permission_mode: Optional native-harness permission mode
             (Claude Code), e.g. ``"acceptEdits"``.
         :param max_cost_usd: Optional per-firing cost budget in USD.
+        :param session_mode: ``"new"`` (default) starts a new session per
+            firing; ``"continue"`` sends each firing's prompt into one session.
+        :param session_id: The existing session a ``"continue"`` task sends
+            its prompt to; ``None`` lets its first firing create one.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
+        :param project_id: First-class project each fired session is filed
+            into, or ``None`` to leave fired sessions unfiled.
         :param execution_target: ``"connected_host"`` (default) or
             ``"managed_sandbox"`` (a fresh server-provisioned sandbox per fire).
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-            Defaults to ``"active"``.
+            Defaults to ``"active"``. Persistent dispatch sets ``completed``
+            once a schedule has no remaining occurrences.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -142,8 +156,11 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
+        session_mode: str | None = None,
+        session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
+        project_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
@@ -154,7 +171,7 @@ class ScheduledTaskStore(ABC):
 
         Most parameters use ``None`` to mean "leave unchanged". For the per-task
         overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``host_id``, ``max_cost_usd``, and
+        ``permission_mode``), ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
         ``last_run_conversation_id``, the sentinel default means "not provided /
         leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (e.g.
@@ -173,6 +190,33 @@ class ScheduledTaskStore(ABC):
 
         :param scheduled_task_id: Opaque task identifier.
         :returns: The updated :class:`ScheduledTask`, or ``None`` if not found.
+        """
+        ...
+
+    @abstractmethod
+    def adopt_session(
+        self,
+        scheduled_task_id: str,
+        session_id: str,
+        *,
+        snapshot: ScheduledTask,
+        host_id: str | None = None,
+    ) -> AdoptOutcome:
+        """
+        Record the session a ``"continue"`` task's first firing created.
+
+        Leaves the task unchanged when another session was recorded first
+        (``"taken"``), or when the task is no longer a ``"continue"`` task or
+        was edited since the firing read it (``"stale"``), so a concurrent run,
+        pick or edit wins.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :param session_id: The session the firing created.
+        :param snapshot: The stored task as the firing read it.
+        :param host_id: The connected host the session runs on, pinned on a task
+            that has none: the session cannot move, so every later run routes
+            to that host.
+        :returns: How the adoption resolved.
         """
         ...
 
@@ -248,6 +292,20 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        """
+        Clear the task's ``project_id`` only while it still equals *project_id*.
+
+        A single conditional write, so a concurrent update that moved the task to
+        another project is never overwritten.
+
+        :param scheduled_task_id: The task to update.
+        :param project_id: The project id expected on the row, e.g. a deleted one.
+        :returns: ``True`` if the column was cleared.
+        """
+        ...
+
+    @abstractmethod
     def update_run(
         self,
         run_id: str,
@@ -290,11 +348,13 @@ class ScheduledTaskStore(ABC):
         scheduled-task run to transition. Workspace-scoped like every other
         store read (filters on ``current_workspace_id()``), so the caller must
         run it inside the run's ``workspace_scope``. Backed by the
-        ``ix_scheduled_task_runs_conversation_id`` index on
-        ``(workspace_id, conversation_id)``.
+        ``ix_scheduled_task_runs_conversation_status`` index on
+        ``(workspace_id, conversation_id, status, id)``.
 
-        A conversation maps to at most one ``running`` run (a fire creates one
-        run per conversation), so this returns a single row rather than a list.
+        A conversation has at most one ``running`` run (only the run that
+        created a session waits for its turn; a continued run is finished once
+        its prompt is delivered), so this returns a single row rather than a
+        list.
 
         :param conversation_id: The fired conversation to look up.
         :returns: The matching ``running`` :class:`ScheduledTaskRun`, or
