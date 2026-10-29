@@ -645,9 +645,9 @@ async def _publish_and_wait_for_harness_elicitation(
         if _harness_parked_elicitations.get(elicitation_id) is parked:
             _harness_parked_elicitations.pop(elicitation_id, None)
         delivery = getattr(params, "native_delivery", None)
-        if published_request and (
-            not settled or (delivery is not None and settled_action is not None)
-        ):
+        # Deleting the session expires its card and the ancestors' mirrors itself.
+        owns_card = published_request and not parked.released
+        if owns_card and (not settled or (delivery is not None and settled_action is not None)):
             unparked = None
             if (
                 terminal_fallback
@@ -673,7 +673,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
                 unparked=unparked,
             )
-        elif published_request:
+        elif owns_card:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
             if conversation_store is not None:
                 await asyncio.to_thread(
@@ -948,37 +948,57 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
             handle.task.cancel()
 
 
-async def _release_unparked_elicitations(
+async def _release_deleted_session_prompts(
     session_ids: list[str],
     conversation_store: ConversationStore,
 ) -> None:
-    """Expire the prompts that sessions about to be deleted hold for their terminals.
+    """Expire the harness prompts of sessions about to be deleted.
 
-    A deleted session's status may never leave mid-turn, so its hold would poll forever.
+    A deleted session's status may never leave mid-turn, so a terminal hold would poll forever.
     Run it before the delete so the expiry still reaches surviving ancestors' mirrors.
     """
     deleted = set(session_ids)
+    released: list[tuple[str, str]] = []
+    # Mark parked hooks before any await so a later disconnect cannot open a hold.
+    for elicitation_id, parked in _harness_parked_elicitations.items():
+        if parked.session_id in deleted and not parked.released:
+            parked.released = True
+            parked.resolved_elsewhere.set()
+            released.append((parked.session_id, elicitation_id))
+    for session_id, elicitation_id in released:
+        await _expire_deleted_session_prompt(session_id, elicitation_id, conversation_store)
     for elicitation_id, unparked in _harness_unparked_elicitations.items():
         if unparked.session_id not in deleted:
             continue
         if _harness_unparked_elicitations.pop(elicitation_id, None) is None:
             continue  # Cleared or re-parked while an earlier prompt was being released.
-        _publish_elicitation_resolved(unparked.session_id, elicitation_id, reason="unanswered")
-        try:
-            await asyncio.to_thread(
-                _publish_elicitation_resolved_to_ancestors,
-                conversation_store,
-                unparked.session_id,
-                elicitation_id,
-                reason="unanswered",
-            )
-        except Exception:  # noqa: BLE001 — the delete must still go through
-            _logger.warning(
-                "Could not clear prompt %s from ancestors of deleted session %s",
-                elicitation_id,
-                unparked.session_id,
-                exc_info=True,
-            )
+        await _expire_deleted_session_prompt(
+            unparked.session_id, elicitation_id, conversation_store
+        )
+
+
+async def _expire_deleted_session_prompt(
+    session_id: str,
+    elicitation_id: str,
+    conversation_store: ConversationStore,
+) -> None:
+    """Publish an unanswered resolution for a deleted session's prompt and its mirrors."""
+    _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
+    try:
+        await asyncio.to_thread(
+            _publish_elicitation_resolved_to_ancestors,
+            conversation_store,
+            session_id,
+            elicitation_id,
+            reason="unanswered",
+        )
+    except Exception:  # noqa: BLE001 — the delete must still go through
+        _logger.warning(
+            "Could not clear prompt %s from ancestors of deleted session %s",
+            elicitation_id,
+            session_id,
+            exc_info=True,
+        )
 
 
 # Strong references to detached archive stops so the tasks can't be
@@ -13912,7 +13932,7 @@ __all__ = [
     "_recover_subagent_status_forward_via_parent",
     "_register_policy_elicitation",
     "_relay_runner_stream",
-    "_release_unparked_elicitations",
+    "_release_deleted_session_prompts",
     "_resolve_elicitation",
     "_run_managed_launch",
     "_run_managed_wake",

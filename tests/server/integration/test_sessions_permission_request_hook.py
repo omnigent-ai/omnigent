@@ -2923,6 +2923,65 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         pending_elicitations.reset_for_tests()
 
 
+async def test_deleting_session_releases_prompt_whose_hook_still_waits(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hook that outlives its session's delete cannot leave a hold when it disconnects."""
+    from omnigent.runtime import pending_elicitations
+
+    disconnect = asyncio.Event()
+
+    async def _wait_for_disconnect(_request: Any) -> None:
+        await disconnect.wait()
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _wait_for_disconnect)
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_POLL_S", 0.02)
+    pending_elicitations.reset_for_tests()
+    name = "test-terminal-fallback-deleted-while-parked"
+    agent = await create_test_agent(client, name)
+    parent_id = await _create_session(client, agent["id"])
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent_id, "title": f"{name}:child"},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
+    payload = {
+        **(await _claude_permission_payload()),
+        "_omnigent_elicitation_id": _REATTACH_ELICITATION_ID,
+    }
+    parent_collector = await start_session_stream_collector(parent_id)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    try:
+        mirrored = await _next_elicitation_event(parent_collector)
+        assert mirrored["type"] == "response.elicitation_request"
+
+        deleted = await client.delete(f"/v1/sessions/{session_id}")
+        assert deleted.status_code == 200, deleted.text
+        expired = await _next_elicitation_event(parent_collector)
+        assert expired["type"] == "response.elicitation_resolved"
+        assert expired["reason"] == "unanswered"
+        disconnect.set()
+        hook = await asyncio.wait_for(hook_task, timeout=5.0)
+        assert hook.status_code == 200, hook.text
+        assert hook.content == b""
+        await _finish_deferred_clears()
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+        assert pending_elicitations.count_for(session_id) == 0
+        assert pending_elicitations.count_for(parent_id) == 0
+    finally:
+        disconnect.set()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(hook_task, timeout=5.0)
+        await parent_collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
 @pytest.mark.parametrize("held_again", [False, True])
 async def test_deleting_session_expires_only_prompts_still_held(
     monkeypatch: pytest.MonkeyPatch,
@@ -2963,7 +3022,7 @@ async def test_deleting_session_expires_only_prompts_still_held(
     _harness_unparked_elicitations["elicit_first"] = held_prompt()
     _harness_unparked_elicitations["elicit_second"] = held_prompt()
     try:
-        await sessions_orchestration._release_unparked_elicitations(
+        await sessions_orchestration._release_deleted_session_prompts(
             ["conv_deleted"], cast(Any, None)
         )
         assert expired == (["elicit_first", "elicit_second"] if held_again else ["elicit_first"])

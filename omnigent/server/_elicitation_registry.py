@@ -61,6 +61,8 @@ class _ParkedHarnessElicitation:
         re-park only adopts the verdict for the SAME logical question
         (harness ids can be reused across distinct requests). ``None``
         when the caller supplied no params to fingerprint.
+    :param released: ``True`` once deleting the session expired the prompt;
+        the wait then ends without a terminal hold or a second resolution.
     """
 
     session_id: str
@@ -68,6 +70,7 @@ class _ParkedHarnessElicitation:
     tool_input: dict[str, Any] | None
     resolved_elsewhere: asyncio.Event
     request_fingerprint: str | None = None
+    released: bool = False
 
 
 @dataclass(frozen=True)

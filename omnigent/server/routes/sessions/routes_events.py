@@ -272,7 +272,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _persist_host_launch_failure_turn,
     _persist_native_terminal_failure,
     _recover_side_chat_runner_via_source,
-    _release_unparked_elicitations,
+    _release_deleted_session_prompts,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _side_chat_source_id,
@@ -3809,7 +3809,7 @@ def register_events_routes(
                 )
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
-        await _release_unparked_elicitations([session_id, *descendant_ids], conversation_store)
+        await _release_deleted_session_prompts([session_id, *descendant_ids], conversation_store)
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
