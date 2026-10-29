@@ -149,6 +149,7 @@ def watch_thread_pool(
                     waited_s=round(waited_s, 3),
                     threshold_s=stall_threshold_s,
                     workers=len(workers),
+                    thread_name_prefix=thread_name_prefix,
                     worker_locations=summary,
                     report_interval_s=report_interval_s,
                 ),

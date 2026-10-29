@@ -3,8 +3,8 @@
 The runner's default executor is small (see ``_entry.py``) and carries
 latency-critical work such as native pane checks and terminal delivery. Work
 that can block for tens of seconds — ``git`` over a large tree, a provider
-CLI, waiting for a native bridge to come up — runs here instead, so a backlog
-of it cannot stall message delivery. Cancelling the awaiting coroutine does
+CLI — runs here instead, so a backlog cannot stall message delivery.
+Cancelling the awaiting coroutine does
 not stop a worker thread, which is why such work must not share that pool.
 """
 

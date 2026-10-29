@@ -16,6 +16,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import ParamSpec, TypeVar
 
+from omnigent.util.thread_pool_watchdog import watch_thread_pool
+
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
@@ -40,6 +42,7 @@ class DedicatedExecutor:
                     max_workers=self._max_workers,
                     thread_name_prefix=self._thread_name_prefix,
                 )
+                watch_thread_pool(self._executor, thread_name_prefix=self._thread_name_prefix)
             return self._executor
 
     async def run(self, func: Callable[_P, _T], /, *args: _P.args, **kwargs: _P.kwargs) -> _T:

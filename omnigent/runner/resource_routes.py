@@ -1209,11 +1209,8 @@ def register_resource_routes(
         await _ensure_session_registered(session_id)
         session_registry = await _resolve_session_fs_registry(session_id)
         try:
-            # ``list_changed_files`` shells out to ``git status`` synchronously,
-            # which on a large repo (cold untracked cache) can take seconds.
-            # Offload it so it never blocks the event loop — a blocked loop can't
-            # answer the server's runner-stream relay probe — and keep it off the
-            # default pool, where a backlog would stall native message delivery.
+            # git status can take seconds; keep it off the loop (relay probes)
+            # and off the default pool (native message delivery).
             raw_changes = (
                 await run_slow_io(
                     session_registry.list_changed_files,
