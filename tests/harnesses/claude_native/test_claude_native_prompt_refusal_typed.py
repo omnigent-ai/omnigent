@@ -99,7 +99,19 @@ def test_a_prompt_after_the_paste_is_not_retryable(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The draft is in the box by then; a retry could append to it."""
-    _show(monkeypatch, f"{_RULE}\n❯ hi\n{_RULE}\n  ? for shortcuts\n")
+    draft = ""
+
+    def run_tmux(_socket_path: str, *args: str) -> None:
+        nonlocal draft
+        if args[0] == "paste-buffer":
+            draft = "hi"
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_args, **_kw: f"{_RULE}\n❯ {draft}\n{_RULE}\n  ? for shortcuts\n",
+    )
     checks = iter([False, True])
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: next(checks))
 

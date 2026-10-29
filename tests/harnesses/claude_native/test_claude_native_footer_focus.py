@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import inject_user_message, write_tmux_target
 
-_CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
+_CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2 + " "
 _AGENTS = ("main", "general-purpose", "general-purpose")
 _RULE = "─" * 60
 
@@ -73,8 +74,14 @@ class _FakeClaudeFooter:
             return
         if key == "Space":
             self.draft += " "
-        elif key == _CLEAR_ONE_ROW_COMPOSER:
-            self.draft = ""
+        elif key.startswith("\x1b["):
+            for token in re.findall(r"\x1b\[\d+;5u|[^\x1b]+", key):
+                if token == "\x1b[117;5u":
+                    self.draft = ""
+                elif token != "\x1b[107;5u":
+                    self.draft += token
+        elif key == "BSpace":
+            self.draft = self.draft[:-1]
         elif key == "Enter":
             if self.draft.strip():
                 self.submitted.append(self.draft.strip())

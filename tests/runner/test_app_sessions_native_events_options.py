@@ -2899,7 +2899,7 @@ class _SlowSwitchTui:
         claude_native_bridge._check_injection_cancelled()
         now = self._clock.monotonic()
         self.sent.append((now, args[-1]))
-        if "-l" in args:
+        if "-l" in args and args[-1].startswith("/"):
             self._pasted_at = now
         elif args[-1] == "Enter" and self._submitted_at is None:
             self._submitted_at = now
@@ -2979,8 +2979,8 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_failed"
     keys = [key for _, key in tui.sent]
-    clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
-    assert keys[:4] == ["Space", clear_composer, "/model claude-opus-4-7", "Enter"], keys
+    clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2 + " "
+    assert keys[:5] == ["Space", clear_composer, "BSpace", "/model claude-opus-4-7", "Enter"], keys
     late = [
         (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
     ]

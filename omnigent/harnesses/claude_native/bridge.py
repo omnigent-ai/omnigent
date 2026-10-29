@@ -6470,10 +6470,14 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     line would leave the rest of a multi-line draft to be submitted with the
     next message.
 
-    One burst is known to have emptied the box only when the capture showed
-    the box whole (both rules on screen) with nothing after its glyph row but
-    blank rows. A box with more text, or one the pane cut off (a draft taller
-    than the pane, or a sliver-height pane with no room for the closing rule),
+    A successful tmux command does not prove the terminal handled its keys.
+    Each clear ends with a space: Claude's empty-input hints disappear when
+    the input is nonempty, so a later capture can verify that only whitespace
+    remains. Remove the probe before typing the message or slash command.
+    The capture must show the whole box (both rules on screen) with only its
+    prompt glyph and blank rows before a paste is safe. A box with more text,
+    or one the pane cut off (a draft taller than the pane, or a sliver-height
+    pane with no room for the closing rule),
     may still hold lines the capture did not show, so it is cleared again,
     up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
     state afterwards is refused rather than pasted into: an exhausted budget
@@ -6485,7 +6489,7 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
-        capture showed the box whole and down to one row; nothing was pasted.
+        capture showed the whole box empty; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
     # Space returns focus from the footer to the input box. The clear also
@@ -6494,9 +6498,16 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
-        # Blank rows after the glyph row hold nothing a paste could join.
-        settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
-        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+        cleared = (
+            box is not None
+            and box.framed
+            and box.rows[0].strip() == _CLAUDE_PROMPT_GLYPH
+            and not any(row.strip() for row in box.rows[1:])
+        )
+        if cleared and round_no > 0:
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BSpace")
+            return
+        if round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
             delivery_diagnostics.record_composer_not_cleared(
                 pane=pane,
                 rows=None if box is None else box.rows,
@@ -6508,22 +6519,28 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
                 "Open the terminal, expand it and clear the input box, then retry."
             )
         if box is not None:
-            _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
-            if settled:
-                return
+            _send_composer_clear_keys(
+                socket_path, tmux_target, rows=len(box.rows), probe_empty=True
+            )
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
-def _send_composer_clear_keys(socket_path: str, tmux_target: str, *, rows: int) -> None:
+def _send_composer_clear_keys(
+    socket_path: str, tmux_target: str, *, rows: int, probe_empty: bool = False
+) -> None:
     """
     Send the Ctrl+K and Ctrl+U presses that empty *rows* rows of a draft.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param rows: Draft rows to delete, e.g. ``3``.
+    :param probe_empty: Append a space to suppress empty-input hints before
+        verifying that only whitespace remains.
     """
     presses = 2 * rows
     keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+    if probe_empty:
+        keys += " "
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
 
 
