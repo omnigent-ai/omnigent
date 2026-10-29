@@ -15,6 +15,7 @@ import queue
 import re
 import shlex
 import ssl
+import subprocess
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -266,11 +267,14 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     args = spec["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -284,6 +288,28 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
     assert "modelOverrides" not in settings
+
+
+def test_claude_terminal_request_without_helper_preserves_credentials(
+    tmp_path, monkeypatch
+) -> None:
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "CLAUDE_CODE_USE_GATEWAY": "1",
+            "ANTHROPIC_AUTH_TOKEN": "test-token",
+            "ANTHROPIC_API_KEY": "test-key",
+        },
+    )
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    assert body["spec"]["args"][:3] == ["-u", "CLAUDECODE", "claude"]
+    assert body["spec"]["env"]["ANTHROPIC_AUTH_TOKEN"] == "test-token"
+    assert body["spec"]["env"]["ANTHROPIC_API_KEY"] == "test-key"
 
 
 def test_native_config_does_not_infer_overrides_from_routable_models() -> None:
@@ -374,9 +400,11 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     )
 
     args = body["spec"]["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -1631,9 +1659,14 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     launch_kwargs: dict[str, Any] = {}
 
     async def _fake_create_session(
-        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+        _client: object,
+        _bundle: bytes,
+        *,
+        bridge_id: str,
+        claude_args: object = (),
+        terminal_launch_args: object = None,
     ) -> str:
-        del _client, _bundle, bridge_id, terminal_launch_args
+        del _client, _bundle, bridge_id, claude_args, terminal_launch_args
         return "conv_local_fresh_raw"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -1999,6 +2032,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         bundle: bytes,
         *,
         bridge_id: str | None,
+        claude_args: tuple[str, ...] = (),
         terminal_launch_args: list[str] | None = None,
     ) -> str:
         """
@@ -2007,6 +2041,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         :param client: HTTP client created by the prepare helper.
         :param bundle: Bundled agent bytes.
         :param bridge_id: Bridge label requested by the caller.
+        :param claude_args: Launch args the effort stamp reads.
         :param terminal_launch_args: Claude launch args persisted on
             the session for the runner to apply.
         :returns: Fixed conversation id.
@@ -2014,6 +2049,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         del client
         assert bundle == b"bundle"
         assert bridge_id is None
+        assert claude_args == ("--print", "hi")
         assert terminal_launch_args == ["--print", "hi"]
         return "conv_daemon_progress"
 
@@ -2131,7 +2167,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        claude_args=("--print", "hi"),
+        claude_args=("--resume", "abc", "--print", "hi"),
         host_id="host_progress",
         workspace="/workspace",
         startup_progress=progress,
@@ -3290,10 +3326,12 @@ async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [500, 429])
+@pytest.mark.parametrize("resume_copy", [False, True])
 async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
+    resume_copy: bool,
 ) -> None:
     """
     Server history unreachable + intact local transcript → resume from it.
@@ -3327,9 +3365,11 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
             session_id="conv_abc",
             external_session_id="sid123",
             workspace=workspace,
+            resume_copy=resume_copy,
         )
 
     assert written == local
+    assert local.with_suffix(".omnigent-resume-copy").exists() == resume_copy
     # The untouched local transcript is used as-is, never overwritten with
     # partial server state.
     assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
@@ -5118,6 +5158,61 @@ async def test_attach_exits_on_real_websocket_close_with_4404(
 
 
 @pytest.mark.asyncio
+async def test_read_fd_removes_reader_when_cancelled() -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    read_task = asyncio.create_task(claude_native._read_fd_with_reader(loop, read_fd))
+    try:
+        await asyncio.sleep(0)
+        assert not read_task.done()
+        read_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read_task
+
+        assert not loop.remove_reader(read_fd), "cancelled read left a selector callback"
+        os.write(write_fd, b"reconnected")
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == b"reconnected"
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await read_task
+        loop.remove_reader(read_fd)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [b"input", b""], ids=["data", "eof"])
+async def test_read_fd_removes_reader_after_reading(data: bytes) -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    try:
+        if data:
+            os.write(write_fd, data)
+        os.close(write_fd)
+        write_fd = -1
+
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == data
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        loop.remove_reader(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
 async def test_websocket_to_stdout_does_not_block_event_loop() -> None:
     """
     ``_websocket_to_stdout`` offloads the blocking ``os.write`` to a
@@ -5896,6 +5991,242 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
 
 
 @pytest.mark.asyncio
+async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_runs_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A session a background Claude job still runs resumes on a rebuilt copy.
+
+    Claude refuses ``--resume`` for that session ("That session is running in
+    the background"), and the job keeps appending to the original transcript,
+    so the resume must leave that file alone and launch a copy under a new id.
+    A later resume while the job still runs reuses that copy and rebuilds it.
+    Both live in ``$CLAUDE_CONFIG_DIR/projects``, where that Claude reads them.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
+    project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+    live_transcript = project_dir / "claude-uuid-abc.jsonl"
+    project_dir.mkdir(mode=0o700, parents=True)
+    live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
+    live_transcript.write_text(live_line, encoding="utf-8")
+    (config_dir / "sessions").mkdir(parents=True)
+    (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg", "jobId": "ab12cd34"}),
+        encoding="utf-8",
+    )
+    item_from_ap = {
+        "id": "msg_user_1",
+        "response_id": "resp_1",
+        "type": "message",
+        "status": "completed",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "fresh Omnigent text"}],
+    }
+    items_from_ap = [item_from_ap]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot and its item page.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        if request.url.path == "/v1/sessions/conv_abc/items":
+            return httpx.Response(200, json=_items_response_body(items_from_ap))
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.chdir(workspace)
+    # Claude keeps transcripts in its config dir, never in the home default.
+    default_projects = tmp_path / "home-claude-projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", default_projects)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        items_from_ap.append(
+            {
+                **item_from_ap,
+                "id": "msg_user_2",
+                "response_id": "resp_2",
+                "content": [{"type": "input_text", "text": "later Omnigent text"}],
+            }
+        )
+        later_args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args[0] == "--resume"
+    copy_session_id = args[1]
+    assert copy_session_id != "claude-uuid-abc"
+    assert later_args == args
+    assert live_transcript.read_text(encoding="utf-8") == live_line
+    copy_transcript = project_dir / f"{copy_session_id}.jsonl"
+    marker = copy_transcript.with_suffix(".omnigent-resume-copy")
+    assert marker.is_file()
+    assert not live_transcript.with_suffix(".omnigent-resume-copy").exists()
+    records = [
+        json.loads(line)
+        for line in copy_transcript.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [record["message"]["content"] for record in records] == [
+        "fresh Omnigent text",
+        "later Omnigent text",
+    ]
+    assert {record["sessionId"] for record in records} == {copy_session_id}
+    assert sorted(path.name for path in project_dir.iterdir()) == sorted(
+        [live_transcript.name, copy_transcript.name, marker.name]
+    )
+    assert not default_projects.exists()
+
+
+def test_resume_copy_id_is_fresh_while_a_live_claude_has_the_copy_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stable copy another live Claude still has open is not rebuilt under it."""
+    config_dir = tmp_path / "claude-config"
+    sessions = config_dir / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    (sessions / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg"}), encoding="utf-8"
+    )
+    stable_copy = claude_native._claude_resume_session_id("claude-uuid-abc", session_id="conv_abc")
+    assert stable_copy != "claude-uuid-abc"
+    assert claude_native._claude_resume_session_id("claude-uuid-abc", session_id="conv_abc") == (
+        stable_copy
+    )
+
+    # The previous launch's Claude still runs on the copy, e.g. a CLI-attached pane.
+    holder = subprocess.Popen(["sleep", "30"])
+    try:
+        (sessions / f"{holder.pid}.json").write_text(
+            json.dumps({"sessionId": stable_copy, "kind": "interactive"}), encoding="utf-8"
+        )
+        fresh_copy = claude_native._claude_resume_session_id(
+            "claude-uuid-abc", session_id="conv_abc"
+        )
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert fresh_copy not in {stable_copy, "claude-uuid-abc"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_resumes_in_place_when_the_registry_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A registry probe that raises leaves the resume exactly as it was before the check."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "claude-projects"
+    item_from_ap = {
+        "id": "msg_user_1",
+        "response_id": "resp_1",
+        "type": "message",
+        "status": "completed",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "fresh Omnigent text"}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot and its item page.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        if request.url.path == "/v1/sessions/conv_abc/items":
+            return httpx.Response(200, json=_items_response_body([item_from_ap]))
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    def broken_registry(session_id: str, **kwargs: object) -> None:
+        raise RuntimeError("unreadable registry")
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "find_background_holder", broken_registry)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args == ("--resume", "claude-uuid-abc")
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_keeps_a_held_transcript_when_history_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unreachable history while a job holds the session fails, never resuming the original."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
+    project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+    project_dir.mkdir(mode=0o700, parents=True)
+    live_transcript = project_dir / "claude-uuid-abc.jsonl"
+    live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
+    live_transcript.write_text(live_line, encoding="utf-8")
+    (config_dir / "sessions").mkdir(parents=True)
+    (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg"}), encoding="utf-8"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot; every item page fails.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    monkeypatch.chdir(workspace)
+    # Claude keeps transcripts in its config dir, never in the home default.
+    default_projects = tmp_path / "home-claude-projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", default_projects)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert live_transcript.read_text(encoding="utf-8") == live_line
+    assert [path.name for path in project_dir.iterdir()] == [live_transcript.name]
+    assert not default_projects.exists()
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6293,9 +6624,11 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         _bundle: bytes,
         *,
         bridge_id: str,
+        claude_args: tuple[str, ...] = (),
     ) -> str:
         """Return a freshly-minted conv id without HTTP."""
         del _client, _bundle, bridge_id
+        assert claude_args == ("--effort", "xhigh")
         return "conv_new"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -6342,7 +6675,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_id=None,
             runner_id="runner_xyz",
             session_bundle=b"fake-bundle",
-            claude_args=(),
+            claude_args=("--effort", "xhigh"),
             command="claude",
             append_system_prompt="Fresh session bridge instructions.",
         )
@@ -7285,9 +7618,11 @@ def test_align_working_directory_raises_when_recorded_path_missing(
     )
 
 
+@pytest.mark.parametrize("background", [False, True])
 def test_align_working_directory_redirect_moves_transcript_and_updates_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    background: bool,
 ) -> None:
     """
     User-approved redirect moves Claude's transcript into the current cwd.
@@ -7324,6 +7659,13 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "",
     ]
     source.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+    if background:
+        sessions = projects_dir.parent / "sessions"
+        sessions.mkdir()
+        (sessions / f"{os.getppid()}.json").write_text(
+            json.dumps({"sessionId": external_session_id, "kind": "bg"})
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(projects_dir.parent))
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(
         claude_native,
@@ -7345,6 +7687,13 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         / claude_native._sanitize_claude_project_name(str(current_workspace.resolve()))
         / f"{external_session_id}.jsonl"
     )
+    state = read_launch_state("conv_redirect")
+    assert state is not None
+    assert state.working_directory == str(current_workspace.resolve())
+    if background:
+        assert source.read_text(encoding="utf-8") == "\n".join(original_lines) + "\n"
+        assert not target.exists()
+        return
     assert target.is_file(), f"redirect target {target} was not created"
     copied_payloads = [
         json.loads(line)
@@ -7361,9 +7710,6 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "sessionId": external_session_id,
     }, "records without top-level cwd must be preserved aside from compact JSON formatting"
     assert not source.exists(), f"source transcript {source} should be removed after move"
-    state = read_launch_state("conv_redirect")
-    assert state is not None
-    assert state.working_directory == str(current_workspace.resolve())
 
 
 def test_align_working_directory_redirect_replaces_stale_target(
@@ -7654,6 +8000,225 @@ def test_clone_claude_transcript_returns_none_when_source_missing(
         str(clone_workspace.resolve())
     )
     assert not clone_project_dir.exists() or not any(clone_project_dir.iterdir())
+
+
+_BACKGROUND_LAUNCH_BLOCKS = [
+    {
+        "type": "text",
+        "text": (
+            "Async agent launched successfully.\nagentId: a46f605cc60f701a8\n"
+            "The agent is working in the background. You will be notified "
+            "automatically when it completes."
+        ),
+    }
+]
+_BACKGROUND_AGENT_HANDLE = {
+    "isAsync": True,
+    "status": "async_launched",
+    "agentId": "a46f605cc60f701a8",
+    "description": "Background module investigation",
+    "prompt": "inspect the module for leaks",
+    "outputFile": "/tmp/claude/tasks/a46f605cc60f701a8.output",
+    "canReadOutputFile": True,
+}
+_BACKGROUND_SKILL_HANDLE = {
+    "status": "forked",
+    "background": True,
+    "agentId": "b2c3d4e5f6a7b8c9d",
+    "commandName": "/investigate",
+    "result": "Forked skill launched in the background.",
+}
+_COMPLETED_AGENT_RESULT = {
+    "status": "completed",
+    "agentId": "c3d4e5f6a7b8c9d0e",
+    "prompt": "summarize the module",
+    "content": [{"type": "text", "text": "Summary ready."}],
+    "totalDurationMs": 1200,
+}
+_FOREGROUND_SKILL_RESULT = {"status": "forked", "agentId": "d4e5f6a7b8c9d0e1f", "result": "done"}
+
+
+def _claude_tool_result_record(
+    uuid: str,
+    parent_uuid: str | None,
+    *,
+    workspace: Path,
+    session_uuid: str,
+    call_id: str,
+    content: object,
+    tool_use_result: object,
+) -> dict[str, object]:
+    return {
+        "type": "user",
+        "cwd": str(workspace.resolve()),
+        "sessionId": session_uuid,
+        "uuid": uuid,
+        "parentUuid": parent_uuid,
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": content}],
+        },
+        "toolUseResult": tool_use_result,
+    }
+
+
+def test_clone_claude_transcript_detaches_live_background_subagent_handles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A clone keeps a background launch's visible result but not the metadata
+    handle Claude Code's resume scan uses to report that agent as orphaned.
+
+    The clone is a new Claude session that cannot own the source's
+    still-running agents; without this a side chat opened mid-fork receives a
+    synthesized failed ``<task-notification>`` for the main chat's agent and
+    the model answers it there. Completed and foreground results keep their
+    metadata, and the source transcript is untouched.
+    """
+    projects_dir = tmp_path / ".claude" / "projects"
+    source_workspace = tmp_path / "source"
+    source_workspace.mkdir()
+    clone_workspace = tmp_path / "clone"
+    clone_workspace.mkdir()
+    source_uuid = "11111111-1111-1111-1111-111111111111"
+    target_uuid = "22222222-2222-2222-2222-222222222222"
+    source_project_dir = projects_dir / claude_native._sanitize_claude_project_name(
+        str(source_workspace.resolve())
+    )
+    source_project_dir.mkdir(parents=True)
+    source_path = source_project_dir / f"{source_uuid}.jsonl"
+    common = {"workspace": source_workspace, "session_uuid": source_uuid}
+    records: list[dict[str, object]] = [
+        {
+            "type": "user",
+            "cwd": str(source_workspace.resolve()),
+            "sessionId": source_uuid,
+            "uuid": "u1",
+            "parentUuid": None,
+            "message": {"role": "user", "content": "investigate the module in the background"},
+        },
+        {
+            "type": "assistant",
+            "cwd": str(source_workspace.resolve()),
+            "sessionId": source_uuid,
+            "uuid": "u2",
+            "parentUuid": "u1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bg",
+                        "name": "Agent",
+                        "input": {"subagent_type": "fork", "prompt": "inspect the module"},
+                    }
+                ],
+            },
+        },
+        _claude_tool_result_record(
+            "u3",
+            "u2",
+            call_id="toolu_bg",
+            content=_BACKGROUND_LAUNCH_BLOCKS,
+            tool_use_result=_BACKGROUND_AGENT_HANDLE,
+            **common,
+        ),
+        _claude_tool_result_record(
+            "u4",
+            "u3",
+            call_id="toolu_skill",
+            content="Forked skill launched in the background.",
+            tool_use_result=_BACKGROUND_SKILL_HANDLE,
+            **common,
+        ),
+        _claude_tool_result_record(
+            "u5",
+            "u4",
+            call_id="toolu_sync",
+            content="Summary ready.",
+            tool_use_result=_COMPLETED_AGENT_RESULT,
+            **common,
+        ),
+        _claude_tool_result_record(
+            "u6",
+            "u5",
+            call_id="toolu_fg",
+            content="done",
+            tool_use_result=_FOREGROUND_SKILL_RESULT,
+            **common,
+        ),
+    ]
+    source_text = "".join(json.dumps(record) + "\n" for record in records)
+    source_path.write_text(source_text, encoding="utf-8")
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
+
+    result = claude_native._clone_claude_transcript(
+        source_external_session_id=source_uuid,
+        target_external_session_id=target_uuid,
+        clone_workspace=clone_workspace.resolve(),
+    )
+
+    assert result is not None and result.is_file()
+    cloned = {
+        payload["uuid"]: payload
+        for payload in (
+            json.loads(line) for line in result.read_text(encoding="utf-8").splitlines() if line
+        )
+    }
+    # Live background handles become the JSON-safe string of the visible
+    # result, the form Omnigent already writes for rebuilt tool results; the
+    # model-visible content block is unchanged.
+    assert cloned["u3"]["toolUseResult"] == json.dumps(
+        _BACKGROUND_LAUNCH_BLOCKS, separators=(",", ":")
+    )
+    assert cloned["u3"]["message"] == records[2]["message"]
+    assert cloned["u4"]["toolUseResult"] == json.dumps("Forked skill launched in the background.")
+    assert cloned["u4"]["message"] == records[3]["message"]
+    for payload in (cloned["u3"], cloned["u4"]):
+        assert not isinstance(json.loads(payload["toolUseResult"]), dict)
+    # Results that owe no notification keep Claude's own metadata.
+    assert cloned["u5"]["toolUseResult"] == _COMPLETED_AGENT_RESULT
+    assert cloned["u6"]["toolUseResult"] == _FOREGROUND_SKILL_RESULT
+    # The clone rewrite itself is unchanged: new session id, clone cwd, chain kept.
+    assert all(payload["sessionId"] == target_uuid for payload in cloned.values())
+    assert all(payload["cwd"] == str(clone_workspace.resolve()) for payload in cloned.values())
+    assert [(payload["uuid"], payload["parentUuid"]) for payload in cloned.values()] == [
+        ("u1", None),
+        ("u2", "u1"),
+        ("u3", "u2"),
+        ("u4", "u3"),
+        ("u5", "u4"),
+        ("u6", "u5"),
+    ]
+    assert source_path.read_text(encoding="utf-8") == source_text
+
+
+def test_copy_transcript_with_cwd_keeps_background_handles_for_the_same_session(
+    tmp_path: Path,
+) -> None:
+    """
+    Moving a session's own transcript between project dirs keeps the handle:
+    that Claude process really did exit, so its orphan accounting must still run.
+    """
+    record = _claude_tool_result_record(
+        "u1",
+        None,
+        workspace=tmp_path / "old",
+        session_uuid="11111111-1111-1111-1111-111111111111",
+        call_id="toolu_bg",
+        content=_BACKGROUND_LAUNCH_BLOCKS,
+        tool_use_result=_BACKGROUND_AGENT_HANDLE,
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    target = tmp_path / "target.jsonl"
+
+    claude_native._copy_transcript_with_cwd(source=source, target=target, current=tmp_path)
+
+    moved = json.loads(target.read_text(encoding="utf-8"))
+    assert moved["toolUseResult"] == _BACKGROUND_AGENT_HANDLE
+    assert moved["cwd"] == str(tmp_path)
 
 
 def test_clone_claude_transcript_repairs_stale_image_duplication(
@@ -9331,6 +9896,86 @@ def test_claude_transcript_records_handles_native_compaction_messages() -> None:
     assert "discarded before compaction" not in json.dumps(records)
 
 
+def test_claude_transcript_records_replay_pi_compaction_snapshot() -> None:
+    """A Pi-native compaction snapshot keeps its summary and retained tool pair."""
+    summary = (
+        "The conversation history before this point was compacted into the following summary:"
+        "\n\n<summary>\nPI-CHECKPOINT\n</summary>"
+    )
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_before",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "summarized raw history"}],
+        },
+        {
+            "id": "cmp_pi",
+            "type": "compaction",
+            "summary": "PI-CHECKPOINT",
+            "token_count": 50,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": summary}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "reading"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "toolu_pi",
+                    "name": "read",
+                    "arguments": '{"path":"a.txt"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "toolu_pi",
+                    "output": "retained result",
+                },
+            ],
+        },
+        {
+            "id": "msg_after",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_pi",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    assert [record.get("subtype") or record["message"] for record in records] == [
+        "compact_boundary",
+        {"role": "user", "content": summary},
+        {"role": "assistant", "content": [{"type": "text", "text": "reading"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_pi", "name": "read", "input": {"path": "a.txt"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_pi", "content": "retained result"}
+            ],
+        },
+        {"role": "user", "content": "after compaction"},
+    ]
+    assert all(record["parentUuid"] == previous["uuid"] for previous, record in pairwise(records))
+    assert "summarized raw history" not in json.dumps(records)
+
+
 def test_claude_transcript_records_downgrades_compaction_stripped_image() -> None:
     """A compaction-stripped image block never resumes as an invalid image.
 
@@ -10757,12 +11402,61 @@ def _picker_response(*aliases: str) -> bytes:
     ).encode()
 
 
-async def test_probe_claude_model_options_runs_bare(
+@pytest.mark.parametrize(
+    ("harness_config", "path_override", "expected_command", "expected_prefix", "with_launcher"),
+    [
+        ({}, None, "claude", [], False),
+        ({"command": "claude-wrapper", "args": ["--"]}, None, "claude-wrapper", ["--"], False),
+        (
+            {"command": "env", "args": ["CLAUDE_MODE=gateway", "claude-wrapper", "--"]},
+            None,
+            "env",
+            ["CLAUDE_MODE=gateway", "claude-wrapper", "--"],
+            False,
+        ),
+        (
+            {"command": "claude-wrapper", "args": ["--"]},
+            "claude-override",
+            "claude-override",
+            ["--"],
+            False,
+        ),
+        ({"command": "claude-wrapper", "args": ["--"]}, None, "claude-wrapper", ["--"], True),
+    ],
+    ids=["bare", "configured-wrapper", "env-wrapper", "path-override", "launcher-composition"],
+)
+async def test_probe_claude_model_options_uses_harness_startup_config(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness_config: dict[str, object],
+    path_override: str | None,
+    expected_command: str,
+    expected_prefix: list[str],
+    with_launcher: bool,
 ) -> None:
-    """An unconfigured launch reads the CLI picker without injecting settings."""
+    """Enumeration and alias resolution use the terminal's command and base args."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    if path_override is not None:
+        monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", path_override)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"harness": {"claude-native": harness_config}})
+    )
+    if with_launcher:
+        from omnigent.claude_launcher import ClaudeLauncher
+
+        class Launcher(ClaudeLauncher):
+            def launch(self, command: str, args: list[str]) -> tuple[str, list[str]]:
+                assert command == expected_command
+                assert args[: len(expected_prefix) + 1] == [*expected_prefix, "-p"]
+                return "plugin-wrapper", [command, *args]
+
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "test-launcher")
+        monkeypatch.setattr("omnigent.claude_launcher._load_launcher", lambda _name: Launcher())
 
     class _FakeProcess:
+        pid = None
         returncode = 0
 
         async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -10772,6 +11466,11 @@ async def test_probe_claude_model_options_runs_bare(
             )
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
+        prefix = [expected_command, *expected_prefix] if with_launcher else expected_prefix
+        expected_argv = claude_native._proc.pipe_supervised_command(
+            "plugin-wrapper" if with_launcher else expected_command, *prefix, "-p"
+        )
+        assert (command, *args)[: len(expected_argv)] == expected_argv
         # No --settings without an apiKeyHelper to deliver.
         assert "--settings" not in args
         return _FakeProcess()
@@ -10813,6 +11512,8 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
     }
 
     class _Run:
+        pid = None
+
         def __init__(self, stdout: bytes, returncode: int = 0) -> None:
             self.returncode = returncode
             self._stdout = stdout
@@ -10870,6 +11571,7 @@ async def test_probe_claude_model_options_resolves_each_alias_via_the_harness(
 
 async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The probe launches Claude Code with the exact launch env.
 
@@ -10878,11 +11580,13 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     apiKeyHelper is delivered via ``--settings`` — so the enumeration
     answers for the session the user would actually get.
     """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     monkeypatch.setenv("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
     monkeypatch.setenv("CLAUDECODE", "1")
     captured: dict[str, Any] = {}
 
     class _FakeProcess:
+        pid = None
         returncode = 0
 
         async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -10907,7 +11611,8 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert probe is not None
     assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
     args = captured["args"]
-    assert args[:3] == ["-p", "--input-format", "stream-json"]
+    probe_start = args.index("-p")
+    assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
     assert settings_payload == {"apiKeyHelper": "printf token"}
@@ -11136,6 +11841,7 @@ async def test_probe_claude_model_options_returns_none_on_probe_failure(
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
 
     class _FailedProcess:
+        pid = None
         returncode = 1
 
         async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
@@ -11471,8 +12177,9 @@ def _point_claude_at(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
 def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, wrapped: bool
 ) -> None:
     """An upgraded Claude Code misses the catalog its predecessor wrote.
 
@@ -11484,9 +12191,17 @@ def test_catalog_fingerprint_changes_when_the_cli_is_upgraded(
     new_release = tmp_path / "2.1.250"
     old_release.write_text("old")
     new_release.write_text("newer build")
+    old_release.chmod(0o755)
+    new_release.chmod(0o755)
     link = tmp_path / "claude"
     link.symlink_to(old_release)
     _point_claude_at(monkeypatch, link)
+    if wrapped:
+        monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+        monkeypatch.setattr(
+            "omnigent.claude_launcher.resolve_claude_launch",
+            lambda command, args: ("env", [str(link), *args]),
+        )
 
     before = claude_native.claude_catalog_fingerprint(None)
 
@@ -11517,6 +12232,43 @@ def test_catalog_fingerprint_survives_a_missing_binary(
     _point_claude_at(monkeypatch, tmp_path / "absent")
 
     assert isinstance(claude_native.claude_catalog_fingerprint(None), str)
+
+
+def test_catalog_fingerprint_changes_with_launch_command_and_args(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed wrapper or its mode must not reuse the previous model catalog."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OMNIGENT_CLAUDE_LAUNCHER", raising=False)
+    monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
+    fingerprints = {claude_native.claude_catalog_fingerprint(None)}
+    for command, args in [
+        ("claude-wrapper-a", ["--"]),
+        ("claude-wrapper-b", ["--"]),
+        ("env", ["CLAUDE_MODE=direct", "claude-wrapper-a", "--"]),
+        ("env", ["CLAUDE_MODE=gateway", "claude-wrapper-a", "--"]),
+    ]:
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"harness": {"claude-native": {"command": command, "args": args}}})
+        )
+        fingerprint = claude_native.claude_catalog_fingerprint(None)
+        assert fingerprint not in fingerprints
+        assert claude_native.claude_catalog_fingerprint(None) == fingerprint
+        fingerprints.add(fingerprint)
+
+    for invocation in [
+        ("plugin-wrapper-a", ["--mode=direct"]),
+        ("plugin-wrapper-b", ["--mode=direct"]),
+        ("plugin-wrapper-b", ["--mode=gateway"]),
+    ]:
+        monkeypatch.setattr(
+            "omnigent.claude_launcher.resolve_claude_launch",
+            lambda *_args, result=invocation: result,
+        )
+        fingerprint = claude_native.claude_catalog_fingerprint(None)
+        assert fingerprint not in fingerprints
+        assert claude_native.claude_catalog_fingerprint(None) == fingerprint
+        fingerprints.add(fingerprint)
 
 
 # ── ambient gateway detection ─────────────────────────────

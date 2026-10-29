@@ -43,6 +43,8 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+
 pexpect = pytest.importorskip("pexpect")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -68,6 +70,7 @@ def _non_utf8_env(home: Path) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if not k.startswith("OMNIGENT_")}
     env.pop("RUNNER_SERVER_URL", None)
     env["HOME"] = str(home)
+    env["OMNIGENT_DATA_DIR"] = str(home / ".omnigent")
     env["XDG_CONFIG_HOME"] = str(home / ".config")
     env["LC_ALL"] = "C"
     env["LANG"] = "C"
@@ -144,3 +147,6 @@ def test_bundled_agent_launch_survives_non_utf8_locale(agent: str, tmp_path: Pat
     finally:
         with contextlib.suppress(Exception):
             child.close(force=True)
+        # Detached host/server processes outlive the CLI and can claim a later test's host.
+        _, survivors = reap_leaked_omnigent_processes(home / ".omnigent")
+        assert not survivors, f"Test runtime processes survived cleanup: {survivors}"
