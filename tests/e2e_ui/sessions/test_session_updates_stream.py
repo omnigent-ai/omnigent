@@ -350,10 +350,11 @@ def test_running_agent_updates_do_not_reload_loaded_folder_pages(
                 ],
             }
             report = (
+                f"folder requests: {folder_requests}\n"
                 f"tab A timeline:\n{_timeline_since(tab_a_traffic, start)}\n"
                 f"tab B timeline:\n{_timeline_since(tab_b_traffic, start)}"
             )
-            assert folder_requests == {"tab A": [], "tab B": []}, report
+            assert not folder_requests["tab A"] and not folder_requests["tab B"], report
     finally:
         for session_id in filler_ids:
             httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)

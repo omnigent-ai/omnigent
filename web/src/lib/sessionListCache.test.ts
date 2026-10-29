@@ -7,6 +7,7 @@ import {
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  filtersFromProjectQueryKey,
   parseProjectSessionsQueryKey,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
@@ -471,6 +472,9 @@ describe("parseProjectSessionsQueryKey", () => {
         expect(
           parseProjectSessionsQueryKey(["project-sessions", "archived", sortBy, archived]),
         ).toEqual({ project: "archived", sortBy, archived });
+        expect(
+          filtersFromProjectQueryKey(["project-sessions", "archived", sortBy, archived]),
+        ).toMatchObject({ sortBy, includeArchived: archived });
       }
     },
   );
