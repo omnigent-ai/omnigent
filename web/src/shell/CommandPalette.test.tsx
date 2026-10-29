@@ -322,6 +322,26 @@ describe("CommandPalette — sessions", () => {
     expect(screen.getByText("Two")).toBeTruthy();
   });
 
+  it("lists a session bumped in place by a pushed update first", () => {
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              { ...conv("c1", "Older"), updated_at: 1 },
+              { ...conv("c2", "Bumped"), updated_at: 5 },
+            ],
+          },
+        ],
+      },
+      isFetching: false,
+    });
+    renderPalette();
+
+    const labels = screen.getAllByText(/^(Older|Bumped)$/).map((row) => row.textContent);
+    expect(labels).toEqual(["Bumped", "Older"]);
+  });
+
   it("indents session rows so their label aligns with the icon-prefixed actions", () => {
     setSessions([conv("c1", "Fix the parser")]);
     renderPalette();

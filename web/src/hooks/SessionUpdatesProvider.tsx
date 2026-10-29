@@ -53,14 +53,13 @@ const DEBOUNCE_MS = 250;
  *
  * @param queryClient - The app QueryClient.
  * @param items - Wire items from a snapshot/changed frame.
- * @returns Ids not found in any cached page and whether any patched row
- *   needs a server refetch to preserve filtered-query membership or sort
- *   order.
+ * @returns Top-level ids not found in any cached page and whether any patched
+ *   row needs a server refetch to preserve filtered-query membership or the
+ *   next-page cursor.
  */
 function applyItemsToCache(
   queryClient: QueryClient,
   items: SessionListWireItem[],
-  activeId: string | undefined,
   viewerId?: string | null,
 ): { missingIds: string[]; needsRefetch: boolean } {
   // Frames are full rows with explicit nulls; convert null → undefined so a
@@ -86,7 +85,7 @@ function applyItemsToCache(
       data: merged,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filters, activeId);
+    } = mergeItemsIntoPages(data, itemsById, filters);
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     // Surface a brand-new watched session (a create here or elsewhere, a share)
@@ -124,7 +123,7 @@ function applyItemsToCache(
       data: next,
       found,
       needsRefetch: queryNeedsRefetch,
-    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key), activeId);
+    } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     for (const id of found) foundAnywhere.add(id);
     if (queryNeedsRefetch) needsRefetch = true;
     if (next !== data) queryClient.setQueryData(key, next);
@@ -151,10 +150,11 @@ function applyItemsToCache(
       .filter((row) => !row.archived);
     return changed ? { ...previous, conversations } : previous;
   });
-  return {
-    missingIds: [...itemsById.keys()].filter((id) => !foundAnywhere.has(id)),
-    needsRefetch,
-  };
+  // Sub-agent rows are listed only under their parent, never in these lists.
+  const missingIds = [...itemsById.values()]
+    .filter((item) => item.parent_session_id == null && !foundAnywhere.has(item.id))
+    .map((item) => item.id);
+  return { missingIds, needsRefetch };
 }
 
 /**
@@ -414,13 +414,11 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
           const { missingIds, needsRefetch } = applyItemsToCache(
             queryClient,
             frame.items,
-            activeIdRef.current,
             getCurrentUserId(),
           );
           // A watched id absent from every page is a new session whose sort
-          // position we can't place locally. Membership-affecting deltas
-          // (archive/search/connected filters) and updated_at resorting need
-          // the same server-side reconciliation.
+          // position we can't place locally. Membership-affecting deltas and a
+          // moved next-page cursor need the same server-side reconciliation.
           //
           // Skip the active session: its updated_at bumps on open before the
           // initial list fetch returns, so it lands in missingIds even though

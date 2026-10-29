@@ -24,6 +24,7 @@ import {
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { sessionRowsPage } from "@/lib/sidebarData";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -272,7 +273,11 @@ export function CommandPalette({
 
   const sessions = useMemo(() => {
     if (searching) return paletteSessions(titleSearch.data?.pages ?? []);
-    const out = paletteSessions(data?.pages ?? []);
+    // Pushed updates patch rows in place, so restore recency order locally.
+    const recent = (data?.pages ?? [])
+      .flatMap((page) => page.data)
+      .sort((first, second) => second.updated_at - first.updated_at);
+    const out = paletteSessions([sessionRowsPage(recent)]);
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out

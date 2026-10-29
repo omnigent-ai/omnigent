@@ -216,41 +216,37 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
   return false;
 }
 
+/** Row fields the server filters list membership on (archive state, owner, project). */
+const MEMBERSHIP_FIELDS = ["archived", "owner", "project_id"];
+
 /**
  * Decide whether a field change needs server-side list reconciliation.
  *
- * The server owns pagination, updated_at sorting, search matches over title
- * and item content, and archive filtering. Push frames update visible row
- * fields immediately; this tells the provider when to follow with a list
- * refetch so filtered query membership and page order converge. Title
- * changes reconcile every list variant because a row absent from a search
- * query may now match it.
+ * Push frames patch row fields in place and lists sort loaded rows client-side,
+ * so only changes the client cannot place need a refetch: a move between
+ * projects, owners, or archive state (the caller's prefix-wide invalidation
+ * reconciles every variant), a rename under a search filter, and an
+ * `updated_at` bump on the next-page cursor, which would shift the next page
+ * and the Mine/Shared watermark.
  *
  * @param changed - Names of wire fields that changed the cached row.
- * @param isActiveRow - Whether this row is the active chat (the one held
- *   in place by `ActiveChatOverride`). An `updated_at`-only change on it
- *   doesn't move the visible row, so it doesn't need a server resort.
+ * @param previous - The cached row before the patch.
+ * @param next - The row after applying the wire item.
+ * @param filters - Canonical filters for the query being patched.
+ * @param isNextPageCursor - Whether this row is the next-page cursor.
  * @returns `true` when the query should be invalidated after patching.
  */
-function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
-  if (changed.has("archived")) return true;
-  if (changed.has("title")) return true;
-  // A labels change can move a row between project-filtered variants and the
-  // project folders (["project-sessions", …]). A session relabeled INTO the
-  // selected project isn't in that filtered cache yet, so no local patch can
-  // place it; only a server reconcile can. The unfiltered variant where the
-  // row lives detects the label change here and flags the refetch, and the
-  // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
-  // the filtered variants too.
-  if (changed.has("labels")) return true;
-  // updated_at only affects the server's sort order. The active chat row is
-  // pinned at its position by ActiveChatOverride regardless of that order, so
-  // an updated_at bump on it — the common case while the user sends messages —
-  // never changes what's visible. Skip the full-list refetch it would
-  // otherwise force every tick. Any other row's updated_at still needs the
-  // server resort to move it.
-  if (changed.has("updated_at") && !isActiveRow) return true;
-  return false;
+function changedFieldsNeedRefetch(
+  changed: Set<string>,
+  previous: Conversation,
+  next: Conversation,
+  filters: ConversationListFilters,
+  isNextPageCursor: boolean,
+): boolean {
+  if (MEMBERSHIP_FIELDS.some((field) => changed.has(field))) return true;
+  if (previous.labels?.[PROJECT_LABEL_KEY] !== next.labels?.[PROJECT_LABEL_KEY]) return true;
+  if (changed.has("title") && filters.searchQuery !== "") return true;
+  return changed.has("updated_at") && isNextPageCursor;
 }
 
 /**
@@ -269,9 +265,6 @@ function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): b
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @param activeId - The active chat's conversation id (`/c/:id`), or
- *   `undefined` when not on a chat route. Its `updated_at` bumps don't force
- *   a refetch because `ActiveChatOverride` pins its visible position.
  * @returns The possibly updated data, ids found in it, and whether this
  *   query needs a server refetch after the local patch.
  */
@@ -279,12 +272,13 @@ export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-  activeId: string | undefined,
 ): { data: ConversationsInfiniteData | undefined; found: Set<string>; needsRefetch: boolean } {
   const found = new Set<string>();
   if (!data) return { data, found, needsRefetch: false };
   let anyPageChanged = false;
   let needsRefetch = false;
+  const lastPage = data.pages.at(-1);
+  const nextPageCursor = lastPage?.has_more ? lastPage.last_id : null;
   const pages = data.pages.map((page) => {
     let rowChanged = false;
     const nextData: Conversation[] = [];
@@ -306,7 +300,7 @@ export function mergeItemsIntoPages(
         needsRefetch = true;
         continue;
       }
-      if (changedFieldsNeedRefetch(changed, conv.id === activeId)) {
+      if (changedFieldsNeedRefetch(changed, conv, nextConv, filters, conv.id === nextPageCursor)) {
         needsRefetch = true;
       }
       rowChanged = true;
@@ -522,25 +516,17 @@ export function overlayTitleIntoCaches(
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   })) {
-    // activeId only gates `needsRefetch`, which both callers ignore —
-    // they patch in place rather than refetching.
     const { data: next } = mergeItemsIntoPages(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromProjectQueryKey(key),
-      undefined,
-    );
+    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
@@ -581,19 +567,13 @@ export function overlayArchivedIntoCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
     if (next !== data) queryClient.setQueryData(key, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromProjectQueryKey(key),
-      undefined,
-    );
+    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
