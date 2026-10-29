@@ -5708,6 +5708,8 @@ def inject_slash_command(
         if a ``tmux send-keys`` invocation fails, if the typed
         command verifiably never left the input box (submit swallowed).
     """
+    import subprocess
+
     if not command or not command.startswith("/"):
         raise ValueError(f"slash command must start with '/'; got {command!r}")
     if "\n" in command:
@@ -5766,8 +5768,9 @@ def inject_slash_command(
     switch = _begin_model_switch(bridge_dir, command)
     try:
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    except BaseException:
-        if switch is not None:
+    except BaseException as exc:
+        # A timed-out send may still have delivered the Enter, so it stays pending.
+        if switch is not None and not isinstance(exc.__cause__, subprocess.TimeoutExpired):
             switch.cancel()
         raise
     if draft_seen:

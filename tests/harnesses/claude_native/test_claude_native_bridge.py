@@ -7184,7 +7184,9 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     ]
 
 
-@pytest.mark.parametrize("outcome", ["submitted", "unconfirmed", "enter failed"])
+@pytest.mark.parametrize(
+    "outcome", ["submitted", "unconfirmed", "enter timed out", "enter failed"]
+)
 def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
 ) -> None:
@@ -7215,6 +7217,8 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
             # A stalled pane keeps showing the typed command after Enter.
             result.stdout = _composer_pane("/model sonnet" if outcome == "unconfirmed" else "")
         elif cmd[-1] == "Enter":
+            if outcome == "enter timed out":
+                raise subprocess.TimeoutExpired(cmd, 1)
             if outcome == "enter failed":
                 result.returncode = 1
             elif outcome == "submitted":
@@ -7230,8 +7234,8 @@ def test_inject_slash_command_keeps_a_model_switch_out_of_the_users_default(
     else:
         with pytest.raises(RuntimeError):
             claude_native_bridge.inject_slash_command(bridge_dir, command="/model sonnet")
-    if outcome == "unconfirmed":
-        # A queued Enter submits the command once the pane recovers.
+    if outcome in ("unconfirmed", "enter timed out"):
+        # The Enter may have reached the pane; its save can land afterwards.
         settings_path.write_text('{"model": "sonnet"}', encoding="utf-8")
     default_model_guard.settle_default_model(settings_path, state_dir=state_dir)
 

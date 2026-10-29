@@ -126,6 +126,43 @@ def test_a_second_session_does_not_take_an_unsettled_save_for_the_default(
     assert _read(settings) == {"model": "opus"}
 
 
+def test_symlink_aliases_share_one_default_baseline(paths: tuple[Path, Path]) -> None:
+    settings, state = paths
+    alias = settings.parent / "alias.json"
+    alias.symlink_to(settings)
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    _write(settings, {"model": "sonnet"})
+
+    default_model_guard.begin_model_switch(alias, "haiku", state_dir=state)
+    default_model_guard.settle_default_model(settings, state_dir=state)
+    _write(settings, {"model": "haiku"})
+    default_model_guard.settle_default_model(alias, state_dir=state)
+
+    assert _read(settings) == {"model": "opus"}
+
+
+def test_an_idle_poll_leaves_the_record_alone(
+    paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, state = paths
+    _write(settings, {"model": "opus"})
+    default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
+    writes: list[Path] = []
+    real_write = default_model_guard._atomic_write
+    monkeypatch.setattr(
+        default_model_guard,
+        "_atomic_write",
+        lambda target, *args, **kwargs: (
+            writes.append(target) or real_write(target, *args, **kwargs)
+        ),
+    )
+
+    assert default_model_guard.settle_default_model(settings, state_dir=state)
+
+    assert writes == []
+
+
 def test_registers_nothing_when_the_default_is_already_that_model(
     paths: tuple[Path, Path],
 ) -> None:
@@ -171,9 +208,21 @@ def test_an_expired_switch_leaves_a_later_save_alone(
     assert _read(settings) == {"model": "sonnet"}
 
 
-def test_the_watcher_restores_the_default_on_its_own(tmp_path: Path) -> None:
+def test_the_watcher_restores_the_default_on_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings, state = tmp_path / "settings.json", tmp_path / "state"
     _write(settings, {"model": "opus"})
+    real_settle = default_model_guard.settle_default_model
+    calls: list[Path] = []
+
+    def settle_failing_once(path: Path, *, state_dir: Path) -> bool:
+        calls.append(path)
+        if len(calls) == 1:
+            raise OSError("state dir briefly unavailable")
+        return real_settle(path, state_dir=state_dir)
+
+    monkeypatch.setattr(default_model_guard, "settle_default_model", settle_failing_once)
     default_model_guard.begin_model_switch(settings, "sonnet", state_dir=state)
 
     _write(settings, {"model": "sonnet"})

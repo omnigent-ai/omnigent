@@ -42,6 +42,10 @@ PENDING_SWITCH_TTL_S = 30 * 60
 _WATCH_POLL_S = 0.25
 _LOCK_TIMEOUT_S = 5.0
 _RESTORE_ATTEMPTS = 3
+# A watcher that keeps failing (locks, filesystem) backs off, then gives up;
+# the next switch restarts it and the record keeps the default meanwhile.
+_WATCH_MAX_FAILURES = 12
+_WATCH_MAX_BACKOFF_S = 30.0
 
 
 _MISSING = object()
@@ -95,6 +99,7 @@ def begin_model_switch(
         default is already *model_arg*) or the record could not be written.
     """
     model = _normalized(model_arg)
+    settings_path = _canonical(settings_path)
     try:
         with _locked_record(state_dir, settings_path) as record_path:
             record: dict[str, Any] | None = _load_record(record_path)
@@ -127,10 +132,12 @@ def settle_default_model(settings_path: Path, *, state_dir: Path) -> bool:
     :param state_dir: Directory for the shared records.
     :returns: ``True`` while switches are still pending.
     """
+    settings_path = _canonical(settings_path)
     with _locked_record(state_dir, settings_path) as record_path:
         record = _load_record(record_path)
         if record is None:
             return False
+        loaded = json.dumps(record, sort_keys=True)
         pending = _live_pending(record)
         default = _decode(record["default"])
         current = _read_settings_model(settings_path)
@@ -156,7 +163,9 @@ def settle_default_model(settings_path: Path, *, state_dir: Path) -> bool:
                         )
                 else:
                     pending.remove(saved)
-        _save_record(record_path, record, pending)
+        # An idle poll leaves the record as it is rather than rewriting it.
+        if not pending or json.dumps({**record, "pending": pending}, sort_keys=True) != loaded:
+            _save_record(record_path, record, pending)
         return bool(pending)
 
 
@@ -179,6 +188,7 @@ def _ensure_watcher(settings_path: Path, state_dir: Path) -> None:
 
 def _watch(settings_path: Path, state_dir: Path) -> None:
     """Settle *settings_path* until no switch is pending."""
+    failures = 0
     while True:
         try:
             if not settle_default_model(settings_path, state_dir=state_dir):
@@ -188,16 +198,22 @@ def _watch(settings_path: Path, state_dir: Path) -> None:
                     if not settle_default_model(settings_path, state_dir=state_dir):
                         _watchers.pop((settings_path, state_dir), None)
                         return
+            failures = 0
         except (OSError, FileLockTimeout):
-            # The next switch restarts the watch; its record keeps the default.
-            _logger.warning(
-                "claude-native: stopped watching the default model in %s",
-                settings_path,
-                exc_info=True,
-            )
-            with _watchers_lock:
-                _watchers.pop((settings_path, state_dir), None)
-            return
+            failures += 1
+            if failures == 1 or failures > _WATCH_MAX_FAILURES:
+                _logger.warning(
+                    "claude-native: could not settle the default model in %s (%s)",
+                    settings_path,
+                    "giving up" if failures > _WATCH_MAX_FAILURES else "retrying",
+                    exc_info=True,
+                )
+            if failures > _WATCH_MAX_FAILURES:
+                with _watchers_lock:
+                    _watchers.pop((settings_path, state_dir), None)
+                return
+            time.sleep(min(_WATCH_POLL_S * 2**failures, _WATCH_MAX_BACKOFF_S))
+            continue
         time.sleep(_WATCH_POLL_S)
 
 
@@ -250,6 +266,11 @@ def _decode(encoded: dict[str, Any]) -> object:
     return encoded.get("value") if encoded.get("present") else _MISSING
 
 
+def _canonical(path: Path) -> Path:
+    """The real file behind *path*, so symlinked aliases share one record and lock."""
+    return Path(os.path.realpath(path))
+
+
 def _normalized(model: str) -> str:
     return model.strip().lower()
 
@@ -296,7 +317,7 @@ def _write_settings_model(path: Path, value: object) -> None:
             payload["model"] = value
         # Claude's own layout: two-space indent, raw UTF-8, trailing newline.
         text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
-        # Another writer's edit between the read and the replace is redone on, not lost.
+        # Retry when an edit is detected before the replace.
         if _atomic_write(
             target,
             text,
