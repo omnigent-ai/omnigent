@@ -830,6 +830,7 @@ describe("runner binding", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ reasoning_effort: "high" });
+    expect(new Headers(init.headers).get("x-omnigent-terminal-fallback")).toBe("on");
   });
 
   it("PATCHes model_override as snake_case", async () => {
@@ -1041,6 +1042,9 @@ describe("getSession", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
+    // Without it the snapshot leaves out a prompt held in the terminal.
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(new Headers(init.headers).get("x-omnigent-terminal-fallback")).toBe("on");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
   });
@@ -1141,6 +1145,8 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false",
     );
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(new Headers(init.headers).get("x-omnigent-terminal-fallback")).toBe("on");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
     expect(session.usageIncluded).toBe(false);

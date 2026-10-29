@@ -1105,7 +1105,7 @@ export async function updateSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...TERMINAL_FALLBACK_HEADERS },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -1159,7 +1159,9 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
  * with no transient (delta) coverage.
  */
 export async function getSession(sessionId: string): Promise<Session> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: TERMINAL_FALLBACK_HEADERS,
+  });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
@@ -1202,7 +1204,7 @@ export async function getSessionSlim(
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
-    { signal: options.signal },
+    { signal: options.signal, headers: TERMINAL_FALLBACK_HEADERS },
   );
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }

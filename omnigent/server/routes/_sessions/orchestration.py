@@ -260,6 +260,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
+    _client_supports_terminal_fallback,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
     _collect_descendant_conversation_ids,
@@ -290,6 +291,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _is_kiro_native_session,
     _is_native_interrupt_record,
+    _is_prompt_held_in_terminal,
     _last_task_error_from_labels,
     _last_task_error_runner_id_from_labels,
     _latest_assistant_text_from_store,
@@ -13887,6 +13889,16 @@ async def _get_session_snapshot(
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+    pending_elicitation_events = await asyncio.to_thread(
+        _pending_elicitation_snapshot_for_session,
+        conv_store,
+        conv,
+    )
+    if request is not None and not _client_supports_terminal_fallback(request.headers):
+        # Older clients saw a prompt held in the terminal expire on the stream.
+        pending_elicitation_events = [
+            event for event in pending_elicitation_events if not _is_prompt_held_in_terminal(event)
+        ]
     response = _build_session_response(
         conv,
         items,
@@ -13904,11 +13916,7 @@ async def _get_session_snapshot(
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
-        pending_elicitation_events=await asyncio.to_thread(
-            _pending_elicitation_snapshot_for_session,
-            conv_store,
-            conv,
-        ),
+        pending_elicitation_events=pending_elicitation_events,
         subtree_usage=subtree_usage,
         viewer_id=viewer_id,
         agent_store=agent_store,

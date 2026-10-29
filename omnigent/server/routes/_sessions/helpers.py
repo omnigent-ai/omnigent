@@ -9827,14 +9827,19 @@ def _client_supports_terminal_fallback(headers: Mapping[str, str]) -> bool:
     return headers.get(TERMINAL_FALLBACK_CLIENT_HEADER, "").lower() == "on"
 
 
+def _is_prompt_held_in_terminal(event: dict[str, Any]) -> bool:
+    """Return whether ``event`` publishes a prompt held in the agent's terminal."""
+    params = event.get("params")
+    return (
+        event.get("type") == "response.elicitation_request"
+        and isinstance(params, dict)
+        and "terminal_fallback" in params
+    )
+
+
 def _expire_held_prompt_for_older_client(event: dict[str, Any]) -> dict[str, Any]:
     """Show an older client a prompt held in the terminal as expired, as it was before holds."""
-    params = event.get("params")
-    if (
-        event.get("type") != "response.elicitation_request"
-        or not isinstance(params, dict)
-        or "terminal_fallback" not in params
-    ):
+    if not _is_prompt_held_in_terminal(event):
         return event
     return {
         "type": "response.elicitation_resolved",
@@ -12457,6 +12462,7 @@ __all__ = [
     "_is_codex_native_subagent",
     "_is_devin_native_subagent",
     "_is_kiro_native_session",
+    "_is_prompt_held_in_terminal",
     "_last_task_error_from_labels",
     "_last_task_error_runner_id_from_labels",
     "_latest_assistant_text_from_store",

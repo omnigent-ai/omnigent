@@ -13,7 +13,7 @@ from typing import Any
 
 import pytest
 
-from omnigent.runtime import session_stream
+from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.server import presence, shutdown_state
 from omnigent.server.routes.sessions import _stream_live_events
 
@@ -36,10 +36,12 @@ def _reset_presence_and_subscribers() -> Any:
     presence.reset_for_tests()
     shutdown_state.reset_for_tests()
     session_stream._subscribers.clear()
+    pending_elicitations.reset_for_tests()
     yield
     presence.reset_for_tests()
     shutdown_state.reset_for_tests()
     session_stream._subscribers.clear()
+    pending_elicitations.reset_for_tests()
 
 
 async def test_aclose_cleans_presence_and_subscribers_without_runtime_error(
@@ -134,11 +136,14 @@ async def test_normal_completion_emits_done_and_cleans_up(
 @pytest.mark.parametrize("client_supports_terminal_fallback", [True, False])
 async def test_older_client_sees_prompt_held_in_terminal_expire(
     client_supports_terminal_fallback: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A client that predates held prompts would take the re-publish as a new prompt.
 
     Its callback would answer again and its turn would end on the refused answer.
     """
+    # An app started by an earlier test leaves its database count hook registered.
+    monkeypatch.setattr(pending_elicitations, "_count_persist_hook", None)
     request = {
         "type": "response.elicitation_request",
         "elicitation_id": "elicit_held",

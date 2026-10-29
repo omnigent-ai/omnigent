@@ -2701,6 +2701,14 @@ async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_ret
             f"/v1/sessions/{session_id}/elicitations/{_REATTACH_ELICITATION_ID}"
         )
         assert older_page.json() == {"status": "resolved"}
+        older_snapshot = await client.get(f"/v1/sessions/{session_id}")
+        assert older_snapshot.json()["pending_elicitations"] == []
+        snapshot = await client.get(
+            f"/v1/sessions/{session_id}", headers=_TERMINAL_FALLBACK_HEADERS
+        )
+        assert [event["elicitation_id"] for event in snapshot.json()["pending_elicitations"]] == [
+            _REATTACH_ELICITATION_ID
+        ]
 
         answer = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
         answer_by_url = await client.post(
