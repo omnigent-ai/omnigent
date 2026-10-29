@@ -1010,7 +1010,7 @@ class _FieldInputState:
         # Elicitation the open prompt answers, so another client's verdict
         # for it can release the prompt; set when the abort came from there.
         self._elicitation_id: str | None = None
-        self._resolved_elsewhere: bool = False
+        self._resolved_elsewhere_id: str | None = None
 
     @property
     def pending(self) -> bool:
@@ -1025,10 +1025,9 @@ class _FieldInputState:
         """:returns: ``True`` if collection was cancelled mid-prompt."""
         return self._aborted
 
-    @property
-    def resolved_elsewhere(self) -> bool:
-        """:returns: ``True`` if another client answered the open prompt."""
-        return self._resolved_elsewhere
+    def resolved_elsewhere_for(self, elicitation_id: str) -> bool:
+        """:returns: ``True`` if another client answered *elicitation_id*'s prompt."""
+        return bool(elicitation_id) and self._resolved_elsewhere_id == elicitation_id
 
     def begin(self, field_name: str, elicitation_id: str | None = None) -> asyncio.Future[str]:
         # A fresh prompt is never pre-aborted. Cleared here (not in the
@@ -1036,7 +1035,7 @@ class _FieldInputState:
         # cycle: the loop reads it the instant the await returns, and
         # the only await between fields IS this ``begin``.
         self._aborted = False
-        self._resolved_elsewhere = False
+        self._resolved_elsewhere_id = None
         if self._future is not None and not self._future.done():
             self._future.set_result("")
         self._field_name = field_name
@@ -1052,7 +1051,7 @@ class _FieldInputState:
         if not self.pending or not elicitation_id or elicitation_id != self._elicitation_id:
             return False
         self.cancel()
-        self._resolved_elsewhere = True
+        self._resolved_elsewhere_id = elicitation_id
         return True
 
     def resolve(self, text: str) -> bool:
@@ -1131,8 +1130,11 @@ def _question_prompts(payload: object) -> list[_QuestionPrompt]:
         text = raw.get("question")
         if not isinstance(text, str) or not text:
             continue
+        raw_options = raw.get("options") or []
+        if not isinstance(raw_options, list):
+            continue  # unusable, as in the web form; the y/a/n path takes over
         options: list[tuple[str, str]] = []
-        for option in raw.get("options") or []:
+        for option in raw_options:
             if isinstance(option, str) and option:
                 options.append((option, ""))
             elif isinstance(option, dict) and isinstance(option.get("label"), str):
@@ -1380,6 +1382,16 @@ def _elicitation_resolve_session_id(sdk_event: object, fallback_session_id: str)
         for a mirrored prompt or ``fallback_session_id`` otherwise.
     """
     return getattr(sdk_event, "target_session_id", None) or fallback_session_id
+
+
+def _log_replay_failure(task: asyncio.Task[None]) -> None:
+    """Log a pending-prompt replay that raised; it runs detached from the pump."""
+    if task.cancelled() or task.exception() is None:
+        return
+    # One line, details behind DEBUG: a WARNING with exc_info paints a
+    # traceback over the TUI (no log handlers are configured).
+    _log.warning("Could not replay pending prompts")
+    _log.debug("pending prompt replay failed", exc_info=task.exception())
 
 
 def _dict_or_none(value: object) -> dict[str, object] | None:
@@ -2503,6 +2515,13 @@ class _SessionsChatReplAdapter:
             ready.cancel()
 
     async def _stream_pump(self) -> None:
+        """Run the stream pump; a replay never outlives it (switch, clear, exit)."""
+        try:
+            await self._stream_pump_forever()
+        finally:
+            self._cancel_replay()
+
+    async def _stream_pump_forever(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
 
         Subscribes to the session's SSE stream and pushes every
@@ -2540,9 +2559,7 @@ class _SessionsChatReplAdapter:
                         # The stream doesn't replay prompts raised before it
                         # opened (REPL startup, reconnects); read them once.
                         replay_scheduled = True
-                        self._replay_task = asyncio.create_task(
-                            self._replay_pending_elicitations()
-                        )
+                        self._start_replay(self._session_id)
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2988,16 +3005,35 @@ class _SessionsChatReplAdapter:
                 await asyncio.sleep(0.1 * (2**attempt))
         return False
 
-    async def _replay_pending_elicitations(self) -> None:
-        """Feed prompts raised before this subscription opened through the live path."""
+    def _start_replay(self, session_id: str | None) -> None:
+        """Replay *session_id*'s pending prompts, replacing any earlier replay."""
+        self._cancel_replay()
+        if session_id is None:
+            return
+        self._replay_task = asyncio.create_task(self._replay_pending_elicitations(session_id))
+        self._replay_task.add_done_callback(_log_replay_failure)
+
+    def _cancel_replay(self) -> None:
+        if self._replay_task is not None and not self._replay_task.done():
+            self._replay_task.cancel()
+        self._replay_task = None
+
+    async def _replay_pending_elicitations(self, session_id: str) -> None:
+        """Feed prompts raised before this subscription opened through the live path.
+
+        :param session_id: Session the subscription belongs to; results are
+            dropped if the REPL switched sessions while the snapshot loaded.
+        """
         from omnigent_client._sessions import _SERVER_STREAM_EVENT_ADAPTER
 
-        if self._on_event is None or self._session_id is None:
+        if self._on_event is None:
             return
         try:
-            snapshot = await self._client.sessions.get(self._session_id)
+            snapshot = await self._client.sessions.get(session_id)
         except Exception:  # noqa: BLE001
             _log.debug("could not read pending prompts", exc_info=True)
+            return
+        if self._session_id != session_id:
             return
         for raw in snapshot.pending_elicitations:
             try:
@@ -3063,7 +3099,7 @@ class _SessionsChatReplAdapter:
                 except Exception:  # noqa: BLE001
                     prompted = None
                 fis = self._field_input_state
-                if fis is not None and fis.resolved_elsewhere:
+                if fis is not None and fis.resolved_elsewhere_for(elicitation_id):
                     return None
                 if prompted is not None:
                     resolve_payload["content"] = prompted
@@ -3090,7 +3126,7 @@ class _SessionsChatReplAdapter:
             # Never leave the elicitation unresolved: a failed prompt declines.
             answers = None
         fis = self._field_input_state
-        if fis is not None and fis.resolved_elsewhere:
+        if fis is not None and fis.resolved_elsewhere_for(elicitation_id):
             return None
         if answers is None:
             return {"action": "decline"}

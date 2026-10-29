@@ -396,6 +396,7 @@ def test_question_prompts_follow_web_form_rules() -> None:
                 {"question": "Env?", "options": [{"label": "dev", "description": "d"}, "prod"]},
                 {"id": "0", "question": "Pick", "options": ["a"], "isOther": False},
                 {"question": "Name?", "options": [], "isOther": False},
+                {"question": "Broken?", "options": 1},
                 {"question": "", "options": ["x"]},
                 "not-a-question",
             ]
@@ -477,7 +478,8 @@ def test_resolve_elsewhere_releases_only_its_own_prompt() -> None:
 
     other, mine, value = _run(_run_case())
     assert (other, mine, value) == (False, True, "")
-    assert state.aborted and state.resolved_elsewhere and not state.pending
+    assert state.aborted and state.resolved_elsewhere_for("elicit_mine") and not state.pending
+    assert not state.resolved_elsewhere_for("elicit_other")
 
 
 def _question_adapter() -> tuple[_SessionsChatReplAdapter, _FieldInputState, Any, Any]:
@@ -557,7 +559,7 @@ def test_settle_resolved_elsewhere_releases_an_open_question_prompt() -> None:
         return unrelated, mine
 
     assert _run(_run_case()) == (None, "approved elsewhere")
-    assert state.resolved_elsewhere
+    assert state.resolved_elsewhere_for("elicit_q")
 
 
 def test_replay_feeds_pending_prompts_through_the_live_path() -> None:
@@ -579,7 +581,7 @@ def test_replay_feeds_pending_prompts_through_the_live_path() -> None:
     seen: list[Any] = []
     adapter._on_event = seen.append
 
-    _run(adapter._replay_pending_elicitations())
+    _run(adapter._replay_pending_elicitations("conv_abc"))
 
     # Unknown events are skipped; the prompt arrives as the same typed event
     # the live stream would deliver.
@@ -621,8 +623,8 @@ async def _until(condition: Any, message: str) -> None:
 
 
 def test_concurrent_prompts_are_asked_one_at_a_time() -> None:
-    # Two pickers sharing the input line used to take it from each other in a
-    # loop, and an editor question could submit its prefill unasked.
+    # Concurrent prompts queue for the shared input line instead of taking it
+    # from each other, and an editor question never submits its prefill unasked.
     adapter, fis, client, _ = _question_adapter()
     editor = _question_event()
     editor.elicitation_id = "elicit_editor"
@@ -754,3 +756,128 @@ def test_stream_reconnect_replays_pending_prompts_once_per_subscription() -> Non
     _run(_run_case())
     assert subscriptions >= 2
     assert replay.call_count == subscriptions
+
+
+def _form_event(elicitation_id: str, schema: dict[str, Any]) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        elicitation_id=elicitation_id,
+        message="Fill in",
+        requested_schema=schema,
+        mode="form",
+        phase="tool_call",
+        policy_name="p",
+        content_preview="",
+        url=None,
+    )
+
+
+def test_a_release_elsewhere_does_not_swallow_the_next_verdict() -> None:
+    # The released flag belongs to one elicitation; a later form that fails
+    # before prompting must still post its decline, or the turn hangs.
+    adapter, fis, client, _ = _question_adapter()
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        await _until(lambda: fis.pending, "the question never opened")
+        assert fis.resolve_elsewhere("elicit_q")
+        await task
+        bad_schema = {"properties": {"x": "not-a-property"}}
+        await adapter._handle_elicitation("conv_abc", _form_event("elicit_next", bad_schema))
+
+    _run(_run_case())
+    client.sessions.resolve_elicitation.assert_awaited_once_with(
+        "conv_abc", "elicit_next", {"action": "decline"}
+    )
+
+
+def test_esc_on_a_question_posts_a_decline() -> None:
+    adapter, fis, client, _ = _question_adapter()
+
+    async def _run_case() -> None:
+        task = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        await _until(lambda: fis.pending, "the question never opened")
+        fis.cancel()
+        await task
+
+    _run(_run_case())
+    client.sessions.resolve_elicitation.assert_awaited_once_with(
+        "conv_abc", "elicit_q", {"action": "decline"}
+    )
+
+
+def test_malformed_question_options_fall_back_to_the_approval_prompt() -> None:
+    # An unusable question must still settle the elicitation, not crash it.
+    adapter, _, client, approval_hook = _question_adapter()
+    event = _question_event()
+    event.ask_user_question = {"questions": [{"question": "Q?", "options": 1}]}
+
+    _run(adapter._handle_elicitation("conv_abc", event))
+
+    approval_hook.assert_awaited_once()
+    client.sessions.resolve_elicitation.assert_awaited_once_with(
+        "conv_abc", "elicit_q", {"action": "accept"}
+    )
+
+
+def test_replay_after_switching_sessions_is_dropped() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    adapter, _, client, _ = _question_adapter()
+    release = asyncio.Event()
+    pending = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_old",
+        "method": "elicitation/create",
+        "params": {"mode": "form", "message": "old session"},
+    }
+
+    async def _slow_get(session_id: str) -> Any:
+        await release.wait()
+        return SimpleNamespace(pending_elicitations=[pending])
+
+    client.sessions.get = AsyncMock(side_effect=_slow_get)
+    seen: list[Any] = []
+    adapter._on_event = seen.append
+
+    async def _run_case() -> None:
+        replay = asyncio.create_task(adapter._replay_pending_elicitations("conv_abc"))
+        await _until(lambda: client.sessions.get.await_count == 1, "snapshot never requested")
+        adapter._session_id = "conv_other"
+        release.set()
+        await replay
+
+    _run(_run_case())
+    assert seen == []
+
+
+def test_stopping_the_pump_cancels_its_replay() -> None:
+    from types import SimpleNamespace
+
+    adapter, _, client, _ = _question_adapter()
+    blocked = asyncio.Event()
+
+    async def _stream(session_id: str) -> Any:
+        yield SimpleNamespace()
+        await blocked.wait()
+
+    async def _never_returns(session_id: str) -> Any:
+        await asyncio.Event().wait()
+
+    client.sessions.stream = _stream
+    client.sessions.get = _never_returns
+    adapter._on_event = lambda event: None
+
+    async def _run_case() -> Any:
+        pump = asyncio.create_task(adapter._stream_pump())
+        await _until(lambda: adapter._replay_task is not None, "replay never started")
+        replay = adapter._replay_task
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+        await _until(lambda: replay.done(), "the replay outlived the pump")
+        return replay
+
+    assert _run(_run_case()).cancelled()
