@@ -89,7 +89,7 @@ import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { approve, fetchSessionItemsPage, getSession } from "@/lib/sessionsApi";
-import { NATIVE_REPARK_POLL_MS, TERMINAL_HOLD_POLL_MS } from "@/lib/sse";
+import { NATIVE_REPARK_POLL_MS, TERMINAL_HOLD_POLL_MS } from "@/lib/nativePermissionDelivery";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";

@@ -18,10 +18,12 @@
 
 import { ApprovalCard } from "@/components/blocks/ApprovalCard";
 import {
+  NATIVE_REPARK_POLL_MS,
+  TERMINAL_HOLD_POLL_MS,
   parseNativePermissionDelivery,
   type NativePermissionDelivery,
 } from "@/lib/nativePermissionDelivery";
-import { NATIVE_REPARK_POLL_MS, TERMINAL_HOLD_POLL_MS, parseTerminalFallback } from "@/lib/sse";
+import { parseTerminalFallback } from "@/lib/sse";
 import type { ElicitationTerminalFallback } from "@/lib/events";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";

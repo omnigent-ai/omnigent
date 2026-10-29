@@ -21,3 +21,8 @@ export function parseNativePermissionDelivery(
     ...(action === "accept" || action === "decline" || action === "cancel" ? { action } : {}),
   };
 }
+
+/** How often pages re-read a prompt while a native agent re-delivers it. */
+export const NATIVE_REPARK_POLL_MS = 1000;
+/** A terminal hold lasts until the user answers there, so pages poll it more slowly. */
+export const TERMINAL_HOLD_POLL_MS = 5000;

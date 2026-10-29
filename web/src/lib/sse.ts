@@ -386,11 +386,6 @@ export function parseTerminalFallback(raw: unknown): ElicitationTerminalFallback
   return { answerUndelivered: (raw as Record<string, unknown>).answer_undelivered === true };
 }
 
-/** How often pages re-read a prompt while a native agent re-delivers it. */
-export const NATIVE_REPARK_POLL_MS = 1000;
-/** A terminal hold lasts until the user answers there, so pages poll it more slowly. */
-export const TERMINAL_HOLD_POLL_MS = 5000;
-
 /**
  * Parse one raw SSE-shaped event payload (e.g. an entry from the
  * snapshot's `pending_elicitations` field) into a typed
