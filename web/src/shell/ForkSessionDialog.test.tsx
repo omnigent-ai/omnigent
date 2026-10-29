@@ -12,7 +12,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
-import { ForkSessionDialog } from "./ForkSessionDialog";
+import { ForkSessionDialog, ForkSessionForm } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
 import { toast, type Action } from "sonner";
 import {
@@ -139,23 +139,37 @@ function renderDialog(
     // "loading", which fails the sandbox gate closed — the world every
     // pre-sandbox case here was written against.
     info?: Partial<ServerInfo>;
+    // Render the bare form, which stays mounted when `setOpen(false)` runs, like
+    // a host whose exit animation is still playing.
+    bareForm?: boolean;
   } = { sourceTitle: "My session" },
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
-  const dialog = () => (
-    <ForkSessionDialog
-      sourceSessionId="conv_src"
-      sourceTitle={props.sourceTitle}
-      sourceWorkspace={props.sourceWorkspace}
-      sourceHostId={props.sourceHostId}
-      sourceGitBranch={props.sourceGitBranch}
-      upToResponseId={props.upToResponseId}
-      workspaceRecovery={props.workspaceRecovery}
-      open
-      onOpenChange={vi.fn()}
-    />
-  );
+  // The host owns `open`; tests flip it with setOpen after asserting onOpenChange.
+  let open = true;
+  const onOpenChange = vi.fn();
+  const dialog = () =>
+    props.bareForm ? (
+      <ForkSessionForm
+        sourceSessionId="conv_src"
+        sourceTitle={props.sourceTitle}
+        open={open}
+        onClose={() => onOpenChange(false)}
+      />
+    ) : (
+      <ForkSessionDialog
+        sourceSessionId="conv_src"
+        sourceTitle={props.sourceTitle}
+        sourceWorkspace={props.sourceWorkspace}
+        sourceHostId={props.sourceHostId}
+        sourceGitBranch={props.sourceGitBranch}
+        upToResponseId={props.upToResponseId}
+        workspaceRecovery={props.workspaceRecovery}
+        open={open}
+        onOpenChange={onOpenChange}
+      />
+    );
   const content = () => (
     <QueryClientProvider client={client}>
       <TooltipProvider>
@@ -172,7 +186,17 @@ function renderDialog(
     </QueryClientProvider>
   );
   const utils = render(content());
-  return { ...utils, invalidateSpy, refresh: () => utils.rerender(content()) };
+  const setOpen = (next: boolean) => {
+    open = next;
+    utils.rerender(content());
+  };
+  return {
+    ...utils,
+    invalidateSpy,
+    onOpenChange,
+    setOpen,
+    refresh: () => utils.rerender(content()),
+  };
 }
 
 /** Open the Radix host <Select> (hosts + sandbox rows). */
@@ -461,7 +485,7 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
   });
 
-  it("reports a clone finished after closing on a toast with Open, without navigating", async () => {
+  it("hands a clone off to a toast when Close is clicked, without navigating", async () => {
     type Fork = Awaited<ReturnType<typeof forkSession>>;
     let settle: (value: Fork) => void = () => {};
     forkSessionMock.mockReturnValue(
@@ -469,12 +493,13 @@ describe("ForkSessionDialog", () => {
         settle = resolve;
       }),
     );
-    const { unmount } = renderDialog();
+    const { onOpenChange, setOpen } = renderDialog();
     fireEvent.click(screen.getByTestId("fork-session-submit"));
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
 
-    // Closing the dialog unmounts the form; the clone keeps running.
-    unmount();
+    fireEvent.click(screen.getByText("Close", { selector: "button" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    setOpen(false);
     expect(toast.loading).toHaveBeenCalledWith("Cloning session…");
     settle({ id: "conv_fork" } as Fork);
 
@@ -493,27 +518,73 @@ describe("ForkSessionDialog", () => {
     expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
   });
 
-  it("reports a clone that fails after closing on a toast that stays", async () => {
+  it("hands off as soon as the dialog closes, while its exit animation still shows the form", async () => {
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let settle: (value: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    const { setOpen } = renderDialog({ sourceTitle: "My session", bareForm: true });
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+
+    setOpen(false);
+    expect(screen.getByTestId("fork-session-submit")).toBeInTheDocument();
+    settle({ id: "conv_fork" } as Fork);
+
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it("reports a clone that fails after Escape on a dismissible toast that stays", async () => {
     let fail: (reason: Error) => void = () => {};
     forkSessionMock.mockReturnValue(
       new Promise((_, reject) => {
         fail = reject;
       }),
     );
-    const { unmount } = renderDialog();
+    const { onOpenChange, setOpen } = renderDialog();
     fireEvent.click(screen.getByTestId("fork-session-submit"));
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
 
-    unmount();
+    await userEvent.keyboard("{Escape}");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    setOpen(false);
     fail(new Error("403 forbidden"));
 
     await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("Couldn't clone the session", {
+      expect(toast.error).toHaveBeenCalledWith("Couldn't clone the session. Nothing was created.", {
         id: "cloning",
         description: "403 forbidden",
         duration: Infinity,
+        closeButton: true,
       }),
     );
+  });
+
+  it("refuses a second clone of the same source while one runs in the background", async () => {
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let settle: (value: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    const first = renderDialog();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    first.setOpen(false);
+
+    renderDialog();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    expect(screen.getByTestId("fork-session-error")).toHaveTextContent(
+      "This session is still being cloned",
+    );
+    expect(forkSessionMock).toHaveBeenCalledTimes(1);
+    settle({ id: "conv_fork" } as Fork);
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
   });
 
   it("surfaces the server error inline on failure and does not navigate", async () => {

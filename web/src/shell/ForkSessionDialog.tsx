@@ -751,6 +751,23 @@ export function ForkSessionForm(
   return <SupportedForkSessionForm {...props} sandboxOnlyProvider={forkSandboxProvider} />;
 }
 
+// Sources with a clone request in flight in this tab, so a reopened dialog
+// can't start a duplicate while the first clone runs in the background.
+const sourcesBeingCloned = new Set<string>();
+
+interface ForkSubmit {
+  running: boolean;
+  /** Set once the dialog closes mid-submit; the outcome then lands on this toast. */
+  backgroundToast?: string | number;
+}
+
+/** Move a running clone's outcome to a toast once its dialog closes. */
+function moveSubmitToToast(submit: ForkSubmit): void {
+  if (submit.running && submit.backgroundToast === undefined) {
+    submit.backgroundToast = toast.loading("Cloning session…");
+  }
+}
+
 function SupportedForkSessionForm({
   sourceSessionId,
   sourceTitle,
@@ -760,6 +777,7 @@ function SupportedForkSessionForm({
   upToResponseId,
   workspaceRecovery = false,
   sandboxOnlyProvider,
+  open,
   onClose,
 }: {
   sourceSessionId: string;
@@ -771,6 +789,8 @@ function SupportedForkSessionForm({
   workspaceRecovery?: boolean;
   /** The only target offered: a fresh sandbox from this provider. */
   sandboxOnlyProvider?: string;
+  /** Whether the host dialog is open; false while its exit animation still shows this form. */
+  open: boolean;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -790,14 +810,16 @@ function SupportedForkSessionForm({
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Closing the dialog mid-submit unmounts this form but doesn't cancel the
-  // clone; from then on a toast reports its outcome instead of the form.
-  const submit = useRef<{ running: boolean; toastId?: string | number }>({ running: false });
+  // Closing the dialog mid-submit doesn't cancel the clone; a toast reports its
+  // outcome instead. Act on `open` (the exit animation keeps this form mounted),
+  // with unmount as the fallback for hosts that drop the form outright.
+  const submit = useRef<ForkSubmit>({ running: false });
+  useLayoutEffect(() => {
+    if (!open) moveSubmitToToast(submit.current);
+  }, [open]);
   useEffect(() => {
     const current = submit.current;
-    return () => {
-      if (current.running) current.toastId = toast.loading("Cloning session…");
-    };
+    return () => moveSubmitToToast(current);
   }, []);
   // Ready-to-send model/effort/permission overrides from the run-config
   // section. Empty until that section (rendered only for a native target)
@@ -1291,10 +1313,15 @@ function SupportedForkSessionForm({
       setFocusField(submitBlocker.field);
       return;
     }
+    if (sourcesBeingCloned.has(sourceSessionId)) {
+      setError("This session is still being cloned. Try again when that clone finishes.");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     const current = submit.current;
     current.running = true;
+    sourcesBeingCloned.add(sourceSessionId);
     try {
       // Pre-flight the directory BEFORE creating anything: the runner
       // launch below is detached and its failure is swallowed, so a
@@ -1405,32 +1432,35 @@ function SupportedForkSessionForm({
       // it either: it skips the active session, and the navigate below makes
       // the fork active.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      if (current.toastId === undefined) {
+      if (current.backgroundToast === undefined) {
         onClose();
         navigate(`/c/${fork.id}`);
       } else {
         // The user closed the dialog to keep working; don't pull them away.
         toast.success("Session cloned", {
-          id: current.toastId,
+          id: current.backgroundToast,
           duration: 10_000,
           action: { label: "Open", onClick: () => navigate(`/c/${fork.id}`) },
         });
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : "Couldn't clone the session. Try again.";
-      if (current.toastId === undefined) {
+      if (current.backgroundToast === undefined) {
         // Nothing created and the form is still open, so inputs stay editable for a resubmit.
         setError(message);
       } else {
-        toast.error("Couldn't clone the session", {
-          id: current.toastId,
+        // Stays until dismissed: the user may be busy elsewhere when it lands.
+        toast.error("Couldn't clone the session. Nothing was created.", {
+          id: current.backgroundToast,
           description: message,
           duration: Infinity,
+          closeButton: true,
         });
       }
     } finally {
+      sourcesBeingCloned.delete(sourceSessionId);
       current.running = false;
-      current.toastId = undefined;
+      current.backgroundToast = undefined;
       setSubmitting(false);
     }
   }
@@ -2089,6 +2119,7 @@ export function ForkSessionDialog({
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
           workspaceRecovery={workspaceRecovery}
+          open={open}
           onClose={() => onOpenChange(false)}
         />
       </DialogContent>

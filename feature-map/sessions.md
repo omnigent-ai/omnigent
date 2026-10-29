@@ -75,6 +75,7 @@ the header menu), and each place is a separate entry point.
   their files, elapsed "worked for" time, and can switch agent or host.
   While a clone runs, the dialog can be closed without cancelling it: a toast
   then reports the outcome, offering **Open** on success instead of navigating.
+  Another clone of the same source is refused until that one finishes.
   For a native target, the fork dialog also offers model, reasoning effort,
   and permission mode pickers. A long model list from several creators (Pi)
   shows creator headings; it has no search or collapsible groups.

@@ -361,6 +361,7 @@ export function ReconnectSessionDialog({
                 sourceWorkspace={sourceWorkspace}
                 sourceHostId={sourceHostId}
                 sourceGitBranch={sourceGitBranch}
+                open={open}
                 onClose={() => onOpenChange(false)}
               />
             </TabsContent>
