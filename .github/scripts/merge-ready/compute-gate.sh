@@ -44,7 +44,7 @@ else
   SHORT="Required checks not all green"
   LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green.'
   if [[ "$FRESHNESS_FAILED" == "true" ]]; then
-    SHORT="CI freshness not satisfied (48h); update branch and run fresh CI"
+    SHORT="CI freshness not satisfied (24h); update branch and run fresh CI"
   fi
 fi
 

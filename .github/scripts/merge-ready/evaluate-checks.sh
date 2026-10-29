@@ -5,7 +5,7 @@
 # Template on an edited description), the highest check-run ID wins, including
 # queued retries without timestamps.
 # Each check counts as green when:
-#   - conclusion=success from a workflow created less than 48 hours ago, OR
+#   - conclusion=success from a workflow created less than 24 hours ago, OR
 #   - conclusion=skipped AND name is in ALLOW_SKIP and isn't a result check, OR
 #   - the check is missing AND name is in ALLOW_SKIP AND its owning
 #     workflow either never ran for this SHA (path-ignored), or its
@@ -45,7 +45,7 @@ source "$HERE/required.sh"
 
 LAG_ATTEMPTS=${MERGE_READY_LAG_ATTEMPTS:-6}
 LAG_DELAY_S=${MERGE_READY_LAG_DELAY_S:-20}
-MAX_AGE_SECONDS=$((48 * 60 * 60))
+MAX_AGE_SECONDS=$((24 * 60 * 60))
 
 # Check runs, plus per-workflow run state for this SHA (one row per run:
 # name<TAB>status<TAB>conclusion<TAB>created_at<TAB>suite_id<TAB>created_epoch).
@@ -72,7 +72,7 @@ require_fresh_workflow() {
   if [[ ! "$created_epoch" =~ ^[0-9]+$ ]] || [[ "$created_epoch" -gt "$NOW" ]]; then
     reason="CI age could not be verified; update the branch to run fresh CI"
   elif [[ $((NOW - created_epoch)) -ge $MAX_AGE_SECONDS ]]; then
-    reason="CI is at least 48 hours old; update the branch to run fresh CI"
+    reason="CI is at least 24 hours old; update the branch to run fresh CI"
   else
     deadline=$((created_epoch + MAX_AGE_SECONDS))
     if [[ -z "$EXPIRES_AT_EPOCH" || "$deadline" -lt "$EXPIRES_AT_EPOCH" ]]; then

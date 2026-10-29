@@ -1077,12 +1077,12 @@ def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
 @pytest.mark.parametrize(
     ("created_at", "fresh"),
     [
-        ("2026-10-17T11:59:59Z", False),
-        ("2026-10-17T12:00:00Z", False),
-        ("2026-10-17T12:00:01Z", True),
+        ("2026-10-18T11:59:59Z", False),
+        ("2026-10-18T12:00:00Z", False),
+        ("2026-10-18T12:00:01Z", True),
     ],
 )
-def test_merge_gate_expires_original_workflow_after_48_hours(tmp_path, created_at, fresh):
+def test_merge_gate_expires_original_workflow_after_24_hours(tmp_path, created_at, fresh):
     snapshot = _gate_snapshot("completed")
     lint = snapshot["runs"]["workflow_runs"][0]
     lint.update(
@@ -1099,7 +1099,7 @@ def test_merge_gate_expires_original_workflow_after_48_hours(tmp_path, created_a
     if fresh:
         assert "expires_at=2026-10-19T12:00:01Z" in output
     else:
-        assert "`Pre-commit checks` (CI is at least 48 hours old" in output
+        assert "`Pre-commit checks` (CI is at least 24 hours old" in output
         assert "update the branch to run fresh CI" in output
         assert _check_reads(tmp_path) == 1
 
@@ -1172,7 +1172,7 @@ def test_merge_gate_does_not_expire_dco_or_intentionally_skipped_checks(tmp_path
     output = (tmp_path / "gate-output").read_text()
     assert process.returncode == 0, process.stdout + process.stderr
     assert "freshness_failed=false" in output
-    assert "expires_at=2026-10-21T10:00:00Z" in output
+    assert "expires_at=2026-10-20T10:00:00Z" in output
 
 
 @pytest.mark.parametrize("conclusion", ["success", "skipped", "no-run"])
@@ -1188,15 +1188,15 @@ def test_merge_gate_stale_workflow_cannot_vouch_for_absent_checks(tmp_path, conc
     assert (process.returncode == 1) == stale, process.stdout + process.stderr
     assert f"freshness_failed={str(stale).lower()}" in output
     if stale:
-        assert "`Integration (claude-sdk)` (CI is at least 48 hours old" in output
+        assert "`Integration (claude-sdk)` (CI is at least 24 hours old" in output
 
 
 def test_merge_gate_expiry_includes_workflows_vouching_for_absent_checks(tmp_path):
     snapshot = _gate_snapshot("completed")
-    snapshot["runs"]["workflow_runs"][3]["created_at"] = "2026-10-18T10:00:00Z"
+    snapshot["runs"]["workflow_runs"][3]["created_at"] = "2026-10-18T13:00:00Z"
     process = _run_merge_gate(tmp_path, [snapshot])
     assert process.returncode == 0, process.stdout + process.stderr
-    assert "expires_at=2026-10-20T10:00:00Z" in (tmp_path / "gate-output").read_text()
+    assert "expires_at=2026-10-19T13:00:00Z" in (tmp_path / "gate-output").read_text()
 
 
 @pytest.mark.parametrize(

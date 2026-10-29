@@ -430,7 +430,7 @@ request enforces this, so unsigned commits will block merging.
 
 ### CI freshness
 
-Passing CI is valid for 48 hours from each workflow's original creation time.
+Passing CI is valid for 24 hours from each workflow's original creation time.
 `Merge Ready` shows the earliest expiry across the required CI checks. Changes
 to `main` during that window do not invalidate a passing result.
 

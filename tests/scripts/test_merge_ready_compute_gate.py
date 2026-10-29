@@ -107,13 +107,13 @@ def test_freshness_failure_revokes_green_without_automerge(tmp_path: Path) -> No
     out = _run(
         tmp_path,
         eval_outcome="failure",
-        failed="- CI is older than 48 hours; update the branch for fresh CI.\n",
+        failed="- CI is older than 24 hours; update the branch for fresh CI.\n",
         freshness_failed="true",
         dependency_required="false",
     )
     assert out["state"] == "failure"
     assert out["post_status"] == "true"
-    assert "48h" in out["short_desc"]
+    assert "24h" in out["short_desc"]
     assert "update the branch" in out["long_desc"]
 
 
