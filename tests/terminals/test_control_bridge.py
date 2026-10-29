@@ -5,8 +5,8 @@ Covers the pure helpers (``unescape_control_output`` octal round-trip,
 ``_WindowNameFilter`` escape stripping, ``_hex_send_keys_commands`` chunking)
 and an end-to-end drive of
 ``bridge_tmux_control_to_websocket`` against a real private tmux server via a
-fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input,
-and the detach close code.
+fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input
+without window-name escapes, and the detach close code.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from omnigent.terminals.control_bridge import (
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
+from tests._helpers.polling import poll_until_async
 
 _HAS_TMUX = shutil.which("tmux") is not None
 
@@ -88,14 +89,21 @@ def test_unescape_control_output_round_trips_control_bytes() -> None:
         (b"\x1bkone\x18a\x1bktwo\x1ab", b"\x1b\\a\x1b\\b"),
         # An OSC that the name's ESC ended still ends there.
         (b"\x1b]0;T\x1bkname\x1b\\text", b"\x1b]0;T\x1b\\text"),
+        # At the end of the stream, a held ESC and an owed ST are flushed,
+        # and an unterminated name stays dropped.
+        (b"text\x1b", b"text\x1b"),
+        (b"\x1bkname\x1b", b"\x1b\\"),
+        (b"text\x1bkname", b"text"),
     ],
 )
 def test_window_name_filter_drops_window_names(stream: bytes, expected: bytes) -> None:
     """Window names are dropped whole, however tmux splits the stream."""
-    assert _WindowNameFilter().feed(stream) == expected
+    whole_filter = _WindowNameFilter()
+    assert whole_filter.feed(stream) + whole_filter.finish() == expected
     # tmux can end an %output line anywhere, including mid-sequence.
     byte_filter = _WindowNameFilter()
-    assert b"".join(byte_filter.feed(stream[i : i + 1]) for i in range(len(stream))) == expected
+    by_byte = b"".join(byte_filter.feed(stream[i : i + 1]) for i in range(len(stream)))
+    assert by_byte + byte_filter.finish() == expected
 
 
 def test_clipboard_buffer_name_accepts_only_safe_notifications() -> None:
@@ -547,10 +555,18 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail(
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
 async def test_control_bridge_seeds_streams_and_detaches() -> None:
-    """End-to-end: seed the pre-attach screen, stream typed input, detach clean."""
-    # `cat` echoes input back to the pane (→ %output); the printf lands before
-    # attach so it can only reach the browser via the capture-pane seed.
-    sock, target = await _new_private_tmux("printf 'SEEDED-LINE\\n'; cat")
+    """End-to-end: seed the pre-attach screen, stream typed input, detach clean.
+
+    The pane answers the input with an ``ESC k`` window name, which tmux
+    streams raw; the browser must get the text after it but not the name.
+    """
+    # The first printf lands before attach so it can only reach the browser via
+    # the capture-pane seed. The tty echoes the typed input (→ %output), then
+    # the reply starts with the window name oh-my-zsh sets before a command.
+    sock, target = await _new_private_tmux(
+        "printf 'SEEDED-LINE\\n'; read -r line; "
+        "printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat"
+    )
     await asyncio.sleep(0.3)  # let the printf render before we attach
 
     ws = _FakeWebSocket(
@@ -566,12 +582,13 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
         )
 
     task = asyncio.create_task(_run())
-    # Give it time to seed, resize, inject input, and observe the echo.
-    await asyncio.sleep(1.2)
+    # The reply follows the seed, the resize, and the echoed input.
+    await poll_until_async(lambda: b"after-name" in b"".join(ws.sent), timeout_s=10)
 
     joined = b"".join(ws.sent)
     assert b"SEEDED-LINE" in joined, "seed-on-attach did not paint pre-attach screen"
     assert b"typed-input" in joined, "send-keys input was not echoed via %output"
+    assert b"WINDOW-NAME" not in joined, "the pane's window name reached the browser as text"
 
     # The seed frame must not carry bare-LF row separators: capture-pane -p
     # joins rows with a lone \n, which would staircase the whole screen to the
@@ -583,30 +600,6 @@ async def test_control_bridge_seeds_streams_and_detaches() -> None:
     )
 
     # Kill the server → the control client's stdout closes → bridge exits.
-    await _kill_and_join(sock, task)
-
-
-@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
-@pytest.mark.asyncio
-async def test_control_bridge_drops_window_name_escape() -> None:
-    """A pane's ``ESC k`` window name, which tmux streams raw, never reaches the browser."""
-    # The pane prints only after the bridge's input arrives, so the escape
-    # reaches the browser through %output rather than the capture-pane seed.
-    sock, target = await _new_private_tmux(
-        "read -r line; printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat"
-    )
-    ws = _FakeWebSocket(inbound=[{"type": "websocket.receive", "bytes": b"go\r"}])
-    task = asyncio.create_task(
-        bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
-        )
-    )
-
-    async with asyncio.timeout(10):
-        while b"after-name" not in b"".join(ws.sent):
-            await asyncio.sleep(0.05)
-    assert b"WINDOW-NAME" not in b"".join(ws.sent)
-
     await _kill_and_join(sock, task)
 
 

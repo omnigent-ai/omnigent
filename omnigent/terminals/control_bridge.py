@@ -252,6 +252,21 @@ class _WindowNameFilter:
                     self._state = _WindowNameState.HELD_ESCAPE
         return bytes(forwarded)
 
+    def finish(self) -> bytes:
+        """Flush what the filter still holds when the pane stream ends.
+
+        :returns: A held ESC, or the ST that replaces a name the stream's last
+            ESC ended; ``b""`` otherwise. An unterminated name stays dropped,
+            as tmux never shows it either.
+        """
+        state = self._state
+        self._state = _WindowNameState.OUTPUT
+        if state is _WindowNameState.HELD_ESCAPE:
+            return _ESC
+        if state is _WindowNameState.NAME_ESCAPE:
+            return _STRING_TERMINATOR
+        return b""
+
 
 async def _read_tmux_buffer(
     tmux: str,
@@ -789,8 +804,9 @@ async def bridge_tmux_control_to_websocket(
         Reads with ``stdout.read()`` rather than ``readline()`` so one wakeup
         can pull many buffered ``%output`` lines at once — letting the
         forwarder coalesce them — and so an oversized line can't raise
-        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit
-        so the forwarder terminates.
+        ``LimitOverrunError``. Always enqueues the ``None`` EOF sentinel on exit,
+        after any bytes the window-name filter still holds, so the forwarder
+        terminates.
         """
         buffer = b""
         try:
@@ -806,6 +822,9 @@ async def bridge_tmux_control_to_websocket(
                     if not _handle_control_line(raw_line.rstrip(b"\r")):
                         return
         finally:
+            tail = window_name_filter.finish()
+            if tail:
+                output_chunks.put_nowait(tail)
             output_chunks.put_nowait(None)
             clipboard_buffers.put_nowait(None)
             if reader_done is not None:
