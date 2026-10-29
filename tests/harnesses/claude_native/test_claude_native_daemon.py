@@ -123,8 +123,10 @@ async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
     assert launched["body"] == {"session_id": "conv_a", "workspace": "/work"}
 
 
+@pytest.mark.parametrize("retry_launch", [False, True])
 async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
     caplog: pytest.LogCaptureFixture,
+    retry_launch: bool,
 ) -> None:
     """
     A bound-but-offline runner is cleared before launching a fresh one.
@@ -133,6 +135,8 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
     NULL``; without clearing the dead binding first it would 400. The
     clear must therefore precede the launch.
     """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+
     caplog.set_level(logging.INFO, logger="omnigent.host.daemon_launch")
     events: list[tuple[str, object]] = []
 
@@ -151,17 +155,24 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
             return httpx.Response(200, json={})
         if request.method == "POST" and path == "/v1/hosts/host_1/runners":
             events.append(("launch", None))
+            if retry_launch and events.count(("launch", None)) == 1:
+                return httpx.Response(409, json={"detail": "host is offline"})
             return httpx.Response(200, json={"runner_id": "runner_fresh"})
         return httpx.Response(404, json={})
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(handler), base_url="https://e.com"
+        transport=httpx.MockTransport(handler),
+        base_url="https://e.com",
+        headers={OMNIGENT_SLICE_KEY_HEADER: "host:host_1", "X-Databricks-Org-Id": "123"},
     ) as client:
         runner_id = await daemon_launch.launch_or_reuse_daemon_runner(
             client, host_id="host_1", session_id="conv_a", workspace="/w"
         )
 
     assert runner_id == "runner_fresh"
+    assert events.count(("launch", None)) == (2 if retry_launch else 1)
+    assert all(r.headers[OMNIGENT_SLICE_KEY_HEADER] == "host:host_1" for r in requests)
+    assert all(r.headers["X-Databricks-Org-Id"] == "123" for r in requests)
     # The stale binding was cleared (runner_id="") strictly before the
     # launch — the ordering the atomic NULL-bind requires.
     assert ("patch", {"runner_id": ""}) in events

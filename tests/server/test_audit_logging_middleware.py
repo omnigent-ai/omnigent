@@ -352,21 +352,27 @@ def test_reserved_attr_keys_never_crash_and_session_id_binds(
         sink.close()
 
 
+@pytest.mark.parametrize("requested_runner", ["", "new_runner"], ids=["clear", "bind"])
 @pytest.mark.asyncio
 async def test_attachment_requests_correlate_with_binding_change(
+    app: FastAPI,
     client: httpx.AsyncClient,
+    requested_runner: str,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The real middleware joins status and unbind requests without trusting client identity."""
+    """Correlate status with clear/rebind requests and isolate subsequent requests."""
+    from unittest.mock import AsyncMock
+
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
     from omnigent.host.launch_audit import launch_audit_headers
     from omnigent.server import app as app_module
     from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes import sessions as sessions_module
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
-    from tests.server.helpers import create_test_agent
+    from tests.server.helpers import create_test_agent, register_test_runner
 
     agent = await create_test_agent(client, "attachment-audit")
     created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
@@ -376,6 +382,10 @@ async def test_attachment_requests_correlate_with_binding_change(
     HostStore(db_uri).upsert_on_connect("a" * 32, "owner-host", RESERVED_USER_LOCAL)
     store.set_host_id(session_id, "a" * 32, workspace="/test")
     store.replace_runner_id(session_id, "old_runner")
+    if requested_runner:
+        register_test_runner(app, requested_runner, owner=RESERVED_USER_LOCAL)
+        # The registered test runner has no HTTP service or event stream.
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
     rows: list[dict[str, object]] = []
 
     def capture(operation: str, phase: str, **fields: object) -> None:
@@ -387,10 +397,10 @@ async def test_attachment_requests_correlate_with_binding_change(
     status = await client.get("/v1/runners/old_runner/status", headers=headers)
     assert status.status_code == 200, status.text
     with caplog.at_level(logging.INFO):
-        cleared = await client.patch(
-            f"/v1/sessions/{session_id}", json={"runner_id": ""}, headers=headers
+        changed = await client.patch(
+            f"/v1/sessions/{session_id}", json={"runner_id": requested_runner}, headers=headers
         )
-    assert cleared.status_code == 200, cleared.text
+    assert changed.status_code == 200, changed.text
     assert all(r["client_launch_id"] == headers["X-Omnigent-Launch-Id"] for r in rows)
     assert all(r["client_host_id"] == "caller_b" for r in rows)
     assert all(r["client_user_agent"] == "test-launcher" for r in rows)
@@ -400,20 +410,27 @@ async def test_attachment_requests_correlate_with_binding_change(
     assert ended[0]["runner_id"] == "old_runner"
     assert ended[0]["runner_online"] == "False"
     assert ended[1]["session_id"] == session_id
-    assert ended[1]["binding_action"] == "clear"
+    assert ended[1]["binding_action"] == ("bind" if requested_runner else "clear")
     assert ended[1]["previous_runner_id"] == "old_runner"
     assert ended[1]["previous_host_id"] == "a" * 32
-    assert ended[1]["requested_runner_id"] == ""
+    assert ended[1]["requested_runner_id"] == requested_runner
     assert ended[0]["request_id"] == status.headers["X-Request-Id"]
-    assert ended[1]["request_id"] == cleared.headers["X-Request-Id"]
+    assert ended[1]["request_id"] == changed.headers["X-Request-Id"]
     assert ended[0]["request_id"] != ended[1]["request_id"]
-    unbound = [
-        r for r in caplog.records if getattr(r, "event_name", None) == "session_runner_unbound"
-    ]
-    assert len(unbound) == 1
-    assert unbound[0].attributes["previous_runner_id"] == "old_runner"
-    assert unbound[0].attributes["previous_host_id"] == "a" * 32
+    event_name = "session_runner_bound" if requested_runner else "session_runner_unbound"
+    binding_events = [r for r in caplog.records if getattr(r, "event_name", None) == event_name]
+    assert len(binding_events) == 1
+    assert binding_events[0].attributes["previous_runner_id"] == "old_runner"
+    assert binding_events[0].attributes["previous_host_id"] == "a" * 32
+    if requested_runner:
+        assert binding_events[0].attributes["runner_id"] == requested_runner
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    assert conversation.runner_id == (requested_runner or None)
     rows.clear()
     response = await client.get(f"/v1/sessions/{session_id}")
     assert response.status_code == 200
+    assert len(rows) == 2
+    assert {r["phase"] for r in rows} == {"start", "ok"}
+    assert all(r["operation"] == "get_session" for r in rows)
     assert all("client_launch_id" not in r and "client_host_id" not in r for r in rows)
