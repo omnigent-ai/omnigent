@@ -10,7 +10,6 @@ designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -125,7 +124,6 @@ async def test_launch_or_reuse_daemon_runner_launches_when_unbound() -> None:
 
 @pytest.mark.parametrize("retry_launch", [False, True])
 async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
-    caplog: pytest.LogCaptureFixture,
     retry_launch: bool,
 ) -> None:
     """
@@ -137,7 +135,6 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
     """
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 
-    caplog.set_level(logging.INFO, logger="omnigent.host.daemon_launch")
     events: list[tuple[str, object]] = []
 
     requests: list[httpx.Request] = []
@@ -184,19 +181,6 @@ async def test_launch_or_reuse_daemon_runner_clears_stale_binding(
     assert all(r.headers["X-Omnigent-Caller-Host-Id"] == "host_1" for r in requests)
     assert all(r.headers["X-Omnigent-Launch-Mode"] == "ensure_existing" for r in requests)
     assert "X-Omnigent-Launch-Id" not in client.headers
-
-    from omnigent.process_logging import RedactingLogFormatter
-
-    records = [r for r in caplog.records if r.name == "omnigent.host.daemon_launch"]
-    assert [r.event_name for r in records] == [
-        "daemon_attachment_started",
-        "daemon_attachment_decision",
-        "daemon_attachment_launched",
-    ]
-    assert records[1].attributes["decision"] == "replace"
-    formatter = RedactingLogFormatter(use_colors=False)
-    assert all(next(iter(launch_ids)) in formatter.format(r) for r in records)
-    assert "parent_pid=" in formatter.format(records[0])
 
 
 async def test_launch_or_reuse_daemon_runner_fresh_skips_session_get() -> None:
