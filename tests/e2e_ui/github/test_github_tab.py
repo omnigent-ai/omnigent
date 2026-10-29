@@ -663,7 +663,7 @@ def test_reply_to_inline_review_conversation(
                     "id": "root",
                     "author": "alice",
                     "body": (
-                        "Why add this line?\n\n```suggestion\nimproved line\nanother line\n```"
+                        "Why add this line?\n\n```suggestion\nimproved line\nreturn result\n```"
                     ),
                     "created_at": "2026-10-26T12:00:00Z",
                     "url": pr_url + "#discussion_r1",
@@ -819,10 +819,15 @@ def test_reply_to_inline_review_conversation(
     expect(conversation).to_be_focused()
     expect(conversation.get_by_text("Why add this line?", exact=True)).to_be_visible()
     suggestion = conversation.get_by_role("region", name="Suggested change", exact=True)
-    expect(suggestion.locator('[data-suggestion-line="removed"]')).to_have_text("2−added line")
-    expect(suggestion.locator('[data-suggestion-line="added"]')).to_have_text(
-        ["2+improved line", "3+another line"]
+    expect(suggestion.locator('[data-line][data-line-type="change-deletion"]')).to_have_text(
+        "added line"
     )
+    expect(suggestion.locator('[data-line][data-line-type="change-addition"]')).to_have_text(
+        ["improved line", "return result"]
+    )
+    expect(suggestion.locator("[data-line-number-content]")).to_have_text(["2", "2", "3"])
+    expect(suggestion.locator("[data-diff-span]").first).to_be_visible()
+    expect(suggestion.get_by_text("return", exact=True)).to_be_visible()
     assert suggestion.evaluate("element => element.scrollWidth <= element.clientWidth")
     textbox = conversation.get_by_role("textbox", name="Reply to review conversation")
     expect(conversation.get_by_role("tab", name="Write", exact=True)).to_have_count(0)
@@ -886,7 +891,10 @@ def test_reply_to_inline_review_conversation(
     page.screenshot(path=str(tmp_path / f"inline-{entry}-posted.png"))
 
     file = panel.locator('[data-github-file="src/app/main.py"]')
-    line = file.locator('[data-column-number="2"][data-line-type="change-addition"]')
+    line = file.locator("diffs-container").first.locator(
+        ":scope > [data-diff] > [data-code] > [data-gutter] "
+        '> [data-column-number="2"][data-line-type="change-addition"]'
+    )
     line.locator("[data-line-number-content]").click()
     plus = file.get_by_role("button", name="Start a new review conversation", exact=True)
     expect(plus).to_be_visible()

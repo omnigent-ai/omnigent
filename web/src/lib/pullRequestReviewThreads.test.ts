@@ -5,6 +5,7 @@ import {
   reviewThreadAnnotations,
   reviewSelection,
   reviewSuggestionSource,
+  reviewSuggestionDiff,
   type ReviewThread,
 } from "./pullRequestReviewThreads";
 
@@ -112,6 +113,34 @@ describe("review thread placement", () => {
 });
 
 describe("review suggestion source", () => {
+  it.each(["new\n\ttext  \n", "", "before\nkeep"])(
+    "builds a library diff for a complete replacement: %j",
+    (replacement) => {
+      const diff = reviewSuggestionDiff(
+        "path with spaces/app.py",
+        {
+          line: 47,
+          lines: ["before", "keep"],
+          original: false,
+        },
+        replacement,
+      );
+      expect(diff.name).toBe("path with spaces/app.py");
+      expect(diff.deletionLines).toEqual(["before\n", "keep\n"]);
+      const added = replacement === "" ? [] : replacement.split("\n").map((line) => `${line}\n`);
+      expect(diff.additionLines).toEqual(added);
+      expect(diff.hunks).toHaveLength(1);
+      expect(diff.hunks[0]).toMatchObject({
+        deletionStart: 47,
+        deletionCount: 2,
+        additionCount: added.length,
+        collapsedBefore: 0,
+        hunkContent: [{ type: "change", deletions: 2, additions: added.length }],
+      });
+      if (added.length) expect(diff.hunks[0].additionStart).toBe(47);
+    },
+  );
+
   it.each([
     ["RIGHT", null, ["after"]],
     ["LEFT", null, ["before"]],

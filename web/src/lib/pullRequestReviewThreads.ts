@@ -5,6 +5,8 @@ import {
   type SelectedLineRange,
 } from "@pierre/diffs";
 
+export const PULL_REQUEST_DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
+
 export interface ReviewThreadAnchor {
   path: string;
   side: "LEFT" | "RIGHT";
@@ -79,6 +81,29 @@ export interface ReviewSuggestionSource {
   line: number;
   lines: string[];
   original: boolean;
+}
+
+/** A suggestion replaces its entire range, including unchanged lines within it. */
+export function reviewSuggestionDiff(
+  path: string,
+  source: ReviewSuggestionSource,
+  replacement: string,
+): FileDiffMetadata {
+  const added = replacement === "" ? [] : replacement.split(/\r?\n/);
+  const patch = [
+    "diff --git a/suggestion b/suggestion",
+    "--- a/suggestion",
+    "+++ b/suggestion",
+    `@@ -${source.line},${source.lines.length} +${added.length ? source.line : source.line - 1},${added.length} @@`,
+    ...source.lines.map((line) => `-${line}`),
+    ...added.map((line) => `+${line}`),
+    "",
+  ].join("\n");
+  const diff = parsePatchFiles(patch)[0].files[0];
+  diff.name = path;
+  // This card contains only the replacement range, without expandable surrounding context.
+  diff.hunks[0].collapsedBefore = 0;
+  return diff;
 }
 
 /** Read only a complete range from one side of a patch or an expanded file. */

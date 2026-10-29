@@ -8,7 +8,8 @@ request's Changes subtab. Top-level comments remain in Comments.
 - `inline-threads`: Published conversations on old/new lines, both diff layouts,
   separate conversations at the same line and multiline range labels.
 - `suggestions`: Fenced suggestions show referenced lines as removals and the
-  replacement as additions. Saved snippets are labeled as original context;
+  replacement as additions, with syntax and word-level highlighting.
+  Saved snippets are labeled as original context;
   unavailable ranges show the replacement without a comparison.
 - `inline-reply`: Compact reply inputs expand on focus; Cancel collapses the
   composer and retains the draft. Markdown preview, account attribution and
@@ -46,7 +47,7 @@ creates a separate conversation on an occupied new-side line and a range on the
 old side, verifying coordinates, placement and deduplication after refresh.
 It checks focus-to-expand, Cancel and keyboard reopening, collapse after posting,
 and the gutter plus centered over the line-number/code divider in both layouts.
-Suggestion assertions verify the before/after lines and numbers, mobile sizing,
+Suggestion assertions verify the before/after lines and numbers, highlighting, mobile sizing,
 and original-context labeling on outdated threads. Component tests cover empty
 replacements, ordinary Markdown/code and unavailable context; mapping tests
 cover side/range selection, partial patches and historical coordinates.

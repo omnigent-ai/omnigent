@@ -1,7 +1,14 @@
 import { createContext, isValidElement, useContext, useMemo, type ComponentProps } from "react";
 import type { FileDiffMetadata } from "@pierre/diffs";
+import { FileDiff } from "@pierre/diffs/react";
 import { ChatCodeBlockPre, MessageResponse } from "@/components/ai-elements/message";
-import { reviewSuggestionSource, type ReviewThread } from "@/lib/pullRequestReviewThreads";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import {
+  PULL_REQUEST_DIFF_THEME,
+  reviewSuggestionDiff,
+  reviewSuggestionSource,
+  type ReviewThread,
+} from "@/lib/pullRequestReviewThreads";
 import { PULL_REQUEST_MARKDOWN_COMPONENTS } from "./PullRequestDetails";
 
 interface ReviewCodeContext {
@@ -21,10 +28,32 @@ function ReviewCodeBlock({ children }: ComponentProps<"pre">) {
   )
     return <ChatCodeBlockPre>{children}</ChatCodeBlockPre>;
 
-  const source = reviewSuggestionSource(context.thread, context.fileDiff);
   // Markdown adds one terminating newline to fenced code, including an empty suggestion.
   const replacement = (children.props.children ?? "").replace(/\r?\n$/, "");
-  const added = replacement === "" ? [] : replacement.split(/\r?\n/);
+  return <ReviewSuggestion {...context} replacement={replacement} />;
+}
+
+function ReviewSuggestion({
+  thread,
+  fileDiff,
+  replacement,
+}: ReviewCodeContext & { replacement: string }) {
+  const themeType = useResolvedThemeMode();
+  const source = useMemo(() => reviewSuggestionSource(thread, fileDiff), [thread, fileDiff]);
+  const diff = useMemo(
+    () => source && reviewSuggestionDiff(thread.path, source, replacement),
+    [thread.path, source, replacement],
+  );
+  const options = useMemo(
+    () => ({
+      theme: PULL_REQUEST_DIFF_THEME,
+      themeType,
+      diffStyle: "unified" as const,
+      diffIndicators: "classic" as const,
+      disableFileHeader: true,
+    }),
+    [themeType],
+  );
   return (
     <section
       aria-label="Suggested change"
@@ -34,39 +63,9 @@ function ReviewCodeBlock({ children }: ComponentProps<"pre">) {
         <span>Suggested change</span>
         {source?.original && <span className="text-xs">Original context</span>}
       </div>
-      {source ? (
+      {diff ? (
         <div className="max-h-80 overflow-auto">
-          <table
-            aria-label="Suggested change diff"
-            className="w-full border-collapse text-left font-mono text-xs"
-          >
-            <tbody>
-              {[
-                { kind: "removed", lines: source.lines, sign: "−", color: "bg-red-500/10" },
-                { kind: "added", lines: added, sign: "+", color: "bg-green-500/10" },
-              ].flatMap(({ kind, lines, sign, color }) =>
-                lines.map((text, index) => {
-                  const lineNumber = source.line + index;
-                  return (
-                    <tr key={`${kind}:${lineNumber}`} data-suggestion-line={kind} className={color}>
-                      <td className="w-1 select-none px-2 py-0.5 text-right align-top text-muted-foreground">
-                        {lineNumber}
-                      </td>
-                      <td
-                        className="w-1 select-none px-2 py-0.5 align-top"
-                        aria-label={kind === "added" ? "Added" : "Removed"}
-                      >
-                        {sign}
-                      </td>
-                      <td className="px-2 py-0.5">
-                        <pre className="m-0 whitespace-pre font-mono">{text || "\n"}</pre>
-                      </td>
-                    </tr>
-                  );
-                }),
-              )}
-            </tbody>
-          </table>
+          <FileDiff fileDiff={diff} options={options} disableWorkerPool />
         </div>
       ) : (
         <>

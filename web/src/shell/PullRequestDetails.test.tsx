@@ -589,15 +589,23 @@ it("renders suggestions as replacement diffs while keeping ordinary Markdown and
   const view = render(<PullRequestReviewBody body={body} thread={thread} fileDiff={fileDiff} />);
   const suggestions = await screen.findAllByRole("region", { name: "Suggested change" });
   expect(suggestions).toHaveLength(2);
-  const rows = suggestions[0].querySelectorAll("tr");
-  expect([...rows].map((row) => row.textContent)).toEqual([
-    "2−current",
-    "2+first",
-    "3+<script>literal()</script>",
+  const diffRoot = suggestions[0].querySelector("diffs-container")!.shadowRoot!;
+  await waitFor(() => expect(diffRoot.querySelectorAll("[data-line]")).toHaveLength(3));
+  expect(
+    [...diffRoot.querySelectorAll("[data-line]")].map((row) => [
+      row.getAttribute("data-line"),
+      row.getAttribute("data-line-type"),
+      row.textContent,
+    ]),
+  ).toEqual([
+    ["2", "change-deletion", "current"],
+    ["2", "change-addition", "first"],
+    ["3", "change-addition", "<script>literal()</script>"],
   ]);
-  expect(suggestions[1].querySelectorAll("tr")).toHaveLength(1);
-  expect(suggestions[1]).toHaveTextContent("2−current");
-  expect(view.container.querySelector("script")).toBeNull();
+  const emptyRoot = suggestions[1].querySelector("diffs-container")!.shadowRoot!;
+  expect(emptyRoot.querySelectorAll("[data-line]")).toHaveLength(1);
+  expect(emptyRoot.querySelector('[data-line-type="change-addition"]')).toBeNull();
+  expect(diffRoot.querySelector("script")).toBeNull();
   expect(screen.getByText("Explanation")).toHaveAttribute("data-streamdown", "strong");
   expect(screen.getAllByRole("button", { name: "Copy Code" })).toHaveLength(1);
   expect(view.container.querySelector(".chat-code-block")).toHaveTextContent(
@@ -606,7 +614,7 @@ it("renders suggestions as replacement diffs while keeping ordinary Markdown and
 
   view.rerender(<PullRequestReviewBody body={body} thread={thread} />);
   expect(screen.getAllByText("Original lines are unavailable for comparison.")).toHaveLength(2);
-  expect(view.container.querySelectorAll("tr")).toHaveLength(0);
+  expect(view.container.querySelectorAll("diffs-container")).toHaveLength(0);
   expect(
     screen.getByText("first\n<script>literal()</script>", { normalizer: (text) => text }),
   ).toBeVisible();

@@ -164,8 +164,9 @@ file-level and unavailable-diff threads remain accessible with their original
 code context. Resolved threads start collapsed.
 
 Fenced `suggestion` blocks render the referenced lines as removals and the
-replacement as additions, with line numbers. They reuse the displayed patch;
-outdated or hidden-context threads use the saved snippet labeled **Original
+replacement as additions, with line numbers. They reuse the displayed patch
+and its diff renderer for syntax and word-level highlighting.
+Outdated or hidden-context threads use the saved snippet labeled **Original
 context**. If the complete original range is unavailable, the replacement is
 shown without a comparison. Suggestions are display-only and add no requests.
 

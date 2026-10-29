@@ -30,6 +30,7 @@ import { PullRequestCommentComposer, PullRequestCommentForm } from "./PullReques
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import {
+  PULL_REQUEST_DIFF_THEME,
   reviewThreadAnnotations,
   reviewSelection,
   type ReviewThread,
@@ -153,10 +154,6 @@ import {
 import { PullRequestLabels } from "./PullRequestLabels";
 import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
-
-// Shiki bundled themes matching the app's editor look; the concrete side is
-// chosen by `themeType` from the app's resolved light/dark mode.
-const DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
 
 /** Centered muted message filling the panel — the shared loading/transient shell. */
 function PanelMessage({ children }: { children: React.ReactNode }) {
@@ -2104,7 +2101,7 @@ function PullRequestPanelDetails({
 
   const diffOptions = useMemo<DiffOptions>(
     () => ({
-      theme: DIFF_THEME,
+      theme: PULL_REQUEST_DIFF_THEME,
       themeType,
       diffStyle,
       // The section renders its own header; the diff body has none.
