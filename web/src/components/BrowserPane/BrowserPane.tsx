@@ -564,7 +564,10 @@ export function BrowserPane({
     (scope === cookiePreview?.host ? (selectedCookieProfile?.cookieCount ?? 0) : 0);
   return (
     <div
-      className={cn("flex min-h-0 min-w-0 flex-col", className)}
+      // Clicking the toolbar or a new tab's empty page focuses the tab, as clicking
+      // a loaded page does, so desktop Close (⌘W) closes the tab, not the session.
+      tabIndex={-1}
+      className={cn("flex min-h-0 min-w-0 flex-col focus:outline-none", className)}
       data-browser-pane-conversation={conversationId}
     >
       <div className="flex shrink-0 items-center gap-1 border-border border-b bg-card px-2 py-1.5">

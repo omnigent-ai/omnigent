@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyMacElectronShellAttribute,
   checkDbcert,
+  closeDesktopWindow,
+  onDesktopCommand,
+  setDesktopCommandState,
+  supportsDesktopCommands,
   getServerPicker,
   hasDbcertPreflightBridge,
   isAndroidShell,
@@ -694,5 +698,79 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("desktop command bridge", () => {
+  type CommandListener = (event: {
+    command: string;
+    browserViewId: string | null;
+    closingQuits?: boolean;
+  }) => void;
+
+  function installDesktop(api: Record<string, unknown>): void {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: () => {},
+      notify: async () => false,
+      ...api,
+    };
+  }
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  });
+
+  it("needs both the subscription and the state report", () => {
+    expect(supportsDesktopCommands()).toBe(false);
+    installDesktop({ onDesktopCommand: () => () => {} });
+    expect(supportsDesktopCommands()).toBe(false);
+    installDesktop({ onDesktopCommand: () => () => {}, setDesktopCommandState: () => {} });
+    expect(supportsDesktopCommands()).toBe(true);
+  });
+
+  it("forwards known commands and drops ones this page doesn't know", () => {
+    let listener: CommandListener = () => {};
+    const unsubscribe = vi.fn();
+    installDesktop({
+      onDesktopCommand: (callback: CommandListener) => {
+        listener = callback;
+        return unsubscribe;
+      },
+    });
+    const received = vi.fn();
+    const stop = onDesktopCommand(received);
+
+    listener({ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true });
+    listener({ command: "open-everything", browserViewId: null });
+    listener({ command: "new-terminal", browserViewId: null });
+    expect(received.mock.calls).toEqual([
+      [{ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true }],
+      [{ command: "new-terminal", browserViewId: null, closingQuits: false }],
+    ]);
+    stop();
+    expect(unsubscribe).toHaveBeenCalled();
+  });
+
+  it("degrades to no-ops outside a supporting shell", async () => {
+    expect(onDesktopCommand(() => {})).toBeTypeOf("function");
+    expect(() =>
+      setDesktopCommandState({ commands: [], sessionPinned: false, sessionArchived: false }),
+    ).not.toThrow();
+    await expect(closeDesktopWindow()).resolves.toBe(false);
+  });
+
+  it("reports state and asks the shell to close the window", async () => {
+    const setState = vi.fn();
+    const closeWindow = vi.fn().mockResolvedValue(true);
+    installDesktop({ setDesktopCommandState: setState, closeWindow });
+    const state = { commands: ["close" as const], sessionPinned: true, sessionArchived: false };
+
+    setDesktopCommandState(state);
+    expect(setState).toHaveBeenCalledWith(state);
+    await expect(closeDesktopWindow()).resolves.toBe(true);
+
+    closeWindow.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(closeDesktopWindow()).resolves.toBe(false);
   });
 });

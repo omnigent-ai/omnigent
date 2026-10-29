@@ -13,6 +13,7 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPr
 const isNativeShell = vi.fn(() => false);
 const isElectronShell = vi.fn(() => false);
 const supportsBrowser = vi.fn(() => false);
+const supportsDesktopCommands = vi.fn(() => false);
 const contentSearchEnabled = vi.fn(() => false);
 const gridsEnabled = vi.fn(() => false);
 const splitTerminalEnabled = vi.fn(() => false);
@@ -29,6 +30,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
   isElectronShell: () => isElectronShell(),
   supportsBrowser: () => supportsBrowser(),
+  supportsDesktopCommands: () => supportsDesktopCommands(),
   // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
   // keyboard; this suite exercises the browser path, so it's always false.
   isIOSShell: () => false,
@@ -38,6 +40,7 @@ beforeEach(() => {
   isNativeShell.mockReturnValue(false);
   isElectronShell.mockReturnValue(false);
   supportsBrowser.mockReturnValue(false);
+  supportsDesktopCommands.mockReturnValue(false);
   contentSearchEnabled.mockReturnValue(false);
   gridsEnabled.mockReturnValue(false);
   splitTerminalEnabled.mockReturnValue(false);
@@ -232,5 +235,27 @@ describe("KeyboardShortcutsDialog", () => {
     expect(
       screen.getByRole("heading", { name: "Navigation" }).closest("section")?.querySelector("li"),
     ).toHaveTextContent("Switch recent sessions");
+  });
+
+  it("lists ⌃` for a new shell, keeping ⌘⌥T as the alternate", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Open a new shell")).toEqual(["Ctrl", "`", "Ctrl", "Alt", "T"]);
+  });
+
+  it("lists the desktop menu commands only when the shell hands them to the page", () => {
+    supportsBrowser.mockReturnValue(true);
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Close tab, or leave the session")).toBeNull();
+    expect(screen.queryByText("Quit Omnigent")).toBeNull();
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
+
+    supportsDesktopCommands.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Close tab, or leave the session")).toEqual(["Ctrl", "W"]);
+    expect(keysFor("Close window")).toEqual(["Ctrl", "⇧", "W"]);
+    expect(keysFor("Pin or unpin current session")).toEqual(["Ctrl", "Alt", "P"]);
+    expect(keysFor("Archive current session")).toEqual(["Ctrl", "⇧", "A"]);
+    expect(keysFor("Quit Omnigent")).toEqual(["Ctrl", "Q"]);
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T", "Ctrl", "Alt", "B"]);
   });
 });

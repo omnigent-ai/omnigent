@@ -22,6 +22,15 @@ export const SPLIT_TERMINAL_KEYS: Record<TerminalSplitAxis, string[]> = {
   columns: [MOD_KEY, ALT_KEY, SHIFT_KEY, "\\"],
   rows: [MOD_KEY, ALT_KEY, "-"],
 };
+// ⌃` opens a shell in every runtime; the rest are desktop menu chords (see the
+// accelerators in web/electron/src/main.js).
+export const NEW_TERMINAL_KEYS = [CTRL_KEY, "`"] as const;
+export const NEW_BROWSER_TAB_KEYS = [MOD_KEY, "T"] as const;
+export const CLOSE_KEYS = [MOD_KEY, "W"] as const;
+export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
+export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
+export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
+export const QUIT_KEYS = [MOD_KEY, "Q"] as const;
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
   return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];

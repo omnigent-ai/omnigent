@@ -99,6 +99,41 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /**
+   * Subscribe to native menu commands for this window (Close, New Terminal,
+   * New Browser Tab, Pin/Archive Session). `browserViewId` names the embedded
+   * browser view that held focus when Close fired, else null. Returns an
+   * unsubscribe function.
+   * @param {(payload: {command: string, browserViewId: string | null}) => void} callback
+   * @returns {() => void}
+   */
+  onDesktopCommand: (callback) => {
+    const listener = (_event, payload) => {
+      if (!payload || typeof payload.command !== "string") return;
+      callback({
+        command: payload.command,
+        browserViewId: typeof payload.browserViewId === "string" ? payload.browserViewId : null,
+        closingQuits: payload.closingQuits === true,
+      });
+    };
+    ipcRenderer.on("omnigent:desktop-command", listener);
+    return () => ipcRenderer.removeListener("omnigent:desktop-command", listener);
+  },
+  /**
+   * Report which menu commands this page can act on right now, plus the open
+   * session's pin/archive state, so the native menu can enable and label them.
+   * Fire-and-forget.
+   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean}} state
+   */
+  setDesktopCommandState: (state) => {
+    ipcRenderer.send("omnigent:set-desktop-command-state", {
+      commands: Array.isArray(state?.commands) ? state.commands.map(String) : [],
+      sessionPinned: state?.sessionPinned === true,
+      sessionArchived: state?.sessionArchived === true,
+    });
+  },
+  /** Close this window once the page has confirmed. Resolves whether it closed. */
+  closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),

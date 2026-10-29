@@ -264,6 +264,45 @@ interface ElectronDesktopApi extends NativeShellApi {
     conversationId: string,
     args: { profileId: string; expectedHost: string; scope?: string },
   ) => Promise<ChromeCookieImportResult>;
+  /** Subscribe to native menu commands for this window; returns an unsubscribe. */
+  onDesktopCommand?: (
+    callback: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits?: boolean;
+    }) => void,
+  ) => () => void;
+  /** Report which menu commands this page can run now (fire-and-forget). */
+  setDesktopCommandState?: (state: DesktopCommandState) => void;
+  /** Close this window once the page has confirmed. Resolves whether it closed. */
+  closeWindow?: () => Promise<boolean>;
+}
+
+/** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
+export type DesktopCommand =
+  "close" | "new-terminal" | "new-browser-tab" | "archive-session" | "toggle-pin-session";
+
+const DESKTOP_COMMANDS: readonly string[] = [
+  "close",
+  "new-terminal",
+  "new-browser-tab",
+  "archive-session",
+  "toggle-pin-session",
+] satisfies DesktopCommand[];
+
+export interface DesktopCommandEvent {
+  command: DesktopCommand;
+  /** The embedded browser view that held keyboard focus when Close fired, else null. */
+  browserViewId: string | null;
+  /** Whether closing this window quits the app (its last window, off macOS). */
+  closingQuits: boolean;
+}
+
+/** What the page tells the shell so it can enable and label its menu items. */
+export interface DesktopCommandState {
+  commands: DesktopCommand[];
+  sessionPinned: boolean;
+  sessionArchived: boolean;
 }
 
 /** One importable site tree and how many cookies a profile holds for it. */
@@ -644,6 +683,62 @@ export async function cancelBrowserRecentSessionSwitch(): Promise<void> {
     await electron.browserCancelRecentSessionSwitch();
   } catch (err) {
     console.warn("[nativeBridge] browser recent-session cancellation failed:", err);
+  }
+}
+
+/**
+ * True when the desktop shell owns the native menu commands (Close, New
+ * Terminal, New Browser Tab, Pin/Archive Session) and hands them to this page.
+ * Older shells lack the bridge and keep their own Close Window behavior.
+ */
+export function supportsDesktopCommands(): boolean {
+  const electron = electronApi();
+  return (
+    typeof electron?.onDesktopCommand === "function" &&
+    typeof electron.setDesktopCommandState === "function"
+  );
+}
+
+/** Subscribe to native menu commands; a no-op outside a supporting shell. */
+export function onDesktopCommand(callback: (event: DesktopCommandEvent) => void): () => void {
+  const electron = electronApi();
+  if (!electron?.onDesktopCommand) return () => {};
+  try {
+    return electron.onDesktopCommand(({ command, browserViewId, closingQuits }) => {
+      // A newer shell may send commands this page doesn't know; drop them.
+      if (!DESKTOP_COMMANDS.includes(command)) return;
+      callback({
+        command: command as DesktopCommand,
+        browserViewId: browserViewId ?? null,
+        closingQuits: closingQuits === true,
+      });
+    });
+  } catch (err) {
+    console.warn("[nativeBridge] desktop command subscription failed:", err);
+    return () => {};
+  }
+}
+
+/** Tell the shell which menu commands this page can run right now. */
+export function setDesktopCommandState(state: DesktopCommandState): void {
+  const electron = electronApi();
+  if (!electron?.setDesktopCommandState) return;
+  try {
+    electron.setDesktopCommandState(state);
+  } catch (err) {
+    console.warn("[nativeBridge] desktop command state update failed:", err);
+  }
+}
+
+/** Close this desktop window after the page's own confirmation; resolves whether it closed. */
+export async function closeDesktopWindow(): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.closeWindow) return false;
+  try {
+    return (await electron.closeWindow()) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
   }
 }
 

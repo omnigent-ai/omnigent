@@ -1,7 +1,7 @@
 import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { isNewShellHotkey, useNewShellHotkey } from "./useNewShellHotkey";
+import { isNewShellHotkey, isTerminalHotkey, useNewShellHotkey } from "./useNewShellHotkey";
 
 afterEach(() => {
   cleanup();
@@ -152,5 +152,52 @@ describe("useNewShellHotkey", () => {
 
     expect(onLaunch).not.toHaveBeenCalled();
     expect(e.defaultPrevented).toBe(false);
+  });
+});
+
+describe("⌃` terminal chord", () => {
+  it("matches literal Control plus the backquote key only", () => {
+    expect(isTerminalHotkey(event({ code: "Backquote", ctrlKey: true }))).toBe(true);
+    expect(isTerminalHotkey(event({ code: "Backquote", metaKey: true }))).toBe(false);
+    expect(isTerminalHotkey(event({ code: "Backquote", ctrlKey: true, shiftKey: true }))).toBe(
+      false,
+    );
+    // AltGr arrives as Ctrl+Alt on Windows/Linux layouts.
+    expect(isTerminalHotkey(event({ code: "Backquote", ctrlKey: true, altKey: true }))).toBe(false);
+    expect(isTerminalHotkey(event({ code: "KeyT", ctrlKey: true }))).toBe(false);
+  });
+
+  it("opens a shell on every platform, even from a focused terminal", () => {
+    for (const isMac of [true, false]) {
+      const onLaunch = vi.fn();
+      const { unmount } = renderHook(() => useNewShellHotkey(onLaunch, true, isMac));
+      const terminal = document.createElement("div");
+      terminal.className = "xterm";
+      const input = document.createElement("textarea");
+      terminal.append(input);
+      document.body.append(terminal);
+      input.focus();
+
+      const pressed = press({ code: "Backquote", ctrlKey: true }, input);
+      expect(onLaunch).toHaveBeenCalledTimes(1);
+      expect(pressed.defaultPrevented).toBe(true);
+      // ⌘⌥T still leaves a focused terminal alone.
+      press({ code: "KeyT", altKey: true, metaKey: isMac, ctrlKey: !isMac }, input);
+      expect(onLaunch).toHaveBeenCalledTimes(1);
+      unmount();
+      document.body.innerHTML = "";
+    }
+  });
+
+  it("ignores auto-repeat and a disabled hook", () => {
+    const onLaunch = vi.fn();
+    const { rerender } = renderHook(({ enabled }) => useNewShellHotkey(onLaunch, enabled, true), {
+      initialProps: { enabled: true },
+    });
+    press({ code: "Backquote", ctrlKey: true, repeat: true });
+    expect(onLaunch).not.toHaveBeenCalled();
+    rerender({ enabled: false });
+    press({ code: "Backquote", ctrlKey: true });
+    expect(onLaunch).not.toHaveBeenCalled();
   });
 });
