@@ -2,10 +2,11 @@
 Unit + integration tests for :mod:`omnigent.terminals.control_bridge`.
 
 Covers the pure helpers (``unescape_control_output`` octal round-trip,
-``_hex_send_keys_commands`` chunking) and an end-to-end drive of
+``_WindowNameFilter`` escape stripping, ``_hex_send_keys_commands`` chunking)
+and an end-to-end drive of
 ``bridge_tmux_control_to_websocket`` against a real private tmux server via a
-fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input,
-and the detach close code.
+fake WebSocket: seed-on-attach, ``%output`` streaming of ``send-keys`` input
+without window-name escapes, and the detach close code.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ from omnigent.terminals.control_bridge import (
     _clipboard_buffer_name,
     _hex_send_keys_commands,
     _read_tmux_buffer,
+    _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
 )
@@ -45,6 +47,7 @@ from omnigent.terminals.writer import (
     bind_terminal_writer,
     terminal_writer_from_scope,
 )
+from tests._helpers.polling import poll_until_async
 
 _HAS_TMUX = shutil.which("tmux") is not None
 
@@ -77,6 +80,39 @@ def test_unescape_control_output_round_trips_control_bytes() -> None:
     assert unescape_control_output(rb"a\134b") == b"a\\b"
     # Printable bytes pass through untouched.
     assert unescape_control_output(b"plain text 123") == b"plain text 123"
+
+
+@pytest.mark.parametrize(
+    ("stream", "expected"),
+    [
+        # oh-my-zsh names the window after each command it runs.
+        (b"\x1bkecho\x1b\\tmux-256color\r\n", b"\x1b\\tmux-256color\r\n"),
+        # Other escapes, OSC strings, and UTF-8 text pass through unchanged.
+        (
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+            "\x1b[31mré\x1b[0m\x1b]7;file://host/tmp\x1b\\\x1b(B".encode(),
+        ),
+        # A name ended by another escape keeps that escape.
+        (b"\x1bkname\x1b[0mtext", b"\x1b\\\x1b[0mtext"),
+        # CAN and SUB end a name and are dropped with it.
+        (b"\x1bkone\x18a\x1bktwo\x1ab", b"\x1b\\a\x1b\\b"),
+        # An OSC that the name's ESC ended still ends there.
+        (b"\x1b]0;T\x1bkname\x1b\\text", b"\x1b]0;T\x1b\\text"),
+        # At the end of the stream, a held ESC and an owed ST are flushed,
+        # and an unterminated name stays dropped.
+        (b"text\x1b", b"text\x1b"),
+        (b"\x1bkname\x1b", b"\x1b\\"),
+        (b"text\x1bkname", b"text"),
+    ],
+)
+def test_window_name_filter_drops_window_names(stream: bytes, expected: bytes) -> None:
+    """Window names are dropped whole, however tmux splits the stream."""
+    whole_filter = _WindowNameFilter()
+    assert whole_filter.feed(stream) + whole_filter.finish() == expected
+    # tmux can end an %output line anywhere, including mid-sequence.
+    byte_filter = _WindowNameFilter()
+    by_byte = b"".join(byte_filter.feed(stream[i : i + 1]) for i in range(len(stream)))
+    assert by_byte + byte_filter.finish() == expected
 
 
 def test_clipboard_buffer_name_accepts_only_safe_notifications() -> None:
@@ -612,15 +648,18 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail(
 async def test_control_bridge_seeds_streams_and_detaches(
     writer: TerminalWriter, tmp_path: Path
 ) -> None:
-    """End-to-end: seed the pre-attach screen, stream typed input, detach clean."""
-    # `cat` echoes input back to the pane (→ %output); the printf lands before
-    # attach so it can only reach the browser via the capture-pane seed.
+    """Preserve input attribution and filter window names while streaming typed input."""
+    # The seed precedes attach; the input reply includes a shell window-name escape.
     created = create_terminal_instance(
         name="bash",
         session_key="main",
         spec=TerminalEnvSpec(
             command="sh",
-            args=["-c", "printf 'SEEDED-LINE\\n'; cat"],
+            args=[
+                "-c",
+                "printf 'SEEDED-LINE\\n'; read -r line; "
+                "printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat",
+            ],
             os_env=OSEnvSpec(
                 type="caller_process",
                 cwd=str(tmp_path),
@@ -655,12 +694,12 @@ async def test_control_bridge_seeds_streams_and_detaches(
             )
 
         task = asyncio.create_task(_run())
-        # Give it time to seed, resize, inject input, and observe the echo.
-        await asyncio.sleep(1.2)
+        await poll_until_async(lambda: b"after-name" in b"".join(ws.sent), timeout_s=10)
 
         joined = b"".join(ws.sent)
         assert b"SEEDED-LINE" in joined, "seed-on-attach did not paint pre-attach screen"
         assert b"typed-input" in joined, "send-keys input was not echoed via %output"
+        assert b"WINDOW-NAME" not in joined, "the pane's window name reached the browser as text"
         snapshot = evidence.snapshot(evidence.incarnation_id)
         assert snapshot is not None and snapshot.writer == writer and snapshot.revision == 1
 
