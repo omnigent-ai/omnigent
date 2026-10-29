@@ -388,6 +388,7 @@ def create_host_tunnel_router(
                 host_store.upsert_on_connect,
                 host_id=host_id,
                 name=frame.name,
+                refreshed_name=frame.refreshed_name,
                 user_id=tunnel_owner,
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,

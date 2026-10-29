@@ -8320,72 +8320,38 @@ async def test_retryable_connection_error_escapes_live_receive_path() -> None:
 
 
 @pytest.mark.parametrize(
-    "conflict",
+    ("identity", "registered_name", "refreshed_name"),
     [
-        "(sqlite3.IntegrityError) UNIQUE constraint failed: "
-        "hosts.workspace_id, hosts.user_id, hosts.name",
-        "(psycopg.errors.UniqueViolation) duplicate key value violates unique constraint "
-        '"uq_hosts_workspace_user_id_name"',
-        "(pymysql.err.IntegrityError) (1062, \"Duplicate entry 'ws-local-ip-10-90-37-46' "
-        "for key 'hosts.uq_hosts_workspace_user_id_name'\")",
+        (
+            HostIdentity(
+                host_id="host_test_connect", name="ip-10-90-37-46", stored_name="ip-10-90-45-193"
+            ),
+            "ip-10-90-45-193",
+            "ip-10-90-37-46",
+        ),
+        (HostIdentity(host_id="host_test_connect", name="dev-laptop"), "dev-laptop", None),
     ],
-    ids=["sqlite", "postgres", "mysql"],
+    ids=["refreshed", "unchanged"],
 )
-async def test_registration_error_retries_with_stored_name_after_hostname_refresh(
-    conflict: str,
+async def test_hello_registers_the_stored_name_and_offers_the_refreshed_one(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: HostIdentity,
+    registered_name: str,
+    refreshed_name: str | None,
 ) -> None:
-    """A server that refuses a refreshed name gets the stored name on the next hello."""
-    identity = HostIdentity(
-        host_id="host_test_connect", name="ip-10-90-37-46", fallback_name="ip-10-90-45-193"
-    )
+    """Older servers read only ``name``, so a refreshed name travels in its own field."""
     host = HostProcess(identity, "https://app.example.databricks.com")
-    refusal = HostConnectionErrorFrame(stage="registration", error=conflict, retryable=True)
-    tunnels = [_ConnectionErrorTunnel(refusal), _ConnectionErrorTunnel(refusal)]
-
-    for tunnel in tunnels:
-        with pytest.raises(HostRetryableConnectionError):
-            await host._serve_frames(tunnel)  # type: ignore[arg-type]
-
-    hellos = [decode_host_frame(tunnel.sent[0]) for tunnel in tunnels]
-    assert [hello.name for hello in hellos if isinstance(hello, HostHelloFrame)] == [
-        "ip-10-90-37-46",
-        "ip-10-90-45-193",
-    ]
-
-
-@pytest.mark.parametrize(
-    "transient",
-    [
-        "database unavailable",
-        "(sqlite3.OperationalError) database is locked\n"
-        "[SQL: SELECT hosts.name FROM hosts WHERE hosts.host_id = ?]",
-    ],
-    ids=["unavailable", "locked"],
-)
-async def test_unrelated_registration_error_keeps_refreshed_name(transient: str) -> None:
-    """Only a name conflict gives up the refreshed name; other failures retry it."""
-    identity = HostIdentity(
-        host_id="host_test_connect", name="ip-10-90-37-46", fallback_name="ip-10-90-45-193"
-    )
-    host = HostProcess(identity, "https://app.example.databricks.com")
-    failed = _ConnectionErrorTunnel(
-        HostConnectionErrorFrame(stage="registration", error=transient, retryable=True)
-    )
-    with pytest.raises(HostRetryableConnectionError):
-        await host._serve_frames(failed)  # type: ignore[arg-type]
-
-    recovered = _BlockingTunnel()
-    serve_task = asyncio.create_task(host._serve_frames(recovered))  # type: ignore[arg-type]
+    monkeypatch.setattr(host, "_initialize_capabilities", AsyncMock())
+    tunnel = _BlockingTunnel()
+    serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
     try:
-        await asyncio.wait_for(recovered.first_send.wait(), timeout=1.0)
+        await asyncio.wait_for(tunnel.first_send.wait(), timeout=1.0)
     finally:
         await _cancel(serve_task)
 
-    hellos = [decode_host_frame(tunnel.sent[0]) for tunnel in (failed, recovered)]
-    assert [hello.name for hello in hellos if isinstance(hello, HostHelloFrame)] == [
-        "ip-10-90-37-46",
-        "ip-10-90-37-46",
-    ]
+    hello = decode_host_frame(tunnel.sent[0])
+    assert isinstance(hello, HostHelloFrame)
+    assert (hello.name, hello.refreshed_name) == (registered_name, refreshed_name)
 
 
 async def test_capabilities_are_initialized_once_across_reconnects(

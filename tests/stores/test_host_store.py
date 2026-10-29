@@ -849,6 +849,38 @@ def test_reconnect_renames_known_host_unless_another_host_holds_the_name(
     assert hosts[earlier_box].status == "offline"
 
 
+def test_refreshed_name_applies_only_while_no_other_host_holds_it(
+    host_store: HostStore,
+) -> None:
+    """A refreshed name replaces the registered one only while no other host holds it."""
+    owner = "grace@example.com"
+    box, reused_ip_box, next_ip_box = "11" * 16, "22" * 16, "33" * 16
+    host_store.upsert_on_connect(box, "ip-10-90-45-193", owner)
+    refreshed = host_store.upsert_on_connect(
+        box, "ip-10-90-45-193", owner, refreshed_name="ip-10-90-37-46"
+    )
+    host_store.upsert_on_connect(reused_ip_box, "ip-10-90-45-193", owner)
+    host_store.upsert_on_connect(next_ip_box, "ip-10-90-18-185", owner)
+
+    both_held = host_store.upsert_on_connect(
+        box, "ip-10-90-45-193", owner, refreshed_name="ip-10-90-18-185"
+    )
+    new_free = host_store.upsert_on_connect(
+        "44" * 16, "ip-10-90-60-1", owner, refreshed_name="ip-10-90-50-7"
+    )
+    new_held = host_store.upsert_on_connect(
+        "55" * 16, "ip-10-90-60-2", owner, refreshed_name="ip-10-90-18-185"
+    )
+
+    assert refreshed.name == "ip-10-90-37-46"
+    assert (both_held.name, both_held.status) == ("ip-10-90-37-46", "online")
+    assert new_free.name == "ip-10-90-50-7"
+    assert new_held.name == "ip-10-90-60-2"
+    hosts = {host.host_id: host.name for host in host_store.list_hosts(owner)}
+    assert hosts[reused_ip_box] == "ip-10-90-45-193"
+    assert hosts[next_ip_box] == "ip-10-90-18-185"
+
+
 _RESERVED_HOST_ID = "ab" * 16
 
 

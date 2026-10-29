@@ -18,7 +18,6 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
 from omnigent.db.utils import get_or_create_engine, now_epoch
-from omnigent.host.connect import _HOST_NAME_CONFLICT
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
@@ -107,11 +106,13 @@ def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    refreshed_name: str | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
     :param name: Human-readable host name.
     :param runners: Live runner IDs, defaults to empty.
+    :param refreshed_name: Hostname-derived replacement for *name*, if any.
     :returns: JSON-encoded hello frame string.
     """
     return encode_host_frame(
@@ -121,6 +122,7 @@ def _make_hello(
             name=name,
             runners=runners or [],
             connection_id=connection_id,
+            refreshed_name=refreshed_name,
         )
     )
 
@@ -150,6 +152,7 @@ async def _send_hello_and_wait(
     name: str = "test-laptop",
     runners: list[str] | None = None,
     connection_id: str | None = None,
+    refreshed_name: str | None = None,
 ) -> None:
     """Send hello and wait for registration.
 
@@ -158,9 +161,13 @@ async def _send_hello_and_wait(
     :param host_id: Expected host_id in the registry.
     :param name: Host name for the hello frame.
     :param runners: Live runner IDs for the hello frame.
+    :param refreshed_name: Hostname-derived replacement for *name*, if any.
     """
     await communicator.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
+        {
+            "type": "websocket.receive",
+            "text": _make_hello(name, runners, connection_id, refreshed_name),
+        },
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
@@ -894,26 +901,20 @@ async def test_host_tunnel_reports_registration_failure(
     assert registry.get(_HOST_ID) is None
 
 
-async def test_renaming_to_a_held_name_without_the_check_is_a_retryable_registration_error(
+async def test_host_tunnel_registers_a_known_host_under_its_refreshed_name(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A server without the held-name check refuses it with a name-conflict registration error."""
+    """A hello's refreshed name renames the known host; ``name`` stays what older servers read."""
     app, registry, store = host_app
-    store.upsert_on_connect(
-        host_id="2555c28ab2a433488edd86d08ade2ce3", name="ip-10-90-37-46", user_id="local"
-    )
     store.upsert_on_connect(host_id=_HOST_ID, name="ip-10-90-45-193", user_id="local")
-    monkeypatch.setattr(HostStore, "_name_held_by_other_host", lambda *_args, **_kwargs: False)
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await comm.send_input({"type": "websocket.receive", "text": _make_hello("ip-10-90-37-46")})
+    await _send_hello_and_wait(
+        comm, registry, name="ip-10-90-45-193", refreshed_name="ip-10-90-37-46"
+    )
 
-    sent = await comm.receive_output(timeout=budget(1.0))
-    error = decode_host_frame(sent["text"])
-    assert isinstance(error, HostConnectionErrorFrame)
-    assert (error.stage, error.retryable) == ("registration", True)
-    assert _HOST_NAME_CONFLICT.search(error.error)
-    assert registry.get(_HOST_ID) is None
+    host = store.get_host(_HOST_ID)
+    assert host is not None
+    assert (host.name, host.status) == ("ip-10-90-37-46", "online")
 
 
 async def test_registry_failure_marks_persisted_host_offline(

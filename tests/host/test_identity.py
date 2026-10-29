@@ -201,7 +201,7 @@ def test_hostname_derived_name_follows_hostname_change(
     second = load_or_create_host_identity(config_path)
 
     assert first.name == "devbox-a"
-    assert second == HostIdentity(host_id=first.host_id, name="devbox-b", fallback_name="devbox-a")
+    assert second == HostIdentity(host_id=first.host_id, name="devbox-b", stored_name="devbox-a")
     data = yaml.safe_load(config_path.read_text())
     assert data["host"]["name"] == "devbox-a"
     assert data["server"] == "http://example.com"
@@ -238,6 +238,7 @@ def test_user_renamed_host_keeps_name_after_hostname_change(
         ("ip-10-90-45-193", "dev-laptop", "dev-laptop"),
         ("my-laptop", "ip-10-90-37-46", "my-laptop"),
         ("ip-10-90-37-46-dev", "ip-10-90-18-185", "ip-10-90-37-46-dev"),
+        ("ip-999-999-999-999", "ip-10-90-18-185", "ip-999-999-999-999"),
     ],
 )
 def test_legacy_config_regenerates_only_a_stale_ec2_hostname_name(
@@ -263,7 +264,7 @@ def test_legacy_config_regenerates_only_a_stale_ec2_hostname_name(
     assert identity == HostIdentity(
         host_id="d6d0ccebce7b4b706d21e23696bb462a",
         name=expected_name,
-        fallback_name=saved_name if expected_name != saved_name else None,
+        stored_name=saved_name if expected_name != saved_name else None,
     )
     assert yaml.safe_load(config_path.read_text())["host"]["name"] == saved_name
 
@@ -286,7 +287,7 @@ def test_legacy_config_name_matching_hostname_follows_later_change(
     monkeypatch.setattr(socket, "gethostname", lambda: "devbox-b")
 
     assert load_or_create_host_identity(config_path) == HostIdentity(
-        host_id="d6d0ccebce7b4b706d21e23696bb462a", name="devbox-b", fallback_name="devbox-a"
+        host_id="d6d0ccebce7b4b706d21e23696bb462a", name="devbox-b", stored_name="devbox-a"
     )
 
 
@@ -313,7 +314,7 @@ def test_name_refresh_survives_an_unwritable_config(
     assert identity == HostIdentity(
         host_id="d6d0ccebce7b4b706d21e23696bb462a",
         name="ip-10-90-37-46",
-        fallback_name="ip-10-90-45-193",
+        stored_name="ip-10-90-45-193",
     )
     assert config_path.read_text() == original
 

@@ -269,6 +269,7 @@ class HostStore:
         name: str,
         user_id: str,
         *,
+        refreshed_name: str | None = None,
         allow_host_id_reown: bool = False,
         configured_harnesses: dict[str, HarnessAvailability] | None = None,
         managed_token: str | None = None,
@@ -301,6 +302,9 @@ class HostStore:
             ``"corey-laptop"``.
         :param user_id: Authenticated user ID from the Bearer token,
             e.g. ``"corey.zumar@databricks.com"``.
+        :param refreshed_name: Current hostname replacing a generated *name*,
+            e.g. ``"ip-10-90-37-46"``. Used instead of *name* unless another
+            host holds it.
         :param allow_host_id_reown: When ``True`` and a row already
             exists for *host_id* under a different ``(user_id, name)``,
             re-own that row in place (preserving the ``host_id`` and its
@@ -369,10 +373,11 @@ class HostStore:
                     )
                 # Known host_id (same user_id, or reown opted in): refresh owner, status and
                 # timestamp; rename unless another owner row (even a tombstone) holds the name.
-                if name != row.name and not self._name_held_by_other_host(
-                    session, host_id=host_id, user_id=user_id, name=name
+                requested_name = refreshed_name or name
+                if requested_name != row.name and not self._name_held_by_other_host(
+                    session, host_id=host_id, user_id=user_id, name=requested_name
                 ):
-                    row.name = name
+                    row.name = requested_name
                 row.user_id = user_id
                 row.account_generation = generation
                 row.status = encode_host_status("online")
@@ -421,10 +426,13 @@ class HostStore:
                 return _row_to_host(row)
 
             # Genuinely new host: plain INSERT.
+            refreshed_name_free = refreshed_name is not None and not self._name_held_by_other_host(
+                session, host_id=host_id, user_id=user_id, name=refreshed_name
+            )
             row = SqlHost(
                 account_generation=generation,
                 user_id=user_id,
-                name=name,
+                name=refreshed_name if refreshed_name_free else name,
                 host_id=host_id,
                 status=encode_host_status("online"),
                 created_at=now,

@@ -46,7 +46,7 @@ NAME_FROM_HOSTNAME_KEY = "name_from_hostname"
 
 # EC2's private-IP hostname, e.g. ``ip-10-90-37-46``. In a config saved before
 # NAME_FROM_HOSTNAME_KEY existed, such a name was generated, never chosen.
-_EC2_PRIVATE_IP_HOSTNAME = re.compile(r"ip(-\d{1,3}){4}(\..+)?")
+_EC2_PRIVATE_IP_HOSTNAME = re.compile(r"ip(-(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){4}(\..+)?")
 
 
 @dataclass
@@ -58,14 +58,15 @@ class HostIdentity:
         Format: bare 32-char uuid4 hex.
     :param name: Human-readable name displayed in the Web UI
         host picker, e.g. ``"corey-laptop"``.
-    :param fallback_name: The name stored in config.yaml when *name* replaced
-        it with a newer hostname, e.g. ``"ip-10-90-45-193"``; registration
-        retries with it if the server refuses *name*. ``None`` otherwise.
+    :param stored_name: The generated name config.yaml still holds when *name*
+        refreshed it from a newer hostname, e.g. ``"ip-10-90-45-193"``. The
+        hello registers it for servers that predate name refreshes. ``None``
+        otherwise.
     """
 
     host_id: str
     name: str
-    fallback_name: str | None = None
+    stored_name: str | None = None
 
 
 HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
@@ -171,7 +172,7 @@ def load_or_create_host_identity(
     A name generated from the hostname follows later hostname changes
     (e.g. a VM re-provisioned with a new IP-based hostname while its
     home directory persists), keeping the same ``host_id``. The stored
-    name is left in place and returned as ``fallback_name``.
+    name is left in place and returned as ``stored_name``.
 
     A *partial* host section is completed rather than discarded: a
     config.yaml that names the host (``host: {name: my-box}``) but
@@ -222,13 +223,13 @@ def load_or_create_host_identity(
     host_id = host_section.get("host_id")
     name = host_section.get("name")
     hostname = socket.gethostname()
-    fallback_name: str | None = None
+    stored_name: str | None = None
     record_provenance = False
     if isinstance(name, str) and _name_is_generated(host_section, name, hostname):
         record_provenance = NAME_FROM_HOSTNAME_KEY not in host_section
         host_section[NAME_FROM_HOSTNAME_KEY] = name
         if name != hostname:
-            name, fallback_name = hostname, name
+            name, stored_name = hostname, name
 
     # A host_id read from config.yaml must be a valid (UUID-shaped) id, same
     # as the env override — an invalid one would only fail later, remotely, as
@@ -245,7 +246,7 @@ def load_or_create_host_identity(
                 host_id, source=f"host_id in {path}", remedy=config_host_id_remedy
             ),
             name=name,
-            fallback_name=fallback_name,
+            stored_name=stored_name,
         )
         if record_provenance:
             # Best effort: an unwritable config only repeats this on the next start.
@@ -263,7 +264,7 @@ def load_or_create_host_identity(
     )
     if not name:
         name = host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = hostname
-    identity = HostIdentity(host_id=host_id, name=name, fallback_name=fallback_name)
+    identity = HostIdentity(host_id=host_id, name=name, stored_name=stored_name)
 
     host_section["host_id"] = identity.host_id
     cfg["host"] = host_section

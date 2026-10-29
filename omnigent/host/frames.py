@@ -247,6 +247,10 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
+    :param refreshed_name: Current hostname of a host whose generated *name*
+        came from an earlier one, e.g. ``"ip-10-90-37-46"``. The server
+        registers it unless another host holds it; older servers ignore it and
+        register *name*. Absent from older hosts.
     """
 
     version: str
@@ -261,6 +265,7 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
+    refreshed_name: str | None = None
 
 
 @dataclass
@@ -1557,6 +1562,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
+                "refreshed_name": frame.refreshed_name,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2625,6 +2631,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
+        refreshed_name=_optional_nullable_str(msg, "refreshed_name"),
     )
 
 
