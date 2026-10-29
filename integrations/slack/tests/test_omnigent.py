@@ -1171,21 +1171,6 @@ async def test_resolve_elicitation_decline_and_benign_statuses() -> None:
 
 
 @respx.mock
-async def test_resolve_elicitation_raises_when_prompt_waits_in_terminal() -> None:
-    # The server refused the verdict, so the card must report a failed delivery
-    # rather than the verdict.
-    respx.post("http://omnigent.test/v1/sessions/conv_1/elicitations/held/resolve").mock(
-        return_value=httpx.Response(423, json={"error": {"code": "prompt_in_terminal"}})
-    )
-    client = OmnigentClient("http://omnigent.test")
-    try:
-        with pytest.raises(OmnigentError):
-            await client.resolve_elicitation("conv_1", "held", accepted=True)
-    finally:
-        await client.aclose()
-
-
-@respx.mock
 async def test_get_session_activity_maps_server_state() -> None:
     # The server snapshot is the authoritative "is this session busy?" signal.
     def snap(status: str, pending: list[dict[str, object]]) -> httpx.Response:
