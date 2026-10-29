@@ -16,6 +16,8 @@ const DESKTOP_COMMANDS = Object.freeze([
   "toggle-pin-session",
   "go-back",
   "go-forward",
+  "reload",
+  "focus-address-bar",
 ]);
 
 /**
