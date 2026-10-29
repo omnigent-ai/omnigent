@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { setOmnigentHostConfig, type HtmlPreviewFrameProps } from "@/lib/host";
 import { HtmlCommentViewer } from "./HtmlCommentViewer";
-import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
+import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { BRIDGE_MSG } from "./htmlCommentBridge";
 
 // Permissions gate the floating "Add comment" button; default to editable.
 vi.mock("@/hooks/usePermissions", () => ({
@@ -195,22 +196,6 @@ describe("HtmlCommentViewer", () => {
 
 describe("HtmlCommentViewer zoom", () => {
   /** Wait for the frame to load and return the bridge's end of the channel the viewer hands it. */
-  async function connectBridge(iframe: HTMLIFrameElement) {
-    if (!iframe.contentWindow) throw new Error("Preview has no content window");
-    const postMessage = vi.spyOn(iframe.contentWindow, "postMessage");
-    // jsdom loads the srcdoc itself; a synthetic load would be superseded by it.
-    await waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1));
-    const [init, , transfer] = postMessage.mock.calls[0] as unknown as [
-      { nonce: string },
-      string,
-      MessagePort[],
-    ];
-    const port = transfer[0];
-    const send = (msg: Record<string, unknown>) =>
-      port.postMessage({ source: BRIDGE_SOURCE, nonce: init.nonce, ...msg });
-    return { port, send };
-  }
-
   function previewParts() {
     const iframe = screen.getByTitle<HTMLIFrameElement>("HTML preview");
     return { iframe, zoomBox: iframe.parentElement as HTMLElement };
@@ -219,7 +204,7 @@ describe("HtmlCommentViewer zoom", () => {
   it("scales only the preview for zoom requests from the frame and shows the level", async () => {
     renderViewer("<body><p>doc</p></body>");
     const { iframe, zoomBox } = previewParts();
-    const { port, send } = await connectBridge(iframe);
+    const { port, send } = await connectHtmlPreviewBridge(iframe);
     const badge = screen.getByTestId("html-preview-zoom");
     expect(zoomBox.style.transform).toBe("");
     expect(badge.textContent).toBe("");
@@ -246,7 +231,7 @@ describe("HtmlCommentViewer zoom", () => {
   it("hides the zoom level shortly after the last change", async () => {
     renderViewer("<body><p>doc</p></body>");
     const { iframe, zoomBox } = previewParts();
-    const { port, send } = await connectBridge(iframe);
+    const { port, send } = await connectHtmlPreviewBridge(iframe);
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     send({ type: BRIDGE_MSG.zoom, action: "in" });
     await vi.waitFor(() => expect(zoomBox.style.transform).toBe("scale(1.1)"));
@@ -263,7 +248,7 @@ describe("HtmlCommentViewer zoom", () => {
 
   it("keeps the zoom when the content reloads", async () => {
     const { rerender } = renderViewer("<body><p>first</p></body>");
-    const { send, port } = await connectBridge(previewParts().iframe);
+    const { send, port } = await connectHtmlPreviewBridge(previewParts().iframe);
     send({ type: BRIDGE_MSG.zoom, action: "in" });
     await waitFor(() => expect(previewParts().zoomBox.style.transform).toBe("scale(1.1)"));
     rerender(
@@ -284,7 +269,7 @@ describe("HtmlCommentViewer zoom", () => {
   it("places the Add-comment button over a selection at the zoomed position", async () => {
     renderViewer("<body><p>Quarterly revenue</p></body>");
     const { iframe, zoomBox } = previewParts();
-    const { port, send } = await connectBridge(iframe);
+    const { port, send } = await connectHtmlPreviewBridge(iframe);
     const selectRevenue = (reflow = false) =>
       send({
         type: BRIDGE_MSG.selection,

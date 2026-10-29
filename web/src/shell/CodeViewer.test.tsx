@@ -7,7 +7,8 @@ import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
-import { BRIDGE_MSG, BRIDGE_SOURCE } from "./htmlCommentBridge";
+import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -843,20 +844,10 @@ describe("CodeViewer HTML preview sandbox", () => {
   it("opens another file at 100% zoom", async () => {
     const html = "<html><head></head><body><p>report</p></body></html>";
     const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
-    const iframe = screen.getByTitle<HTMLIFrameElement>("HTML preview");
-    const postMessage = vi.spyOn(iframe.contentWindow!, "postMessage");
-    await waitFor(() => expect(postMessage).toHaveBeenCalledTimes(1));
-    const [init, , [port]] = postMessage.mock.calls[0] as unknown as [
-      { nonce: string },
-      string,
-      MessagePort[],
-    ];
-    port.postMessage({
-      source: BRIDGE_SOURCE,
-      nonce: init.nonce,
-      type: BRIDGE_MSG.zoom,
-      action: "in",
-    });
+    const { port, send } = await connectHtmlPreviewBridge(
+      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+    );
+    send({ type: BRIDGE_MSG.zoom, action: "in" });
     const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
     await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
 

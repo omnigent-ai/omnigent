@@ -207,12 +207,15 @@ describe("bridge runtime zoom shortcuts", () => {
     [["resize", "selectionchange"], false],
   ])("re-reports the selection after %o with reflow %s", (events, reflow) => {
     vi.useFakeTimers();
+    const getClientRects = Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects");
     try {
       const port = startRuntime();
       document.body.innerHTML = "<p>Quarterly revenue</p>";
       // jsdom has no layout, so give the selected range a rect.
-      Range.prototype.getClientRects = () =>
-        [{ left: 1, top: 2, right: 3, bottom: 4 }] as unknown as DOMRectList;
+      Object.defineProperty(Range.prototype, "getClientRects", {
+        configurable: true,
+        value: () => [{ left: 1, top: 2, right: 3, bottom: 4 }],
+      });
       document.getSelection()?.selectAllChildren(document.body);
       vi.runAllTimers();
       port.postMessage.mockClear();
@@ -231,7 +234,8 @@ describe("bridge runtime zoom shortcuts", () => {
         ],
       ]);
     } finally {
-      delete (Range.prototype as Partial<Range>).getClientRects;
+      if (getClientRects) Object.defineProperty(Range.prototype, "getClientRects", getClientRects);
+      else delete (Range.prototype as Partial<Range>).getClientRects;
       document.getSelection()?.removeAllRanges();
       document.body.innerHTML = "";
       vi.useRealTimers();

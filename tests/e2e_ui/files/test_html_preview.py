@@ -40,6 +40,8 @@ import httpx
 import pytest
 from playwright.sync_api import FrameLocator, Locator, Page, expect
 
+from tests._helpers.polling import poll_until
+
 # The hello_world agent spec uses ``os_env.cwd: .``, so the runner writes
 # seeded files into the server process's cwd — the repo root (this file is
 # ``<repo>/tests/e2e_ui/files/...``, so the repo root is ``parents[3]``).
@@ -279,19 +281,26 @@ def _expect_scaled(heading: Locator, base_height: float, scale: float) -> None:
 _ZOOM_VIEWPORT = {"width": 1600, "height": 900}
 
 
-def _expect_button_above(page: Page, button: Locator, selected: Locator) -> None:
+def _expect_button_above(button: Locator, selected: Locator) -> None:
     """Wait for ``button`` to sit just above ``selected`` on screen."""
     expect(button).to_be_visible()
-    # The button moves on a debounced selection report after the frame resizes.
-    for _ in range(50):
-        button_box, selected_box = _box(button), _box(selected)
-        if (
+    boxes: dict[str, dict[str, float]] = {}
+
+    def aligned() -> bool:
+        boxes["button"], boxes["selection"] = _box(button), _box(selected)
+        button_box, selected_box = boxes["button"], boxes["selection"]
+        return (
             abs(button_box["x"] - selected_box["x"]) < 4
             and abs(button_box["y"] + button_box["height"] + 6 - selected_box["y"]) < 4
-        ):
-            return
-        page.wait_for_timeout(100)
-    raise AssertionError(f"Add comment at {button_box}, selection at {selected_box}")
+        )
+
+    # The button moves on a debounced selection report after the frame resizes.
+    try:
+        poll_until(aligned, timeout_s=5, interval_s=0.1)
+    except AssertionError as error:
+        raise AssertionError(
+            f"Add comment at {boxes['button']}, selection at {boxes['selection']}"
+        ) from error
 
 
 def _hold_for_recording(page: Page) -> None:
@@ -365,7 +374,7 @@ def test_html_preview_zoom_shortcuts_scale_only_the_preview(
     status_line = preview.locator("#js-status")
     status_line.select_text()
     add_comment = page.get_by_role("button", name="Add comment")
-    _expect_button_above(page, add_comment, status_line)
+    _expect_button_above(add_comment, status_line)
     _hold_for_recording(page)
 
     # Zooming reflows the text; the button follows the selection to its new place.
@@ -374,7 +383,7 @@ def test_html_preview_zoom_shortcuts_scale_only_the_preview(
     expect(badge).to_have_text("Preview zoom 110%")
     _expect_scaled(heading, base_height, 1.1)
     assert _box(status_line) != selected_before
-    _expect_button_above(page, add_comment, status_line)
+    _expect_button_above(add_comment, status_line)
     _hold_for_recording(page)
 
     assert _press_in_preview(page, preview, "Control+0")

@@ -340,7 +340,7 @@
 
   // Browser zoom shortcuts would zoom the whole app; zoom only this preview.
   // Bound on connect, after the artifact's startup listeners, so a shortcut
-  // the artifact cancels stays with it.
+  // they cancel stays with the artifact. Listeners added later run after this.
   function onZoomKey(e) {
     if (e.defaultPrevented) return;
     const action = zoomAction(e);
