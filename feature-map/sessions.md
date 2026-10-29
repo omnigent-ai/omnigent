@@ -66,7 +66,8 @@ the header menu), and each place is a separate entry point.
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
-  attention or is unread.
+  attention or is unread. Filing a session into the folder leaves its listed
+  rows as they are, so an older one lands behind Show more.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
@@ -931,7 +932,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-show-more`:** no browser test drives it. Component tests in
   `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
   the next server page, the slide and its reduced-motion skip, the open-session
-  reveal, row-menu filing, the hidden-session badge, and the ⌘[ / ⌘] hotkey;
+  reveal, row-menu filing leaving the listed rows as they are, the
+  hidden-session badge, and the ⌘[ / ⌘] hotkey;
   `web/src/shell/Sidebar.shiftSelect.test.tsx` covers shift ranges, bulk
   actions, and bulk filing. By hand: create a project
   (`POST /v1/projects`), file six or more sessions into it with

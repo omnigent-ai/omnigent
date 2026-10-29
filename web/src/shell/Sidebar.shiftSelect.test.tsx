@@ -338,7 +338,7 @@ describe("Sidebar shift-click selection", () => {
     expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(["a0", "a4"]);
   });
 
-  it("lists sessions bulk-moved into a folder when they sort past the first five", async () => {
+  it("keeps a folder's listed rows when older sessions are bulk-moved into it", async () => {
     projectsMock.push("Alpha");
     const alpha = Array.from({ length: 6 }, (_, i) =>
       conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
@@ -378,9 +378,13 @@ describe("Sidebar shift-click selection", () => {
       ids: ["old1", "old2"],
       project: "Alpha",
     });
+    // Leaving selection renders the moved rows: they wait behind Show more.
     await waitFor(() => {
-      expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4", "a5", "old1", "old2"]);
+      expect(screen.queryByText("2 selected")).toBeNull();
     });
+    expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4"]);
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(alphaRowIds()).toEqual(["a0", "a1", "a2", "a3", "a4", "a5", "old1", "old2"]);
   });
 
   it("labels Delete with the owned count when the selection is mixed-ownership", async () => {

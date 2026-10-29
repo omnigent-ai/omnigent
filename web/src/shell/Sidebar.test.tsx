@@ -2807,7 +2807,7 @@ describe("Sidebar project Show more", () => {
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
 
-  it("lists a session filed from its row menu when it sorts past the first five", async () => {
+  it("keeps a folder's listed rows when an older session is filed into it", async () => {
     projectsMock.push("Customer X");
     const older = conv("conv_older", "Claude Code", { updated_at: 1 });
     mockConversations([...filedSessions(6), older]);
@@ -2824,12 +2824,13 @@ describe("Sidebar project Show more", () => {
     });
     fireEvent.click(await screen.findByTestId("move-to-project"));
     fireEvent.click(await screen.findByRole("menuitem", { name: /Customer X/ }));
-    expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
+    // Re-render with the moved row, as the pointer does over the list mid-drag.
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
 
-    // Toggling the folder drops the reveal, so it starts at five again.
-    toggleFolder();
-    toggleFolder();
     expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.queryByRole("link", { name: "conv_older" })).toBeNull();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
   });
 
   it("steps the session hotkey past the sessions behind Show more", () => {
