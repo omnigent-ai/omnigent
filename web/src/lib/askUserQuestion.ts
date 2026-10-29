@@ -52,6 +52,8 @@ export interface ClaudeQuestion {
   multiSelect: boolean;
   isOther?: boolean;
   isSecret?: boolean;
+  /** Editable text whose exact contents, including empty text, are the answer. */
+  textInput?: { default: string };
 }
 
 export interface AskUserQuestionPayload {
@@ -157,6 +159,7 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
     if (typeof id === "string" && id) {
       questionPayload.id = id;
     }
+    if (rec.isSecret === true) questionPayload.isSecret = true;
     questions.push(questionPayload);
   }
 

@@ -278,7 +278,9 @@ async def test_oversized_pane_snapshot_is_bounded(tmp_path: Path) -> None:
     assert len(pane_block) <= 4100, len(pane_block)
 
 
-def _required_terminal_exit(session_was_idle: bool) -> TerminalExitEvent:
+def _required_terminal_exit(
+    session_was_idle: bool, expected_close: bool = False
+) -> TerminalExitEvent:
     """Build the exit the registry publishes when the session's Claude pane dies."""
     return TerminalExitEvent(
         session_id=_CONV_ID,
@@ -291,6 +293,7 @@ def _required_terminal_exit(session_was_idle: bool) -> TerminalExitEvent:
         cwd="/work",
         last_output="Waiting for the API key helper...\n",
         session_was_idle=session_was_idle,
+        expected_close=expected_close,
     )
 
 
@@ -309,6 +312,29 @@ def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
         ):
             statuses.append(item)
     return statuses
+
+
+@pytest.mark.asyncio
+async def test_expected_close_of_the_pane_publishes_no_terminal_failure() -> None:
+    """A pane Omnigent closed to fail its turn adds no terminal-exit failure.
+
+    The delivery timeout's own error fails the turn. The exit that the reap
+    causes must not publish a second ``session.status: failed``, which would
+    show the person two failure banners and make the terminal exit the
+    first error.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    app = _make_app(cause="unused")
+    publish = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        publish(_required_terminal_exit(session_was_idle=False, expected_close=True))
+        statuses = _failed_statuses(_CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert statuses == []
 
 
 @pytest.mark.asyncio
