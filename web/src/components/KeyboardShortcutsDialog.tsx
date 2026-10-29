@@ -27,6 +27,7 @@ import {
   NEW_TERMINAL_KEYS,
   newSessionShortcutKeys,
   PIN_SESSION_KEYS,
+  pinnedSessionShortcutKeys,
   QUIT_KEYS,
   SHIFT_KEY,
   SPLIT_TERMINAL_KEYS,
@@ -181,7 +182,7 @@ const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
 function pinnedSessionShortcut(native: boolean): Shortcut {
   return {
     label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
+    keys: pinnedSessionShortcutKeys("1…0", native),
   };
 }
 

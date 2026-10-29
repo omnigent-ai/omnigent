@@ -40,6 +40,15 @@ export function newSessionAriaShortcut(native = isNativeShell()): string {
   return `${ARIA_MOD_KEY}+${native ? "Alt+N" : "Shift+O"}`;
 }
 
+/** Keys for the pinned-session jump chord; `digit` is one slot's digit or a range label. */
+export function pinnedSessionShortcutKeys(digit: string, native = isNativeShell()): string[] {
+  return native ? [MOD_KEY, digit] : [MOD_KEY, ALT_KEY, digit];
+}
+
+export function pinnedSessionAriaShortcut(digit: string, native = isNativeShell()): string {
+  return native ? `${ARIA_MOD_KEY}+${digit}` : `${ARIA_MOD_KEY}+Alt+${digit}`;
+}
+
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
 }
