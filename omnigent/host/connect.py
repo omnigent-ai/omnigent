@@ -5381,6 +5381,13 @@ def run_host_process(
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
+    from omnigent.cli_auth import pin_databricks_org_id
+    from omnigent.util.server_url import ServerUrl, is_workspace_hosted_url
+
+    if is_workspace_hosted_url(server_url):
+        # Foreground hosts need the same snapshot as auto-launched daemons.
+        # Pinning absence prevents later login metadata retargeting runners.
+        pin_databricks_org_id(server_url, ServerUrl.from_api_base(server_url).org_id)
     # Before any startup work logs, so its earliest debug-log rows are attributed.
     publish_origin_identity(server_url)
     # The loop prints and logs to the terminal; one that stops reading must not stall it.

@@ -59,6 +59,8 @@ class HostDaemonRecord:
     :param workspace_id: Databricks workspace id the daemon connects to, as
         the server reported it at startup, e.g. ``"123"``; ``None`` when
         unknown or for records written by older daemons.
+    :param org_pin: Immutable routing pin, including ``?o=`` for no selector;
+        ``None`` for legacy records without a routing snapshot.
     """
 
     pid: int
@@ -71,6 +73,9 @@ class HostDaemonRecord:
     resolved_server_url: str | None = None
     config_sig: str | None = None
     workspace_id: str | None = None
+    # Launch-time routing binding; unlike workspace_id this is not a probe
+    # result. None identifies a legacy record without an immutable snapshot.
+    org_pin: str | None = None
 
 
 def normalize_daemon_target(server_url: str | None, *, org_id: str | None = None) -> str:
@@ -395,6 +400,7 @@ def record_from_json(raw: Mapping[str, object]) -> HostDaemonRecord | None:
         resolved_server_url=_text("resolved_server_url"),
         config_sig=_text("config_sig"),
         workspace_id=_text("workspace_id"),
+        org_pin=_text("org_pin"),
     )
 
 
