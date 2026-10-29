@@ -3115,11 +3115,11 @@ class SessionListItem(BaseModel):
         passing through ``session_stream`` and decrements when a
         verdict is dispatched. ``0`` when the session has no
         outstanding elicitations.
-    :param background_work_running: ``True`` while a background shell
-        outlives the session's ended turn (claude-native, from Claude's
-        status file). The sidebar shows such a session as working; ``status``
-        stays as reported, so the session still takes a new message. ``False``
-        while the session's runner is offline.
+    :param background_work_running: ``True`` while work outlives the
+        session's ended turn, such as a background shell or a Codex goal that
+        keeps running between turns. The sidebar shows such a session as
+        working; ``status`` stays as reported, so the session still takes a new
+        message. ``False`` while the session's runner is offline.
     :param blocked_on: Why the session's agent is parked on a terminal prompt,
         e.g. ``"permission prompt"``, from the last status edge, truncated to
         128 characters. The sidebar shows such a session as needing input even

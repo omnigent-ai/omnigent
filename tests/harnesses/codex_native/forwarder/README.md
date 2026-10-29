@@ -6,6 +6,7 @@ parameterization produces additional collected cases.
 
 | Module | Behavior | Test definitions |
 | --- | --- | ---: |
+| [test_background_work.py](test_background_work.py) | Background work | 15 |
 | [test_compaction.py](test_compaction.py) | Compaction | 8 |
 | [test_delivery.py](test_delivery.py) | Delivery | 15 |
 | [test_delivery_limits.py](test_delivery_limits.py) | Upload limits and completion after oversized events | 3 |

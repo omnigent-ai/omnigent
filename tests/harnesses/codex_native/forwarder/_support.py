@@ -7,8 +7,35 @@ from pathlib import Path
 import httpx
 
 from omnigent.harnesses.codex_native.bridge import (
+    CodexNativeBridgeState,
     codex_home_for_bridge_dir,
+    write_bridge_state,
 )
+
+
+def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
+    """
+    Seed bridge state so a terminal turn edge clears the active turn.
+
+    ``_terminal_turn_status_edge`` only produces an edge when the terminal
+    event clears the recorded active turn id; without this seed it returns
+    ``None`` as "stale".
+
+    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
+    :param turn_id: Active Codex turn id to record, e.g. ``"turn_123"``.
+    :returns: None.
+    """
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=turn_id,
+        ),
+    )
+
 
 _Tokens = tuple[int, int, int]
 

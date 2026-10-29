@@ -41,7 +41,7 @@ function describe(state: SessionState): Visual {
       };
     }
     case "running": {
-      const tooltip = state.background ? "Background shell running" : "Session running";
+      const tooltip = state.background ? "Working in the background" : "Session running";
       return {
         kind: state.kind,
         ariaLabel: tooltip,
