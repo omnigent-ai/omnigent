@@ -96,7 +96,7 @@ export function useDeleteCustomAgent() {
   });
 }
 
-function refreshAgents(client: ReturnType<typeof useQueryClient>) {
+export function refreshAgents(client: ReturnType<typeof useQueryClient>) {
   for (const key of [
     "settings-agents",
     "available-agents-user",
