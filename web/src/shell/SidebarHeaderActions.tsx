@@ -24,7 +24,8 @@ import { cn } from "@/lib/utils";
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
  * while peeking the card floats at `inset-2` and drags the cluster off the
  * traffic lights' centre line. Hoisting it out of the sidebar is what keeps the
- * three icons in one fixed place across open, collapsed, and peeking.
+ * available header actions in one fixed place across open, collapsed, and
+ * peeking. Current native shells move Settings to the profile footer.
  *
  * Only the toggle's meaning changes with state: it collapses an open sidebar and
  * opens a closed or peeking one, so the caller passes `expanded` and the icon
@@ -35,6 +36,7 @@ export function SidebarHeaderActions({
   onToggle,
   onOpenSearch,
   onSettingsClick,
+  showSettings = true,
   onTogglePointerEnter,
   onTogglePointerDown,
   onTogglePointerLeave,
@@ -54,6 +56,8 @@ export function SidebarHeaderActions({
    * list); navigation itself is the Link's job.
    */
   onSettingsClick?: () => void;
+  /** Whether Settings lives in this cluster instead of the native-shell footer. */
+  showSettings?: boolean;
   /**
    * Dwell-to-peek hooks for the toggle. On the macOS shell this cluster replaces
    * ChatHeader's collapsed-state button, which is where peek used to be armed,
@@ -66,7 +70,9 @@ export function SidebarHeaderActions({
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
       <SidebarSearchButton onOpenSearch={onOpenSearch} />
-      <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
+      {showSettings && (
+        <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
+      )}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
@@ -164,11 +170,16 @@ export function SidebarSettingsButton({
   onSettingsClick,
   className,
   testId = "settings-button",
+  to = "/settings",
+  label = "Settings",
 }: {
   onSettingsClick?: () => void;
   className?: string;
   /** Distinguishes the header-row copy from the mobile floating copy. */
   testId?: string;
+  /** Destination and accessible action name; the profile-footer copy toggles back home. */
+  to?: string;
+  label?: string;
 }) {
   return (
     <Tooltip delayDuration={750}>
@@ -177,17 +188,17 @@ export function SidebarSettingsButton({
           asChild
           variant="ghost"
           size="icon-xs"
-          aria-label="Settings"
+          aria-label={label}
           aria-keyshortcuts={settingsAriaShortcut()}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
-          <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
+          <Link to={to} onClick={onSettingsClick} data-testid={testId}>
             <SettingsIcon className={SIDEBAR_FLOAT_ICON} />
           </Link>
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
-        <span>Settings</span>
+        <span>{label}</span>
       </TooltipContent>
     </Tooltip>
   );

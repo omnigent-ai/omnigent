@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
-import { CheckIcon, ChevronUpIcon, LogOutIcon, PlusIcon, ServerIcon } from "lucide-react";
+import { CheckIcon, ChevronUpIcon, LogOutIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { toast } from "sonner";
+import { logout } from "@/lib/accountsApi";
+import { withBasePath } from "@/lib/basePath";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -14,12 +18,17 @@ import {
   getServerPicker,
   openServerSetup,
   signOutOfServer,
+  supportsNativeServerPicker,
   switchServer,
   type ServerPickerInfo,
 } from "@/lib/nativeBridge";
+import { Link } from "@/lib/routing";
+import { userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
-import { SIDEBAR_ROW } from "./sidebarStyles";
+import { useViewerId } from "@/hooks/useViewerId";
 import { ownServerName } from "@/lib/serverNames";
+import { SidebarSettingsButton } from "./SidebarHeaderActions";
+import { useSettingsRoute } from "./settingsNav";
 
 /** Short display label for a server URL — its host, e.g. "localhost:8000". */
 function hostOf(url: string): string {
@@ -72,14 +81,11 @@ function serverKey(url: string): string | null {
 }
 
 /**
- * Server picker for the native shells (Electron desktop and iOS), pinned to
- * the sidebar's bottom.
+ * Profile control pinned to the sidebar's bottom in browsers and native shells.
  *
- * A sidebar row (server glyph + current host + an upward chevron) that opens a
- * menu of organization-provided and recently-connected servers — selecting one
- * re-points the whole window via the shell — plus "Connect to new server…",
- * which returns the window to the shell's setup page, and "Sign out" when the
- * shell owns the current server's sign-in.
+ * A profile trigger (avatar + identity + current server) opens the existing
+ * server menu, with Settings above it and Sign out below it. The adjacent gear
+ * links directly to Settings.
  *
  * This deliberately lives at the bottom of the sidebar rather than in the
  * chat surface's top strip. The macOS shell hides the native title bar
@@ -91,16 +97,28 @@ function serverKey(url: string): string | null {
  * the chat header's title and floating controls on a notched iPhone. Docking
  * the picker here takes it out of that contested space on both shells.
  *
- * Renders nothing until the shell confirms this page is a connected server
- * (getServerPicker resolves non-null) — so it's absent in plain browsers, under
- * shells too old for the picker bridge, and on foreign pages. That single check
- * is the whole gate: no platform sniffing, matching how the rest of
- * nativeBridge degrades (one bundle, many runtimes, decided at runtime).
+ * Native shells keep the existing server switcher. Browsers and older shells
+ * show the current origin without offering unsupported switching actions.
  */
 export function SidebarServerPicker() {
-  const [info, setInfo] = useState<ServerPickerInfo | null>(null);
+  const nativeServerPicker = supportsNativeServerPicker();
+  const [info, setInfo] = useState<ServerPickerInfo | null>(() =>
+    nativeServerPicker
+      ? null
+      : {
+          currentOrigin: window.location.origin,
+          recentServers: [],
+        },
+  );
+  const viewerId = useViewerId();
+  const serverInfo = useServerInfo();
+  const { inSettings } = useSettingsRoute();
 
   useEffect(() => {
+    if (!nativeServerPicker) {
+      setInfo({ currentOrigin: window.location.origin, recentServers: [] });
+      return;
+    }
     let cancelled = false;
     void getServerPicker().then((result) => {
       if (!cancelled) setInfo(result);
@@ -108,7 +126,7 @@ export function SidebarServerPicker() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [nativeServerPicker]);
 
   if (!info) return null;
 
@@ -156,38 +174,70 @@ export function SidebarServerPicker() {
     currentManagedName === undefined && currentOwnName !== null
       ? `${currentOwnName} (${currentAddress})`
       : currentHost;
+  const userName = viewerId === "local" ? "Local user" : (viewerId ?? "User");
+  const browserServerInfo = serverInfo === "loading" ? null : serverInfo;
+  const canSignOut = nativeServerPicker
+    ? info.canSignOut === true
+    : browserServerInfo !== null && browserServerInfo.login_url !== null;
+
+  const handleSignOut = () => {
+    if (nativeServerPicker) {
+      void signOutOfServer().then((ok) => {
+        if (!ok) toast.error(`Couldn't sign out of ${currentHost}`);
+      });
+      return;
+    }
+    if (browserServerInfo === null || browserServerInfo.login_url === null) return;
+    if (browserServerInfo.accounts_enabled) {
+      void logout().then(() => {
+        window.location.href = withBasePath("/login");
+      });
+      return;
+    }
+    window.location.href = withBasePath("/auth/logout");
+  };
 
   return (
     // shrink-0 keeps the row at its natural height so the scrolling session
     // list above (flex-1) gives up space instead of squashing it.
-    <div className="shrink-0 px-2 pt-1 pb-2" data-testid="sidebar-server-picker-row">
+    <div
+      className="flex shrink-0 items-stretch gap-1 px-2 pt-1 pb-2"
+      data-testid="sidebar-server-picker-row"
+    >
       <DropdownMenu
         onOpenChange={(open) => {
           // Re-read when opened so a newly applied/removed MDM profile appears
           // without restarting the server-served SPA.
-          if (open) void getServerPicker().then(setInfo);
+          if (open && nativeServerPicker) void getServerPicker().then(setInfo);
         }}
       >
         <DropdownMenuTrigger asChild>
           <Button
             type="button"
             variant="ghost"
-            // Same shared row construct as New session / Inbox / Settings, so
-            // the icon lands on the sidebar's icon column and the label on its
-            // label column.
             className={cn(
-              SIDEBAR_ROW,
-              "w-full justify-start border-0 font-normal",
+              "h-9 min-w-0 flex-1 justify-start gap-2 rounded-[var(--radius-otto-button)] border-0 px-2 py-1",
               "text-muted-foreground",
               "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50",
               "data-[state=open]:bg-muted data-[state=open]:text-foreground",
             )}
-            aria-label={`Server: ${currentDescription}. Switch server`}
+            aria-label={`${userName}. Server: ${currentDescription}. Open profile menu`}
             title={currentDescription}
             data-testid="sidebar-server-picker"
           >
-            <ServerIcon className="ui-icon text-muted-foreground" />
-            <span className="truncate">{currentHost}</span>
+            <Avatar className="size-6 after:border-0">
+              <AvatarFallback className="bg-secondary font-medium text-sm text-secondary-foreground">
+                {userInitials(userName.replace(/\s+/g, "."))}
+              </AvatarFallback>
+            </Avatar>
+            <span className="flex min-w-0 flex-1 flex-col items-start text-left">
+              <span className="w-full truncate text-left font-medium text-ui text-foreground leading-4">
+                {userName}
+              </span>
+              <span className="w-full truncate text-left text-sm text-muted-foreground leading-4">
+                {currentHost}
+              </span>
+            </span>
             {/* Points up: the menu opens upward from the sidebar's bottom. */}
             <ChevronUpIcon className="ui-icon ml-auto shrink-0 text-muted-foreground" />
           </Button>
@@ -199,95 +249,123 @@ export function SidebarServerPicker() {
         <DropdownMenuContent
           side="top"
           align="start"
-          className="min-w-56 max-w-[min(20rem,calc(100vw-1rem))]"
+          className="min-w-[var(--radix-dropdown-menu-trigger-width)] max-w-[min(20rem,calc(100vw-1rem))]"
         >
-          {managed.length > 0 ? (
-            <>
-              <DropdownMenuLabel className="text-muted-foreground">
-                Provided by your organization
-              </DropdownMenuLabel>
-              {managed.map((url) => {
-                const current = isCurrent(url);
-                return (
-                  <DropdownMenuItem
-                    key={url}
-                    disabled={current}
-                    className={cn("gap-2", current && "opacity-100")}
-                    onSelect={current ? undefined : () => void switchServer(recentFor(url) ?? url)}
-                  >
-                    {current ? (
-                      <CheckIcon className="size-4 shrink-0" />
-                    ) : (
-                      <span className="size-4 shrink-0" aria-hidden="true" />
-                    )}
-                    {managedNames.has(url) ? (
-                      <span className={cn("min-w-0 truncate", current && "font-medium")}>
-                        {managedLabel(url)}
-                      </span>
-                    ) : (
-                      // No organization name: the server's own, beside its host.
-                      <ServerLabel
-                        name={ownName(url)}
-                        host={hostOf(url)}
-                        className={current ? "font-medium" : undefined}
-                      />
-                    )}
-                  </DropdownMenuItem>
-                );
-              })}
-            </>
-          ) : null}
-          {!currentIsManaged || recentOthers.length > 0 ? (
-            <>
-              {managed.length > 0 ? <DropdownMenuSeparator /> : null}
-              <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
-              {!currentIsManaged ? (
-                <DropdownMenuItem disabled className="gap-2 opacity-100">
-                  <CheckIcon className="size-4 shrink-0" />
-                  <ServerLabel
-                    name={currentOwnName}
-                    host={currentAddress}
-                    className="font-medium"
-                  />
-                </DropdownMenuItem>
-              ) : null}
-              {recentOthers.map((url) => (
-                <DropdownMenuItem
-                  key={url}
-                  className="gap-2"
-                  onSelect={() => void switchServer(url)}
-                >
-                  <span className="size-4 shrink-0" aria-hidden="true" />
-                  <ServerLabel name={ownName(shownAs(url))} host={hostOf(shownAs(url))} />
-                </DropdownMenuItem>
-              ))}
-            </>
-          ) : null}
-          <DropdownMenuSeparator />
-          <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
-            <PlusIcon className="size-4 shrink-0" />
-            Connect to new server…
-          </DropdownMenuItem>
-          {info.canSignOut ? (
-            // The next Connect signs in through the browser, which is how a
-            // user switches accounts.
-            <DropdownMenuItem
-              className="gap-2"
-              onSelect={() =>
-                void signOutOfServer().then((ok) => {
-                  // On success the shell navigates every window away; only a
-                  // failure leaves this page to report it.
-                  if (!ok) toast.error(`Couldn't sign out of ${currentHost}`);
-                })
-              }
-              data-testid="sidebar-server-sign-out"
+          <DropdownMenuItem asChild className="gap-2">
+            <Link
+              to="/settings"
+              componentId="sidebar.profile_menu.settings"
+              data-testid="sidebar-profile-menu-settings"
             >
-              <LogOutIcon className="size-4 shrink-0" />
-              <span className="min-w-0 truncate">Sign out of {currentHost}</span>
-            </DropdownMenuItem>
+              <SettingsIcon className="size-4 shrink-0" />
+              Settings
+            </Link>
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {nativeServerPicker ? (
+            <>
+              {managed.length > 0 ? (
+                <>
+                  <DropdownMenuLabel className="text-muted-foreground">
+                    Provided by your organization
+                  </DropdownMenuLabel>
+                  {managed.map((url) => {
+                    const current = isCurrent(url);
+                    return (
+                      <DropdownMenuItem
+                        key={url}
+                        disabled={current}
+                        className={cn("gap-2", current && "opacity-100")}
+                        onSelect={
+                          current ? undefined : () => void switchServer(recentFor(url) ?? url)
+                        }
+                      >
+                        {current ? (
+                          <CheckIcon className="size-4 shrink-0" />
+                        ) : (
+                          <span className="size-4 shrink-0" aria-hidden="true" />
+                        )}
+                        {managedNames.has(url) ? (
+                          <span className={cn("min-w-0 truncate", current && "font-medium")}>
+                            {managedLabel(url)}
+                          </span>
+                        ) : (
+                          // No organization name: the server's own, beside its host.
+                          <ServerLabel
+                            name={ownName(url)}
+                            host={hostOf(url)}
+                            className={current ? "font-medium" : undefined}
+                          />
+                        )}
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </>
+              ) : null}
+              {!currentIsManaged || recentOthers.length > 0 ? (
+                <>
+                  {managed.length > 0 ? <DropdownMenuSeparator /> : null}
+                  <DropdownMenuLabel className="text-muted-foreground">Recents</DropdownMenuLabel>
+                  {!currentIsManaged ? (
+                    <DropdownMenuItem disabled className="gap-2 opacity-100">
+                      <CheckIcon className="size-4 shrink-0" />
+                      <ServerLabel
+                        name={currentOwnName}
+                        host={currentAddress}
+                        className="font-medium"
+                      />
+                    </DropdownMenuItem>
+                  ) : null}
+                  {recentOthers.map((url) => (
+                    <DropdownMenuItem
+                      key={url}
+                      className="gap-2"
+                      onSelect={() => void switchServer(url)}
+                    >
+                      <span className="size-4 shrink-0" aria-hidden="true" />
+                      <ServerLabel name={ownName(shownAs(url))} host={hostOf(shownAs(url))} />
+                    </DropdownMenuItem>
+                  ))}
+                </>
+              ) : null}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem className="gap-2" onSelect={() => openServerSetup()}>
+                <PlusIcon className="size-4 shrink-0" />
+                Connect to new server…
+              </DropdownMenuItem>
+            </>
+          ) : (
+            <>
+              <DropdownMenuLabel className="text-muted-foreground">Server</DropdownMenuLabel>
+              <DropdownMenuItem disabled className="gap-2 opacity-100">
+                <CheckIcon className="size-4 shrink-0" />
+                <ServerLabel name={currentOwnName} host={currentAddress} className="font-medium" />
+              </DropdownMenuItem>
+            </>
+          )}
+          {canSignOut ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                className="gap-2"
+                onSelect={handleSignOut}
+                data-testid="sidebar-server-sign-out"
+              >
+                <LogOutIcon className="size-4 shrink-0" />
+                <span className="min-w-0 truncate">
+                  {nativeServerPicker ? `Sign out of ${currentHost}` : "Sign out"}
+                </span>
+              </DropdownMenuItem>
+            </>
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
+      <SidebarSettingsButton
+        testId="sidebar-profile-settings"
+        className="size-9 shrink-0 rounded-[var(--radius-otto-button)]"
+        to={inSettings ? "/" : "/settings"}
+        label={inSettings ? "Home" : "Settings"}
+      />
     </div>
   );
 }

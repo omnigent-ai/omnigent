@@ -1,29 +1,38 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { MemoryRouter } from "react-router-dom";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 
-// The picker reaches the Electron shell only through nativeBridge, so the
-// bridge is the seam: mocking it covers "inside the shell" (info resolves) and
-// "plain browser" (resolves null) without having to fake a preload object.
+// Native server switching is capability-gated; browsers retain the profile
+// footer with a read-only current-server section.
 const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
 const signOutOfServer = vi.fn();
+const supportsNativeServerPicker = vi.fn();
+const viewer = vi.hoisted(() => ({ id: "alice.smith@example.com" }));
 
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
   signOutOfServer: () => signOutOfServer(),
+  supportsNativeServerPicker: () => supportsNativeServerPicker(),
 }));
 
-function renderPicker() {
+vi.mock("@/hooks/useViewerId", () => ({
+  useViewerId: () => viewer.id,
+}));
+
+function renderPicker(initialEntries = ["/"]) {
   return render(
-    <TooltipProvider>
-      <SidebarServerPicker />
-    </TooltipProvider>,
+    <MemoryRouter initialEntries={initialEntries}>
+      <TooltipProvider>
+        <SidebarServerPicker />
+      </TooltipProvider>
+    </MemoryRouter>,
   );
 }
 
@@ -42,19 +51,28 @@ beforeEach(() => {
   switchServer.mockReset();
   openServerSetup.mockReset();
   signOutOfServer.mockReset();
+  supportsNativeServerPicker.mockReset();
+  supportsNativeServerPicker.mockReturnValue(true);
+  viewer.id = "alice.smith@example.com";
 });
 
 afterEach(cleanup);
 
 describe("SidebarServerPicker", () => {
-  it("renders nothing in a plain browser (bridge resolves null)", async () => {
-    getServerPicker.mockResolvedValue(null);
-    const { container } = renderPicker();
+  it("keeps the profile footer in a browser without native server actions", async () => {
+    supportsNativeServerPicker.mockReturnValue(false);
+    renderPicker();
 
-    // Wait out the resolve so this can't pass merely by asserting too early.
-    await waitFor(() => expect(getServerPicker).toHaveBeenCalled());
-    expect(screen.queryByTestId("sidebar-server-picker")).toBeNull();
-    expect(container).toBeEmptyDOMElement();
+    expect(await screen.findByTestId("sidebar-server-picker")).toBeInTheDocument();
+    expect(screen.getByText(window.location.host)).toHaveClass("text-sm");
+    await openMenu();
+    expect(screen.getByTestId("sidebar-profile-menu-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
+    expect(screen.getByText("Server")).toBeInTheDocument();
+    expect(screen.queryByText("Connect to new server…")).toBeNull();
+    expect(getServerPicker).not.toHaveBeenCalled();
   });
 
   it("shows the current host on the row and lists recents in the menu", async () => {
@@ -69,7 +87,10 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: localhost:8000. Switch server");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "alice.smith@example.com. Server: localhost:8000. Open profile menu",
+    );
 
     expect(await screen.findByText("Recents")).toBeInTheDocument();
     // localhost:8000 shows twice by design — once as the row's own label, once
@@ -82,6 +103,75 @@ describe("SidebarServerPicker", () => {
     expect(
       screen.getByText("omnigents-9147263058412098.aws.databricksapps.com"),
     ).toBeInTheDocument();
+  });
+
+  it("shows the viewer and server in the profile control with direct Settings access", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+
+    const initials = await screen.findByText("AS");
+    expect(initials).toHaveClass("bg-secondary", "text-secondary-foreground");
+    expect(initials.parentElement).toHaveClass("size-6", "after:border-0");
+    expect(screen.getByText("alice.smith@example.com")).toHaveClass(
+      "text-left",
+      "font-medium",
+      "text-ui",
+    );
+    expect(screen.getByText("localhost:8000")).toHaveClass(
+      "text-left",
+      "text-sm",
+      "text-muted-foreground",
+    );
+    expect(screen.getByTestId("sidebar-server-picker")).toHaveClass("h-9");
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveClass("size-9");
+    expect(screen.getByTestId("sidebar-profile-settings")).toHaveAttribute("href", "/settings");
+  });
+
+  it("uses both initials from the local user label", async () => {
+    viewer.id = "local";
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker();
+
+    expect(await screen.findByText("LU")).toBeInTheDocument();
+  });
+
+  it("uses the footer Settings control to return home from Settings", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+    });
+    renderPicker(["/settings/general"]);
+
+    const settingsToggle = await screen.findByTestId("sidebar-profile-settings");
+    expect(settingsToggle).toHaveAttribute("href", "/");
+    expect(settingsToggle).toHaveAttribute("aria-label", "Home");
+  });
+
+  it("orders Settings, server actions, and Sign out as three menu sections", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "http://localhost:8000",
+      recentServers: [],
+      canSignOut: true,
+    });
+    renderPicker();
+    await openMenu();
+
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveClass("min-w-[var(--radix-dropdown-menu-trigger-width)]");
+    const items = within(menu).getAllByRole("menuitem");
+    expect(items[0]).toHaveTextContent("Settings");
+    expect(items.at(-2)).toHaveTextContent("Connect to new server…");
+    expect(items.at(-1)).toHaveTextContent("Sign out of localhost:8000");
+    expect(screen.getByTestId("sidebar-profile-menu-settings")).toHaveAttribute(
+      "href",
+      "/settings",
+    );
   });
 
   it("shows managed servers before recents and switches to one", async () => {
@@ -166,7 +256,10 @@ describe("SidebarServerPicker", () => {
     renderPicker();
 
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: not-a-url. Switch server");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "alice.smith@example.com. Server: not-a-url. Open profile menu",
+    );
 
     // Unparseable recents survive as-is rather than being dropped, so a
     // hand-edited settings file stays switchable instead of invisible.
@@ -268,7 +361,7 @@ describe("SidebarServerPicker", () => {
     const trigger = await openMenu();
     expect(trigger).toHaveAttribute(
       "aria-label",
-      "Server: Acme Engineering (omni.example). Switch server",
+      "alice.smith@example.com. Server: Acme Engineering (omni.example). Open profile menu",
     );
     // The current entry and the other named recent both keep their host visible.
     expect(screen.getAllByText("Acme Engineering").length).toBeGreaterThan(1);
@@ -288,7 +381,10 @@ describe("SidebarServerPicker", () => {
     });
     renderPicker();
     const trigger = await openMenu();
-    expect(trigger).toHaveAttribute("aria-label", "Server: omni.example. Switch server");
+    expect(trigger).toHaveAttribute(
+      "aria-label",
+      "alice.smith@example.com. Server: omni.example. Open profile menu",
+    );
   });
 
   it("names an unnamed managed server from its manifest, with its host", async () => {

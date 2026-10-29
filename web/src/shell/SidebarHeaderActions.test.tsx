@@ -48,4 +48,18 @@ describe("SidebarHeaderActions shortcut hints", () => {
       Array.from(content.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
     ).toEqual(keys);
   });
+
+  it("leaves Settings to the native-shell profile footer when requested", () => {
+    render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <SidebarHeaderActions expanded onToggle={vi.fn()} showSettings={false} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByLabelText("Settings")).toBeNull();
+    expect(screen.getByLabelText("Search")).toBeInTheDocument();
+    expect(screen.getByLabelText("Close sidebar")).toBeInTheDocument();
+  });
 });
