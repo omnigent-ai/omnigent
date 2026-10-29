@@ -378,6 +378,7 @@ describe("createBundledSession", () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         session_id: "conv_bundle",
+        agent_id: "ag_bundle",
       }),
     );
 
@@ -386,7 +387,7 @@ describe("createBundledSession", () => {
       { workspace: "/tmp/project" },
     );
 
-    expect(result.id).toBe("conv_bundle");
+    expect(result).toEqual({ id: "conv_bundle", agentId: "ag_bundle" });
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });

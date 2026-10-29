@@ -209,9 +209,11 @@ from omnigent.server.schemas import (
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+_BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="runner-bridge-notify")
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -1170,6 +1172,7 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    native_pane_idle_timeout_s: float | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -1205,6 +1208,8 @@ def create_runner_app(
     :param auth_token_factory: Refresh-capable server bearer factory owned by
         the runner process. Native terminal helpers reuse it instead of
         resolving host credentials again for every terminal launch.
+    :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
+        disables reaping; ``None`` uses the pane environment override or default.
     """
     import hmac
 
@@ -1432,6 +1437,8 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    # Server pending IDs owned by each session's current turn, including injections.
+    _turn_pending_ids: dict[str, set[str]] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     # Desynced conversations; cleared when a fresh turn binds.
@@ -1486,6 +1493,31 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+        """Whether a native pane shows the live work the pane reaper spares it for.
+
+        A pane parked on a permission prompt is quiet and can read ``idle``, and a
+        pane still redrawing output can too, so the status edge alone misses them.
+        Reads the same in-memory signals the reaper uses, not its tmux calls.
+
+        :param terminals: Terminal registry holding the pane instance.
+        :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
+        :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
+        :returns: ``True`` when a permission hook is parked or the pane shows recent
+            input or output.
+        """
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
+
+        if approval_wait_is_fresh(session_id):
+            return True
+        instance = terminals.get(session_id, terminal_name, "main")
+        if instance is None:
+            return False
+        if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
+            return True
+        return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -1504,15 +1536,16 @@ def create_runner_app(
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
         if terminals is not None:
-            session_ids.update(
-                session_id
-                for session_id, name, _ in terminals.native_panes()
-                if is_native_harness(
+            for session_id, name, _ in terminals.native_panes():
+                if not is_native_harness(
                     resource_registry.terminal_resource_role(
                         session_id, terminal_resource_id(name, "main")
                     )
-                )
-            )
+                ):
+                    continue
+                session_ids.add(session_id)
+                if _native_pane_shows_live_work(terminals, session_id, name):
+                    return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
@@ -1709,6 +1742,15 @@ def create_runner_app(
         blocked_on: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if status == "failed":
+            # Structured status has no provider detail when its terminal hook is lost.
+            event["error"] = {
+                "code": "native_failure_detail_unavailable",
+                "message": (
+                    "The native agent reported an error, but its failure details did not "
+                    "arrive. Open the terminal to inspect the error before retrying."
+                ),
+            }
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
@@ -2538,6 +2580,12 @@ def create_runner_app(
         # endpoint at all.
         _routing_class = init_context.routing_class
         remember_session_routing_class(session_id, _routing_class)
+        from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
+
+        surface_labels = init_context.labels or {}
+        resource_registry.set_client_surface(
+            session_id, surface_labels.get(CLIENT_SURFACE_LABEL_KEY)
+        )
         if init_context.envelope is not None:
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
@@ -3448,6 +3496,7 @@ def create_runner_app(
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
+        _turn_pending_ids.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -3894,14 +3943,39 @@ def create_runner_app(
     _native_pane_names = _sign_in_watch.native_pane_names
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
 
-    def _begin_turn_slot(conv_id: str) -> None:
+    def _begin_turn_slot(conv_id: str, body: Mapping[str, Any] | None = None) -> None:
         """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
 
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
         a replacement turn that ran and finished during a teardown await.
+
+        :param conv_id: Session whose turn slot is bound.
+        :param body: Forwarded message that starts the turn, when there is one.
         """
         _active_turns[conv_id] = None
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+        pending_id = body.get("pending_id") if body is not None else None
+        if isinstance(pending_id, str):
+            _turn_pending_ids[conv_id] = {pending_id}
+        else:
+            _turn_pending_ids.pop(conv_id, None)
+
+    def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
+        """Whether a forward repeats a message that is still queued or running.
+
+        The server re-forwards a message under the same pending id when an
+        earlier forward timed out on its side; the runner may still hold that
+        earlier forward, so taking the repeat would deliver the message twice.
+        """
+        pending_id = body.get("pending_id")
+        if not isinstance(pending_id, str):
+            return False
+        if conv_id in _active_turns and pending_id in _turn_pending_ids.get(conv_id, ()):
+            return True
+        return any(
+            queued.get("pending_id") == pending_id
+            for queued in _session_message_buffers.get(conv_id, ())
+        )
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -3920,6 +3994,7 @@ def create_runner_app(
         if _active_turns.get(conv_id) is not occupant:
             return False
         _active_turns.pop(conv_id, None)
+        _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         _interrupted_sessions.discard(conv_id)
         return True
@@ -3945,6 +4020,7 @@ def create_runner_app(
             return
 
         _active_turns.pop(conv_id, None)
+        _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         # A claude-sdk `/compact` turn that ended without emitting
         # `response.compaction.completed` produced no compaction (nothing to
@@ -4207,6 +4283,7 @@ def create_runner_app(
         )
         if stream_sentinel:
             _active_turns.pop(conv_id, None)
+            _turn_pending_ids.pop(conv_id, None)
             await _forward_harness_interrupt(conv_id, turn_epoch=_entry_epoch)
         else:
             await _cancel_inprocess_turn(conv_id)
@@ -4428,6 +4505,7 @@ def create_runner_app(
             # whenever a /compact is buffered, so each lands as its own turn.
             if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
+                all_bodies = [next_body]
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
@@ -4466,7 +4544,12 @@ def create_runner_app(
                     {"type": "response.compaction.in_progress", "task_id": session_id},
                 )
                 _sdk_compact_inprogress.add(session_id)
-            _begin_turn_slot(session_id)
+            _begin_turn_slot(session_id, next_body)
+            _turn_pending_ids[session_id] = {
+                pending_id
+                for body in all_bodies
+                if isinstance(pending_id := body.get("pending_id"), str)
+            }
             _publish_turn_status(session_id, "running")
             _turn_task = asyncio.create_task(
                 _run_turn_bg(next_body, session_id),
@@ -4909,7 +4992,10 @@ def create_runner_app(
 
             cancelled = Event()
             try:
-                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
+                # Bridge readiness waits must not compete with git or message delivery.
+                await _BRIDGE_NOTIFICATIONS.run(
+                    post_tools_changed, bridge_dir, cancelled=cancelled
+                )
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -5473,6 +5559,7 @@ def create_runner_app(
             _slot = _active_turns.get(session_id)
             if _slot is None or _slot is asyncio.current_task():
                 _active_turns.pop(session_id, None)
+                _turn_pending_ids.pop(session_id, None)
                 # Clear the live response AND the in-flight marker together (B1
                 # class fix): a bare pop would leak the process-manager marker and
                 # the idle reaper would skip the harness forever.
@@ -5994,6 +6081,11 @@ def create_runner_app(
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
+                                            _pending_id = _m.get("pending_id")
+                                            if isinstance(_pending_id, str):
+                                                _turn_pending_ids.setdefault(conv_id, set()).add(
+                                                    _pending_id
+                                                )
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "message",
@@ -6609,6 +6701,20 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
+                if _message_already_taken(conversation_id, message_body):
+                    _logger.info(
+                        "post_session_events: dropping repeated forward conv=%s pending_id=%s",
+                        conversation_id,
+                        message_body.get("pending_id"),
+                        extra={"session_id": conversation_id},
+                    )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "duplicate",
+                            "detail": "Message already queued or running.",
+                        },
+                    )
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -6727,7 +6833,7 @@ def create_runner_app(
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
-                _begin_turn_slot(conversation_id)
+                _begin_turn_slot(conversation_id, message_body)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -8037,6 +8143,7 @@ def create_runner_app(
             list_native_panes=_native_panes_for_reaper,
             is_busy=_native_pane_is_busy,
             reap=_reap_native_pane,
+            idle_timeout_s=native_pane_idle_timeout_s,
         )
     else:
         app.state.native_pane_reaper = None
@@ -8438,6 +8545,8 @@ def _build_spawn_env_from_spec(
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
+        if resource_registry is not None and session_id is not None:
+            env.update(resource_registry.client_surface_env(session_id))
 
     if (
         env is not None

@@ -627,6 +627,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _create_session_from_bundle as _create_session_from_bundle,
     _create_session_from_existing_agent as _create_session_from_existing_agent,
     _drive_terminal_resolved_elicitation as _drive_terminal_resolved_elicitation,
+    _drive_terminal_resolved_elicitation_from_store as _drive_terminal_resolved_elicitation_from_store,
     _enrich_terminal_status_with_subagent_output as _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready as _ensure_native_terminal_ready,
     _ensure_runner_relay as _ensure_runner_relay,

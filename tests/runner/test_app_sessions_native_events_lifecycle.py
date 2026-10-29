@@ -3776,28 +3776,13 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effort", [None, "medium", "none", "ultra"])
 async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    effort: str | None,
 ) -> None:
-    """
-    POST ``/events`` ``model_change`` on a pi-native session queues a
-    ``model_change`` payload to the Pi extension inbox.
-
-    A pi-native turn runs inside the resident Pi TUI process, and the
-    ``--model`` launch flag is baked in at spawn. The dispatch must route to
-    ``_handle_pi_native_model_change``, which drops a ``model_change`` payload
-    the extension applies live via Pi's ``setModel``.
-
-    Regression guard: the ``model_change`` branch originally enumerated only
-    claude/codex/cursor/opencode/kiro, so pi-native fell through to the no-op
-    and a web-picked model never reached the running Pi process.
-
-    Pins:
-    1. 204 returned.
-    2. A ``model_change_*`` payload carrying the model id is written to the
-       session's bridge inbox.
-    """
+    """A live model switch carries the explicit session effort in Pi vocabulary."""
     import json as _json
 
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
@@ -3826,6 +3811,12 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
         )
         assert create_resp.status_code == 201, create_resp.text
 
+        if effort is not None:
+            effort_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "effort_change", "effort": effort},
+            )
+            assert effort_resp.status_code == 204
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
             json={"type": "model_change", "model": "databricks-claude-opus-4-1"},
@@ -3846,6 +3837,9 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     )
     assert model_changes[0]["model"] == "databricks-claude-opus-4-1"
     assert model_changes[0]["id"].startswith("model_change_")
+
+    expected_level = {"none": "off", "ultra": "max"}.get(effort, effort)
+    assert model_changes[0].get("thinkingLevel") == expected_level
 
 
 def test_interrupted_sessions_isolated_per_app_instance() -> None:

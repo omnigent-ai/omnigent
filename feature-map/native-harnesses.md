@@ -55,7 +55,8 @@ implements them separately, so a fix for one harness does not reach the others.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
-  when rebuilding tool results, as required by Gemini. Unmatched outputs become
+  when rebuilding tool results, as required by Gemini. Results stay after their
+  calls, ahead of messages sent while a tool ran. Unmatched outputs become
   labeled recovery text so missing calls do not block continuation.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
@@ -133,6 +134,17 @@ Chat session as well as the local terminal.
 **Pi Smart Routing:** enable Smart Routing for the session, then send a task
 from Chat or type it into the native Pi terminal. Follow a completed tool call
 with a question about its result; verify the routed model and retained history.
+
+**Pi model and effort changes:** in an existing session, select Medium, switch
+to a non-reasoning model, then to a reasoning model from another family. Send
+immediately from Chat and repeat from Terminal. Verify the target request uses
+Medium and retains earlier conversation text. Repeat with a later effort change
+while the model switch is pending; the latest choice must win. With no explicit
+session effort, Pi keeps its native defaults. Component coverage:
+`tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_model_change_on_pi_native_enqueues_bridge_model_change`
+and
+`tests/harnesses/pi_native/test_pi_native_extension.py::test_input_waits_for_inbox_model_change_to_settle`.
+Real-provider history compatibility requires a separate live check.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
@@ -655,6 +667,16 @@ Cross-harness journeys:
   relative settings must survive relocation of the agent root, including a
   relative custom root. Existing context/prompt opt-outs remain independent.
   This is not Claude marketplace or Managed deployment coverage.
+- **`auth-recovery`, Pi token commands (component/process boundaries):**
+  With a positive configured auth refresh interval, warm and renew tokens in the
+  session workspace, even when the runner starts elsewhere. Relative token files
+  must keep working after renewal. Discard caches created in another directory
+  or before directory tracking was added.
+  `tests/runner/test_app_pi_native_model.py::test_auto_create_pi_terminal_threads_spec_model_into_models_json`
+  drives startup and renewal with real helpers and a stubbed terminal launcher;
+  `tests/harnesses/pi_native/test_pi_native_auth_refresh.py` covers cache rejection,
+  failed refreshes and cleanup. These checks do not establish browser, sandbox
+  or live-gateway acceptance.
 - **`resume`, Pi cost reporting (component boundaries):**
   `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
   dollars, duplicate callbacks, local/server restart baselines and missing pricing.
@@ -942,9 +964,9 @@ persistence deduplication. These checks do not establish desktop rendering parit
 
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
-and duplicate results, plus missing calls and outputs arriving across user turns.
-Unmatched outputs retain their content as labeled, untrusted tool data without inventing a call;
-same-turn results retain their names and pairing. The existing
+and duplicate results, results stored after a message sent during their call,
+missing calls, and calls, including interrupted or malformed ones, that reuse an earlier call's id. Unmatched outputs retain their content as labeled, untrusted
+tool data without inventing a call; matched results retain their names and pairing. The existing
 `tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
 checks real server/runner serialization with a stub Pi process.
 `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
@@ -952,6 +974,9 @@ uses real Pi with scripted providers: an Anthropic tool turn forks onto Anthropi
 or OpenAI Responses with an unmatched stored output. The Responses case also
 stops Pi, removes its isolated local history file and cold-resumes. Both retain
 parallel results and recovery text, and the follow-up succeeds.
+`tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool`
+steers a message into a running real Pi `bash` call, then cold-resumes; the provider
+receives the real result before that message instead of a synthetic missing result.
 
 For a manual check, fork an affected session onto a Responses model and send a
 follow-up; expect retained output without an orphan-call HTTP 400. Reload Chat

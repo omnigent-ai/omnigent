@@ -17,7 +17,7 @@ import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
@@ -52,6 +52,7 @@ const {
   pinnedIdsRef,
   projectSessionsMock,
   projectSessionsLoadingRef,
+  projectSessionsNextPage,
   useHostsMock,
   usePullRequestInfoMock,
   useSessionWorktreesMock,
@@ -82,6 +83,9 @@ const {
   // prove a folder fetches its members independently of the global window.
   projectSessionsMock: { current: {} as Record<string, unknown[]> },
   projectSessionsLoadingRef: { current: false },
+  // Per-project server-page stub: a folder listed here reports another page
+  // and calls its function from fetchNextPage.
+  projectSessionsNextPage: { current: {} as Record<string, () => unknown> },
   useHostsMock: vi.fn(),
   usePullRequestInfoMock: vi.fn(),
   useSessionWorktreesMock: vi.fn(),
@@ -154,8 +158,8 @@ vi.mock("@/hooks/useConversations", async () => {
         isLoading: loading,
         isError: false,
         error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
+        fetchNextPage: projectSessionsNextPage.current[project] ?? vi.fn(),
+        hasNextPage: enabled && project in projectSessionsNextPage.current,
         isFetchingNextPage: false,
       };
     },
@@ -184,6 +188,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
 import { Sidebar } from "./Sidebar";
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "./sidebarNav";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
 
@@ -317,6 +322,7 @@ beforeEach(() => {
   fetchProjectSessionIdsMock.mockResolvedValue([]);
   projectSessionsMock.current = {};
   projectSessionsLoadingRef.current = false;
+  projectSessionsNextPage.current = {};
   pinnedIdsRef.current = [];
   // Default to a multi-user server so the tab-based tests see the tabs.
   isServerLocalMock.mockReturnValue(false);
@@ -2621,6 +2627,232 @@ describe("Sidebar project sections", () => {
       "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
       "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
     );
+  });
+});
+
+// An expanded folder lists five sessions; each "Show more" lists five more.
+describe("Sidebar project Show more", () => {
+  // Filed sessions, newest first: conv_filed_0 … conv_filed_{count - 1}.
+  const filedSessions = (count: number) =>
+    Array.from({ length: count }, (_, i) =>
+      conv(`conv_filed_${i}`, "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        updated_at: 100 - i,
+      }),
+    );
+  const filedIds = (count: number) => filedSessions(count).map((c) => c.id);
+  const folderRowIds = () =>
+    Array.from(
+      screen
+        .getByText("Customer X")
+        .closest("section")!
+        .querySelectorAll("[data-sidebar-session-id]"),
+      (row) => row.getAttribute("data-sidebar-session-id"),
+    );
+  const toggleFolder = () => fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+
+  function LocationProbe() {
+    return <div data-testid="loc">{useLocation().pathname}</div>;
+  }
+  // Mounted on a session route so useParams resolves the open session.
+  function renderOnSession(sessionId: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={[`/c/${sessionId}`]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+              <LocationProbe />
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("lists five more sessions per click until none remain", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    renderSidebar();
+    toggleFolder();
+
+    expect(folderRowIds()).toEqual(filedIds(5));
+    // The hand cursor, like the session rows' links.
+    expect(screen.getByTestId("project-show-more")).toHaveClass("cursor-pointer");
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(10));
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(12));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+  });
+
+  it.each([
+    {
+      reduceMotion: false,
+      animated: ["UL", "LI", "LI", "LI", "LI", "LI"],
+      listKeyframes: [
+        { height: "140px", overflow: "hidden" },
+        { height: "280px", overflow: "hidden" },
+      ],
+    },
+    { reduceMotion: true, animated: [], listKeyframes: undefined },
+  ])(
+    "slides the list open over the rows Show more adds (reduced motion: $reduceMotion)",
+    ({ reduceMotion, animated, listKeyframes }) => {
+      projectsMock.push("Customer X");
+      mockConversations(filedSessions(12));
+      // jsdom has no layout or Web Animations: lists measure 28px per row, and
+      // animations are recorded instead of played.
+      const animate = vi.fn();
+      Object.defineProperty(Element.prototype, "animate", { configurable: true, value: animate });
+      Object.defineProperty(HTMLUListElement.prototype, "offsetHeight", {
+        configurable: true,
+        get(this: HTMLUListElement) {
+          return this.children.length * 28;
+        },
+      });
+      const matchMedia = window.matchMedia;
+      window.matchMedia = (query: string) => ({
+        ...matchMedia(query),
+        matches: reduceMotion && query === "(prefers-reduced-motion: reduce)",
+      });
+      try {
+        renderSidebar();
+        toggleFolder();
+        fireEvent.click(screen.getByTestId("project-show-more"));
+
+        expect(animate.mock.contexts.map((element) => (element as Element).tagName)).toEqual(
+          animated,
+        );
+        expect(animate.mock.calls[0]?.[0]).toEqual(listKeyframes);
+      } finally {
+        Reflect.deleteProperty(Element.prototype, "animate");
+        Reflect.deleteProperty(HTMLUListElement.prototype, "offsetHeight");
+        window.matchMedia = matchMedia;
+      }
+    },
+  );
+
+  it("offers no Show more for a folder of five sessions", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(5));
+    renderSidebar();
+    toggleFolder();
+
+    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+  });
+
+  it("starts each expansion at five sessions", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    renderSidebar();
+    toggleFolder();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toHaveLength(10);
+
+    toggleFolder();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+  });
+
+  it("lists loaded sessions before fetching the folder's next server page", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(7));
+    const fetchNextPage = vi.fn();
+    projectSessionsNextPage.current["Customer X"] = fetchNextPage;
+    renderSidebar();
+    toggleFolder();
+
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(7));
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    // Every loaded row is listed but the server has more, so the next click fetches.
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("badges Show more with the state of the sessions it hides", () => {
+    projectsMock.push("Customer X");
+    mockConversations([
+      ...filedSessions(5),
+      conv("conv_awaiting", "Claude Code", {
+        labels: { omni_project: "Customer X" },
+        updated_at: 1,
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+    toggleFolder();
+
+    expect(
+      within(screen.getByTestId("project-show-more")).getByText("Needs response"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    const row = document.querySelector<HTMLElement>('[data-sidebar-session-id="conv_awaiting"]')!;
+    expect(within(row).getByText("Needs response")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+  });
+
+  it("lists the open session when it sits past the first five", () => {
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    renderOnSession("conv_filed_7");
+
+    // The folder auto-expands for the open session and grows a whole page to list it.
+    expect(folderRowIds()).toEqual(filedIds(10));
+    expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
+  });
+
+  it("keeps a folder's listed rows when an older session is filed into it", async () => {
+    projectsMock.push("Customer X");
+    const older = conv("conv_older", "Claude Code", { updated_at: 1 });
+    mockConversations([...filedSessions(6), older]);
+    renderSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+
+    // Filing keeps updated_at, so the moved session sorts below the folder's six.
+    mockConversations([...filedSessions(6), { ...older, labels: { omni_project: "Customer X" } }]);
+    const row = screen.getByRole("link", { name: /conv_older/ }).closest("li")!;
+    fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("move-to-project"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Customer X/ }));
+    // Re-render with the moved row, as the pointer does over the list mid-drag.
+    fireEvent.mouseOver(screen.getByTestId("sidebar-conversation-list"));
+
+    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.queryByRole("link", { name: "conv_older" })).toBeNull();
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
+  });
+
+  it("steps the session hotkey past the sessions behind Show more", () => {
+    projectsMock.push("Customer X", "Customer Y");
+    mockConversations([
+      ...filedSessions(7),
+      conv("conv_other_folder", "Claude Code", {
+        labels: { omni_project: "Customer Y" },
+        updated_at: 1,
+      }),
+    ]);
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["Customer X", "Customer Y"]),
+    );
+    renderOnSession("conv_filed_4");
+
+    fireEvent.keyDown(window, {
+      code: "BracketRight",
+      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+    });
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
   });
 });
 

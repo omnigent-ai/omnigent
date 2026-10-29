@@ -4638,7 +4638,7 @@ async def test_get_session_labels_returns_labels_only(
     assert resp.headers["cache-control"] == "no-store"
     assert resp.json() == {
         "id": session["id"],
-        "labels": {"mode": "debug", "team": "infra"},
+        "labels": {"mode": "debug", "team": "infra", "omnigent.client_surface": "cli"},
     }
 
 
@@ -5841,6 +5841,42 @@ _CODEX_COMPACTION_RETRY_CARD = {
 _CODEX_LOGIN_EXPIRED_DETAIL = (
     "unexpected status 401 Unauthorized: Provided authentication token is expired."
 )
+_CODEX_PROVIDER_AUTH_DETAIL = (
+    "provider auth command `isaac` exited with status exit status: 1: [INFO] Access token "
+    "expiring. Attempting silent refresh.\n[ERROR] Silent token refresh failed: Failed to "
+    "refresh token: HTTP Error 400: Bad Request.\nError: Could not get an AI DevTools access "
+    "token. Run `isaac` to log in and try again."
+)
+_CODEX_PROVIDER_AUTH_CARD = {
+    "code": "codex_provider_auth_failed",
+    "title": "Codex couldn't get a model provider token",
+    "cause": (
+        "The model provider's token command `isaac` failed on the host: Error: Could not "
+        "get an AI DevTools access token. Run `isaac` to log in and try again."
+    ),
+    "remediation": "Run `isaac` on the host to sign in again, then send your message again.",
+}
+_CODEX_PROVIDER_DISK_FULL_DETAIL = (
+    "provider auth command `isaac` exited with status exit status: 1: "
+    "Traceback (most recent call last):\n"
+    '  File "/opt/token-helper/pex/bootstrap.py", line 20, in bootstrap_venv\n'
+    "    create_venv()\n"
+    '  File "/opt/token-helper/pex/venv.py", line 10, in create_venv\n'
+    "    tempfile.mkdtemp()\n"
+    "OSError: [Errno 28] No space left on device: '/tmp/token-helper-example'"
+)
+_CODEX_PROVIDER_DISK_FULL_CARD = {
+    "code": "codex_provider_auth_failed",
+    "title": "Host storage is full",
+    "cause": (
+        "The model provider's token command `isaac` failed on the host: "
+        "OSError: [Errno 28] No space left on device: '/tmp/token-helper-example'"
+    ),
+    "remediation": (
+        "Free space or inodes on the affected host filesystem, or raise its disk quota, "
+        "then send your message again."
+    ),
+}
 
 
 @pytest.mark.parametrize("wire_output", [False, True])
@@ -6039,6 +6075,58 @@ async def test_native_failures_are_coded_live_and_after_reload(
         if item.get("type") == "message"
         for block in item.get("data", {}).get("content", [])
     ]
+
+
+@pytest.mark.parametrize("status_extra", [{}, _CODEX_COMPACTION_MODELS])
+@pytest.mark.parametrize(
+    ("output", "card"),
+    [
+        (_CODEX_PROVIDER_AUTH_DETAIL, _CODEX_PROVIDER_AUTH_CARD),
+        # Older runners flag it as a Codex login failure and append a login hint.
+        (
+            f"{_CODEX_PROVIDER_AUTH_DETAIL}\n\nIf this looks like an auth issue, "
+            "running `codex login` may help.",
+            _CODEX_PROVIDER_AUTH_CARD,
+        ),
+        (_CODEX_PROVIDER_DISK_FULL_DETAIL, _CODEX_PROVIDER_DISK_FULL_CARD),
+    ],
+)
+async def test_codex_provider_token_failure_keeps_its_recovery_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    output: str,
+    card: dict[str, str],
+    status_extra: dict[str, str],
+) -> None:
+    """Provider token failures retain their cause and recovery, live and after reload."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": "codex-native"}}
+    )
+    session = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    data: dict[str, Any] = {"status": "failed", "output": output, **status_extra}
+    if "codex login" in output:
+        data["reauth_required"] = True
+
+    status_resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={"type": "external_session_status", "data": data},
+    )
+
+    assert status_resp.status_code == 202, status_resp.text
+    [failed_event] = [event for event in published if event.get("status") == "failed"]
+    assert {key: failed_event["error"][key] for key in card} == card
+    assert failed_event["error"]["message"] == output
+    snapshot_resp = await client.get(f"/v1/sessions/{session['id']}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    # The stored message is cut to one label, so the card must keep the recovery.
+    assert {key: snapshot_resp.json()["last_task_error"][key] for key in card} == card
 
 
 async def test_post_external_session_status_propagates_runner_delivery_failure(

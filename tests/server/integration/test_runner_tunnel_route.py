@@ -8,9 +8,10 @@ import json
 import logging
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -495,14 +496,46 @@ async def test_abnormal_peer_disconnect_preserves_code_during_registry_cleanup(
     assert route_app.registry.get(_RUNNER_ID) is None
 
 
+@pytest.mark.parametrize("first_helper", ["sender", "receive"])
+@pytest.mark.parametrize("send_error", [ValueError, OSError])
+@pytest.mark.parametrize("peer_code", [1000, 1006, 1012])
 async def test_tunnel_close_race_logs_each_helper_outcome(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    first_helper: str,
+    send_error: type[Exception],
+    peer_code: int,
 ) -> None:
     """A failed sender must not hide the receive helper's peer-close evidence."""
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import runner_tunnel
+
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    monkeypatch.setattr(shutdown_state, "_marked_at", None)
     frame_in_transport = asyncio.Event()
     peer_closed = asyncio.Event()
     private_detail = "transport-private-detail"
+    peer_reason = RUNNER_IDLE_SHUTDOWN_CLOSE_REASON if peer_code == 1000 else ""
+
+    class OrderedTasks(set[asyncio.Task[None]]):
+        def __iter__(self) -> Iterator[asyncio.Task[None]]:
+            return iter(
+                sorted(
+                    super().__iter__(),
+                    key=lambda task: not task.get_name().startswith(f"tunnel-{first_helper}:"),
+                )
+            )
+
+    async def ordered_wait(
+        tasks: set[asyncio.Task[None]], *, return_when: str
+    ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+        done, pending = await asyncio.wait(tasks, return_when=return_when)
+        return OrderedTasks(done), pending
+
+    monkeypatch.setattr(
+        runner_tunnel, "asyncio", SimpleNamespace(**(vars(asyncio) | {"wait": ordered_wait}))
+    )
 
     class ClosingTransport:
         def __init__(self, app: ASGIApp) -> None:
@@ -519,8 +552,7 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
                 if message["type"] == "websocket.send":
                     frame_in_transport.set()
                     await peer_closed.wait()
-                    # RuntimeError after disconnect is an expected send/close race.
-                    raise ValueError(private_detail)
+                    raise send_error(private_detail)
                 await send(message)
 
             await self.app(scope, receive_frame, send_frame)
@@ -534,7 +566,9 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
         assert session is not None
         await route_app.registry.send_text(session, encode_frame(PingFrame(ts=0)))
         await asyncio.wait_for(frame_in_transport.wait(), timeout=budget(1.0))
-        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await communicator.send_input(
+            {"type": "websocket.disconnect", "code": peer_code, "reason": peer_reason}
+        )
         await asyncio.wait_for(communicator.future, timeout=budget(1.0))
     finally:
         communicator.stop(exceptions=False)
@@ -544,13 +578,31 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
     assert len(ends) == 1
     assert ends[0]["connection_id"] == "conn-close-race"
     outcomes = json.loads(ends[0]["helper_outcomes"])
-    assert outcomes["sender"] == "error:ValueError"
+    assert outcomes["sender"] == (
+        "error:WebSocketDisconnect" if send_error is OSError else "error:ValueError"
+    )
     assert outcomes["receive"] == "error:WebSocketDisconnect"
-    assert ends[0]["receive_close_code"] == 1006
+    assert ends[0]["receive_close_code"] == peer_code
     assert ends[0]["asgi_client_state"] == "DISCONNECTED"
-    assert ends[0]["asgi_application_state"] == "CONNECTED"
+    assert ends[0]["asgi_application_state"] == (
+        "DISCONNECTED" if send_error is OSError else "CONNECTED"
+    )
     assert private_detail not in str(ends[0])
     assert route_app.registry.get(_RUNNER_ID) is None
+    assert session.peer_close_reason == (peer_reason or None)
+    evidence = DisconnectEvidence.from_session(session)
+    assert evidence is not None
+    assert evidence.close_code == peer_code
+    assert evidence.close_reason_category == (
+        "idle_shutdown"
+        if peer_code == 1000
+        else "abnormal"
+        if peer_code == 1006
+        else "runner_closed"
+    )
+    assert shutdown_state.server_shutting_down() is (peer_code == 1012)
+    if send_error is ValueError and first_helper == "sender":
+        assert ends[0]["phase"] == "error"
 
 
 @pytest.mark.parametrize(

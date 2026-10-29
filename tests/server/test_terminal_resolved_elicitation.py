@@ -42,12 +42,14 @@ from omnigent.entities.conversation import (
     ConversationItem,
     FunctionCallData,
     FunctionCallOutputData,
+    NewConversationItem,
 )
 from omnigent.server._elicitation_registry import (
     _harness_parked_elicitations,
     _ParkedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 SESSION = "conv_test"
 
@@ -314,3 +316,106 @@ def test_drive_output_without_known_call_id_is_noop() -> None:
     )
 
     assert not a.resolved_elsewhere.is_set()
+
+
+def _store_with_mirrored_call(
+    db_uri: str, call_id: str, name: str, tool_input: dict[str, Any]
+) -> tuple[SqlAlchemyConversationStore, str]:
+    """Persist a mirrored ``function_call`` as another replica would have."""
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation(kind="default").id
+    call = _function_call_item(call_id, name, tool_input)
+    store.append(
+        session_id,
+        [NewConversationItem(type="function_call", response_id="resp_test", data=call.data)],
+    )
+    return store, session_id
+
+
+async def test_store_fallback_resolves_prompt_whose_call_another_replica_mirrored(
+    db_uri: str,
+) -> None:
+    """
+    A result arriving on a replica that never cached its call (the session
+    moved replicas between the call and its result) still resolves the
+    prompt parked here, from the call persisted in the store.
+    """
+    store, session_id = _store_with_mirrored_call(
+        db_uri, "toolu_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}
+    )
+    asked = _park(
+        "e_q", "AskUserQuestion", {"questions": [{"question": "Pick?"}]}, session_id=session_id
+    )
+    other = _park(
+        "e_other",
+        "AskUserQuestion",
+        {"questions": [{"question": "Other?"}]},
+        session_id=session_id,
+    )
+    output = _function_call_output_item("toolu_q")
+
+    # The per-process cache path recovers nothing on this replica.
+    sessions_route._drive_terminal_resolved_elicitation(session_id, output)
+    assert not asked.resolved_elsewhere.is_set()
+
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(session_id, output, store)
+
+    assert asked.resolved_elsewhere.is_set()
+    assert not other.resolved_elsewhere.is_set()
+
+
+def _record_list_items(store: SqlAlchemyConversationStore) -> list[str]:
+    """Record the session id of every ``list_items`` call on ``store``."""
+    reads: list[str] = []
+    original = store.list_items
+
+    def recording_list_items(*args: Any, **kwargs: Any) -> Any:
+        reads.append(args[0])
+        return original(*args, **kwargs)
+
+    store.list_items = recording_list_items  # type: ignore[method-assign]
+    return reads
+
+
+async def test_store_fallback_skips_store_without_a_parked_prompt(db_uri: str) -> None:
+    """With nothing parked for the session, a cache miss reads nothing."""
+    store, session_id = _store_with_mirrored_call(db_uri, "toolu_q", "Bash", {"command": "ls"})
+    _park("e_elsewhere", "Bash", {"command": "ls"}, session_id="conv_other")
+    reads = _record_list_items(store)
+
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(
+        session_id, _function_call_output_item("toolu_q"), store
+    )
+
+    assert reads == []
+
+
+async def test_store_fallback_skips_store_on_a_cache_hit(db_uri: str) -> None:
+    """A result whose call this replica cached resolves through the cache alone."""
+    store, session_id = _store_with_mirrored_call(db_uri, "toolu_q", "Bash", {"command": "ls"})
+    parked = _park("e_q", "Bash", {"command": "ls"}, session_id=session_id)
+    # Another prompt stays parked, so only the cache hit keeps the store unread.
+    _park("e_other", "Bash", {"command": "pwd"}, session_id=session_id)
+    reads = _record_list_items(store)
+    sessions_route._drive_terminal_resolved_elicitation(
+        session_id, _function_call_item("toolu_q", "Bash", {"command": "ls"})
+    )
+    output = _function_call_output_item("toolu_q")
+
+    sessions_route._drive_terminal_resolved_elicitation(session_id, output)
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(session_id, output, store)
+
+    assert parked.resolved_elsewhere.is_set()
+    assert reads == []
+
+
+async def test_store_fallback_ignores_unknown_call_id(db_uri: str) -> None:
+    """A result whose call is not in the store resolves nothing."""
+    store, session_id = _store_with_mirrored_call(db_uri, "toolu_q", "Bash", {"command": "ls"})
+    parked = _park("e_q", "Bash", {"command": "ls"}, session_id=session_id)
+
+    await sessions_route._drive_terminal_resolved_elicitation_from_store(
+        session_id, _function_call_output_item("toolu_unknown"), store
+    )
+
+    assert not parked.resolved_elsewhere.is_set()

@@ -109,6 +109,7 @@ import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
+import { subagentTabId } from "@/lib/subagentTabs";
 import {
   STARTING_GRACE_S,
   livenessRowFromSession,
@@ -129,11 +130,12 @@ import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import type { ChangedSort } from "./FlatFileList";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
-import { useRootSessionId, useSession } from "@/hooks/useSession";
+import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { workspaceRecoveryDisabledReason } from "@/lib/sessionCapabilities";
 import {
@@ -1961,6 +1963,43 @@ function AppShellImpl() {
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
   const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
+  // With the panel setting on, sub-agent links open a rail tab beside this chat,
+  // revealing the rail if another panel covers it. Ancestors still navigate.
+  const parentSessionId = activeSession?.parentSessionId;
+  const workspacePanelMounted = hasRailContent || selectedFilePath !== null;
+  const openSubagentInPanel = useCallback(
+    (childSessionId: string) => {
+      if (
+        !conversationId ||
+        pendingConversation ||
+        !workspacePanelMounted ||
+        childSessionId === conversationId ||
+        childSessionId === rootSessionId ||
+        isCachedAncestor(queryClient, parentSessionId, childSessionId) ||
+        // The parent chain may still be loading; the Agents tree's cache shows ancestry too.
+        cachedTreeContains(queryClient, childSessionId, conversationId, MAX_TREE_DEPTH)
+      ) {
+        return false;
+      }
+      revealRightPanel();
+      useChatStore.setState({
+        sideChatToOpen: { childId: subagentTabId(childSessionId), parentId: conversationId },
+      });
+      return true;
+    },
+    [
+      conversationId,
+      pendingConversation,
+      workspacePanelMounted,
+      rootSessionId,
+      parentSessionId,
+      queryClient,
+      revealRightPanel,
+    ],
+  );
+  // Sub-agent tabs opened on desktop must stay reachable from a phone's
+  // drawer even when this harness can't start side chats.
+  const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2590,7 +2629,7 @@ function AppShellImpl() {
                       shellsPanelOpen,
                       githubPanelOpen,
                       sideChatsPanelOpen,
-                      showSideChats,
+                      showSideChats: showSideChats || hasSubagentTabs,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2618,7 +2657,9 @@ function AppShellImpl() {
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
                 >
-                  <Outlet />
+                  <SubagentPanelOpenerContext.Provider value={openSubagentInPanel}>
+                    <Outlet />
+                  </SubagentPanelOpenerContext.Provider>
                 </GridSessionMain>
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
@@ -2645,7 +2686,7 @@ function AppShellImpl() {
               rectangle (e.g. a no-filesystem agent with no terminals).
               Sits inside the group so the header overlay spans it; the
               push panels below sit outside the group. */}
-                {conversationId && (hasRailContent || selectedFilePath !== null) && (
+                {conversationId && workspacePanelMounted && (
                   <WorkspacePanel
                     conversationId={conversationId}
                     pending={pendingConversation}
@@ -2699,6 +2740,8 @@ function AppShellImpl() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
+                    onHasSubagentTabsChange={setHasSubagentTabs}
+                    subagentPanelOpener={openSubagentInPanel}
                   />
                 )}
               </div>

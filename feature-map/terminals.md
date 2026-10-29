@@ -103,6 +103,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
+  A program's terminal queries get exactly one reply:
+  `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
