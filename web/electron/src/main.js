@@ -2788,8 +2788,8 @@ function openFindBar(target) {
   };
   // Results belong to the searched conversation, so switching closes the bar.
   const openedIn = findConversationId(target.webContents.getURL());
-  const onNavigate = (_event, url) => {
-    if (findConversationId(url) !== openedIn) bar.close();
+  const onNavigate = (_event, url, isMainFrame) => {
+    if (isMainFrame && findConversationId(url) !== openedIn) bar.close();
   };
   target.on("resize", reposition);
   target.on("move", reposition);
