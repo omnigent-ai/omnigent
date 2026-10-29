@@ -351,6 +351,46 @@ describe("ApprovePage submission", () => {
     expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
   });
 
+  it("ignores a refusal that arrives after the page moved to the next approval link", async () => {
+    let finishSubmit!: (response: Response) => void;
+    vi.mocked(identity.authenticatedFetch).mockImplementation(async (url, init) => {
+      if (init?.method === "POST") {
+        return new Promise<Response>((resolve) => {
+          finishSubmit = resolve;
+        });
+      }
+      const message = String(url).endsWith("/eli_2") ? "Deploy the release?" : "Run the migration?";
+      return jsonResponse({ status: "pending", message });
+    });
+    function OpenNextApproval() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate("/approve/sess_1/eli_2")}>
+          Next link
+        </button>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={["/approve/sess_1/eli_1"]}>
+        <OpenNextApproval />
+        <Routes>
+          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
+    expect(await screen.findByText("Approved")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Next link" }));
+    expect(await screen.findByText("Deploy the release?")).toBeInTheDocument();
+    await act(async () => {
+      finishSubmit(jsonResponse(null, { ok: false, status: 423 }));
+    });
+    expect(screen.getByText("Deploy the release?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Approve/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Resolve failed/)).not.toBeInTheDocument();
+  });
+
   it("shows a network error when the resolve POST throws", async () => {
     // WHY: a thrown resolve POST routes to the `error` branch (network error).
     vi.mocked(identity.authenticatedFetch)

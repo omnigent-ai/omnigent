@@ -3486,7 +3486,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }));
       // The stream missed the prompt moving to the terminal; fetch the held card.
       if (err instanceof ApiError && err.code === PROMPT_IN_TERMINAL_CODE) {
-        void reconcilePendingElicitations(sessionId);
+        void reconcilePendingElicitations(sessionId, { fresh: true });
       }
     }
   },
@@ -4546,18 +4546,25 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  * retries), or nothing is stale.
  *
  * @param id - Conversation/session id to reconcile.
+ * @param options.fresh - Skip the shared query, whose in-flight fetch may predate a change
+ *   the caller already knows happened.
  */
-async function reconcilePendingElicitations(id: string): Promise<void> {
+async function reconcilePendingElicitations(
+  id: string,
+  { fresh = false }: { fresh?: boolean } = {},
+): Promise<void> {
   if (queryClient === null) return;
   const cardsBeforeFetch = captureElicitationIdsByStatus(setterForState(id)?.blocks ?? []).cards;
   let session: Session;
   try {
-    session = await queryClient.fetchQuery({
-      queryKey: ["session", id],
-      queryFn: () => getSessionSlim(id),
-      staleTime: 0,
-      retry: false,
-    });
+    session = fresh
+      ? await getSessionSlim(id)
+      : await queryClient.fetchQuery({
+          queryKey: ["session", id],
+          queryFn: () => getSessionSlim(id),
+          staleTime: 0,
+          retry: false,
+        });
   } catch {
     return;
   }
@@ -4583,6 +4590,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
       // A live event that changed the card during the fetch is newer than the snapshot.
       if (
         current &&
+        !b.nativeDeliveryResolved &&
         cardsBeforeFetch.get(b.elicitationId) === b &&
         terminalHoldChanged(current, b)
       ) {

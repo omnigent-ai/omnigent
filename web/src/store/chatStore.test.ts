@@ -1444,49 +1444,62 @@ describe("chatStore — switchTo", () => {
     expect(reconciled[0]!.response).toEqual({ action: "auto_resolved" });
   });
 
-  it("reopens an answered card on tab focus once its prompt waits in the terminal", async () => {
-    const prompt = {
-      type: "response.elicitation_request",
-      elicitation_id: "elic_vis_held",
-      params: {
-        mode: "form",
-        message: "Approve?",
-        phase: "tool_call_approval",
-        policy_name: "test_policy",
-        content_preview: "",
-      },
-    };
-    seedSession("conv_vis_held", []);
-    seedPendingElicitations("conv_vis_held", [prompt]);
-    await useChatStore.getState().switchTo("conv_vis_held");
-    const entry = conversationRegistry.peek("conv_vis_held")!;
-    const cards = () =>
-      entry.getState().blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
-    entry.setState({
-      blocks: entry
-        .getState()
-        .blocks.map((b) =>
+  it.each([
+    { nativeDeliveryResolved: false, reopened: true },
+    { nativeDeliveryResolved: true, reopened: false },
+  ])(
+    "reopens an answered card on tab focus once its prompt waits in the terminal (nativeDeliveryResolved=$nativeDeliveryResolved)",
+    async ({ nativeDeliveryResolved, reopened }) => {
+      const prompt = {
+        type: "response.elicitation_request",
+        elicitation_id: "elic_vis_held",
+        params: {
+          mode: "form",
+          message: "Approve?",
+          phase: "tool_call_approval",
+          policy_name: "test_policy",
+          content_preview: "",
+        },
+      };
+      seedSession("conv_vis_held", []);
+      seedPendingElicitations("conv_vis_held", [prompt]);
+      await useChatStore.getState().switchTo("conv_vis_held");
+      const entry = conversationRegistry.peek("conv_vis_held")!;
+      const cards = () =>
+        entry.getState().blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+      entry.setState({
+        blocks: entry.getState().blocks.map((b) =>
           b.type === "elicitation"
-            ? { ...b, status: "responded", response: { action: "accept" } }
+            ? {
+                ...b,
+                status: "responded",
+                response: { action: "accept" },
+                nativeDeliveryResolved,
+              }
             : b,
         ),
-    });
-    // The hook exited before the answer reached it; the hidden tab missed the re-publish.
-    seedPendingElicitations("conv_vis_held", [
-      { ...prompt, params: { ...prompt.params, terminal_fallback: { answer_undelivered: true } } },
-    ]);
+      });
+      // The hook exited before the answer reached it; the hidden tab missed the re-publish.
+      seedPendingElicitations("conv_vis_held", [
+        {
+          ...prompt,
+          params: { ...prompt.params, terminal_fallback: { answer_undelivered: true } },
+        },
+      ]);
 
-    document.dispatchEvent(new Event("visibilitychange"));
-    await tick();
-    await tick();
+      document.dispatchEvent(new Event("visibilitychange"));
+      await tick();
+      await tick();
 
-    expect(cards()).toHaveLength(1);
-    expect(cards()[0]).toMatchObject({
-      status: "pending",
-      response: null,
-      terminalFallback: { answerUndelivered: true },
-    });
-  });
+      expect(cards()).toHaveLength(1);
+      // A card the native delivery confirmed stays settled, as on reconnect.
+      expect(cards()[0]).toMatchObject(
+        reopened
+          ? { status: "pending", response: null, terminalFallback: { answerUndelivered: true } }
+          : { status: "responded", response: { action: "accept" } },
+      );
+    },
+  );
 
   it("does not abort a conversation's stream when switching away", async () => {
     const sink = pushableStream();
@@ -17959,7 +17972,7 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     await abortLoop(sinks, controller, loop);
   });
 
-  it("shows the terminal card when an answer is refused while a reconnect snapshot is in flight", async () => {
+  it("shows the terminal card when an answer is refused while an older reconnect snapshot is in flight", async () => {
     const sid = "conv_terminal_refused_race";
     const eid = "elic_terminal_refused_race";
     seedSession(sid, []);
@@ -17975,7 +17988,34 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     await drainAsync();
     expect(cards()[0]!.status).toBe("pending");
 
-    // The prompt moved to the terminal during the gap; only the snapshot has the hold.
+    // The reconnect snapshot is captured before the prompt moves to the terminal.
+    seedPendingElicitations(sid, [raw]);
+    const route = fetchMock.getMockImplementation()!;
+    let releaseSnapshot!: () => void;
+    const snapshotHeld = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    let snapshotRequests = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith(`/v1/sessions/${sid}/elicitations/${eid}/resolve`)) {
+        return mockResponse({ error: { code: "prompt_in_terminal" } }, { ok: false, status: 423 });
+      }
+      if (url.startsWith(`/v1/sessions/${sid}?`)) {
+        snapshotRequests += 1;
+        if (snapshotRequests === 1) {
+          const olderSnapshot = await route(input, init);
+          await snapshotHeld;
+          return olderSnapshot;
+        }
+      }
+      return route(input, init);
+    });
+    sinks.at(-1)!.error();
+    await drainAsync();
+    expect(snapshotRequests).toBe(1);
+
+    // The re-publish that moved the prompt to the terminal was lost in the gap.
     seedPendingElicitations(sid, [
       {
         ...raw,
@@ -17985,33 +18025,16 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
         },
       },
     ]);
-    const route = fetchMock.getMockImplementation()!;
-    let releaseSnapshots!: () => void;
-    const snapshotsHeld = new Promise<void>((resolve) => {
-      releaseSnapshots = resolve;
-    });
-    let heldSnapshots = 0;
-    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input);
-      if (url.endsWith(`/v1/sessions/${sid}/elicitations/${eid}/resolve`)) {
-        return mockResponse({ error: { code: "prompt_in_terminal" } }, { ok: false, status: 423 });
-      }
-      if (url.startsWith(`/v1/sessions/${sid}?`)) {
-        heldSnapshots += 1;
-        await snapshotsHeld;
-      }
-      return route(input, init);
-    });
-    sinks.at(-1)!.error();
-    await drainAsync();
-    expect(heldSnapshots).toBe(1);
-
     await useChatStore.getState().submitApproval(eid, "accept");
     await drainAsync();
-    expect(cards()[0]).toMatchObject({ status: "pending", response: null });
-    expect(cards()[0]!.terminalFallback).toBeUndefined();
+    expect(snapshotRequests).toBe(2);
+    expect(cards()[0]).toMatchObject({
+      status: "pending",
+      response: null,
+      terminalFallback: { answerUndelivered: false },
+    });
 
-    releaseSnapshots();
+    releaseSnapshot();
     await drainAsync();
     expect(cards()).toHaveLength(1);
     expect(cards()[0]).toMatchObject({
