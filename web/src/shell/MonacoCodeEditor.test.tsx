@@ -21,14 +21,14 @@ import type { ActiveSelection, SaveStatus } from "./codeViewerHelpers";
 // need the props, not a real DOM editor).
 const h = vi.hoisted(() => ({
   editorProps: null as {
-    options?: { readOnly?: boolean; fontWeight?: string };
+    options?: { readOnly?: boolean; fontWeight?: string; wordWrap?: string };
     theme?: string;
     language?: string;
   } | null,
 }));
 vi.mock("@monaco-editor/react", () => ({
   Editor: (props: {
-    options?: { readOnly?: boolean; fontWeight?: string };
+    options?: { readOnly?: boolean; fontWeight?: string; wordWrap?: string };
     theme?: string;
     language?: string;
   }) => {
@@ -140,7 +140,11 @@ function setupHooks(
 }
 
 function renderEditor(
-  props: { truncated?: boolean; onSaveStatusChange?: (s: SaveStatus) => void } = {},
+  props: {
+    truncated?: boolean;
+    wrapLines?: boolean;
+    onSaveStatusChange?: (s: SaveStatus) => void;
+  } = {},
 ) {
   return render(
     <MonacoCodeEditor
@@ -295,6 +299,37 @@ describe("MonacoCodeEditor read-only / truncated gating", () => {
 
     await waitFor(() => expect(h.editorProps).not.toBeNull());
     expect(h.editorProps?.options?.fontWeight).toBe("500");
+  });
+});
+
+describe("MonacoCodeEditor word wrap", () => {
+  it("leaves long lines unwrapped by default", async () => {
+    renderEditor();
+    await waitFor(() => expect(h.editorProps).not.toBeNull());
+    expect(h.editorProps?.options?.wordWrap).toBe("off");
+  });
+
+  it("passes the wrap toggle to the live editor's options", async () => {
+    const { rerender } = renderEditor();
+    await waitFor(() => expect(h.editorProps?.options?.wordWrap).toBe("off"));
+
+    rerender(
+      <MonacoCodeEditor
+        content="const x = 1;"
+        conversationId="conv_1"
+        path="src/a.ts"
+        isSettled={true}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        wrapLines
+      />,
+    );
+
+    // @monaco-editor/react pushes changed options through updateOptions, so the
+    // toggle reaches the mounted editor without the "Loading…" remount.
+    expect(h.editorProps?.options?.wordWrap).toBe("on");
+    expect(screen.queryByText("Loading…")).toBeNull();
   });
 });
 
