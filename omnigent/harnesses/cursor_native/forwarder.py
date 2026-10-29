@@ -214,11 +214,19 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
 def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
     """Atomically persist the forward cursor (tmp write + rename).
 
+    Stamps the heartbeat at persist time so every poll refreshes the chat
+    claim; a peer treats a claim older than ``_CLAIM_FRESH_MS`` as a dead
+    session it may take over.
+
     :returns: ``True`` on success. A failure is logged (not silently swallowed)
         and returns ``False`` — the in-memory cursor still guards against
         within-process re-posting; only a crash before a successful persist
         could re-post, so a persistent write failure is worth surfacing.
     """
+    return _persist_state(bridge_dir, state, heartbeat_ms=int(time.time() * 1000))
+
+
+def _persist_state(bridge_dir: Path, state: _ForwardState, *, heartbeat_ms: int) -> bool:
     try:
         bridge_dir.mkdir(parents=True, exist_ok=True)
         tmp = bridge_dir / (_STATE_FILE + ".tmp")
@@ -228,10 +236,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
                     "store_path": state.store_path,
                     "last_rowid": state.last_rowid,
                     "launch_epoch_ms": state.launch_epoch_ms,
-                    # Stamp the heartbeat at persist time so every poll refreshes
-                    # the chat claim; a peer treats a claim older than
-                    # ``_CLAIM_FRESH_MS`` as a dead session it may take over.
-                    "heartbeat_ms": int(time.time() * 1000),
+                    "heartbeat_ms": heartbeat_ms,
                 }
             ),
             encoding="utf-8",
@@ -243,6 +248,20 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
             "cursor forwarder could not persist state to %s", bridge_dir, exc_info=True
         )
         return False
+
+
+def release_cursor_chat_claim(bridge_dir: Path) -> None:
+    """Mark this session's chat claim dead while keeping its resume cursor.
+
+    A stopped forwarder must not hold its chat for another ``_CLAIM_FRESH_MS``:
+    the next session in the same cwd discovers the same store and would pause
+    on the stale claim. Zeroing the heartbeat releases it at once; the store
+    path and rowid stay so a cold resume still skips already-mirrored turns.
+    """
+    state = _read_state(bridge_dir)
+    if state.store_path is None:
+        return
+    _persist_state(bridge_dir, state, heartbeat_ms=0)
 
 
 def clear_cursor_bridge_state(bridge_dir: Path) -> None:
@@ -346,6 +365,8 @@ def preseed_resume_state(
 
     Writing the known store path + current rowid here lets the forwarder skip
     discovery entirely and start tailing only messages posted after the resume.
+    When this session's saved cursor already names the store, resume continues
+    from it instead, so rows that were never delivered are still mirrored.
 
     External contract (verified empirically against the current cursor build):
     ``cursor-agent --resume`` reuses the SAME chat store and *appends* new turns
@@ -368,6 +389,9 @@ def preseed_resume_state(
     if not store_path.exists():
         return False
     last_rowid = _get_current_rowid(store_path)
+    saved = _read_state(bridge_dir)
+    if saved.store_path == str(store_path):
+        last_rowid = min(saved.last_rowid, last_rowid)
     _write_state(
         bridge_dir,
         _ForwardState(
@@ -407,14 +431,15 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     the dir lazily on the first message, so we pick the newest chat created at or
     after this session's launch under the exact ``md5(workspace)`` dir. If that
     dir has nothing (a path-hash mismatch), we fall back to other workspace dirs
-    but bind ONLY when exactly one chat across them qualifies — never guessing
-    among multiple, so a concurrent session or unrelated workspace can't be
-    mirrored by mistake.
+    but bind ONLY when exactly one chat across them was created at or after the
+    launch itself (no skew) — never guessing among multiple, so a concurrent
+    session or unrelated workspace can't be mirrored by mistake.
 
     :param workspace: The session's working directory, exactly as passed to the
         cursor TUI.
     :param launch_epoch_ms: Wall-clock ms when this terminal launched; only
-        chats created at/after this (minus a small skew) are candidates.
+        chats created at/after this (minus a small skew in the exact
+        workspace dir) are candidates.
     :returns: The newest matching ``store.db`` path, or ``None`` if none yet.
     """
     root = _cursor_chats_root()
@@ -425,12 +450,8 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
     best, _best_created = _scan_hash_dir(exact_dir, floor_ms, None, -1)
     if best is not None:
         return best
-    # Fallback ONLY for a path-hash mismatch: scan the other workspace dirs, but
-    # bind only when EXACTLY ONE chat across them qualifies. With two candidates
-    # we can't tell which session owns which (concurrent sessions, or an
-    # unrelated workspace), so we return None and retry rather than risk
-    # mirroring the wrong conversation — silent cross-talk is worse than a brief
-    # delay.
+    # Hash-mismatch fallback: bind only when exactly one chat in other dirs
+    # qualifies; with several we can't tell ownership, so retry instead.
     if not root.is_dir():
         return None
     matches: list[Path] = []
@@ -439,7 +460,8 @@ def _discover_store(workspace: str, launch_epoch_ms: int) -> Path | None:
             continue
         for chat_dir in hash_dir.iterdir():
             store = chat_dir / "store.db"
-            if store.is_file() and _chat_created_ms(chat_dir) >= floor_ms:
+            # No skew here: another workspace's pre-launch chat is never ours.
+            if store.is_file() and _chat_created_ms(chat_dir) >= launch_epoch_ms:
                 matches.append(store)
     return matches[0] if len(matches) == 1 else None
 
@@ -1052,6 +1074,8 @@ async def forward_cursor_store_to_session(
                             store_path,
                             session_id,
                         )
+                        # The owner mirrors these rows, so a resume must not replay them.
+                        clear_cursor_bridge_state(bridge_dir)
                         store_path = None
                     else:
                         items = await asyncio.to_thread(
@@ -1324,42 +1348,48 @@ async def supervise_cursor_forwarder(
     :param launch_epoch_ms: Wall-clock ms when this terminal launched.
     :param poll_interval_s: Seconds between store polls.
     :param auth: Optional refresh-capable httpx Auth.
-    :returns: Never normally returns; cancel the task to stop it.
+    :returns: Never normally returns; cancel the task to stop it. Cancellation
+        releases the session's chat claim (:func:`release_cursor_chat_claim`).
     """
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
-    while True:
-        run_started_at = _supervisor_monotonic()
-        crash_exc: Exception | None = None
-        try:
-            await forward_cursor_store_to_session(
-                base_url=base_url,
-                headers=headers,
-                session_id=session_id,
-                bridge_dir=bridge_dir,
-                agent_name=agent_name,
-                workspace=workspace,
-                launch_epoch_ms=launch_epoch_ms,
-                poll_interval_s=poll_interval_s,
-                auth=auth,
-            )
-            _logger.warning(
-                "cursor forwarder returned unexpectedly; restarting; session=%s bridge_dir=%s",
-                session_id,
-                bridge_dir,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — supervisor restarts on any Exception
-            crash_exc = exc
-        if _supervisor_monotonic() - run_started_at >= _SUPERVISOR_HEALTHY_UPTIME_S:
-            backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
-        if crash_exc is not None:
-            _logger.error(
-                "cursor forwarder crashed; restarting in %.1fs; session=%s bridge_dir=%s",
-                backoff_s,
-                session_id,
-                bridge_dir,
-                exc_info=crash_exc,
-            )
-        await _supervisor_sleep(backoff_s)
-        backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
+    try:
+        while True:
+            run_started_at = _supervisor_monotonic()
+            crash_exc: Exception | None = None
+            try:
+                await forward_cursor_store_to_session(
+                    base_url=base_url,
+                    headers=headers,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    agent_name=agent_name,
+                    workspace=workspace,
+                    launch_epoch_ms=launch_epoch_ms,
+                    poll_interval_s=poll_interval_s,
+                    auth=auth,
+                )
+                _logger.warning(
+                    "cursor forwarder returned unexpectedly; restarting; session=%s bridge_dir=%s",
+                    session_id,
+                    bridge_dir,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — supervisor restarts on any Exception
+                crash_exc = exc
+            if _supervisor_monotonic() - run_started_at >= _SUPERVISOR_HEALTHY_UPTIME_S:
+                backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
+            if crash_exc is not None:
+                _logger.error(
+                    "cursor forwarder crashed; restarting in %.1fs; session=%s bridge_dir=%s",
+                    backoff_s,
+                    session_id,
+                    bridge_dir,
+                    exc_info=crash_exc,
+                )
+            await _supervisor_sleep(backoff_s)
+            backoff_s = min(backoff_s * 2.0, _SUPERVISOR_MAX_BACKOFF_S)
+    finally:
+        # The task only ends by cancellation; a claim left fresh would park the
+        # next same-cwd session on it until the heartbeat ages out.
+        release_cursor_chat_claim(bridge_dir)

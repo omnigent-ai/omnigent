@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,9 +17,15 @@ from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.runner import app as runner_app_mod
-from omnigent.runner import subagent_work
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner.resource_registry import (
+    SessionResourceRegistry,
+    TerminalExitEvent,
+    TerminalLifecycle,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests.budgets import budget
+from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
 
@@ -380,6 +387,63 @@ async def test_cancel_auto_forwarder_task_cancels_and_awaits_registered_task() -
     finally:
         runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
         await _drain_forwarder_runs([run])
+
+
+@pytest.mark.parametrize("session_was_idle", [True, False])
+@pytest.mark.asyncio
+async def test_required_cursor_terminal_exit_cancels_transcript_forwarder(
+    session_was_idle: bool,
+) -> None:
+    """
+    A cursor session whose required terminal exits stops mirroring.
+
+    A surviving forwarder keeps polling discovery and claims the chat that the
+    next same-cwd cursor session creates, so that session mirrors nothing.
+
+    :param session_was_idle: Whether the pane's last status was idle at exit.
+    """
+    session_id = uuid.uuid4().hex
+    run = _ForwarderRun()
+
+    async def _parked() -> None:
+        run.task = asyncio.current_task()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            run.cancelled = True
+            raise
+
+    process_manager = _FakeProcessManager(_ScriptedHarnessClient([]))
+    process_manager._sessions.add(session_id)
+    app = create_runner_app(
+        process_manager=process_manager,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    forwarder = asyncio.create_task(_parked())
+    runner_app_mod._register_auto_forwarder_task(session_id, forwarder)
+    try:
+        await asyncio.sleep(0)
+        publish_exit(
+            TerminalExitEvent(
+                session_id=session_id,
+                terminal_id="terminal_cursor_main",
+                terminal_name="cursor",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                session_was_idle=session_was_idle,
+            )
+        )
+        await asyncio.wait({forwarder}, timeout=budget(5.0))
+
+        assert run.cancelled is True
+        assert session_id not in runner_app_mod._AUTO_FORWARDER_TASKS
+    finally:
+        runner_app_mod._AUTO_FORWARDER_TASKS.pop(session_id, None)
+        await _drain_forwarder_runs([run])
+        runner_app_mod._session_event_queues_ref.pop(session_id, None)
+        subagent_work.unregister_child_session(session_id)
 
 
 @pytest.mark.parametrize(

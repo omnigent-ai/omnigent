@@ -551,6 +551,62 @@ async def test_uniform_stop_kill_failure_returns_503_without_idle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("registered", "retires"),
+    [([], True), ([("bash", "s1")], True), ([("bash", "s1"), ("cursor", "main")], False)],
+    ids=["pane-gone", "aux-shell-only", "pane-live"],
+)
+async def test_uniform_stop_kill_failure_retires_forwarder_only_without_a_pane(
+    monkeypatch: pytest.MonkeyPatch, registered: list[tuple[str, str]], retires: bool
+) -> None:
+    """A kill that finds no registered harness pane still stops the forwarder.
+
+    The pane already exited, so the forwarder has nothing left to mirror; left
+    running it keeps the session's chat claim fresh and can adopt the next
+    same-cwd session's chat. A failed kill against a live pane changes nothing.
+    """
+    import json
+
+    import omnigent.harnesses.cursor_native.bridge as cursor_bridge
+    from omnigent.runner.native import interrupt as interrupt_mod
+    from omnigent.terminals.registry import TerminalListEntry
+
+    def _boom(bridge_dir: Any, *, timeout_s: float) -> None:
+        raise RuntimeError("tmux target is not advertised")
+
+    monkeypatch.setattr(cursor_bridge, "bridge_dir_for_session_id", lambda conv: "d")
+    monkeypatch.setattr(cursor_bridge, "kill_session", _boom)
+    retired: list[str] = []
+
+    async def _record_cancel(conv_id: str) -> None:
+        retired.append(conv_id)
+
+    monkeypatch.setattr(interrupt_mod, "_cancel_auto_forwarder_task", _record_cancel)
+
+    runner, captured = _make_runner()
+    entries = [TerminalListEntry(name, key, SimpleNamespace()) for name, key in registered]
+    monkeypatch.setattr(
+        runner._resource_registry.terminal_registry, "list_for_conversation", lambda _: entries
+    )
+    resp = await runner.stop("cursor-native", "conv_c")
+
+    assert resp is not None and resp.status_code == 503
+    assert json.loads(bytes(resp.body))["error"] == "cursor_native_stop_failed"
+    assert [e for _, e in captured["published"] if e.get("status") == "idle"] == []
+    assert retired == (["conv_c"] if retires else [])
+
+
+def test_forwarder_retires_with_pane_follows_the_uniform_stop_registry() -> None:
+    """Pane-bound forwarders are exactly the uniform-stop harnesses."""
+    from omnigent.runner.native.interrupt import _UNIFORM_STOP, forwarder_retires_with_pane
+
+    for key in _UNIFORM_STOP:
+        assert forwarder_retires_with_pane(key), key
+    for other in ("claude", "codex", "pi", "opencode", "antigravity", "worker"):
+        assert not forwarder_retires_with_pane(other), other
+
+
+@pytest.mark.asyncio
 async def test_codex_and_pi_stop_route_to_interrupt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
