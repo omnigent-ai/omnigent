@@ -32,7 +32,11 @@ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
-import { TERMINAL_FALLBACK_HEADERS } from "@/lib/sessionsApi";
+import {
+  PROMPT_IN_TERMINAL_CODE,
+  TERMINAL_FALLBACK_HEADERS,
+  apiErrorFromResponse,
+} from "@/lib/sessionsApi";
 import { formatPreview } from "@/lib/previewFormat";
 
 interface ElicitationData {
@@ -48,9 +52,6 @@ interface ElicitationData {
   ask_user_question?: Record<string, unknown> | null;
   exit_plan_mode?: Record<string, unknown> | null;
 }
-
-// The server refuses an answer with 423 once its prompt waits in the agent's terminal.
-const PROMPT_IN_TERMINAL_STATUS = 423;
 
 type PageState =
   | { kind: "loading" }
@@ -186,8 +187,10 @@ export function ApprovePage() {
             }),
           },
         );
-        if (!res.ok && submission.current === submitted) {
-          if (res.status === PROMPT_IN_TERMINAL_STATUS) {
+        if (!res.ok) {
+          const { code } = await apiErrorFromResponse(res);
+          if (submission.current !== submitted) return;
+          if (code === PROMPT_IN_TERMINAL_CODE) {
             // The prompt moved to the terminal; its reloaded copy carries the hold.
             refusedResolveStatus.current = res.status;
             setState({ kind: "loading" });

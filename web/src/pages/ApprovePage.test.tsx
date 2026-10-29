@@ -26,6 +26,11 @@ function jsonResponse(body: unknown, { ok = true, status = 200 } = {}): Response
   } as unknown as Response;
 }
 
+/** The server's refusal of an answer to a prompt that waits in the agent's terminal. */
+function promptInTerminalRefusal(): Response {
+  return jsonResponse({ error: { code: "prompt_in_terminal" } }, { ok: false, status: 423 });
+}
+
 /** A button that moves the mounted page to the next approval link, `eli_2`. */
 function OpenNextApproval() {
   const navigate = useNavigate();
@@ -302,22 +307,35 @@ describe("ApprovePage submission", () => {
     expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "decline" });
   });
 
-  it.each([500, 409, 423])("shows a resolve error when the POST returns %i", async (status) => {
-    // WHY: a failed resolve POST routes to the `error` branch with the status.
-    // A 423 whose reload offers chat answers again still wasn't delivered.
-    vi.mocked(identity.authenticatedFetch)
-      .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status }));
-    renderPage();
-    fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
-    expect(await screen.findByText(`Resolve failed: ${status}`)).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
-  });
+  it.each([
+    [500, false],
+    [409, false],
+    [423, false],
+    [423, true],
+  ])(
+    "shows a resolve error when the POST returns %i (prompt in terminal: %s)",
+    async (status, promptInTerminal) => {
+      // WHY: a failed resolve POST routes to the `error` branch with the status.
+      // A refused prompt whose reload offers chat answers again still wasn't delivered.
+      const fetch = vi.mocked(identity.authenticatedFetch);
+      fetch
+        .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
+        .mockResolvedValueOnce(
+          promptInTerminal ? promptInTerminalRefusal() : jsonResponse(null, { ok: false, status }),
+        );
+      renderPage();
+      fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
+      expect(await screen.findByText(`Resolve failed: ${status}`)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Approve|Reject/ })).not.toBeInTheDocument();
+      // Only the terminal refusal reloads the prompt.
+      expect(fetch).toHaveBeenCalledTimes(promptInTerminal ? 3 : 2);
+    },
+  );
 
   it("reloads into the terminal card when the server refuses a prompt that moved there", async () => {
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 423 }))
+      .mockResolvedValueOnce(promptInTerminalRefusal())
       .mockResolvedValue(
         jsonResponse({
           status: "pending",
@@ -345,7 +363,7 @@ describe("ApprovePage submission", () => {
   it("doesn't carry a refused answer's error to the next approval link", async () => {
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
-      .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 423 }))
+      .mockResolvedValueOnce(promptInTerminalRefusal())
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
       .mockResolvedValue(jsonResponse({ status: "pending", message: "Deploy the release?" }));
     renderPage("sess_1", "eli_1", { withNextLink: true });
@@ -375,7 +393,7 @@ describe("ApprovePage submission", () => {
     fireEvent.click(screen.getByRole("button", { name: "Next link" }));
     expect(await screen.findByText("Deploy the release?")).toBeInTheDocument();
     await act(async () => {
-      finishSubmit(jsonResponse(null, { ok: false, status: 423 }));
+      finishSubmit(promptInTerminalRefusal());
     });
     expect(screen.getByText("Deploy the release?")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Approve/ })).toBeInTheDocument();
