@@ -44,6 +44,7 @@ from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
     _harness_unparked_elicitations,
     _PreResolvedHarnessElicitation,
+    _UnparkedHarnessElicitation,
 )
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.routes import sessions as sessions_route
@@ -2920,6 +2921,55 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         await collector.stop()
         await parent_collector.stop()
         pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.parametrize("held_again", [False, True])
+async def test_deleting_session_expires_only_prompts_still_held(
+    monkeypatch: pytest.MonkeyPatch,
+    held_again: bool,
+) -> None:
+    """A prompt cleared while an earlier one is released gets no second resolution."""
+
+    def held_prompt() -> _UnparkedHarnessElicitation:
+        return _UnparkedHarnessElicitation(
+            session_id="conv_deleted",
+            tool_name="AskUserQuestion",
+            tool_input=None,
+            event_payload={},
+            request_fingerprint=None,
+            resolved_elsewhere=asyncio.Event(),
+        )
+
+    expired: list[str] = []
+
+    def clear_second_prompt(
+        _store: Any, _session_id: str, elicitation_id: str, **_kwargs: Any
+    ) -> None:
+        if elicitation_id == "elicit_first":
+            _harness_unparked_elicitations.pop("elicit_second")
+            if held_again:
+                _harness_unparked_elicitations["elicit_second"] = held_prompt()
+
+    monkeypatch.setattr(
+        sessions_orchestration,
+        "_publish_elicitation_resolved",
+        lambda _session_id, elicitation_id, **_kwargs: expired.append(elicitation_id),
+    )
+    monkeypatch.setattr(
+        sessions_orchestration,
+        "_publish_elicitation_resolved_to_ancestors",
+        clear_second_prompt,
+    )
+    _harness_unparked_elicitations["elicit_first"] = held_prompt()
+    _harness_unparked_elicitations["elicit_second"] = held_prompt()
+    try:
+        await sessions_orchestration._release_unparked_elicitations(
+            ["conv_deleted"], cast(Any, None)
+        )
+        assert expired == (["elicit_first", "elicit_second"] if held_again else ["elicit_first"])
+        assert _harness_unparked_elicitations.items() == []
+    finally:
+        _harness_unparked_elicitations.clear()
 
 
 @pytest.mark.parametrize("vendor", ["kimi", "devin"])

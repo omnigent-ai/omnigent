@@ -961,7 +961,8 @@ async def _release_unparked_elicitations(
     for elicitation_id, unparked in _harness_unparked_elicitations.items():
         if unparked.session_id not in deleted:
             continue
-        _harness_unparked_elicitations.pop(elicitation_id, None)
+        if _harness_unparked_elicitations.pop(elicitation_id, None) is None:
+            continue  # Cleared or re-parked while an earlier prompt was being released.
         _publish_elicitation_resolved(unparked.session_id, elicitation_id, reason="unanswered")
         try:
             await asyncio.to_thread(

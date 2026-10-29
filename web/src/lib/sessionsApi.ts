@@ -1392,6 +1392,9 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 /** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
 export const HOST_OFFLINE_CODE = "host_offline";
 
+/** The server's ErrorCode.PROMPT_IN_TERMINAL: an answer to a prompt held in the terminal. */
+export const PROMPT_IN_TERMINAL_CODE = "prompt_in_terminal";
+
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
 

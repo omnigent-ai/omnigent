@@ -1893,22 +1893,42 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
   });
 
   it.each([
-    { viewer: "the session itself", requester: null, sideChatId: null, opensTerminal: true },
+    {
+      viewer: "the session itself",
+      requester: null,
+      sideChatId: null,
+      isTerminalFirst: true,
+      opensTerminal: true,
+    },
+    {
+      viewer: "the session itself without a terminal view",
+      requester: null,
+      sideChatId: null,
+      isTerminalFirst: false,
+      opensTerminal: false,
+    },
     {
       viewer: "an ancestor of the sub-agent",
       requester: { sessionId: "conv_child", ancestorSessionId: "conv_parent" },
       sideChatId: null,
+      isTerminalFirst: true,
       opensTerminal: false,
     },
-    { viewer: "a side chat", requester: null, sideChatId: "conv_child", opensTerminal: false },
+    {
+      viewer: "a side chat",
+      requester: null,
+      sideChatId: "conv_child",
+      isTerminalFirst: true,
+      opensTerminal: false,
+    },
   ])(
     "offers Open terminal when viewed from $viewer: $opensTerminal",
-    ({ requester, sideChatId, opensTerminal }) => {
+    ({ requester, sideChatId, isTerminalFirst, opensTerminal }) => {
       const setView = vi.fn();
       const terminalFirst: TerminalFirstContextValue = {
         isClaudeNative: true,
         isNativeWrapper: true,
-        isTerminalFirst: true,
+        isTerminalFirst,
         isShellView: false,
         view: "chat",
         terminalViewKey: null,

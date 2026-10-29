@@ -74,16 +74,16 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  PROMPT_IN_TERMINAL_CODE,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
-import {
-  PROMPT_IN_TERMINAL_STATUS,
-  type McpServerStartup,
-  type SessionInputConsumedEvent,
-  type SessionViewer,
-  type StreamEvent,
+import type {
+  McpServerStartup,
+  SessionInputConsumedEvent,
+  SessionViewer,
+  StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
@@ -3485,7 +3485,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ),
       }));
       // The stream missed the prompt moving to the terminal; fetch the held card.
-      if (err instanceof ApiError && err.status === PROMPT_IN_TERMINAL_STATUS) {
+      if (err instanceof ApiError && err.code === PROMPT_IN_TERMINAL_CODE) {
         void reconcilePendingElicitations(sessionId);
       }
     }
@@ -4540,10 +4540,10 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  * elsewhere" — the same end state the `response.elicitation_resolved` SSE
  * event produces. This is the recovery path for a backgrounded tab that
  * missed that event (e.g. the approval was answered in the native-terminal
- * popup while the web tab was hidden). A still-pending card whose terminal
- * hold changed takes the snapshot's copy. No-op when the session changed mid-
- * fetch, the fetch fails (transient — the next focus retries), or nothing
- * is stale.
+ * popup while the web tab was hidden). A card whose terminal hold changed,
+ * including one answered locally, takes the snapshot's copy. No-op when the
+ * session changed mid-fetch, the fetch fails (transient — the next focus
+ * retries), or nothing is stale.
  *
  * @param id - Conversation/session id to reconcile.
  */
@@ -4575,7 +4575,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
   setterFor(id)((s) => {
     let changed = false;
     const blocks = s.blocks.map((b) => {
-      if (b.type !== "elicitation" || b.status !== "pending") return b;
+      if (b.type !== "elicitation") return b;
       const current = snapshotPending.find(
         (candidate): candidate is ElicitationBlock =>
           candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
@@ -4589,7 +4589,7 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
         changed = true;
         return { ...current, ctx: b.ctx };
       }
-      if (!stillPending.has(b.elicitationId)) {
+      if (b.status === "pending" && !stillPending.has(b.elicitationId)) {
         changed = true;
         const updated: ElicitationBlock = {
           ...b,

@@ -22,7 +22,7 @@ import {
   type NativePermissionDelivery,
 } from "@/lib/nativePermissionDelivery";
 import { parseTerminalFallback } from "@/lib/sse";
-import { PROMPT_IN_TERMINAL_STATUS, type ElicitationTerminalFallback } from "@/lib/events";
+import type { ElicitationTerminalFallback } from "@/lib/events";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { CheckIcon, MessageCircleQuestionMark, XIcon } from "lucide-react";
@@ -45,6 +45,9 @@ interface ElicitationData {
   ask_user_question?: Record<string, unknown> | null;
   exit_plan_mode?: Record<string, unknown> | null;
 }
+
+// The server refuses an answer with 423 once its prompt waits in the agent's terminal.
+const PROMPT_IN_TERMINAL_STATUS = 423;
 
 type PageState =
   | { kind: "loading" }
