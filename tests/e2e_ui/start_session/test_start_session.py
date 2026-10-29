@@ -1561,7 +1561,9 @@ async def _drive_managed_repository_workspace_bar(
 
             await page.keyboard.press("Escape")
             await sandbox_worktree.click()
-            sandbox_note = page.get_by_test_id("new-chat-landing-sandbox-worktree-note")
+            sandbox_note = page.get_by_role(
+                "dialog", name="Worktrees unavailable in Databricks Sandbox"
+            ).get_by_test_id("new-chat-landing-sandbox-worktree-note")
             await expect(sandbox_note).to_be_visible()
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")

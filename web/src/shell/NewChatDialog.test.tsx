@@ -7942,9 +7942,11 @@ describe("NewChatLandingScreen", () => {
     expect(sandboxWorktreeChip.getAttribute("title")).toMatch(/worktrees aren't available/);
     // Touch and keyboard users get the explanation without a hover title.
     fireEvent.click(sandboxWorktreeChip);
-    expect(screen.getByTestId("new-chat-landing-sandbox-worktree-note").textContent).toMatch(
-      /worktrees aren't available\. To use a worktree, choose one of your machines/,
-    );
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Worktrees unavailable in New Sandbox" }),
+      ).getByTestId("new-chat-landing-sandbox-worktree-note").textContent,
+    ).toMatch(/worktrees aren't available\. To use a worktree, choose one of your machines/);
   });
 
   it("labels the sandbox option with the server's provider name", async () => {

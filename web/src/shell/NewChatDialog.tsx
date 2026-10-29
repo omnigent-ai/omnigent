@@ -1045,7 +1045,7 @@ export function composeSandboxWorkspaces(repos: LastSandboxRepo[]): string[] {
 const MAX_SANDBOX_REPOS = 10;
 
 const SANDBOX_WORKTREE_NOTE =
-  "A sandbox already works on its own fresh copy of the repository, so worktrees aren't available. To use a worktree, choose one of your machines from the host menu.";
+  "A sandbox already runs in its own isolated workspace, so worktrees aren't available. To use a worktree, choose one of your machines from the host menu.";
 
 /**
  * Derive a repository's display name from its URL.
@@ -6718,7 +6718,11 @@ export function NewChatLandingScreen() {
                     data-testid="new-chat-landing-sandbox-worktree-chip"
                   />
                 </PopoverTrigger>
-                <PopoverContent align="start" className="w-80 p-3">
+                <PopoverContent
+                  align="start"
+                  className="w-80 p-3"
+                  aria-label={`Worktrees unavailable in ${selectedSandboxLabel}`}
+                >
                   <p
                     className="text-sm text-muted-foreground"
                     data-testid="new-chat-landing-sandbox-worktree-note"
