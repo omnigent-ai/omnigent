@@ -14,6 +14,7 @@ from typing import get_args
 
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.harnesses.claude_native.bridge import (
+    RESUME_COPY_MARKER_SUFFIX,
     ClaudeTranscriptItem,
     read_transcript_items_from_offset,
 )
@@ -331,7 +332,9 @@ def _recent_local_sessions_with_recency(
         candidates = [
             (path, path.stem)
             for path in root.rglob("*.jsonl")
-            if "subagents" not in path.parts and path.is_file()
+            if "subagents" not in path.parts
+            and path.is_file()
+            and not path.with_suffix(RESUME_COPY_MARKER_SUFFIX).exists()
         ]
         return _recent_unique_sessions_with_recency(candidates, limit=limit)
 
@@ -553,6 +556,10 @@ def load_claude_session(
     transcript_path = _find_transcript(root, session_id)
     if transcript_path is None:
         raise SessionImportNotFoundError(f"Claude Code session {session_id!r} was not found")
+    if transcript_path.with_suffix(RESUME_COPY_MARKER_SUFFIX).exists():
+        raise SessionImportNotFoundError(
+            f"Claude Code session {session_id!r} is an Omnigent resume copy"
+        )
 
     parsed = read_transcript_items_from_offset(
         transcript_path,
