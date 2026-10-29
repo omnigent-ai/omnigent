@@ -96,6 +96,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   refused or failed (next press moves past it, or retries it when it is the only
   other mode), no other mode (native focus move, no
   `aria-keyshortcuts`).
+- `plan-mode`: the + menu's Plan row turns on plan mode. For Codex it can be
+  armed on the new-session composer before the first prompt (a "Plan mode"
+  badge), and the session starts in Codex's own Plan mode. States: armed,
+  cleared by an agent switch, unavailable for Smart Routing and unsaved custom
+  agents, and a connected host too old to start Codex in Plan mode (create refused).
 - `managed-mcp-picker`: choose administrator-configured services before launch
   on a host or sandbox. States: loading, empty, error/retry, selected, unavailable,
   remembered selection, explicitly none, restored connection needing sign-in.
@@ -265,6 +270,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **New-session composer** (landing page, or New session):
 
+- Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to
   keep the tooltip open. Click elsewhere or press Escape to dismiss it. Choose
@@ -519,6 +525,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/lib/permissionModeCycle.test.ts`.
   `web/src/shell/NewChatDialog.test.tsx` checks that Shift+Tab on the landing
   page leaves the launch mode unchanged and does not prevent focus traversal.
+- **`plan-mode`:** with a real Codex CLI and a mock model, creation in Plan mode
+  and subsequent composer toggles preserve the preset and agent instructions in
+  `tests/e2e_ui/chat/test_codex_plan_mode_instructions.py::test_codex_plan_mode_creation_and_toggles_preserve_instructions`.
+  Landing-page arming is in `web/src/shell/NewChatDialog.test.tsx`; the older-host
+  refusal is in `tests/server/integration/test_multipart_create_host_launch.py`.
 - **`model-picker`, `effort-picker`, `permission-mode`, Fork dialog:** the
   permission-mode picker has component coverage in
   `web/src/shell/ForkSessionDialog.test.tsx`; drive the model and effort

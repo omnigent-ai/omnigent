@@ -129,6 +129,8 @@ interface TerminalViewProps {
   resumeTarget?: "session" | "sandbox";
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
+  /** When provided, the parent increments this after successful recovery to redial a closed bridge. */
+  resumeGeneration?: number;
   /**
    * False while the surface is mounted but hidden (a pre-warmed attach
    * kept alive behind the chat view). The session stays connected either
@@ -167,6 +169,7 @@ export function TerminalView({
   onResume,
   resumeTarget = "session",
   resumePending = false,
+  resumeGeneration,
   active = true,
   focusOnConnect = active,
   directAttachUrl,
@@ -511,12 +514,14 @@ export function TerminalView({
     setResumeError(null);
     try {
       await onResume();
-      disposeActiveSession();
-      setConnectAttempt((attempt) => attempt + 1);
+      if (resumeGeneration === undefined) {
+        disposeActiveSession();
+        setConnectAttempt((attempt) => attempt + 1);
+      }
     } catch (error) {
       setResumeError(resumeErrorText(error, resumeTarget));
     }
-  }, [onResume, disposeActiveSession, resumeTarget]);
+  }, [onResume, disposeActiveSession, resumeTarget, resumeGeneration]);
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
@@ -637,6 +642,21 @@ export function TerminalView({
     sessionRef.current?.setClipboardEnabled(!readOnly && active);
   }, [readOnly, active]);
 
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const previousResumeGeneration = useRef(resumeGeneration);
+  useEffect(() => {
+    if (previousResumeGeneration.current === resumeGeneration) return;
+    previousResumeGeneration.current = resumeGeneration;
+    if (resumeGeneration === undefined) return;
+    setResumeError(null);
+    const current = stateRef.current;
+    if (current.kind === "connected") return;
+    reconnectAttemptsRef.current = 0;
+    disposeActiveSession();
+    setConnectAttempt((attempt) => attempt + 1);
+  }, [resumeGeneration, disposeActiveSession]);
+
   // On the hidden→visible edge of a pre-warmed surface: focus the
   // terminal (the session's WS-open focus is a no-op while the element is
   // hidden — visibility:hidden elements aren't focusable), and if the
@@ -645,8 +665,6 @@ export function TerminalView({
   // immediately with a fresh budget. Reveal is a user signal, exactly
   // like the visibilitychange redial for frozen tabs. Deliberate closes
   // (4xxx) keep the dead-end overlay as ever.
-  const stateRef = useRef(state);
-  stateRef.current = state;
   const wasActiveRef = useRef(active);
   useEffect(() => {
     if (active && !wasActiveRef.current) {
