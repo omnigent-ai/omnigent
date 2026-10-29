@@ -415,6 +415,11 @@ _PI_NATIVE_WRAPPER_LABEL_VALUE = PI_NATIVE_CODING_AGENT.wrapper_label
 _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S = 30.0
 
 
+# Bound on forwarding an interrupt or stop_session to the runner; it covers the
+# runner's own stop budgets, e.g. a tmux kill plus a 5s terminal close.
+_RUNNER_STOP_FORWARD_TIMEOUT_S = 15.0
+
+
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 
 
@@ -1231,6 +1236,7 @@ __all__ = [
     "_RUNNER_FORWARD_TIMEOUT",
     "_RUNNER_RELAY_READY_TIMEOUT_S",
     "_RUNNER_SESSION_INIT_TIMEOUT_S",
+    "_RUNNER_STOP_FORWARD_TIMEOUT_S",
     "_SERVER_STREAM_EVENT_ADAPTER",
     "_SESSION_STREAM_HEARTBEAT_INTERVAL_S",
     "_SESSION_UPDATES_HEARTBEAT_INTERVAL_S",

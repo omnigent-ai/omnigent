@@ -321,12 +321,15 @@ async def test_cancelled_worker_leaves_unsent_input_for_restart(startup_env: _En
 
 
 @pytest.mark.parametrize("control", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("runner_bound", [False, True])
 async def test_stop_before_host_ready_cancels_all_saved_inputs(
-    startup_env: _Env, control: str, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env, control: str, runner_bound: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = startup_env
     session_id = await _create(env)
     startup = env.app.state.startup_inputs
+    if runner_bound:
+        assert env.conv_store.set_runner_id(session_id, "connecting-runner")
     for _ in range(2):
         followup = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
         assert followup.status_code == 202, followup.text
@@ -348,31 +351,258 @@ async def test_stop_before_host_ready_cancels_all_saved_inputs(
     assert forwarded == []
 
 
-async def test_stop_cancels_local_dispatch_and_clears_saved_input(startup_env: _Env) -> None:
+@pytest.mark.parametrize(
+    "claim_timing", ["before_cancel", "during_cancel", "already_delivered", "claimed_followup"]
+)
+@pytest.mark.parametrize("runner_bound", [False, True])
+async def test_interrupt_does_not_confirm_cancellation_of_submitted_startup(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, claim_timing: str, runner_bound: bool
+) -> None:
+    env = startup_env
+    session_id = await _create(env)
+    if runner_bound:
+        assert env.conv_store.set_runner_id(session_id, "unreachable-runner")
+    [first] = env.conv_store.list_pending_inputs(session_id)
+    transition = env.conv_store.transition_pending_input
+
+    def claim_first() -> None:
+        assert transition(session_id, first.id, expected="in_progress", status="incomplete")
+
+    if claim_timing == "claimed_followup":
+        followup = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert followup.status_code == 202, followup.text
+        second = env.conv_store.list_pending_inputs(session_id)[1]
+        assert transition(session_id, second.id, expected="in_progress", status="incomplete")
+    elif claim_timing == "before_cancel":
+        claim_first()
+    elif claim_timing == "during_cancel":
+        followup = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert followup.status_code == 202, followup.text
+
+        def concurrent_claim(
+            conversation_id: str, item_id: str, *, expected: str, status: str | None
+        ) -> bool:
+            if item_id == first.id and status is None:
+                claim_first()
+            return transition(conversation_id, item_id, expected=expected, status=status)
+
+        monkeypatch.setattr(env.conv_store, "transition_pending_input", concurrent_claim)
+    else:
+        # A previously accepted first input must not be hidden by queued follow-ups.
+        claim_first()
+        assert transition(session_id, first.id, expected="incomplete", status=None)
+        followup = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert followup.status_code == 202, followup.text
+
+    response = await env.client.post(
+        f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_unavailable"
+    remaining = env.conv_store.list_pending_inputs(session_id)
+    expected_statuses = {
+        "claimed_followup": ["in_progress", "incomplete"],
+        "during_cancel": ["incomplete", "in_progress"],
+        "already_delivered": ["in_progress"],
+        "before_cancel": ["incomplete"],
+    }
+    assert [item.status for item in remaining] == expected_statuses[claim_timing]
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert len(snapshot["pending_inputs"]) == len(remaining)
+    assert not await env.app.state.startup_inputs.retry(session_id)
+
+
+@pytest.mark.parametrize("runner_status", [202, 503])
+@pytest.mark.parametrize("claim_owner", ["remote", "local", "remote_with_local_task"])
+async def test_startup_interrupt_settles_only_captured_inputs_after_runner_ack(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, runner_status: int, claim_owner: str
+) -> None:
+    env = startup_env
+    session_id = await _create(env)
+    assert env.conv_store.set_runner_id(session_id, "interrupt-runner")
+    startup = env.app.state.startup_inputs
+    [first] = env.conv_store.list_pending_inputs(session_id)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    delivery = None
+    if claim_owner != "remote":
+
+        async def dispatch(context: StartupInputContext, *_: Any) -> dict[str, str]:
+            if claim_owner == "local":
+                assert await context.claim(env.conv_store, session_id)
+            entered.set()
+            await release.wait()
+            return {"pending_id": first.id}
+
+        startup.dispatch = dispatch
+        delivery = asyncio.create_task(startup._deliver(env.app, session_id, first))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+    if claim_owner != "local":
+        context = StartupInputContext(env.app, Headers(), None, first.id)
+        assert await context.claim(env.conv_store, session_id)
+    first_pending_id = pending_inputs.record(
+        session_id, _INPUT["data"]["content"], stable_id=first.id
+    )
+    second = await startup.enqueue(
+        session_id,
+        SessionEventInput.model_validate(_INPUT),
+        user_id=None,
+        headers=Headers(),
+        first=False,
+    )
+    sent_after_stop = []
+
+    async def acknowledge(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["type"] == "interrupt"
+        sent_after_stop.append(
+            await startup.enqueue(
+                session_id,
+                SessionEventInput.model_validate(_INPUT),
+                user_id=None,
+                headers=Headers(),
+                first=False,
+            )
+        )
+        return httpx.Response(runner_status)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(acknowledge), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
+        )
+        response = await env.client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+        )
+
+    if delivery is not None:
+        release.set()
+        await asyncio.gather(delivery, return_exceptions=True)
+        assert delivery.cancelled()
+    confirmed = runner_status == 202 and claim_owner == "local"
+    assert response.status_code == (202 if confirmed else 503), response.text
+    [newer] = sent_after_stop
+    remaining = env.conv_store.list_pending_inputs(session_id)
+    assert [item.id for item in remaining] == (
+        [newer.id] if confirmed else [first.id, second.id, newer.id]
+    )
+    assert [item["pending_id"] for item in pending_inputs.snapshot_for(session_id)] == (
+        [] if confirmed else [first_pending_id]
+    )
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert len(snapshot["pending_inputs"]) == len(remaining)
+
+
+async def test_cancelled_local_startup_can_confirm_interrupt_after_runner_recovers(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = startup_env
+    session_id = await _create(env)
+    startup = env.app.state.startup_inputs
+    first = _bind(env, session_id)
+    entered = asyncio.Event()
+
+    async def dispatch(context: StartupInputContext, *_: Any) -> dict[str, str]:
+        assert await context.claim(env.conv_store, session_id)
+        entered.set()
+        await asyncio.Future()
+        return {"pending_id": first.id}
+
+    startup.dispatch = dispatch
+    delivery = asyncio.create_task(startup._deliver(env.app, session_id, first))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    responses = iter([503, 202])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(next(responses))),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
+        )
+        for expected_status in (503, 202):
+            response = await env.client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+            )
+            assert response.status_code == expected_status, response.text
+            assert delivery.cancelled()
+            assert [item.id for item in env.conv_store.list_pending_inputs(session_id)] == (
+                [first.id] if expected_status == 503 else []
+            )
+
+
+async def test_startup_interrupt_cleanup_failure_releases_output_fence(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    env = startup_env
+    session_id = await _create(env)
+    first = _bind(env, session_id)
+    context = StartupInputContext(env.app, Headers(), None, first.id)
+    assert await context.claim(env.conv_store, session_id)
+    monkeypatch.setattr(
+        env.app.state.startup_inputs,
+        "confirm_interrupt",
+        AsyncMock(side_effect=RuntimeError("interrupt store unavailable")),
+    )
+    runner = _stub_runner(monkeypatch, status=202)
+    try:
+        with pytest.raises(RuntimeError, match="interrupt store unavailable"):
+            await env.client.post(f"/v1/sessions/{session_id}/events", json={"type": "interrupt"})
+        assert session_id not in _interrupt_fenced_sessions
+    finally:
+        _interrupt_fenced_sessions.discard(session_id)
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+@pytest.mark.parametrize("runner_status", [202, 503])
+async def test_stop_cancels_local_dispatch_and_clears_saved_input(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, submitted: bool, runner_status: int
+) -> None:
     env = startup_env
     session_id = await _create(env)
     startup = env.app.state.startup_inputs
     entry = _bind(env, session_id)
     entered = asyncio.Event()
+    release = asyncio.Event()
     stopped = asyncio.Event()
+    sent = asyncio.Event()
 
-    async def dispatch(*_: Any) -> dict[str, bool | str]:
+    async def dispatch(context: StartupInputContext, *_: Any) -> dict[str, bool | str]:
+        if submitted:
+            assert await context.claim(env.conv_store, session_id)
         entered.set()
         try:
-            await asyncio.Future()
+            await release.wait()
+            sent.set()
         finally:
             stopped.set()
-        return {"queued": True}
+        return {"pending_id": entry.id}
 
     startup.dispatch = dispatch
     delivery = asyncio.create_task(startup._deliver(env.app, session_id, entry))
     await asyncio.wait_for(entered.wait(), timeout=5)
-    response = await env.client.post(
-        f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
-    )
-    assert response.status_code == 202, response.text
+    runner = _stub_runner(monkeypatch, status=runner_status)
+    try:
+        response = await env.client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+        )
+    finally:
+        release.set()
+        await asyncio.gather(delivery, return_exceptions=True)
+        await runner.aclose()
+
+    assert response.status_code == (runner_status if submitted else 202), response.text
     assert stopped.is_set() and delivery.cancelled()
-    assert env.conv_store.list_pending_inputs(session_id) == []
+    assert not sent.is_set(), (
+        "an acknowledged interrupt must not be followed by a delayed submission"
+    )
+    remaining = env.conv_store.list_pending_inputs(session_id)
+    assert [item.status for item in remaining] == (
+        ["incomplete"] if submitted and runner_status == 503 else []
+    )
 
 
 async def test_uncertain_native_submission_is_not_retried_on_restart(startup_env: _Env) -> None:
@@ -972,7 +1202,10 @@ async def test_refused_input_does_not_hold_back_the_next_one(
     async def recover_until_idle() -> None:
         for _ in range(10):
             await startup._recover_session(env.app, session_id, connection)
-            await asyncio.gather(*startup._deliveries.values(), return_exceptions=True)
+            await asyncio.gather(
+                *(delivery.task for delivery in startup._deliveries.values()),
+                return_exceptions=True,
+            )
 
     try:
         await recover_until_idle()

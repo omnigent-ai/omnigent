@@ -317,6 +317,7 @@ from omnigent.server.routes._sessions.helpers import (
     _persist_stored_session_bundle,
     _policy_notice_from_ensure_response,
     _poll_request_disconnect,
+    _post_runner_session_event,
     _priced_cost_for_display,
     _provision_managed_sandbox,
     _prune_pre_resolved_harness_elicitations,
@@ -6448,7 +6449,7 @@ async def _forward_native_terminal_message(
     :param agent_revision: Effective spec revision used to invalidate runner caches.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
-        the injection request.
+        the injection request, or the runner does not answer in time.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     event = _build_native_terminal_message_event(
@@ -6500,11 +6501,15 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    forward_timeout_s = _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
+    if isinstance(event.get("content"), list):
+        from omnigent.inner.native_attachments import attachment_fetch_budget_s
+
+        # The runner fetches deferred attachments before it accepts the message.
+        forward_timeout_s += attachment_fetch_budget_s(event["content"])
     try:
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json=event,
-            timeout=_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
+        resp = await _post_runner_session_event(
+            runner_client, session_id, event, timeout_s=forward_timeout_s
         )
         _logger.info(
             "%s terminal message runner response: session=%s status=%s body=%s",
@@ -6514,7 +6519,7 @@ async def _forward_native_terminal_message(
             resp.text[:500],
             extra={"session_id": session_id},
         )
-    except (httpx.HTTPError, ConnectionError) as exc:
+    except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
         # WSTunnelTransport raises bare ConnectionError on tunnel close;
         # map it to the same 502 as an httpx transport failure so a
         # runner tunnel drop mid-forward doesn't escape as an opaque 500.

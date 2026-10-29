@@ -222,6 +222,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _PI_NATIVE_WRAPPER_LABEL_VALUE,
     _RUNNER_CONVICTION_POLL_S,
     _RUNNER_FORWARD_TIMEOUT,
+    _RUNNER_STOP_FORWARD_TIMEOUT_S,
     _SERVER_STREAM_EVENT_ADAPTER,
     _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
     _SHARED_DISCOVERY_KEY,
@@ -7471,6 +7472,37 @@ async def _forward_session_change_to_runner_impl(
     return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
 
 
+async def _post_runner_session_event(
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    event: Mapping[str, Any],
+    *,
+    timeout_s: float,
+) -> httpx.Response:
+    """
+    POST one event to a session's runner and give up after *timeout_s*.
+
+    The tunnel transport does not enforce httpx timeouts, so the bound is
+    applied around the call; without it a stalled runner holds the caller
+    until a front-end proxy times the request out.
+
+    :param runner_client: HTTP client pointed at the session's runner.
+    :param session_id: Session the runner should receive *event* for, e.g.
+        ``"conv_abc123"``.
+    :param event: Runner events payload, e.g. ``{"type": "interrupt"}``.
+    :param timeout_s: Seconds to wait for the runner's response.
+    :returns: The runner's response.
+    :raises TimeoutError: When the runner does not answer within *timeout_s*.
+    """
+    try:
+        return await asyncio.wait_for(
+            runner_client.post(f"/v1/sessions/{session_id}/events", json=event, timeout=timeout_s),
+            timeout=timeout_s,
+        )
+    except TimeoutError as exc:
+        raise TimeoutError(f"runner did not answer within {timeout_s:g}s") from exc
+
+
 async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
@@ -7525,12 +7557,13 @@ async def _stop_session_via_runner_impl(
     if runner_client is None:
         return False
     try:
-        resp = await runner_client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": _STOP_SESSION_TYPE},
-            timeout=5.0,
+        resp = await _post_runner_session_event(
+            runner_client,
+            session_id,
+            {"type": _STOP_SESSION_TYPE},
+            timeout_s=_RUNNER_STOP_FORWARD_TIMEOUT_S,
         )
-    except (httpx.HTTPError, ConnectionError) as exc:
+    except (httpx.HTTPError, ConnectionError, TimeoutError) as exc:
         # WSTunnelTransport raises bare ConnectionError on tunnel close.
         raise OmnigentError(
             f"Could not reach the runner to stop session {session_id!r}: {exc}",
@@ -12414,6 +12447,7 @@ __all__ = [
     "_pin_claude_permission_launch_args",
     "_policy_notice_from_ensure_response",
     "_poll_request_disconnect",
+    "_post_runner_session_event",
     "_presentation_labels_for_agent",
     "_presentation_labels_for_agent_impl",
     "_priced_cost_for_display",

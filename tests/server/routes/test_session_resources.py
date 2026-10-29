@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
+from omnigent.inner import native_attachments
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
@@ -40,6 +41,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
 )
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -325,6 +327,7 @@ class _FakeRunnerClient:
         exc_paths: dict[str, Exception] | None = None,
         responses: dict[str, tuple[int, dict[str, Any]]] | None = None,
         text_responses: dict[str, tuple[int, str, dict[str, str]]] | None = None,
+        stall_paths: set[str] | None = None,
     ) -> None:
         """
         Initialize a fake runner HTTP client.
@@ -339,6 +342,8 @@ class _FakeRunnerClient:
             next (message forward) on the same client.
         :param responses: Per-URL JSON response overrides.
         :param text_responses: Per-URL text response overrides.
+        :param stall_paths: POST paths that never answer, ignoring the
+            request timeout as the runner tunnel transport does.
         :returns: None.
         """
         self._payload = payload
@@ -347,8 +352,10 @@ class _FakeRunnerClient:
         self._exc_paths = exc_paths or {}
         self._responses = responses or {}
         self._text_responses = text_responses or {}
+        self._stall_paths = stall_paths or set()
         self.calls: list[tuple[str, str]] = []
         self.post_json_calls: list[tuple[str, Any]] = []
+        self.post_timeouts: list[tuple[str, float | None]] = []
         # Query params passed to each GET, in call order. ``None`` when
         # the caller sent no params — lets tests assert that a proxy
         # forwarded (or deliberately dropped) the incoming query string.
@@ -425,11 +432,14 @@ class _FakeRunnerClient:
 
         :param url: Request URL path.
         :param json: JSON body passed to the fake client.
-        :param timeout: Request timeout (ignored).
+        :param timeout: Request timeout, recorded in ``post_timeouts``.
         :returns: The canned response.
         """
-        del timeout
         self.post_json_calls.append((url, json))
+        self.post_timeouts.append((url, timeout))
+        if url in self._stall_paths:
+            self.calls.append(("POST", url))
+            await asyncio.Event().wait()
         return self._make_response("POST", url)
 
     async def put(
@@ -960,6 +970,42 @@ async def test_claude_native_message_tunnel_close_mid_forward_returns_502(
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_claude_native_message_stalled_runner_returns_502(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A runner that never answers the message forward yields a 502.
+
+    The runner tunnel transport does not enforce httpx timeouts, so the
+    fake ignores ``timeout`` too; the route must bound the wait itself.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    events_path = "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"
+    fake_runner = _FakeRunnerClient(payload={}, stall_paths={events_path})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    monkeypatch.setattr(orchestration, "_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S", 0.05)
+
+    async with asyncio.timeout(budget(10)):
+        resp = await client.post(
+            events_path,
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hello claude"}],
+                },
+            },
+        )
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["detail"] == "Claude terminal message delivery failed"
+    assert fake_runner.post_timeouts[-1] == (events_path, 0.05)
 
 
 @pytest.mark.asyncio
@@ -2678,6 +2724,12 @@ async def test_native_forward_leaves_a_workspace_file_for_the_runner(
     )
     assert forwarded["content"] == [zip_block]
     assert "File reference resolution failed" not in caplog.text
+    forward_timeout = next(
+        timeout for path, timeout in fake_runner.post_timeouts if path.endswith("/events")
+    )
+    assert forward_timeout == (
+        _CLAUDE_NATIVE_MESSAGE_TIMEOUT_S + native_attachments._ATTACHMENT_RESOLVE_TIMEOUT_S
+    )
 
 
 @pytest.mark.asyncio

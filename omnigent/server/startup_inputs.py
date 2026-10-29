@@ -8,7 +8,7 @@ import logging
 import re
 import weakref
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
@@ -104,6 +104,22 @@ class StartupInputContext:
         return self.submitted
 
 
+@dataclass(frozen=True)
+class StartupInterrupt:
+    """Saved inputs owned by one interrupt request."""
+
+    items: tuple[ConversationItem, ...]
+    cancelled_claim_input_id: str | None = None
+    cancelled_before_delivery: bool = False
+
+
+@dataclass
+class _StartupDelivery:
+    input_id: str
+    task: asyncio.Task[Any]
+    context: StartupInputContext | None = None
+
+
 StartupDispatch = Callable[
     [StartupInputContext, str, SessionEventInput], Coroutine[Any, Any, dict[str, bool | str]]
 ]
@@ -132,7 +148,8 @@ class ManagedStartupInputs:
         self._workers: dict[
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
-        self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
+        self._deliveries: dict[tuple[int, str], _StartupDelivery] = {}
+        self._cancelled_claims: dict[tuple[int, str], str] = {}
 
     async def enqueue(
         self,
@@ -344,7 +361,7 @@ class ManagedStartupInputs:
                 task = asyncio.create_task(
                     self._deliver(app, session_id, head), name=f"startup-input-{session_id}"
                 )
-                self._deliveries[key] = task
+                self._deliveries[key] = _StartupDelivery(head.id, task)
             return head.status == "in_progress"
         if state == "pending" and conv.runner_id is None:
             # The launch bound this host on a replica without its tunnel, so it
@@ -382,9 +399,11 @@ class ManagedStartupInputs:
         key = (current_workspace_id(), session_id)
         task = asyncio.current_task()
         assert task is not None
-        if key in self._deliveries and self._deliveries[key] is not task:
+        existing = self._deliveries.get(key)
+        if existing is not None and existing.task is not task:
             return
-        self._deliveries[key] = task
+        delivery = _StartupDelivery(item.id, task)
+        self._deliveries[key] = delivery
         context: StartupInputContext | None = None
         try:
             conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
@@ -414,6 +433,7 @@ class ManagedStartupInputs:
                 item.created_by,
                 item.id,
             )
+            delivery.context = context
             event = SessionEventInput(
                 type=item.type,
                 data={**item.data.model_dump(exclude={"startup_options"}), "stable_id": item.id},
@@ -471,7 +491,9 @@ class ManagedStartupInputs:
                 + str(exc)[:1000],
             )
         finally:
-            self._deliveries.pop(key, None)
+            existing = self._deliveries.get(key)
+            if existing is not None and existing.task is task:
+                self._deliveries.pop(key, None)
 
     async def retry(self, session_id: str) -> bool:
         changed = False
@@ -486,6 +508,103 @@ class ManagedStartupInputs:
                 )
         return changed
 
+    async def prepare_interrupt(self, session_id: str) -> StartupInterrupt:
+        """Cancel a provably unsent first turn; retain submitted inputs until acknowledgment."""
+        items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        await self._cancel_delivery(
+            session_id, pending_item_ids=frozenset(item.id for item in items)
+        )
+        key = (current_workspace_id(), session_id)
+        cancelled_claim_input_id = self._cancelled_claims.get(key)
+        if cancelled_claim_input_id not in {item.id for item in items}:
+            self._cancelled_claims.pop(key, None)
+            cancelled_claim_input_id = None
+        interrupt = StartupInterrupt(tuple(items), cancelled_claim_input_id)
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if (
+            conv is None
+            or conv.labels.get(STARTUP_LABEL) != "pending"
+            or not any(
+                item.id == initial_input_id(session_id) and item.status == "in_progress"
+                for item in items
+            )
+            or any(item.status == "incomplete" for item in items)
+        ):
+            return interrupt
+        for item in items:
+            removed = await asyncio.to_thread(
+                self.conversations.transition_pending_input,
+                session_id,
+                item.id,
+                expected=item.status,
+                status=None,
+            )
+            # Leave the remaining queue untouched once another replica may own delivery.
+            if not removed:
+                return interrupt
+        await self._finish(session_id)
+        return replace(interrupt, cancelled_before_delivery=True)
+
+    async def confirm_interrupt(self, session_id: str, interrupt: StartupInterrupt) -> bool:
+        """Settle captured inputs only when none can still be submitted after the stop."""
+        if not interrupt.items:
+            return True
+        if any(
+            item.status == "incomplete" and item.id != interrupt.cancelled_claim_input_id
+            for item in interrupt.items
+        ):
+            return False
+        for item in interrupt.items:
+            if item.id == interrupt.cancelled_claim_input_id:
+                continue
+            removed = await asyncio.to_thread(
+                self.conversations.transition_pending_input,
+                session_id,
+                item.id,
+                expected=item.status,
+                status=None,
+            )
+            if not removed:
+                return False
+        if interrupt.cancelled_claim_input_id is not None:
+            current = await asyncio.to_thread(
+                self.conversations.get_item, session_id, interrupt.cancelled_claim_input_id
+            )
+            if current is not None and current.response_id == PENDING_INPUT_RESPONSE_ID:
+                removed = await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    current.id,
+                    expected=current.status,
+                    status=None,
+                )
+                if not removed:
+                    return False
+            key = (current_workspace_id(), session_id)
+            if self._cancelled_claims.get(key) == interrupt.cancelled_claim_input_id:
+                self._cancelled_claims.pop(key, None)
+        pending_inputs.mark_interrupted(
+            session_id,
+            [pending_inputs.make_pending_id(session_id, item.id) for item in interrupt.items],
+        )
+        await self._finish(session_id)
+        return True
+
+    async def _cancel_delivery(
+        self, session_id: str, *, pending_item_ids: frozenset[str] | None = None
+    ) -> None:
+        key = (current_workspace_id(), session_id)
+        delivery = self._deliveries.get(key)
+        if delivery is None:
+            return
+        if pending_item_ids is not None and delivery.input_id not in pending_item_ids:
+            return
+        claimed = delivery.context is not None and delivery.context.submitted
+        delivery.task.cancel()
+        await asyncio.gather(delivery.task, return_exceptions=True)
+        if claimed and delivery.task.cancelled():
+            self._cancelled_claims[key] = delivery.input_id
+
     async def cancel(self, session_id: str) -> None:
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
@@ -494,11 +613,7 @@ class ManagedStartupInputs:
         await asyncio.to_thread(
             self.conversations.set_labels, session_id, {STARTUP_LABEL: "cancelled"}
         )
-        key = (current_workspace_id(), session_id)
-        task = self._deliveries.get(key)
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        await self._cancel_delivery(session_id)
         for item in items:
             if item.status == "incomplete":
                 pending_inputs.mark_interrupted(
@@ -540,8 +655,11 @@ class ManagedStartupInputs:
         _publish_status(session_id, "failed", failure_origin="startup_input_failed")
 
     async def shutdown(self) -> None:
-        tasks = [task for _, task, _ in self._workers.values()] + list(self._deliveries.values())
+        tasks = [task for _, task, _ in self._workers.values()] + [
+            delivery.task for delivery in self._deliveries.values()
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._workers.clear()
+        self._cancelled_claims.clear()

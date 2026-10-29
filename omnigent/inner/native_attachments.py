@@ -524,6 +524,20 @@ def has_unresolved_file_id(block: Mapping[str, object]) -> bool:
     return not (isinstance(data_uri, str) and data_uri.startswith("data:"))
 
 
+def attachment_fetch_budget_s(content: Iterable[object]) -> float:
+    """
+    Return the longest time :func:`resolve_file_id_block` may spend on *content*.
+
+    :param content: Message content blocks, e.g. one ``input_file`` block
+        that still carries its ``file_id``.
+    :returns: Seconds, e.g. ``60.0`` for one unresolved block and ``0.0`` for none.
+    """
+    unresolved = sum(
+        1 for block in content if isinstance(block, Mapping) and has_unresolved_file_id(block)
+    )
+    return unresolved * _ATTACHMENT_RESOLVE_TIMEOUT_S
+
+
 def resize_notice(source_metadata: object) -> str | None:
     """
     Model-facing note that an uploaded image was downscaled, or ``None``.

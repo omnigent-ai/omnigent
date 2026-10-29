@@ -18,6 +18,7 @@ from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     DataUri,
     attachment_cache_dir,
+    attachment_fetch_budget_s,
     attachment_reference_line,
     codex_resize_metadata_path,
     filesystem_attachment_capability,
@@ -463,6 +464,20 @@ def test_requires_filesystem_allowed(filename: str) -> None:
 def test_requires_filesystem_false_for_other_types(filename: str | None) -> None:
     """Other file types keep their existing admission and delivery rules."""
     assert not requires_filesystem(filename)
+
+
+def test_attachment_fetch_budget_counts_only_unresolved_file_ids() -> None:
+    """Each block the runner must still fetch adds one per-fetch budget."""
+    content = [
+        {"type": "input_text", "text": "see attached"},
+        {"type": "input_file", "file_id": "file_zip", "filename": "bundle.zip"},
+        {"type": "input_image", "file_id": "file_png"},
+        {"type": "input_image", "file_id": "file_inline", "image_url": _PNG_DATA_URI},
+        "not a block",
+    ]
+
+    assert attachment_fetch_budget_s(content) == 120.0
+    assert attachment_fetch_budget_s([]) == 0.0
 
 
 async def test_relaunch_re_resolution_keeps_a_zip_on_the_filesystem_path() -> None:

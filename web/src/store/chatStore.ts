@@ -3242,10 +3242,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // do NOT abort the local SSE stream — it remains open across
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
-    void interruptSession(sessionId).catch(() => {
-      // Interrupt is best-effort. A network failure here means the
-      // user's cancel won't reach the server, but the local UI already
-      // reflects the user's stop request below.
+    void interruptSession(sessionId).catch((err: unknown) => {
+      toast.error("Interrupt wasn't confirmed", {
+        description: err instanceof Error ? err.message : String(err),
+        richColors: true,
+      });
     });
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};

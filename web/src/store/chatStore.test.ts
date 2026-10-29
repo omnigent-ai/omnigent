@@ -6952,6 +6952,28 @@ describe("chatStore — stop", () => {
     expect(controller.signal.aborted).toBe(false);
   });
 
+  it("reports an interrupt that the server could not confirm without closing the stream", async () => {
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_abc", abortController: controller });
+    const toastError = vi.spyOn(toast, "error").mockReturnValue("interrupt-failed");
+    onTestFinished(() => toastError.mockRestore());
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "runner_unavailable", message: "Couldn't confirm the interrupt." } },
+        { status: 503, ok: false },
+      ),
+    );
+
+    useChatStore.getState().stop();
+    await tick();
+
+    expect(toastError).toHaveBeenCalledExactlyOnceWith("Interrupt wasn't confirmed", {
+      description: "Couldn't confirm the interrupt.",
+      richColors: true,
+    });
+    expect(controller.signal.aborted).toBe(false);
+  });
+
   it("clears local working state immediately while the interrupt ack is pending", () => {
     useChatStore.setState({
       conversationId: "conv_abc",
