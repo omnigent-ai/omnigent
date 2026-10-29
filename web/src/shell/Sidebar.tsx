@@ -1423,23 +1423,20 @@ function SidebarImpl({
 // (AppShell stabilizes the callbacks with useCallback).
 export const Sidebar = memo(SidebarImpl);
 
-/**
- * Auto-loading pagination control. An IntersectionObserver fetches the next
- * page when this nears view (rooted on the scroll container, pre-fetching 200px
- * early for smoothness); the button stays clickable as an a11y /
- * no-IntersectionObserver fallback. Renders nothing once there's no more to
- * load. Shared by the global list and each project folder.
- */
 const projectDragId = (name: string) => `project-order:${name}`;
 type ProjectHeaderDrag = ReturnType<typeof useSortable>;
+
+// Sessions an expanded project folder lists before, and adds per, "Show more".
+const PROJECT_FOLDER_PAGE_SIZE = 5;
 
 /**
  * One project folder. Fetches its own sessions server-side (`?project=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
- * scrolled, paginated with its own infinite-scroll sentinel. Lazy: the fetch is
- * gated on `expanded`, so a collapsed folder costs nothing. The collapsed
- * `marker` is supplied by the parent (best-effort, from the globally-loaded
- * window) since a collapsed folder hasn't fetched yet.
+ * scrolled. It lists PROJECT_FOLDER_PAGE_SIZE rows at a time; "Show more"
+ * reveals the next page, fetching another server page once the loaded rows run
+ * out. Lazy: the fetch is gated on `expanded`, so a collapsed folder costs
+ * nothing. The collapsed `marker` is supplied by the parent (best-effort, from
+ * the globally-loaded window) since a collapsed folder hasn't fetched yet.
  */
 function ProjectFolder({
   name,
@@ -1448,13 +1445,13 @@ function ProjectFolder({
   windowConversations,
   archived,
   activeConversationId,
+  revealIds,
   expanded,
   active,
   onToggleCollapsed,
   pinnedConversationIds,
   activeOverride,
   frozenSortKeys,
-  scrollRoot,
   onRowClick,
   onTogglePinned,
   selectionMode,
@@ -1485,6 +1482,9 @@ function ProjectFolder({
   /** The active conversation's resolved top-level root id (see
       ConversationSection) — forwarded to the folder's section for row highlight. */
   activeConversationId: string | null;
+  /** Sessions just filed into this folder from the sidebar. Filing keeps a
+      session's place in the order, so the folder lists down to them too. */
+  revealIds?: readonly string[];
   expanded: boolean;
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
@@ -1494,19 +1494,22 @@ function ProjectFolder({
   /** Pointer-inside sort-key freeze shared with the flat list (see
       ConversationList); null while the pointer is outside the list. */
   frozenSortKeys: Map<string, number> | null;
-  scrollRoot: RefObject<HTMLElement | null>;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
-  onProjectAssigned?: (projectName: string) => void;
-  /** Report this folder's own loaded (rendered) sessions to the parent. The
-      folder paginates independently of the global window, so bulk-selection in
-      the projects scope must resolve selected rows against these — not the
-      global list — or an out-of-window member would silently drop from the
-      action. */
-  onConversationsLoaded?: (name: string, conversations: Conversation[]) => void;
+  onProjectAssigned?: (projectName: string, sessionIds: string[]) => void;
+  /** Report this folder's own loaded sessions to the parent, and how many of
+      them it lists above "Show more". The folder paginates independently of the
+      global window, so bulk-selection in the projects scope must resolve
+      selected rows against these — not the global list — or an out-of-window
+      member would silently drop from the action. */
+  onConversationsLoaded?: (
+    name: string,
+    conversations: Conversation[],
+    visibleCount: number,
+  ) => void;
 }) {
   const { registerFolder, sortBy } = useSidebarData();
   const viewerId = useViewerId();
@@ -1552,18 +1555,39 @@ function ProjectFolder({
     name,
     viewerId,
   ]);
+  // Each expansion starts at one page; the open session and just-filed ones
+  // are never left hidden.
+  const revealed = new Set([activeConversationId, ...(revealIds ?? [])]);
+  const display = useSidebarDisplayPagination(
+    conversations,
+    JSON.stringify([expanded, archived, sortBy]),
+    PROJECT_FOLDER_PAGE_SIZE,
+    query.hasNextPage,
+    query.fetchNextPage,
+    expanded ? conversations.findLastIndex((c) => revealed.has(c.id)) : -1,
+  );
+  const visibleCount = display.rows.length;
   const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
   const marker = projectMarkerState(conversations, errors, startingConversationId);
+  // "Show more" carries the badge of the rows it hides, as a collapsed header does.
+  const hiddenMarker =
+    expanded && visibleCount < conversations.length
+      ? projectMarkerState(
+          conversations.slice(visibleCount),
+          errors.slice(visibleCount),
+          startingConversationId,
+        )
+      : null;
 
-  // Publish the folder's rendered rows upward so projects-scope bulk selection
+  // Publish the folder's loaded rows upward so projects-scope bulk selection
   // resolves them (the parent sources its action set from these, not the global
-  // paginated window).
+  // paginated window), and the visible count for keyboard and range selection.
   useEffect(() => {
-    onConversationsLoaded?.(name, conversations);
-  }, [name, conversations, onConversationsLoaded]);
+    onConversationsLoaded?.(name, conversations, visibleCount);
+  }, [name, conversations, visibleCount, onConversationsLoaded]);
 
   // While the first page loads, show a "Loading…" footer instead of the "No
   // chats" empty state (which would otherwise flash before rows arrive).
@@ -1631,7 +1655,7 @@ function ProjectFolder({
         }
         active={active}
         marker={marker}
-        conversations={conversations}
+        conversations={display.rows}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
         // Projects default collapsed: shown only when explicitly expanded.
@@ -1693,19 +1717,68 @@ function ProjectFolder({
                 Loading…
               </p>
             </div>
-          ) : (
-            <InfiniteScrollSentinel
-              hasMore={query.hasNextPage}
-              isFetching={query.isFetchingNextPage}
-              fetchMore={query.fetchNextPage}
-              scrollRoot={scrollRoot}
-              scopeKey={name}
-              indent
+          ) : display.hasMore ? (
+            <ProjectShowMoreRow
+              loading={query.isFetchingNextPage}
+              marker={hiddenMarker}
+              onShowMore={display.loadMore}
             />
-          )
+          ) : null
         }
       />
       {menuDialogs}
+    </div>
+  );
+}
+
+/**
+ * A project folder's "Show more" row, aligned with the folder's session rows.
+ * `marker` is the badge of the sessions it hides.
+ */
+function ProjectShowMoreRow({
+  loading,
+  marker,
+  onShowMore,
+}: {
+  loading: boolean;
+  marker: SessionState | null;
+  onShowMore: () => unknown;
+}) {
+  return (
+    <div className="pl-6">
+      {/* aria-disabled, not disabled, so keyboard focus survives a page load. */}
+      <button
+        type="button"
+        data-testid="project-show-more"
+        aria-disabled={loading || undefined}
+        onClick={() => {
+          if (!loading) void onShowMore();
+        }}
+        className={cn(
+          SIDEBAR_ROW,
+          "relative flex w-full items-center text-left text-muted-foreground transition-colors",
+          SIDEBAR_HOVER_HIGHLIGHT,
+        )}
+      >
+        {loading ? (
+          <>
+            <Loader2Icon aria-hidden className="size-3 animate-spin" />
+            Loading…
+          </>
+        ) : (
+          "Show more"
+        )}
+        {marker && !loading && (
+          <span
+            className={cn(
+              "-translate-y-1/2 pointer-events-none absolute top-1/2 right-1 flex h-5 items-center",
+              isDotMarker(marker) && SESSION_STATE_DOT_SLOT_CLASS,
+            )}
+          >
+            <SessionStateBadge state={marker} />
+          </span>
+        )}
+      </button>
     </div>
   );
 }
@@ -2193,7 +2266,11 @@ function ConversationList({
   // user has expanded — persisted across reloads. A project shows its rows only
   // while its name is in this set.
   const [expandedProjects, setExpandedProjects] = useState<string[]>(readExpandedProjectSections);
+  // Sessions just filed into a project from the sidebar. Filing keeps their
+  // place in the order, so that folder lists down to them until it's toggled.
+  const [justFiled, setJustFiled] = useState<{ project: string; ids: string[] } | null>(null);
   const toggleProjectExpanded = useCallback((projectName: string) => {
+    setJustFiled((prev) => (prev?.project === projectName ? null : prev));
     setExpandedProjects((prev) => {
       const next = prev.includes(projectName)
         ? prev.filter((n) => n !== projectName)
@@ -2213,6 +2290,13 @@ function ConversationList({
       return next;
     });
   }, []);
+  const handleSessionsFiled = useCallback(
+    (projectName: string, sessionIds: string[]) => {
+      setJustFiled({ project: projectName, ids: sessionIds });
+      expandProject(projectName);
+    },
+    [expandProject],
+  );
 
   // ── Drag-and-drop: file sessions into / out of projects ────────────────────
   // A session row can be dragged onto a project folder (file it there), onto the
@@ -2297,7 +2381,7 @@ function ConversationList({
         // Undo pill: re-pinning would leave the session filed in the new folder.
         if (action.unpin) pinAt({ id: dragged.id, pinned: false }).catch(() => {});
         // Open the (possibly brand-new) folder so the session is visible in it.
-        expandProject(action.project);
+        handleSessionsFiled(action.project, [dragged.id]);
         return;
       }
       if (action.kind === "reorder-pin") {
@@ -2341,7 +2425,7 @@ function ConversationList({
       activeDrag,
       grids,
       moveToProject,
-      expandProject,
+      handleSessionsFiled,
       onTogglePinned,
       projects,
       saveOrder,
@@ -2358,40 +2442,51 @@ function ConversationList({
     });
   }, []);
   const collapseAllProjects = useCallback(() => {
+    setJustFiled(null);
     setExpandedProjects(() => {
       writeExpandedProjectSections([]);
       return [];
     });
   }, []);
 
-  // Sessions each expanded ProjectFolder has actually rendered, keyed by
-  // project name. A folder paginates independently of the global window, so its
-  // rows can include members the global list hasn't loaded; projects-scope
-  // selection must resolve against these to avoid silently dropping an
-  // out-of-window row from a bulk action. Folders report via
-  // `onConversationsLoaded`; collapsed folders report `[]`.
-  const [folderConversations, setFolderConversations] = useState<Map<string, Conversation[]>>(
-    () => new Map(),
-  );
+  // Sessions each ProjectFolder has loaded, keyed by project name, with how many
+  // it lists above "Show more" (a prefix of `conversations`). A folder paginates
+  // independently of the global window, so its rows can include members the
+  // global list hasn't loaded; projects-scope selection must resolve against
+  // these to avoid silently dropping an out-of-window row from a bulk action.
+  // Folders report via `onConversationsLoaded`.
+  const [folderConversations, setFolderConversations] = useState<
+    Map<string, { conversations: Conversation[]; visibleCount: number }>
+  >(() => new Map());
   const handleFolderConversationsLoaded = useCallback(
-    (name: string, conversations: Conversation[]) => {
+    (name: string, conversations: Conversation[], visibleCount: number) => {
       setFolderConversations((prev) => {
         const existing = prev.get(name);
         // Skip the update when the id set is unchanged, so a background refetch
         // that returns the same rows doesn't churn state (and re-render).
         if (
           existing &&
-          existing.length === conversations.length &&
-          existing.every((c, i) => c.id === conversations[i]?.id)
+          existing.visibleCount === visibleCount &&
+          existing.conversations.length === conversations.length &&
+          existing.conversations.every((c, i) => c.id === conversations[i]?.id)
         ) {
           return prev;
         }
         const next = new Map(prev);
-        next.set(name, conversations);
+        next.set(name, { conversations, visibleCount });
         return next;
       });
     },
     [],
+  );
+  // An expanded folder's rows above "Show more", in render order; the
+  // window-derived membership stands in until the folder first reports.
+  const folderVisibleRows = useCallback(
+    (group: { name: string; conversations: Conversation[] }) => {
+      const folder = folderConversations.get(group.name);
+      return folder ? folder.conversations.slice(0, folder.visibleCount) : group.conversations;
+    },
+    [folderConversations],
   );
 
   // The projects-scope selection pool: the folders' own rendered rows (the
@@ -2404,8 +2499,8 @@ function ConversationList({
     for (const group of sections.projectGroups) {
       for (const c of group.conversations) byId.set(c.id, c);
     }
-    for (const rows of folderConversations.values()) {
-      for (const c of rows) byId.set(c.id, c);
+    for (const { conversations } of folderConversations.values()) {
+      for (const c of conversations) byId.set(c.id, c);
     }
     return [...byId.values()];
   }, [sections.projectGroups, folderConversations]);
@@ -2456,42 +2551,42 @@ function ConversationList({
     expandProject(activeProjectName);
   }, [activeId, activeProjectName, pinnedSet, expandProject]);
 
-  // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
+  // Visible rows in render order (collapsed sections excluded) for the ⌘[ / ⌘]
   // session hotkey. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       effectiveCollapsedSections.includes(title) ? [] : list;
     // A project's chats are navigable only when the "Projects" group is
     // expanded AND that individual project folder is expanded (folders are
-    // collapsed unless explicitly opened — inverse of the fixed sections).
+    // collapsed unless explicitly opened — inverse of the fixed sections), and
+    // only down to its "Show more".
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
-    const projectVisible = (name: string, list: readonly Conversation[]) =>
-      !projectsCollapsed && expandedProjects.includes(name) ? list : [];
+    const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
+      !projectsCollapsed && expandedProjects.includes(group.name) ? folderVisibleRows(group) : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
     // Projects / Sessions walk covers both tabs (Projects is empty on shared).
     return [
       ...visible("Pinned", sections.pinned),
-      ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+      ...sections.projectGroups.flatMap(projectVisible),
       ...visible("Shared", sections.shared),
       ...(sessionGroups
         ? sessionGroups.flatMap((g) => visible(g.title, g.conversations))
         : visible("Chats", sections.sessions)),
     ].map((c) => c.id);
-  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects]);
+  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects, folderVisibleRows]);
   // Getter for the shift-select range, built on demand (at click time). Scopes
   // to whichever section is selectable: the flat Sessions list, or the sessions
   // across expanded project folders (in render order). For projects scope the
   // range uses each folder's own reported rows — the same source the folder
   // renders — so a shift target the global window hasn't loaded still resolves.
-  // Rows outside the active scope have no checkboxes, so they never enter a range.
+  // Rows outside the active scope or behind "Show more" have no checkboxes, so
+  // they never enter a range.
   getVisibleIdsRef.current = () => {
     const projectIds = () => {
       if (effectiveCollapsedSections.includes("Projects")) return [];
-      return sections.projectGroups.flatMap((g) => {
-        if (!expandedProjects.includes(g.name)) return [];
-        const rows = folderConversations.get(g.name) ?? g.conversations;
-        return rows.map((c) => c.id);
-      });
+      return sections.projectGroups.flatMap((g) =>
+        expandedProjects.includes(g.name) ? folderVisibleRows(g).map((c) => c.id) : [],
+      );
     };
     if (selectionScope === "projects") return projectIds();
     const visibleIds = (title: string, list: readonly Conversation[]) =>
@@ -2570,7 +2665,7 @@ function ConversationList({
     selectionMode: sessionsSelecting,
     selectedIds,
     onToggleSelected,
-    onProjectAssigned: expandProject,
+    onProjectAssigned: handleSessionsFiled,
   };
   const sessionsBulkBar =
     sessionsSelecting && !unifiedSelection ? (
@@ -2579,7 +2674,7 @@ function ConversationList({
         allConversations={displayPagination.rows}
         onDeselectAll={onDeselectAll}
         onExit={onExitSelectionMode}
-        onProjectAssigned={expandProject}
+        onProjectAssigned={handleSessionsFiled}
       />
     ) : undefined;
   // The filter stays reachable while bulk-selecting; switching scope just exits
@@ -2787,7 +2882,7 @@ function ConversationList({
                           selectionMode={false}
                           selectedIds={selectedIds}
                           onToggleSelected={onToggleSelected}
-                          onProjectAssigned={expandProject}
+                          onProjectAssigned={handleSessionsFiled}
                         />
                       </PinOrderContext.Provider>
                     </PinDropZone>
@@ -2812,7 +2907,7 @@ function ConversationList({
                             }
                             onDeselectAll={onDeselectAll}
                             onExit={onExitSelectionMode}
-                            onProjectAssigned={expandProject}
+                            onProjectAssigned={handleSessionsFiled}
                           />
                         ) : undefined
                       }
@@ -2887,19 +2982,21 @@ function ConversationList({
                             windowConversations={group.conversations}
                             archived={activeTab === "archived"}
                             activeConversationId={displayedActiveId}
+                            revealIds={
+                              justFiled?.project === group.name ? justFiled.ids : undefined
+                            }
                             expanded={expandedProjects.includes(group.name)}
                             active={newSessionProjectName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}
                             pinnedConversationIds={pinnedConversationIds}
                             activeOverride={activeOverride}
                             frozenSortKeys={frozenKeys}
-                            scrollRoot={scrollContainerRef}
                             onRowClick={onRowClick}
                             onTogglePinned={onTogglePinned}
                             selectionMode={projectsSelecting}
                             selectedIds={selectedIds}
                             onToggleSelected={onToggleSelected}
-                            onProjectAssigned={expandProject}
+                            onProjectAssigned={handleSessionsFiled}
                             onConversationsLoaded={handleFolderConversationsLoaded}
                           />
                         ))}
@@ -3757,11 +3854,12 @@ function ConversationSection({
       shown even when collapsed) — e.g. the bulk-selection action bar. */
   afterHeader?: ReactNode;
   /** Optional content rendered after the rows inside the expanded body (e.g. a
-      project folder's own infinite-scroll sentinel / loading row). */
+      project folder's "Show more" / loading row). */
   footer?: ReactNode;
-  /** Called with the project name when a row is filed into one, so the sidebar
-      can expand that (possibly brand-new) project folder. */
-  onProjectAssigned?: (projectName: string) => void;
+  /** Called with the project name and session ids when rows are filed into
+      one, so the sidebar can expand that (possibly brand-new) project folder
+      and list them. */
+  onProjectAssigned?: (projectName: string, sessionIds: string[]) => void;
 }) {
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
@@ -3994,7 +4092,7 @@ function ConversationMenuItems({
   onTogglePinned: (conversationId: string) => void;
   onMarkUnread: () => void;
   onMarkRead: () => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectName: string, sessionIds: string[]) => void;
   moveToProject: ReturnType<typeof useMoveToProject>;
   setShareOpen: (open: boolean) => void;
   setForkOpen: (open: boolean) => void;
@@ -4043,7 +4141,7 @@ function ConversationMenuItems({
     // hidden in a collapsed folder.
     if (project !== "") {
       moveToProject.mutate({ id: conversation.id, project });
-      onProjectAssigned?.(project);
+      onProjectAssigned?.(project, [conversation.id]);
       return;
     }
     // Removing just unfiles the session (project_id=""). No confirmation: a
@@ -4683,7 +4781,7 @@ function ConversationRowImpl({
   selectionMode: boolean;
   isSelected: boolean;
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectName: string, sessionIds: string[]) => void;
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
@@ -6427,7 +6525,7 @@ function BulkActionBar({
   allConversations: Conversation[];
   onDeselectAll: () => void;
   onExit: () => void;
-  onProjectAssigned?: (projectName: string) => void;
+  onProjectAssigned?: (projectName: string, sessionIds: string[]) => void;
 }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -6533,7 +6631,7 @@ function BulkActionBar({
       { ids, project },
       {
         onSuccess: () => {
-          if (project) onProjectAssigned?.(project);
+          if (project) onProjectAssigned?.(project, ids);
           onExit();
         },
       },

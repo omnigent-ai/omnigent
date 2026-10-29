@@ -276,6 +276,63 @@ describe("Sidebar shift-click selection", () => {
     expect([...ids].sort()).toEqual(["p1", "p2", "p3"]);
   });
 
+  it("keeps a projects-scope shift range to the rows above Show more", async () => {
+    projectsMock.push("Alpha", "Beta");
+    mockConversations([
+      ...Array.from({ length: 7 }, (_, i) =>
+        conv(`a${i}`, { labels: { omni_project: "Alpha" }, updated_at: 100 - i }),
+      ),
+      conv("b0", { labels: { omni_project: "Beta" }, updated_at: 1 }),
+    ]);
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha", "Beta"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(await screen.findByRole("link", { name: "a0" }));
+    fireEvent.click(screen.getByRole("link", { name: "b0" }), { shiftKey: true });
+
+    // a0–a4 and b0; a5 and a6 sit behind Alpha's Show more.
+    await waitFor(() => {
+      expect(screen.getByText("6 selected")).toBeInTheDocument();
+    });
+  });
+
+  it("keeps a selected folder session in bulk actions once it moves behind Show more", async () => {
+    projectsMock.push("Alpha");
+    const filed = (id: string, updatedAt: number) =>
+      conv(id, { labels: { omni_project: "Alpha" }, updated_at: updatedAt });
+    const rows = Array.from({ length: 6 }, (_, i) => filed(`a${i}`, 100 - i));
+    // The global window holds only a0; a4 comes from the folder's own query.
+    mockConversations([rows[0]!, conv("c1")]);
+    projectSessionsMock.current["Alpha"] = rows;
+    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
+    renderSidebar();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Project list actions" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByTestId("projects-select-sessions"));
+    fireEvent.click(await screen.findByRole("link", { name: "a4" }));
+    // A newer session lands on top; the next render pushes a4 behind Show more.
+    projectSessionsMock.current["Alpha"] = [filed("a_new", 200), ...rows];
+    fireEvent.click(screen.getByRole("link", { name: "a0" }));
+    await waitFor(() => {
+      expect(screen.getByText("2 selected")).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("link", { name: "a4" })).toBeNull();
+
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+    await waitFor(() => {
+      expect(bulkArchiveMock.mutate).toHaveBeenCalledTimes(1);
+    });
+    expect([...bulkArchiveMock.mutate.mock.calls[0][0].ids].sort()).toEqual(["a0", "a4"]);
+  });
+
   it("labels Delete with the owned count when the selection is mixed-ownership", async () => {
     // The flat "All sessions" list mixes the viewer's own sessions with ones
     // shared to them by other owners. Delete acts only on owned rows, so its

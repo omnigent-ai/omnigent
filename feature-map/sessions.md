@@ -62,6 +62,10 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+- `project-show-more`: an expanded project folder lists its five newest
+  sessions; each Show more lists five more until none remain. Re-expanding
+  starts at five again, the open session always stays listed, and Show more
+  carries the badge of a hidden session that needs attention or is unread.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
@@ -217,6 +221,10 @@ session), archive or unarchive, and delete.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
+
+**Project folder sessions:** expand a project with more than five sessions,
+then click Show more under its rows. Opening one of its older sessions from
+the ⌘K / Ctrl+K palette or a link also lists down to that session.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -918,6 +926,14 @@ plain `uv run pytest`, which starts a private server for the test.
   (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
+- **`project-show-more`:** no browser test drives it. Component tests in
+  `web/src/shell/Sidebar.test.tsx` ("Sidebar project Show more") cover paging,
+  the next server page, the open-session reveal, the hidden-session badge, and
+  the ⌘[ / ⌘] hotkey; `web/src/shell/Sidebar.shiftSelect.test.tsx` covers
+  shift ranges and bulk actions. By hand: create a project
+  (`POST /v1/projects`), file six or more sessions into it with
+  `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
+  orders them, then expand the folder and click Show more.
 
 ## Gotchas
 
