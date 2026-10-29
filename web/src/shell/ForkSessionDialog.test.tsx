@@ -14,6 +14,7 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { toast, type Action } from "sonner";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -36,6 +37,9 @@ vi.mock("react-router-dom", async (importOriginal) => {
   return { ...actual, useNavigate: () => navigateMock };
 });
 vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("sonner", () => ({
+  toast: { loading: vi.fn(() => "cloning"), success: vi.fn(), error: vi.fn() },
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -194,6 +198,10 @@ beforeEach(() => {
   forkSessionMock.mockReset();
   launchRunnerMock.mockReset();
   navigateMock.mockReset();
+  // mockClear keeps toast.loading's "cloning" id.
+  vi.mocked(toast.loading).mockClear();
+  vi.mocked(toast.success).mockClear();
+  vi.mocked(toast.error).mockClear();
   // The submit pre-flight passes by default; the nonexistent-directory
   // test overrides it with a failure message.
   checkHostDirectoryMock.mockReset();
@@ -380,6 +388,11 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(submit).toHaveAttribute("aria-busy", "true"));
     expect(submit).toBeDisabled();
     expect(screen.getByRole("status", { name: "Loading" })).toBeInTheDocument();
+    // A long clone mustn't trap the user: closing stays available.
+    for (const close of screen.getAllByRole("button", { name: "Close" })) {
+      expect(close).toBeEnabled();
+    }
+    expect(screen.getByText(/cloning continues in the background/)).toBeInTheDocument();
 
     settle({ id: "conv_fork" } as Fork);
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
@@ -446,6 +459,61 @@ describe("ForkSessionDialog", () => {
 
     await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+  });
+
+  it("reports a clone finished after closing on a toast with Open, without navigating", async () => {
+    type Fork = Awaited<ReturnType<typeof forkSession>>;
+    let settle: (value: Fork) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise<Fork>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    const { unmount } = renderDialog();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+
+    // Closing the dialog unmounts the form; the clone keeps running.
+    unmount();
+    expect(toast.loading).toHaveBeenCalledWith("Cloning session…");
+    settle({ id: "conv_fork" } as Fork);
+
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(
+        "Session cloned",
+        expect.objectContaining({
+          id: "cloning",
+          action: expect.objectContaining({ label: "Open" }),
+        }),
+      ),
+    );
+    expect(navigateMock).not.toHaveBeenCalled();
+    const action = vi.mocked(toast.success).mock.calls[0][1]?.action as Action;
+    action.onClick({} as never);
+    expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+  });
+
+  it("reports a clone that fails after closing on a toast that stays", async () => {
+    let fail: (reason: Error) => void = () => {};
+    forkSessionMock.mockReturnValue(
+      new Promise((_, reject) => {
+        fail = reject;
+      }),
+    );
+    const { unmount } = renderDialog();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+
+    unmount();
+    fail(new Error("403 forbidden"));
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't clone the session", {
+        id: "cloning",
+        description: "403 forbidden",
+        duration: Infinity,
+      }),
+    );
   });
 
   it("surfaces the server error inline on failure and does not navigate", async () => {

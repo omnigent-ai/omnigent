@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import {
   AlertTriangleIcon,
   ChevronDownIcon,
@@ -789,6 +790,15 @@ function SupportedForkSessionForm({
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Closing the dialog mid-submit unmounts this form but doesn't cancel the
+  // clone; from then on a toast reports its outcome instead of the form.
+  const submit = useRef<{ running: boolean; toastId?: string | number }>({ running: false });
+  useEffect(() => {
+    const current = submit.current;
+    return () => {
+      if (current.running) current.toastId = toast.loading("Cloning session…");
+    };
+  }, []);
   // Ready-to-send model/effort/permission overrides from the run-config
   // section. Empty until that section (rendered only for a native target)
   // reports its seeded value.
@@ -1283,6 +1293,8 @@ function SupportedForkSessionForm({
     }
     setSubmitting(true);
     setError(null);
+    const current = submit.current;
+    current.running = true;
     try {
       // Pre-flight the directory BEFORE creating anything: the runner
       // launch below is detached and its failure is swallowed, so a
@@ -1306,14 +1318,10 @@ function SupportedForkSessionForm({
             // path too — a missing repo can't recreate anything, and the
             // detached launch below swallows its failure.
             const repoProblem = await checkHostDirectory(selectedHostId, workspaceTrimmed);
-            if (repoProblem !== null) {
-              setError(repoProblem);
-              return;
-            }
+            if (repoProblem !== null) throw new Error(repoProblem);
             recreateSourceWorktree = true;
           } else {
-            setError(problem);
-            return;
+            throw new Error(problem);
           }
         }
       }
@@ -1397,12 +1405,32 @@ function SupportedForkSessionForm({
       // it either: it skips the active session, and the navigate below makes
       // the fork active.
       void queryClient.invalidateQueries({ queryKey: ["project-sessions"] });
-      onClose();
-      navigate(`/c/${fork.id}`);
+      if (current.toastId === undefined) {
+        onClose();
+        navigate(`/c/${fork.id}`);
+      } else {
+        // The user closed the dialog to keep working; don't pull them away.
+        toast.success("Session cloned", {
+          id: current.toastId,
+          duration: 10_000,
+          action: { label: "Open", onClick: () => navigate(`/c/${fork.id}`) },
+        });
+      }
     } catch (e) {
-      // forkSession failed — nothing created, so inputs stay editable for a resubmit.
-      setError(e instanceof Error ? e.message : "Couldn't clone the session. Try again.");
+      const message = e instanceof Error ? e.message : "Couldn't clone the session. Try again.";
+      if (current.toastId === undefined) {
+        // Nothing created and the form is still open, so inputs stay editable for a resubmit.
+        setError(message);
+      } else {
+        toast.error("Couldn't clone the session", {
+          id: current.toastId,
+          description: message,
+          duration: Infinity,
+        });
+      }
     } finally {
+      current.running = false;
+      current.toastId = undefined;
       setSubmitting(false);
     }
   }
@@ -1937,9 +1965,16 @@ function SupportedForkSessionForm({
         </p>
       )}
 
+      {submitting && (
+        <p className="text-sm text-muted-foreground">
+          Large sessions can take a minute. You can close this, and cloning continues in the
+          background.
+        </p>
+      )}
+
       <DialogFooter>
-        <Button variant="ghost" onClick={onClose} disabled={submitting}>
-          Cancel
+        <Button variant="ghost" onClick={onClose}>
+          {submitting ? "Close" : "Cancel"}
         </Button>
         <Button
           data-testid="fork-session-submit"

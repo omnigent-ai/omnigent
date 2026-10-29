@@ -73,6 +73,8 @@ the header menu), and each place is a separate entry point.
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
+  While a clone runs, the dialog can be closed without cancelling it: a toast
+  then reports the outcome, offering **Open** on success instead of navigating.
   For a native target, the fork dialog also offers model, reasoning effort,
   and permission mode pickers. A long model list from several creators (Pi)
   shows creator headings; it has no search or collapsible groups.
@@ -578,6 +580,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-rename`, project header right-click and three-dot menus:**
   `tests/e2e_ui/sessions/test_project_rename_dialog_focus.py::test_rename_dialog_preselects_name_so_typing_replaces`
   covers typing across the menu's exit animation from both menus.
+- **`fork`, closing the dialog mid-clone:** no browser test;
+  `web/src/shell/ForkSessionDialog.test.tsx` covers it with mocked responses.
+  Clone a large session, close the dialog while it spins, and expect a
+  "Session cloned" toast whose **Open** lands in the clone's history.
 - **`fork`, message cutoff:**
   `tests/e2e_ui/fork_session/test_fork_from_middle.py::test_fork_from_middle_truncates_history`,
   plus agent switching (own environment):
