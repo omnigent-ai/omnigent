@@ -4199,7 +4199,7 @@ def _first_routable_codex_provider(
         launch = _codex_provider_launch(candidate, model)
         if launch is not None:
             _logger.warning(
-                "native-codex: subscription default %r has no usable Codex login; "
+                "native-codex: subscription default %r cannot serve this launch; "
                 "routing through provider %r instead.",
                 exclude,
                 name,
@@ -4278,6 +4278,22 @@ def _resolve_subscription_launch(
     # Gateway), which would silently hijack a Subscription selection. A
     # no-op when the user's config sets no custom default.
     subscription_overrides = [_BUILTIN_OPENAI_PROVIDER_OVERRIDE]
+    if model is not None and is_databricks_model_id(model):
+        # A ChatGPT login cannot serve a gateway id, even when Codex is logged in.
+        gateway_launch = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
+        if gateway_launch is not None:
+            return gateway_launch
+        return NativeCodexLaunch(
+            config_overrides=subscription_overrides,
+            model=None,
+            profile=None,
+            summary=(
+                f"Codex CLI login (subscription provider {entry.name!r}; gateway model "
+                f"{model!r} is not served by the login and no provider routes it, so Codex "
+                "runs its own default)"
+            ),
+            login_required=not _codex_login_usable(),
+        )
     if _codex_login_usable():
         log_info_once(
             _logger,
