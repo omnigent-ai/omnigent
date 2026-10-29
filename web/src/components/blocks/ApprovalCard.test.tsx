@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { useIsSessionOwner } from "@/hooks/usePermissions";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -14,6 +15,11 @@ import {
 } from "@/shell/TerminalFirstContext";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
+
+vi.mock("@/hooks/usePermissions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/hooks/usePermissions")>()),
+  useIsSessionOwner: vi.fn(() => true),
+}));
 
 afterEach(() => {
   cleanup();
@@ -1894,36 +1900,55 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
 
   it.each([
     {
-      viewer: "the session itself",
+      viewer: "the session's owner",
       requester: null,
       sideChatId: null,
       isTerminalFirst: true,
+      isOwner: true,
       opensTerminal: true,
+      ownerOnlyNote: false,
+    },
+    {
+      viewer: "a collaborator who does not own the session",
+      requester: null,
+      sideChatId: null,
+      isTerminalFirst: true,
+      isOwner: false,
+      opensTerminal: false,
+      ownerOnlyNote: true,
     },
     {
       viewer: "the session itself without a terminal view",
       requester: null,
       sideChatId: null,
       isTerminalFirst: false,
+      isOwner: true,
       opensTerminal: false,
+      ownerOnlyNote: false,
     },
     {
       viewer: "an ancestor of the sub-agent",
       requester: { sessionId: "conv_child", ancestorSessionId: "conv_parent" },
       sideChatId: null,
       isTerminalFirst: true,
+      isOwner: true,
       opensTerminal: false,
+      ownerOnlyNote: false,
     },
     {
       viewer: "a side chat",
       requester: null,
       sideChatId: "conv_child",
       isTerminalFirst: true,
+      isOwner: true,
       opensTerminal: false,
+      ownerOnlyNote: false,
     },
   ])(
     "offers Open terminal when viewed from $viewer: $opensTerminal",
-    ({ requester, sideChatId, isTerminalFirst, opensTerminal }) => {
+    ({ requester, sideChatId, isTerminalFirst, isOwner, opensTerminal, ownerOnlyNote }) => {
+      useChatStore.setState({ conversationId: "conv_parent", blocks: [] });
+      vi.mocked(useIsSessionOwner).mockClear().mockReturnValue(isOwner);
       const setView = vi.fn();
       const terminalFirst: TerminalFirstContextValue = {
         isClaudeNative: true,
@@ -1959,6 +1984,11 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
         </QueryClientProvider>,
       );
 
+      const ownerOnly = screen.queryByTestId("approval-card-terminal-owner-only");
+      expect(ownerOnly !== null).toBe(ownerOnlyNote);
+      if (opensTerminal || ownerOnlyNote) {
+        expect(vi.mocked(useIsSessionOwner)).toHaveBeenCalledWith("conv_parent");
+      }
       if (!opensTerminal) {
         expect(screen.queryByTestId("approval-card-open-terminal")).toBeNull();
         return;

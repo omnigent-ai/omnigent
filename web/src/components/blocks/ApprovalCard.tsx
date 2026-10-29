@@ -49,6 +49,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useDescendantSession } from "@/hooks/useChildSessions";
+import { useIsSessionOwner } from "@/hooks/usePermissions";
 import {
   type AskUserQuestionPayload,
   castAskUserQuestionPayload,
@@ -146,6 +147,32 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
     <span data-testid="approval-card-requester" className="text-sm">
       {label ? <>Requested by sub-agent {link}</> : <>Requested by a {link}</>}
     </span>
+  );
+}
+
+/** Offers the session's terminal to its owner; other viewers attach read-only and cannot answer. */
+function OpenTerminalAction({ onOpen }: { onOpen: () => void }) {
+  const conversationId = useScopedConversationId();
+  const isOwner = useIsSessionOwner(conversationId ?? "");
+  if (!isOwner) {
+    return (
+      <span data-testid="approval-card-terminal-owner-only" className="text-sm">
+        Only the session owner can answer in the terminal.
+      </span>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-2 pt-1">
+      <Button
+        size="sm"
+        onClick={onOpen}
+        data-testid="approval-card-open-terminal"
+        componentId="approval.open_terminal"
+      >
+        <TerminalIcon className="mr-1 size-3.5" />
+        Open terminal
+      </Button>
+    </div>
   );
 }
 
@@ -694,17 +721,7 @@ export function ApprovalCard({
           </span>
           {promptDetails}
           {canOpenTerminal && (
-            <div className="flex flex-wrap gap-2 pt-1">
-              <Button
-                size="sm"
-                onClick={() => terminalFirst?.setView("terminal")}
-                data-testid="approval-card-open-terminal"
-                componentId="approval.open_terminal"
-              >
-                <TerminalIcon className="mr-1 size-3.5" />
-                Open terminal
-              </Button>
-            </div>
+            <OpenTerminalAction onOpen={() => terminalFirst?.setView("terminal")} />
           )}
         </AlertDescription>
       </Alert>

@@ -11,6 +11,7 @@ import {
   derivePermissionLevel,
   getSessionOwner,
   grantPermission,
+  isOwnerLevel,
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
@@ -76,25 +77,38 @@ export function useRevokePermission(sessionId: string) {
   });
 }
 
-/**
- * Returns whether the current user has edit access (level >= 2) to a session.
- * `null` permission level (single-user mode) is treated as unrestricted.
- */
-export function useCanEdit(conversationId: string): boolean {
+/** The current user's permission level on a session, as `derivePermissionLevel` resolves it. */
+function useSessionPermissionLevel(conversationId: string): number | null {
   const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);
     const activeConv = conversations?.find((c) => c.id === conversationId) ?? null;
-    const permissionLevel = derivePermissionLevel(
+    return derivePermissionLevel(
       activeSession,
       sessionLoading,
       activeConv,
       conversationId,
       conversationsData !== undefined,
     );
-    return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/**
+ * Returns whether the current user has edit access (level >= 2) to a session.
+ * `null` permission level (single-user mode) is treated as unrestricted.
+ */
+export function useCanEdit(conversationId: string): boolean {
+  const permissionLevel = useSessionPermissionLevel(conversationId);
+  return permissionLevel == null || permissionLevel >= 2;
+}
+
+/**
+ * Returns whether the current user owns a session, which terminal input requires.
+ * `null` permission level is treated as owner, matching `isOwnerLevel`.
+ */
+export function useIsSessionOwner(conversationId: string): boolean {
+  return isOwnerLevel(useSessionPermissionLevel(conversationId));
 }
 
 export type { Permission };
