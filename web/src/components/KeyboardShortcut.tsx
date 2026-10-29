@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 import { cn } from "@/lib/utils";
 
@@ -43,11 +43,19 @@ export const RIGHT_SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 export const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
+  return native ? [MOD_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
 }
 
 export function newSessionAriaShortcut(native = isNativeShell()): string {
-  return `${ARIA_MOD_KEY}+${native ? "Alt+N" : "Shift+O"}`;
+  return `${ARIA_MOD_KEY}+${native ? "N" : "Shift+O"}`;
+}
+
+/**
+ * Keys that open Settings: the desktop menu's ⌘, (Ctrl+, elsewhere), or ⌘⌥, in a
+ * browser, where ⌘, belongs to the browser's own settings.
+ */
+export function settingsShortcutKeys(desktopMenu = supportsDesktopCommands()): string[] {
+  return desktopMenu ? [MOD_KEY, ","] : [...SETTINGS_KEYS];
 }
 
 /** Keys for the numbered-session jump chord; `digit` is one slot's digit or a range label. */
