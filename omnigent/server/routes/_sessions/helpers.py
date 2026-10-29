@@ -1630,8 +1630,9 @@ def _publish_elicitation_resolved_to_ancestors(
         mirrors; see :func:`_publish_elicitation_resolved`.
     :param reason: Optional no-verdict reason carried through to the
         mirrors; see :func:`_publish_elicitation_resolved`.
-    :param ancestor_ids: Ancestors read before the session was deleted;
-        ``None`` reads them from ``conv_store``.
+    :param ancestor_ids: Sessions holding the mirrors, e.g. from the pending
+        index once the session's parent links are deleted; ``None`` reads the
+        ancestors from ``conv_store``.
     """
     if ancestor_ids is None:
         ancestor_ids = _ancestor_session_ids(conv_store, session_id)
@@ -9804,7 +9805,7 @@ def _is_prompt_held_in_terminal(event: dict[str, Any]) -> bool:
 
 
 def _expire_held_prompt_for_older_client(event: dict[str, Any]) -> dict[str, Any]:
-    """Show an older client a prompt held in the terminal as expired, as it was before holds."""
+    """Show a client without terminal-fallback support a prompt held in the terminal as expired."""
     if not _is_prompt_held_in_terminal(event):
         return event
     return {

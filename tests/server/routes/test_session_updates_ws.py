@@ -237,22 +237,15 @@ def test_pending_count_includes_prompt_held_in_terminal_only_when_opted_in(
             "params": {"terminal_fallback": {"answer_undelivered": False}},
         },
     )
-    try:
-        client = TestClient(app)
-        listed = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE, **headers})
-        assert [row["pending_elicitations_count"] for row in listed.json()["data"]] == [
-            pending_count
-        ]
-        with client.websocket_connect(
-            f"/v1/sessions/updates{socket_query}", headers={"X-Forwarded-Email": ALICE}
-        ) as ws:
-            ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
-            snapshot = _recv_until(ws, {"snapshot"})
-        assert [item["pending_elicitations_count"] for item in snapshot["items"]] == [
-            pending_count
-        ]
-    finally:
-        pending_elicitations.reset_for_tests()
+    client = TestClient(app)
+    listed = client.get("/v1/sessions", headers={"X-Forwarded-Email": ALICE, **headers})
+    assert [row["pending_elicitations_count"] for row in listed.json()["data"]] == [pending_count]
+    with client.websocket_connect(
+        f"/v1/sessions/updates{socket_query}", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+    assert [item["pending_elicitations_count"] for item in snapshot["items"]] == [pending_count]
 
 
 def test_child_busy_rollup_flows_through_updates_stream(

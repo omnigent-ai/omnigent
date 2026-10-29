@@ -36,12 +36,10 @@ def _reset_presence_and_subscribers() -> Any:
     presence.reset_for_tests()
     shutdown_state.reset_for_tests()
     session_stream._subscribers.clear()
-    pending_elicitations.reset_for_tests()
     yield
     presence.reset_for_tests()
     shutdown_state.reset_for_tests()
     session_stream._subscribers.clear()
-    pending_elicitations.reset_for_tests()
 
 
 async def test_aclose_cleans_presence_and_subscribers_without_runtime_error(
