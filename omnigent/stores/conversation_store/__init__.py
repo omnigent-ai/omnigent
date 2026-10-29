@@ -1592,7 +1592,8 @@ class ConversationStore(ABC):
         :param runner_id: Runner id to bind to, e.g.
             ``"runner_abc123"``.
         :returns: ``True`` if this call won the bind (NULL → runner_id);
-            ``False`` if already bound or the row doesn't exist.
+            ``False`` if already bound, the row doesn't exist, or an
+            account move is pending (only :meth:`bind_account_launch` may bind then).
         """
         ...
 
@@ -1736,7 +1737,123 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def clear_host_binding(self, conversation_id: str) -> Conversation:
+    def begin_account_transition(
+        self,
+        conversation_id: str,
+        transition: dict[str, Any],
+        *,
+        expected_runner_id: str | None,
+    ) -> Conversation:
+        """
+        Record an account change's destination and detach the runner.
+
+        Both writes share one transaction, so a crash cannot leave a detached
+        session without its destination. The server adds ``previous_host_id``
+        and ``previous_runner_id`` so the later launch can retire the old
+        runner. Repeating the call with the same destination keeps the stored
+        marker.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition: Destination with ``id``, ``account_id``,
+            ``host_id``, ``harness``, ``model``, ``effort`` and ``workspace``.
+        :param expected_runner_id: Runner the caller observed; ``None`` for an
+            unbound session. A different binding, or a running or waiting
+            session, is a conflict.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If the conversation does not exist.
+        :raises OmnigentError: ``CONFLICT`` when the session changed, is busy,
+            or another destination is already pending.
+        """
+        ...
+
+    @abstractmethod
+    def bind_account_launch(
+        self,
+        conversation_id: str,
+        transition_id: str,
+        runner_id: str,
+        host_id: str,
+        workspace: str,
+        git_branch: str | None = None,
+    ) -> bool:
+        """
+        Bind a launch attempt for a pending transition.
+
+        Stores the runner on the session, remembers it as the marker's
+        ``launch_runner_id`` and persists the host binding in one transaction.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param runner_id: Runner id of this attempt.
+        :param host_id: Destination host; it must match the marker.
+        :param workspace: Destination working directory.
+        :param git_branch: Branch of a worktree created for this launch.
+        :returns: ``False`` when the marker, host or runner binding no longer
+            allows this attempt.
+        """
+        ...
+
+    @abstractmethod
+    def reset_account_launch(
+        self, conversation_id: str, transition_id: str, expected_runner_id: str
+    ) -> None:
+        """
+        Release an earlier attempt's runner while keeping the transition.
+
+        Called only after the host confirmed that runner stopped.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param expected_runner_id: The attempt being released.
+        :raises OmnigentError: ``CONFLICT`` when the marker or binding changed.
+        """
+        ...
+
+    @abstractmethod
+    def finish_account_transition(
+        self,
+        conversation_id: str,
+        transition_id: str,
+        runner_id: str,
+    ) -> None:
+        """
+        Clear the transition once its destination launch is acknowledged.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param runner_id: The acknowledged launch's runner.
+        :raises OmnigentError: ``CONFLICT`` when the marker or binding changed.
+        """
+        ...
+
+    @abstractmethod
+    def abandon_account_transition(
+        self,
+        conversation_id: str,
+        transition_id: str,
+        *,
+        expected_launch_runner_id: str | None,
+    ) -> Conversation:
+        """
+        Drop a pending account move and leave the session detached.
+
+        Clears the marker and the runner binding together. Call it only after
+        the launch attempt it names, if any, is confirmed stopped.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param expected_launch_runner_id: The marker's ``launch_runner_id`` the
+            caller observed, or ``None`` when no attempt was recorded.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If the conversation does not exist.
+        :raises OmnigentError: ``CONFLICT`` when the marker or its launch attempt changed.
+        """
+        ...
+
+    @abstractmethod
+    def clear_host_binding(
+        self, conversation_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         Revert a session to fully unbound: NULL ``host_id``,
         ``workspace``, ``git_branch``, and ``runner_id`` together.
@@ -1758,9 +1875,14 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param expected_runner_id: Clear only while this runner is still bound,
+            so a delayed cleanup cannot undo a newer launch. ``None`` is
+            unconditional.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.
+        :raises OmnigentError: ``CONFLICT`` when ``expected_runner_id`` no
+            longer matches.
         """
         ...
 

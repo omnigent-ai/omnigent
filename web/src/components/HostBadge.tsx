@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
+import { useExecutionTopology } from "@/hooks/useExecutionTopology";
 import { useHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
@@ -90,6 +91,30 @@ function launchStatusWord(launch: SandboxStatus): string {
 }
 
 /**
+ * The composer menu's switch action. It offers model and account changes
+ * only when the server has an account registry. The menu mounts it only
+ * while open, so the registry is read on demand rather than for every badge.
+ */
+function SwitchMenuItem({
+  disabledReason,
+  onSelect,
+}: {
+  disabledReason?: string;
+  onSelect: () => void;
+}) {
+  const { data: topology } = useExecutionTopology(true);
+  return (
+    <SessionActionMenuItem
+      disabledReason={disabledReason}
+      onSelect={onSelect}
+      data-testid="composer-host-switch"
+    >
+      {topology?.configured === true ? "Switch model or account…" : "Switch host…"}
+    </SessionActionMenuItem>
+  );
+}
+
+/**
  * Session-bound host status with shared liveness, reconnect and switch behavior.
  * The composer variant uses the compact host menu; the default retains the
  * name-and-status badge. Managed sandbox placement remains server-owned.
@@ -107,6 +132,9 @@ export function HostBadge({
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The dialog opens outside any Radix trigger's focus handling, so it hands
+  // focus back to whichever control opened it (badge or composer trigger).
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
@@ -196,6 +224,7 @@ export function HostBadge({
           >
             <DropdownMenuTrigger asChild>
               <ComposerHostTrigger
+                ref={triggerRef}
                 label={label}
                 status={launchStatus ? undefined : (badge?.status ?? "unknown")}
                 cloud={!!launchStatus || !!host?.sandbox_provider}
@@ -230,12 +259,10 @@ export function HostBadge({
               </DropdownMenuItem>
             )}
             {!readOnly && (canSwitch || switchHostDisabledReason) && (
-              <SessionActionMenuItem
+              <SwitchMenuItem
                 disabledReason={switchHostDisabledReason}
                 onSelect={() => setSwitchOpen(true)}
-              >
-                Switch host…
-              </SessionActionMenuItem>
+              />
             )}
             {(launchStatus || !badge) && (
               <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
@@ -250,6 +277,8 @@ export function HostBadge({
             onOpenChange={setSwitchOpen}
             sessionId={sessionId}
             currentHostId={hostId}
+            currentWorkspace={session?.workspace}
+            returnFocusRef={triggerRef}
           />
         )}
       </>
@@ -300,6 +329,7 @@ export function HostBadge({
       >
         {canSwitch ? (
           <button
+            ref={triggerRef}
             type="button"
             data-testid="host-badge"
             onClick={() => setSwitchOpen(true)}
@@ -332,6 +362,8 @@ export function HostBadge({
           onOpenChange={setSwitchOpen}
           sessionId={sessionId}
           currentHostId={hostId}
+          currentWorkspace={session?.workspace}
+          returnFocusRef={triggerRef}
         />
       )}
     </>

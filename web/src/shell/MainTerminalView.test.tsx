@@ -472,9 +472,9 @@ describe("MainTerminalView — native wrapper sessions", () => {
     // because of the empty intermediate render — if MainTerminalView ever
     // kept the pane alive across an empty inventory, the pill's Terminal
     // view would stay attached to the previous host's PTY (old WS, old
-    // scrollback) after "Switch host…". This pins the reset's other half:
-    // the clear unmounts the pane and the refetched row (the new host's
-    // attach info) rebuilds it.
+    // scrollback) after a host or account switch. This pins the reset's
+    // other half: the clear unmounts the pane and the refetched row (the new
+    // host's attach info) rebuilds it.
     const paneOnHostA: TerminalInfo = {
       id: "terminal_claude_main",
       name: "claude",

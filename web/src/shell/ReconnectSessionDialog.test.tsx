@@ -67,11 +67,16 @@ vi.mock("./ForkSessionDialog", () => ({
 // The switch dialog owns its own host/filesystem queries; stub it so these
 // tests only pin whether this dialog offers it and with which session.
 vi.mock("./SwitchHostDialog", () => ({
-  SwitchHostDialog: (props: { sessionId: string; currentHostId: string | null }) => (
+  SwitchHostDialog: (props: {
+    sessionId: string;
+    currentHostId: string | null;
+    currentWorkspace?: string | null;
+  }) => (
     <div
       data-testid="switch-host-dialog-stub"
       data-session-id={props.sessionId}
       data-current-host-id={props.currentHostId ?? ""}
+      data-current-workspace={props.currentWorkspace ?? ""}
     />
   ),
 }));
@@ -305,6 +310,7 @@ describe("<ReconnectSessionDialog />", () => {
       state: "host_offline",
       isOwner: true,
       sourceHostId: "host_dead",
+      sourceWorkspace: "/home/alice/repo",
     });
     expect(screen.queryByTestId("switch-host-dialog-stub")).toBeNull();
 
@@ -316,6 +322,8 @@ describe("<ReconnectSessionDialog />", () => {
     const stub = screen.getByTestId("switch-host-dialog-stub");
     expect(stub.getAttribute("data-session-id")).toBe("conv_abc123");
     expect(stub.getAttribute("data-current-host-id")).toBe("host_dead");
+    // The session's directory travels along so the new host can keep it.
+    expect(stub.getAttribute("data-current-workspace")).toBe("/home/alice/repo");
   });
 
   it("withholds the host switch from a non-owner and from local_stranded", () => {

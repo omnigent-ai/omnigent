@@ -103,6 +103,7 @@ from omnigent.server.feature_flags import (
     harness_install_enabled,
     resolve_feature_flags,
 )
+from omnigent.server.host_accounts import load_account_registry
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -2178,6 +2179,7 @@ def create_app(
     )
     app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
+    app.state.account_registry = load_account_registry()
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider

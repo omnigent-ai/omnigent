@@ -27,7 +27,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -75,6 +75,13 @@ from omnigent.server.feature_flags import (
     harness_install_enabled,
     resolve_feature_flags,
 )
+from omnigent.server.host_accounts import (
+    account_registry,
+    execution_topology,
+    require_account_route,
+    validate_account_selection,
+    validate_transition_launch,
+)
 from omnigent.server.host_registry import (
     HarnessLoginState,
     HostConnection,
@@ -82,6 +89,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     update_harness_accounts,
 )
+from omnigent.server.routes._account_transition import retire_transition_runners
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -728,6 +736,11 @@ class LaunchRunnerRequest(BaseModel):
         ``"/Users/corey/projects/frontend"``. When ``git`` is set,
         this is interpreted as the source repository directory and
         the runner starts in the created worktree instead.
+    :param account_id: Account the session is launched under, e.g.
+        ``"claude-personal"``. Required to finish an account move; must
+        match the configured registry.
+    :param transition_id: ``account_transition.id`` of the pending move
+        this launch finishes.
     :param git: Optional git worktree options. In create mode the
         server creates a worktree for a new branch off ``workspace`` on
         the host and binds the runner to it (the fork-resume path;
@@ -741,6 +754,8 @@ class LaunchRunnerRequest(BaseModel):
 
     session_id: str
     workspace: str
+    account_id: str | None = Field(default=None, max_length=128)
+    transition_id: str | None = Field(default=None, max_length=64)
     git: SessionGitOptions | None = None
 
 
@@ -943,6 +958,64 @@ def create_hosts_router(
             result.append(item)
         return {"hosts": result}
 
+    async def visible_accounts(request: Request) -> dict[str, Any]:
+        """List the configured accounts with their usable placements.
+
+        Only placements on non-sandbox hosts the caller owns appear; each
+        carries ``available`` and, when unavailable, a ``reason``.
+
+        :param request: The incoming request (for auth).
+        :returns: ``{"configured": False, "accounts": []}`` when no
+            registry is configured, else the registry's accounts.
+        """
+        user_id = require_user(request, auth_provider)
+        registry = account_registry(request)
+        if registry is None:
+            return {"configured": False, "accounts": []}
+        owned = await asyncio.to_thread(host_store.list_hosts, user_id or "local")
+        hosts_by_id = {host.host_id: host for host in owned if not host.sandbox_provider}
+        now = now_epoch()
+        accounts = []
+        for account in registry.accounts:
+            placements = []
+            for placement in account.placements:
+                host = hosts_by_id.get(placement.host_id)
+                if host is None:
+                    continue
+                configured = host.configured_harnesses or {}
+                ready = configured.get(
+                    account.harness,
+                    configured.get(ui_install_key(account.harness) or ""),
+                )
+                online = host_is_live(host, now=now)
+                available = online and ready is True
+                placements.append(
+                    {
+                        **placement.model_dump(),
+                        "available": available,
+                        "reason": None
+                        if available
+                        else ("Machine is offline" if not online else "Harness is not ready"),
+                    }
+                )
+            if placements:
+                accounts.append(
+                    {**account.model_dump(exclude={"placements"}), "placements": placements}
+                )
+        return {"configured": True, "accounts": accounts}
+
+    @router.get("/execution-topology")
+    async def get_execution_topology(request: Request) -> dict[str, Any]:
+        """Return the account registry as machines, accounts and bindings.
+
+        Lists only placements on non-sandbox hosts the caller owns, each with
+        its availability.
+
+        :param request: The incoming request (for auth).
+        :returns: ``configured``, ``machines``, ``accounts`` and ``bindings``.
+        """
+        return execution_topology(await visible_accounts(request))
+
     @router.get("/hosts/{host_id}")
     async def get_host(request: Request, host_id: str) -> dict[str, Any]:
         """Get details for a single host.
@@ -1007,6 +1080,7 @@ def create_hosts_router(
         request: Request,
         host_id: str,
         harness: str,
+        account_id: str | None = None,
     ) -> HostModelOptionsResponse:
         """Return pre-launch model choices resolved by the selected host.
 
@@ -1014,9 +1088,13 @@ def create_hosts_router(
         snapshot: launch re-resolves with the session's agent spec, and the
         in-session picker reflects that launch snapshot once the runner is up.
 
+        With an account registry configured, the host and harness must
+        belong to an account (and to ``account_id`` when given).
+
         :raises HTTPException: 404 when the host is unknown, 403 when not the
-            owner, 409 when offline or the host daemon is too old to list model
-            options, 502 on host-side failure, 504 on timeout.
+            owner, 400 when the route is not allowed by the account
+            registry, 409 when offline or the host daemon is too old to list
+            model options, 502 on host-side failure, 504 on timeout.
         """
         user_id = require_user(request, auth_provider)
         host = await asyncio.to_thread(host_store.get_host, host_id)
@@ -1027,6 +1105,9 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        require_account_route(
+            request, host_id=host.host_id, harness=harness, account_id=account_id
+        )
         _require_harness_setup_support(conn, "pre-launch model listing")
 
         result = await _proxy_model_options(
@@ -1156,6 +1237,27 @@ def create_hosts_router(
         if agent_store is not None and agent_cache is not None:
             harness = await _resolve_agent_harness(target.conv, agent_store, agent_cache)
 
+        # A pending account move may only finish at its recorded destination,
+        # and a configured registry must allow this route.
+        route_harness = target.conv.harness_override or harness
+        marker = validate_transition_launch(
+            target.conv,
+            host_id=host_id,
+            harness=route_harness,
+            account_id=body.account_id,
+            transition_id=body.transition_id,
+            workspace=body.workspace,
+        )
+        await validate_account_selection(
+            request,
+            host_id=host_id,
+            harness=route_harness,
+            model=target.conv.model_override,
+            effort=target.conv.reasoning_effort,
+            host_registry=host_registry,
+            account_id=body.account_id,
+        )
+
         git_branch: str | None = None
         worktree = None
 
@@ -1195,7 +1297,19 @@ def create_hosts_router(
                     stage="runner_launch",
                 ),
             )
-            await asyncio.to_thread(conversation_store.clear_host_binding, body.session_id)
+            try:
+                await asyncio.to_thread(
+                    conversation_store.clear_host_binding,
+                    body.session_id,
+                    # A delayed cleanup of a pending change must not undo a newer attempt.
+                    expected_runner_id=runner_id if marker is not None else None,
+                )
+            except OmnigentError as exc:
+                if exc.code != ErrorCode.CONFLICT:
+                    raise
+                # A newer launch owns the binding; only this request's worktree is stale.
+                await _rollback_worktree()
+                return
             try:
                 if worktree is not None or (body.git is not None and body.git.existing_worktree):
                     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
@@ -1222,18 +1336,32 @@ def create_hosts_router(
         launch_lock = _runner_launch_locks.setdefault(body.session_id, asyncio.Lock())
         waited_for_launch = launch_lock.locked()
         async with launch_lock:
-            if waited_for_launch:
+            if waited_for_launch or marker is not None or account_registry(request) is not None:
                 current = await asyncio.to_thread(
                     conversation_store.get_conversation,
                     body.session_id,
                 )
                 if current is None:
                     raise HTTPException(status_code=404, detail="session not found")
-                if current.runner_id is not None:
+                if marker is not None or current.account_transition is not None:
+                    # A move can begin or end while this request waits for the lock.
+                    marker = validate_transition_launch(
+                        current,
+                        host_id=host_id,
+                        harness=route_harness,
+                        account_id=body.account_id,
+                        transition_id=body.transition_id,
+                        workspace=body.workspace,
+                    )
+                if waited_for_launch and current.runner_id is not None:
                     raise HTTPException(
                         status_code=400,
                         detail="session already has a runner bound",
                     )
+            if marker is not None:
+                await retire_transition_runners(
+                    request, host_registry, conversation_store, body.session_id, host_id, marker
+                )
 
             if body.git is not None:
                 if body.git.existing_worktree:
@@ -1272,11 +1400,22 @@ def create_hosts_router(
                 await _rollback_worktree()
                 raise
 
-            bound = await asyncio.to_thread(
-                conversation_store.set_runner_id,
-                body.session_id,
-                runner_id,
-            )
+            if marker is not None:
+                bound = await asyncio.to_thread(
+                    conversation_store.bind_account_launch,
+                    body.session_id,
+                    marker["id"],
+                    runner_id,
+                    host_id,
+                    workspace,
+                    git_branch,
+                )
+            else:
+                bound = await asyncio.to_thread(
+                    conversation_store.set_runner_id,
+                    body.session_id,
+                    runner_id,
+                )
             if not bound:
                 await _rollback_worktree()
                 raise HTTPException(
@@ -1314,13 +1453,14 @@ def create_hosts_router(
                             body.session_id,
                             WORKTREE_ROOT_LABEL_KEY,
                         )
-                await asyncio.to_thread(
-                    conversation_store.set_host_id,
-                    body.session_id,
-                    host_id,
-                    workspace,
-                    git_branch,
-                )
+                if marker is None:
+                    await asyncio.to_thread(
+                        conversation_store.set_host_id,
+                        body.session_id,
+                        host_id,
+                        workspace,
+                        git_branch,
+                    )
 
             persist_task = asyncio.create_task(persist_binding())
             try:
@@ -1426,6 +1566,25 @@ def create_hosts_router(
                 status_code=502,
                 detail=f"host failed to launch runner: {result.get('error')}",
             )
+
+        if marker is not None:
+            try:
+                await asyncio.to_thread(
+                    conversation_store.finish_account_transition,
+                    body.session_id,
+                    marker["id"],
+                    runner_id,
+                )
+            except OmnigentError as exc:
+                if exc.code != ErrorCode.CONFLICT:
+                    raise
+                # The move was cancelled while the destination started; stop that runner.
+                from omnigent.server.routes._sessions.helpers import _spawn_superseded_runner_stop
+
+                _spawn_superseded_runner_stop(body.session_id, host_id, runner_id, host_registry)
+                raise HTTPException(
+                    status_code=409, detail="The move was cancelled while it was starting"
+                ) from exc
 
         # The runner is bound to a session carried in the body (not the request
         # path); the middleware promotes a bag session_id to the audit row's

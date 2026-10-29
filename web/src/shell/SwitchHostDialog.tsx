@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangleIcon } from "lucide-react";
 import {
   Dialog,
@@ -20,17 +20,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { parentOf, resolveWorkspacePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { WorkspacePathField } from "./WorkspacePathField";
 import { HostLabel } from "./HostLabel";
-import { normalizeWorkspacePath } from "./NewChatDialog";
+import { useExecutionTopology } from "@/hooks/useExecutionTopology";
 import { useHosts } from "@/hooks/useHosts";
-import { useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { useRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
-import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { sessionSwitchHarness } from "@/lib/sessionSwitch";
+import { getSessionSlim, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import { useChatStore } from "@/store/chatStore";
+import {
+  returnFocusOnClose,
+  SwitchAccountDialog,
+  switchSnapshotKey,
+  type SwitchDialogProps,
+} from "./SwitchAccountDialog";
+import { useSwitchWorkspace } from "./useSwitchWorkspace";
 
 /**
  * Move an existing session onto a different host, from the composer's
@@ -49,7 +54,8 @@ import { useChatStore } from "@/store/chatStore";
  *    session's ``host_id``.
  *
  * A directory is always required: workspaces are per-machine, so the
- * old path means nothing on the new host even when it reads the same.
+ * old path may mean nothing on the new host. The session's own directory
+ * is still the default when the new host has it.
  *
  * The first available host is selected on open and its directory
  * defaulted, so the common "just move it over there" case is one click.
@@ -64,8 +70,11 @@ import { useChatStore } from "@/store/chatStore";
  * @param sessionId - The session to move, e.g. ``"conv_abc"``.
  * @param currentHostId - The host it is bound to now; excluded from the
  *   picker and used for the "different machine" warning.
+ * @param currentWorkspace - Its directory now, e.g. ``"/home/me/repo"``.
+ * @param returnFocusRef - Element to focus on close when the opener isn't a
+ *   Radix trigger.
  */
-export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDialog>[0]) {
+export function SwitchHostDialog(props: SwitchDialogProps) {
   const { switchHostDisabledReason } = useSessionActionRestrictions(props.sessionId, {
     hostId: props.currentHostId,
   });
@@ -94,26 +103,122 @@ export function SwitchHostDialog(props: Parameters<typeof SupportedSwitchHostDia
       </Dialog>
     );
   }
-  return <SupportedSwitchHostDialog {...props} />;
+  return <SwitchByAccountRegistry {...props} />;
 }
 
-function SupportedSwitchHostDialog({
+/** Native sessions on an account registry get the account dialog; everything else moves by host. */
+function SwitchByAccountRegistry(props: SwitchDialogProps) {
+  const { open, sessionId } = props;
+  const topology = useExecutionTopology(open, { live: true });
+  const configured = topology.data?.configured === true;
+  const pausePollingRef = useRef(false);
+  // The shared ["session", id] snapshot is cached forever, so read a fresh one.
+  const snapshotQuery = useQuery({
+    queryKey: switchSnapshotKey(sessionId),
+    queryFn: () => getSessionSlim(sessionId),
+    enabled: open && configured,
+    staleTime: 0,
+    gcTime: 0,
+    retry: false,
+    // Polled while open (a finished turn shows up); paused mid-apply.
+    refetchInterval: () => (pausePollingRef.current ? false : 2_000),
+  });
+
+  // The plain host move covers a server without a registry, and the moment
+  // before the first registry answer arrives.
+  const snapshot = snapshotQuery.data;
+  if (topology.data === undefined && !topology.isError) {
+    return <HostOnlySwitchDialog {...props} />;
+  }
+  if (topology.data === undefined) {
+    return (
+      <SwitchStatusDialog
+        {...props}
+        message="Couldn't load machines and accounts."
+        onRetry={() => void topology.refetch()}
+      />
+    );
+  }
+  if (!configured) return <HostOnlySwitchDialog {...props} />;
+  if (snapshot === undefined) {
+    return (
+      <SwitchStatusDialog
+        {...props}
+        message={snapshotQuery.isError ? "Couldn't read this session's current state." : undefined}
+        onRetry={snapshotQuery.isError ? () => void snapshotQuery.refetch() : undefined}
+      />
+    );
+  }
+  const nativeHarness = sessionSwitchHarness(snapshot);
+  // Saved inference profiles own their catalog, and sub-agents can't switch.
+  const switchable = !snapshot.inferenceConfigured && snapshot.parentSessionId == null;
+  if (nativeHarness === null || !switchable) {
+    // A registered harness may only move to registered hosts.
+    const registeredHostIds =
+      nativeHarness === null
+        ? undefined
+        : new Set(
+            topology.data.bindings.filter((b) => b.harness === nativeHarness).map((b) => b.host_id),
+          );
+    return <HostOnlySwitchDialog {...props} registeredHostIds={registeredHostIds} />;
+  }
+  return (
+    <SwitchAccountDialog
+      {...props}
+      snapshot={snapshot}
+      harness={nativeHarness}
+      topology={topology.data}
+      pausePollingRef={pausePollingRef}
+      recheckSnapshot={async () => (await snapshotQuery.refetch()).data}
+    />
+  );
+}
+
+/** Loading (no `message`) or load-failure (`message` and `onRetry`) state for the configured registry. */
+function SwitchStatusDialog({
+  open,
+  onOpenChange,
+  message,
+  onRetry,
+}: SwitchDialogProps & { message?: string; onRetry?: () => void }) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent data-testid="switch-host-dialog" className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Switch model or account</DialogTitle>
+          <DialogDescription role={onRetry ? "alert" : "status"}>
+            {message ?? "Loading…"}
+          </DialogDescription>
+        </DialogHeader>
+        {onRetry && (
+          <DialogFooter data-testid="switch-load-error">
+            <Button variant="outline" onClick={onRetry}>
+              Try again
+            </Button>
+          </DialogFooter>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function HostOnlySwitchDialog({
   open,
   onOpenChange,
   sessionId,
   currentHostId,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  sessionId: string;
-  currentHostId: string | null;
+  currentWorkspace = null,
+  returnFocusRef,
+  registeredHostIds,
+}: SwitchDialogProps & {
+  /** When set, only these hosts are offered. */
+  registeredHostIds?: ReadonlySet<string>;
 }) {
   const queryClient = useQueryClient();
   const { data: hosts } = useHosts({ enabled: open });
   const markRunnerLaunched = useChatStore((s) => s.markRunnerLaunched);
 
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
-  const [workspace, setWorkspace] = useState("");
   const [browsing, setBrowsing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -121,8 +226,6 @@ function SupportedSwitchHostDialog({
   // unbound, so the retry copy has to say so rather than implying the
   // old host is still serving it.
   const [stranded, setStranded] = useState(false);
-
-  const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
   // Pinned at mount — the badge mounts this dialog only while it is open.
   // A successful switch repoints the session's host, so filtering on the
@@ -137,9 +240,12 @@ function SupportedSwitchHostDialog({
   const targetHosts = useMemo(
     () =>
       (hosts ?? []).filter(
-        (h) => h.status === "online" && (stranded || h.host_id !== originHostId),
+        (h) =>
+          h.status === "online" &&
+          (stranded || h.host_id !== originHostId) &&
+          (registeredHostIds === undefined || registeredHostIds.has(h.host_id)),
       ),
-    [hosts, originHostId, stranded],
+    [hosts, originHostId, stranded, registeredHostIds],
   );
 
   // Land on a usable selection instead of an empty form: take the first
@@ -150,66 +256,23 @@ function SupportedSwitchHostDialog({
     }
   }, [open, selectedHostId, targetHosts]);
 
-  // Home listing for the chosen host. Shares the picker's query key, so
-  // opening the browser afterwards costs no extra request.
-  const { data: homeListing, isPlaceholderData } = useHostFilesystem(
-    selectedHostId,
-    selectedHostId === null ? null : "",
-  );
-  // Entries share one parent, so the home listing's first entry resolves the
-  // host's absolute home directory.
-  const firstHomeEntry = homeListing && !isPlaceholderData ? homeListing.entries[0] : undefined;
-  const resolvedHome = firstHomeEntry ? parentOf(firstHomeEntry.path) : null;
-
-  // A path is meaningless on a machine it didn't come from, so clear the
-  // field whenever the target changes and let the default below refill it.
-  const prevHostId = useRef<string | null>(null);
-  const userEditedRef = useRef(false);
-  useEffect(() => {
-    if (prevHostId.current === selectedHostId) return;
-    prevHostId.current = selectedHostId;
-    setWorkspace("");
-    userEditedRef.current = false;
-  }, [selectedHostId]);
-
-  // Default the directory for the chosen host: the last workspace used
-  // there, else its home. Never overwrites typed text — a late-arriving
-  // home listing must not clobber what the user is entering.
-  useEffect(() => {
-    if (!open || selectedHostId === null || workspace !== "" || userEditedRef.current) return;
-    const preferred = recent[0] ?? resolvedHome;
-    if (preferred) setWorkspace(preferred);
-  }, [open, selectedHostId, workspace, recent, resolvedHome]);
-
-  function handleWorkspaceChange(next: string): void {
-    userEditedRef.current = true;
-    setWorkspace(next);
-  }
+  const directory = useSwitchWorkspace({ open, hostId: selectedHostId, currentWorkspace });
+  const { path: workspaceTrimmed, valid: workspaceValid, addRecent } = directory;
 
   function handleOpenChange(next: boolean): void {
     if (!next) {
       setSelectedHostId(null);
-      setWorkspace("");
+      directory.reset();
       setBrowsing(false);
       setError(null);
       setStranded(false);
       setSubmitting(false);
-      prevHostId.current = null;
-      userEditedRef.current = false;
     }
     onOpenChange(next);
   }
 
-  // Resolve a typed "~/…" path to its absolute form against the host's home
-  // (resolvedHome, above), so it's directly submittable without opening the
-  // tree browser (the server never expands ~). Already-absolute values pass
-  // through; a tilde path stays unresolved until the home listing arrives.
-  const resolvedWorkspace = resolveWorkspacePath(workspace, resolvedHome);
-  const workspaceTrimmed = resolvedWorkspace ?? normalizeWorkspacePath(workspace) ?? "";
-  const workspaceValid = resolvedWorkspace !== null;
-
   function commitWorkspacePath(path: string): void {
-    handleWorkspaceChange(path);
+    directory.onChange(path);
     setBrowsing(true);
   }
 
@@ -259,7 +322,11 @@ function SupportedSwitchHostDialog({
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent data-testid="switch-host-dialog" className="flex flex-col gap-4 sm:max-w-lg">
+      <DialogContent
+        data-testid="switch-host-dialog"
+        onCloseAutoFocus={returnFocusOnClose(returnFocusRef)}
+        className="flex flex-col gap-4 sm:max-w-lg"
+      >
         <DialogHeader>
           <DialogTitle>Switch host</DialogTitle>
           <DialogDescription>Move this session to another connected machine.</DialogDescription>
@@ -301,11 +368,11 @@ function SupportedSwitchHostDialog({
                 <>
                   <WorkspacePathField
                     hostId={selectedHostId}
-                    value={workspace}
-                    onChange={handleWorkspaceChange}
+                    value={directory.workspace}
+                    onChange={directory.onChange}
                     onBrowse={() => setBrowsing((v) => !v)}
                     onCommit={commitWorkspacePath}
-                    recent={recent}
+                    recent={directory.recent}
                     dropdownDisabled={browsing}
                   />
                   <WorkspacePickerDialog
@@ -313,7 +380,7 @@ function SupportedSwitchHostDialog({
                     onOpenChange={setBrowsing}
                     hostId={selectedHostId}
                     initialPath={workspaceTrimmed}
-                    onConfirm={handleWorkspaceChange}
+                    onConfirm={directory.onChange}
                   />
                   <p
                     className="flex items-start gap-1.5 text-xs text-warning"

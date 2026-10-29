@@ -90,18 +90,31 @@ vi.mock("@/hooks/useHosts", () => ({
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostOnline: (id: string | undefined) => useSessionHostOnlineMock(id),
 }));
+const useExecutionTopologyMock = vi.fn();
+vi.mock("@/hooks/useExecutionTopology", () => ({
+  useExecutionTopology: (enabled: boolean, options?: unknown) =>
+    useExecutionTopologyMock(enabled, options),
+}));
 // Stub the switch dialog: it owns its own network/query wiring, so the badge
 // test only cares that it is mounted with the session's current binding.
+const switchDialogProps = vi.fn();
 vi.mock("@/shell/SwitchHostDialog", () => ({
-  SwitchHostDialog: (props: { currentHostId: string | null }) => (
-    <div data-testid="switch-host-dialog" data-current-host={props.currentHostId ?? ""} />
-  ),
+  SwitchHostDialog: (props: {
+    currentHostId: string | null;
+    returnFocusRef?: { current: HTMLElement | null };
+  }) => {
+    switchDialogProps(props);
+    return <div data-testid="switch-host-dialog" data-current-host={props.currentHostId ?? ""} />;
+  },
 }));
 
 beforeEach(() => {
   useSessionMock.mockReset();
   useHostsMock.mockReset();
   useSessionHostOnlineMock.mockReset();
+  switchDialogProps.mockReset();
+  useExecutionTopologyMock.mockReset();
+  useExecutionTopologyMock.mockReturnValue({ data: { configured: false } });
   // Sensible defaults; each test overrides what it cares about.
   useSessionMock.mockReturnValue({
     session: { hostId: "host_a1b2" },
@@ -588,6 +601,40 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("host-badge").textContent).toBe("host_x9, status unknown");
   });
 
+  it("offers the model-or-account switch once the registry is known to be configured", async () => {
+    useExecutionTopologyMock.mockReturnValue({ data: { configured: true } });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.keyDown(screen.getByTestId("composer-host-select"), { key: "ArrowDown" });
+    const item = await screen.findByTestId("composer-host-switch");
+    expect(item.textContent).toBe("Switch model or account…");
+    fireEvent.click(item);
+    expect(
+      (await screen.findByTestId("switch-host-dialog")).getAttribute("data-current-host"),
+    ).toBe("host_a1b2");
+    // The menu has closed by now, so the dialog returns focus to its trigger.
+    expect(switchDialogProps.mock.lastCall?.[0].returnFocusRef?.current).toBe(
+      screen.getByTestId("composer-host-select"),
+    );
+  });
+
+  it("keeps the host-switch wording without a registry, and reads it only when the menu opens", async () => {
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    expect(useExecutionTopologyMock).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByTestId("composer-host-select"), { key: "ArrowDown" });
+    expect((await screen.findByTestId("composer-host-switch")).textContent).toBe("Switch host…");
+    // Only `configured` is needed here, so the cheap read-once query is used.
+    expect(useExecutionTopologyMock).toHaveBeenCalledWith(true, undefined);
+  });
+
+  it("passes the session's directory so the dialog can keep it on the new host", async () => {
+    useSessionMock.mockReturnValue({
+      session: { hostId: "host_a1b2", workspace: "/home/alice/repo" },
+    });
+    render(<HostBadge sessionId="conv_1" />);
+    fireEvent.click(screen.getByTestId("host-badge"));
+    expect(switchDialogProps.mock.lastCall?.[0].currentWorkspace).toBe("/home/alice/repo");
+  });
+
   it("opens the switch dialog on the current binding when the host name is clicked", () => {
     render(<HostBadge sessionId="conv_1" />);
     const badge = screen.getByTestId("host-badge");
@@ -599,6 +646,8 @@ describe("HostBadge", () => {
     expect(screen.getByTestId("switch-host-dialog").getAttribute("data-current-host")).toBe(
       "host_a1b2",
     );
+    // Not a Radix trigger: the dialog must hand focus back to the badge.
+    expect(switchDialogProps.mock.lastCall?.[0].returnFocusRef?.current).toBe(badge);
   });
 
   it("keeps a sandbox session's badge passive — the server owns its placement", () => {

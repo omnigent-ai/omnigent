@@ -35,6 +35,7 @@ from omnigent.db.account_authority import AccountAuthority, require_active_accou
 from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
+    ACCOUNT_TRANSITION_MAX_BYTES,
     LABEL_VALUE_MAX_LEN,
     SqlAgent,
     SqlComment,
@@ -208,6 +209,17 @@ class _RowCountResult(Protocol):
     rowcount: int
 
 
+def _encode_account_transition(marker: dict[str, Any]) -> str:
+    """Serialize a pending account move, refusing a value over the column cap.
+
+    ``json.dumps`` escapes non-ASCII, so the byte length equals the character length.
+    """
+    encoded = json.dumps(marker, separators=(",", ":"))
+    if len(encoded) > ACCOUNT_TRANSITION_MAX_BYTES:
+        raise OmnigentError("Account change is too large", code=ErrorCode.INVALID_INPUT)
+    return encoded
+
+
 def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
@@ -254,6 +266,11 @@ def _to_conversation(
         agent_id=row.agent_id,
         runner_id=meta.runner_id if meta else None,
         host_id=meta.host_id if meta else None,
+        account_transition=(
+            json.loads(meta.account_transition)
+            if meta and meta.account_transition is not None
+            else None
+        ),
         labels=labels if labels is not None else {},
         session_state=session_state,
         session_usage=session_usage,
@@ -3973,6 +3990,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
+                .where(SqlConversationMetadata.account_transition.is_(None))
                 .values(runner_id=runner_id)
             )
             result = cast(_RowCountResult, session.execute(stmt))
@@ -4169,11 +4187,17 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if meta.account_transition is not None:
+                raise OmnigentError("An account change is pending", code=ErrorCode.CONFLICT)
             if expected_runner_id is None:
                 meta.runner_id = runner_id
             else:
@@ -4198,6 +4222,227 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
+
+    def begin_account_transition(
+        self,
+        conversation_id: str,
+        transition: dict[str, Any],
+        *,
+        expected_runner_id: str | None,
+    ) -> Conversation:
+        """
+        Persist a destination and detach the runner in one transaction.
+
+        See :meth:`ConversationStore.begin_account_transition`.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition: Destination to record.
+        :param expected_runner_id: Runner the caller observed.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If the conversation does not exist.
+        :raises OmnigentError: ``CONFLICT`` when the session changed, is busy,
+            or another destination is already pending.
+        """
+
+        def write(session: Session) -> None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            if meta.account_transition is not None:
+                existing = json.loads(meta.account_transition)
+                if any(
+                    existing.get(key) != transition.get(key)
+                    for key in ("account_id", "host_id", "harness", "model", "effort", "workspace")
+                ):
+                    raise OmnigentError(
+                        "Another account change is pending; finish or cancel it first",
+                        code=ErrorCode.CONFLICT,
+                    )
+                return
+            if meta.runner_id != expected_runner_id or meta.live_status in {
+                encode_session_live_status("running"),
+                encode_session_live_status("waiting"),
+            }:
+                raise OmnigentError("Session changed or is busy", code=ErrorCode.CONFLICT)
+            marker = dict(transition)
+            marker["previous_host_id"] = meta.host_id
+            marker["previous_runner_id"] = meta.runner_id
+            meta.account_transition = _encode_account_transition(marker)
+            meta.runner_id = None
+
+        run_write_transaction(self._session_immediate, "begin_account_transition", write)
+        result = self.get_conversation(conversation_id)
+        if result is None:
+            raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+        return result
+
+    @staticmethod
+    def _transition_marker(meta: SqlConversationMetadata | None) -> dict[str, Any]:
+        """Decode the pending marker, or an empty dict when none is stored."""
+        if meta is None or not meta.account_transition:
+            return {}
+        return json.loads(meta.account_transition)
+
+    def bind_account_launch(
+        self,
+        conversation_id: str,
+        transition_id: str,
+        runner_id: str,
+        host_id: str,
+        workspace: str,
+        git_branch: str | None = None,
+    ) -> bool:
+        """
+        Persist a launch attempt and its host binding in one transaction.
+
+        See :meth:`ConversationStore.bind_account_launch`.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param runner_id: Runner id of this attempt.
+        :param host_id: Destination host.
+        :param workspace: Destination working directory.
+        :param git_branch: Branch of a worktree created for this launch.
+        :returns: ``False`` when the attempt is no longer allowed.
+        """
+
+        def write(session: Session) -> bool:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            marker = self._transition_marker(meta)
+            if (
+                meta is None
+                or marker.get("id") != transition_id
+                or marker.get("host_id") != host_id
+                or meta.runner_id
+            ):
+                return False
+            marker["launch_runner_id"] = runner_id
+            meta.account_transition = _encode_account_transition(marker)
+            changed = meta.host_id != host_id or meta.workspace != workspace
+            meta.runner_id, meta.host_id, meta.workspace = runner_id, host_id, workspace
+            if changed or git_branch is not None:
+                meta.git_branch = git_branch
+            return True
+
+        return run_write_transaction(self._session_immediate, "bind_account_launch", write)
+
+    def reset_account_launch(
+        self, conversation_id: str, transition_id: str, expected_runner_id: str
+    ) -> None:
+        """
+        Release only the recorded attempt that the host confirmed stopped.
+
+        See :meth:`ConversationStore.reset_account_launch`.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param expected_runner_id: The attempt being released.
+        :raises OmnigentError: ``CONFLICT`` when the marker or binding changed.
+        """
+
+        def write(session: Session) -> None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            marker = self._transition_marker(meta)
+            if meta is None or marker.get("id") != transition_id:
+                raise OmnigentError("Account change was replaced", code=ErrorCode.CONFLICT)
+            if marker.get("launch_runner_id") != expected_runner_id or (
+                meta.runner_id is not None and meta.runner_id != expected_runner_id
+            ):
+                raise OmnigentError("Account launch binding changed", code=ErrorCode.CONFLICT)
+            meta.runner_id = None
+
+        run_write_transaction(self._session_immediate, "reset_account_launch", write)
+
+    def finish_account_transition(
+        self,
+        conversation_id: str,
+        transition_id: str,
+        runner_id: str,
+    ) -> None:
+        """
+        Clear the marker once the matching destination launch is acknowledged.
+
+        See :meth:`ConversationStore.finish_account_transition`.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param runner_id: The acknowledged launch's runner.
+        :raises OmnigentError: ``CONFLICT`` when the marker or binding changed.
+        """
+
+        def write(session: Session) -> None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            marker = self._transition_marker(meta)
+            if meta is None or marker.get("id") != transition_id or meta.runner_id != runner_id:
+                raise OmnigentError("Account change was replaced", code=ErrorCode.CONFLICT)
+            meta.account_transition = None
+
+        run_write_transaction(self._session_immediate, "finish_account_transition", write)
+
+    def abandon_account_transition(
+        self,
+        conversation_id: str,
+        transition_id: str,
+        *,
+        expected_launch_runner_id: str | None,
+    ) -> Conversation:
+        """
+        Drop a pending marker and leave the session detached.
+
+        See :meth:`ConversationStore.abandon_account_transition`.
+
+        :param conversation_id: Session/conversation identifier.
+        :param transition_id: ``id`` of the pending transition.
+        :param expected_launch_runner_id: The launch attempt the caller stopped,
+            or ``None`` when no attempt was recorded.
+        :returns: The updated :class:`Conversation`.
+        :raises ConversationNotFoundError: If the conversation does not exist.
+        :raises OmnigentError: ``CONFLICT`` when the marker or its launch attempt changed.
+        """
+
+        def write(session: Session) -> None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                raise ConversationNotFoundError(
+                    f"conversation {conversation_id!r} does not exist",
+                )
+            marker = self._transition_marker(meta)
+            if (
+                marker.get("id") != transition_id
+                or marker.get("launch_runner_id") != expected_launch_runner_id
+                or meta.runner_id not in (None, expected_launch_runner_id)
+            ):
+                raise OmnigentError("Account change was replaced", code=ErrorCode.CONFLICT)
+            meta.account_transition = None
+            meta.runner_id = None
+
+        run_write_transaction(self._session_immediate, "abandon_account_transition", write)
+        result = self.get_conversation(conversation_id)
+        if result is None:
+            raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
+        return result
 
     def clear_runner_id(self, conversation_id: str) -> Conversation:
         """
@@ -4229,7 +4474,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             labels = _fetch_labels(ap_sess, conversation_id)
         return _to_conversation(ap_row, meta, labels)
 
-    def clear_host_binding(self, conversation_id: str) -> Conversation:
+    def clear_host_binding(
+        self, conversation_id: str, *, expected_runner_id: str | None = None
+    ) -> Conversation:
         """
         NULL ``host_id``/``workspace``/``git_branch``/``runner_id`` together.
 
@@ -4240,17 +4487,26 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param expected_runner_id: Clear only while this runner is still bound.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             exists for ``conversation_id``.
+        :raises OmnigentError: ``CONFLICT`` when ``expected_runner_id`` no
+            longer matches.
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
+            if expected_runner_id is not None and meta.runner_id != expected_runner_id:
+                raise OmnigentError("Runner launch binding changed", code=ErrorCode.CONFLICT)
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None

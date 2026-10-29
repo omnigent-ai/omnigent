@@ -249,6 +249,7 @@ class Conversation:
     reasoning_effort: str | None = None
     model_override: str | None = None
     inference_snapshot: dict[str, Any] | None = None
+    account_transition: dict[str, Any] | None = None
     reported_model: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
