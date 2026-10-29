@@ -1,15 +1,8 @@
-import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
-import {
-  AppWindowIcon,
-  ChevronDownIcon,
-  CheckIcon,
-  CodeIcon,
-  FolderOpenIcon,
-  TerminalIcon,
-} from "lucide-react";
-import { toast } from "sonner";
-import { authenticatedFetch } from "@/lib/identity";
+import { useSyncExternalStore, type ReactNode } from "react";
+import { ChevronDownIcon, CheckIcon, FolderOpenIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { CursorIcon } from "@/components/icons/CursorIcon";
+import { VSCodeIcon } from "@/components/icons/VSCodeIcon";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
@@ -17,17 +10,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  getFileOpenApps,
-  getFileOpenSshHost,
-  openFileInApp,
-  openRemoteFileInApp,
-  supportsFileOpen,
-  supportsFileOpenSshDiscovery,
-  supportsFileReveal,
-  supportsRemoteFileOpen,
-  type FileOpenApp,
-} from "@/lib/nativeBridge";
+import { useHostSshTarget } from "@/hooks/useHostSshTarget";
+import { CODE_EDITORS, editorLink, launchEditorLink } from "@/lib/editorLinks";
+import { isAndroidShell, isIOSShell, supportsFileReveal } from "@/lib/nativeBridge";
 import {
   revealInFileManager,
   revealLabel,
@@ -36,19 +21,19 @@ import {
 } from "./RevealInFileManager";
 
 const APP_PREFERENCE_EVENT = "omnigent:open-in-app-changed";
-const preferenceKey = (remote: boolean) => `omnigent:open-in-app:${remote ? "remote" : "local"}`;
+const PREFERENCE_KEY = "omnigent:default-code-editor";
 
-function readPreferredApp(remote: boolean): string {
+function readPreferredApp(): string {
   try {
-    return localStorage.getItem(preferenceKey(remote)) ?? "";
+    return localStorage.getItem(PREFERENCE_KEY) ?? "";
   } catch {
     return "";
   }
 }
 
-function rememberApp(remote: boolean, appId: string) {
+function rememberApp(appId: string) {
   try {
-    localStorage.setItem(preferenceKey(remote), appId);
+    localStorage.setItem(PREFERENCE_KEY, appId);
   } catch {
     // Opening still works if this browser cannot save preferences.
   }
@@ -64,29 +49,6 @@ function subscribeToAppPreference(listener: () => void) {
   };
 }
 
-async function discoverSshHost(hostId: string): Promise<string | null> {
-  const cached = await getFileOpenSshHost(hostId);
-  if (cached) return cached;
-  try {
-    const response = await authenticatedFetch(
-      `/v1/hosts/${encodeURIComponent(hostId)}?require_live=true`,
-      { signal: AbortSignal.timeout(3000) },
-    );
-    if (response.ok) {
-      const detail = await response.json();
-      if (
-        Array.isArray(detail.ssh_host_key_fingerprints) &&
-        detail.ssh_host_key_fingerprints.length
-      ) {
-        return getFileOpenSshHost(hostId, detail.ssh_host_key_fingerprints);
-      }
-    }
-  } catch {
-    // Unavailable metadata leaves remote opening hidden.
-  }
-  return null;
-}
-
 interface OpenInAction {
   key: string;
   label: string;
@@ -99,102 +61,39 @@ interface OpenInAction {
 export function useOpenInActions(path: string | null, directory = false): OpenInAction[] {
   const localTarget = useLocalFileTarget(path);
   const target = useHostFileTarget(path);
-  const remote = !localTarget;
-  const preferredApp = useSyncExternalStore(
-    subscribeToAppPreference,
-    () => readPreferredApp(remote),
-    () => "",
-  );
-  const hostId = target?.hostId;
-  const available =
-    !!target &&
-    (remote ? supportsRemoteFileOpen() && supportsFileOpenSshDiscovery() : supportsFileOpen());
-  const [apps, setApps] = useState<FileOpenApp[]>([]);
-  const [connection, setConnection] = useState<{ hostId: string; alias: string } | null>(null);
-  const sshHost = connection && connection.hostId === hostId ? connection.alias : null;
-  useEffect(() => {
-    if (!available || !remote || !hostId) return;
-    let cancelled = false;
-    void discoverSshHost(hostId).then((alias) => {
-      if (!cancelled) setConnection(alias ? { hostId, alias } : null);
+  const mobile = isAndroidShell() || isIOSShell();
+  const sshTarget = useHostSshTarget(!mobile && !localTarget ? (target?.hostId ?? null) : null);
+  const preferred = useSyncExternalStore(subscribeToAppPreference, readPreferredApp, () => "");
+  if (mobile || !target || (!localTarget && !sshTarget)) return [];
+  const actions: OpenInAction[] = [];
+  for (const editor of CODE_EDITORS) {
+    const url = editorLink(editor.id, target.path, localTarget ? null : sshTarget, directory);
+    if (!url) continue;
+    actions.push({
+      key: editor.id,
+      label: editor.label,
+      icon: (
+        <span aria-hidden="true" className="inline-flex size-4 shrink-0">
+          {editor.id === "cursor" ? <CursorIcon size={16} /> : <VSCodeIcon size={16} />}
+        </span>
+      ),
+      active: false,
+      onSelect: () => {
+        rememberApp(editor.id);
+        launchEditorLink(url);
+      },
     });
-    return () => {
-      cancelled = true;
-    };
-  }, [available, remote, hostId]);
-  useEffect(() => {
-    if (!available) return;
-    let cancelled = false;
-    void getFileOpenApps().then((result) => {
-      if (!cancelled) setApps(result);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [available]);
-
-  const eligibleApps = remote
-    ? apps.filter((app) => app.id === "vscode" || app.id === "cursor")
-    : apps;
-  const actions =
-    !available || !target || (remote && !sshHost)
-      ? []
-      : eligibleApps.map((app) => ({
-          key: app.id,
-          label: app.label,
-          icon: app.icon ? (
-            <img src={app.icon} alt="" className="size-4 shrink-0 object-contain" />
-          ) : app.directory ? (
-            <TerminalIcon className="size-4" />
-          ) : app.id === "default" ? (
-            <AppWindowIcon className="size-4" />
-          ) : (
-            <CodeIcon className="size-4" />
-          ),
-          active: false,
-          onSelect: () => {
-            rememberApp(remote, app.id);
-            if (remote && sshHost) {
-              void discoverSshHost(target.hostId).then(async (alias) => {
-                setConnection((current) =>
-                  current?.hostId === target.hostId
-                    ? alias
-                      ? { hostId: target.hostId, alias }
-                      : null
-                    : current,
-                );
-                const ok =
-                  alias &&
-                  (await openRemoteFileInApp(target.hostId, target.path, app.id, alias, directory));
-                if (!ok)
-                  toast.error(
-                    `Couldn't open this remote ${directory ? "folder" : "file"} in ${app.label}`,
-                  );
-              });
-              return;
-            }
-            void openFileInApp(target.hostId, target.path, app.id).then((ok) => {
-              if (!ok)
-                toast.error(`Couldn't open this ${directory ? "folder" : "file"} in ${app.label}`);
-            });
-          },
-        }));
-  if (available && localTarget && supportsFileReveal()) {
+  }
+  if (localTarget && supportsFileReveal()) {
     actions.push({
       key: "reveal",
       label: revealLabel(directory),
       icon: <FolderOpenIcon className="size-4" />,
       active: false,
-      onSelect: () => {
-        rememberApp(false, "reveal");
-        revealInFileManager(localTarget);
-      },
+      onSelect: () => revealInFileManager(localTarget),
     });
   }
-  const defaultAction =
-    actions.find((action) => action.key === preferredApp) ??
-    actions.find((action) => action.key === "vscode" || action.key === "cursor") ??
-    actions[0];
+  const defaultAction = actions.find((action) => action.key === preferred) ?? actions[0];
   for (const action of actions) action.active = action === defaultAction;
   return actions;
 }

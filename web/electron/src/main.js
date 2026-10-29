@@ -38,7 +38,6 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
-const { registerFileOpen } = require("./fileOpen");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -1446,7 +1445,6 @@ function pinWindow(win, origin, attemptToKeep) {
 function setWindowServerUrl(win, serverUrl) {
   const state = windows.get(win);
   if (state) {
-    if (state.serverUrl !== serverUrl) state.fileOpenContext = Symbol("file-open-server");
     if (state.serverUrl && arcaTarget(state.serverUrl) !== arcaTarget(serverUrl)) {
       // Same-origin workspace/mount switches bypass pinWindow's origin teardown.
       state.browserRegistry?.closeAll("server-changed");
@@ -3091,7 +3089,7 @@ async function changeCachedOAuthToken(tokenType) {
  * @param {string} scheme The URL's scheme including the colon,
  *   e.g. ``"vscode:"``.
  */
-async function requestExternalProtocolConsent(win, url, scheme) {
+async function confirmExternalProtocol(win, url, scheme) {
   const pinned = pinnedOrigin(win);
   // The persisted grant applies only when the user is actually ON the
   // pinned server — a foreign page reached via redirect gets a fresh
@@ -3099,7 +3097,8 @@ async function requestExternalProtocolConsent(win, url, scheme) {
   const onPinnedServer = pinned !== null && originOf(win.webContents.getURL()) === pinned;
   const allowedSchemes = loadSettings().allowed_protocols?.[pinned] ?? [];
   if (onPinnedServer && allowedSchemes.includes(scheme)) {
-    return true;
+    void shell.openExternal(url);
+    return;
   }
   const requester = originOf(win.webContents.getURL());
   const { response, checkboxChecked } = await dialog.showMessageBox(win, {
@@ -3114,7 +3113,7 @@ async function requestExternalProtocolConsent(win, url, scheme) {
       : undefined,
     checkboxChecked: false,
   });
-  if (response !== 1) return false;
+  if (response !== 1) return;
   if (checkboxChecked && onPinnedServer) {
     const settings = loadSettings();
     const grants = settings.allowed_protocols ?? {};
@@ -3124,13 +3123,7 @@ async function requestExternalProtocolConsent(win, url, scheme) {
     settings.allowed_protocols = grants;
     saveSettings(settings);
   }
-  return true;
-}
-
-async function confirmExternalProtocol(win, url, scheme) {
-  if (await requestExternalProtocolConsent(win, url, scheme)) {
-    void shell.openExternal(url);
-  }
+  void shell.openExternal(url);
 }
 
 /**
@@ -4667,28 +4660,6 @@ function registerIpc() {
     shell,
     isPinnedOriginSender,
     localHostId: () => omnigentCli.localHostId(),
-  });
-  registerFileOpen({
-    ipcMain,
-    shell,
-    isPinnedOriginSender,
-    localHostId: () => omnigentCli.localHostId(),
-    getServerContext: (event) => {
-      const state = windows.get(BrowserWindow.fromWebContents(event.sender));
-      return state?.fileOpenContext ?? state?.serverUrl ?? null;
-    },
-    confirmDefaultOpen: (event, filePath) => {
-      const win = BrowserWindow.fromWebContents(event.sender);
-      return win
-        ? requestExternalProtocolConsent(win, pathToFileURL(filePath).href, "file:")
-        : false;
-    },
-    getVerifiedSshHost: (event, hostId) => {
-      const win = BrowserWindow.fromWebContents(event.sender);
-      if (!win) return null;
-      const identity = arcaIdentities.get(windowArcaServerUrl(win));
-      return identity?.hostId === hostId ? "arca.ssh" : null;
-    },
   });
 
   registerFolderChooser({

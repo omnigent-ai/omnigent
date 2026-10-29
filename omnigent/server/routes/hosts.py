@@ -995,9 +995,7 @@ def create_hosts_router(
             "gateway_inference": host_registry.gateway_inference(host.host_id),
             "interactive_shells": host_registry.interactive_shells(host.host_id),
             "runners": [],
-            "ssh_host_key_fingerprints": (
-                conn.hello.ssh_host_key_fingerprints if conn is not None else None
-            ),
+            "ssh_target": (conn.hello.ssh_target if conn is not None else None),
         }
         if (
             harness_setup_enabled

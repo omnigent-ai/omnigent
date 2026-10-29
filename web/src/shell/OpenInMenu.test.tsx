@@ -1,46 +1,35 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { toast } from "sonner";
 
-vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
-
-const openFileInApp = vi.fn();
-const getFileOpenApps = vi.fn();
-const revealFile = vi.fn();
-const openRemoteFileInApp = vi.fn();
-const getFileOpenSshHost = vi.fn();
 const fetchHost = vi.fn();
+const open = vi.fn();
+const revealFile = vi.fn();
+let client: QueryClient;
 
 beforeEach(() => {
   vi.resetModules();
   localStorage.clear();
-  openFileInApp.mockReset().mockResolvedValue(true);
+  client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
+  fetchHost
+    .mockReset()
+    .mockImplementation(async () => new Response(JSON.stringify({ ssh_target: "arclet_dev.ssh" })));
+  open.mockReset();
   revealFile.mockReset().mockResolvedValue(true);
-  openRemoteFileInApp.mockReset().mockResolvedValue(true);
-  getFileOpenSshHost.mockReset().mockResolvedValue(null);
-  fetchHost.mockReset().mockResolvedValue({ ok: true, json: async () => ({}) });
   vi.stubGlobal("fetch", fetchHost);
-  getFileOpenApps.mockReset().mockResolvedValue([
-    { id: "vscode", label: "VS Code" },
-    { id: "cursor", label: "Cursor" },
-    { id: "terminal", label: "Terminal", directory: true },
-    { id: "default", label: "Default app" },
-  ]);
+  vi.stubGlobal("open", open);
   vi.stubGlobal("omnigentDesktop", {
     kind: "electron",
-    getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "local" }),
-    getFileOpenApps,
-    openFileInApp,
+    getHostIdentity: async () => ({ cliInstalled: true, hostId: "local" }),
     revealFile,
-    openRemoteFileInApp,
-    getFileOpenSshHost,
   });
 });
 
 afterEach(() => {
   cleanup();
+  client.clear();
   vi.unstubAllGlobals();
-  vi.clearAllMocks();
+  document.querySelectorAll("iframe").forEach((frame) => frame.remove());
 });
 
 function contextFor(sessionHostId: string | null) {
@@ -58,377 +47,174 @@ function contextFor(sessionHostId: string | null) {
 
 async function renderMenu(
   path = "src/main.ts",
-  sessionHostId: string | null = "local",
+  hostId: string | null = "local",
   directory = false,
 ) {
   const { FileViewerContext } = await import("./FileViewerContext");
   const { OpenInMenu } = await import("./OpenInMenu");
-  let context = contextFor(sessionHostId);
+  let context = contextFor(hostId);
+  let isDirectory = directory;
   const tree = (nextPath: string) => (
-    <FileViewerContext.Provider value={context}>
-      <OpenInMenu path={nextPath} directory={directory} />
-    </FileViewerContext.Provider>
+    <QueryClientProvider client={client}>
+      <FileViewerContext.Provider value={context}>
+        <OpenInMenu path={nextPath} directory={isDirectory} />
+      </FileViewerContext.Provider>
+    </QueryClientProvider>
   );
   const view = render(tree(path));
   await act(() => Promise.resolve());
   return {
-    changePath: (nextPath: string) => view.rerender(tree(nextPath)),
-    changeHost: (hostId: string) => {
-      context = contextFor(hostId);
-      view.rerender(tree(path));
+    changeTarget: (nextPath: string, nextHost: string | null, nextDirectory = directory) => {
+      isDirectory = nextDirectory;
+      context = contextFor(nextHost);
+      view.rerender(tree(nextPath));
     },
   };
 }
 
-async function openMenu() {
-  fireEvent.pointerDown(await screen.findByRole("button", { name: "Choose app to open in" }), {
-    button: 0,
-  });
+async function openMenu(index = 0) {
+  fireEvent.pointerDown(
+    (await screen.findAllByRole("button", { name: "Choose app to open in" }))[index],
+    { button: 0 },
+  );
 }
 
-it("opens the default app directly and uses its artwork", async () => {
-  const icon = "data:image/png;base64,aWNvbg==";
-  getFileOpenApps.mockResolvedValue([{ id: "vscode", label: "VS Code", icon }]);
+it("opens the default editor directly using a local deep link and bundled icon", async () => {
   await renderMenu();
   const primary = await screen.findByRole("button", { name: "Open in VS Code" });
-  expect(primary.querySelector("img")).toHaveAttribute("src", icon);
+  expect(primary).toHaveTextContent("Open");
+  expect(primary.querySelector("svg")).not.toBeNull();
   fireEvent.click(primary);
-  expect(openFileInApp).toHaveBeenCalledWith("local", "/workspace/src/main.ts", "vscode");
+  expect(open).toHaveBeenCalledWith(
+    "vscode://file/workspace/src/main.ts",
+    "_blank",
+    "noopener,noreferrer",
+  );
   expect(screen.queryByRole("menu")).toBeNull();
 });
 
-it.each([
-  ["local", false],
-  ["local", true],
-  ["remote", false],
-  ["remote", true],
-])(
-  "opens both child-session controls on the inherited %s host (late: %s)",
-  async (hostId, late) => {
-    const { setSessionHost, setSessionParent } = await import("@/lib/sessionHost");
-    setSessionParent("conv_1", "parent");
-    getFileOpenSshHost.mockResolvedValue("arca.ssh");
-    if (!late) setSessionHost("parent", hostId);
-    await renderMenu("/workspace", null, true);
-    await renderMenu("src/main.ts", null);
-    if (late) {
-      expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
-      await act(() => setSessionHost("parent", hostId));
-    }
-    const buttons = await screen.findAllByRole("button", { name: "Open in VS Code" });
-    expect(buttons).toHaveLength(2);
-    buttons.forEach((button) => fireEvent.click(button));
-    if (hostId === "local") {
-      expect(openFileInApp.mock.calls).toEqual([
-        [hostId, "/workspace", "vscode"],
-        [hostId, "/workspace/src/main.ts", "vscode"],
-      ]);
-      expect(openRemoteFileInApp).not.toHaveBeenCalled();
-    } else {
-      await waitFor(() =>
-        expect(openRemoteFileInApp.mock.calls).toEqual([
-          [hostId, "/workspace", "vscode", "arca.ssh", true],
-          [hostId, "/workspace/src/main.ts", "vscode", "arca.ssh", false],
-        ]),
-      );
-      expect(openFileInApp).not.toHaveBeenCalled();
-    }
+it.each(["arca.ssh", "arclet_dev.ssh", "me@devbox"])(
+  "opens remote folders/files through %s",
+  async (target) => {
+    fetchHost.mockImplementation(async () => new Response(JSON.stringify({ ssh_target: target })));
+    const { changeTarget } = await renderMenu("/workspace", "remote", true);
+    fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+    expect(open.mock.calls[0][0]).toBe(
+      `vscode://vscode-remote/ssh-remote+${encodeURIComponent(target)}/workspace`,
+    );
+    changeTarget("src/a #.ts", "remote", false);
+    await openMenu();
+    expect(screen.queryByRole("menuitem", { name: /Finder|file manager/ })).toBeNull();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Cursor" }));
+    expect(open.mock.calls[1][0]).toBe(
+      `cursor://vscode-remote/ssh-remote+${encodeURIComponent(target)}/workspace/src/a%20%23.ts:1:1`,
+    );
+    expect(fetchHost.mock.calls[0][0]).toContain("/v1/hosts/remote?require_live=true");
   },
 );
 
-it("shares the selected default between folder and file buttons and remembers it", async () => {
+it("opens remote browser links without a native bridge", async () => {
+  vi.stubGlobal("omnigentDesktop", undefined);
+  await renderMenu("/workspace", "remote", true);
+  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+  expect(document.querySelector("iframe")).toHaveAttribute(
+    "src",
+    "vscode://vscode-remote/ssh-remote+arclet_dev.ssh/workspace",
+  );
+  expect(open).not.toHaveBeenCalled();
+});
+
+it("shares and remembers the editor preference across both controls", async () => {
   await renderMenu("/workspace", "local", true);
-  await renderMenu("src/main.ts");
-  fireEvent.pointerDown(screen.getAllByRole("button", { name: "Choose app to open in" })[0], {
-    button: 0,
-  });
-  expect(openFileInApp).not.toHaveBeenCalled();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
+  await renderMenu();
+  await openMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name: "Cursor" }));
   expect(screen.getAllByRole("button", { name: "Open in Cursor" })).toHaveLength(2);
   fireEvent.click(screen.getAllByRole("button", { name: "Open in Cursor" })[1]);
-  expect(openFileInApp).toHaveBeenLastCalledWith("local", "/workspace/src/main.ts", "cursor");
+  expect(open.mock.calls.at(-1)?.[0]).toBe("cursor://file/workspace/src/main.ts");
+  expect(localStorage.getItem("omnigent:default-code-editor")).toBe("cursor");
   cleanup();
   await renderMenu();
-  expect(await screen.findByRole("button", { name: "Open in Cursor" })).toBeInTheDocument();
+  expect(await screen.findByRole("button", { name: "Open in Cursor" })).toBeVisible();
 });
 
-it("keeps remote and local defaults separate and ignores unavailable choices", async () => {
-  localStorage.setItem("omnigent:open-in-app:local", "terminal");
-  localStorage.setItem("omnigent:open-in-app:remote", "removed-editor");
-  getFileOpenSshHost.mockResolvedValue("arca.ssh");
-  await renderMenu("src/main.ts", "remote");
-  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-  await waitFor(() =>
-    expect(openRemoteFileInApp).toHaveBeenCalledWith(
-      "remote",
-      "/workspace/src/main.ts",
-      "vscode",
-      "arca.ssh",
-      false,
-    ),
-  );
-  expect(localStorage.getItem("omnigent:open-in-app:local")).toBe("terminal");
-});
+it.each(["local", "remote"])(
+  "resolves a late inherited %s host for both controls",
+  async (hostId) => {
+    const { setSessionHost, setSessionParent } = await import("@/lib/sessionHost");
+    setSessionParent("conv_1", "parent");
+    await renderMenu("/workspace", null, true);
+    await renderMenu("src/main.ts", null);
+    expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
+    await act(() => setSessionHost("parent", hostId));
+    const buttons = await screen.findAllByRole("button", { name: "Open in VS Code" });
+    expect(buttons).toHaveLength(2);
+    buttons.forEach((button) => fireEvent.click(button));
+    const location = hostId === "local" ? "file" : "vscode-remote/ssh-remote+arclet_dev.ssh";
+    expect(open.mock.calls.map(([url]) => url)).toEqual([
+      `vscode://${location}/workspace`,
+      `vscode://${location}/workspace/src/main.ts${hostId === "remote" ? ":1:1" : ""}`,
+    ]);
+  },
+);
 
-it("opens the selected app even when saving the default fails", async () => {
-  const save = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-    throw new Error("storage unavailable");
-  });
-  try {
-    await renderMenu();
-    await openMenu();
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
-    expect(openFileInApp).toHaveBeenCalledWith("local", "/workspace/src/main.ts", "cursor");
-  } finally {
-    save.mockRestore();
-  }
-});
-
-it("opens the current file in an editor and follows file navigation", async () => {
-  const { changePath } = await renderMenu();
-  await openMenu();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "VS Code" }));
-  expect(openFileInApp).toHaveBeenCalledWith("local", "/workspace/src/main.ts", "vscode");
-  changePath("/other folder/notes.md");
-  await openMenu();
-  fireEvent.click(screen.getByRole("menuitem", { name: "Default app" }));
-  expect(openFileInApp).toHaveBeenLastCalledWith("local", "/other folder/notes.md", "default");
-});
-
-it("opens the browsed folder in a terminal or the file manager", async () => {
+it("keeps local reveal available", async () => {
   await renderMenu("/workspace/packages", "local", true);
-  await openMenu();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "Terminal" }));
-  expect(openFileInApp).toHaveBeenCalledWith("local", "/workspace/packages", "terminal");
   await openMenu();
   fireEvent.click(screen.getByRole("menuitem", { name: /^Open in / }));
   expect(revealFile).toHaveBeenCalledWith("local", "/workspace/packages");
 });
 
-it.each(["browser", "old shell", "partial bridge", "remote host on old shell"])(
-  "hides unavailable actions for %s",
-  async (mode) => {
-    if (mode === "browser") vi.stubGlobal("omnigentDesktop", undefined);
-    if (mode !== "browser") {
-      vi.stubGlobal("omnigentDesktop", {
-        kind: "electron",
-        getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "local" }),
-        revealFile,
-        ...(mode !== "old shell" ? { getFileOpenApps } : {}),
-        ...(mode === "remote host on old shell" ? { openFileInApp } : {}),
-      });
-    }
-    await renderMenu("src/main.ts", mode === "remote host on old shell" ? "remote" : "local");
+it.each([undefined, null, "", "bad target"])(
+  "hides unknown remote destinations: %j",
+  async (ssh_target) => {
+    fetchHost.mockImplementation(async () => new Response(JSON.stringify({ ssh_target })));
+    await renderMenu("/workspace", "remote", true);
+    await waitFor(() => expect(client.isFetching()).toBe(0));
     expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
-    expect(getFileOpenApps).not.toHaveBeenCalled();
   },
 );
 
-it("opens a verified Arca workspace through SSH and hides local-only apps", async () => {
-  getFileOpenSshHost.mockResolvedValue("arca.ssh");
-  await renderMenu("/home/user/project", "remote", true);
-  await openMenu();
-  expect(screen.queryByRole("menuitem", { name: "Terminal" })).toBeNull();
-  expect(screen.queryByRole("menuitem", { name: "Default app" })).toBeNull();
-  expect(screen.queryByRole("menuitem", { name: /Finder|file manager/ })).toBeNull();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
-  await waitFor(() =>
-    expect(openRemoteFileInApp).toHaveBeenCalledWith(
-      "remote",
-      "/home/user/project",
-      "cursor",
-      "arca.ssh",
-      true,
-    ),
+it("clears disconnected targets and recovers after a host update", async () => {
+  await renderMenu("/workspace", "remote", true);
+  expect(await screen.findByRole("button", { name: "Open in VS Code" })).toBeVisible();
+  fetchHost.mockImplementation(async () => new Response("", { status: 409 }));
+  await act(() => client.invalidateQueries({ queryKey: ["hosts"] }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull());
+  fetchHost.mockImplementation(
+    async () => new Response(JSON.stringify({ ssh_target: "arclet_new.ssh" })),
   );
-  expect(openFileInApp).not.toHaveBeenCalled();
-  expect(screen.queryByRole("dialog")).toBeNull();
-  expect(fetchHost).not.toHaveBeenCalled();
+  await act(() => client.invalidateQueries({ queryKey: ["hosts"] }));
+  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+  expect(open.mock.calls.at(-1)?.[0]).toBe(
+    "vscode://vscode-remote/ssh-remote+arclet_new.ssh/workspace",
+  );
 });
 
-it("discovers an existing Arca connection from host fingerprints without prompting", async () => {
-  const fingerprints = ["SHA256:LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ"];
-  fetchHost.mockResolvedValue({
-    ok: true,
-    json: async () => ({ ssh_host_key_fingerprints: fingerprints }),
-  });
-  getFileOpenSshHost.mockImplementation((_host, keys) => Promise.resolve(keys ? "arca.ssh" : null));
-  await renderMenu("/home/user/project", "remote", true);
-  await openMenu();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
-  await waitFor(() =>
-    expect(openRemoteFileInApp).toHaveBeenCalledWith(
-      "remote",
-      "/home/user/project",
-      "cursor",
-      "arca.ssh",
-      true,
-    ),
-  );
-  expect(fetchHost).toHaveBeenCalledWith(
-    "/v1/hosts/remote?require_live=true",
-    expect.objectContaining({ signal: expect.any(AbortSignal) }),
-  );
-  expect(getFileOpenSshHost).toHaveBeenLastCalledWith("remote", fingerprints);
-  expect(screen.queryByRole("dialog")).toBeNull();
-});
-
-it.each(["primary", "menu"])(
-  "refreshes expired SSH discovery for the %s action",
-  async (action) => {
-    getFileOpenSshHost.mockResolvedValue("arca.ssh");
-    await renderMenu("src/main.ts", "remote");
-    const select = async () => {
-      if (action === "menu") {
-        await openMenu();
-        fireEvent.click(await screen.findByRole("menuitem", { name: "VS Code" }));
-      } else {
-        fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
-      }
-    };
-
-    const fingerprints = ["SHA256:DcVKDkNT1trsHMeIduuDIEvYPWDlTq3PqsRW++VXXzc"];
-    getFileOpenSshHost.mockImplementation((_host, keys) =>
-      Promise.resolve(keys ? "arca_new.ssh" : null),
-    );
-    let provideMetadata!: (response: unknown) => void;
-    fetchHost.mockReturnValueOnce(
-      new Promise((resolve) => {
-        provideMetadata = resolve;
-      }),
-    );
-    await select();
-    await waitFor(() => expect(fetchHost).toHaveBeenCalledTimes(1));
-    expect(fetchHost).toHaveBeenCalledWith(
-      "/v1/hosts/remote?require_live=true",
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(openRemoteFileInApp).not.toHaveBeenCalled();
-    await act(() =>
-      provideMetadata({
-        ok: true,
-        json: async () => ({ ssh_host_key_fingerprints: fingerprints }),
-      }),
-    );
-    await waitFor(() =>
-      expect(openRemoteFileInApp).toHaveBeenCalledWith(
-        "remote",
-        "/workspace/src/main.ts",
-        "vscode",
-        "arca_new.ssh",
-        false,
-      ),
-    );
-    expect(getFileOpenSshHost).toHaveBeenLastCalledWith("remote", fingerprints);
-
-    getFileOpenSshHost.mockResolvedValue(null);
-    fetchHost.mockRejectedValue(new Error("Host unavailable"));
-    await select();
-    await waitFor(() =>
-      expect(toast.error).toHaveBeenCalledWith("Couldn't open this remote file in VS Code"),
-    );
-    expect(openRemoteFileInApp).toHaveBeenCalledTimes(1);
-    expect(openFileInApp).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
-  },
-);
-
-it.each(["old server", "unreachable", "unmatched", "no discovery bridge"])(
-  "hides remote opening when discovery is %s",
-  async (mode) => {
-    if (mode === "unreachable") fetchHost.mockRejectedValue(new Error("timeout"));
-    if (mode === "unmatched")
-      fetchHost.mockResolvedValue({
-        ok: true,
-        json: async () => ({
-          ssh_host_key_fingerprints: ["SHA256:sjpqhDnA3eVRWJPnyQweMjO4YW5jRHDyDcSSi882Cbw"],
-        }),
-      });
-    if (mode === "no discovery bridge")
-      vi.stubGlobal("omnigentDesktop", {
-        kind: "electron",
-        getFileOpenApps,
-        openRemoteFileInApp,
-        getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "local" }),
-      });
-    await renderMenu("src/main.ts", "remote");
-    await act(() => Promise.resolve());
-    expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(openRemoteFileInApp).not.toHaveBeenCalled();
-    if (mode === "no discovery bridge") expect(fetchHost).not.toHaveBeenCalled();
-  },
-);
-
-it("waits for SSH discovery before showing the remote picker", async () => {
-  let complete!: (alias: string | null) => void;
-  getFileOpenSshHost.mockImplementation(
+it("does not reuse a pending destination when switching hosts", async () => {
+  let finish!: (response: Response) => void;
+  fetchHost.mockImplementation(
     () =>
-      new Promise((resolve) => {
-        complete = resolve;
+      new Promise<Response>((resolve) => {
+        finish = resolve;
       }),
   );
-  await renderMenu("src/main.ts", "remote");
+  const { changeTarget } = await renderMenu("/workspace", "first", true);
+  await waitFor(() => expect(fetchHost).toHaveBeenCalled());
+  fetchHost.mockImplementation(
+    async () => new Response(JSON.stringify({ ssh_target: "arclet_second.ssh" })),
+  );
+  changeTarget("/second", "second");
+  await act(() => finish(new Response(JSON.stringify({ ssh_target: "arclet_first.ssh" }))));
+  fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
+  expect(open.mock.calls[0][0]).toBe("vscode://vscode-remote/ssh-remote+arclet_second.ssh/second");
+});
+
+it.each(["ios", "android"])("hides desktop editor choices in the %s shell", async (kind) => {
+  vi.stubGlobal("omnigentDesktop", undefined);
+  vi.stubGlobal("omnigentNative", { kind });
+  await renderMenu("/workspace", "remote", true);
   expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
-  await act(() => complete("arca.ssh"));
-  getFileOpenSshHost.mockResolvedValue("arca.ssh");
-  await openMenu();
-  expect(screen.queryByRole("menuitem", { name: "SSH connection…" })).toBeNull();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
-  await waitFor(() =>
-    expect(openRemoteFileInApp).toHaveBeenCalledWith(
-      "remote",
-      "/workspace/src/main.ts",
-      "cursor",
-      "arca.ssh",
-      false,
-    ),
-  );
-});
-
-it("ignores stale SSH discovery when the session changes hosts", async () => {
-  let finishOld!: (alias: string | null) => void;
-  getFileOpenSshHost.mockImplementation((hostId) =>
-    hostId === "remote"
-      ? new Promise((resolve) => {
-          finishOld = resolve;
-        })
-      : Promise.resolve(null),
-  );
-  const { changeHost } = await renderMenu("src/main.ts", "remote");
-  changeHost("other");
-  await act(() => finishOld("arca.ssh"));
-  expect(screen.queryByRole("button", { name: "Choose app to open in" })).toBeNull();
-  expect(openRemoteFileInApp).not.toHaveBeenCalled();
-});
-
-it("reports a remote launch failure without retrying the path locally", async () => {
-  getFileOpenSshHost.mockResolvedValue("arca.ssh");
-  openRemoteFileInApp.mockRejectedValue(new Error("Cannot connect"));
-  await renderMenu("src/main.ts", "remote");
-  await openMenu();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "Cursor" }));
-  await waitFor(() =>
-    expect(toast.error).toHaveBeenCalledWith("Couldn't open this remote file in Cursor"),
-  );
-  expect(openFileInApp).not.toHaveBeenCalled();
-});
-
-it("reports a failed native launch without an unhandled rejection", async () => {
-  openFileInApp.mockRejectedValue(new Error("App unavailable"));
-  await renderMenu();
-  await openMenu();
-  fireEvent.click(await screen.findByRole("menuitem", { name: "VS Code" }));
-  await waitFor(() =>
-    expect(toast.error).toHaveBeenCalledWith("Couldn't open this file in VS Code"),
-  );
-});
-
-it("keeps file-manager access if app discovery fails", async () => {
-  getFileOpenApps.mockRejectedValue(new Error("Disconnected"));
-  await renderMenu();
-  await openMenu();
-  expect(screen.queryByRole("menuitem", { name: "VS Code" })).toBeNull();
-  fireEvent.click(screen.getByRole("menuitem", { name: /^Show in / }));
-  expect(revealFile).toHaveBeenCalledWith("local", "/workspace/src/main.ts");
+  expect(fetchHost).not.toHaveBeenCalled();
 });

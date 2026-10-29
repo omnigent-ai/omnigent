@@ -1757,12 +1757,11 @@ describe("FileViewer view-settings menu", () => {
   });
 
   it("opens the selected file directly beside Copy link", async () => {
-    const openFileInApp = vi.fn().mockResolvedValue(true);
+    const openEditor = vi.fn();
+    vi.stubGlobal("open", openEditor);
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "this-mac" }),
-      getFileOpenApps: () => Promise.resolve([{ id: "vscode", label: "VS Code" }]),
-      openFileInApp,
     });
     const context = localDesktopContext();
     render(
@@ -1774,7 +1773,11 @@ describe("FileViewer view-settings menu", () => {
     const copy = screen.getByRole("button", { name: "Copy link to file" });
     expect(copy.compareDocumentPosition(openIn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     fireEvent.click(openIn);
-    expect(openFileInApp).toHaveBeenCalledWith("this-mac", "/repo/file1.py", "vscode");
+    expect(openEditor).toHaveBeenCalledWith(
+      "vscode://file/repo/file1.py",
+      "_blank",
+      "noopener,noreferrer",
+    );
   });
 
   it("adds the wrap-lines and whitespace toggles in diff view", async () => {

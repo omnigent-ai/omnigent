@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -247,8 +248,8 @@ class HostHelloFrame:
         supported" without a version check.
     :param connection_id: Host-minted identifier for this socket, shared with
         server diagnostics. Absent from older hosts.
-    :param ssh_host_key_fingerprints: Public SSH identity for desktop connection
-        discovery. ``None`` when unavailable or unreported by an older host.
+    :param ssh_target: SSH destination the owner uses from their laptop.
+        ``None`` when unavailable or unreported by an older host.
     """
 
     version: str
@@ -263,7 +264,7 @@ class HostHelloFrame:
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
     connection_id: str | None = None
-    ssh_host_key_fingerprints: list[str] | None = None
+    ssh_target: str | None = None
 
 
 @dataclass
@@ -1560,7 +1561,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
                 "connection_id": frame.connection_id,
-                "ssh_host_key_fingerprints": frame.ssh_host_key_fingerprints,
+                "ssh_target": frame.ssh_target,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -2606,6 +2607,16 @@ def _decode_known_host_frame(
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
+_SSH_TARGET_RE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def normalize_ssh_target(value: object) -> str | None:
+    """Accept a bounded SSH alias or user@host that fits inside an editor URL."""
+    if not isinstance(value, str) or len(value) > 255:
+        return None
+    return value if _SSH_TARGET_RE.fullmatch(value) else None
+
+
 def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
     """Decode a host hello frame.
 
@@ -2629,11 +2640,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
         connection_id=_optional_nullable_str(msg, "connection_id"),
-        ssh_host_key_fingerprints=(
-            _optional_str_list(msg, "ssh_host_key_fingerprints")
-            if msg.get("ssh_host_key_fingerprints") is not None
-            else None
-        ),
+        ssh_target=normalize_ssh_target(msg.get("ssh_target")),
     )
 
 

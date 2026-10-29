@@ -825,7 +825,7 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
         connection_id="host-connection-1",
-        ssh_host_key_fingerprints=["SHA256:public-key"],
+        ssh_target="arclet_dev.ssh",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -835,7 +835,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
     assert decoded.connection_id == "host-connection-1"
-    assert decoded.ssh_host_key_fingerprints == ["SHA256:public-key"]
+    assert decoded.ssh_target == "arclet_dev.ssh"
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -852,11 +852,24 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     )
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.interactive_shells is None
-    assert decoded.ssh_host_key_fingerprints is None
+    assert decoded.ssh_target is None
     # An older host advertises no capabilities — the server must read this as an
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
     assert decoded.connection_id is None
+
+
+@pytest.mark.parametrize(
+    "target", [None, "", "bad target", "box/path", "box?x", "-box", 1, [], "x" * 256]
+)
+def test_hello_ignores_invalid_ssh_target(target: object) -> None:
+    message = json.loads(
+        encode_host_frame(HostHelloFrame(version="1", frame_protocol_version=1, name="host"))
+    )
+    message["ssh_target"] = target
+    decoded = decode_host_frame(json.dumps(message))
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.ssh_target is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:

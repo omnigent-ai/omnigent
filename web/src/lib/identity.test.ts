@@ -504,10 +504,7 @@ describe("authenticatedFetch", () => {
 
     it.each([
       ["/v1/sessions/sess_xyz/resources/terminals", {}],
-      [
-        "/v1/hosts/host_789?require_live=true",
-        { ssh_host_key_fingerprints: ["SHA256:Q6RvHQgdJwEw4iEKHeWflxXeAzMH0GjtxlozWyfpXT0"] },
-      ],
+      ["/v1/hosts/host_789?require_live=true", { ssh_target: "arclet_dev.ssh" }],
     ] as const)(
       "retries %s keyless on wrong_replica and remembers the route",
       async (url, body) => {

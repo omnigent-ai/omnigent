@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import socket
 import tempfile
 import uuid
@@ -19,9 +20,13 @@ import yaml
 
 from omnigent.config import global_config_path
 from omnigent.host import identity_env
+from omnigent.host.frames import normalize_ssh_target
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
 CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
+_ARCLET_MARKER = Path("/etc/arclet/config.json")
+_ARCLET_NAME = Path("/opt/arclet/arclet-name")
+_ARCA_MARKER = Path("/opt/databricks/arca_image_version.txt")
 
 # The HOST_ID / HOST_NAME / HOST_TOKEN env-var names live in the dependency-free
 # leaf module omnigent.host.identity_env so the warm-pool readiness probe can
@@ -83,6 +88,43 @@ def export_configured_slice_key(path: Path) -> None:
 def host_config_path(path: Path | None = None) -> Path:
     """Return the effective config path used for host identity."""
     return path if path is not None else global_config_path(CONFIG_PATH)
+
+
+def load_host_ssh_target(path: Path | None = None) -> str | None:
+    """Read the owner's SSH destination on each connect, without persisting it.
+
+    ``host.ssh_target`` overrides the standard Arca/Arclet alias. An explicit
+    null or invalid value disables links; an absent setting permits detection.
+    ``path`` follows the same config-home rules as the host identity.
+    """
+    try:
+        config = yaml.safe_load(host_config_path(path).read_text()) or {}
+    except FileNotFoundError:
+        config = {}
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    host = config.get("host", {})
+    if not isinstance(host, dict):
+        return None
+    if "ssh_target" in host:
+        return normalize_ssh_target(host["ssh_target"])
+    try:
+        # Arclets also carry the Arca image marker, so check them first.
+        if _ARCLET_MARKER.exists():
+            name_file = Path(os.environ.get("DATABRICKS_ARCLET_NAME_FILE") or _ARCLET_NAME)
+            name = name_file.read_text().strip()
+            return (
+                normalize_ssh_target(f"arclet_{name}.ssh")
+                if re.fullmatch(r"[A-Za-z0-9_-]+", name)
+                else None
+            )
+        if _ARCA_MARKER.exists():
+            return "arca.ssh"
+    except (OSError, UnicodeError):
+        pass
+    return None
 
 
 def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:

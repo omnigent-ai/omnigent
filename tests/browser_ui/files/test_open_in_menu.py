@@ -1,10 +1,11 @@
-"""Both Open in entry points through the built SPA and a desktop bridge contract."""
+"""Folder and file editor links through the built SPA in browser and desktop modes."""
 
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -18,8 +19,14 @@ seeded_session = seeded_session_fixture
 
 
 @pytest.mark.parametrize(
-    ("width", "host_id", "ssh_host"),
-    [(360, "local", None), (950, "local", None), (950, "arca", "arca.ssh"), (360, "remote", None)],
+    ("width", "host_id", "ssh_host", "desktop"),
+    [
+        (360, "local", None, True),
+        (950, "local", None, True),
+        (950, "arca", "arca.ssh", True),
+        (360, "arclet", "arclet_dev.ssh", False),
+        (360, "remote", None, False),
+    ],
 )
 def test_open_folder_and_file_in_app(
     page: Page,
@@ -27,6 +34,7 @@ def test_open_folder_and_file_in_app(
     width: int,
     host_id: str,
     ssh_host: str | None,
+    desktop: bool,
     tmp_path: Path,
 ) -> None:
     session = seeded_session
@@ -61,53 +69,38 @@ def test_open_folder_and_file_in_app(
         },
     )
     session.contract.json(f"/v1/hosts/{host_id}/worktrees", {"data": []})
-    session.contract.json(
-        f"/v1/hosts/{host_id}",
-        {
-            "ssh_host_key_fingerprints": ["SHA256:Q6RvHQgdJwEw4iEKHeWflxXeAzMH0GjtxlozWyfpXT0"]
-            if ssh_host
-            else None
-        },
-    )
+    session.contract.json(f"/v1/hosts/{host_id}", {"ssh_target": ssh_host})
     state = [{"id": sid, "state": {"open": True, "widthPx": width, "rightRailTab": "files"}}]
     encoded_state = json.dumps(json.dumps(state))
     page.add_init_script(
         f"localStorage.setItem('omnigent:session-workspace-state', {encoded_state});"
     )
-    page.add_init_script(f"window.__editorSshHost = {json.dumps(ssh_host)};")
     page.add_init_script("""
       window.__openInCalls = [];
-      window.omnigentDesktop = {
-        kind: "electron",
-        getHostIdentity: () => Promise.resolve({ cliInstalled: true, hostId: "local" }),
-        getFileOpenApps: () => Promise.resolve([
-          { id: "vscode", label: "VS Code" },
-          { id: "cursor", label: "Cursor" },
-          { id: "terminal", label: "Terminal", directory: true },
-          { id: "default", label: "Default app" },
-        ]),
-        openFileInApp: (...args) => {
-          window.__openInCalls.push(['local', ...args]);
-          return Promise.resolve(true);
-        },
-        getFileOpenSshHost: (_hostId, fingerprints) => {
-          window.__sshDiscoveryDone = true;
-          return Promise.resolve(fingerprints?.length ? window.__editorSshHost : null);
-        },
-        openRemoteFileInApp: (...args) => {
-          window.__openInCalls.push(['remote', ...args]);
-          return Promise.resolve(true);
-        },
-        revealFile: () => Promise.resolve(true),
+      window.open = (url) => { window.__openInCalls.push(url); return null; };
+      const originalAppend = Node.prototype.appendChild;
+      Node.prototype.appendChild = function(child) {
+        if (child instanceof HTMLIFrameElement && /^(cursor|vscode):/.test(child.src)) {
+          window.__openInCalls.push(child.src);
+          child.removeAttribute('src');
+        }
+        return originalAppend.call(this, child);
       };
     """)
+    if desktop:
+        page.add_init_script("""
+          window.omnigentDesktop = {
+            kind: "electron",
+            getHostIdentity: async () => ({ cliInstalled: true, hostId: "local" }),
+            revealFile: async () => true,
+          };
+        """)
     page.set_viewport_size({"width": 1800, "height": 1000})
     page.goto(f"{session.contract.base_url}/c/{sid}")
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
     folder_open = rail.get_by_role("button", name="Choose app to open in", exact=True)
     if host_id == "remote":
-        page.wait_for_function("window.__sshDiscoveryDone === true")
         expect(folder_open).to_have_count(0)
         rail.get_by_text("main.md", exact=True).click()
         viewer = rail.get_by_test_id("file-viewer")
@@ -131,11 +124,8 @@ def test_open_folder_and_file_in_app(
     )
     page.screenshot(path=str(tmp_path / "folder-split-button.png"), animations="disabled")
     default_folder.click()
-    expected_folder = (
-        ["local", host_id, "/workspace", "vscode"]
-        if host_id == "local"
-        else ["remote", host_id, "/workspace", "vscode", ssh_host, True]
-    )
+    location = "file" if host_id == "local" else f"vscode-remote/ssh-remote+{ssh_host}"
+    expected_folder = f"vscode://{location}/workspace"
     page.wait_for_function("window.__openInCalls.length === 1")
     assert page.evaluate("window.__openInCalls") == [expected_folder]
     expect(page.get_by_role("menu")).to_have_count(0)
@@ -160,12 +150,8 @@ def test_open_folder_and_file_in_app(
     page.screenshot(path=str(tmp_path / "file-split-button.png"), animations="disabled")
     default_file.click()
     page.wait_for_function("window.__openInCalls.length === 3")
-    expected_file = [host_id, f"/workspace/{path}", "cursor"]
-    expected_file = (
-        ["local", *expected_file]
-        if host_id == "local"
-        else ["remote", *expected_file, ssh_host, False]
-    )
+    selection = "" if host_id == "local" else ":1:1"
+    expected_file = f"cursor://{location}/workspace/{quote(path, safe='/')}{selection}"
     assert page.evaluate("window.__openInCalls")[2] == expected_file
     viewer.get_by_role("button", name="Choose app to open in", exact=True).click()
     expect(page.get_by_role("menuitem", name="VS Code", exact=True)).to_be_visible()
@@ -173,9 +159,5 @@ def test_open_folder_and_file_in_app(
     page.get_by_role("menuitem", name="VS Code", exact=True).click()
     page.wait_for_function("window.__openInCalls.length === 4")
     expect(page.get_by_role("dialog")).to_have_count(0)
-    expected_file = [host_id, f"/workspace/{path}", "vscode"]
-    if host_id == "local":
-        expected_file = ["local", *expected_file]
-    else:
-        expected_file = ["remote", *expected_file, ssh_host, False]
+    expected_file = f"vscode://{location}/workspace/{quote(path, safe='/')}{selection}"
     assert page.evaluate("window.__openInCalls")[3] == expected_file
