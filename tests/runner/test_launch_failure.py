@@ -119,6 +119,36 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        (1, "OSError: [Errno 28] No space left on device: '/tmp/agent-cache'"),
+        (0, "OSError: [Errno 122] Disk quota exceeded: '/tmp/agent-cache'"),
+        (
+            None,
+            "No space left on device\n"
+            "FileNotFoundError: No such file or directory: '/tmp/agent-cache/metadata'",
+        ),
+    ],
+)
+def test_classifies_exhausted_host_storage(exit_status: int | None, output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent host is out of disk space"
+    assert diagnosis.category is ErrorCategory.HOST
+    assert diagnosis.remediation is not None
+    assert "space" in diagnosis.remediation.lower()
+
+
+def test_available_disk_space_message_is_not_storage_exhaustion() -> None:
+    assert (
+        classify_terminal_failure(
+            command="env", exit_status=1, output="Checking available disk space before launch"
+        )
+        is None
+    )
+
+
 def test_classifies_gateway_claude_version_failure() -> None:
     diagnosis = classify_terminal_failure(
         command="env",

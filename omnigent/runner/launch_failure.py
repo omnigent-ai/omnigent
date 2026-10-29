@@ -147,6 +147,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
     _TerminalMatcher(
+        "host_storage_exhausted",
+        lambda s: s.output_contains_any(("no space left on device", "disk quota exceeded")),
+        FailureDiagnosis(
+            title="Agent host is out of disk space",
+            cause=(
+                "The agent process could not write files because the host's filesystem "
+                "is full or its disk quota is exhausted."
+            ),
+            remediation=(
+                "Free disk space or increase the disk quota on the agent's host, "
+                "then retry the session."
+            ),
+            category=ErrorCategory.HOST,
+        ),
+    ),
+    _TerminalMatcher(
         "missing_binary",
         lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
         FailureDiagnosis(
