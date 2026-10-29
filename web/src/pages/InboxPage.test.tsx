@@ -30,12 +30,13 @@ import {
   seedReadState,
 } from "@/hooks/useUnseenConversations";
 
-// Keep the real native-delivery controls and their attempt-token submission.
+// Keep real controls for native delivery and directory grants.
 vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
   const actual = await importActual<typeof approvalCard>();
   return {
     ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) => {
-      if (props.nativeDelivery) return <actual.ApprovalCard {...props} />;
+      if (props.nativeDelivery || props.permissionDirectories)
+        return <actual.ApprovalCard {...props} />;
       const { elicitationId, message, status, allowAutoMode, onSubmit, requester } = props;
       return (
         <div data-testid="approval-card" data-status={status}>
@@ -340,6 +341,35 @@ describe("InboxPage approval items", () => {
       }),
     );
     expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded");
+  });
+
+  it("shows directory access from a snapshot and submits only the user's consent", async () => {
+    const row = conversation({ id: "sess_directory" });
+    const directories = ["/worktrees/branch", "/mount/real-branch"];
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [
+        rawElicitation("eli_directory", "Claude wants to call **Edit**", {
+          permission_directories: directories,
+        }),
+      ],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    const button = await screen.findByRole("button", {
+      name: "Approve & allow directories for this session",
+    });
+    for (const directory of directories) {
+      expect(screen.getByText(directory, { selector: "code" })).toBeInTheDocument();
+    }
+    fireEvent.click(button);
+    await waitFor(() =>
+      expect(sessionsApi.approve).toHaveBeenCalledWith("sess_directory", "eli_directory", {
+        action: "accept",
+        content: { allow_directories: true },
+      }),
+    );
+    expect(screen.getByText("Approved · directory access for this session")).toBeInTheDocument();
   });
 
   it("rolls back the optimistic verdict when approve() rejects", async () => {

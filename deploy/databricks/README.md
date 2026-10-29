@@ -312,6 +312,61 @@ uv run python deploy/databricks/deploy.py --no-otel ...
 > deploy warns when `--no-otel` is paired with a target that lacks those
 > overrides, since OTel then stays on.
 
+## Server-managed Databricks Sandboxes
+
+The `databricks` sandbox provider runs managed sessions (`host_type: "managed"`, or
+the Web UI's New Sandbox option) in [Databricks
+Sandbox](https://docs.databricks.com/aws/en/compute/serverless/sandbox) over the
+workspace REST API. The Sandbox preview must be enabled in the workspace.
+
+Each Sandbox is created and driven by the user who started the session, with the
+token they connected under **Settings → Connections → Databricks** (a Databricks
+account connection). The token inside the Sandbox and its proxy bearer are that
+user's, and the server's own identity is never used: a user who has not connected
+is refused with a "Connect Databricks first" message and no Sandbox is created.
+Code running in a Sandbox, including the agent, can read that token and act in
+the workspace as its owner.
+
+```yaml
+sandbox:
+  provider: databricks
+  server_url: https://your-host        # public URL the Sandbox host dials back to
+  databricks:
+    workspace_host: https://<workspace>.cloud.databricks.com   # required
+    proxy_bearer: true                 # only behind the Databricks Apps OAuth proxy
+    inactivity_timeout_s: 3600         # optional idle stop; resumed on the next turn
+    sandbox_id_prefix: omnigent        # optional
+```
+
+`workspace_host` is the workspace Sandboxes run in; a user connected to any other
+workspace is refused, so their existing Sandboxes are never lost track of. With `proxy_bearer: true`,
+the Sandbox's `omnigent` must include proxy-bearer support, so pin it with a
+`bootstrap_command` (e.g. `uv tool install omnigent==<server version>`) if the
+image's built-in copy is older than the server.
+
+**Databricks account connection.** The server needs an account-level [custom OAuth
+app integration](https://docs.databricks.com/aws/en/integrations/enable-disable-oauth)
+with the redirect URL `<server_url>/v1/connections/databricks/callback` and the
+scopes `all-apis offline_access` (see
+[DATABRICKS_CONNECT.md](../../designs/DATABRICKS_CONNECT.md)). Set its client id and
+secret in `OMNIGENT_DATABRICKS_CLIENT_ID` and `OMNIGENT_DATABRICKS_CLIENT_SECRET`,
+and a credential-store key (`OMNIGENT_CREDENTIAL_KMS_KEY_ID` or
+`OMNIGENT_CREDENTIAL_VAULT_KEY`) to encrypt the stored tokens. The Apps entry
+point (`src/app.py`), `omnigent server`, and the Docker entry point all read these.
+
+**Stop and resume.** A Sandbox stopped by its idle timeout is started in place on
+the session's next turn, and its host is re-bootstrapped. While a runner is
+connected, the keepalive runs a command in the Sandbox so it does not idle-stop,
+and refreshes the proxy bearer.
+
+**Cleanup after a user disconnects.** Teardown also acts as the owner, so if the
+owner has disconnected, their Sandbox stays after the session is deleted. With
+the managed-sandbox reaper enabled (`sandbox.reaper.enabled: true`; it is off by
+default), each sweep retries the delete and finishes it once the owner
+reconnects. Otherwise, or to remove it sooner, a workspace admin deletes it by id
+(logged as `Creating Databricks Sandbox '<id>'`):
+`databricks api delete /api/2.0/sandboxes/<id>`.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

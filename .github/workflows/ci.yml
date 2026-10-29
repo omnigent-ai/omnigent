@@ -6,7 +6,10 @@ name: CI
 # bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
 # out within a file. The `misc` group is a catch-all so new top-level
 # tests/<dir>/ are picked up automatically (it ignores the dirs that have their
-# own group). Draft PRs are skipped (ready_for_review re-fires the workflow).
+# own group). When Python tests run, `ci-tooling` (tests/scripts) is kept only
+# if the PR touches CI, release or dev tooling or a manifest (see
+# dependency_scope.py); push, scheduled and manual runs always include it.
+# Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
 on:
@@ -51,11 +54,14 @@ jobs:
   # scan; trusted authors / non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
-    name: CI scope
+    name: CI coverage scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       dependency: ${{ steps.scope.outputs.dependency }}
@@ -79,7 +85,8 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
-    runs-on: ubuntu-latest
+    # coreutils on ubuntu-26.04 differs from what host env-wrapper tests compare against; keep 24.04 until tests are updated.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -99,11 +106,25 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Node.js for local relay tests
-        if: matrix.group == 'misc'
+      - name: Set up Node.js for local relay and harness CLI tests
+        if: matrix.group == 'misc' || matrix.group == 'inner-rest' || matrix.group == 'ci-tooling'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+
+      # Tests that exercise a real harness CLI skip without it; install the
+      # pinned CLI only in the lanes that run them.
+      - name: Install Codex CLI
+        if: matrix.group == 'misc'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        with:
+          harness: codex
+
+      - name: Install Pi CLI
+        if: matrix.group == 'inner-rest'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
+        with:
+          harness: pi
 
       - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
@@ -127,7 +148,21 @@ jobs:
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
         # empty for the default lanes.
-        run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+
+      - name: Check installed sandbox SDK consumers
+        if: matrix.group == 'server-rest'
+        run: |
+          uv run python - <<'PYTHON'
+          from openshell import ExecChunk, ExecResult, SandboxClient, SandboxError
+          from openshell._proto import openshell_pb2, openshell_pb2_grpc
+          from kubernetes import client, config
+          from kubernetes.stream import stream
+          from omnigent.onboarding.sandboxes import kubernetes, openshell
+
+          openshell._ensure_sdk()
+          kubernetes._ensure_sdk()
+          PYTHON
 
       - name: Run pytest
         shell: bash
@@ -188,7 +223,7 @@ jobs:
     name: Pytest (stores-postgres)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
@@ -236,7 +271,7 @@ jobs:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -285,7 +320,7 @@ jobs:
     name: Pytest (stores-mysql)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       mysql:
@@ -333,7 +368,7 @@ jobs:
     name: Rust tests (omnidev)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.omnidev == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -355,7 +390,7 @@ jobs:
     name: Pytest (codex-parity)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.sidecar == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out repo
@@ -380,16 +415,13 @@ jobs:
         id: rustc
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      # The sidecar source is frozen and its deps are rev-pinned, so the binary is
-      # a pure function of sidecar/** + the toolchain. Cache the built binary (not
-      # the 1.6 GB target dir) and skip the ~3 min compile below on a hit; the key
-      # self-invalidates when the source, Cargo.lock, or rustc changes.
-      - name: Cache parity sidecar binary
+      # Cache compiled dependencies and test binaries, but execute tests on every run.
+      - name: Cache parity sidecar build
         id: sidecar-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          path: .tmp-codex-parity-target
+          key: codex-parity-tests-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
         # This job never runs pnpm install, so caching the (empty) pnpm store
@@ -399,7 +431,7 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex
 
@@ -411,6 +443,12 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked --extra all --group test
+
+      - name: Test parity sidecar
+        run: |
+          cargo test --locked \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
 
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
@@ -447,7 +485,7 @@ jobs:
     name: CI result
     if: always()
     needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require successful test selection
@@ -475,7 +513,7 @@ jobs:
     # and a red run gets re-run anyway, re-triggering this.
     needs: [pytest, scope]
     if: ${{ success() && !github.event.pull_request.draft && needs.scope.outputs.dependency != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out repo

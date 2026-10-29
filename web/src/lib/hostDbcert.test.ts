@@ -2,7 +2,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   DBCERT_EXPIRY_COMMAND,
+  DBCERT_REFRESH_CHECK_COMMAND,
   DBCERT_REFRESH_COMMAND,
+  canStartHostDbcertRefresh,
   parseDbcertExpiry,
   readHostDbcertExpiry,
   startHostDbcertRefresh,
@@ -61,6 +63,17 @@ describe("host shell calls", () => {
     expect(await readHostDbcertExpiry("s")).toBeUndefined();
     vi.mocked(authenticatedFetch).mockRejectedValueOnce(new Error("offline"));
     expect(await readHostDbcertExpiry("s")).toBeUndefined();
+  });
+
+  it("checks whether the host can renew dbcert without starting a sign-in", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult(""));
+    expect(await canStartHostDbcertRefresh("s")).toBe(true);
+    const init = vi.mocked(authenticatedFetch).mock.calls[0][1];
+    expect(JSON.parse(String(init?.body)).command).toBe(DBCERT_REFRESH_CHECK_COMMAND);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(shellResult("", 1));
+    expect(await canStartHostDbcertRefresh("s")).toBe(false);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce(new Response("{}", { status: 502 }));
+    expect(await canStartHostDbcertRefresh("s")).toBeUndefined();
   });
 
   it("starts dbcert in the background and reports whether the shell ran", async () => {

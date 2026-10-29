@@ -9,6 +9,8 @@
  */
 export const SANDBOX_STAGE_LABELS: Record<string, string | undefined> = {
   provisioning: "Provisioning sandbox",
+  // Still provisioning; `SandboxActionBanner` says what the user needs to do.
+  action_required: "Provisioning sandbox",
   cloning: "Cloning repository",
   starting: "Connecting host",
   connecting: "Starting agent",

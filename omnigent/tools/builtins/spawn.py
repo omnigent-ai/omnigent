@@ -539,10 +539,12 @@ class SysSessionListTool(Tool):
             "parent/siblings) — use their conversation_id to read "
             "history, get info, or close. 'sessions': a global list of "
             "every session "
-            "you can access, each with status + runner connectivity, "
-            "for orchestration (inspect via sys_agent_get / "
-            "sys_session_get_info, or drive via sys_session_send by "
-            "session_id). Pass agent_name to filter the global list to "
+            "you can access, each with status, runner connectivity and "
+            "created_by_session_id (creation origin for independent workers). "
+            "Match that field to your session ID to find workers you created. "
+            "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
+            "for children or sys_session_message for independent sessions. "
+            "Pass agent_name to filter the global list to "
             "sessions running that agent. Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
@@ -857,7 +859,7 @@ class SysSessionShareTool(Tool):
 
 class SysSessionCreateTool(Tool):
     """
-    Create a child session from an existing agent or a local bundle.
+    Create a session from an existing agent or a local bundle.
 
     The child is a separate Omnigent agent session — its own
     conversation, visible in the session tree, optionally a different
@@ -865,11 +867,10 @@ class SysSessionCreateTool(Tool):
     subagent/Task tool (which remains the right choice for quick
     in-context helpers).
 
-    A **child-only write**: the new session's ``parent_session_id`` is
-    forced to the caller's own session, so an orchestrator can only spawn
-    sessions inside its own subtree — never a top-level or sibling
-    session. The child inherits the caller's runner (co-location), so it
-    starts executing as soon as a message is queued.
+    The default placement forces ``parent_session_id`` to the caller.
+    A child inherits the caller's runner and starts when a message is queued.
+    With ``agent_id``, independent placements use the server's orchestration
+    gate and create private top-level sessions without completion forwarding.
 
     Two addressing modes — exactly one of ``agent_id`` or
     ``config_path`` must be given:
@@ -887,16 +888,13 @@ class SysSessionCreateTool(Tool):
       proxies the multipart ``POST /v1/sessions`` create, registering
       a fresh session-scoped agent.
 
-    An optional ``message`` is queued as the child's first user turn;
+    An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``. The
     session runs asynchronously — use ``sys_session_get_history`` /
-    ``sys_session_get_info`` to monitor it, or ``sys_session_send`` (with
-    the returned ``conversation_id``) to drive it further.
-
-    Runner-dispatched: both modes force ``parent_session_id`` to the
-    caller.
+    ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
+    further child work and ``sys_session_message`` for independent sessions.
     """
 
     @classmethod
@@ -908,7 +906,7 @@ class SysSessionCreateTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Create a child session from an agent. This launches a "
+            "Create a session from an agent. This launches a "
             "separate Omnigent agent session — its own conversation, "
             "visible in the session tree, optionally a different "
             "registered agent. It is not your harness's built-in "
@@ -925,12 +923,21 @@ class SysSessionCreateTool(Tool):
             "with sys_os_write) and launches it. Always use agent_id "
             "for an agent that already exists — never download and "
             "re-upload its bundle. Optionally queue an initial user "
-            "message. The new session is always a child of the calling "
-            "session (you cannot create top-level or sibling sessions). "
+            "message. By default the new session is a child of the caller. "
+            "With agent_id, placement='same_host' creates an independent private session "
+            "on the caller's host/workspace; placement='managed' provisions a new sandbox "
+            "using the server's configured default provider. Managed creation requires a "
+            "configured sandbox provider; use same_host for an existing connected host. "
+            "These placements require orchestration enabled "
+            "and a private, non-scheduled sending session, including its side-chat source chain. "
+            "An independent worker's optional "
+            "first message must contain 1–8000 characters. "
+            "Independent sessions do not forward replies: "
+            "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send."
+            "with sys_session_send for children or sys_session_message for independent sessions."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -951,6 +958,14 @@ class SysSessionCreateTool(Tool):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "placement": {
+                            "type": "string",
+                            "enum": ["child", "same_host", "managed"],
+                            "description": (
+                                "Default child; same_host or managed launches a private "
+                                "top-level session (agent_id only)."
+                            ),
+                        },
                         "agent_id": {
                             "type": "string",
                             "description": (

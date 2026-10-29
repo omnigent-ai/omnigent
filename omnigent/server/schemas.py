@@ -64,6 +64,19 @@ class PaginatedList(BaseModel):
     has_more: bool = False
 
 
+class AgentList(PaginatedList):
+    """
+    The built-in agent list, plus the packaged names this deployment hides.
+
+    :param suppressed_agent_names: Packaged built-ins ``OMNIGENT_SEEDED_AGENTS``
+        trimmed from ``data``. The web picker also discovers agents from a
+        user's recent sessions, so it needs these names to keep a hidden
+        built-in with prior sessions from resurfacing as a custom agent.
+    """
+
+    suppressed_agent_names: list[str] = Field(default_factory=list)
+
+
 # ── Agents ──────────────────────────────────────────────────────
 
 
@@ -1109,8 +1122,8 @@ class CreateResponseRequest(BaseModel):
         "description": "...", "parameters": {...}}}]``.
     :param tool_choice: Ignored — agent controls this. Silently
         dropped.
-    :param max_output_tokens: Ignored — agent controls this.
-        Silently dropped.
+    :param max_output_tokens: Output token cap, e.g. ``32``.
+        Executors that support a cap apply it; others ignore it.
     :param frequency_penalty: Ignored — agent controls this.
         Silently dropped.
     :param presence_penalty: Ignored — agent controls this.
@@ -2012,9 +2025,11 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# ``failed`` are terminal. ``action_required`` is a provisioning-time
+# warning: the user needs to do what the status's ``details`` say.
 SandboxLaunchStage = Literal[
     "provisioning",
+    "action_required",
     "cloning",
     "starting",
     "connecting",
@@ -2034,13 +2049,17 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox) → ``cloning``
+        ``provisioning`` (creating the sandbox; ``action_required``
+        while it also needs the user to act) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -2049,6 +2068,20 @@ class SandboxStatus(BaseModel):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
+
+
+class NativeUsageBaseline(BaseModel):
+    """Own-session cumulative usage for resuming a native usage reporter.
+
+    Excludes spawned sessions. Input includes cache reads, matching the native
+    usage event contract rather than the display's separate token buckets.
+    """
+
+    cumulative_input_tokens: int = Field(default=0, ge=0)
+    cumulative_output_tokens: int = Field(default=0, ge=0)
+    cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
+    cumulative_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ModelUsage(BaseModel):
@@ -2275,6 +2308,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
+    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
+        descendants. Available even when display usage aggregation is skipped;
+        ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2381,6 +2417,8 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    # Derived from the parent runner's live handshake, never persisted on the child.
+    side_chat_settings_supported: bool = False
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False
@@ -2402,6 +2440,7 @@ class SessionResponse(BaseModel):
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
+    native_usage_baseline: NativeUsageBaseline | None = None
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2889,6 +2928,72 @@ class ReadStatePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionPullRequestSummary(BaseModel):
+    """
+    The first pull request linked to a session, for list surfaces.
+
+    Stored on the server from what the session's host last reported, so it
+    is available while the host is offline.
+
+    :param url: The PR's URL.
+    :param provider: Git provider id, e.g. ``"github"``.
+    :param provider_display: The provider's labels (``display_name``,
+        ``request_name``, ``number_prefix``), or ``None`` for an unknown provider.
+    :param repository: Base repository, e.g. ``"owner/repo"``.
+    :param number: The PR number.
+    :param title: The last title the host looked up, or ``None``.
+    :param state: ``"OPEN"``, ``"MERGED"`` or ``"CLOSED"`` as last fetched, or
+        ``None`` before the host fetched the PR.
+    :param is_draft: Whether the PR was a draft when last fetched.
+    :param state_checked_at: Epoch seconds of the request that last fetched the
+        PR's state, or ``None`` before one did. Open PRs older than five minutes
+        are refreshed when their host is online; clients show older ones as stale.
+    """
+
+    url: str
+    provider: str
+    provider_display: dict[str, str] | None = None
+    repository: str
+    number: int
+    title: str | None = None
+    state: str | None = None
+    is_draft: bool = False
+    state_checked_at: float | None = None
+
+
+class SessionPullRequest(SessionPullRequestSummary):
+    """
+    A pull request linked to a session, as ``GET /v1/sessions/{id}/pull-requests`` lists it.
+
+    :param host: Forge host, e.g. ``"github.com"``.
+    :param relationship: How the PR joined the session: ``"created"``,
+        ``"worked_on"``, ``"attached"``, or ``"inferred"`` from the branch.
+    :param first_seen_at: Epoch seconds the session first saw the PR.
+    :param last_seen_at: Epoch seconds of the PR's latest activity in the session.
+    """
+
+    host: str
+    relationship: Literal["created", "worked_on", "attached", "inferred"]
+    first_seen_at: float
+    last_seen_at: float
+
+
+class SessionPullRequestList(BaseModel):
+    """
+    A page of a session's linked pull requests in display order, keyed by URL.
+
+    :param synced: Whether the server has imported the session's PRs from its
+        host. Until then an empty list means "not known yet", not "none".
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionPullRequest] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    synced: bool = False
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -2901,6 +3006,7 @@ class SessionListItem(BaseModel):
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
+    :param harness: Canonical effective harness, including per-session overrides.
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
@@ -2989,11 +3095,17 @@ class SessionListItem(BaseModel):
         matched in its body. Present whenever the query hit an item body
         (even if the title also matched); ``None`` on non-search reads and
         when only the title matched.
+    :param pull_request: The session's first linked pull request, or
+        ``None`` when it has none.
+    :param pull_requests_synced: Whether the server has imported the session's
+        PRs from its host, so a missing ``pull_request`` means "none" rather than
+        "not known yet". ``None`` on servers without PR storage.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
+    harness: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
@@ -3021,6 +3133,8 @@ class SessionListItem(BaseModel):
     # unfiled. Lets the sidebar group sessions by project without a follow-up
     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
     project_id: str | None = None
+    pull_request: SessionPullRequestSummary | None = None
+    pull_requests_synced: bool | None = None
 
 
 class SessionList(BaseModel):
@@ -3624,6 +3738,9 @@ class SessionSandboxStatusEvent(_SSEEventBase):
         pipeline order.
     :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
         or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -3639,6 +3756,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     stage: SandboxLaunchStage
     error: str | None = None
     provider: str | None = None
+    details: str | None = None
 
 
 class McpServerStartup(BaseModel):
@@ -4345,6 +4463,13 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class UiOpenFileEvent(_SSEEventBase):
+    """Ask current session viewers to open a workspace-relative file; never replayed."""
+
+    type: Literal["ui.open_file"]
+    path: str
+
+
 class BrowserActionRequestEvent(_SSEEventBase):
     """
     Request that the desktop renderer perform one browser action.
@@ -4970,6 +5095,7 @@ ServerStreamEvent = Annotated[
     | ElicitationResolvedEvent
     # ── Transient (SSE-only) — embedded-browser action request ─
     | BrowserActionRequestEvent
+    | UiOpenFileEvent
     # ── Transient (SSE-only) — native policy DENY signal ───────
     | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────

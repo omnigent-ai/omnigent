@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC
 from typing import Any
 
 import cachetools
@@ -146,7 +147,7 @@ def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
     :returns: The period string ("day", "week", "month", "quarter", "year")
         for the oldest period, or None if no cost-budget policies are present.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from omnigent.db.utils import now_epoch
 
@@ -171,25 +172,25 @@ def _get_cost_policy_oldest_period(specs: list[PolicySpec]) -> str | None:
 
     # Calculate start date for each period and find the oldest
     now = now_epoch()
-    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    dt = datetime.fromtimestamp(now, tz=UTC)
 
     def period_start_date(period: str) -> datetime:
         if period == "day":
-            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+            return datetime.combine(dt.date(), datetime.min.time(), tzinfo=UTC)
         if period == "week":
             # ISO week starts on Monday
             start = dt.date() - timedelta(days=dt.weekday())
-            return datetime.combine(start, datetime.min.time(), tzinfo=timezone.utc)
+            return datetime.combine(start, datetime.min.time(), tzinfo=UTC)
         if period == "month":
-            return datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+            return datetime(dt.year, dt.month, 1, tzinfo=UTC)
         if period == "quarter":
             quarter = (dt.month - 1) // 3 + 1
             start_month = (quarter - 1) * 3 + 1
-            return datetime(dt.year, start_month, 1, tzinfo=timezone.utc)
+            return datetime(dt.year, start_month, 1, tzinfo=UTC)
         if period == "year":
-            return datetime(dt.year, 1, 1, tzinfo=timezone.utc)
+            return datetime(dt.year, 1, 1, tzinfo=UTC)
         # Unknown period, treat as day
-        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=timezone.utc)
+        return datetime.combine(dt.date(), datetime.min.time(), tzinfo=UTC)
 
     # Find the period with the oldest start date
     return min(periods, key=period_start_date)
@@ -288,9 +289,9 @@ def _utc_day(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC day string, e.g. ``"2026-08-21"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%d")
 
 
 def _utc_week(epoch: int) -> str:
@@ -299,9 +300,9 @@ def _utc_week(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC ISO week string, e.g. ``"2026-W34"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    dt = datetime.fromtimestamp(epoch, tz=UTC)
     year, week, _ = dt.isocalendar()
     return f"{year}-W{week:02d}"
 
@@ -312,9 +313,9 @@ def _utc_month(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC month string, e.g. ``"2026-08"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m")
 
 
 def _utc_quarter(epoch: int) -> str:
@@ -323,9 +324,9 @@ def _utc_quarter(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC quarter string, e.g. ``"2026-Q3"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    dt = datetime.fromtimestamp(epoch, tz=timezone.utc)
+    dt = datetime.fromtimestamp(epoch, tz=UTC)
     quarter = (dt.month - 1) // 3 + 1
     return f"{dt.year}-Q{quarter}"
 
@@ -336,9 +337,9 @@ def _utc_year(epoch: int) -> str:
     :param epoch: Unix epoch seconds.
     :returns: UTC year string, e.g. ``"2026"``.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y")
+    return datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y")
 
 
 def _load_user_period_cost(
@@ -364,7 +365,7 @@ def _load_user_period_cost(
     :returns: List of daily cost dicts, one per day in the period. Empty
         in single-user mode.
     """
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     from omnigent.db.utils import now_epoch
 
@@ -374,7 +375,7 @@ def _load_user_period_cost(
 
     # Calculate date range for the period
     now = now_epoch()
-    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    dt = datetime.fromtimestamp(now, tz=UTC)
 
     if period == "day":
         start = dt.date()

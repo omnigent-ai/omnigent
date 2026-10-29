@@ -367,6 +367,14 @@ def test_hermes_and_hermes_native_deliver_differently() -> None:
     assert caps["hermes-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED
 
 
+def test_native_startup_additive_instruction_delivery() -> None:
+    for harness in ("claude-native", "codex-native", "pi-native"):
+        assert (
+            harness_capabilities()[harness].instruction_delivery
+            is InstructionDelivery.AGENT_STARTUP_ADDITIVE
+        )
+
+
 def test_kiro_native_is_not_delivered() -> None:
     caps = harness_capabilities()
     assert caps["kiro-native"].instruction_delivery is InstructionDelivery.NOT_DELIVERED

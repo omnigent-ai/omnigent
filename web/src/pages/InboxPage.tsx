@@ -409,6 +409,7 @@ export function InboxPage() {
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
+            permissionDirectories={item.elicitation.permissionDirectories}
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
             agyPermission={item.elicitation.agyPermission}

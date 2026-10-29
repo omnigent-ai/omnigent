@@ -42,10 +42,10 @@ from __future__ import annotations
 
 import shutil
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
-import tomllib
 
 from tests.e2e._native_resume_helpers import (
     cli_env,

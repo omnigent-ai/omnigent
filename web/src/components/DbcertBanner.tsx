@@ -1,8 +1,8 @@
 import { AlertTriangleIcon, XIcon } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { useHostDbcert } from "@/hooks/useHostDbcert";
-import { getDesktopFeatures, hasDbcertRefreshBridge } from "@/lib/nativeBridge";
+import { checkDbcert, refreshDbcert } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 /**
@@ -11,38 +11,95 @@ import { cn } from "@/lib/utils";
  * `StreamBudgetBanner` and stacked with it in a `FloatingBannerStack`.
  * Dismissable per expired certificate.
  */
-interface DbcertBannerProps {
+export function DbcertBanner({
+  conversationId,
+  hostId,
+}: {
   conversationId: string | null | undefined;
   hostId: string | null | undefined;
-}
-
-export function DbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
-  const [supported, setSupported] = useState(false);
-
-  useEffect(() => {
-    if (!hasDbcertRefreshBridge()) return;
-    let active = true;
-    void getDesktopFeatures().then((features) => {
-      if (active) {
-        setSupported(
-          features?.databricksInternalFeatures === true && features.canRefreshDbcert === true,
-        );
-      }
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  if (!supported) return null;
-  return <SupportedDbcertBanner conversationId={conversationId} hostId={hostId} />;
-}
-
-function SupportedDbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
+}) {
   const dbcert = useHostDbcert(conversationId, hostId);
   if (!dbcert.show) return null;
-  const running = dbcert.phase === "running";
+  return (
+    <DbcertRefreshBanner
+      message={`The dbcert on ${dbcert.hostName || "this host"} has expired. Certain internal tools will fail until you refresh it.`}
+      running={dbcert.phase === "running"}
+      error={
+        dbcert.phase === "failed"
+          ? dbcert.refreshMode === "host"
+            ? "Sign-in didn't complete. Try again, or run dbcert on the host."
+            : "Couldn't refresh it from here. Click dbcert in the Arca Companion menu on your laptop."
+          : null
+      }
+      onRefresh={() => void dbcert.refresh()}
+      onDismiss={dbcert.dismiss}
+    />
+  );
+}
 
+export function LaptopDbcertBanner({
+  onReady,
+  onDismiss,
+}: {
+  onReady: () => void;
+  onDismiss: () => void;
+}) {
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refreshAttemptRef = useRef<symbol | null>(null);
+  useEffect(
+    () => () => {
+      refreshAttemptRef.current = null;
+    },
+    [],
+  );
+
+  async function refresh() {
+    if (refreshAttemptRef.current !== null) return;
+    const attempt = Symbol();
+    refreshAttemptRef.current = attempt;
+    setRunning(true);
+    setError(null);
+    const result = await refreshDbcert({ skipArcaSync: true });
+    if (refreshAttemptRef.current !== attempt) return;
+    if (!result.ok) {
+      setError(result.error);
+    } else {
+      const status = await checkDbcert();
+      if (refreshAttemptRef.current !== attempt) return;
+      if (!status.ok) setError(status.error);
+      else if (!status.valid)
+        setError("Your laptop's dbcert is still invalid after sign-in. Try refreshing it again.");
+      else onReady();
+    }
+    refreshAttemptRef.current = null;
+    setRunning(false);
+  }
+
+  return (
+    <DbcertRefreshBanner
+      message="Your laptop's dbcert is missing or expired. Refresh it, then try again."
+      running={running}
+      error={error}
+      onRefresh={() => void refresh()}
+      onDismiss={onDismiss}
+    />
+  );
+}
+
+function DbcertRefreshBanner({
+  message,
+  running,
+  error,
+  onRefresh,
+  onDismiss,
+}: {
+  message: string;
+  running: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onDismiss: () => void;
+}) {
   return (
     <div
       role="status"
@@ -56,33 +113,28 @@ function SupportedDbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
     >
       <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
       <div className="min-w-0 flex-1">
-        <p>
-          The dbcert on {dbcert.hostName || "this host"} has expired. Certain internal tools will
-          fail until you refresh it.
-        </p>
+        <p>{message}</p>
         {running && (
-          <p className="mt-0.5 opacity-80">Finish the sign-in in the browser tab that opened.</p>
-        )}
-        {dbcert.phase === "failed" && (
           <p className="mt-0.5 opacity-80">
-            Couldn't refresh it from here. Click dbcert in the Arca Companion menu on your laptop.
+            Opening browser sign-in. Complete sign-in to refresh your dbcert.
           </p>
         )}
+        {error && <p className="mt-0.5 opacity-80">{error}</p>}
       </div>
       <button
         type="button"
         disabled={running}
-        onClick={() => void dbcert.refresh()}
+        onClick={onRefresh}
         className={cn(
           "shrink-0 rounded-md border border-amber-400 px-2 py-0.5 font-medium hover:bg-amber-200 disabled:opacity-60",
           "dark:border-amber-700 dark:hover:bg-amber-900",
         )}
       >
-        {running ? "Refreshing…" : dbcert.phase === "failed" ? "Try again" : "Refresh dbcert"}
+        {running ? "Refreshing…" : error ? "Try again" : "Refresh dbcert"}
       </button>
       <button
         type="button"
-        onClick={dbcert.dismiss}
+        onClick={onDismiss}
         aria-label="Dismiss"
         className={cn(
           "-mr-1 shrink-0 rounded p-0.5 text-amber-900/60 hover:bg-amber-200 hover:text-amber-900",

@@ -109,7 +109,7 @@ evaluate_once() {
     ROW=$(echo "$CHECKS" | awk -F'\t' -v n="$n" '$1 == n {print}' | sort -t $'\t' -k4,4n | tail -n 1)
     scope=$(scope_for_result "$n")
     if [[ -z "$ROW" ]]; then
-      if [[ -n "$scope" ]] && echo "$CHECKS" | awk -F'\t' -v n="$scope" '$1 == n {found=1} END {exit !found}'; then
+      if [[ -n "$scope" ]] && echo "$CHECKS" | awk -F'\t' -v names="$scope" 'BEGIN {split(names, scopes, ",")} {for (i in scopes) if ($1 == scopes[i]) found=1} END {exit !found}'; then
         echo "MISSING : $n  (selection job '$scope' requires an executed result check)"
         FAILED_LINES+="- \`$n\` (selection ran; waiting for its result check)"$'\n'
         FAIL=1

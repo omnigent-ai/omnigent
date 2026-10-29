@@ -393,3 +393,52 @@ async def _fire_timer(timer) -> None:
 def scheduler_task_of(scheduler: ScheduledTaskScheduler, task_id: str) -> _FakeTask:
     """Reach into the fake store to get the seed task for update tests."""
     return scheduler._store.get(task_id)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("mutation", ["create", "edit", "resume", "pause", "delete", "stop"])
+async def test_startup_snapshot_preserves_changes_during_load(monkeypatch, mutation):
+    from threading import Event
+
+    original = _task("changed", state="paused" if mutation == "resume" else "active")
+    scheduler, _clock, timers, _fired = _make([original, _task("untouched")])
+    entered, release = asyncio.Event(), Event()
+    loop = asyncio.get_running_loop()
+    load = scheduler._store.list_active_all_workspaces
+
+    def snapshot_then_wait():
+        snapshot = load()
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Startup snapshot was never released"
+        return snapshot
+
+    monkeypatch.setattr(scheduler._store, "list_active_all_workspaces", snapshot_then_wait)
+    startup = asyncio.create_task(scheduler.start())
+    target = "new" if mutation == "create" else "changed"
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if mutation == "create":
+            scheduler.add(_task(target))
+        elif mutation in ("edit", "resume"):
+            scheduler.update(
+                replace(
+                    original, state="active", rrule="FREQ=DAILY;BYHOUR=9", timezone="Asia/Tokyo"
+                )
+            )
+        elif mutation == "pause":
+            scheduler.update(replace(original, state="paused"))
+        elif mutation == "delete":
+            scheduler.remove(target)
+        else:
+            scheduler.stop()
+        expected = scheduler.next_run_at(target)
+    finally:
+        release.set()
+        await startup
+    try:
+        assert scheduler.next_run_at(target) == expected
+        assert (expected is not None) == (mutation in ("create", "edit", "resume"))
+        assert scheduler.is_started == (mutation != "stop")
+        assert (scheduler.next_run_at("untouched") is not None) == (mutation != "stop")
+        assert len(timers.live()) == scheduler.job_count
+    finally:
+        scheduler.stop()
