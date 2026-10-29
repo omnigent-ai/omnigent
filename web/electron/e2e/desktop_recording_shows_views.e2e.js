@@ -97,7 +97,7 @@ function bannerFractions(clip, fps = 2, width = 160, height = 120) {
 }
 
 // Drive the preload-exposed browser APIs from the shell renderer (same helpers
-// as desktop_cookie_isolation.e2e.js — they run in the SPA window's context).
+// as desktop_browser_profile.e2e.js — they run in the SPA window's context).
 async function openView(window, conversationId, url) {
   return openBrowserFixture(window, conversationId, url);
 }

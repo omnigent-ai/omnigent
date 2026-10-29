@@ -879,6 +879,12 @@ export interface SessionChildSessionUpdatedEvent {
   child: Record<string, unknown>;
 }
 
+/** A viewer saved their browser tabs in the session; refetch your own. */
+export interface SessionBrowserTabsChangedEvent {
+  type: "session_browser_tabs_changed";
+  sessionId: string;
+}
+
 /**
  * `session.changed_files.invalidated` — the session's changed-files list
  * may have changed; the consumer should refetch it. Coarse signal (no
@@ -1047,6 +1053,7 @@ export type StreamEvent =
   | SessionResourceDeletedEvent
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
+  | SessionBrowserTabsChangedEvent
   | SessionTerminalActivityEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent

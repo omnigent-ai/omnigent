@@ -683,7 +683,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, releaseAgentRequestGuard, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -2528,7 +2528,7 @@ describe("browser permission wiring", () => {
       const registry = h.api.createBrowserRegistryForWindow(h.win);
       const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
       const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
-      assert.notEqual(a.session, b.session);
+      assert.equal(a.session, b.session, "conversations share the browser profile session");
       const check = (wc) =>
         wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
       assert.equal(check(a), false, "detached panes cannot prompt");
@@ -2557,7 +2557,7 @@ describe("browser permission wiring", () => {
     }
   });
 
-  it("guards each agent partition's document requests through its own Chromium session", async () => {
+  it("guards agent document requests from every window sharing a profile session", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
       const sessions = new Map();
@@ -2642,40 +2642,33 @@ describe("browser permission wiring", () => {
       );
       const firstHop = await registry.checkAgentNavigation("conv", "http://lvh.me:8899/", null);
       assert.equal(firstHop.ok, false, "the IPC first hop resolves through the same session");
-      const otherAgent = registry.openOrNavigate("other-conv", "https://example.com/", undefined, {
-        agent: true,
-      }).entry.view.webContents;
-      assert.notEqual(partitions[2], partitions[0], "conversations use independent partitions");
-      const otherSession = sessions.get(partitions[2]);
-      assert.notEqual(otherSession, ses);
+      // A second window's registry runs its views on the same profile session,
+      // so the hooks installed for the first window must guard its views too.
+      const otherRegistry = h.api.createBrowserRegistryForWindow(h.win);
+      const otherAgent = otherRegistry.openOrNavigate(
+        "other-conv",
+        "https://example.com/",
+        undefined,
+        {
+          agent: true,
+        },
+      ).entry.view.webContents;
+      assert.equal(partitions[2], partitions[0], "windows share the profile partition");
+      assert.equal(ses.installs.length, 3, "a shared session is hooked only once");
+      ses.dns["example.com"] = "127.0.0.1";
+      ses.resolveProxy = async () => "DIRECT";
+      assert.deepEqual(await decide("request", { url: next }, ses, otherAgent), { cancel: true });
       assert.deepEqual(
-        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
-        "each independent session receives all document hooks",
-      );
-      otherSession.dns["example.com"] = "127.0.0.1";
-      ses.lookups.length = 0;
-      otherSession.lookups.length = 0;
-      assert.deepEqual(await decide("request", { url: next }, otherSession, otherAgent), {
-        cancel: true,
-      });
-      assert.deepEqual(otherSession.lookups, ["example.com"]);
-      assert.deepEqual(ses.lookups, [], "the second session never resolves through the first");
-      assert.deepEqual(await decide("request", { url: next }), { cancel: false });
-      assert.deepEqual(ses.lookups, ["example.com"]);
-      assert.deepEqual(
-        otherSession.lookups,
-        ["example.com"],
-        "the first session stays independent",
-      );
-      assert.deepEqual(
-        await decide("sendHeaders", { url: next, requestHeaders: {} }, otherSession, otherAgent),
+        await decide("sendHeaders", { url: next, requestHeaders: {} }, ses, otherAgent),
         { requestHeaders: { "Cache-Control": "no-cache" } },
       );
-      assert.deepEqual(
-        await decide("headers", { url: next, ip: "127.0.0.1" }, otherSession, otherAgent),
-        { cancel: true },
-      );
+      assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }, ses, otherAgent), {
+        cancel: true,
+      });
+      // A closed window's registry is no longer consulted.
+      h.api.releaseAgentRequestGuard(otherRegistry);
+      assert.deepEqual(await decide("request", { url: next }, ses, otherAgent), { cancel: false });
+      assert.deepEqual(await decide("request", { url: next }), { cancel: true });
     } finally {
       h.cleanup();
     }

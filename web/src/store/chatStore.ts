@@ -61,6 +61,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { syncBrowserTabsInBackground } from "@/lib/browserTabSync";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
@@ -8871,6 +8872,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           queryKey: childSessionsQueryKey(event.conversationId),
         });
       }
+      return;
+    case "session_browser_tabs_changed":
+      // Tabs are per user; refetch ours, which is a no-op when nothing of ours changed.
+      syncBrowserTabsInBackground(event.sessionId);
       return;
     case "session_changed_files_invalidated":
       // Coarse "something changed" signal. Coalesce bursts into one

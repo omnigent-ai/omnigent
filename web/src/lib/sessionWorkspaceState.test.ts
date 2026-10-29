@@ -235,4 +235,29 @@ describe("sessionWorkspaceState", () => {
       openSubagentTabs: ["subagent:a", "subagent:b"],
     });
   });
+
+  it("keeps only restorable browser tab pages from storage", () => {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_d",
+          state: {
+            openBrowsers: ["a", "b", "c", "d", "e"],
+            browserTabPages: {
+              a: { url: "https://docs.example/", title: "Docs" },
+              b: { url: "javascript:alert(1)" },
+              c: { url: `https://long.example/${"x".repeat(9000)}` },
+              d: { url: "http://localhost:3000/", title: "  ", extra: true },
+              e: "https://not-an-object.example/",
+            },
+          },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_d").browserTabPages).toEqual({
+      a: { url: "https://docs.example/", title: "Docs" },
+      d: { url: "http://localhost:3000/" },
+    });
+  });
 });

@@ -44,6 +44,7 @@ from omnigent.db.db_models import (
     SqlConversationMetadata,
     SqlPolicy,
     SqlProject,
+    SqlSessionBrowserTabs,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
@@ -5601,6 +5602,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlSessionPermission).where(
                     SqlSessionPermission.workspace_id == current_workspace_id(),
                     SqlSessionPermission.conversation_id.in_(subtree_ids),
+                )
+            )
+            session.execute(
+                delete(SqlSessionBrowserTabs).where(
+                    SqlSessionBrowserTabs.workspace_id == current_workspace_id(),
+                    SqlSessionBrowserTabs.conversation_id.in_(subtree_ids),
                 )
             )
             session.execute(
