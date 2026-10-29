@@ -50,13 +50,13 @@ from omnigent.runner.subagent_routing import (
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
 from tests.server.helpers import FakeCaps, FakeRoutingClient
 
-CLAUDE_MODEL = "databricks-claude-opus-4-8"
-GPT_MODEL = "databricks-gpt-5-5"
+CLAUDE_MODEL = "system.ai.claude-opus-4-8"
+GPT_MODEL = "system.ai.gpt-5-5"
 GLM_MODEL = "databricks-glm-5-2"
 # The spelling the gateway actually serves GLM under; see ``_SERVABLE_ALIASES``.
 GLM_SERVABLE = "system.ai.glm-5-2"
-KIMI_MODEL = "databricks-kimi-k2-6"
-PARENT_MODEL = "databricks-claude-sonnet-4-6"
+KIMI_MODEL = "system.ai.kimi-k2-6"
+PARENT_MODEL = "system.ai.claude-sonnet-4-6"
 
 # ── Stubs ───────────────────────────────────────────────────────────
 
@@ -272,8 +272,13 @@ def test_pinned_sessions_are_never_offered_the_counterpart_family(harness: str) 
 
 
 async def test_same_family_pick_rewrites() -> None:
+    """A legacy router pick resolves onto the offered Unity Catalog id."""
     client = FakeRoutingClient(
-        RoutingResult(model=CLAUDE_MODEL, rationale="deep reasoning", harness="claude-sdk")
+        RoutingResult(
+            model="databricks-claude-opus-4-8",
+            rationale="deep reasoning",
+            harness="claude-sdk",
+        )
     )
     decision = await resolve_subagent_route(
         "conv_1", _request(), caps=FakeCaps(routing_client=client)
@@ -294,7 +299,7 @@ async def test_same_family_pick_rewrites() -> None:
         (GLM_SERVABLE, "honored — the router picked the same arm", None),
         # It picked another: the router's pick is applied and the ask is
         # recorded as the override attempt.
-        (GPT_MODEL, "overridden — the router picked databricks-gpt-5-5", GLM_SERVABLE),
+        (GPT_MODEL, "overridden — the router picked system.ai.gpt-5-5", GLM_SERVABLE),
     ],
     ids=["match", "mismatch"],
 )

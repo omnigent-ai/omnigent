@@ -121,7 +121,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
-  per-harness coverage gaps separately from observed results.
+  per-harness coverage gaps separately from observed results. Its
+  [comparison guidance](./harness-acceptance.md#compare-harnesses-by-user-journey)
+  separates declared capabilities, mapped tests and observed CUJ results.
 
 - [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
   before/after recordings, load probes, and complementary persistence checks.
@@ -151,8 +153,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
-- [Tool calls in chat](./tool-calls.md) covers tool-call rows, their result
-  lines, the expanded field and Raw views, and tool-run folding.
+- [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
+  counts, the expanded field, error and Raw views, and tool-run folding.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.

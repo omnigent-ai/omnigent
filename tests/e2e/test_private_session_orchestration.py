@@ -1,5 +1,6 @@
 """Real local host/server/SDK and Codex processes; scripted model, no cloud sandbox."""
 
+import ast
 import json
 import os
 import shutil
@@ -304,12 +305,53 @@ def test_private_manager_launch_send_read_and_sharing(
                 created = next(row for row in rows if row["title"] == "Independent worker")
                 created = client.get(f"/v1/sessions/{created['id']}").json()
                 assert created["parent_session_id"] is None
+                assert created["labels"]["omnigent.created_by_session_id"] == manager
                 assert created["host_id"] == host_id
                 wait_text(created["id"], "NEW_WORKER_RESULT")
                 grants = client.get(f"/v1/sessions/{created['id']}/permissions").json()[
                     "permissions"
                 ]
                 assert [g["user_id"] for g in grants] == ["local"]
+
+                configure(
+                    "MANAGER_SEND_READ_CREATE_FIND",
+                    [
+                        {"tool_calls": [tool("sys_session_list", {}, "creator-list")]},
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_get_info",
+                                    {"session_id": created["id"]},
+                                    "creator-info",
+                                )
+                            ]
+                        },
+                        {"text": "CREATOR_FOUND"},
+                    ],
+                )
+                send(manager, "MANAGER_SEND_READ_CREATE_FIND")
+                wait_text(manager, "CREATOR_FOUND")
+                for call_id in ("creator-list", "creator-info"):
+                    results = tool_results(call_id)
+                    assert results
+                    output = results[-1].get("output", results[-1].get("content"))
+                    if harness == "codex-native":
+                        # Codex wraps MCP content in timing text; the SDK renders a Python dict.
+                        content = json.loads(output.split("\nOutput:\n", 1)[1])
+                        payload = json.loads(content[0]["text"])
+                    else:
+                        payload = ast.literal_eval(output)
+                    discovered_worker = (
+                        next(
+                            row
+                            for row in payload["sessions"]
+                            if row["session_id"] == created["id"]
+                        )
+                        if call_id == "creator-list"
+                        else payload
+                    )
+                    assert discovered_worker["session_id"] == created["id"]
+                    assert discovered_worker["created_by_session_id"] == manager
 
                 before_managed = {
                     row["id"]
@@ -376,7 +418,7 @@ def test_private_manager_launch_send_read_and_sharing(
                                     "sys_session_message",
                                     {
                                         "session_id": worker,
-                                        "message": "SCHEDULED_MUST_NOT_DELIVER",
+                                        "message": "SCHEDULED_DELIVERED",
                                     },
                                     "scheduled-message",
                                 )
@@ -391,7 +433,7 @@ def test_private_manager_launch_send_read_and_sharing(
                                 )
                             ]
                         },
-                        {"text": "SCHEDULED_MANAGER_BLOCKED"},
+                        {"text": "SCHEDULED_MANAGER_DONE"},
                     ],
                 )
                 response = client.post(
@@ -421,16 +463,17 @@ def test_private_manager_launch_send_read_and_sharing(
                 scheduled = client.get(f"/v1/scheduled-tasks/{task_id}").json()[
                     "last_run_conversation_id"
                 ]
-                wait_text(scheduled, "SCHEDULED_MANAGER_BLOCKED")
-                assert "SCHEDULED_MUST_NOT_DELIVER" not in json.dumps(items(worker))
-                assert "Scheduled sessions cannot" in json.dumps(get_mock_requests(mock))
+                # An automation run messages the owner's worker and starts one of its own.
+                wait_text(scheduled, "SCHEDULED_MANAGER_DONE")
+                wait_text(worker, "SCHEDULED_DELIVERED")
                 after_scheduled = {
                     row["id"]
                     for row in client.get("/v1/sessions", params={"visibility": "mine"}).json()[
                         "data"
                     ]
                 }
-                assert after_scheduled == before_managed | {scheduled}
+                assert scheduled in after_scheduled
+                assert len(after_scheduled - before_managed - {scheduled}) == 1
 
                 fork = client.post(
                     f"/v1/sessions/{manager}/fork",

@@ -16,6 +16,7 @@
 // helpers so tests can model capped snapshots and full transcripts.
 
 import type * as IdentityModule from "@/lib/identity";
+import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
 import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -32,6 +33,8 @@ import type {
 } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { latestActivityErrorState } from "@/lib/sessionError";
+import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
@@ -5473,6 +5476,34 @@ describe("chatStore — send while streaming (queueing)", () => {
     const errorBlocks = useChatStore.getState().blocks.filter((b) => b.type === "error");
     expect(errorBlocks).toHaveLength(1);
     expect(errorBlocks[0]).toMatchObject({ code: "executor_error", message: "boom" });
+  });
+
+  it("stops reporting a status-only relaunch failure as the latest error after a resume", () => {
+    // A failed resume, then a successful one that adds no items.
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      sessionStatus: "idle",
+      blocks: itemsToBlocks([userMessage("resp_a", "hi"), assistantMessage("resp_a", "Done.")]),
+    });
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_abc",
+      status: "failed",
+      error: { code: "required_terminal_exited", message: "Required terminal exited." },
+    });
+    let state = useChatStore.getState();
+    expect(latestActivityErrorState(state.blocks, null, state.sessionStatus)).toBe("error");
+
+    for (const status of ["idle", "running", "idle"] as const) {
+      handleSessionEvent({ type: "session_status", conversationId: "conv_abc", status });
+    }
+    state = useChatStore.getState();
+    expect(state.blocks.at(-1)).toMatchObject({
+      type: "error",
+      code: "required_terminal_exited",
+      fromSessionStatus: true,
+    });
+    expect(latestActivityErrorState(state.blocks, null, state.sessionStatus)).toBeNull();
   });
 
   it("preserves a cancelled turn across a bare idle edge", () => {
@@ -13278,6 +13309,65 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  it("stretches failed reopens while the page is hidden and reopens once visible", async () => {
+    seedSession("conv_hidden_backoff", []);
+    const sinks: StreamSink[] = [];
+    let openAttempts = 0;
+    let serverUp = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        openAttempts += 1;
+        if (!serverUp) return mockResponse({}, { ok: false, status: 503 });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const setPageHidden = (hidden: boolean): void => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_hidden_backoff", abortController: controller });
+
+    const loop = startStreamPump("conv_hidden_backoff", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(openAttempts).toBe(1);
+
+      // Backgrounded, then the server goes away: the instant reopen after a
+      // healthy drop is refused, and the retries after it wait the hidden
+      // cadence instead of the visible 5 s ramp.
+      setPageHidden(true);
+      serverUp = false;
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(openAttempts).toBe(2);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(openAttempts).toBe(2);
+
+      // Back in the foreground the stretched wait ends within a first-retry delay.
+      serverUp = true;
+      setPageHidden(false);
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
+      expect(openAttempts).toBe(3);
+      expect(sinks).toHaveLength(2);
+
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+    } finally {
+      // Restore visibility through the event too, so the presence tracker's
+      // hidden state cannot leak into later tests if this one fails.
+      Reflect.deleteProperty(document, "hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      controller.abort();
+      await loop;
+    }
+  });
+
   it("preserves native streamed text across a server process restart", async () => {
     seedSession("conv_epoch_changed", []);
     const sinks = routeStreamOpens(["server-before", "server-after"]);
@@ -17492,6 +17582,45 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
       .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
   }
 
+  /** Hold every elicitation resolve POST until the returned release runs. */
+  function holdElicitationResolves(): () => void {
+    const route = fetchMock.getMockImplementation()!;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/elicitations\/[^/]+\/resolve$/.test(url)) await held;
+      return route(input, init);
+    });
+    return release;
+  }
+
+  /** Hold the next GET of `id`'s session snapshot until the returned release
+   *  runs. The response is built when the request is made, so it reflects the
+   *  server state at that moment. */
+  function holdNextSessionSnapshot(id: string): () => void {
+    const route = fetchMock.getMockImplementation()!;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let holdNext = true;
+    const snapshotUrl = new RegExp(`^/v1/sessions/${id}(?:\\?.*)?$`);
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (holdNext && snapshotUrl.test(url) && (init?.method ?? "GET") === "GET") {
+        holdNext = false;
+        const response = route(input, init);
+        await held;
+        return response;
+      }
+      return route(input, init);
+    });
+    return release;
+  }
+
   /** Drain the pump + reconcile's sequential await chain under fake timers. */
   async function drainAsync(turns = 25): Promise<void> {
     /* oxlint-disable no-await-in-loop */
@@ -17775,15 +17904,17 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
   it("does not clobber an in-flight user verdict with a re-publish", async () => {
     seedSession("conv_verdict", []);
     const { sinks, controller, loop } = await openLoop("conv_verdict");
+    const releaseResolves = holdElicitationResolves();
 
     sinks[0]!.push(elicitationReqFrame("elic_v", "Approve verdict?"));
     await drainAsync();
-    await useChatStore.getState().submitApproval("elic_v", "accept");
+    const submitted = useChatStore.getState().submitApproval("elic_v", "accept");
+    await drainAsync();
     expect(elicitationCards()[0]!.response?.action).toBe("accept");
 
-    // A re-publish racing the verdict POST must not re-open the card —
-    // the user already answered; submitApproval owns rolling back its
-    // own optimistic flip if the POST fails.
+    // A re-publish racing the verdict POST may predate the server receiving
+    // the verdict, so it must not re-open the card; submitApproval owns
+    // rolling back its own optimistic flip if the POST fails.
     sinks[0]!.push(elicitationReqFrame("elic_v", "Approve verdict?"));
     await drainAsync();
 
@@ -17792,7 +17923,307 @@ describe("chatStore — elicitations across stream drops and re-publishes", () =
     expect(cards[0]!.status).toBe("responded");
     expect(cards[0]!.response?.action).toBe("accept");
 
+    // The verdict arrived: once the POST returns, a fresh snapshot no longer
+    // lists the prompt, so the card stays answered.
+    releaseResolves();
+    await submitted;
+    await drainAsync();
+    expect(elicitationCards()[0]!.status).toBe("responded");
+    expect(elicitationCards()[0]!.response?.action).toBe("accept");
+
     await abortLoop(sinks, controller, loop);
+  });
+
+  it("rechecks a re-publish ignored during the verdict POST once it returns", async () => {
+    seedSession("conv_suppressed", []);
+    seedPendingElicitations("conv_suppressed", [
+      pendingElicitationRaw("elic_sup", "Pick an option?"),
+    ]);
+    const { sinks, controller, loop } = await openLoop("conv_suppressed");
+    sinks[0]!.push(elicitationReqFrame("elic_sup", "Pick an option?"));
+    await drainAsync();
+
+    const releaseResolves = holdElicitationResolves();
+    const submitted = useChatStore.getState().submitApproval("elic_sup", "decline");
+    await drainAsync();
+    // Ignored for now: the verdict may not have reached the server yet.
+    sinks[0]!.push(elicitationReqFrame("elic_sup", "Pick an option?"));
+    await drainAsync();
+    expect(elicitationCards()[0]!.status).toBe("responded");
+
+    // The POST returns and a fresh snapshot still lists the prompt, so the
+    // verdict never reached the hook; no further re-publish arrives.
+    releaseResolves();
+    await submitted;
+    await drainAsync();
+
+    const cards = elicitationCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("pending");
+    expect(cards[0]!.response).toBeNull();
+
+    await abortLoop(sinks, controller, loop);
+  });
+
+  it("revives an answered card when its prompt re-publishes after the verdict POST", async () => {
+    seedSession("conv_lost_verdict", []);
+    const { sinks, controller, loop } = await openLoop("conv_lost_verdict");
+
+    sinks[0]!.push(elicitationReqFrame("elic_lost", "Pick an option?"));
+    await drainAsync();
+    await useChatStore.getState().submitApproval("elic_lost", "decline");
+    expect(elicitationCards()[0]!.response?.action).toBe("decline");
+
+    // The server adopts a stored verdict before re-publishing, so a
+    // re-publish after the POST returned means the verdict never reached
+    // the waiting hook (it landed on a replica with no waiter). Ids can
+    // recur, so this one carries a different request.
+    sinks[0]!.push(elicitationReqFrame("elic_lost", "Pick another option?"));
+    await drainAsync();
+
+    const cards = elicitationCards();
+    // Answerable again, in place. Left "responded" = the prompt the agent
+    // is still blocked on has no card the user can answer.
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("pending");
+    expect(cards[0]!.response).toBeNull();
+    // The reopened card shows the request an answer would now approve.
+    expect(cards[0]!.message).toBe("Pick another option?");
+
+    await abortLoop(sinks, controller, loop);
+  });
+
+  it("keeps an answered card closed when reconnect could join an older snapshot request", async () => {
+    seedSession("conv_old_snapshot", []);
+    seedPendingElicitations("conv_old_snapshot", [
+      pendingElicitationRaw("elic_old", "Pick an option?"),
+    ]);
+    const { sinks, loop } = await openLoop("conv_old_snapshot");
+    sinks[0]!.push(elicitationReqFrame("elic_old", "Pick an option?"));
+    await drainAsync();
+
+    // A shared session request starts while the prompt is pending, and its
+    // response (still listing the prompt) is held.
+    const releaseSnapshot = holdNextSessionSnapshot("conv_old_snapshot");
+    const olderRequest = client
+      .fetchQuery({
+        queryKey: ["session", "conv_old_snapshot"],
+        queryFn: () => getSessionSlim("conv_old_snapshot"),
+        staleTime: 0,
+      })
+      .catch(() => undefined);
+    await drainAsync();
+
+    // The answer is accepted and the server clears the prompt.
+    await useChatStore.getState().submitApproval("elic_old", "decline");
+    seedPendingElicitations("conv_old_snapshot", []);
+
+    // Reconnect while the older request is still in flight, then let it return.
+    sinks[0]!.error();
+    await drainAsync();
+    releaseSnapshot();
+    await olderRequest;
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // Reopened = the reconcile used the older snapshot, which predates the answer.
+    const cards = elicitationCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("responded");
+    expect(cards[0]!.response?.action).toBe("decline");
+
+    await closeLoop(sinks, loop);
+  });
+
+  it.each([
+    { order: "starts during the verdict POST", reconnectFirst: false },
+    { order: "starts first and ends during the verdict POST", reconnectFirst: true },
+  ])(
+    "rechecks an answered card after its verdict POST when a reconnect $order",
+    async ({ reconnectFirst }) => {
+      const id = reconnectFirst ? "conv_overlap" : "conv_recheck";
+      seedSession(id, []);
+      seedPendingElicitations(id, [pendingElicitationRaw("elic_recheck", "Pick an option?")]);
+      const { sinks, loop } = await openLoop(id);
+      sinks[0]!.push(elicitationReqFrame("elic_recheck", "Pick an option?"));
+      await drainAsync();
+
+      // Either way, the reconnect sees the prompt still pending while the
+      // verdict POST is in flight, so it must leave the card answered: the
+      // verdict may not have arrived yet.
+      const releaseSnapshot = reconnectFirst ? holdNextSessionSnapshot(id) : undefined;
+      if (reconnectFirst) {
+        sinks[0]!.error();
+        await drainAsync();
+      }
+      const releaseResolves = holdElicitationResolves();
+      const submitted = useChatStore.getState().submitApproval("elic_recheck", "decline");
+      await drainAsync();
+      if (reconnectFirst) {
+        releaseSnapshot!();
+      } else {
+        sinks[0]!.error();
+      }
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+      expect(elicitationCards()[0]!.status).toBe("responded");
+
+      // The POST returns and the prompt is still parked (the verdict never
+      // reached the hook). The card reopens with no further stream event.
+      releaseResolves();
+      await submitted;
+      await drainAsync();
+
+      const cards = elicitationCards();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.status).toBe("pending");
+      expect(cards[0]!.response).toBeNull();
+
+      await closeLoop(sinks, loop);
+    },
+  );
+
+  it("keeps a newer answer when an older recheck's snapshot returns late", async () => {
+    seedSession("conv_newer_answer", []);
+    seedPendingElicitations("conv_newer_answer", [
+      pendingElicitationRaw("elic_na", "Pick an option?"),
+    ]);
+    const { sinks, controller, loop } = await openLoop("conv_newer_answer");
+    sinks[0]!.push(elicitationReqFrame("elic_na", "Pick an option?"));
+    await drainAsync();
+
+    // Answer 1: a re-publish arrives during its POST, so a recheck runs
+    // once it returns. That recheck's snapshot (still pending) is held.
+    const releaseResolves = holdElicitationResolves();
+    const first = useChatStore.getState().submitApproval("elic_na", "decline");
+    await drainAsync();
+    sinks[0]!.push(elicitationReqFrame("elic_na", "Pick an option?"));
+    await drainAsync();
+    const releaseSnapshot = holdNextSessionSnapshot("conv_newer_answer");
+    releaseResolves();
+    await first;
+    await drainAsync();
+
+    // A live re-publish reopens the card, and answer 2 completes.
+    sinks[0]!.push(elicitationReqFrame("elic_na", "Pick an option?"));
+    await drainAsync();
+    expect(elicitationCards()[0]!.status).toBe("pending");
+    await useChatStore.getState().submitApproval("elic_na", "accept");
+    await drainAsync();
+
+    // The old snapshot returns with no resolution event in between.
+    releaseSnapshot();
+    await drainAsync();
+
+    // Reopened = the stale recheck erased answer 2.
+    const cards = elicitationCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("responded");
+    expect(cards[0]!.response?.action).toBe("accept");
+
+    await abortLoop(sinks, controller, loop);
+  });
+
+  it("keeps a rechecked card answered when the prompt resolves during the recheck", async () => {
+    seedSession("conv_recheck_resolved", []);
+    seedPendingElicitations("conv_recheck_resolved", [
+      pendingElicitationRaw("elic_rr", "Pick an option?"),
+    ]);
+    const { sinks, loop } = await openLoop("conv_recheck_resolved");
+    sinks[0]!.push(elicitationReqFrame("elic_rr", "Pick an option?"));
+    await drainAsync();
+
+    const releaseResolves = holdElicitationResolves();
+    const submitted = useChatStore.getState().submitApproval("elic_rr", "decline");
+    await drainAsync();
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // The POST returns; the recheck's snapshot is read while the prompt is
+    // still parked, then the prompt resolves before that snapshot arrives.
+    const releaseSnapshot = holdNextSessionSnapshot("conv_recheck_resolved");
+    releaseResolves();
+    await submitted;
+    await drainAsync();
+    // The server drops a prompt from its pending list before publishing its
+    // resolution, so later snapshots no longer list it.
+    seedPendingElicitations("conv_recheck_resolved", []);
+    sinks[1]!.push(sse("response.elicitation_resolved", { elicitation_id: "elic_rr" }));
+    await drainAsync();
+    releaseSnapshot();
+    await drainAsync();
+
+    // Reopened = the recheck trusted a snapshot that predates the resolution.
+    const cards = elicitationCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("responded");
+    expect(cards[0]!.response?.action).toBe("decline");
+
+    await closeLoop(sinks, loop);
+  });
+
+  it("keeps an answered card closed when the prompt resolves during the reconnect", async () => {
+    seedSession("conv_gap_resolved", []);
+    seedPendingElicitations("conv_gap_resolved", [
+      pendingElicitationRaw("elic_gr", "Pick an option?"),
+    ]);
+    const { sinks, loop } = await openLoop("conv_gap_resolved");
+    sinks[0]!.push(elicitationReqFrame("elic_gr", "Pick an option?"));
+    await drainAsync();
+    await useChatStore.getState().submitApproval("elic_gr", "decline");
+
+    // The reconnect's snapshot is read while the prompt is still parked, then
+    // the prompt resolves on the new stream before that snapshot arrives.
+    const releaseSnapshot = holdNextSessionSnapshot("conv_gap_resolved");
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+    // The server drops a prompt from its pending list before publishing its
+    // resolution, so later snapshots no longer list it.
+    seedPendingElicitations("conv_gap_resolved", []);
+    sinks[1]!.push(sse("response.elicitation_resolved", { elicitation_id: "elic_gr" }));
+    await drainAsync();
+    releaseSnapshot();
+    await drainAsync();
+
+    const cards = elicitationCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("responded");
+    expect(cards[0]!.response?.action).toBe("decline");
+
+    await closeLoop(sinks, loop);
+  });
+
+  it("revives an answered card the reconnect snapshot still lists", async () => {
+    seedSession("conv_lost_gap", []);
+    seedPendingElicitations("conv_lost_gap", [
+      pendingElicitationRaw("elic_gap_lost", "Pick an option?"),
+    ]);
+    const { sinks, loop } = await openLoop("conv_lost_gap");
+
+    sinks[0]!.push(elicitationReqFrame("elic_gap_lost", "Pick an option?"));
+    await drainAsync();
+    await useChatStore.getState().submitApproval("elic_gap_lost", "decline");
+    expect(elicitationCards()[0]!.response?.action).toBe("decline");
+
+    // The stream drops; a prompt re-parked during the gap under the same
+    // id (with a different request), so the snapshot lists it after the
+    // verdict POST returned.
+    seedPendingElicitations("conv_lost_gap", [
+      pendingElicitationRaw("elic_gap_lost", "Pick another option?"),
+    ]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    const cards = elicitationCards();
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.status).toBe("pending");
+    expect(cards[0]!.response).toBeNull();
+    expect(cards[0]!.message).toBe("Pick another option?");
+
+    await closeLoop(sinks, loop);
   });
 });
 
@@ -18138,46 +18569,81 @@ describe("chatStore — client-side message queue", () => {
     },
   );
 
-  it("queues a side chat's follow-up on its own entry and drains it when that turn ends", async () => {
-    bindConversationForTest("conv_main", { boundAgentId: "agent_main", sessionStatus: "running" });
-    const side = conversationRegistry.acquire("conv_side");
-    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
-    seedConversationsCache([conv("conv_main", "running"), conv("conv_side", "idle")]);
-    const posts = (id: string) =>
-      fetchMock.mock.calls
-        .filter(
-          ([u, init]) =>
-            u === `/v1/sessions/${id}/events` && (init as RequestInit)?.method === "POST",
-        )
-        .map(([, init]) => JSON.parse((init as RequestInit).body as string));
+  it.each(["none", "confirmed", "rejected", "detached"])(
+    "drains a side-chat queue after its turn and settings save settle (%s)",
+    async (settings) => {
+      bindConversationForTest("conv_main", {
+        boundAgentId: "agent_main",
+        sessionStatus: "running",
+      });
+      const side = conversationRegistry.acquire("conv_side");
+      side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+      seedConversationsCache([conv("conv_main", "running"), conv("conv_side", "idle")]);
+      const posts = (id: string) =>
+        fetchMock.mock.calls
+          .filter(
+            ([u, init]) =>
+              u === `/v1/sessions/${id}/events` && (init as RequestInit)?.method === "POST",
+          )
+          .map(([, init]) => JSON.parse((init as RequestInit).body as string));
 
-    useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
-    expect(useChatStore.getState().queuedMessages).toEqual([
-      expect.objectContaining({
-        text: "side follow-up",
-        conversationId: "conv_side",
-        agentId: "agent_side",
-      }),
-    ]);
-    // The side chat's entry owns this queue, not the sidebar-driven background flush.
-    useChatStore.getState().flushBackgroundQueues();
-    await tick();
-    expect(posts("conv_side")).toEqual([]);
-
-    side.setState({ sessionStatus: "idle" });
-    await tick();
-    expect(posts("conv_side")).toEqual([
-      expect.objectContaining({
-        type: "message",
-        data: expect.objectContaining({
-          content: [{ type: "input_text", text: "side follow-up" }],
+      useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({
+          text: "side follow-up",
+          conversationId: "conv_side",
+          agentId: "agent_side",
         }),
-      }),
-    ]);
-    expect(posts("conv_main")).toEqual([]);
-    expect(useChatStore.getState().queuedMessages).toEqual([]);
-    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
-  });
+      ]);
+      // The side chat's entry owns this queue, not the sidebar-driven background flush.
+      useChatStore.getState().flushBackgroundQueues();
+      await tick();
+      expect(posts("conv_side")).toEqual([]);
+
+      let settle: (() => void) | undefined;
+      const saving =
+        settings === "none"
+          ? undefined
+          : client
+              .getMutationCache()
+              .build(client, {
+                mutationKey: sideChatSettingsMutationKey("conv_side"),
+                mutationFn: () =>
+                  new Promise<void>((resolve, reject) => {
+                    settle = () =>
+                      settings === "rejected" ? reject(new Error("Settings refused")) : resolve();
+                  }),
+              })
+              .execute(undefined)
+              .catch(() => undefined);
+      await tick();
+      side.setState({ sessionStatus: "idle" });
+      if (settings === "detached") conversationRegistry.release("conv_side");
+      if (saving) {
+        useChatStore.getState().flushBackgroundQueues();
+        const queued = useChatStore.getState().queuedMessages[0]!;
+        useChatStore.getState().steerMessage(queued.queueId);
+        useChatStore.getState().steerAllQueuedMessages("conv_side");
+        await tick();
+        expect(posts("conv_side")).toEqual([]);
+        expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+        settle!();
+        await saving;
+      }
+      await tick();
+      expect(posts("conv_side")).toEqual([
+        expect.objectContaining({
+          type: "message",
+          data: expect.objectContaining({
+            content: [{ type: "input_text", text: "side follow-up" }],
+          }),
+        }),
+      ]);
+      expect(posts("conv_main")).toEqual([]);
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    },
+  );
 
   it("drains an idle side chat's queue when a held head is released", async () => {
     bindConversationForTest("conv_main", { boundAgentId: "agent_main" });

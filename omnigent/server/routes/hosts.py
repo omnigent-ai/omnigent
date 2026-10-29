@@ -78,6 +78,7 @@ from omnigent.server.feature_flags import (
 from omnigent.server.host_registry import (
     HarnessLoginState,
     HostConnection,
+    HostLaunchResult,
     HostRegistry,
     update_harness_accounts,
 )
@@ -1351,7 +1352,7 @@ def create_hosts_router(
             ),
         )
         request_id = secrets.token_hex(8)
-        future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
 
         launch_frame = encode_host_frame(

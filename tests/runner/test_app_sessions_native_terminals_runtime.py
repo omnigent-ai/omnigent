@@ -730,7 +730,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     retained_client = _RetainedClient()
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1179,7 +1179,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1477,7 +1477,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1748,7 +1748,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
 
     launch_captured: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the launched terminal spec."""
 
         async def launch_auxiliary_terminal(
@@ -1977,7 +1977,7 @@ async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
         async def close(self) -> None:
             """:returns: None."""
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that accepts the launched terminal."""
 
         async def launch_auxiliary_terminal(self, **kwargs: Any) -> SessionResourceView:
@@ -2225,7 +2225,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
         async def close(self) -> None:
             """:returns: None."""
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry returning a fixed terminal view."""
 
         async def launch_auxiliary_terminal(
@@ -2620,7 +2620,7 @@ async def _run_antigravity_auto_create(
             patch_calls.append((url, json))
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the required-terminal launch."""
 
         terminal_registry = None
@@ -2820,7 +2820,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
 
     launched_specs: list[Any] = []
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that records the required-terminal launch spec."""
 
         terminal_registry = None
@@ -3412,7 +3412,7 @@ async def test_auto_create_antigravity_wires_reader_task_and_interaction_bridge(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -3541,7 +3541,7 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
             del json
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -3691,7 +3691,7 @@ async def test_auto_create_antigravity_prepends_gemini_dir_to_generated_flags(
             del json
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -5007,7 +5007,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         """
         del kwargs
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that accepts the terminal launch."""
 
         async def launch_auxiliary_terminal(
@@ -5237,7 +5237,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
         """Accept the known-thread forwarder invocation."""
         del kwargs
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Resource registry that accepts the terminal launch."""
 
         async def launch_auxiliary_terminal(
