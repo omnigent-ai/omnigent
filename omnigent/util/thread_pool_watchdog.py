@@ -85,6 +85,16 @@ def _worker_stacks(workers: list[threading.Thread]) -> str:
     return "".join(sections)
 
 
+def _summarize_locations(locations: Counter[str]) -> str:
+    """Join the busiest locations, e.g. ``"a.py:1 in f x6, +2 more locations"``."""
+    parts = [
+        f"{location} x{count}" for location, count in locations.most_common(_MAX_SUMMARY_LOCATIONS)
+    ]
+    if len(locations) > _MAX_SUMMARY_LOCATIONS:
+        parts.append(f"+{len(locations) - _MAX_SUMMARY_LOCATIONS} more locations")
+    return ", ".join(parts)
+
+
 def watch_thread_pool(
     executor: ThreadPoolExecutor,
     *,
@@ -97,6 +107,7 @@ def watch_thread_pool(
     """Start a daemon thread that reports when *executor* backs up.
 
     The thread exits once the executor shuts down and rejects its next probe.
+    A watchdog that cannot start is logged, never raised into the caller.
 
     :param executor: The pool to watch, e.g. the runner's default executor.
     :param thread_name_prefix: The pool's worker name prefix, e.g. ``"runner"``.
@@ -104,7 +115,7 @@ def watch_thread_pool(
     :param stall_threshold_s: Probe wait that triggers a report, e.g. ``10.0``.
     :param probe_interval_s: Pause between probes, e.g. ``1.0``.
     :param report_interval_s: Minimum seconds between reports, e.g. ``60.0``.
-    :returns: The started watchdog thread.
+    :returns: The watchdog thread; not alive if it could not start.
     """
     for value in (stall_threshold_s, probe_interval_s, report_interval_s):
         if not math.isfinite(value) or value <= 0:
@@ -123,10 +134,7 @@ def watch_thread_pool(
             )
         finally:
             del frames
-        summary = ", ".join(
-            f"{location} x{count}"
-            for location, count in locations.most_common(_MAX_SUMMARY_LOCATIONS)
-        )
+        summary = _summarize_locations(locations)
         _logger.warning(
             "%s thread pool backed up: a queued job has waited %.1fs for one of %d workers; "
             "workers are in: %s",
@@ -150,12 +158,27 @@ def watch_thread_pool(
 
     def watch() -> None:
         last_report = -math.inf
+        last_submit_failure = -math.inf
         while True:
             submitted_at = monotonic()
             try:
                 probe = executor.submit(_probe)
-            except RuntimeError:
-                return  # The executor has shut down.
+            except RuntimeError as exc:
+                if str(exc).startswith("cannot schedule new futures"):
+                    return  # The executor has shut down.
+                # A live pool can fail to add a worker; keep watching it.
+                if submitted_at - last_submit_failure >= report_interval_s:
+                    last_submit_failure = submitted_at
+                    _logger.warning(
+                        "Could not submit the %s thread pool watchdog probe; retrying",
+                        process_role,
+                        exc_info=True,
+                        extra=debug_event(
+                            f"{process_role}_thread_pool_probe_failed", pid=os.getpid()
+                        ),
+                    )
+                sleep(probe_interval_s)
+                continue
             while True:
                 try:
                     probe.result(timeout=stall_threshold_s)
@@ -178,5 +201,11 @@ def watch_thread_pool(
     thread = threading.Thread(
         target=watch, name=f"omnigent-{process_role}-pool-watchdog", daemon=True
     )
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError:
+        _logger.exception(
+            "Could not start the thread pool watchdog; running without pool reports",
+            extra=debug_event(f"{process_role}_thread_pool_watchdog_failed", pid=os.getpid()),
+        )
     return thread
