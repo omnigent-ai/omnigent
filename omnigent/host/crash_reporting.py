@@ -79,6 +79,9 @@ _signal_exit_started = threading.Event()
 _signal_exit_thread: threading.Thread | None = None
 # The stop signal that owns the exit, once one does.
 _owning_signal: int | None = None
+# Called before a SIGHUP exit so runners can finish in-flight work; see
+# set_hangup_callback().
+_hangup_callback: Callable[[], None] | None = None
 # Held while handlers are restored, and by the re-raise: the re-raise must never
 # land between restoring a previous handler and re-arming the default action.
 # Re-entrant because the start-failure fallback re-raises from the signal
@@ -270,8 +273,9 @@ def host_asyncio_exception_handler(
 def install_host_signal_handlers() -> Callable[[], None]:
     """Log and flush before a stop signal ends the host, then die by that signal.
 
-    The handler keeps today's semantics: no graceful teardown. Runners notice
-    the daemon is gone through their parent-death watchdog. After logging, the
+    There is no graceful teardown: runners notice the daemon is gone through
+    their parent-death watchdog. On SIGHUP (the terminal hung up) the hangup
+    callback first tells runners to finish in-flight work. After logging, the
     signal's default action is restored and re-raised, so supervisors still see
     a signal death. POSIX main thread only; elsewhere this is a no-op.
 
@@ -310,6 +314,35 @@ def install_host_signal_handlers() -> Callable[[], None]:
                     signal.signal(owning, signal.SIG_DFL)
 
     return _restore
+
+
+def set_hangup_callback(callback: Callable[[], None] | None) -> None:
+    """Register what to run, non-blocking, before a SIGHUP ends the host.
+
+    :param callback: Called once from the signal-exit thread; ``None`` clears it.
+    """
+    global _hangup_callback
+    _hangup_callback = callback
+
+
+def _run_hangup_callback(signum: int, *, log_failures: bool = True) -> None:
+    """Run the hangup callback for SIGHUP only; never let it block the exit.
+
+    *log_failures* must be ``False`` when called directly from a signal
+    handler: logging there could deadlock on a lock the interrupted main
+    thread already holds, with no watchdog to break it.
+    """
+    callback = _hangup_callback
+    if callback is None or signum != getattr(signal, "SIGHUP", None):
+        return
+    try:
+        callback()
+    except Exception:
+        # A broken finish-work sweep would otherwise hard-kill runners with
+        # no trace; the exit path flushes handlers right after this.
+        if log_failures:
+            with contextlib.suppress(Exception):
+                _logger.debug("hangup callback failed", exc_info=True)
 
 
 def drain_debug_sink() -> None:
@@ -353,9 +386,10 @@ def _on_stop_signal(signum: int, frame: FrameType | None) -> None:  # noqa: ARG0
     try:
         thread.start()
     except RuntimeError:
-        # No thread available (exhaustion, interpreter shutdown): skip the
-        # report rather than risk logging from a signal handler, and still
-        # die by the signal.
+        # No thread available (exhaustion, interpreter shutdown): skip the report
+        # rather than risk logging from a signal handler, and still die by the
+        # signal. The non-blocking hangup callback still lets work finish.
+        _run_hangup_callback(signum, log_failures=False)
         _die_by_signal(signum)
         return
     _signal_exit_thread = thread
@@ -370,9 +404,12 @@ def _exit_on_signal(signum: int) -> None:
     try:
         watchdog.start()
     except RuntimeError:
-        # No deadline without a watchdog: don't risk wedging in logging.
+        # No deadline without a watchdog: don't risk wedging in logging. The
+        # non-blocking hangup callback still runs so a hangup finishes work.
+        _run_hangup_callback(signum, log_failures=False)
         _die_by_signal(signum)
     try:
+        _run_hangup_callback(signum)
         report_host_exit("signal", exit_code=exit_code, signal=signal.Signals(signum).name)
         drain_debug_sink()
         for handler in logging.getLogger().handlers:
