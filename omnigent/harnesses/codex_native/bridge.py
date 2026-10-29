@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from omnigent.harnesses.codex_egress import CertificateFailure
-from omnigent.native import native_bridge_common
+from omnigent.native import native_bridge_common, policy_allow_cache
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -69,6 +69,10 @@ _STARTUP_TIMEOUT_MAX_BYTES = 256
 # events), read by the executor's first-turn gate and the runner's
 # Stop handler.
 _MCP_STARTUP_FILE = "mcp_startup.json"
+# Usage each Codex child thread inherited at its fork (zeros when fresh), kept
+# across forwarder restarts because resumed threads report their totals again.
+_CHILD_USAGE_BASELINES_FILE = "child_usage_baselines.json"
+_CHILD_USAGE_BASELINES_LOCK_FILE = "child_usage_baselines.lock"
 
 # Startup states mirrored from Codex's ``McpServerStartupState`` enum.
 MCP_STARTUP_STARTING = "starting"
@@ -1079,6 +1083,8 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         _write_bridge_state_unlocked(bridge_dir, state)
+    # A new or rotated session's policies were never checked.
+    policy_allow_cache.invalidate(bridge_dir)
 
 
 def _validated_startup_timeout(value: object) -> float | None:
@@ -1205,19 +1211,99 @@ def write_bridge_startup_error(
 def _write_bridge_record(bridge_dir: Path, filename: str, record: Mapping[str, object]) -> None:
     """Atomically write one best-effort JSON record into the bridge directory."""
     try:
-        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path = bridge_dir / filename
-        fd, tmp_name = tempfile.mkstemp(prefix=f"{filename}.", dir=str(bridge_dir))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True)
-                handle.write("\n")
-            os.replace(tmp_name, path)
-        finally:
-            if os.path.exists(tmp_name):
-                os.unlink(tmp_name)
+        _replace_bridge_record(bridge_dir, filename, record)
     except OSError:
         return  # best-effort; the cause is already logged
+
+
+def _replace_bridge_record(bridge_dir: Path, filename: str, record: Mapping[str, object]) -> None:
+    """Atomically replace one JSON record in the bridge directory, raising ``OSError``."""
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = bridge_dir / filename
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{filename}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
+def read_child_usage_baselines(bridge_dir: Path) -> dict[str, tuple[int, int, int]]:
+    """
+    Read the usage each Codex child thread inherited from its source.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Inherited ``(input, cached input, output)`` token totals keyed by
+        child thread id, e.g. ``{"thread_child": (5000, 4000, 100)}``. Empty when
+        nothing was recorded or the file is unreadable.
+    """
+    try:
+        return _load_child_usage_baselines(bridge_dir)
+    except OSError:
+        return {}
+
+
+def _load_child_usage_baselines(bridge_dir: Path) -> dict[str, tuple[int, int, int]]:
+    """
+    Load recorded child usage baselines, treating a missing or malformed file as empty.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Inherited token totals keyed by child thread id.
+    :raises OSError: When the baselines file exists but cannot be read.
+    """
+    try:
+        data = (bridge_dir / _CHILD_USAGE_BASELINES_FILE).read_bytes()
+    except FileNotFoundError:
+        return {}
+    try:
+        raw = json.loads(data)
+    except ValueError:
+        return {}
+    threads = raw.get("threads") if isinstance(raw, dict) else None
+    if not isinstance(threads, dict):
+        return {}
+    baselines: dict[str, tuple[int, int, int]] = {}
+    for thread_id, values in threads.items():
+        if (
+            isinstance(thread_id, str)
+            and thread_id
+            and isinstance(values, list)
+            and len(values) == 3
+            and all(type(value) is int and value >= 0 for value in values)
+        ):
+            baselines[thread_id] = (values[0], values[1], values[2])
+    return baselines
+
+
+def record_child_usage_baseline(
+    bridge_dir: Path, thread_id: str, baseline: tuple[int, int, int]
+) -> None:
+    """
+    Persist the usage one Codex child thread inherited (best-effort).
+
+    A read or write failure is logged and leaves the recorded baselines as they were.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex child thread id, e.g. ``"thread_child"``.
+    :param baseline: Inherited ``(input, cached input, output)`` token totals.
+    :returns: None.
+    """
+    try:
+        with _bridge_state_lock(bridge_dir, _CHILD_USAGE_BASELINES_LOCK_FILE):
+            baselines = _load_child_usage_baselines(bridge_dir)
+            baselines[thread_id] = baseline
+            _replace_bridge_record(
+                bridge_dir,
+                _CHILD_USAGE_BASELINES_FILE,
+                {"threads": {key: list(value) for key, value in baselines.items()}},
+            )
+    except OSError:
+        _logger.warning(
+            "Could not record inherited Codex child usage in %s", bridge_dir, exc_info=True
+        )
 
 
 def clear_bridge_startup_error(bridge_dir: Path) -> None:
@@ -1599,7 +1685,9 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
-        if state is None:
+        # An accepted steer often returns the turn already saved here. Rewriting
+        # it can fail on a full disk after Codex has accepted the message.
+        if state is None or state.active_turn_id == active_turn_id:
             return
         _write_bridge_state_unlocked(
             bridge_dir,

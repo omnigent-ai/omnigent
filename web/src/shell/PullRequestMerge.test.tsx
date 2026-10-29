@@ -68,12 +68,12 @@ function stubFetch(options: () => Response) {
   return { fetch, posts };
 }
 
-function renderMerge(pr: PullRequest) {
+function renderMerge(pr: PullRequest, compact = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidate = vi.spyOn(client, "invalidateQueries");
   const tree = (next: PullRequest) => (
     <QueryClientProvider client={client}>
-      <PullRequestMerge conversationId="conv_1" prUrl={PR_URL} pr={next} />
+      <PullRequestMerge conversationId="conv_1" prUrl={PR_URL} pr={next} compact={compact} />
     </QueryClientProvider>
   );
   const view = render(tree(pr));
@@ -187,12 +187,12 @@ describe("with auto-merge enabled", () => {
   });
 });
 
-it("merges once with the chosen method at the head the dialog opened on", async () => {
+it.each([false, true])("merges once at the confirmed head (compact: %s)", async (compact) => {
   const { posts } = stubFetch(allMethods);
-  const { invalidate, rerender } = renderMerge(pullRequest());
+  const { invalidate, rerender } = renderMerge(pullRequest(), compact);
 
-  await openDialog();
-  const picker = screen.getByRole("combobox", { name: "Merge method" });
+  await openDialog(compact ? "Merge" : undefined);
+  const picker = await screen.findByRole("combobox", { name: "Merge method" });
   expect(picker).toHaveTextContent("Squash and merge");
   fireEvent.click(picker);
   fireEvent.click(screen.getByRole("option", { name: "Rebase and merge" }));

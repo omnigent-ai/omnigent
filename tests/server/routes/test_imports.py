@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -14,6 +15,8 @@ from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.app import _ensure_default_agents
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.imports import (
@@ -21,7 +24,9 @@ from omnigent.server.routes.imports import (
     _stream_local_sessions_from_host,
     create_imports_router,
 )
+from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -438,6 +443,43 @@ async def test_rejected_force_import_preserves_existing_session(
     assert conversation_store.get_conversation(session_id) == original
     assert conversation_store.list_items(session_id).data == original_items
     assert permission_store.get_permission_level(caller, session_id) == LEVEL_OWNER
+
+
+async def test_import_into_a_native_agent_the_allowlist_trims(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh database trimmed to Claude still imports Codex transcripts."""
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    artifact_store = LocalArtifactStore(str(tmp_path / "seed-artifacts"))
+    suppressed = _ensure_default_agents(
+        SqlAlchemyAgentStore(db_uri),
+        artifact_store,
+        AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "seed-cache"),
+    )
+    assert "codex-native-ui" in suppressed
+
+    response = await client.post(
+        "/v1/imports",
+        json={
+            "source": "codex",
+            "external_session_id": "trimmed-codex-session",
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "codex:turn-1",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Hello"}],
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201, response.text
 
 
 async def test_import_session_rejects_empty_history(client: httpx.AsyncClient) -> None:

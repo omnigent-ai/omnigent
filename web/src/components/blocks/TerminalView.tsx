@@ -8,7 +8,7 @@
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -31,12 +31,6 @@ import {
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
-import {
-  readTerminalThemeMode,
-  resolveTerminalIsDark,
-  subscribeTerminalTheme,
-  type TerminalThemeMode,
-} from "@/lib/terminalThemePreferences";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   TerminalClipboardPrompt,
@@ -275,16 +269,8 @@ export function TerminalView({
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
-  const resolvedMode = useResolvedThemeMode();
-  // Terminal theme is independent of the app theme: "auto" follows the app's
-  // resolved appearance, while "light"/"dark" pin the terminal. Reading the
-  // pref as state (seeded at mount, updated via the pub/sub) lets a Settings
-  // change re-theme a live terminal through the existing setTheme effect below.
-  const [terminalMode, setTerminalMode] = useState<TerminalThemeMode>(() =>
-    readTerminalThemeMode(),
-  );
-  useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
-  const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
+  // A Settings change re-themes a live terminal through the setTheme effect below.
+  const isDark = useTerminalIsDark();
   const terminalBackground = terminalTheme(isDark).background;
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
