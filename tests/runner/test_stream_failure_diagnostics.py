@@ -410,6 +410,95 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
     assert ended[0].attributes["exception_type"] == "ReadError"
 
 
+class _ExitBeforeFailureHarnessClient(_ScriptedHarnessClient):
+    """Harness client whose pane dies between its first frame and the rest."""
+
+    def __init__(self, frames: list[str], on_exit: Callable[[], None]) -> None:
+        super().__init__(frames)
+        self._on_exit = on_exit
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        """Stream the first frame, run *on_exit*, then stream the rest."""
+        del method, url, timeout
+        self.posted_bodies.append(json)
+        frames, on_exit = self._sse_frames, self._on_exit
+
+        class _Handle:
+            status_code = 200
+
+            async def aiter_text(self) -> AsyncIterator[str]:
+                yield frames[0]
+                on_exit()
+                for frame in frames[1:]:
+                    yield frame
+
+        class _Ctx:
+            async def __aenter__(self) -> _Handle:
+                return _Handle()
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+        return _Ctx()
+
+
+@pytest.mark.asyncio
+async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> None:
+    """A Claude pane that dies while the message waits for its prompt reports one failure.
+
+    The exit arrives while the turn is live; the turn then ends saying nothing
+    was typed, and the server sends the message again. The terminal exit must
+    not publish its own ``required_terminal_exited`` failure, which is the
+    session failure the re-send exists to avoid.
+    """
+    import asyncio
+
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runtime.pending_inputs import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+
+    _session_event_queues_ref.pop(_CONV_ID, None)
+    publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+    harness_client = _ExitBeforeFailureHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_waiting"}}),
+            _sse(
+                {
+                    "type": "response.failed",
+                    "response": {"id": "resp_waiting"},
+                    "error": {
+                        "code": TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+                        "message": "The Claude Code terminal has exited before delivery.",
+                        "undelivered": True,
+                    },
+                }
+            ),
+        ],
+        on_exit=lambda: publish["exit"](_required_terminal_exit(session_was_idle=False)),
+    )
+    spec = AgentSpec(spec_version=1, name="plain-agent")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
+    try:
+        failed, _ = await _failed_event_message(app, _CONV_ID)
+        # The held exit settles once the turn has ended.
+        await asyncio.sleep(0.2)
+        statuses = _failed_statuses(_CONV_ID)
+    finally:
+        _session_event_queues_ref.pop(_CONV_ID, None)
+
+    assert failed["error"]["code"] == TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+    assert [s["error"]["code"] for s in statuses] == [TERMINAL_EXITED_BEFORE_DELIVERY_CODE]
+
+
 @pytest.mark.asyncio
 async def test_earlier_terminal_exit_does_not_relabel_a_later_stream_drop() -> None:
     """An exit recorded before the turn started is not blamed for its drop."""

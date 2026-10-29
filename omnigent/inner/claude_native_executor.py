@@ -54,6 +54,7 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.runtime.pending_inputs import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 
 _logger = logging.getLogger(__name__)
 
@@ -332,7 +333,14 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            # Nothing was typed, so a pane that died under the turn lets the
+            # server relaunch Claude and send the message once more.
+            resendable = not clean_exit and not exc.killed_by_omnigent
+            yield ExecutorError(
+                message=message,
+                code=TERMINAL_EXITED_BEFORE_DELIVERY_CODE if resendable else None,
+                undelivered=True,
+            )
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(

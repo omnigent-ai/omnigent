@@ -8628,6 +8628,78 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
 
 
 @pytest.mark.asyncio
+async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A re-send that cannot start records the failure the re-send replaced."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    # Earlier relay tests leave this session's live status failed.
+    orchestration_module._session_status_cache.pop(session_id, None)
+    stable_id = "9c" * 16
+    content = [{"type": "input_text", "text": "run the tests"}]
+    pending_inputs.record(session_id, content, stable_id=stable_id)
+    attempts: list[str] = []
+
+    async def refuse(*args: Any) -> None:
+        attempts.append(args[0])
+        raise RuntimeError("runner unavailable")
+
+    monkeypatch.setattr(orchestration_module, "_native_input_resender", refuse)
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    error = {
+        "code": pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+        "message": "The Claude Code terminal is no longer running.",
+        "undelivered": True,
+    }
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame({"type": "response.in_progress", "response": {"id": "resp_untyped"}}),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": stable_id,
+                    "response": {"id": "resp_untyped", "error": error},
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": error["code"], "message": error["message"]},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+        await asyncio.gather(*orchestration_module._resend_tasks)
+
+        assert attempts == [session_id]
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        assert store.appended_items[0].data.content == content
+        assert store.appended_items[1].data.code == error["code"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [event["error"]["code"] for event in failed] == [error["code"]]
+        assert pending_inputs.snapshot_for(session_id) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("undelivered", [True, False])
 async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     undelivered: bool,

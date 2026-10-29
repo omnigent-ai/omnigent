@@ -139,6 +139,10 @@ _MAX_ENTRIES_PER_CONVERSATION = 64
 _ONE_LEADING_ATTACHMENT_MARKER_RE = re.compile(rf"^\s*(?:{ATTACHMENT_MARKER_STRIP_PATTERN})\s*")
 _ATTACHMENT_BLOCK_TYPES = frozenset({"input_image", "input_file"})
 
+# Failure code for a turn whose native terminal died on its own before any of the
+# message was typed. Nothing reached the agent, so the server may send it once more.
+TERMINAL_EXITED_BEFORE_DELIVERY_CODE = "terminal_exited_before_delivery"
+
 NativeInputCauseClass = Literal[
     "rejected_before_handoff",
     "rejected_by_native",

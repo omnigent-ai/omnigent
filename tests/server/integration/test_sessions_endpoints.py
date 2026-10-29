@@ -10561,6 +10561,204 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
                 pending_inputs.resolve(session["id"], pending["pending_id"])
 
 
+async def _claude_turn_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: Exception | None
+) -> dict[str, Any] | None:
+    """Run one real Claude-native turn whose delivery raises *failure*; return its error."""
+    from omnigent.inner import claude_native_executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    def deliver(bridge_dir: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir, content, timeout_s
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", deliver)
+    monkeypatch.setattr(claude_native_executor, "kill_session", lambda *_a, **_k: None)
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: claude_native_executor.ClaudeNativeExecutor(tmp_path)
+    )
+    context = TurnContext(
+        response_id="resp_pane_died", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        await adapter.run_turn(
+            CreateResponseRequest(
+                model="claude", input=[{"type": "input_text", "text": "run the tests"}]
+            ),
+            context,
+        )
+    except RuntimeError as exc:
+        return adapter._build_error_detail(exc).model_dump(exclude_none=True)
+    finally:
+        await adapter.on_shutdown()
+    return None
+
+
+def _failed_turn_frames(stable_id: str, error: dict[str, Any]) -> list[str]:
+    """The runner's relay frames for a turn that failed with *error*, then [DONE]."""
+    from tests.server.routes.test_session_resources import _sse_frame
+
+    return [
+        _sse_frame({"type": "response.in_progress", "response": {"id": "resp_pane_died"}}),
+        _sse_frame(
+            {
+                "type": "response.failed",
+                "input_stable_id": stable_id,
+                "response": {"id": "resp_pane_died", "error": error},
+            }
+        ),
+        # The runner's turn-end edge carries the turn's own code.
+        _sse_frame(
+            {
+                "type": "session.status",
+                "status": "failed",
+                "error": {"code": error["code"], "message": error["message"]},
+                "response_id": "resp_pane_died",
+            }
+        ),
+        "data: [DONE]\n\n",
+    ]
+
+
+@pytest.mark.parametrize("pane_died", ["waiting_for_prompt", "after_submit"])
+async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pane_died: str,
+) -> None:
+    """A message still waiting for Claude's prompt when its pane dies is delivered once.
+
+    Nothing was typed, so the server relaunches the terminal through the normal
+    send path and forwards the same message again instead of failing the turn.
+    It does that at most once per message, and a pane that died after the
+    message was submitted still fails as before: re-sending it could run it twice.
+    """
+    from omnigent.harnesses.claude_native.bridge import ClaudeTerminalExited
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _relay_runner_stream, routes_events
+    from tests.server.routes.test_session_resources import _ScriptedStreamingRunnerClient
+
+    agent = await create_test_agent(client, name="claude-native-ui")
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.replace_runner_id(session_id, "native-runner")
+    terminals_path = f"/v1/sessions/{session_id}/resources/terminals"
+    events_path = f"/v1/sessions/{session_id}/events"
+    ensures: list[str] = []
+    forwarded: list[dict[str, Any]] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201, json={"session_init_protocol_version": 2, "terminal_ready": False}
+            )
+        if request.url.path == terminals_path:
+            ensures.append(request.url.path)
+            return httpx.Response(200, json={})
+        if request.url.path == events_path:
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    stable_id = "5e" * 16
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "run the tests"}],
+            "stable_id": stable_id,
+        },
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr(
+            routes_events, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        monkeypatch.setattr(
+            routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock()
+        )
+        bound = store.get_conversation(session_id)
+        assert bound is not None
+        await app.state.runner_session_initializer.initialize(
+            bound, runner_client, timeout=5, suppress_recovery_turn=True
+        )
+        try:
+            sent = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert sent.status_code == 202, sent.text
+            assert len(forwarded) == 1
+            pending_id = sent.json()["pending_id"]
+            ensures.clear()
+
+            if pane_died == "waiting_for_prompt":
+                # Delivery was still waiting for the prompt when tmux lost the pane.
+                error = await _claude_turn_failure(
+                    monkeypatch,
+                    tmp_path,
+                    ClaudeTerminalExited("The Claude Code terminal is no longer running."),
+                )
+            else:
+                # The message was submitted; the pane died while Claude worked on it.
+                assert await _claude_turn_failure(monkeypatch, tmp_path, None) is None
+                error = {"code": "required_terminal_exited", "message": "Claude exited."}
+            assert error is not None
+            await _relay_runner_stream(
+                session_id,
+                _ScriptedStreamingRunnerClient(_failed_turn_frames(stable_id, error)),  # type: ignore[arg-type]
+                store,
+            )
+            await asyncio.gather(*orchestration_module._resend_tasks)
+
+            snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+            errors = [item for item in snapshot["items"] if item["type"] == "error"]
+            if pane_died == "after_submit":
+                assert len(forwarded) == 1
+                assert ensures == []
+                assert snapshot["status"] == "failed"
+                assert [item["data"]["code"] for item in errors] == ["required_terminal_exited"]
+                return
+
+            # Relaunched through the send path and forwarded once more, unchanged.
+            assert ensures == [terminals_path]
+            assert len(forwarded) == 2
+            assert forwarded[1]["content"] == forwarded[0]["content"]
+            assert snapshot["status"] != "failed"
+            assert errors == []
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+                pending_id
+            ]
+
+            # The re-sent message dies the same way: no third send, the failure stands.
+            await _relay_runner_stream(
+                session_id,
+                _ScriptedStreamingRunnerClient(_failed_turn_frames(stable_id, error)),  # type: ignore[arg-type]
+                store,
+            )
+            await asyncio.gather(*orchestration_module._resend_tasks)
+            snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+            assert len(forwarded) == 2
+            assert snapshot["status"] == "failed"
+            assert [item["type"] for item in snapshot["items"]] == ["message", "error"]
+            assert pending_inputs.snapshot_for(session_id) == []
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
 ) -> None:

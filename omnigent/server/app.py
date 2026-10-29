@@ -12,6 +12,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from functools import partial
 from importlib import import_module
 from itertools import batched, groupby
 from pathlib import Path
@@ -137,6 +138,7 @@ from omnigent.server.routes.sessions import (
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
+    set_native_input_resender,
     set_relay_host_offline_probe,
     set_server_host_registry,
     set_server_runner_router,
@@ -3646,6 +3648,9 @@ def create_app(
             ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
+            ),
+            register_native_input_resend=lambda handler: set_native_input_resender(
+                partial(handler, app)
             ),
         ),
         prefix="/v1",

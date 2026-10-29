@@ -613,6 +613,7 @@ from omnigent.server.routes._sessions.orchestration import (
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _MID_TURN_STATUSES as _MID_TURN_STATUSES,
     _host_row_offline as _host_row_offline,
+    set_native_input_resender as set_native_input_resender,
     set_relay_host_offline_probe as set_relay_host_offline_probe,
     _accumulate_session_usage as _accumulate_session_usage,
     _best_effort_stop as _best_effort_stop,
@@ -823,6 +824,7 @@ def create_sessions_router(
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
+    register_native_input_resend: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -1002,6 +1004,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        register_native_input_resend=register_native_input_resend,
     )
 
     register_permissions_routes(

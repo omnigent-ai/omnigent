@@ -635,12 +635,16 @@ class ClaudeTerminalExited(ClaudePromptTimeout):
     Subclasses :class:`ClaudePromptTimeout` so existing delivery handlers
     keep catching it, while callers that care about severity can tell a
     clean quit (``exit_status`` ``"0"`` — the person closed Claude Code)
-    from a crash.
+    from a crash. ``killed_by_omnigent`` tells a pane Omnigent ended itself from
+    one that died under it.
     """
 
-    def __init__(self, message: str, *, exit_status: str | None = None) -> None:
+    def __init__(
+        self, message: str, *, exit_status: str | None = None, killed_by_omnigent: bool = False
+    ) -> None:
         super().__init__(message)
         self.exit_status = exit_status
+        self.killed_by_omnigent = killed_by_omnigent
 
 
 class ClaudeTerminalDialog(RuntimeError):
@@ -7054,6 +7058,7 @@ def _wait_for_claude_prompt_ready(
             "Relaunch the terminal to continue this conversation."
             + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
+            killed_by_omnigent=pane_killed_by_omnigent(Path(socket_path).parent),
         )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
