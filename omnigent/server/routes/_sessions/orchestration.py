@@ -124,6 +124,7 @@ from omnigent.runtime.policies.builder import (
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.requester import REQUESTER_FIELD, ToolRequester
 from omnigent.runtime.workflow import _find_spec_by_name
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
@@ -6366,6 +6367,8 @@ def _build_native_terminal_message_event(
         can resolve the harness spec on the first message.
     :raises OmnigentError: If the event is not a user message.
     """
+    from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
+
     display_name, model, harness = _native_terminal_runtime(conv)
     data = parse_item_data(body.type, {"type": body.type, **body.data})
     if not isinstance(data, MessageData) or data.role != "user":
@@ -6379,6 +6382,7 @@ def _build_native_terminal_message_event(
         "content": data.content,
         "model": model,
         "harness": harness,
+        REQUESTER_FIELD: (body.requester or InputRequester()).model_dump(),
         # The runner resolves the harness from the agent spec keyed by
         # agent_id; the forwarded ``harness`` hint is ignored on the turn
         # path. Without agent_id, the first message of a freshly
@@ -7110,7 +7114,14 @@ async def _forward_event_to_runner(
     # inline base64 data: URIs before forwarding. The runner and
     # harness don't have access to the server's file store — the
     # LLM endpoint needs the actual content, not an internal ID.
+    from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
+
     forwarded_data = dict(body.data)
+    forwarded_data[REQUESTER_FIELD] = (
+        (body.requester or InputRequester())
+        .model_copy(update={"input_id": persisted_items[0].id})
+        .model_dump()
+    )
     if (
         file_store is not None
         and artifact_store is not None
@@ -12453,6 +12464,7 @@ async def _handle_mcp_tools_call(
     request: Request | None = None,
     execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     credential_user: str | None = None,
+    requester: ToolRequester | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -12516,7 +12528,12 @@ async def _handle_mcp_tools_call(
         *,
         step: str,
     ) -> dict[str, Any]:
-        body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        protected_params = {
+            key: value for key, value in execute_params.items() if key != REQUESTER_FIELD
+        }
+        if requester is not None:
+            protected_params[REQUESTER_FIELD] = requester.model_dump()
+        body: dict[str, Any] = {"method": "tools/call", "params": protected_params}
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body
@@ -12559,6 +12576,28 @@ async def _handle_mcp_tools_call(
         if state.get("session_id") != session_id:
             # Reject cross-session replay.
             return _mcp_error_response(rpc_id, -32000, "requestState session mismatch")
+
+        from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+        if (
+            requester is not None
+            and request is not None
+            and RUNNER_TUNNEL_TOKEN_HEADER not in request.headers
+        ):
+            pending = _pending_policy_ask_writes.get(state.get("elicitation_id", ""))
+            identity = pending.mcp_call_identity if pending is not None else None
+            if identity is not None:
+                saved_requester = identity[4]
+                if (
+                    identity[:4]
+                    != (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
+                    or saved_requester is None
+                    or not requester.origin.same_account(saved_requester.origin)
+                    or (operation_id is not None and requester != saved_requester)
+                ):
+                    return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
+                # The client carries only the lookup ID; the server retains the origin.
+                requester = saved_requester
 
         # Re-evaluate policy on every retry; approval cannot override a denial.
         retry_ctx = EvaluationContext(
@@ -12603,7 +12642,13 @@ async def _handle_mcp_tools_call(
             if approval.get("action") != "accept":
                 return _mcp_error_response(rpc_id, -32000, "Tool call denied by user")
             _pending = _pending_policy_ask_writes.get(elicitation_id_from_state)
-            identity = (session_id, namespaced_name, (actor or {}).get("run_as"), credential_user)
+            identity = (
+                session_id,
+                namespaced_name,
+                (actor or {}).get("run_as"),
+                credential_user,
+                requester,
+            )
             if _pending is not None and _pending.mcp_call_identity not in (None, identity):
                 return _mcp_error_response(rpc_id, -32000, "Approval does not match this call")
             _pending_policy_ask_writes.pop(elicitation_id_from_state, None)
@@ -12687,6 +12732,7 @@ async def _handle_mcp_tools_call(
                     namespaced_name,
                     (actor or {}).get("run_as"),
                     credential_user,
+                    requester,
                 ),
             )
             # The client carries identifiers; reviewed arguments stay on the server.

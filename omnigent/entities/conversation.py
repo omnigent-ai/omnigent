@@ -13,6 +13,7 @@ from omnigent.inner.native_attachments import (
     reject_authored_framework_notices,
 )
 from omnigent.llms.adapters._content import redact_binary_payloads
+from omnigent.runtime.requester import InputRequester
 
 # Attachment markers the native executors prepend to prompt text
 # ("[Attached: /tmp/.../x.png]" from claude-native's _content_to_text,
@@ -287,6 +288,7 @@ class StartupInputOptions(BaseModel):
     model_override: str | None = None
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
+    requester: InputRequester | None = None
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.

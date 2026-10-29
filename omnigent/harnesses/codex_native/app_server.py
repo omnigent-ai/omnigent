@@ -31,6 +31,7 @@ from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.codex_native.terminal_proxy import CodexTerminalProxy
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
@@ -2185,6 +2186,7 @@ class CodexNativeAppServer:
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
     app_server_command: tuple[str, ...] = ()
+    terminal_proxy: CodexTerminalProxy | None = field(default=None, init=False, repr=False)
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2695,6 +2697,9 @@ class CodexNativeAppServer:
 
         :returns: None.
         """
+        if self.terminal_proxy is not None:
+            await self.terminal_proxy.close()
+            self.terminal_proxy = None
         if self.proc is not None and self.proc.returncode is None:
             _terminate_process_tree(self.proc)
             try:

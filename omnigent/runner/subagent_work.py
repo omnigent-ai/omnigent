@@ -25,6 +25,7 @@ from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
+from omnigent.runtime.requester import InputRequester, current_tool_requester
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -146,6 +147,7 @@ class _SubagentWorkEntry:
     title: str
     wrapper_label: str | None = None
     created_by: str | None = None
+    requester: InputRequester | None = None
     status: str = "launching"
     output: str | None = None
     created_at: float = dataclasses.field(default_factory=time.time)
@@ -290,6 +292,7 @@ def register_subagent_work(
             if not children:
                 _subagent_work_by_parent.pop(prior.parent_session_id, None)
 
+    caller = current_tool_requester.get()
     entry = _SubagentWorkEntry(
         parent_session_id=parent_session_id,
         child_session_id=child_session_id,
@@ -298,6 +301,7 @@ def register_subagent_work(
         title=title,
         wrapper_label=wrapper_label,
         created_by=created_by,
+        requester=caller.origin if caller else None,
     )
     _drained_delivered_subagent_children.discard(child_session_id)
     _subagent_work_by_child[child_session_id] = entry
@@ -934,6 +938,7 @@ async def _deliver_subagent_wake_post(
     notice: str,
     *,
     created_by: str | None = None,
+    requester: InputRequester | None = None,
 ) -> bool:
     """
     POST a sub-agent wake notice with a bounded retry on transient failure.
@@ -955,12 +960,14 @@ async def _deliver_subagent_wake_post(
         failed (transport error, timeout, or non-2xx response).
     """
     attribution_created_by = created_by
+    origin = requester or InputRequester()
     for attempt in range(1, _WAKE_POST_MAX_ATTEMPTS + 1):
         try:
             resp = await server_client.post(
                 f"/v1/sessions/{parent_id}/events",
                 json={
                     "type": "message",
+                    "requester": origin.model_dump(),
                     "data": {
                         "role": "user",
                         "content": [{"type": "input_text", "text": notice}],

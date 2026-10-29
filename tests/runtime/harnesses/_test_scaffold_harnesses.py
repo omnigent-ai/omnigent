@@ -20,7 +20,7 @@ import os
 
 from fastapi import FastAPI
 
-from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
+from omnigent.runtime.harnesses._scaffold import HarnessApp, HarnessResponseRequest, TurnContext
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
@@ -46,7 +46,14 @@ class _EchoHarness(HarnessApp):
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         # Stringify the input list — tests assert the echoed text
         # contains a marker they injected.
-        echoed = json.dumps(request.input or [])
+        echoed = json.dumps(
+            {
+                "input": request.input or [],
+                "requester": request.requester.model_dump()
+                if isinstance(request, HarnessResponseRequest)
+                else None,
+            }
+        )
         ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta=echoed))
 
 

@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -947,7 +948,8 @@ class _WakeRecordingServerClient(NullServerClient):
 
 
 @pytest.mark.asyncio
-async def test_native_subagent_completion_wakes_idle_parent() -> None:
+@pytest.mark.parametrize("requester_name", [None, "bryan", "pat"])
+async def test_native_subagent_completion_wakes_idle_parent(requester_name) -> None:
     """
     A finished native sub-agent wakes its idle parent via a ``/events`` POST.
 
@@ -960,6 +962,12 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     "nessie doesn't know its sub-agent finished" bug this fixes.
     """
 
+    from omnigent.runtime.requester import (
+        ExecutionRequester,
+        InputRequester,
+        current_tool_requester,
+    )
+
     parent_id = "bf881b8f7e32add48bfcd6afc476452a"
     child_id = "7ec2f4cd958a2c2a8c02bd3c03cbacc6"
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -971,12 +979,17 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
     )
 
     subagent_work._session_inboxes_ref[parent_id] = session_inbox
-    subagent_work.register_subagent_work(
-        parent_session_id=parent_id,
-        child_session_id=child_id,
-        agent="claude_code",
-        title="auth",
-    )
+    origin = InputRequester(user_id=requester_name)
+    token = current_tool_requester.set(ExecutionRequester(origin).snapshot())
+    try:
+        subagent_work.register_subagent_work(
+            parent_session_id=parent_id,
+            child_session_id=child_id,
+            agent="claude_code",
+            title="auth",
+        )
+    finally:
+        current_tool_requester.reset(token)
 
     try:
         async with _runner_client(app) as client:
@@ -1009,6 +1022,7 @@ async def test_native_subagent_completion_wakes_idle_parent() -> None:
         f"Expected one wake POST to the parent, got {len(server_client.wake_posts)}."
     )
     wake_text = server_client.wake_posts[0]["data"]["content"][0]["text"]
+    assert InputRequester.model_validate(server_client.wake_posts[0]["requester"]) == origin
     # Notice names the finished worker and steers the parent to drain the inbox.
     assert "sub-agent claude_code/auth finished (completed)" in wake_text
     assert "sys_read_inbox" in wake_text
@@ -2690,6 +2704,8 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
 async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harnesses(
     harness: str,
     expected_statuses: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     Runner lifecycle status is edge-specific for terminal-backed harnesses.
@@ -2713,7 +2729,9 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
     :returns: None.
     """
     from omnigent.runner.app import _session_event_queues_ref
+    from tests._helpers.providers import isolate_provider_resolution
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     session_id = uuid.uuid4().hex
     spec = AgentSpec(
         spec_version=1,

@@ -28,6 +28,7 @@ import pytest
 from omnigent.inner.executor import Executor
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.runtime.requester import ExecutionRequester, InputRequester, ToolRequester
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_executor_adapter_harness"
@@ -1955,7 +1956,10 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
 
         def __init__(self) -> None:
             """Init."""
+            import asyncio
+
             self.response_id = "resp_capturing"
+            self.cancelled = asyncio.Event()
 
         async def dispatch_tool(
             self,
@@ -1964,6 +1968,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             name: str,
             arguments: str,
             agent: str,
+            requester: ToolRequester | None = None,
         ) -> str:
             """Record the call_id then return a benign payload.
 
@@ -1974,7 +1979,7 @@ async def test_stable_tool_executor_pops_queue_for_bare_tool_name() -> None:
             :returns: Empty JSON object so
                 ``_bridge_one_dispatch`` can decode.
             """
-            del name, arguments, agent
+            del name, arguments, agent, requester
             captured_call_ids.append(call_id)
             return "{}"
 
@@ -2079,7 +2084,10 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
 
         def __init__(self) -> None:
             """Seed a stable response_id so _bridge_one_dispatch logs it."""
+            import asyncio
+
             self.response_id = "resp_capturing"
+            self.cancelled = asyncio.Event()
 
         async def dispatch_tool(
             self,
@@ -2088,6 +2096,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             name: str,
             arguments: str,
             agent: str,
+            requester: ToolRequester | None = None,
         ) -> str:
             """
             Record the call_id and return a benign payload.
@@ -2103,7 +2112,7 @@ async def test_observed_and_dispatched_call_ids_match_for_openai_agents() -> Non
             :returns: ``"{}"`` so the inner SDK can decode it as
                 JSON without errors.
             """
-            del name, arguments, agent
+            del name, arguments, agent, requester
             captured_dispatched_call_ids.append(call_id)
             return "{}"
 
@@ -2250,6 +2259,7 @@ class _OneInjectionCtx:
         self.emitted: list[Any] = []
         self.response_id = "resp_injection"
         self.session_id = "session_injection"
+        self.requester = ExecutionRequester(InputRequester())
         # Mirror TurnContext: the watcher skips delivery once cancelled.
         self.cancelled = asyncio.Event()
 

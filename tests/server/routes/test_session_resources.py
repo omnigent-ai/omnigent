@@ -31,6 +31,7 @@ from omnigent.runtime import (
     set_runner_direct_attach_resolver,
     set_runner_router,
 )
+from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -763,6 +764,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
     caplog.set_level(logging.INFO)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     set_runner_client(fake_runner)  # type: ignore[arg-type]
+    claimed_requester = InputRequester(user_id="forged@example.test", account_generation="old")
 
     resp = await client.post(
         "/v1/sessions/64a784c3aa907d1774f44313546947c6/events",
@@ -772,6 +774,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "role": "user",
                 **({"stable_id": stable_id} if stable_id is not None else {}),
                 "content": [{"type": "input_text", "text": "hello claude"}],
+                REQUESTER_FIELD: claimed_requester.model_dump(),
             },
         },
     )
@@ -789,6 +792,10 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
     forwarded = fake_runner.post_json_calls[1][1]
+    requester = InputRequester.model_validate(forwarded[REQUESTER_FIELD])
+    assert requester.user_id is None
+    assert requester.account_generation is None
+    assert requester.input_id != claimed_requester.input_id
     assert re.fullmatch(r"[0-9a-f]{32}", forwarded["delivery_attempt_id"])
     assert isinstance(forwarded["input_enqueued_at_ms"], int)
     assert forwarded["input_enqueued_at_ms"] > 0
@@ -810,6 +817,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "content": [{"type": "input_text", "text": "hello claude"}],
                 "model": "claude-native-ui",
                 "harness": "claude-native",
+                REQUESTER_FIELD: requester.model_dump(),
                 # Forwarded so the runner resolves the harness spec on the
                 # first message (before POST /v1/sessions caches it).
                 "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
@@ -1230,8 +1238,10 @@ def _terminals_only_payload() -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated_attach", [False, True])
 async def test_list_terminals_adds_direct_attach_url_when_advertised(
     client: httpx.AsyncClient,
+    authenticated_attach: bool,
 ) -> None:
     """A runner-advertised loopback listener surfaces per-terminal URLs.
 
@@ -1239,7 +1249,10 @@ async def test_list_terminals_adds_direct_attach_url_when_advertised(
     the disclosure gate treats as owner — mirroring the relay's
     write-attach behavior.
     """
-    fake_runner = _FakeRunnerClient(payload=_terminals_only_payload())
+    payload = _terminals_only_payload()
+    if authenticated_attach:
+        payload["data"][0].setdefault("metadata", {})["requires_authenticated_attach"] = True
+    fake_runner = _FakeRunnerClient(payload=payload)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     set_runner_direct_attach_resolver(
         lambda conversation_id: DirectAttachEndpoint(port=54321, token="tok_abc")
@@ -1249,6 +1262,9 @@ async def test_list_terminals_adds_direct_attach_url_when_advertised(
 
     assert resp.status_code == 200
     (item,) = resp.json()["data"]
+    if authenticated_attach:
+        assert "direct_attach_url" not in item["metadata"]
+        return
     assert item["metadata"]["direct_attach_url"] == (
         "ws://127.0.0.1:54321/v1/sessions/79b22ebd2309e48fdeb450c65611d51b"
         "/resources/terminals/terminal_runner_s1/attach?token=tok_abc"

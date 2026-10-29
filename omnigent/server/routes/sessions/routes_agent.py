@@ -548,7 +548,9 @@ def register_agent_routes(
             return response
 
         if method == "tools/call":
+            from omnigent.runner.mcp_execution_registry import MCP_OPERATION_ID_PARAM
             from omnigent.server.mcp_identity import mcp_policy_actor
+            from omnigent.server.requester import tool_requester
 
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             actor = mcp_policy_actor(request, conv, user_id) if conv else _build_actor(user_id)
@@ -562,6 +564,16 @@ def register_agent_routes(
                 actor=actor,
                 credential_user=user_id,
                 request=request,
+                requester=(
+                    tool_requester(
+                        request,
+                        conv,
+                        user_id=user_id,
+                        operation_id=params.get(MCP_OPERATION_ID_PARAM),
+                    )
+                    if conv
+                    else None
+                ),
             )
 
         return _mcp_error_response(rpc_id, -32601, f"Method not found: {method!r}")

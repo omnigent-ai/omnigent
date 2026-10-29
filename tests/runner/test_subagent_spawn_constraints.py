@@ -85,14 +85,14 @@ def _new_child_handler(
             )
         if request.method == "GET" and path == f"/v1/sessions/{_PARENT_SESSION}/child_sessions":
             return httpx.Response(200, json={"data": []})
-        if request.method == "POST" and path == "/v1/sessions":
+        if request.method == "POST" and path == "/v1/requester/sessions":
             body = json.loads(request.content)
             writes.append((path, body))
             return httpx.Response(201, json={"id": child_id})
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/policies":
             writes.append((path, json.loads(request.content)))
             return httpx.Response(201, json={"ok": True})
-        if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
+        if request.method == "POST" and path == f"/v1/requester/sessions/{child_id}/events":
             writes.append((path, json.loads(request.content)))
             return httpx.Response(202, json={"queued": True})
         raise AssertionError(f"unexpected {request.method} {path}")
@@ -165,9 +165,9 @@ async def test_cost_budget_is_normalized_and_attached_to_child_policy(
     event_posts = [body for path, body in writes if path.endswith("/events")]
     assert handle["conversation_id"] == _CHILD_SESSION
     assert [path for path, _body in writes] == [
-        "/v1/sessions",
+        "/v1/requester/sessions",
         f"/v1/sessions/{_CHILD_SESSION}/policies",
-        f"/v1/sessions/{_CHILD_SESSION}/events",
+        f"/v1/requester/sessions/{_CHILD_SESSION}/events",
     ]
     assert policy_posts == [
         {
@@ -311,7 +311,7 @@ async def test_reasoning_effort_is_validated_and_carried_to_child_create(
     )
 
     assert json.loads(output)["conversation_id"] == _CHILD_SESSION
-    create_body = next(body for path, body in writes if path == "/v1/sessions")
+    create_body = next(body for path, body in writes if path == "/v1/requester/sessions")
     assert create_body["reasoning_effort"] == expected
 
 
@@ -354,7 +354,7 @@ async def test_spec_default_reasoning_effort_is_carried_to_child_create() -> Non
     )
 
     assert json.loads(output)["conversation_id"] == _CHILD_SESSION
-    create_body = next(body for path, body in writes if path == "/v1/sessions")
+    create_body = next(body for path, body in writes if path == "/v1/requester/sessions")
     assert create_body["reasoning_effort"] == "high"
 
 

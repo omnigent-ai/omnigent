@@ -38,6 +38,7 @@ from omnigent.inner.terminal_lifecycle import (
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
+from omnigent.terminals.writer import TerminalWriter, TerminalWriterEvidence
 
 
 @dataclass
@@ -2277,8 +2278,9 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     assert instance.last_exit_text() is None
 
 
+@pytest.mark.parametrize("complete_observation", [False, True])
 async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_launch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, complete_observation: bool
 ) -> None:
     inherited = {
         TERMINAL_INSTANCE_ID_ENV: "a" * 32,
@@ -2293,6 +2295,7 @@ async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_lau
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
         env=inherited,
+        complete_writer_observation=complete_observation,
     )
     instance.lifecycle_trace.session_id = "synthetic-owner"
     spawn = AsyncMock(return_value=_SuccessfulProcess())
@@ -2303,6 +2306,12 @@ async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_lau
     )
 
     await instance.launch()
+    evidence = instance.writer_evidence
+    actor = TerminalWriter(user_id="authenticated-actor", account_generation="generation-1")
+    evidence.record(actor)
+    writer_snapshot = evidence.snapshot(evidence.incarnation_id)
+    assert writer_snapshot is not None
+    assert writer_snapshot.writer == (actor if complete_observation else TerminalWriter())
     first = spawn.call_args.kwargs["env"]
     assert first[TERMINAL_INSTANCE_ID_ENV] == instance.diagnostic_id
     assert first[TERMINAL_LAUNCH_SESSION_ID_ENV] == "synthetic-owner"
@@ -2314,10 +2323,18 @@ async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_lau
 
     await instance.launch()
     assert spawn.call_count == 1
+    assert instance.writer_evidence is evidence
     assert instance.lifecycle_trace.launch_id == first[TERMINAL_LAUNCH_ID_ENV]
     instance.running = False
     await instance.launch()
     second = spawn.call_args.kwargs["env"]
+    assert instance.writer_evidence is not evidence
+    assert instance.writer_evidence.incarnation_id != evidence.incarnation_id
+    assert instance.writer_evidence.snapshot(evidence.incarnation_id) is None
+    fresh_writer = instance.writer_evidence.snapshot(instance.writer_evidence.incarnation_id)
+    assert fresh_writer is not None and fresh_writer.revision == 0
+    assert fresh_writer.writer == TerminalWriter()
+    assert evidence.snapshot(evidence.incarnation_id) == writer_snapshot
     assert spawn.call_count == 2
     assert second[TERMINAL_INSTANCE_ID_ENV] == first[TERMINAL_INSTANCE_ID_ENV]
     assert second[TERMINAL_LAUNCH_ID_ENV] != first[TERMINAL_LAUNCH_ID_ENV]
@@ -3107,6 +3124,9 @@ async def test_send_chunks_long_literal_text_under_tmux_command_cap(
         :returns: A successful fake process.
         """
         del stdout, stderr
+        writer_snapshot = instance.writer_evidence.snapshot("send-process")
+        assert writer_snapshot is not None and writer_snapshot.writer == TerminalWriter()
+        assert writer_snapshot.revision > 1
         captured.append(list(cmd))
         return _SuccessfulProcess()
 
@@ -3128,6 +3148,14 @@ async def test_send_chunks_long_literal_text_under_tmux_command_cap(
         private_dir=tmp_path,
     )
     instance.running = True
+
+    instance.writer_evidence = TerminalWriterEvidence("send-process", complete_observation=True)
+    actor = TerminalWriter(user_id="authenticated-actor")
+    instance.writer_evidence.record(actor)
+    before = instance.writer_evidence.snapshot("send-process")
+    assert before is not None and before.writer == actor
+    assert await instance.send(text="", keys=" ") == {"status": "sent"}
+    assert instance.writer_evidence.snapshot("send-process") == before
 
     # 20,000 chars exceeds tmux's 16KB per-command cap outright — before
     # chunking this exact call failed with "command too long".

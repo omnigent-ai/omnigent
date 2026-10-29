@@ -46,6 +46,7 @@ from fastapi import FastAPI, Query, WebSocket
 from starlette import status
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.terminals.writer import TerminalWriter, bind_terminal_writer
 
 _logger = logging.getLogger(__name__)
 
@@ -194,6 +195,8 @@ def create_direct_attach_app(
         if not _authorized(websocket):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
+        # The listener bearer grants transport access, not human identity.
+        bind_terminal_writer(websocket.scope, TerminalWriter())
         await attach_handler(
             websocket,
             session_id,

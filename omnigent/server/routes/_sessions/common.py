@@ -46,6 +46,7 @@ from omnigent.harness_plugins import (
     harness_capabilities,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runtime.requester import ToolRequester
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -808,7 +809,7 @@ class _PendingPolicyAskWrites:
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
-    :param mcp_call_identity: Session, tool, policy actor and credential user.
+    :param mcp_call_identity: Session, tool, policy actor, credential user and requester.
     """
 
     state_updates: list[StateUpdate] | None
@@ -816,7 +817,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
-    mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
+    mcp_call_identity: tuple[str, str, str | None, str | None, ToolRequester | None] | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be

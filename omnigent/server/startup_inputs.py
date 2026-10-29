@@ -14,6 +14,7 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from starlette.datastructures import Headers
 
+from omnigent.db.account_authority import account_generation
 from omnigent.db.db_models import current_workspace_id
 from omnigent.entities.conversation import (
     Conversation,
@@ -26,6 +27,7 @@ from omnigent.entities.conversation import (
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
+from omnigent.runtime.requester import InputRequester
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
@@ -150,7 +152,7 @@ class ManagedStartupInputs:
         )
 
         try:
-            SessionStartupInput.model_validate(event.model_dump())
+            SessionStartupInput.model_validate(event.model_dump(exclude={"requester"}))
         except ValueError as exc:
             raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
         raw_id = event.data.get("stable_id")
@@ -176,6 +178,13 @@ class ManagedStartupInputs:
                     model_override=event.model_override,
                     tools=event.tools,
                     background_titles_enabled=background_session_titles_enabled(headers),
+                    requester=(
+                        event.requester
+                        or InputRequester(
+                            user_id=user_id,
+                            account_generation=account_generation(user_id) if user_id else None,
+                        )
+                    ).model_copy(update={"input_id": input_id}),
                 )
             }
         )
@@ -419,6 +428,7 @@ class ManagedStartupInputs:
                 data={**item.data.model_dump(exclude={"startup_options"}), "stable_id": item.id},
                 model_override=options.model_override if options else None,
                 tools=options.tools if options else None,
+                requester=options.requester if options and options.requester else InputRequester(),
             )
             response = await self.dispatch(context, session_id, event)
             if response.get("denied"):

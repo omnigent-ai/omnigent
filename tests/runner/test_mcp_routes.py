@@ -9,12 +9,14 @@ summarizer, harness forwarding — is driven through the real HTTP handler.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -25,10 +27,16 @@ from omnigent.runner import mcp_routes
 from omnigent.runner.mcp_execution_registry import McpExecutionRegistry
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.native.orchestration import ResolvedSpec
+from omnigent.runner.native_requester import CodexTerminalInputBinding
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runtime.harnesses._scaffold import HarnessApp, NativeInputRegistration
 from omnigent.runtime.harnesses.process_manager import NoLiveHarnessError
+from omnigent.runtime.requester import REQUESTER_FIELD, ExecutionRequester, InputRequester
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
+from omnigent.terminals.registry import TerminalRegistry
+from omnigent.terminals.writer import TerminalWriter, TerminalWriterEvidence
 from omnigent.tools.mcp import McpElicitationRequired
+from tests.runner.helpers import make_test_terminal_instance
 
 pytestmark = pytest.mark.asyncio
 
@@ -361,8 +369,10 @@ async def test_elicitation_reply_resumes_the_tool_with_the_user_input() -> None:
 # ── tools/call: built-in tools dispatched through execute_tool ─────────────
 
 
+@pytest.mark.parametrize("requester_user", ["missing", None, "pat"])
 async def test_builtin_tool_dispatch_passes_session_context(
     monkeypatch: pytest.MonkeyPatch,
+    requester_user: str | None,
 ) -> None:
     seen: dict[str, Any] = {}
 
@@ -374,11 +384,23 @@ async def test_builtin_tool_dispatch_passes_session_context(
     h = Harness()
     spec = _spec()
     h.spec_cache[SESSION] = ResolvedSpec(spec=spec, workdir=Path("/tmp/bundle"))
-    status, body = await h.execute(_call("sys_list_files", arguments={"path": "."}))
+    requester = (
+        None
+        if requester_user == "missing"
+        else ExecutionRequester(InputRequester(user_id=requester_user)).snapshot()
+    )
+    owner_claim = ExecutionRequester(InputRequester(user_id="bryan")).snapshot()
+    arguments = {"path": ".", REQUESTER_FIELD: owner_claim.model_dump()}
+    call = _call("sys_list_files", arguments=arguments)
+    if requester is not None:
+        call["params"][REQUESTER_FIELD] = requester.model_dump()
+    status, body = await h.execute(call)
     assert status == 200
     assert body == {"result": {"output": "listed"}}
     assert seen["tool_name"] == "sys_list_files"
-    assert json.loads(seen["arguments"]) == {"path": "."}
+    assert json.loads(seen["arguments"]) == arguments
+    # Legacy proxies can omit metadata; argument claims cannot replace it.
+    assert seen["requester"] == requester
     assert seen["agent_spec"] is spec
     assert seen["local_tool_workdir"] == Path("/tmp/bundle")
     assert seen["runner_workspace"] == Path("/tmp/runtime-cwd")
@@ -508,6 +530,317 @@ async def test_retained_operation_with_changed_params_is_a_conflict() -> None:
     assert body["error"]["code"] == -32000
     assert "parameters changed" in body["error"]["message"]
     assert len(manager.calls) == 1
+
+
+@pytest.fixture
+async def terminal_input_binding(tmp_path: Path) -> AsyncIterator[SimpleNamespace]:
+    """Real registration/refusal HTTP routes with a recorded, unspawned terminal."""
+    registrations: list[NativeInputRegistration] = []
+    refused: list[str] = []
+    requests: list[httpx.Request] = []
+
+    class NativeHarness(HarnessApp):
+        def register_native_input(self, body: NativeInputRegistration) -> str:
+            registrations.append(body)
+            return f"{len(registrations):032x}"
+
+        def refuse_native_input(self, client_id: str) -> None:
+            refused.append(client_id)
+
+    harness = NativeHarness()
+    app = harness.build()
+    app.state.conversation_id = SESSION
+    app.state.harness_auth_token = "binding-test-token"
+    terminal = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal.writer_evidence = TerminalWriterEvidence("incarnation", complete_observation=True)
+    registry = TerminalRegistry()
+    registry._by_conversation[SESSION] = {("codex", "main"): terminal}
+    bridge_dir = tmp_path / "recovered-native-bridge"
+    spawn_env = {
+        "HARNESS_CODEX_NATIVE_BRIDGE_DIR": str(bridge_dir),
+        "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID": SESSION,
+    }
+
+    async def capture(request: httpx.Request) -> None:
+        requests.append(request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer binding-test-token"},
+        event_hooks={"request": [capture]},
+    ) as client:
+        manager = SimpleNamespace(get_client=AsyncMock(return_value=client))
+        binding = CodexTerminalInputBinding(
+            manager, registry, SESSION, "ws://provider.test/app-server", bridge_dir=bridge_dir
+        )
+        binding.bind(terminal)
+        yield SimpleNamespace(
+            binding=binding,
+            client=client,
+            manager=manager,
+            spawn_env=spawn_env,
+            registry=registry,
+            terminal=terminal,
+            harness=harness,
+            registrations=registrations,
+            refused=refused,
+            requests=requests,
+        )
+
+
+@pytest.mark.parametrize(
+    ("writer_user", "complete_observation", "expected_user"),
+    [(None, True, None), ("bryan", True, "bryan"), ("pat", True, "pat"), ("bryan", False, None)],
+)
+@pytest.mark.parametrize("expected_turn_id", [None, "retained-turn"])
+async def test_terminal_input_registration_and_refusal_ipc(
+    terminal_input_binding, writer_user, complete_observation, expected_user, expected_turn_id
+) -> None:
+    h = terminal_input_binding
+    if not complete_observation:
+        h.terminal.writer_evidence = TerminalWriterEvidence("incarnation")
+        h.binding.bind(h.terminal)
+    writer = TerminalWriter(
+        user_id=writer_user, account_generation="generation" if writer_user else None
+    )
+    h.terminal.writer_evidence.record(writer)
+    registration = await h.binding.register("thread", expected_turn_id)
+    h.manager.get_client.assert_awaited_once_with(
+        SESSION,
+        "codex-native",
+        env=h.spawn_env,
+        replace_existing=False,
+        validate=h.binding._check_incarnation,
+    )
+    assert registration.client_id == f"{1:032x}"
+    [body] = h.registrations
+    assert body.requester.user_id == expected_user
+    assert body.requester.account_generation == ("generation" if expected_user else None)
+    assert json.loads(h.requests[0].content) == {
+        "requester": body.requester.model_dump(),
+        "thread_id": "thread",
+        "expected_turn_id": expected_turn_id,
+        "provider_url": "ws://provider.test/app-server",
+    }
+    assert h.requests[0].headers["Authorization"] == "Bearer binding-test-token"
+    await registration.refuse()
+    assert h.refused == [registration.client_id]
+    assert [request.url.path for request in h.requests] == [
+        f"/v1/sessions/{SESSION}/native-input",
+        f"/v1/sessions/{SESSION}/native-input/refused",
+    ]
+    assert json.loads(h.requests[1].content) == {"client_id": registration.client_id}
+    h.manager.get_client.assert_awaited_once()
+
+
+@pytest.mark.parametrize("replacement", ["instance", "evidence", "stopped"])
+@pytest.mark.parametrize("pause_at", ["client", "registration", "unknown-registration"])
+async def test_terminal_input_replacement_during_registration_is_refused(
+    terminal_input_binding, tmp_path, replacement, pause_at
+) -> None:
+    h = terminal_input_binding
+    writer = TerminalWriter(user_id="bryan", account_generation="generation")
+    h.terminal.writer_evidence.record(writer)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def wait_for_replacement() -> None:
+        entered.set()
+        await release.wait()
+
+    if pause_at == "client":
+
+        async def acquire_client(*args, **kwargs):
+            await wait_for_replacement()
+            return h.client
+
+        h.manager.get_client.side_effect = acquire_client
+    else:
+
+        async def pause_response(response):
+            if response.request.url.path.endswith("/native-input"):
+                if pause_at == "unknown-registration" and len(h.registrations) == 1:
+                    h.terminal.writer_evidence.record(writer)
+                else:
+                    await wait_for_replacement()
+
+        h.client.event_hooks["response"].append(pause_response)
+
+    task = asyncio.create_task(h.binding.register("thread", "retained-turn"))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        if replacement == "instance":
+            h.registry._by_conversation[SESSION][("codex", "main")] = make_test_terminal_instance(
+                "codex", "main", tmp_path / "replacement"
+            )
+        elif replacement == "evidence":
+            # Even an object reusing the same incarnation label is a replacement.
+            h.terminal.writer_evidence = TerminalWriterEvidence(
+                "incarnation", complete_observation=True
+            )
+        else:
+            h.terminal.running = False
+        release.set()
+        with pytest.raises(RuntimeError, match="Terminal input source changed"):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    if pause_at == "client":
+        assert h.requests == []
+        assert h.registrations == h.refused == []
+        return
+
+    count = 2 if pause_at == "unknown-registration" else 1
+    assert h.refused == [f"{index:032x}" for index in range(1, count + 1)]
+    assert len(h.registrations) == count
+    assert [request.url.path.rsplit("/", 1)[-1] for request in h.requests] == (
+        ["native-input", "native-input", "refused", "refused"]
+        if count == 2
+        else ["native-input", "refused"]
+    )
+    if count == 2:
+        assert h.registrations[1].requester.user_id is None
+
+
+@pytest.mark.parametrize("pause_at", ["client", "registration"])
+@pytest.mark.parametrize("next_writer", ["bryan", "pat", None])
+async def test_terminal_input_writer_revision_reregisters_unknown(
+    terminal_input_binding, pause_at, next_writer
+) -> None:
+    from omnigent.harnesses.codex_native.execution import CodexExecutionIdentity
+    from omnigent.harnesses.codex_native.requester import CodexRequesterRegistry
+
+    h = terminal_input_binding
+    evidence = h.terminal.writer_evidence
+    evidence.record(TerminalWriter(user_id="bryan", account_generation="generation"))
+    registry = CodexRequesterRegistry()
+    owner = InputRequester(user_id="bryan", account_generation="generation")
+    accepted_id = registry.begin(owner, "thread", None)
+    identity = CodexExecutionIdentity("provider-session", "thread", "owner-turn")
+    response = {
+        "result": {
+            "thread": {
+                "id": identity.thread_id,
+                "sessionId": identity.session_id,
+                "turns": [
+                    {
+                        "id": identity.turn_id,
+                        "items": [{"type": "userMessage", "clientId": accepted_id}],
+                    }
+                ],
+            }
+        }
+    }
+    assert registry.snapshot(identity, response, revision=registry.revision).origin == owner
+    register, refuse = h.harness.register_native_input, h.harness.refuse_native_input
+    input_ids = {}
+
+    def register_pending(body):
+        client_id = register(body)
+        input_ids[client_id] = registry.begin(
+            body.requester, body.thread_id, body.expected_turn_id
+        )
+        return client_id
+
+    def refuse_pending(client_id):
+        refuse(client_id)
+        registry.finish(input_ids[client_id], refused=True)
+        # The retained owner call must remain restricted across both IPC awaits.
+        snapshot = registry.snapshot(identity, response, revision=registry.revision)
+        assert snapshot is not None
+        assert snapshot.origin.user_id == (None if len(h.refused) == 1 else "bryan")
+
+    h.harness.register_native_input = register_pending
+    h.harness.refuse_native_input = refuse_pending
+
+    async def change_writer() -> None:
+        evidence.record(
+            TerminalWriter(
+                user_id=next_writer, account_generation="generation" if next_writer else None
+            )
+        )
+        await asyncio.sleep(0)
+
+    if pause_at == "client":
+
+        async def acquire_client(*args, **kwargs):
+            await change_writer()
+            return h.client
+
+        h.manager.get_client.side_effect = acquire_client
+    else:
+
+        async def change_after_registration(response):
+            if response.request.url.path.endswith("/native-input") and len(h.registrations) == 1:
+                await change_writer()
+
+        h.client.event_hooks["response"].append(change_after_registration)
+
+    registration = await h.binding.register("thread", None)
+    assert registration.client_id == f"{2:032x}"
+    assert h.refused == [f"{1:032x}"]
+    first, second = h.registrations
+    assert first.requester.user_id == "bryan"
+    assert second.requester.user_id is None
+    assert second.requester.account_generation is None
+    assert first.requester.input_id != second.requester.input_id
+    assert [request.url.path.rsplit("/", 1)[-1] for request in h.requests] == [
+        "native-input",
+        "native-input",
+        "refused",
+    ]
+    first_json, second_json = (json.loads(h.requests[index].content) for index in (0, 1))
+    assert second_json == {**first_json, "requester": second.requester.model_dump()}
+    await registration.refuse()
+    assert h.refused == [f"{1:032x}", f"{2:032x}"]
+
+
+@pytest.mark.parametrize("provisioning", ["recovered", "missing", "failed"])
+async def test_terminal_input_recovers_idle_harness_or_refuses_failed_provisioning(
+    terminal_input_binding, provisioning
+) -> None:
+    h = terminal_input_binding
+
+    async def provision(session_id, harness, *, env, replace_existing, validate):
+        # Recovery starts without a live harness; lookup-only acquisition cannot help.
+        assert (session_id, harness, env) == (SESSION, "codex-native", h.spawn_env)
+        assert replace_existing is False
+        assert validate == h.binding._check_incarnation
+        assert h.requests == []
+        if provisioning == "missing":
+            raise NoLiveHarnessError("no live harness")
+        if provisioning == "failed":
+            raise RuntimeError("harness provisioning failed")
+        return h.client
+
+    h.manager.get_client.side_effect = provision
+    if provisioning == "recovered":
+        registration = await h.binding.register("thread", None)
+        [body] = h.registrations
+        # Starting a harness must not authenticate unobserved terminal input.
+        assert body.requester.user_id is None
+        assert body.requester.account_generation is None
+        assert body.thread_id == "thread"
+        assert body.expected_turn_id is None
+        assert body.provider_url == "ws://provider.test/app-server"
+        await registration.refuse()
+        assert h.refused == [registration.client_id]
+    else:
+        error = NoLiveHarnessError if provisioning == "missing" else RuntimeError
+        message = "no live harness" if provisioning == "missing" else "harness provisioning failed"
+        with pytest.raises(error, match=message):
+            await h.binding.register("thread", None)
+        assert h.requests == []
+        assert h.registrations == h.refused == []
+    h.manager.get_client.assert_awaited_once_with(
+        SESSION,
+        "codex-native",
+        env=h.spawn_env,
+        replace_existing=False,
+        validate=h.binding._check_incarnation,
+    )
 
 
 # ── /v1/summarize ──────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@ from omnigent.db.utils import (
 )
 from omnigent.entities import Account, ResolvedAccess, SessionPermission
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     RESERVED_USER_PUBLIC,
@@ -378,6 +379,27 @@ class SqlAlchemyPermissionStore(PermissionStore):
         else:
             next_cursor = None
         return [_to_entity(r) for r in rows], next_cursor
+
+    def has_other_write_grants(self, conversation_id: str, owner_id: str) -> bool:
+        """Check write sharing through the covering permission-level index."""
+        with self._session("check_other_session_writers") as session:
+            writers = session.execute(
+                select(SqlSessionPermission.user_id)
+                .where(
+                    SqlSessionPermission.workspace_id == current_workspace_id(),
+                    SqlSessionPermission.conversation_id == conversation_id,
+                    SqlSessionPermission.level >= LEVEL_EDIT,
+                )
+                .order_by(SqlSessionPermission.level, SqlSessionPermission.user_id)
+                .limit(2)
+                .with_hint(
+                    SqlSessionPermission,
+                    "FORCE INDEX (ix_session_permissions_write_access)",
+                    dialect_name="mysql",
+                )
+            ).scalars()
+            # A session has at most one grant per user, so only one row can be the owner.
+            return any(writer != owner_id for writer in writers)
 
     def list_for_sessions(self, conversation_ids: list[str]) -> dict[str, list[SessionPermission]]:
         """Return all grants for multiple sessions.  See base class for contract."""

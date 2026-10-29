@@ -240,10 +240,12 @@ async def _noop_relay_ready(*_: Any, **__: Any) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("claimed_requester", [None, "payload", "top_level"])
 async def test_post_event_records_authenticated_poster(
     auth_client: httpx.AsyncClient,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    claimed_requester: str | None,
 ) -> None:
     """``POST /events`` persists the item with the caller's identity.
 
@@ -252,12 +254,11 @@ async def test_post_event_records_authenticated_poster(
     persisted ``created_by``. If the route stopped threading the
     user_id, the read-back below would be ``None``.
     """
+    from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
     from omnigent.server.routes import sessions as sessions_mod
+    from tests.server.integration.test_sessions_harness_override import _stub_runner_client
 
-    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
-        return _CaptureRunnerClient()
-
-    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    captured = _stub_runner_client(monkeypatch)
     monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
 
     session_id = _seed_shared_session(
@@ -265,15 +266,28 @@ async def test_post_event_records_authenticated_poster(
         {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_EDIT},
     )
 
+    event: dict[str, Any] = {
+        "type": "message",
+        "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    }
+    false_origin = InputRequester(user_id="bob@example.com").model_dump()
+    if claimed_requester == "payload":
+        event["data"][REQUESTER_FIELD] = false_origin
+    elif claimed_requester == "top_level":
+        event["requester"] = false_origin
     resp = await auth_client.post(
         f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-        },
+        json=event,
         headers={"X-Forwarded-Email": "alice@example.com"},
     )
+    if claimed_requester == "top_level":
+        assert resp.status_code == 403, resp.text
+        assert not captured.get("posts")
+        return
     assert resp.status_code == 202, resp.text
+    origin = InputRequester.from_body(captured["body"])
+    assert origin.user_id == "alice@example.com"
+    assert origin.input_id != false_origin["input_id"]
 
     items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
     [persisted] = items.data

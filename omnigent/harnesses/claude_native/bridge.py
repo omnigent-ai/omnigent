@@ -78,6 +78,10 @@ from omnigent.harnesses.claude_native.submit_verification import (
     capture_submit_boundary,
     has_matching_hook_refusal,
 )
+from omnigent.harnesses.codex_native.execution import (
+    CodexExecutionIdentity,
+    current_codex_execution,
+)
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     launcher_password_prompt,
@@ -7650,7 +7654,15 @@ def _tool_relay_handler_factory(
                 else contextlib.nullcontext()
             )
             with mutation:
-                result = _run_relay_tool(tool_executor, loop, name, arguments)
+                result = _run_relay_tool(
+                    tool_executor,
+                    loop,
+                    name,
+                    arguments,
+                    codex_execution=CodexExecutionIdentity.from_wire(
+                        payload.get("codex_execution")
+                    ),
+                )
             self._send_json(result)
 
         def _respond_hook_output(self, output: dict[str, object] | None) -> None:
@@ -7914,6 +7926,8 @@ def _run_relay_tool(
     loop: asyncio.AbstractEventLoop,
     name: str,
     arguments: _JsonObject,
+    *,
+    codex_execution: CodexExecutionIdentity | None = None,
 ) -> _JsonObject:
     """
     Execute one relay tool call on the harness event loop.
@@ -7923,11 +7937,18 @@ def _run_relay_tool(
     :param loop: Event loop that owns ``tool_executor``.
     :param name: Tool name, e.g. ``"sys_os_shell"``.
     :param arguments: Decoded tool arguments.
+    :param codex_execution: Provider locator for this call, not requester authority.
     :returns: MCP tool-call response.
     """
-    future = asyncio.run_coroutine_threadsafe(
-        _await_tool_result(tool_executor(name, arguments)), loop
-    )
+
+    async def execute() -> object:
+        token = current_codex_execution.set(codex_execution)
+        try:
+            return await tool_executor(name, arguments)
+        finally:
+            current_codex_execution.reset(token)
+
+    future = asyncio.run_coroutine_threadsafe(execute(), loop)
     try:
         result = future.result(timeout=_TOOL_CALL_TIMEOUT_S)
     except Exception as exc:  # noqa: BLE001 - relay converts callback failures to MCP errors.
@@ -8341,7 +8362,13 @@ def _call_mcp_tool(
     if not isinstance(arguments, dict):
         arguments = {}
     if name in _read_relay_tool_names(bridge_dir):
-        return _call_relay_tool(bridge_dir, name, arguments)
+        codex_execution = CodexExecutionIdentity.from_mcp_meta(params.get("_meta"))
+        return _call_relay_tool(
+            bridge_dir,
+            name,
+            arguments,
+            codex_execution=codex_execution,
+        )
     if name not in tools:
         return _mcp_error(f"unknown tool: {name!r}")
     bridge_config = _read_json_file(bridge_dir / _CONFIG_FILE)
@@ -8393,6 +8420,8 @@ def _call_relay_tool(
     bridge_dir: Path,
     name: str,
     arguments: _JsonObject,
+    *,
+    codex_execution: CodexExecutionIdentity | None = None,
 ) -> _JsonObject:
     """
     Call the active harness turn's tool relay.
@@ -8401,6 +8430,7 @@ def _call_relay_tool(
         ``tool_relay.json``.
     :param name: Tool name, e.g. ``"sys_terminal_launch"``.
     :param arguments: Decoded tool arguments.
+    :param codex_execution: Provider locator captured from this MCP request.
     :returns: MCP tool-call result.
     """
     relay = _read_json_file(bridge_dir / _TOOL_RELAY_FILE)
@@ -8408,7 +8438,10 @@ def _call_relay_tool(
     url = relay.get("url")
     if not isinstance(token, str) or not isinstance(url, str):
         return _mcp_error("active Omnigent tool relay is missing url/token")
-    payload = json.dumps({"name": name, "arguments": arguments}).encode("utf-8")
+    body: _JsonObject = {"name": name, "arguments": arguments}
+    if codex_execution is not None:
+        body["codex_execution"] = codex_execution.to_wire()
+    payload = json.dumps(body).encode("utf-8")
     req = request.Request(
         f"{url}/tool",
         data=payload,

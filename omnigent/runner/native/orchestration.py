@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
     from omnigent.spec.types import MCPServerConfig
 
 import click
@@ -68,7 +69,11 @@ from omnigent.errors import (
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inference_config import ModelNotAllowedError
-from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
+from omnigent.inner.terminal import (
+    build_terminal_os_env_spec,
+    current_native_terminal_launch,
+    terminal_pane_environment,
+)
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -4843,6 +4848,7 @@ async def _launch_codex_native_tui(
     thread_id: str | None,
     agent_spec: AgentSpec | ResolvedSpec | None,
     login_required: bool = False,
+    harness_manager: HarnessProcessManager | None = None,
 ) -> _CodexNativeTuiLaunch:
     """Attach a terminal to an app-server without owning its lifecycle."""
     from omnigent.harnesses.codex_native.app_server import (
@@ -4856,171 +4862,224 @@ async def _launch_codex_native_tui(
         codex_terminal_interactive,
     )
     from omnigent.harnesses.codex_native.launch_args import redact_codex_launch_args
+    from omnigent.harnesses.codex_native.terminal_proxy import TOKEN_ENV, CodexTerminalProxy
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     codex_ws_url = app_server.listen_url
     assert codex_ws_url is not None
-    workspace = str(launch_config.workspace)
-    agent_os_env = _agent_os_env_from_spec(agent_spec)
-    codex_remote_args = build_codex_remote_args(
-        codex_args=tuple(launch_config.terminal_launch_args or ()),
-        thread_id=thread_id,
-        remote_url=codex_ws_url,
-        bypass_sandbox=launch_config.bypass_sandbox,
-        # The remote TUI needs the app-server's provider and cannot answer an update prompt.
-        config_overrides=(
-            *app_server.config_overrides,
-            "check_for_update_on_startup=false",
-        ),
-        codex_cli_version=app_server.codex_cli_version,
-        # The runner provisions and trusts these hooks. An unknown CLI version
-        # must not strand a headless session behind an interactive trust prompt.
-        bypass_hook_trust=(
-            app_server.codex_cli_version is None
-            or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
-        ),
-    )
-    # Apply configured wrappers to both cold start and recovery.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import (
-        resolve_harness_args,
-        resolve_harness_config,
-    )
-
-    # Read project config from the session workspace; the runner's cwd may be gone.
-    _codex_harness_cfg = load_effective_config(workspace=workspace)
-    # Honor configured wrappers while keeping the host-provisioned binary
-    # immune to ambient OMNIGENT_CODEX_PATH overrides.
-    _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
-    _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
-    configured_codex_command = (
-        _codex_cmd_override.strip()
-        if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
-        else None
-    )
-    codex_command = configured_codex_command or app_server.codex_path
-    thread_start_timeout_seconds = (
-        CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
-        if configured_codex_command is not None and not login_required
-        else None
-    )
-    if configured_codex_command is not None:
-        if thread_id is not None:
-            _logger.info(
-                "Codex resume: bridge state is preloaded before configured "
-                "command %r starts; no bridge-state wait extension is needed "
-                "(session %s)",
-                configured_codex_command,
-                session_id,
-            )
-        elif login_required:
-            _logger.info(
-                "Codex startup: configured command %r requires interactive "
-                "login; preserving the unbounded sign-in wait (session %s)",
-                configured_codex_command,
-                session_id,
-            )
-        elif thread_start_timeout_seconds is not None:
-            _logger.info(
-                "Codex startup: configured command %r gets a %.0fs "
-                "thread-start budget (session %s)",
-                configured_codex_command,
-                thread_start_timeout_seconds,
-                session_id,
-            )
-    codex_launch_args = resolve_harness_args(
-        "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
-    )
-    loggable_launch_args = shlex.join(redact_codex_launch_args(codex_launch_args))
-    _logger.info(
-        "Codex terminal launch: session=%s command=%s codex_cli_version=%s resume=%s args=%s",
-        session_id,
-        codex_command,
-        _format_codex_version(app_server.codex_cli_version),
-        thread_id is not None,
-        loggable_launch_args,
-        extra=debug_event(
-            "codex_terminal_launch",
-            session_id=session_id,
-            command=codex_command,
-            codex_cli_version=_format_codex_version(app_server.codex_cli_version),
-            resume=thread_id is not None,
-            args=loggable_launch_args,
-        ),
-    )
-    terminal_view = await resource_registry.launch_auxiliary_terminal(
-        session_id=session_id,
-        terminal_name="codex",
-        session_key="main",
-        resource_role=CODEX_NATIVE_TERMINAL_ROLE,
-        parent_os_env=agent_os_env,
-        spec=TerminalEnvSpec(
-            os_env=OSEnvSpec(
-                type="caller_process",
-                cwd=workspace,
-                sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
-            ),
-            command=codex_command,
-            args=codex_launch_args,
-            env=codex_terminal_env(app_server),
-            # Match the local ``omnigent codex`` terminal scrollback.
-            scrollback=100_000,
-            # Preserve the final frame and exit status until lifecycle cleanup.
-            keep_alive_after_exit=True,
-            # Enable tmux passthrough so the Codex TUI's escape sequences
-            # reach the web xterm.
-            tmux_allow_passthrough=True,
-            # Let the initial render settle detached so attaching over the
-            # runner tunnel does not starve its heartbeat with startup traffic.
-            tmux_start_on_attach=False,
-        ),
-    )
+    input_binding = None
+    terminal_proxy = None
     terminal_registry = getattr(resource_registry, "terminal_registry", None)
-    registry_instance = (
-        terminal_registry.get(session_id, "codex", "main")
-        if terminal_registry is not None
-        else None
-    )
-    # ``terminal_instance`` arms discovery's exit-detection race
-    # (:func:`_wait_for_codex_thread_or_terminal_exit`), which fails a launch
-    # the instant its TUI exits instead of waiting out the full thread-start
-    # budget.
-    terminal_instance, exit_watch_unarmed_reason = _codex_exit_watch_decision(
-        terminal_registry_present=terminal_registry is not None,
-        instance=registry_instance,
-        launched_socket=terminal_view.metadata.get("tmux_socket"),
-    )
-    if exit_watch_unarmed_reason is not None:
-        _logger.warning(
-            "Codex startup exit-detection unarmed (%s) for session %s; a TUI that "
-            "exits before creating a thread will surface only at the thread-start "
-            "timeout, not immediately",
-            exit_watch_unarmed_reason,
-            session_id,
-            extra=debug_event(
-                "codex_startup_exit_watch_unarmed",
-                session_id=session_id,
-                harness="codex-native",
-                reason=exit_watch_unarmed_reason,
+    launch_complete = False
+    try:
+        if harness_manager is not None and terminal_registry is not None:
+            from omnigent.runner.native_requester import CodexTerminalInputBinding
+
+            previous_proxy = getattr(app_server, "terminal_proxy", None)
+            if previous_proxy is not None:
+                await previous_proxy.close()
+            input_binding = CodexTerminalInputBinding(
+                harness_manager,
+                terminal_registry,
+                session_id,
+                codex_ws_url,
+                bridge_dir=bridge_dir,
+            )
+            terminal_proxy = CodexTerminalProxy(codex_ws_url, input_binding.register)
+            codex_ws_url = await terminal_proxy.start()
+            app_server.terminal_proxy = terminal_proxy
+        workspace = str(launch_config.workspace)
+        agent_os_env = _agent_os_env_from_spec(agent_spec)
+        codex_remote_args = build_codex_remote_args(
+            codex_args=tuple(launch_config.terminal_launch_args or ()),
+            thread_id=thread_id,
+            remote_url=codex_ws_url,
+            bypass_sandbox=launch_config.bypass_sandbox,
+            # The remote TUI needs the app-server's provider and cannot answer an update prompt.
+            config_overrides=(
+                *app_server.config_overrides,
+                "check_for_update_on_startup=false",
+            ),
+            codex_cli_version=app_server.codex_cli_version,
+            # The runner provisions and trusts these hooks. An unknown CLI version
+            # must not strand a headless session behind an interactive trust prompt.
+            bypass_hook_trust=(
+                app_server.codex_cli_version is None
+                or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
             ),
         )
-    publish_event(
-        session_id,
-        {
-            "type": "session.resource.created",
-            "resource": session_resource_view_to_dict(terminal_view),
-        },
-    )
-    _schedule_terminal_interactive_observer(
-        session_id=session_id,
-        resource_registry=resource_registry,
-        terminal_name="codex",
-        session_key="main",
-        harness="codex-native",
-        readiness_signal="codex_composer",
-        is_interactive=lambda pane: codex_terminal_interactive(bridge_dir, pane),
-    )
-    return _CodexNativeTuiLaunch(terminal_view, terminal_instance, thread_start_timeout_seconds)
+        terminal_environment = codex_terminal_env(app_server)
+        if terminal_proxy is not None:
+            codex_remote_args = ["--remote-auth-token-env", TOKEN_ENV, *codex_remote_args]
+            terminal_environment = {**terminal_environment, **terminal_proxy.environment}
+        # Apply configured wrappers to both cold start and recovery.
+        from omnigent.config import load_effective_config
+        from omnigent.harness_startup_config import (
+            resolve_harness_args,
+            resolve_harness_config,
+        )
+
+        # Read project config from the session workspace; the runner's cwd may be gone.
+        _codex_harness_cfg = load_effective_config(workspace=workspace)
+        # Honor configured wrappers while keeping the host-provisioned binary
+        # immune to ambient OMNIGENT_CODEX_PATH overrides.
+        _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
+        _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
+        configured_codex_command = (
+            _codex_cmd_override.strip()
+            if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
+            else None
+        )
+        codex_command = configured_codex_command or app_server.codex_path
+        thread_start_timeout_seconds = (
+            CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
+            if configured_codex_command is not None and not login_required
+            else None
+        )
+        if configured_codex_command is not None:
+            if thread_id is not None:
+                _logger.info(
+                    "Codex resume: bridge state is preloaded before configured "
+                    "command %r starts; no bridge-state wait extension is needed "
+                    "(session %s)",
+                    configured_codex_command,
+                    session_id,
+                )
+            elif login_required:
+                _logger.info(
+                    "Codex startup: configured command %r requires interactive "
+                    "login; preserving the unbounded sign-in wait (session %s)",
+                    configured_codex_command,
+                    session_id,
+                )
+            elif thread_start_timeout_seconds is not None:
+                _logger.info(
+                    "Codex startup: configured command %r gets a %.0fs "
+                    "thread-start budget (session %s)",
+                    configured_codex_command,
+                    thread_start_timeout_seconds,
+                    session_id,
+                )
+        codex_launch_args = resolve_harness_args(
+            "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
+        )
+        loggable_launch_args = shlex.join(redact_codex_launch_args(codex_launch_args))
+        _logger.info(
+            "Codex terminal launch: session=%s command=%s codex_cli_version=%s resume=%s args=%s",
+            session_id,
+            codex_command,
+            _format_codex_version(app_server.codex_cli_version),
+            thread_id is not None,
+            loggable_launch_args,
+            extra=debug_event(
+                "codex_terminal_launch",
+                session_id=session_id,
+                command=codex_command,
+                codex_cli_version=_format_codex_version(app_server.codex_cli_version),
+                resume=thread_id is not None,
+                args=loggable_launch_args,
+            ),
+        )
+        terminal_view = await resource_registry.launch_auxiliary_terminal(
+            session_id=session_id,
+            terminal_name="codex",
+            session_key="main",
+            resource_role=CODEX_NATIVE_TERMINAL_ROLE,
+            complete_writer_observation=terminal_proxy is not None,
+            parent_os_env=agent_os_env,
+            spec=TerminalEnvSpec(
+                os_env=OSEnvSpec(
+                    type="caller_process",
+                    cwd=workspace,
+                    sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
+                ),
+                command=codex_command,
+                args=codex_launch_args,
+                env=terminal_environment,
+                # Match the local ``omnigent codex`` terminal scrollback.
+                scrollback=100_000,
+                # Preserve the final frame and exit status until lifecycle cleanup.
+                keep_alive_after_exit=True,
+                # Enable tmux passthrough so the Codex TUI's escape sequences
+                # reach the web xterm.
+                tmux_allow_passthrough=True,
+                # Let the initial render settle detached so attaching over the
+                # runner tunnel does not starve its heartbeat with startup traffic.
+                tmux_start_on_attach=False,
+            ),
+        )
+        registry_instance = (
+            terminal_registry.get(session_id, "codex", "main")
+            if terminal_registry is not None
+            else None
+        )
+        if input_binding is not None:
+            # Registry launch may reuse a terminal or lose a concurrent replacement race.
+            # Bind only the process configured for this launch's unique proxy.
+            launched_socket = terminal_view.metadata.get("tmux_socket")
+            if (
+                registry_instance is None
+                or terminal_proxy is None
+                or getattr(app_server, "terminal_proxy", None) is not terminal_proxy
+                or getattr(resource_registry, "terminal_registry", None) is not terminal_registry
+                or not registry_instance.running
+                or not registry_instance.complete_writer_observation
+                or registry_instance.env.get(TOKEN_ENV) != terminal_proxy.environment[TOKEN_ENV]
+                or not isinstance(launched_socket, str)
+                or str(registry_instance.socket_path) != launched_socket
+            ):
+                raise RuntimeError("Codex terminal launch identity changed or is unverified")
+            input_binding.bind(registry_instance)
+        # ``terminal_instance`` arms discovery's exit-detection race
+        # (:func:`_wait_for_codex_thread_or_terminal_exit`), which fails a launch
+        # the instant its TUI exits instead of waiting out the full thread-start
+        # budget.
+        terminal_instance, exit_watch_unarmed_reason = _codex_exit_watch_decision(
+            terminal_registry_present=terminal_registry is not None,
+            instance=registry_instance,
+            launched_socket=terminal_view.metadata.get("tmux_socket"),
+        )
+        if exit_watch_unarmed_reason is not None:
+            _logger.warning(
+                "Codex startup exit-detection unarmed (%s) for session %s; a TUI that "
+                "exits before creating a thread will surface only at the thread-start "
+                "timeout, not immediately",
+                exit_watch_unarmed_reason,
+                session_id,
+                extra=debug_event(
+                    "codex_startup_exit_watch_unarmed",
+                    session_id=session_id,
+                    harness="codex-native",
+                    reason=exit_watch_unarmed_reason,
+                ),
+            )
+        publish_event(
+            session_id,
+            {
+                "type": "session.resource.created",
+                "resource": session_resource_view_to_dict(terminal_view),
+            },
+        )
+        _schedule_terminal_interactive_observer(
+            session_id=session_id,
+            resource_registry=resource_registry,
+            terminal_name="codex",
+            session_key="main",
+            harness="codex-native",
+            readiness_signal="codex_composer",
+            is_interactive=lambda pane: codex_terminal_interactive(bridge_dir, pane),
+        )
+        launch_complete = True
+        return _CodexNativeTuiLaunch(
+            terminal_view, terminal_instance, thread_start_timeout_seconds
+        )
+    finally:
+        if not launch_complete and terminal_proxy is not None:
+            try:
+                await terminal_proxy.close()
+            finally:
+                if getattr(app_server, "terminal_proxy", None) is terminal_proxy:
+                    app_server.terminal_proxy = None
 
 
 #: Waits between ``thread/resume`` retries when codex finds no rollout for a
@@ -5039,6 +5098,7 @@ async def _auto_create_codex_terminal(
     server_client: httpx.AsyncClient | None = None,
     session_init: RunnerSessionInitEnvelope | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    harness_manager: HarnessProcessManager | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -5158,6 +5218,7 @@ async def _auto_create_codex_terminal(
             bridge_dir=bridge_dir,
             thread_id=bridge_state.thread_id,
             agent_spec=agent_spec,
+            harness_manager=harness_manager,
         )
         return launched.view
     # Route across all offerings: a configured provider (omnigent setup),
@@ -5837,6 +5898,7 @@ async def _auto_create_codex_terminal(
             bridge_dir=bridge_dir,
             thread_id=launch_config.external_session_id,
             agent_spec=agent_spec,
+            harness_manager=harness_manager,
             login_required=_codex_launch.login_required,
         )
         terminal_view = launched.view
@@ -9652,6 +9714,9 @@ async def _auto_create_claude_terminal(
         env_spec.scrollback,
         extra={"session_id": session_id},
     )
+    launch_token = current_native_terminal_launch.set(
+        ("claude-native", launch_command, tuple(launch_args))
+    )
     try:
         terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
@@ -9677,6 +9742,8 @@ async def _auto_create_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+    finally:
+        current_native_terminal_launch.reset(launch_token)
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
@@ -10197,6 +10264,7 @@ class NativeLaunchContext:
     server_client: httpx.AsyncClient | None = None
     event_dispatcher: RunnerEventDispatcher | None = None
     ensure_comment_relay: _EnsureCommentRelay | None = None
+    harness_manager: HarnessProcessManager | None = None
     agent_spec: AgentSpec | ResolvedSpec | None = None
     bundle_dir: Path | None = None
     skills_filter: str | list[str] = "all"
@@ -10347,6 +10415,7 @@ async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         session_init=ctx.session_init,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        harness_manager=ctx.harness_manager,
     )
 
 

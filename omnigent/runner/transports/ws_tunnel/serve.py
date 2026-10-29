@@ -1720,6 +1720,8 @@ async def _dispatch_ws_via_asgi(
     :param frame: The ``ws.open`` that triggered this dispatch.
     :param channel: Per-channel state for the receive side.
     """
+    from omnigent.terminals.writer import bind_relay_terminal_writer
+
     scope: Scope = {
         "type": "websocket",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -1734,6 +1736,7 @@ async def _dispatch_ws_via_asgi(
         "root_path": "",
         "subprotocols": [],
     }
+    bind_relay_terminal_writer(scope)
 
     # First receive() must return websocket.connect per ASGI WS spec.
     connect_event_consumed = False

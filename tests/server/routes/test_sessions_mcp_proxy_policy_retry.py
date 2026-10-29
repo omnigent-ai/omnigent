@@ -22,6 +22,13 @@ import pytest
 from omnigent.entities.conversation import Conversation
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.runtime.policies.engine import PolicyEngine
+from omnigent.runtime.requester import (
+    REQUESTER_FIELD,
+    ExecutionRequester,
+    InputRequester,
+    ToolRequester,
+    current_tool_requester,
+)
 from omnigent.server.routes import sessions as sessions_mod
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import (
@@ -750,17 +757,31 @@ async def test_mcp_proxy_runner_supplied_actor_reaches_policy_engine(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("retry_action", "reviewed_transform", "retry_transform", "changed_arguments", "approval"),
+    (
+        "retry_action",
+        "reviewed_transform",
+        "retry_transform",
+        "changed_arguments",
+        "approval",
+        "requester_change",
+    ),
     [
-        (PolicyAction.ASK, {"value": "reviewed"}, {"value": "later"}, False, "accept"),
-        (PolicyAction.ASK, None, {"value": "later"}, False, "accept"),
-        (PolicyAction.ASK, {}, {"value": "later"}, False, "accept"),
-        (PolicyAction.ASK, {"value": "reviewed"}, None, True, "accept"),
-        (PolicyAction.ASK, {"value": "reviewed"}, None, False, "decline"),
-        (PolicyAction.DENY, {"value": "reviewed"}, None, False, "accept"),
-        (PolicyAction.ALLOW, {"value": "reviewed"}, {"value": "current"}, False, "accept"),
-        (PolicyAction.ALLOW, {"value": "reviewed"}, None, False, "accept"),
-        (PolicyAction.ALLOW, {"value": "reviewed"}, {}, False, "accept"),
+        (PolicyAction.ASK, {"value": "reviewed"}, {"value": "later"}, False, "accept", "same"),
+        (PolicyAction.ASK, None, {"value": "later"}, False, "accept", "same"),
+        (PolicyAction.ASK, {}, {"value": "later"}, False, "accept", "same"),
+        (PolicyAction.ASK, {"value": "reviewed"}, None, True, "accept", "same"),
+        (PolicyAction.ASK, {"value": "reviewed"}, None, False, "decline", "same"),
+        (PolicyAction.DENY, {"value": "reviewed"}, None, False, "accept", "same"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, {"value": "current"}, False, "accept", "same"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, None, False, "accept", "same"),
+        (PolicyAction.ALLOW, {"value": "reviewed"}, {}, False, "accept", "same"),
+        (PolicyAction.ASK, None, None, False, "accept", "legacy"),
+        (PolicyAction.ASK, None, None, False, "accept", "execution_id"),
+        (PolicyAction.ASK, None, None, False, "accept", "user_id"),
+        (PolicyAction.ASK, None, None, False, "accept", "account_generation"),
+        (PolicyAction.ASK, None, None, False, "accept", "input_id"),
+        (PolicyAction.ASK, None, None, False, "accept", "drop"),
+        (PolicyAction.ASK, None, None, False, "accept", "add"),
     ],
 )
 async def test_retry_dispatches_policy_owned_arguments(
@@ -771,6 +792,7 @@ async def test_retry_dispatches_policy_owned_arguments(
     retry_transform: dict[str, str] | None,
     changed_arguments: bool,
     approval: str,
+    requester_change: str,
 ) -> None:
     """Approval preserves the reviewed call; ALLOW uses the current policy result."""
     eid = "elicit_reviewed_call"
@@ -778,6 +800,25 @@ async def test_retry_dispatches_policy_owned_arguments(
     dispatched: list[dict[str, Any]] = []
     store, _conv, engine = approval_state
     evaluations: list[EvaluationContext] = []
+    requester = ExecutionRequester(
+        InputRequester(user_id="pat@example.test", account_generation="v1")
+    ).snapshot()
+    fresh_owner = ExecutionRequester(
+        InputRequester(user_id="bryan@example.test", account_generation="v1")
+    ).snapshot()
+    initial_requester = None if requester_change in {"legacy", "add"} else requester
+    retry_requester = None if requester_change in {"legacy", "drop"} else requester
+    if requester_change in {"execution_id", "user_id", "account_generation", "input_id"}:
+        changed = requester.model_dump()
+        if requester_change == "execution_id":
+            changed["execution_id"] = fresh_owner.execution_id
+        else:
+            changed["origin"][requester_change] = {
+                "user_id": "bryan@example.test",
+                "account_generation": "v2",
+                "input_id": fresh_owner.origin.input_id,
+            }[requester_change]
+        retry_requester = ToolRequester.model_validate(changed)
 
     call_results = iter(
         [
@@ -825,7 +866,7 @@ async def test_retry_dispatches_policy_owned_arguments(
 
         monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
 
-        async def call(params):
+        async def call(params, call_requester):
             response = await _handle_mcp_tools_call(
                 rpc_id=1,
                 session_id=_SESSION_ID,
@@ -833,27 +874,37 @@ async def test_retry_dispatches_policy_owned_arguments(
                 conversation_store=store,
                 agent_store=_StubAgentStore(),  # type: ignore[arg-type]
                 runner_router=None,
+                requester=call_requester,
             )
             return json.loads(bytes(response.body))
 
+        token = current_tool_requester.set(requester)
         try:
-            initial = await call({"name": "example__lookup", "arguments": original_arguments})
+            initial = await call(
+                {"name": "example__lookup", "arguments": original_arguments}, initial_requester
+            )
             assert "result" in initial, initial
             assert not dispatched
             assert store.get_conversation(_SESSION_ID).labels == {}
             assert store.get_conversation(_SESSION_ID).session_state == {}
             state = json.loads(initial["result"]["requestState"])
             state["transformed_arguments"] = {"value": "client"}
+            state[REQUESTER_FIELD] = fresh_owner.model_dump()
+            current_tool_requester.set(fresh_owner)
             result = await call(
                 {
                     "name": "example__lookup",
+                    REQUESTER_FIELD: fresh_owner.model_dump(),
                     "arguments": {"value": "changed"} if changed_arguments else original_arguments,
                     "requestState": json.dumps(state),
                     "inputResponses": {eid: {"action": approval}},
-                }
+                },
+                retry_requester,
             )
+            requester_mismatch = initial_requester != retry_requester
             rejected = retry_action == PolicyAction.DENY or (
-                retry_action == PolicyAction.ASK and (changed_arguments or approval != "accept")
+                retry_action == PolicyAction.ASK
+                and (changed_arguments or approval != "accept" or requester_mismatch)
             )
             if rejected:
                 assert "error" in result
@@ -861,6 +912,9 @@ async def test_retry_dispatches_policy_owned_arguments(
                 assert store.get_conversation(_SESSION_ID).labels == {}
                 if changed_arguments:
                     assert "do not match" in result["error"]["message"]
+                if requester_mismatch:
+                    assert result["error"]["message"] == "Approval does not match this call"
+                    assert eid in _pending_policy_ask_writes
             else:
                 assert "error" not in result
                 transform = (
@@ -869,6 +923,10 @@ async def test_retry_dispatches_policy_owned_arguments(
                 expected = transform if transform is not None else original_arguments
                 assert len(dispatched) == 1
                 assert dispatched[0]["params"]["arguments"] == expected
+                if retry_requester is None:
+                    assert REQUESTER_FIELD not in dispatched[0]["params"]
+                else:
+                    assert dispatched[0]["params"][REQUESTER_FIELD] == retry_requester.model_dump()
                 assert evaluations[-1].request_data == {
                     "name": "example__lookup",
                     "arguments": expected,
@@ -885,4 +943,5 @@ async def test_retry_dispatches_policy_owned_arguments(
             )
             assert "transformed_arguments" not in json.loads(initial["result"]["requestState"])
         finally:
+            current_tool_requester.reset(token)
             _pending_policy_ask_writes.pop(eid, None)

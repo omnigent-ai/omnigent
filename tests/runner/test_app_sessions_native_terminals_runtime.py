@@ -742,6 +742,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1191,6 +1192,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1489,6 +1491,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -1760,6 +1763,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -2237,6 +2241,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """:returns: A fixed terminal resource view."""
             del terminal_name, session_key, spec, resource_role
@@ -5019,6 +5024,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """
             Accept the terminal launch request.
@@ -5249,6 +5255,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """Accept the terminal launch request."""
             del terminal_name, session_key, spec, resource_role, parent_os_env
@@ -5290,32 +5297,48 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("launch_fails", [False, True])
-@pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
+@pytest.mark.parametrize(
+    ("outcome", "rotated"),
+    [
+        ("success", False),
+        ("success", True),
+        ("launch-error", False),
+        ("launch-error", True),
+        ("cancelled", False),
+        ("config-error", False),
+        ("stale-token", False),
+        ("socket-replaced", False),
+        ("missing-socket", False),
+        ("unobserved", False),
+        ("stopped", False),
+        ("proxy-replaced", False),
+        ("cleanup-replaced", False),
+    ],
+)
 async def test_codex_tui_recovery_preserves_live_control_plane(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool, rotated: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, rotated: bool
 ) -> None:
-    """A lost TUI reattaches to the live app-server without cancelling the forwarder.
+    """Recovery binds only its launched TUI and releases its listener on failure.
 
-    The app-server owns thread state and the forwarder owns transcript delivery.
-    Replacing only the TUI must not disturb either — even if the new TUI fails to
-    launch. A rotated session's live bridge state sits in its bridge id label's
-    directory, which is where the reattach has to look for it.
+    Exercise the real launch/proxy lifecycle with the terminal spawn substituted;
+    backend and transcript delivery survive errors, cancellation and stale reuse.
     """
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
+    from urllib.parse import urlsplit
 
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.harnesses.codex_native.terminal_proxy import TOKEN_ENV, CodexTerminalProxy
+    from omnigent.inner.terminal import TerminalInstance
     from omnigent.runner.native import orchestration as native
-    from omnigent.runner.native.orchestration import (
-        _CodexNativeLaunchConfig,
-        _CodexNativeTuiLaunch,
-    )
+    from omnigent.runner.native.orchestration import _CodexNativeLaunchConfig
+    from omnigent.runner.native_requester import CodexTerminalInputBinding
 
     session_id = "tui-recovery-test-session"
     bridge_id = _ROTATED_BRIDGE_ID if rotated else session_id
     server_url = "ws://127.0.0.1:9876"
     thread_id = "thread-live-1234"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path)
     bridge_dir = codex_native_bridge.prepare_bridge_dir(bridge_id)
     codex_native_bridge.write_bridge_state(
@@ -5343,6 +5366,12 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
         proc=SimpleNamespace(returncode=None),
         listen_url=server_url,
         codex_home=tmp_path,
+        config_overrides=[],
+        codex_cli_version=(0, 142, 0),
+        codex_path="/opt/codex/bin/codex",
+        env={},
+        terminal_proxy=None,
+        close=AsyncMock(),
     )
     forwarder = asyncio.create_task(asyncio.Event().wait())
     monkeypatch.setitem(native._AUTO_CODEX_APP_SERVERS, session_id, fake_server)
@@ -5350,35 +5379,140 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
     monkeypatch.setattr(native, "_codex_native_launch_config", AsyncMock(return_value=config))
     cancel = AsyncMock()
     monkeypatch.setattr(native, "_cancel_auto_forwarder_task", cancel)
+    monkeypatch.setattr(native, "_schedule_terminal_interactive_observer", Mock())
+    started: list[tuple[CodexTerminalProxy, str]] = []
+    start_proxy = CodexTerminalProxy.start
+
+    async def start(proxy: CodexTerminalProxy) -> str:
+        url = await start_proxy(proxy)
+        started.append((proxy, url))
+        return url
+
+    monkeypatch.setattr(CodexTerminalProxy, "start", start)
+    bound: list[TerminalInstance] = []
+    bind_terminal = CodexTerminalInputBinding.bind
+
+    def bind(binding: CodexTerminalInputBinding, terminal: TerminalInstance) -> None:
+        bound.append(terminal)
+        bind_terminal(binding, terminal)
+
+    monkeypatch.setattr(CodexTerminalInputBinding, "bind", bind)
+    if outcome == "config-error":
+        monkeypatch.setattr(
+            "omnigent.harness_startup_config.resolve_harness_args",
+            Mock(side_effect=RuntimeError("TUI configuration failed")),
+        )
+    terminal = TerminalInstance(
+        name="codex", session_key="main", socket_path=tmp_path / "tmux.sock", private_dir=tmp_path
+    )
     fake_view = SessionResourceView(
-        id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+        id="terminal_codex_main",
+        type="terminal",
+        session_id=session_id,
+        name="Codex",
+        metadata={"tmux_socket": str(terminal.socket_path)},
     )
-    launch_result = _CodexNativeTuiLaunch(fake_view, None, None)
-    launch = AsyncMock(
-        side_effect=RuntimeError("TUI launch failed") if launch_fails else None,
-        return_value=launch_result,
+    replacement_proxy = SimpleNamespace(close=AsyncMock())
+    if outcome == "cleanup-replaced":
+        close_proxy = CodexTerminalProxy.close
+
+        async def close(proxy: CodexTerminalProxy) -> None:
+            fake_server.terminal_proxy = replacement_proxy
+            await close_proxy(proxy)
+
+        monkeypatch.setattr(CodexTerminalProxy, "close", close)
+    launch_entered = asyncio.Event()
+    release_launch = asyncio.Event()
+
+    async def launch(**kwargs: Any) -> SessionResourceView:
+        nonlocal terminal
+        assert kwargs["complete_writer_observation"] is True
+        spec = kwargs["spec"]
+        assert spec.args[-1] == thread_id
+        assert spec.env["CODEX_HOME"] == str(tmp_path)
+        assert spec.env[TOKEN_ENV] == started[0][0].environment[TOKEN_ENV]
+        terminal.env = dict(spec.env)
+        terminal.complete_writer_observation = outcome != "unobserved"
+        terminal.running = outcome != "stopped"
+        if outcome in {"launch-error", "cleanup-replaced"}:
+            raise RuntimeError("TUI launch failed")
+        if outcome == "cancelled":
+            launch_entered.set()
+            await release_launch.wait()
+        if outcome == "stale-token":
+            terminal.env[TOKEN_ENV] = "previous-launch-token"
+        if outcome == "socket-replaced":
+            terminal = replace(terminal, socket_path=tmp_path / "replacement.sock")
+        if outcome == "missing-socket":
+            fake_view.metadata.pop("tmux_socket")
+        if outcome == "proxy-replaced":
+            fake_server.terminal_proxy = replacement_proxy
+        return fake_view
+
+    launch_mock = AsyncMock(side_effect=launch)
+    registry = SimpleNamespace(
+        terminal_registry=SimpleNamespace(get=lambda *_: terminal),
+        launch_auxiliary_terminal=launch_mock,
     )
-    monkeypatch.setattr(native, "_launch_codex_native_tui", launch)
+    published = Mock()
+    task = asyncio.create_task(
+        native._auto_create_codex_terminal(
+            session_id,
+            cast(Any, registry),
+            published,
+            harness_manager=cast(Any, _FakeProcessManager(_ScriptedHarnessClient([]))),
+        )
+    )
     try:
-        if launch_fails:
-            with pytest.raises(RuntimeError, match="TUI launch failed"):
-                await native._auto_create_codex_terminal(
-                    session_id, cast(Any, None), lambda *_: None
-                )
+        if outcome == "success":
+            assert await task is fake_view
+            assert bound == [terminal]
+            published.assert_called_once()
+        elif outcome == "cancelled":
+            await asyncio.wait_for(launch_entered.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
         else:
-            result = await native._auto_create_codex_terminal(
-                session_id, cast(Any, None), lambda *_: None
+            message = (
+                "TUI launch failed"
+                if outcome in {"launch-error", "cleanup-replaced"}
+                else "TUI configuration failed"
+                if outcome == "config-error"
+                else "Codex terminal launch identity changed or is unverified"
             )
-            assert result is fake_view
+            with pytest.raises(RuntimeError, match=message):
+                await task
         cancel.assert_not_awaited()
+        fake_server.close.assert_not_awaited()
         assert not forwarder.done()
+        assert fake_server.proc.returncode is None
         assert native._AUTO_CODEX_APP_SERVERS.get(session_id) is fake_server
-        assert launch.await_count == 1
-        assert launch.await_args is not None
-        assert launch.await_args.kwargs["app_server"] is fake_server
-        assert launch.await_args.kwargs["thread_id"] == thread_id
-        assert launch.await_args.kwargs["bridge_dir"] == bridge_dir
+        assert codex_native_bridge.read_bridge_state(bridge_dir).thread_id == thread_id
+        assert launch_mock.await_count == (0 if outcome == "config-error" else 1)
+        assert len(started) == 1
+        proxy, url = started[0]
+        address = urlsplit(url)
+        if outcome == "success":
+            assert fake_server.terminal_proxy is proxy
+            _, writer = await asyncio.open_connection(address.hostname, address.port)
+            writer.close()
+            await writer.wait_closed()
+        else:
+            assert bound == []
+            published.assert_not_called()
+            with pytest.raises(OSError):
+                await asyncio.open_connection(address.hostname, address.port)
+            if outcome in {"proxy-replaced", "cleanup-replaced"}:
+                assert fake_server.terminal_proxy is replacement_proxy
+                replacement_proxy.close.assert_not_awaited()
+            else:
+                assert fake_server.terminal_proxy is None
     finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        for proxy, _ in started:
+            await proxy.close()
         forwarder.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await forwarder

@@ -256,6 +256,7 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        complete_writer_observation: bool = False,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
 
@@ -268,6 +269,8 @@ class TerminalRegistry:
         was created.
 
         :param program_status_app: Opt-in runtime PTY relay application identity.
+        :param complete_writer_observation: Runtime-only assurance that all supported
+            input paths are observed. Applies only to a newly launched process.
         :param conversation_id: The owning conversation id, e.g.
             ``"conv_abc123"``.
         :param terminal_name: The terminal's spec name from
@@ -336,6 +339,7 @@ class TerminalRegistry:
         stage = "terminal_spawn"
         try:
             created.instance.program_status_app = program_status_app
+            created.instance.complete_writer_observation = complete_writer_observation
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             await created.instance.launch(cwd=created.cwd)
             stage = "terminal_liveness"

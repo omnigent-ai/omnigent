@@ -9,15 +9,212 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
-from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import ServerConnection, serve
-from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+from websockets.exceptions import (
+    ConnectionClosed,
+    ConnectionClosedError,
+    ConnectionClosedOK,
+    InvalidStatus,
+)
 
 from omnigent.harnesses.codex_native import app_server
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
 )
+from omnigent.harnesses.codex_native.execution import CodexExecutionIdentity
+from omnigent.harnesses.codex_native.requester import CodexRequesterRegistry
+from omnigent.harnesses.codex_native.terminal_proxy import (
+    TOKEN_ENV,
+    CodexTerminalProxy,
+    RegisteredTerminalInput,
+)
+from omnigent.runtime.requester import InputRequester
+
+
+@pytest.mark.parametrize("method", ["turn/start", "turn/steer"])
+@pytest.mark.parametrize("outcome", ["accepted", "refused", "lost", "registration_failed"])
+async def test_terminal_proxy_registers_before_delivery_and_preserves_display_ids(method, outcome):
+    registered_id = "a" * 32
+    refuse = AsyncMock()
+    register = AsyncMock(return_value=RegisteredTerminalInput(registered_id, refuse))
+    if outcome == "registration_failed":
+        register.side_effect = RuntimeError("Harness unavailable")
+    received = []
+
+    async def handle(websocket):
+        async for raw in websocket:
+            message = json.loads(raw)
+            received.append(message)
+            register.assert_awaited_once()
+            assert message["params"]["clientUserMessageId"] == registered_id
+            if outcome == "lost":
+                await websocket.close()
+            elif outcome == "refused":
+                await websocket.send(json.dumps({"id": message["id"], "error": {"code": -32600}}))
+            else:
+                await websocket.send(
+                    json.dumps({"id": message["id"], "result": {"turnId": "turn"}})
+                )
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "method": "item/started",
+                            "params": {
+                                "item": {
+                                    "type": "userMessage",
+                                    "clientId": registered_id,
+                                    "content": [],
+                                }
+                            },
+                        }
+                    )
+                )
+
+    async with serve(handle, "127.0.0.1", 0) as provider:
+        proxy = CodexTerminalProxy(
+            f"ws://127.0.0.1:{provider.sockets[0].getsockname()[1]}", register
+        )
+        url = await proxy.start()
+        try:
+            with pytest.raises(InvalidStatus):
+                async with connect(url):
+                    pytest.fail("Unauthenticated terminal connected")
+            register.assert_not_awaited()
+            async with connect(
+                url, additional_headers={"Authorization": f"Bearer {proxy.environment[TOKEN_ENV]}"}
+            ) as terminal:
+                params = {"threadId": "thread", "clientUserMessageId": "display-id", "input": []}
+                if method == "turn/steer":
+                    params["expectedTurnId"] = "turn"
+                await terminal.send(json.dumps({"id": 7, "method": method, "params": params}))
+                if outcome == "lost":
+                    with pytest.raises(ConnectionClosed):
+                        await asyncio.wait_for(terminal.recv(), timeout=3)
+                else:
+                    response = json.loads(await asyncio.wait_for(terminal.recv(), timeout=3))
+                    assert response["id"] == 7
+                    if outcome == "accepted":
+                        event = json.loads(await asyncio.wait_for(terminal.recv(), timeout=3))
+                        assert event["params"]["item"]["clientId"] == "display-id"
+                    else:
+                        assert "error" in response
+            register.assert_awaited_once_with("thread", "turn" if method == "turn/steer" else None)
+            if outcome == "refused":
+                refuse.assert_awaited_once_with()
+                assert registered_id not in proxy._display_ids
+            else:
+                refuse.assert_not_awaited()
+            assert len(received) == (0 if outcome == "registration_failed" else 1)
+        finally:
+            await proxy.close()
+
+
+async def test_terminal_proxy_retention_keeps_fresh_authority_and_old_calls_restricted(
+    monkeypatch,
+):
+    monkeypatch.setattr(CodexRequesterRegistry, "_MAX_RECORDS", 2)
+    monkeypatch.setattr(CodexTerminalProxy, "_MAX_DISPLAY_IDS", 2)
+    registry = CodexRequesterRegistry()
+    owner = InputRequester(user_id="owner", account_generation="one")
+    origin = owner
+    turns = []
+
+    async def register(thread_id, expected_turn_id):
+        client_id = registry.begin(origin, thread_id, expected_turn_id)
+
+        async def refuse():
+            registry.finish(client_id, refused=True)
+
+        return RegisteredTerminalInput(client_id, refuse)
+
+    async def handle(websocket):
+        async for raw in websocket:
+            message = json.loads(raw)
+            method = message.get("method")
+            if method in ("turn/start", "turn/steer"):
+                item = {
+                    "type": "userMessage",
+                    "clientId": message["params"]["clientUserMessageId"],
+                }
+                if method == "turn/start":
+                    turns.append({"id": str(message["id"]), "items": []})
+                turns[-1]["items"].append(item)
+                await websocket.send(json.dumps({"id": message["id"], "result": {}}))
+                await websocket.send(
+                    json.dumps({"method": "item/started", "params": {"item": item}})
+                )
+            elif method == "thread/read":
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "id": message["id"],
+                            "result": {
+                                "thread": {"id": "thread", "sessionId": "session", "turns": turns}
+                            },
+                        }
+                    )
+                )
+            elif "id" in message:
+                await websocket.send(json.dumps({"id": message["id"], "result": {}}))
+
+    async with serve(handle, "127.0.0.1", 0) as provider:
+        upstream = f"ws://127.0.0.1:{provider.sockets[0].getsockname()[1]}"
+        proxy = CodexTerminalProxy(upstream, register)
+        url = await proxy.start()
+        client = CodexAppServerClient(ws_url=upstream)
+        try:
+            await client.connect()
+            async with connect(
+                url, additional_headers={"Authorization": f"Bearer {proxy.environment[TOKEN_ENV]}"}
+            ) as terminal:
+                for index in range(8):
+                    origin = InputRequester(user_id="collaborator") if index == 1 else owner
+                    method = "turn/steer" if index == 1 else "turn/start"
+                    params = {"threadId": "thread", "clientUserMessageId": f"display-{index}"}
+                    if index == 1:
+                        params["expectedTurnId"] = "0"
+                    await terminal.send(
+                        json.dumps({"id": index, "method": method, "params": params})
+                    )
+                    response = json.loads(await asyncio.wait_for(terminal.recv(), timeout=3))
+                    assert "error" not in response
+                    event = json.loads(await asyncio.wait_for(terminal.recv(), timeout=3))
+                    assert event["params"]["item"]["clientId"] == f"display-{index}"
+                    history = await client.request(
+                        "thread/read", {"threadId": "thread", "includeTurns": True}
+                    )
+                    identity = CodexExecutionIdentity(
+                        "session", "thread", "0" if index == 1 else str(index)
+                    )
+                    requester = registry.snapshot(identity, history, revision=registry.revision)
+                    assert requester is not None
+                    assert requester.origin.user_id == (None if index == 1 else "owner")
+                    assert len(registry._submissions) <= 2
+                    assert len(registry._executions) <= 2
+                    assert len(proxy._display_ids) <= 2
+
+                # Replayed history may lose an old display alias, never acquire a fresh one.
+                await terminal.send(
+                    json.dumps({"id": "history", "method": "thread/read", "params": {}})
+                )
+                replay = json.loads(await asyncio.wait_for(terminal.recv(), timeout=3))
+                replayed_turns = replay["result"]["thread"]["turns"]
+                assert (
+                    replayed_turns[0]["items"][0]["clientId"] == turns[0]["items"][0]["clientId"]
+                )
+                assert replayed_turns[-1]["items"][0]["clientId"] == "display-7"
+                delayed = registry.snapshot(
+                    CodexExecutionIdentity("session", "thread", "0"),
+                    history,
+                    revision=registry.revision,
+                )
+                assert delayed is None or delayed.origin.user_id is None
+        finally:
+            await client.close()
+            await proxy.close()
+        assert proxy._display_ids == {}
 
 
 @pytest.mark.parametrize(

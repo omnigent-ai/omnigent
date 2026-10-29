@@ -1516,6 +1516,10 @@ def register_resources_routes(
             if not isinstance(metadata, dict):
                 metadata = {}
                 item["metadata"] = metadata
+            if metadata.get("requires_authenticated_attach") is True:
+                # This terminal must retain the authenticated writer on every input.
+                metadata.pop("direct_attach_url", None)
+                continue
             metadata["direct_attach_url"] = (
                 f"ws://127.0.0.1:{endpoint.port}/v1/sessions/{session_id}"
                 f"/resources/terminals/{terminal_id}/attach?token={endpoint.token}"

@@ -49,6 +49,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.runtime.requester import ToolRequester
 
 # ---------------------------------------------------------------------------
 # Construction / argv
@@ -974,6 +975,7 @@ class _RecordingCtx:
 
     def __init__(self, response_id: str = "resp_acp") -> None:
         self.response_id = response_id
+        self.cancelled = asyncio.Event()
         self.emitted: list[object] = []
 
     def emit(self, event: object) -> None:
@@ -1003,7 +1005,11 @@ async def test_native_call_before_a_bridge_call_keeps_each_call_id(
 
     dispatched: dict[str, str] = {}
 
-    async def fake_bridge(*_args: object, call_id: str, **_kw: object) -> dict[str, object]:
+    async def fake_bridge(
+        *_args: object, call_id: str, requester: ToolRequester
+    ) -> dict[str, object]:
+        assert requester.origin.user_id is None
+        assert requester.origin.account_generation is None
         dispatched["call_id"] = call_id
         return {"ok": True}
 

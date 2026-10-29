@@ -158,6 +158,11 @@ def terminal_resource_view(session_id: str, entry: TerminalListEntry) -> Session
             "session_key": session_key,
             "running": entry.instance.running,
             "tmux_socket": str(entry.instance.socket_path),
+            **(
+                {"requires_authenticated_attach": True}
+                if getattr(entry.instance, "complete_writer_observation", False)
+                else {}
+            ),
             "tmux_target": entry.instance.tmux_target,
         },
     )

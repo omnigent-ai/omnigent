@@ -96,7 +96,7 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
             )
         # THE FAULT: creation commits on the server, but the caller's read
         # deadline elapses before it reads the response body.
-        if method == "POST" and path == "/v1/sessions":
+        if method == "POST" and path == "/v1/requester/sessions":
             created_ids.append(CHILD_ID)
             post_committed[0] = True
             raise httpx.ReadTimeout("read timed out", request=request)

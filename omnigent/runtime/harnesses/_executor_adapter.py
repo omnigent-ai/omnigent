@@ -1,8 +1,8 @@
 """
 Shared :class:`HarnessApp` adapter that drives any inner :class:`Executor`.
 
-The four per-harness wraps (claude-sdk, codex, pi, openai-agents-sdk) all use this adapter —
-they differ only in the executor they construct. The adapter handles lazy executor construction,
+The per-harness wraps choose the executor this adapter drives.
+The adapter handles lazy executor construction,
 per-turn message/event translation, tool/elicitation/policy bridging, cancellation propagation,
 injection forwarding, and shutdown cleanup.
 """
@@ -19,6 +19,9 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
+from contextvars import ContextVar
+from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from fastapi import Response
@@ -52,8 +55,15 @@ from omnigent.native.input_diagnostics import (
     log_input_event,
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
-from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
+from omnigent.runtime.harnesses._scaffold import (
+    HarnessApp,
+    HarnessResponseRequest,
+    NativeInputRegistration,
+    PolicyVerdictPayload,
+    TurnContext,
+)
 from omnigent.runtime.prompt import dedupe_tool_output_images
+from omnigent.runtime.requester import DelegationPolicy, InputRequester, ToolRequester
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.ask_user_question import structured_ask_user_question
 from omnigent.server.schemas import (
@@ -182,6 +192,38 @@ class InnerExecutorError(RuntimeError):
         self.undelivered = undelivered
 
 
+@dataclass(frozen=True)
+class _ToolExecutionBinding:
+    ctx: TurnContext
+    agent: str | None
+
+
+def _executor_delegation_policy(executor: Executor) -> DelegationPolicy:
+    """Select the fallback from the actual producer, never mutable session configuration."""
+    from omnigent.inner.acp_executor import AcpExecutor
+    from omnigent.inner.antigravity_executor import AntigravityExecutor
+    from omnigent.inner.copilot_executor import CopilotExecutor
+    from omnigent.inner.cursor_executor import CursorExecutor
+    from omnigent.inner.goose_executor import GooseExecutor
+    from omnigent.inner.pi_executor import PiExecutor
+    from omnigent.inner.qwen_executor import QwenExecutor
+
+    if isinstance(
+        executor,
+        (
+            AcpExecutor,
+            AntigravityExecutor,
+            CopilotExecutor,
+            CursorExecutor,
+            GooseExecutor,
+            PiExecutor,
+            QwenExecutor,
+        ),
+    ):
+        return "no_edit_sharing"
+    return "requester"
+
+
 class ExecutorAdapter(HarnessApp):
     """
     :class:`HarnessApp` subclass that drives any inner :class:`Executor`.
@@ -204,11 +246,14 @@ class ExecutorAdapter(HarnessApp):
         self._harness_label = harness_label
         # Lazily-constructed inner executor, reused across turns for the conversation lifetime.
         self._executor: Executor | None = None
-        # Per-turn turn context. The stable tool/elicitation/policy bridges read this at call
-        # time so MCP handlers that closure-captured the bridge on turn 1 dispatch into the
-        # current turn's ctx, not turn 1's dead ctx.
+        # Routing for legacy SDK handlers that closure-capture bridges on turn one.
+        # Tool authority requires an explicit execution binding, independent of this slot.
         self._current_ctx: TurnContext | None = None
         self._current_agent: str | None = None
+        self._tool_executions: dict[str, _ToolExecutionBinding] = {}
+        self._task_tool_execution: ContextVar[_ToolExecutionBinding | None] = ContextVar(
+            "executor_adapter_tool_execution", default=None
+        )
         # FIFO queue of inner-SDK tool-use ids from ToolCallRequest events. Drained by
         # _stable_tool_executor so each dispatch reuses the same call_id as the inline
         # observed event, letting BlockStream dedupe the two renders into one.
@@ -258,13 +303,23 @@ class ExecutorAdapter(HarnessApp):
         if request.max_output_tokens is not None:
             extra["max_tokens"] = int(request.max_output_tokens)
         # model_override is the per-request override; takes precedence over the spec default.
-        config = ExecutorConfig(model=request.model_override, extra=extra)
+        config = ExecutorConfig(
+            model=request.model_override,
+            extra=extra,
+            requester=request.requester
+            if isinstance(request, HarnessResponseRequest)
+            else InputRequester(),
+        )
         tools = _normalize_tool_schemas(request.tools or [])
         system_prompt = request.instructions or ""
         # Install stable bridges once on first use — the SDK closure-captures them from the first
         # turn; per-turn rebinding would leave later tool calls dispatching into a dead ctx.
         if getattr(executor, "_tool_executor", None) is None:
-            executor._tool_executor = self._stable_tool_executor  # type: ignore[attr-defined]
+            executor._tool_executor = partial(  # type: ignore[attr-defined]
+                self._stable_tool_executor,
+                _executor=executor,
+                _delegation_policy=_executor_delegation_policy(executor),
+            )
         if getattr(executor, "_elicitation_handler", None) is None:
             executor._elicitation_handler = self._stable_elicitation_handler  # type: ignore[attr-defined]
         # ACP-shaped executors also accept a choice bridge, to offer the agent's own
@@ -298,6 +353,9 @@ class ExecutorAdapter(HarnessApp):
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
+        execution_id = ctx.requester.execution_id
+        binding = _ToolExecutionBinding(ctx=ctx, agent=request.model)
+        self._tool_executions[execution_id] = binding
         # Clear per-turn state so stale entries from an errored prior turn don't bleed through.
         self._pending_mcp_call_ids.clear()
         # Reset orphan counter: measures only post-bind orphans (no intervening clean turn).
@@ -342,6 +400,15 @@ class ExecutorAdapter(HarnessApp):
             self._watch_injections(ctx, executor),
             name=f"executor-adapter-injection-watch:{ctx.response_id}",
         )
+        # OpenAI Runner creates its tool tasks per run. Claude's persistent reader
+        # inherits the first run's context, so it must supply explicit provenance.
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.codex_executor import CodexExecutor
+        from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
+
+        execution_token = self._task_tool_execution.set(
+            binding if isinstance(executor, OpenAIAgentsSDKExecutor) else None
+        )
         try:
             trace_cm: contextlib.AbstractContextManager[None] = contextlib.nullcontext()
             if tctx:
@@ -373,6 +440,11 @@ class ExecutorAdapter(HarnessApp):
                     tools=tools,
                     system_prompt=system_prompt,
                     config=config,
+                    **(
+                        {"requester": ctx.requester.snapshot()}
+                        if isinstance(executor, (ClaudeSDKExecutor, CodexExecutor))
+                        else {}
+                    ),
                 ):
                     if ctx.cancelled.is_set():
                         log_input_event(
@@ -564,6 +636,9 @@ class ExecutorAdapter(HarnessApp):
                 agent_span = None
             raise
         finally:
+            self._task_tool_execution.reset(execution_token)
+            if self._tool_executions.get(execution_id) is binding:
+                del self._tool_executions[execution_id]
             # Cancel the injection watcher (long-polls a queue; cancellation is the only way out).
             injection_watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -614,6 +689,34 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    async def native_tool_requester(self, execution: dict[str, str]) -> ToolRequester | None:
+        """Resolve native evidence through the already-running executor's registry."""
+        from omnigent.harnesses.codex_native.execution import CodexExecutionIdentity
+        from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+        identity = CodexExecutionIdentity.from_wire(execution)
+        if identity is None or not isinstance(self._executor, CodexNativeExecutor):
+            return None
+        return await self._executor.resolve_tool_requester(identity)
+
+    def register_native_input(self, body: NativeInputRegistration) -> str:
+        from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+        # New submissions may initialize an executor. Retained tool lookups may not.
+        executor = self._ensure_executor()
+        if not isinstance(executor, CodexNativeExecutor):
+            raise RuntimeError("Native input registration is unavailable")
+        return executor.begin_terminal_input(
+            body.requester, body.thread_id, body.expected_turn_id, body.provider_url
+        )
+
+    def refuse_native_input(self, client_id: str) -> None:
+        from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
+        if not isinstance(self._executor, CodexNativeExecutor):
+            raise RuntimeError("Native input registration is unavailable")
+        self._executor.refuse_terminal_input(client_id)
 
     async def _prepare_turn_retry(self) -> bool:
         """Wait for confirmed teardown without cancelling the background reap."""
@@ -722,6 +825,8 @@ class ExecutorAdapter(HarnessApp):
         Loops until cancelled by run_turn's finally. Best-effort — a failed or malformed
         injection logs and continues rather than raising.
         """
+        from omnigent.inner.codex_native_executor import CodexNativeExecutor
+
         while True:
             try:
                 injection = await ctx.next_injection(timeout=None)
@@ -739,6 +844,13 @@ class ExecutorAdapter(HarnessApp):
                 continue
             if ctx.cancelled.is_set():
                 return
+            injection_id = injection.injection_id or uuid.uuid4().hex
+            input_requester = (
+                injection.requester
+                if isinstance(injection, HarnessResponseRequest)
+                else InputRequester()
+            )
+            ctx.requester.begin_injection(injection_id, input_requester)
             try:
                 with input_delivery_scope(
                     injection.model_dump(include=set(INPUT_FIELDS)), response_id=ctx.response_id
@@ -747,12 +859,22 @@ class ExecutorAdapter(HarnessApp):
                         _logger, "native_input_steering_started", session_id=ctx.session_id
                     )
                     try:
-                        accepted = await executor.enqueue_session_message(self._session_key, text)
+                        if isinstance(executor, CodexNativeExecutor):
+                            accepted = await executor.enqueue_session_message(
+                                self._session_key, text, requester=input_requester
+                            )
+                        else:
+                            accepted = await executor.enqueue_session_message(
+                                self._session_key, text
+                            )
                         outcome = "executor_accepted" if accepted else "executor_refused"
                     except InjectionDeliveryAmbiguous:
                         # The harness may already hold the message; resending could duplicate it.
                         accepted, outcome = True, "executor_ambiguous"
                     except BaseException as exc:
+                        # Cancellation or a transport error may follow delivery. Keep
+                        # authority restricted unless the executor explicitly refused it.
+                        ctx.requester.finish_injection(injection_id, consumed=True)
                         log_input_event(
                             _logger,
                             "native_input_steering_finished",
@@ -763,6 +885,7 @@ class ExecutorAdapter(HarnessApp):
                             exception_type=type(exc).__name__,
                         )
                         raise
+                    ctx.requester.finish_injection(injection_id, consumed=accepted)
                     log_input_event(
                         _logger,
                         "native_input_steering_finished",
@@ -797,13 +920,45 @@ class ExecutorAdapter(HarnessApp):
         args: dict[str, Any],
         *,
         call_id: str | None = None,
+        requester: ToolRequester | None = None,
+        _executor: Executor | None = None,
+        _delegation_policy: DelegationPolicy = "requester",
     ) -> dict[str, Any]:
-        """Bridge installed once on the executor; dispatches tool calls into the current turn ctx.
+        """Route a producer-bound call to its execution, never to a newer requester.
 
-        Reads ``_current_ctx`` at call time. Returns a structured error for orphaned callbacks.
+        OpenAI Agents SDK callbacks inherit an execution binding from its per-run tasks.
+        Other producers must supply an explicit requester; inherited reader-task context
+        and display call IDs cannot establish authority.
+
+        Unbound calls retain unknown origin. The producing executor fixes their
+        delegation policy through :func:`_executor_delegation_policy`.
         """
-        ctx = self._current_ctx
-        agent = self._current_agent
+        if _executor is not None and _executor is not self._executor:
+            return {"error": "tool callback belongs to a retired executor"}
+        task_binding = self._task_tool_execution.get()
+        if requester is None and task_binding is not None:
+            requester = task_binding.ctx.requester.snapshot()
+        if requester is not None:
+            binding = (
+                self._tool_executions.get(requester.execution_id)
+                if isinstance(requester, ToolRequester)
+                else None
+            )
+            if binding is None or binding.ctx.cancelled.is_set():
+                return {
+                    "error": "tool callback has no live originating execution",
+                    "code": "runner_turn_context_desync",
+                }
+            ctx, agent = binding.ctx, binding.agent
+            # A delayed producer snapshot cannot restore authority after steering.
+            if not requester.origin.same_account(ctx.requester.snapshot().origin):
+                requester = ToolRequester(
+                    execution_id=requester.execution_id, origin=InputRequester()
+                )
+        else:
+            ctx, agent = self._current_ctx, self._current_agent
+            requester = ToolRequester(execution_id=uuid.uuid4().hex, origin=InputRequester())
+        requester = requester.model_copy(update={"delegation_policy": _delegation_policy})
         if ctx is None or agent is None:
             # Orphaned callback — safe-fail to avoid parking a Future on a dead ctx.
             # Host-tool orphans are the deterministic respawn-desync signature, so force
@@ -823,25 +978,31 @@ class ExecutorAdapter(HarnessApp):
                 "error": "no active turn context for tool dispatch",
                 "code": "runner_turn_context_desync",
             }
-        # Explicit IDs survive callbacks arriving before, or out of order with,
-        # stdout observations. SDKs without callback IDs retain FIFO correlation.
+        if ctx.cancelled.is_set():
+            return {
+                "error": "tool callback belongs to a cancelled turn",
+                "code": "runner_turn_context_desync",
+            }
+        # This queue correlates display cards only; it cannot establish a requester.
         correlated_call_id = call_id
-        if call_id:
+        if call_id and ctx is self._current_ctx:
             with contextlib.suppress(ValueError):
                 self._pending_mcp_call_ids.remove(call_id)
-        elif self._pending_mcp_call_ids:
+        elif call_id is None and ctx is self._current_ctx and self._pending_mcp_call_ids:
             correlated_call_id = self._pending_mcp_call_ids.popleft()
         # Allocate id here to record in _dispatched_call_ids; matching ToolCallComplete
         # is suppressed in _translate_event (dispatch_tool already emits its output).
 
         dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
-        self._dispatched_call_ids.add(dispatch_call_id)
+        if ctx is self._current_ctx:
+            self._dispatched_call_ids.add(dispatch_call_id)
         return await _bridge_one_dispatch(
             ctx,
             agent,
             tool_name,
             args,
             call_id=dispatch_call_id,
+            requester=requester,
         )
 
     async def _stable_elicitation_handler(
@@ -1480,6 +1641,7 @@ async def _bridge_one_dispatch(
     args: dict[str, Any],
     *,
     call_id: str | None = None,
+    requester: ToolRequester | None = None,
 ) -> dict[str, Any]:
     """Round-trip one tool call through ``ctx.dispatch_tool``; returns an MCP-compatible dict.
 
@@ -1495,6 +1657,7 @@ async def _bridge_one_dispatch(
             name=tool_name,
             arguments=json.dumps(args),
             agent=agent,
+            requester=requester,
         )
     except Exception as exc:
         _logger.exception("dispatch_tool failed for %s", tool_name)

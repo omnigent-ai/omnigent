@@ -22,9 +22,12 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
+from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.writer import TerminalWriter, TerminalWriterEvidence
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -38,18 +41,10 @@ from tests.runner.native_helpers import _harness_spec
 
 
 @pytest.fixture(autouse=True)
-def _isolate_anthropic_default_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Clear ambient ``ANTHROPIC_DEFAULT_*_MODEL`` gateway pins (#4279).
-
-    claude-native model resolution reads these from ``os.environ``; a developer
-    whose shell pins them (anyone driving Claude through a gateway) otherwise
-    gets a different model-change verdict and these tests fail spuriously.
-    """
-    for var in (
-        "ANTHROPIC_DEFAULT_OPUS_MODEL",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-    ):
+def _isolate_native_provider_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Use only each scenario's provider config and model vocabulary."""
+    isolate_provider_resolution(monkeypatch, tmp_path / "provider-config")
+    for var in MODEL_VOCABULARY_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
 
@@ -628,6 +623,9 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
         """Record tmux send-keys calls without touching tmux."""
+        snapshot = instance.writer_evidence.snapshot("codex-process")
+        assert snapshot is not None and snapshot.writer == TerminalWriter()
+        assert snapshot.revision > 1
         events.append(("tmux", (socket_path, list(args))))
 
     class _RecordingTime:
@@ -648,6 +646,8 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
     conv_id = "9864122f95f2f013c9599f4014725784"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
+    instance.writer_evidence = TerminalWriterEvidence("codex-process", complete_observation=True)
+    instance.writer_evidence.record(TerminalWriter(user_id="owner"))
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
 
     app, _ = await _build_app_for_spec(codex_native_spec, terminal_registry=terminal_registry)
@@ -709,31 +709,53 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
 
 
 @pytest.mark.asyncio
-async def test_events_clear_on_codex_native_types_clear_into_the_tui(
+@pytest.mark.parametrize(
+    ("control", "mode", "digit", "status"),
+    [
+        ("clear", None, None, 200),
+        ("codex_approval_mode_change", "ask-for-approval", "1", 200),
+        ("codex_approval_mode_change", "full-access", "2", 200),
+        ("codex_approval_mode_change", "read-only", None, 503),
+        ("codex_approval_mode_change", "invalid", None, 400),
+    ],
+)
+async def test_events_codex_programmatic_controls_taint_before_typing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    control: str,
+    mode: str | None,
+    digit: str | None,
+    status: int,
 ) -> None:
-    """
-    POST ``/events`` with ``{"type":"clear"}`` on a codex-native session types
-    Codex's own ``/clear`` into its tmux pane and returns 200.
-
-    Codex's /clear starts a fresh thread in the same terminal; the forwarder
-    then rotates the Omnigent session, so the web /clear must run inside Codex.
-    """
+    """Programmatic clear/permissions preserve typing without inheriting the writer."""
     from tests.runner.helpers import make_test_terminal_instance
 
     tmux_calls: list[tuple[str, list[str]]] = []
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
         """Record tmux send-keys calls without touching tmux."""
+        snapshot = instance.writer_evidence.snapshot("codex-process")
+        assert snapshot is not None and snapshot.writer == TerminalWriter()
+        assert snapshot.revision > before.revision
         tmux_calls.append((socket_path, list(args)))
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
     monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+    label = "Full Access" if mode == "full-access" else "Ask for approval"
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_: f"1. Ask for approval\n2. Full Access\nPermissions updated to {label}",
+    )
 
     conv_id = "5b6a0c3d0f1e4a7b8c9d0e1f2a3b4c5d"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
+    instance.writer_evidence = TerminalWriterEvidence("codex-process", complete_observation=True)
+    actor = TerminalWriter(user_id="owner", account_generation="generation-1")
+    instance.writer_evidence.record(actor)
+    before = instance.writer_evidence.snapshot("codex-process")
+    assert before is not None and before.writer == actor
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
     app, _ = await _build_app_for_spec(
         _harness_spec("codex-native"), terminal_registry=terminal_registry
@@ -745,15 +767,36 @@ async def test_events_clear_on_codex_native_types_clear_into_the_tui(
             json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
         )
         assert create_resp.status_code == 201, create_resp.text
-        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": control, "approval_mode": mode}
+        )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert tmux_calls == []
+        assert instance.writer_evidence.snapshot("codex-process") == before
+        return
+
     socket = str(instance.socket_path)
-    assert tmux_calls == [
-        (socket, ["send-keys", "-t", "main", "C-u"]),
-        (socket, ["send-keys", "-l", "-t", "main", "/clear"]),
-        (socket, ["send-keys", "-t", "main", "Enter"]),
-    ]
+    command = "/clear" if control == "clear" else "/permissions"
+    expected = [] if control == "clear" else [(socket, ["send-keys", "-t", "main", "Escape"])]
+    expected.extend(
+        [
+            (socket, ["send-keys", "-t", "main", "C-u"]),
+            (socket, ["send-keys", "-l", "-t", "main", command]),
+            (socket, ["send-keys", "-t", "main", "Enter"]),
+        ]
+    )
+    if digit is not None:
+        expected.append((socket, ["send-keys", "-l", "-t", "main", digit]))
+    if mode == "full-access":
+        expected.append((socket, ["send-keys", "-l", "-t", "main", "1"]))
+    elif mode == "read-only":
+        expected.append((socket, ["send-keys", "-t", "main", "Escape"]))
+    assert tmux_calls == expected
+    instance.writer_evidence.record(actor)
+    after = instance.writer_evidence.snapshot("codex-process")
+    assert after is not None and after.writer == TerminalWriter()
 
 
 @pytest.mark.asyncio
@@ -791,9 +834,11 @@ async def test_events_compact_on_codex_native_returns_503_when_no_terminal() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("control", ["compact", "codex_approval_mode_change"])
 async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    control: str,
 ) -> None:
     """
     Codex-native compact returns 503 when the tmux send-keys call fails.
@@ -807,6 +852,9 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     def _failing_run_tmux(socket_path: str, *args: str) -> None:
         """Simulate a tmux pane that is no longer alive."""
         del socket_path, args
+        snapshot = instance.writer_evidence.snapshot("codex-process")
+        assert snapshot is not None and snapshot.writer == TerminalWriter()
+        assert snapshot.revision > 1
         raise RuntimeError("no server running on /tmp/dead.sock")
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", _failing_run_tmux)
@@ -816,6 +864,9 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
     conv_id = "e5d09a0ff8458b2d6abb7f0c7deda0d3"
     terminal_registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
+    instance.writer_evidence = TerminalWriterEvidence("codex-process", complete_observation=True)
+    actor = TerminalWriter(user_id="owner")
+    instance.writer_evidence.record(actor)
     terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
 
     app, _ = await _build_app_for_spec(codex_native_spec, terminal_registry=terminal_registry)
@@ -829,7 +880,7 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
 
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "compact"},
+            json={"type": control, "approval_mode": "full-access"},
         )
 
     assert resp.status_code == 503, (
@@ -837,9 +888,17 @@ async def test_events_compact_on_codex_native_returns_503_on_tmux_failure(
         f"got {resp.status_code}: {resp.text}"
     )
     body = resp.json()
-    assert body.get("error") == "codex_native_compact_failed", (
+    error = (
+        "codex_native_compact_failed"
+        if control == "compact"
+        else "codex_native_approval_mode_failed"
+    )
+    assert body.get("error") == error, (
         f"503 body must carry the codex bridge-failure error code; got {body!r}"
     )
+    instance.writer_evidence.record(actor)
+    after = instance.writer_evidence.snapshot("codex-process")
+    assert after is not None and after.writer == TerminalWriter()
 
 
 @pytest.mark.asyncio
@@ -3444,6 +3503,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
     swallows this 503 and still returns 200 with the persisted
     value — the next spawn applies the new model via ``--model``.
     """
+    commands: list[str] = []
 
     def _fake_inject(
         bridge_dir: Any,
@@ -3455,10 +3515,16 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
         ready_timeout_s: float | None = None,
     ) -> None:
         """Simulate the bridge-not-ready path."""
-        del bridge_dir, command, timeout_s
+        del bridge_dir, timeout_s
+        commands.append(command)
         raise RuntimeError("tmux target is not advertised")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
 
     native_spec = _harness_spec("claude-native")
 
@@ -3487,6 +3553,7 @@ async def test_events_model_change_on_native_session_returns_503_when_bridge_not
     assert body.get("error") == "claude_native_model_failed", (
         f"503 body must carry the bridge-failure error code; got {body!r}"
     )
+    assert commands == ["/model claude-opus-4-7"]
 
 
 @pytest.mark.asyncio

@@ -27,6 +27,7 @@ record omissions rather than treating unselected checks as passed.
 | `compaction` | P1 | Supported compaction finishes and a later turn works with retained context; pending messages are not lost. |
 | `images` | P1 | A supported image reaches the model and its reply uses the image; unsupported inputs are rejected without losing the draft. |
 | `fork` | P1 | A supported fork uses copied history on its first turn and remains separate from its parent. |
+| `requester-delegation` | P1 | For requester-aware session orchestration, owner input succeeds while collaborator or unknown input cannot send peer work or create independent workers. Consumed steering stays restricted until a fresh owner execution. Fallback harnesses instead require no edit sharing; removing the last editor reauthorizes retained work without rewriting its requester. Validate Chat, terminal and child paths separately using [Session orchestration](./session-orchestration.md). Distinguish host-managed from standalone terminals and Omnigent children from provider-created helpers; a supported row does not cover another launcher. |
 | `mcp` | P1 | A configured, supported Omnigent MCP connection can call a harmless tool and show its result. |
 | `user-resources` | P1 | Supported user skills, extensions, prompts and packages remain available after launch/resume; relative paths, disabled resources and owner context controls retain their meaning. |
 | `interactive-input` | P1 | Supported questions and editor dialogs preserve literal/empty answers, settle cancellation, and allow a later turn to complete. |
@@ -126,6 +127,7 @@ no harness-specific tests exist. No passing per-harness results are implied.
 | `compaction` | — | No shared probe. Use the Composer compaction recipe and the harness's supported entry points. |
 | `images` | — | No shared probe. Attachment UI alone does not establish delivery to a real harness/model. |
 | `fork` | `fork_replay` | Copied-history use through server/runner; fork dialog, alternate targets and parent isolation need the Sessions recipe. |
+| `requester-delegation` | — | `tests/e2e/test_private_session_orchestration.py` covers OpenAI Agents SDK, isolated Claude SDK, and native Codex Chat/host-managed terminal input. [Session orchestration](./session-orchestration.md) maps browser checks, public CLI typed delegation with a connected host, and the native Claude, CLI onboarding/auth, native-child and version-skew gaps. No shared bench probe. |
 | `mcp` | `omnigent_mcp` | Read-only relay tool for supported natives; Settings inventory alone is not a tool-execution check. |
 | `user-resources` | — | Use the Pi resource recipes below and the native skill/plugin recipes. No shared cross-harness resource-loading probe; file linking alone does not prove runtime discovery or marketplace compatibility. |
 | `interactive-input` | — | `tests/e2e/test_pi_extension_ui_round_trip.py` drives SDK/native Pi through the approval API. The [native dialog recipe](./native-harnesses.md#driving-it-with-the-repro-environment) separately covers browser answers. No shared cross-harness dialog probe. |

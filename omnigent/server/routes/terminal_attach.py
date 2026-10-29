@@ -55,15 +55,11 @@ attached with ``-r``: tmux >= 3.7 would then reject the harness's own
 Write attach is owner-only
 --------------------------
 
-A terminal is a single shared PTY driving one process that runs as the
-session owner. Raw keystroke bytes carry no per-user identity, so input
-typed by anyone other than the owner would be acted on — and, for the
-agent's TUI, persisted into conversation history — as if the owner typed
-it. To keep that attribution honest, an *interactive* (write) attach
-requires ``LEVEL_OWNER``; non-owners can only attach read-only and drive
-the agent through the chat composer, which carries the real sender's
-identity. This holds uniformly for the agent's own terminal and for
-user-launched shells, since both attach through this route.
+A terminal is a shared PTY, so interactive attach requires ``LEVEL_OWNER``.
+The permission gate may also admit administrators; it never establishes that
+the actor is the session owner. Capture the actual authenticated actor for the
+protected runner transport. Native submission authority additionally requires
+complete writer observation for that terminal process incarnation.
 """
 
 from __future__ import annotations
@@ -76,18 +72,30 @@ from typing import Final
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
+from omnigent.db.account_authority import account_generation
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import OmnigentError
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
+from omnigent.server.auth import (
+    LEVEL_OWNER,
+    LEVEL_READ,
+    RESERVED_USER_PUBLIC,
+    AuthProvider,
+)
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.terminals.control_bridge import bridge_tmux_control_to_websocket
+from omnigent.terminals.writer import (
+    TERMINAL_WRITER_QUERY,
+    TerminalWriter,
+    bind_terminal_writer,
+)
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -152,7 +160,7 @@ def create_terminal_attach_router(
             resolve_terminal_entry_by_resource_id,
         )
 
-        user_id = await _authorize_terminal_attach(
+        writer = await _authorize_terminal_attach(
             websocket,
             session_id=session_id,
             read_only=read_only,
@@ -160,9 +168,9 @@ def create_terminal_attach_router(
             permission_store=permission_store,
             conversation_store=conversation_store,
         )
-        # WebSockets bypass the HTTP middleware that attributes debug-log rows
-        # to the request's user; this handler task is per-connection.
-        set_current_user_id(user_id)
+        bind_terminal_writer(websocket.scope, writer)
+        # WebSockets bypass HTTP log attribution; this task is per connection.
+        set_current_user_id(auth_provider.get_user_id(websocket) if auth_provider else None)
         await websocket.accept()
         _logger.info(
             "terminal attach connected for session %s terminal %s",
@@ -181,7 +189,10 @@ def create_terminal_attach_router(
         if ws_factory is not None:
             from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
+            query = {"read_only": "true" if read_only else "false"}
+            if not read_only:
+                query[TERMINAL_WRITER_QUERY] = writer.model_dump_json()
+            qs = urlencode(query)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
             )
@@ -274,6 +285,7 @@ def create_terminal_attach_router(
                 socket_path=str(entry.instance.socket_path),
                 tmux_target=entry.instance.tmux_target,
                 read_only=read_only,
+                writer_evidence=entry.instance.writer_evidence,
             )
 
     return router
@@ -287,20 +299,14 @@ async def _authorize_terminal_attach(
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore | None,
-) -> str | None:
+) -> TerminalWriter:
     """
     Authorize a terminal-attach WebSocket before accepting it.
 
-    Interactive attaches write bytes to the shared PTY, which runs as the
-    session owner and (for the agent's TUI) persists input into history
-    under the owner's identity. Raw keystrokes carry no per-user
-    attribution, so an interactive attach requires ``LEVEL_OWNER`` — only
-    the owner can drive the terminal. Read-only attaches still expose
-    terminal output, so read access is the minimum; non-owners attach
-    read-only and send input through the chat composer (which carries the
-    real sender's identity). When permissions are disabled
-    (``permission_store is None``), preserve the existing
-    single-user/dev behavior.
+    Interactive attaches require owner-level access; viewers require read
+    access. Preserve the authenticated actor independently of this permission
+    check, including administrator access. With permissions disabled, typing
+    remains available and an absent authenticated identity stays unknown.
 
     :param websocket: The incoming FastAPI :class:`WebSocket`, used to
         resolve the caller's identity via *auth_provider*.
@@ -316,21 +322,28 @@ async def _authorize_terminal_attach(
         all checks (single-user/dev mode).
     :param conversation_store: Conversation store consulted by the
         access check. Required when *permission_store* is set.
-    :returns: The caller's user id, or ``None`` when it cannot be resolved
-        (only possible with permissions disabled).
+    :returns: Captured actor and account generation, or an unknown writer.
     :raises WebSocketException: With ``WS_1008_POLICY_VIOLATION`` when
         auth is misconfigured, the caller is unauthenticated, or the
         caller lacks the required level for the requested mode.
     """
+    user_id = auth_provider.get_user_id(websocket) if auth_provider is not None else None
+    # The provider may authenticate "local" under its explicit single-user policy.
+    # A runner credential still identifies only the transport.
+    writer = (
+        TerminalWriter(user_id=user_id, account_generation=account_generation(user_id))
+        if user_id not in (None, RESERVED_USER_PUBLIC)
+        and RUNNER_TUNNEL_TOKEN_HEADER not in websocket.headers
+        else TerminalWriter()
+    )
     if permission_store is None:
-        return auth_provider.get_user_id(websocket) if auth_provider is not None else None
+        return writer
     if auth_provider is None or conversation_store is None:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,
             reason="terminal attach authorization is not configured",
         )
 
-    user_id = auth_provider.get_user_id(websocket)
     if user_id is None:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,
@@ -360,7 +373,7 @@ async def _authorize_terminal_attach(
             code=status.WS_1008_POLICY_VIOLATION,
             reason="not authorized",
         ) from exc
-    return user_id
+    return writer
 
 
 class _RunnerWSClosed(Exception):

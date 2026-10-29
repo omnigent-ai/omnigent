@@ -28,6 +28,7 @@ from omnigent.inner.terminal import TerminalCreateResult, TerminalInstance
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals import registry as registry_mod
 from omnigent.terminals.registry import TerminalListEntry, conversation_link_for_id
+from omnigent.terminals.writer import TerminalWriter
 
 # ── Pure bookkeeping (no tmux) ────────────────────────────────
 
@@ -445,10 +446,12 @@ async def test_launch_get_close_round_trip(
 
 
 @pytestmark_tmux
+@pytest.mark.parametrize("complete_observation", [False, True])
 async def test_launch_idempotent_returns_existing_instance(
     reg_with_tmux: TerminalRegistry,
     bash_spec: TerminalEnvSpec,
     cleanup: None,
+    complete_observation: bool,
 ) -> None:
     """
     Launching the same triple twice returns the SAME instance
@@ -456,13 +459,36 @@ async def test_launch_idempotent_returns_existing_instance(
     transient errors don't leak orphan tmux sessions.
     """
     del cleanup
-    first = await reg_with_tmux.launch("conv_a", "bash", "s1", bash_spec)
-    second = await reg_with_tmux.launch("conv_a", "bash", "s1", bash_spec)
+    first = await reg_with_tmux.launch(
+        "conv_a", "bash", "s1", bash_spec, complete_writer_observation=complete_observation
+    )
+    evidence = first.writer_evidence
+    actor = TerminalWriter(user_id="authenticated-actor", account_generation="generation-1")
+    evidence.record(actor)
+    before = evidence.snapshot(evidence.incarnation_id)
+    assert before is not None
+    assert before.writer == (actor if complete_observation else TerminalWriter())
+    second = await reg_with_tmux.launch(
+        "conv_a", "bash", "s1", bash_spec, complete_writer_observation=not complete_observation
+    )
     assert first is second, (
         "Idempotent launch must return the existing instance. If "
         "first is not second, the registry is spawning a fresh "
         "tmux on every launch — a leak."
     )
+    assert second.writer_evidence is evidence
+    assert evidence.snapshot(evidence.incarnation_id) == before
+
+    await reg_with_tmux.close("conv_a", "bash", "s1")
+    replacement = await reg_with_tmux.launch(
+        "conv_a", "bash", "s1", bash_spec, complete_writer_observation=not complete_observation
+    )
+    assert replacement.writer_evidence is not evidence
+    assert replacement.writer_evidence.snapshot(evidence.incarnation_id) is None
+    replacement.writer_evidence.record(actor)
+    after = replacement.writer_evidence.snapshot(replacement.writer_evidence.incarnation_id)
+    assert after is not None
+    assert after.writer == (TerminalWriter() if complete_observation else actor)
 
 
 @pytestmark_tmux

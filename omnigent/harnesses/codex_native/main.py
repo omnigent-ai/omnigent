@@ -374,6 +374,7 @@ class LaunchedCodexTerminal:
     terminal_id: str
     tmux_socket: Path | None
     tmux_target: str | None
+    requires_authenticated_attach: bool = False
 
 
 @dataclass
@@ -413,6 +414,7 @@ class PreparedCodexTerminal:
     app_server: CodexNativeAppServer | None
     event_client: CodexAppServerClient | None
     reattached: bool
+    requires_authenticated_attach: bool = False
 
 
 def _require_codex_app_server_url(prepared: PreparedCodexTerminal) -> str:
@@ -990,6 +992,7 @@ async def _prepare_codex_terminal_via_daemon(
                     app_server=None,
                     event_client=None,
                     reattached=True,
+                    requires_authenticated_attach=existing_terminal.requires_authenticated_attach,
                 )
             patch: _JsonObject = {}
             if persist_args:
@@ -1048,6 +1051,7 @@ async def _prepare_codex_terminal_via_daemon(
         app_server=None,
         event_client=None,
         reattached=reattached,
+        requires_authenticated_attach=terminal.requires_authenticated_attach,
     )
 
 
@@ -1187,6 +1191,7 @@ async def _prepare_codex_terminal(
                     app_server=None,
                     event_client=None,
                     reattached=True,
+                    requires_authenticated_attach=existing_terminal.requires_authenticated_attach,
                 )
             if thread_id is None:
                 raise click.ClickException(
@@ -1323,6 +1328,7 @@ async def _prepare_codex_terminal(
         app_server=app_server,
         event_client=event_client,
         reattached=False,
+        requires_authenticated_attach=launched_terminal.requires_authenticated_attach,
     )
 
 
@@ -1527,12 +1533,12 @@ async def _attach_terminal_resource(
     :returns: None after the attach exits.
     """
     direct_tmux_error = _direct_tmux_unavailable_reason(prepared)
-    if direct_tmux_error is None:
+    if direct_tmux_error is None and not prepared.requires_authenticated_attach:
         if prepared.tmux_socket is None or prepared.tmux_target is None:
             raise click.ClickException("Codex tmux attach metadata was incomplete.")
         await _attach_direct_tmux(prepared.tmux_socket, prepared.tmux_target)
         return
-    if prepared.app_server_url is None:
+    if prepared.app_server_url is None and not prepared.requires_authenticated_attach:
         raise click.ClickException(
             f"Runner-owned Codex terminal requires direct tmux attach, but {direct_tmux_error}"
         )
@@ -3041,6 +3047,9 @@ def _launched_codex_terminal_from_payload(payload: object) -> LaunchedCodexTermi
         terminal_id=terminal_id,
         tmux_socket=tmux_socket,
         tmux_target=tmux_target,
+        requires_authenticated_attach=(
+            isinstance(metadata, dict) and metadata.get("requires_authenticated_attach") is True
+        ),
     )
 
 

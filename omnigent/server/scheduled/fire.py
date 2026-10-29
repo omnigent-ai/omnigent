@@ -327,11 +327,17 @@ class _NewRunRecorder:
                 await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
 
 
-def _prompt_event(prompt: str) -> SessionEventInput:
+def _prompt_event(task: ScheduledTask) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
+    from omnigent.runtime.requester import InputRequester
+
     return SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+        requester=InputRequester(
+            user_id=task.user_id or RESERVED_USER_LOCAL,
+            account_generation=task.account_generation,
+        ),
+        data={"role": "user", "content": [{"type": "input_text", "text": task.prompt}]},
     )
 
 
@@ -1818,7 +1824,7 @@ async def _send_prompt(
     await _dispatch_session_event_to_runner(
         conv.id,
         conv,
-        _prompt_event(task.prompt),
+        _prompt_event(task),
         deps.conversation_store,
         runner_client,
         agent_name=None,
@@ -1847,7 +1853,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
         # No browser preference applies to a fire; keep the server default.
         await deps.startup_inputs.enqueue(
             conv.id,
-            _prompt_event(task.prompt),
+            _prompt_event(task),
             user_id=task.user_id or RESERVED_USER_LOCAL,
             headers=Headers({BACKGROUND_SESSION_TITLES_HEADER: "on"}),
         )

@@ -1240,6 +1240,7 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
 
     async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> None:
         captured["agent_revision"] = kwargs.get("agent_revision")
+        captured["requester"] = args[2].requester
 
     monkeypatch.setattr(host_launch, "resolve_host_launch", _resolve_host_launch)
     monkeypatch.setattr(sessions_routes, "_launch_runner_on_host", _launch_runner_on_host)
@@ -1269,6 +1270,8 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
+    assert captured["requester"].user_id == RESERVED_USER_LOCAL
+    assert captured["requester"].account_generation is None
     # The kickoff names the bundle it runs, so the runner sees a later reinstall.
     assert captured["agent_revision"] == "ag_1/rev1"
 
@@ -1926,6 +1929,7 @@ async def test_managed_fire_saves_prompt_then_launches_fresh_sandbox(
     assert len({saved["session_id"] for saved in startup.enqueued}) == 2
     for saved in startup.enqueued:
         assert saved["user_id"] == RESERVED_USER_LOCAL
+        assert saved["event"].requester.user_id == RESERVED_USER_LOCAL
         assert saved["event"].data["content"] == [{"type": "input_text", "text": "do the thing"}]
         assert saved["headers"].get("x-omnigent-background-session-titles") == "on"
     for call in managed_launch.await_args_list:
@@ -2407,20 +2411,60 @@ async def _fire_once(deps: FireDeps) -> list[Any]:
 
 
 @pytest.mark.asyncio
-async def test_continue_sends_the_prompt_into_the_session() -> None:
-    conv_store = _ExistingConversationStore(_continued_session())
+@pytest.mark.parametrize("task_user", [None, "alice@example.com"])
+async def test_continue_sends_the_prompt_into_the_session(
+    monkeypatch: pytest.MonkeyPatch, task_user: str | None
+) -> None:
+    from omnigent.server.routes import sessions
+
+    conv = _continued_session()
+    conv_store = _ExistingConversationStore(conv)
     perm = FakePermissionStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+    generation = "owner-generation" if task_user else None
+    task = _continuing_task(user_id=task_user, account_generation=generation)
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    owner = task_user or RESERVED_USER_LOCAL
+    account = replace(perm.get_user(owner), account_generation=generation)
+    monkeypatch.setattr(perm, "get_user", lambda user_id: account if user_id == owner else None)
+    clients = [object(), object()]
+    connect = AsyncMock(side_effect=[(client, conv) for client in clients])
+    initialize = AsyncMock()
+    dispatch = AsyncMock()
+    monkeypatch.setattr(sessions, "ensure_runner_connected", connect)
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", dispatch)
+    deps = _deps(store, conversation_store=conv_store, permission_store=perm)
+    on_fire = build_on_fire(deps)
 
-    launched = await _fire_once(_deps(store, conversation_store=conv_store, permission_store=perm))
+    for _ in clients:
+        await on_fire(0, "task_1")
+        await _drain()
 
-    assert [conv.id for conv in launched] == ["conv_prev"]
+    assert connect.await_count == initialize.await_count == dispatch.await_count == 2
+    origins = []
+    for client, initialized, sent in zip(
+        clients, initialize.await_args_list, dispatch.await_args_list, strict=True
+    ):
+        assert initialized.args == (conv.id, conv, client, conv_store)
+        assert sent.args[:2] == (conv.id, conv)
+        assert sent.args[3:] == (conv_store, client)
+        assert sent.kwargs["created_by"] == owner
+        event = SessionEventInput.model_validate_json(sent.args[2].model_dump_json())
+        assert event.type == "message"
+        assert event.data == {
+            "role": "user",
+            "content": [{"type": "input_text", "text": task.prompt}],
+        }
+        assert event.requester.user_id == owner
+        assert event.requester.account_generation == generation
+        origins.append(event.requester.input_id)
+    assert len(set(origins)) == 2, "each firing must have its own input identity"
     assert conv_store.created == []
     assert perm.grants == []
     assert store.adopted == []
     assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
         ("succeeded", "conv_prev")
-    ]
+    ] * 2
 
 
 @pytest.mark.asyncio
@@ -2997,7 +3041,9 @@ async def test_a_continue_waits_for_the_first_sandbox_still_provisioning(
         return object(), conv
 
     monkeypatch.setattr(sessions, "ensure_runner_connected", _connected)
-    monkeypatch.setattr(fire_mod, "_send_prompt", AsyncMock())
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    send = AsyncMock()
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
     store = FakeScheduledTaskStore(rows={"task_1": task})
     dispatch = fire_mod._make_reuse_dispatch(
         _deps(store, conversation_store=conv_store, managed_launches=tracker)
@@ -3014,7 +3060,11 @@ async def test_a_continue_waits_for_the_first_sandbox_still_provisioning(
     await sending
 
     assert reached == [own]
-    fire_mod._send_prompt.assert_awaited_once()
+    send.assert_awaited_once()
+    event = send.await_args.args[2]
+    assert event.requester.user_id == RESERVED_USER_LOCAL
+    assert event.requester.account_generation is None
+    assert event.data["content"] == [{"type": "input_text", "text": task.prompt}]
 
 
 @pytest.mark.asyncio

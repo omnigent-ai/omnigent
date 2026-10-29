@@ -361,7 +361,7 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
     class _StubClient:
         """Captures ``options.env`` at connect time (= CLI spawn time)."""
 
-        def __init__(self, options) -> None:  # type: ignore[no-untyped-def]  # SDK options shape owned by stub
+        def __init__(self, options, *, transport=None) -> None:  # type: ignore[no-untyped-def]  # SDK options shape owned by stub
             self.options = options
             self._query = None
             self._transport = None

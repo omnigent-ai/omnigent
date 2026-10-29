@@ -652,6 +652,7 @@ async def test_auto_create_repl_terminal_launches_attach_and_stamps_label(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """
             Record the terminal launch request.
@@ -795,6 +796,7 @@ async def test_auto_create_repl_terminal_inherits_agent_sandbox(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """Record the spec + parent_os_env and return a resource view."""
             del terminal_name, session_key, resource_role

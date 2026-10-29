@@ -40,6 +40,7 @@ from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runner.transports.ws_tunnel.frames import EventAckFrame, EventBatchFrame
 from omnigent.runtime import inflight_text
+from omnigent.runtime.requester import InputRequester
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.background_session_titles import BackgroundTitleRequest
 from omnigent.server.routes._sessions.helpers import (
@@ -5548,12 +5549,16 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         )
 
     assert status_resp.status_code == 202, status_resp.text
+    requester = InputRequester.model_validate(forwarded[0]["body"]["requester"])
+    assert requester.user_id is None
+    assert requester.account_generation is None
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
                 "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "requester": requester.model_dump(),
                 "model_override": None,
                 "tools": None,
                 "created_by": None,

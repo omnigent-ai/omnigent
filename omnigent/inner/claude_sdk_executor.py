@@ -36,9 +36,11 @@ import pathlib
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -64,6 +66,7 @@ from omnigent.models.claude_model_vocabulary import (
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.requester import ToolRequester
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -734,10 +737,11 @@ def _to_anthropic_content_blocks(
     return result
 
 
-async def _multimodal_message_iter(
-    content_blocks: list[_JsonObject],
+async def _user_message_iter(
+    content: str | list[_JsonObject],
     *,
     session_id: str,
+    input_uuid: str | None = None,
 ) -> AsyncIterator[_JsonObject]:
     """
     Yield a single structured user message dict for the Claude
@@ -747,16 +751,17 @@ async def _multimodal_message_iter(
     the CLI's stdin. The CLI forwards the content blocks to the
     Anthropic Messages API, which supports multimodal input.
 
-    :param content_blocks: Anthropic API content block dicts
-        (output of :func:`_to_anthropic_content_blocks`).
+    :param content: Text or Anthropic API content blocks.
     :param session_id: The SDK session identifier.
+    :param input_uuid: Registered submission identifier, when a requester transport is used.
     :yields: A single message dict.
     """
     yield {
         "type": "user",
-        "message": {"role": "user", "content": content_blocks},
+        "message": {"role": "user", "content": content},
         "parent_tool_use_id": None,
         "session_id": session_id,
+        **({"uuid": input_uuid} if input_uuid else {}),
     }
 
 
@@ -901,6 +906,159 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    requester_transport: _ClaudeRequesterTransport | None = None
+
+
+@dataclass(frozen=True)
+class _ClaudeToolBinding:
+    call_id: str
+    name: str
+    requester: ToolRequester
+
+
+_claude_tool_binding: ContextVar[_ClaudeToolBinding | None] = ContextVar(
+    "claude_sdk_tool_binding", default=None
+)
+
+
+class _ClaudeRequesterTransport:
+    """Retain provider provenance before the SDK discards input UUIDs and MCP metadata.
+
+    The headless CLI serializes roots through Result and echoes their submitted UUID
+    on the first assistant frame. Child frames carry the originating parent tool ID.
+    Only those producer records can bind a call; arguments and reader context cannot.
+    """
+
+    _MAX_RECORDS = 8192
+
+    def __init__(self, options: SdkOptions) -> None:
+        self._options = options
+        self.inner: Any = None  # type: ignore[explicit-any]  # optional SDK transport
+        self._submitted: dict[str, ToolRequester | None] = {}
+        self._tools: dict[str, _ClaudeToolBinding | None] = {}
+        self._root: ToolRequester | None = None
+        self._root_input: str | None = None
+
+    @property
+    def at_capacity(self) -> bool:
+        """Rotate the producer before another turn; retained IDs cannot be safely reused."""
+        return len(self._submitted) >= self._MAX_RECORDS or len(self._tools) >= self._MAX_RECORDS
+
+    def register(self, requester: ToolRequester | None) -> str:
+        """Mint an input UUID at the trusted submission boundary, before writing it."""
+        input_uuid = str(uuid.uuid4())
+        self._root = None
+        self._root_input = None
+        if len(self._submitted) < self._MAX_RECORDS:
+            self._submitted[input_uuid] = requester
+        return input_uuid
+
+    async def connect(self) -> None:
+        from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+        options = self._options
+        if options.can_use_tool:
+            # Custom transports must apply the same stdio permission setting as Client.
+            options = replace(options, permission_prompt_tool_name="stdio")
+        self.inner = SubprocessCLITransport(prompt="", options=options)
+        await self.inner.connect()
+
+    async def write(self, data: str) -> None:
+        await self.inner.write(data)
+
+    async def close(self) -> None:
+        self._root = None
+        self._root_input = None
+        self._submitted.clear()
+        self._tools.clear()
+        if self.inner is not None:
+            await self.inner.close()
+
+    async def end_input(self) -> None:
+        await self.inner.end_input()
+
+    def is_ready(self) -> bool:
+        return self.inner is not None and bool(self.inner.is_ready())
+
+    @staticmethod
+    def _identifier(value: object) -> str | None:
+        return value if isinstance(value, str) and 0 < len(value) <= 256 else None
+
+    def _observe(self, frame: dict[str, Any]) -> _ClaudeToolBinding | None:  # type: ignore[explicit-any]
+        kind = frame.get("type")
+        if kind == "result":
+            self._root = None
+            self._root_input = None
+        elif kind == "system" and frame.get("status") == "requesting":
+            # The CLI may consume additional queued inputs without changing its primary UUID.
+            if frame.get("user_message_uuids") != [self._root_input]:
+                self._root = None
+        elif kind == "assistant":
+            parent = frame.get("parent_tool_use_id")
+            if parent is None and "parent_tool_use_id" in frame:
+                if "user_message_uuid" in frame:
+                    input_uuid = self._identifier(frame["user_message_uuid"])
+                    self._root_input = input_uuid
+                    self._root = self._submitted.pop(input_uuid, None) if input_uuid else None
+                    inputs = frame.get("user_message_uuids", [input_uuid])
+                    if not isinstance(inputs, list) or inputs != [input_uuid]:
+                        self._root = None
+                requester = self._root
+            else:
+                binding = self._tools.get(self._identifier(parent) or "")
+                requester = binding.requester if binding else None
+            message = frame.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            for block in content if isinstance(content, list) else []:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                call_id = self._identifier(block.get("id"))
+                name = self._identifier(block.get("name"))
+                if call_id is None:
+                    continue
+                candidate = (
+                    _ClaudeToolBinding(call_id, name, requester)
+                    if name and requester is not None
+                    else None
+                )
+                if call_id in self._tools:
+                    if self._tools[call_id] != candidate:
+                        self._tools[call_id] = None
+                elif len(self._tools) < self._MAX_RECORDS:
+                    self._tools[call_id] = candidate
+        elif kind == "control_request":
+            request = frame.get("request")
+            if not isinstance(request, dict) or request.get("subtype") != "mcp_message":
+                return None
+            message = request.get("message")
+            if not isinstance(message, dict) or message.get("method") != "tools/call":
+                return None
+            params = message.get("params")
+            if not isinstance(params, dict):
+                return None
+            meta = params.get("_meta")
+            call_id = (
+                self._identifier(meta.get("claudecode/toolUseId"))
+                if isinstance(meta, dict)
+                else None
+            )
+            binding = self._tools.get(call_id or "")
+            if (
+                binding is not None
+                and request.get("server_name") == "omnigent"
+                and binding.name == f"{_OMNIGENT_MCP_PREFIX}{params.get('name')}"
+            ):
+                return binding
+        return None
+
+    async def read_messages(self) -> AsyncIterator[dict[str, Any]]:  # type: ignore[explicit-any]
+        async for frame in self.inner.read_messages():
+            token = _claude_tool_binding.set(self._observe(frame))
+            try:
+                # Query creates each control task synchronously while handling this yield.
+                yield frame
+            finally:
+                _claude_tool_binding.reset(token)
 
 
 @dataclass(frozen=True)
@@ -998,7 +1156,17 @@ def _build_mcp_tools(
                     # so we always await. The isinstance guard below preserves
                     # the pre-refactor safety net for unexpected non-dict
                     # runtime returns without confusing the type checker.
-                    raw = await tool_executor(tool_name, args)
+                    binding = _claude_tool_binding.get()
+                    if (
+                        binding is not None
+                        and binding.name == f"{_OMNIGENT_MCP_PREFIX}{tool_name}"
+                    ):
+                        bound_executor = cast(Callable[..., Awaitable[ToolResult]], tool_executor)
+                        raw = await bound_executor(
+                            tool_name, args, call_id=binding.call_id, requester=binding.requester
+                        )
+                    else:
+                        raw = await tool_executor(tool_name, args)
                     result: ToolResult = raw if isinstance(raw, dict) else {"result": raw}
                     image_result = decode_mcp_image_result(result)
                     if image_result is not None:
@@ -1999,7 +2167,8 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
-            client = sdk.ClaudeSDKClient(options)
+            requester_transport = _ClaudeRequesterTransport(options)
+            client = sdk.ClaudeSDKClient(options, transport=requester_transport)
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2079,6 +2248,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                requester_transport=requester_transport,
             )
             self._clients[session_key] = state
             return client
@@ -2146,6 +2316,8 @@ class ClaudeSDKExecutor(Executor):
         if state is None:
             return
         transport = getattr(state.client, "_transport", None)
+        if isinstance(transport, _ClaudeRequesterTransport):
+            transport = transport.inner
         process = getattr(transport, "_process", None)
         # A non-None returncode is exactly the reaped-corpse state the SDK's
         # write() refuses; a missing transport/process reads as alive and is skipped.
@@ -2225,6 +2397,12 @@ class ClaudeSDKExecutor(Executor):
                     tg.cancel_scope.cancel()
 
         transport = getattr(client, "_transport", None)
+        if isinstance(transport, _ClaudeRequesterTransport):
+            transport._root = None
+            transport._root_input = None
+            transport._submitted.clear()
+            transport._tools.clear()
+            transport = transport.inner
         if transport is not None:
             # The SDK's stderr reader changed shape across revs: current
             # claude-agent-sdk (>=0.2.x) exposes a single ``_stderr_task``
@@ -2748,6 +2926,8 @@ class ClaudeSDKExecutor(Executor):
         tools: list[ToolSpec],
         system_prompt: str,
         config: ExecutorConfig | None = None,
+        *,
+        requester: ToolRequester | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         """Run one turn via the Claude Agent SDK.
 
@@ -2791,9 +2971,18 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
-            # turns, but let /compact operate on the existing client's context.
+        if (
+            state is not None
+            and prompt != "/compact"
+            and (
+                state.effort != reasoning_effort
+                or (
+                    state.requester_transport is not None and state.requester_transport.at_capacity
+                )
+            )
+        ):
+            # Rebuild for launch-option changes or full provenance maps. Keep IDs
+            # scoped to their producer, and let /compact use the existing context.
             await self._close_live_client(session_key)
             resume_session = False
             prompt = self._build_prompt(messages, resume_session=False)
@@ -3233,10 +3422,19 @@ class ClaudeSDKExecutor(Executor):
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
-                if isinstance(prompt, list):
+                state = self._clients.get(session_key)
+                requester_transport = state.requester_transport if state else None
+                if requester_transport is not None:
+                    # Authority is supplied by the adapter for this execution, never the reader.
+                    sdk_prompt = _user_message_iter(
+                        prompt,
+                        session_id=session_key,
+                        input_uuid=requester_transport.register(requester),
+                    )
+                elif isinstance(prompt, list):
                     # Multimodal content blocks — send as a
                     # structured message via the SDK's dict path.
-                    sdk_prompt = _multimodal_message_iter(prompt, session_id=session_key)
+                    sdk_prompt = _user_message_iter(prompt, session_id=session_key)
                 else:
                     sdk_prompt = prompt
                 await asyncio.wait_for(

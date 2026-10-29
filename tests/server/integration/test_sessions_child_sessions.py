@@ -35,6 +35,7 @@ from fastapi import FastAPI
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import session_stream
+from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -1681,6 +1682,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
         return fake_runner
 
     monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    claimed_requester = InputRequester(user_id="forged@example.test", account_generation="old")
     try:
         message_resp = await client.post(
             f"/v1/sessions/{child['id']}/events",
@@ -1689,6 +1691,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "data": {
                     "role": "user",
                     "content": [{"type": "input_text", "text": "build the patch"}],
+                    REQUESTER_FIELD: claimed_requester.model_dump(),
                 },
             },
         )
@@ -1704,6 +1707,10 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     assert message_body["queued"] is True
     assert message_body["pending_id"].startswith("pending_")
     forwarded_event = forwarded[1]["body"]
+    requester = InputRequester.model_validate(forwarded_event[REQUESTER_FIELD])
+    assert requester.user_id is None
+    assert requester.account_generation is None
+    assert requester.input_id != claimed_requester.input_id
     assert re.fullmatch(r"[0-9a-f]{32}", forwarded_event["delivery_attempt_id"])
     assert isinstance(forwarded_event["input_enqueued_at_ms"], int)
     assert forwarded_event["input_enqueued_at_ms"] > 0
@@ -1729,6 +1736,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "content": [{"type": "input_text", "text": "build the patch"}],
                 "model": expected_model,
                 "harness": harness,
+                REQUESTER_FIELD: requester.model_dump(),
                 "agent_id": parent["agent_id"],
                 "agent_revision": parent_agent.bundle_location,
                 "pending_id": message_body["pending_id"],

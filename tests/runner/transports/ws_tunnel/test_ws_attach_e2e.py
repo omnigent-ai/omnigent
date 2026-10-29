@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+from urllib.parse import urlencode
 
 import pytest
 from fastapi import FastAPI, WebSocket
@@ -37,6 +38,11 @@ from omnigent.server._runner_ws_tunnel import (
     DirectAttachEndpoint,
     _TunneledWSConn,
     make_direct_attach_resolver,
+)
+from omnigent.terminals.writer import (
+    TERMINAL_WRITER_QUERY,
+    TerminalWriter,
+    terminal_writer_from_scope,
 )
 
 
@@ -80,6 +86,7 @@ def _build_echo_app() -> FastAPI:
 
     @app.websocket("/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach")
     async def attach(websocket: WebSocket, session_id: str, terminal_id: str) -> None:
+        app.state.terminal_writer = terminal_writer_from_scope(websocket.scope)
         await websocket.accept()
         try:
             while True:
@@ -149,8 +156,10 @@ async def test_text_and_binary_round_trip_over_tunneled_ws_attach() -> None:
     try:
         # Server side: open a tunneled WS attach via the factory's
         # connection class directly.
+        writer = TerminalWriter(user_id="authenticated-actor", account_generation="generation-1")
         runner_path = (
-            "/v1/sessions/conv_x/resources/terminals/terminal_bash_s1/attach?read_only=false"
+            "/v1/sessions/conv_x/resources/terminals/terminal_bash_s1/attach?"
+            + urlencode({"read_only": "false", TERMINAL_WRITER_QUERY: writer.model_dump_json()})
         )
         async with _TunneledWSConn(
             registry=registry,
@@ -173,6 +182,7 @@ async def test_text_and_binary_round_trip_over_tunneled_ws_attach() -> None:
             await conn.send(b"\x00\x01\x02ABC")
             reply2 = await asyncio.wait_for(conn.recv(), timeout=2.0)
             assert reply2 == b"binary-echo:\x00\x01\x02ABC"
+            assert runner_app.state.terminal_writer == writer
     finally:
         for task in (sender_task, server_recv_task, runner_recv_task):
             task.cancel()

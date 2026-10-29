@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
     from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 import httpx
@@ -147,6 +148,7 @@ def register_resource_routes(
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
     terminal_registry: TerminalRegistry | None,
+    harness_manager: HarnessProcessManager | None = None,
 ) -> ResourceRoutes:
     """Register the ``/v1/sessions/{id}/resources/...`` routes on *app*.
 
@@ -406,6 +408,7 @@ def register_resource_routes(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                harness_manager=harness_manager,
                 rebind_bridge=_rebind_claude_bridge,
             )
             _ensure_build: (
@@ -1001,6 +1004,7 @@ def register_resource_routes(
             tmux_target=entry.instance.tmux_target,
             read_only=read_only,
             on_client_interaction=entry.instance.note_client_interaction,
+            writer_evidence=entry.instance.writer_evidence,
         )
 
     # Reused by the loopback direct-attach listener (see

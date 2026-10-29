@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from omnigent.entities.conversation import Conversation
+from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
 from omnigent.server.schemas import SessionEventInput
 
 
@@ -55,12 +56,17 @@ def test_codex_native_session_uses_codex_harness_for_web_messages() -> None:
     # agent_id must be forwarded so the runner can resolve the harness
     # spec on the first message, before POST /v1/sessions caches it —
     # otherwise the turn falls back to "runner-test-default" and drops.
-    assert sessions_routes._build_native_terminal_message_event(conv, _message_event()) == {
+    event = sessions_routes._build_native_terminal_message_event(conv, _message_event())
+    requester = InputRequester.model_validate(event[REQUESTER_FIELD])
+    assert requester.user_id is None
+    assert requester.account_generation is None
+    assert event == {
         "type": "message",
         "role": "user",
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "codex-native-ui",
         "harness": "codex-native",
+        REQUESTER_FIELD: requester.model_dump(),
         "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
@@ -72,12 +78,17 @@ def test_kiro_native_session_uses_kiro_harness_for_web_messages() -> None:
     conv = _conversation_with_wrapper("kiro-native-ui")
 
     assert sessions_routes._is_native_terminal_session(conv) is True
-    assert sessions_routes._build_native_terminal_message_event(conv, _message_event()) == {
+    event = sessions_routes._build_native_terminal_message_event(conv, _message_event())
+    requester = InputRequester.model_validate(event[REQUESTER_FIELD])
+    assert requester.user_id is None
+    assert requester.account_generation is None
+    assert event == {
         "type": "message",
         "role": "user",
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "kiro-native-ui",
         "harness": "kiro-native",
+        REQUESTER_FIELD: requester.model_dump(),
         "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
 
@@ -95,14 +106,40 @@ def test_antigravity_native_session_uses_antigravity_harness_for_web_messages() 
     conv = _conversation_with_wrapper("antigravity-native-ui")
 
     assert sessions_routes._is_native_terminal_session(conv) is True
-    assert sessions_routes._build_native_terminal_message_event(conv, _message_event()) == {
+    event = sessions_routes._build_native_terminal_message_event(conv, _message_event())
+    requester = InputRequester.model_validate(event[REQUESTER_FIELD])
+    assert requester.user_id is None
+    assert requester.account_generation is None
+    assert event == {
         "type": "message",
         "role": "user",
         "content": [{"type": "input_text", "text": "hello"}],
         "model": "antigravity-native-ui",
         "harness": "antigravity-native",
+        REQUESTER_FIELD: requester.model_dump(),
         "agent_id": "d5de5cef9504e12d06e729f3071d4f48",
     }
+
+
+@pytest.mark.parametrize("wrapper", ["codex-native-ui", "kiro-native-ui", "antigravity-native-ui"])
+@pytest.mark.parametrize("requester_user", [None, "bryan@example.test", "pat@example.test"])
+def test_native_message_preserves_trusted_requester_over_payload_claim(
+    wrapper: str, requester_user: str | None
+) -> None:
+    from omnigent.server.routes import sessions as sessions_routes
+
+    requester = InputRequester(
+        user_id=requester_user, account_generation="account-v1" if requester_user else None
+    )
+    message = _message_event().model_copy(update={"requester": requester})
+    message.data[REQUESTER_FIELD] = InputRequester(user_id="forged@example.test").model_dump()
+    event = sessions_routes._build_native_terminal_message_event(
+        _conversation_with_wrapper(wrapper), message
+    )
+
+    assert event[REQUESTER_FIELD] == requester.model_dump()
+    assert event["content"] == message.data["content"]
+    assert message.requester == requester
 
 
 def test_native_message_event_carries_the_session_harness_override() -> None:

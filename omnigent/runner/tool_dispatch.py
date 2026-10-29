@@ -35,6 +35,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.runner.session_requests import requester_route_error
+from omnigent.runtime.requester import (
+    InputRequester,
+    ToolRequester,
+    bind_tool_requester,
+    current_tool_requester,
+    requester_headers,
+)
 from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -164,9 +172,10 @@ def _route_identifier(value: object, kind: str) -> str:
     return value
 
 
-def _session_url(session_id: object) -> str:
+def _session_url(session_id: object, *, requester_bound: bool = False) -> str:
     """Build a session URL from one identifier, retaining legacy prefixed ids."""
-    return f"/v1/sessions/{_route_identifier(session_id, 'Session')}"
+    prefix = "/v1/requester" if requester_bound else "/v1"
+    return f"{prefix}/sessions/{_route_identifier(session_id, 'Session')}"
 
 
 def _optional_string(value: object) -> str | None:
@@ -1550,10 +1559,13 @@ async def _post_child_message_event(
     created_by: str | None,
 ) -> httpx.Response:
     """Post a child message, retrying once without best-effort attribution."""
+    caller = current_tool_requester.get()
+    origin = caller.origin if caller else InputRequester()
 
     def _payload(actor: str | None) -> _JsonObject:
         return {
             "type": "message",
+            "requester": origin.model_dump(),
             "data": {
                 "role": "user",
                 "content": content,
@@ -1562,7 +1574,7 @@ async def _post_child_message_event(
         }
 
     resp = await server_client.post(
-        f"{_session_url(session_id)}/events",
+        f"{_session_url(session_id, requester_bound=True)}/events",
         json=_payload(created_by),
         # This message is gated at the recipient's REQUEST phase, which can
         # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
@@ -1579,7 +1591,7 @@ async def _post_child_message_event(
         session_id,
     )
     return await server_client.post(
-        f"{_session_url(session_id)}/events",
+        f"{_session_url(session_id, requester_bound=True)}/events",
         json=_payload(None),
         timeout=_ASK_GATE_DELIVERY_TIMEOUT,
     )
@@ -2918,7 +2930,12 @@ async def _execute_subagent_tool(
         resp: httpx.Response | None = None
         try:
             for _ordinal_attempt in range(_max_ordinal_retries + 1):
-                resp = await server_client.post("/v1/sessions", json=create_body, timeout=30.0)
+                resp = await server_client.post(
+                    "/v1/requester/sessions",
+                    json=create_body,
+                    headers=requester_headers(),
+                    timeout=30.0,
+                )
                 if (
                     resp.status_code == 409
                     and _auto_ordinal
@@ -2970,6 +2987,8 @@ async def _execute_subagent_tool(
                 f"committed the session — reaping any orphaned cluster.{_suffix} "
                 "Retry the same send to continue in a fresh child."
             )
+        if resp is not None and (protocol_error := requester_route_error(resp)):
+            return f"Error: {protocol_error}"
         if resp is None or resp.status_code >= 400:
             status = resp.status_code if resp is not None else 0
             text = resp.text[:200] if resp is not None else "(no response)"
@@ -3550,7 +3569,7 @@ async def _execute_session_create(
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = requester_headers()
     if placement != "child":
         from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 
@@ -3574,7 +3593,7 @@ async def _execute_session_create(
     }
     create_requested = False
     try:
-        endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
+        endpoint = "/v1/requester/sessions"
         if placement == "managed":
             from omnigent.runner.session_requests import post_on_host
 
@@ -3605,13 +3624,8 @@ async def _execute_session_create(
         # Host loss can be reported before persistence or during the later launch.
         if is_wrong_replica(resp) or resp.status_code == 409:
             return json.dumps(unconfirmed_creation)
-    if placement != "child" and resp.status_code in (404, 405):
-        return json.dumps(
-            {
-                "error": "Independent session creation is unavailable on this server "
-                "or the agent was not found",
-            }
-        )
+    if protocol_error := requester_route_error(resp):
+        return json.dumps({"error": protocol_error})
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
@@ -3734,16 +3748,11 @@ async def _post_child_first_message(
         ``sys_session_send``) on failure.
     """
     try:
-        msg_resp = await server_client.post(
-            f"{_session_url(child_session_id)}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
-                },
-            },
-            timeout=30.0,
+        msg_resp = await _post_child_message_event(
+            server_client,
+            child_session_id,
+            content=[{"type": "input_text", "text": message}],
+            created_by=None,
         )
     except httpx.HTTPError as exc:
         return json.dumps(
@@ -3815,13 +3824,16 @@ async def _upload_config_bundle(
         metadata["title"] = title
     try:
         resp = await server_client.post(
-            "/v1/sessions",
+            "/v1/requester/sessions",
+            headers=requester_headers(),
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
             timeout=60.0,
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
+    if protocol_error := requester_route_error(resp):
+        return json.dumps({"error": protocol_error})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
     if resp.status_code >= 400:
@@ -6846,6 +6858,7 @@ async def _fetch_peek_meta(
     return _PeekMeta(agent=parsed.agent, title=parsed.title, pending_elicitations=pending)
 
 
+@bind_tool_requester
 async def execute_tool(
     *,
     tool_name: str,
@@ -6867,6 +6880,7 @@ async def execute_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    requester: ToolRequester | None = None,  # noqa: ARG001 -- bound by the dispatch decorator
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -7270,6 +7284,7 @@ async def dispatch_tool_locally(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    requester: ToolRequester | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -7302,6 +7317,7 @@ async def dispatch_tool_locally(
         )
     output = await execute_tool(
         tool_name=tool_name,
+        requester=requester,
         arguments=arguments,
         server_client=server_client,
         terminal_registry=terminal_registry,

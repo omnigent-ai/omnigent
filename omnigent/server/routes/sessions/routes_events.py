@@ -855,6 +855,12 @@ def register_events_routes(
         return user_id, conv
 
     @event_router.post(
+        "/requester/sessions/{session_id}/events",
+        include_in_schema=False,
+        status_code=202,
+        response_model=None,
+    )
+    @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
         include_in_schema=False,
@@ -870,6 +876,9 @@ def register_events_routes(
     ) -> dict[str, bool | str] | list[dict[str, bool | str]]:
         """
         Route entry for :func:`_post_event_impl`.
+
+        The internal ``/requester`` alias guarantees that delegation metadata
+        is understood by the replica accepting the event, before any effects.
 
         A single object preserves the existing API. A top-level JSON array is
         processed in order and returns one acknowledgement per event when all
@@ -1123,6 +1132,29 @@ def register_events_routes(
             ),
         )
         peer_message = body.type == "session_message"
+        from omnigent.db.account_authority import account_generation
+        from omnigent.runtime.requester import InputRequester
+
+        runner_originated = _has_runner_created_by_authority(request, conv)
+        trusted_origin = runner_originated or isinstance(request, StartupInputContext)
+        if body.requester is not None and not trusted_origin:
+            raise OmnigentError(
+                "requester is reserved for runner-originated session events",
+                code=ErrorCode.FORBIDDEN,
+            )
+        if body.requester is None:
+            # Legacy runner attribution is a display hint, not requester authority.
+            requester_id = None if trusted_origin else user_id
+            body = body.model_copy(
+                update={
+                    "requester": InputRequester(
+                        user_id=requester_id,
+                        account_generation=(
+                            account_generation(requester_id) if requester_id else None
+                        ),
+                    )
+                }
+            )
         if peer_message:
             if not isinstance(request, Request):
                 raise OmnigentError(
@@ -1136,9 +1168,16 @@ def register_events_routes(
                 permission_store,
                 target_id=session_id,
             )
+            from omnigent.server.requester import tool_requester
             from omnigent.server.session_orchestration import orchestration_message
 
             body = orchestration_message(source.id, body.data.get("message"))
+            source_requester = tool_requester(request, source)
+            body = body.model_copy(
+                update={
+                    "requester": source_requester.origin if source_requester else InputRequester()
+                }
+            )
         if body.type == "message" and _is_native_terminal_session(conv):
             _logger.info(
                 "Native input received before runner initialization",

@@ -23,6 +23,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 from fastapi import WebSocketDisconnect
@@ -37,6 +38,14 @@ from omnigent.terminals.control_bridge import (
     _WindowNameFilter,
     bridge_tmux_control_to_websocket,
     unescape_control_output,
+)
+from omnigent.terminals.writer import (
+    TERMINAL_WRITER_QUERY,
+    TerminalWriter,
+    TerminalWriterEvidence,
+    bind_relay_terminal_writer,
+    bind_terminal_writer,
+    terminal_writer_from_scope,
 )
 from tests._helpers.polling import poll_until_async
 
@@ -165,6 +174,82 @@ def test_hex_send_keys_commands_encodes_and_chunks() -> None:
     assert cmds[1].count(b"00") == 5
 
 
+@pytest.mark.parametrize(
+    "other",
+    [
+        TerminalWriter(),
+        TerminalWriter(user_id="pat"),
+        TerminalWriter(user_id="bryan", account_generation="new"),
+    ],
+)
+def test_terminal_writer_evidence_retains_mixed_input_and_process_scope(
+    other: TerminalWriter,
+) -> None:
+    owner = TerminalWriter(user_id="bryan", account_generation="old")
+    evidence = TerminalWriterEvidence("process-1", complete_observation=True)
+    unseen = evidence.snapshot("process-1")
+    assert unseen is not None and unseen.writer == TerminalWriter()
+    evidence.record(owner)
+    captured = evidence.snapshot("process-1")
+    assert captured is not None and captured.writer == owner
+    evidence.record(owner)
+    same = evidence.snapshot("process-1")
+    assert same is not None and same.writer == owner and same.revision > captured.revision
+    evidence.record(other)
+    evidence.record(owner)
+    mixed = evidence.snapshot("process-1")
+    assert mixed is not None and mixed.writer == TerminalWriter()
+    assert mixed.revision > same.revision
+    assert captured.writer == owner
+    assert evidence.snapshot("replacement-process") is None
+    replacement = TerminalWriterEvidence("replacement-process", complete_observation=True)
+    replacement.record(owner)
+    fresh = replacement.snapshot("replacement-process")
+    assert fresh is not None and fresh.writer == owner
+    assert evidence.snapshot("process-1") == mixed
+
+
+def test_terminal_writer_unobserved_paths_never_establish_identity() -> None:
+    with pytest.raises(ValueError, match="incarnation"):
+        TerminalWriterEvidence("")
+    evidence = TerminalWriterEvidence("process-1")
+    evidence.record(TerminalWriter(user_id="bryan"))
+    snapshot = evidence.snapshot("process-1")
+    assert snapshot is not None and snapshot.writer == TerminalWriter()
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        None,
+        "not-json",
+        '{"user_id":42}',
+        '{"user_id":"bryan","extra":true}',
+        '{"user_id":"bryan"}',
+    ],
+)
+def test_terminal_writer_relay_envelope_requires_trusted_binding(envelope: str | None) -> None:
+    scope = {
+        "query_string": urlencode({TERMINAL_WRITER_QUERY: envelope}).encode()
+        if envelope is not None
+        else b""
+    }
+    assert terminal_writer_from_scope(scope) == TerminalWriter()
+    bind_relay_terminal_writer(scope)
+    expected = (
+        TerminalWriter(user_id="bryan") if envelope == '{"user_id":"bryan"}' else TerminalWriter()
+    )
+    assert terminal_writer_from_scope(scope) == expected
+    scope["query_string"] += (
+        b"&" + urlencode({TERMINAL_WRITER_QUERY: '{"user_id":"pat"}'}).encode()
+    )
+    bind_relay_terminal_writer(scope)
+    # A duplicate envelope is ambiguous; a lone Pat envelope is valid.
+    assert terminal_writer_from_scope(scope) == (
+        TerminalWriter(user_id="pat") if envelope is None else TerminalWriter()
+    )
+
+
 class _FakeWebSocket:
     """Minimal WebSocket stand-in driving bridge_tmux_control_to_websocket.
 
@@ -174,6 +259,7 @@ class _FakeWebSocket:
 
     def __init__(self, inbound: list[dict[str, object]], send_delay_s: float = 0.0) -> None:
         self._inbound = list(inbound)
+        self.scope = {}
         self.sent: list[bytes] = []
         self.sent_text: list[str] = []
         self.close_code: int | None = None
@@ -554,53 +640,91 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail(
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
-async def test_control_bridge_seeds_streams_and_detaches() -> None:
-    """End-to-end: seed the pre-attach screen, stream typed input, detach clean.
-
-    The pane answers the input with an ``ESC k`` window name, which tmux
-    streams raw; the browser must get the text after it but not the name.
-    """
-    # The first printf lands before attach so it can only reach the browser via
-    # the capture-pane seed. The tty echoes the typed input (→ %output), then
-    # the reply starts with the window name oh-my-zsh sets before a command.
-    sock, target = await _new_private_tmux(
-        "printf 'SEEDED-LINE\\n'; read -r line; "
-        "printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat"
+@pytest.mark.parametrize(
+    "writer",
+    [TerminalWriter(user_id="owner", account_generation="generation-1"), TerminalWriter()],
+    ids=["authenticated", "unknown"],
+)
+async def test_control_bridge_seeds_streams_and_detaches(
+    writer: TerminalWriter, tmp_path: Path
+) -> None:
+    """Preserve input attribution and filter window names while streaming typed input."""
+    # The seed precedes attach; the input reply includes a shell window-name escape.
+    created = create_terminal_instance(
+        name="bash",
+        session_key="main",
+        spec=TerminalEnvSpec(
+            command="sh",
+            args=[
+                "-c",
+                "printf 'SEEDED-LINE\\n'; read -r line; "
+                "printf '\\033kWINDOW-NAME\\033\\\\after-name\\n'; cat",
+            ],
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=str(tmp_path),
+                sandbox=OSEnvSandboxSpec(type="none"),
+            ),
+        ),
     )
-    await asyncio.sleep(0.3)  # let the printf render before we attach
+    instance = created.instance
+    instance.complete_writer_observation = True
+    task: asyncio.Task[None] | None = None
+    try:
+        await instance.launch(cwd=created.cwd)
+        sock, target = instance.socket_path, instance.tmux_target
+        await asyncio.sleep(0.3)  # let the printf render before we attach
 
-    ws = _FakeWebSocket(
-        inbound=[
-            {"type": "websocket.receive", "text": '{"type":"resize","cols":100,"rows":30}'},
-            {"type": "websocket.receive", "bytes": b"typed-input\r"},
-        ]
-    )
+        ws = _FakeWebSocket(
+            inbound=[
+                {"type": "websocket.receive", "text": '{"type":"resize","cols":100,"rows":30}'},
+                {"type": "websocket.receive", "bytes": b"typed-input\r"},
+            ]
+        )
+        bind_terminal_writer(ws.scope, writer)
+        evidence = instance.writer_evidence
 
-    async def _run() -> None:
-        await bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=False
+        async def _run() -> None:
+            await bridge_tmux_control_to_websocket(
+                ws,
+                socket_path=str(sock),
+                tmux_target=target,
+                read_only=False,
+                writer_evidence=evidence,
+            )
+
+        task = asyncio.create_task(_run())
+        await poll_until_async(lambda: b"after-name" in b"".join(ws.sent), timeout_s=10)
+
+        joined = b"".join(ws.sent)
+        assert b"SEEDED-LINE" in joined, "seed-on-attach did not paint pre-attach screen"
+        assert b"typed-input" in joined, "send-keys input was not echoed via %output"
+        assert b"WINDOW-NAME" not in joined, "the pane's window name reached the browser as text"
+        snapshot = evidence.snapshot(evidence.incarnation_id)
+        assert snapshot is not None and snapshot.writer == writer and snapshot.revision == 1
+
+        # The seed frame must not carry bare-LF row separators: capture-pane -p
+        # joins rows with a lone \n, which would staircase the whole screen to the
+        # right in xterm. The bridge rewrites them to CRLF and prepends home+clear.
+        seed_frame = ws.sent[0]
+        assert seed_frame.startswith(b"\x1b[H\x1b[2J"), "seed did not start with home+clear"
+        assert b"\n" not in seed_frame.replace(b"\r\n", b""), (
+            "seed frame contains a bare LF — rows will staircase in xterm"
         )
 
-    task = asyncio.create_task(_run())
-    # The reply follows the seed, the resize, and the echoed input.
-    await poll_until_async(lambda: b"after-name" in b"".join(ws.sent), timeout_s=10)
+        # Agent input retains typing but permanently taints the observed process.
+        assert await instance.send(text="programmatic-input") == {"status": "sent"}
+        after_send = evidence.snapshot(evidence.incarnation_id)
+        assert after_send is not None and after_send.writer == TerminalWriter()
+        assert after_send.revision > snapshot.revision
+        evidence.record(writer)
+        still_unknown = evidence.snapshot(evidence.incarnation_id)
+        assert still_unknown is not None and still_unknown.writer == TerminalWriter()
 
-    joined = b"".join(ws.sent)
-    assert b"SEEDED-LINE" in joined, "seed-on-attach did not paint pre-attach screen"
-    assert b"typed-input" in joined, "send-keys input was not echoed via %output"
-    assert b"WINDOW-NAME" not in joined, "the pane's window name reached the browser as text"
-
-    # The seed frame must not carry bare-LF row separators: capture-pane -p
-    # joins rows with a lone \n, which would staircase the whole screen to the
-    # right in xterm. The bridge rewrites them to CRLF and prepends home+clear.
-    seed_frame = ws.sent[0]
-    assert seed_frame.startswith(b"\x1b[H\x1b[2J"), "seed did not start with home+clear"
-    assert b"\n" not in seed_frame.replace(b"\r\n", b""), (
-        "seed frame contains a bare LF — rows will staircase in xterm"
-    )
-
-    # Kill the server → the control client's stdout closes → bridge exits.
-    await _kill_and_join(sock, task)
+    finally:
+        if task is not None:
+            await _kill_and_join(instance.socket_path, task)
+        await instance.close()
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
@@ -1088,13 +1212,17 @@ async def test_control_bridge_read_only_drops_input() -> None:
     await asyncio.sleep(0.2)
 
     ws = _FakeWebSocket(inbound=[{"type": "websocket.receive", "bytes": b"should-not-appear\r"}])
+    evidence = TerminalWriterEvidence("process-1", complete_observation=True)
+    bind_terminal_writer(ws.scope, TerminalWriter(user_id="viewer"))
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
-            ws, socket_path=str(sock), tmux_target=target, read_only=True
+            ws, socket_path=str(sock), tmux_target=target, read_only=True, writer_evidence=evidence
         )
     )
     await asyncio.sleep(0.8)
     assert b"should-not-appear" not in b"".join(ws.sent)
+    snapshot = evidence.snapshot("process-1")
+    assert snapshot is not None and snapshot.writer == TerminalWriter() and snapshot.revision == 0
 
     tmux = shutil.which("tmux")
     assert tmux

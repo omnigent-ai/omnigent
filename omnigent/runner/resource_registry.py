@@ -1262,6 +1262,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        complete_writer_observation: bool = False,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1282,6 +1283,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            complete_writer_observation=complete_writer_observation,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1296,6 +1298,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        complete_writer_observation: bool = False,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1304,11 +1307,11 @@ class SessionResourceRegistry:
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
         spec = replace(spec, env={**spec.env, **self.client_surface_env(session_id)})
-        program_status_args = (
-            {"program_status_app": "claude-code"}
+        program_status_app = (
+            "claude-code"
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)
-            else {}
+            else None
         )
         try:
             instance = await self._terminal_registry.launch(
@@ -1319,7 +1322,8 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
-                **program_status_args,
+                complete_writer_observation=complete_writer_observation,
+                program_status_app=program_status_app,
             )
         except TerminalExitedDuringLaunch as exc:
             await self._finalize_terminal_exit(

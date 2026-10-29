@@ -20,6 +20,7 @@ import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -45,6 +46,12 @@ from omnigent.server.auth import (
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.writer import (
+    TERMINAL_WRITER_QUERY,
+    TerminalWriter,
+    TerminalWriterEvidence,
+    terminal_writer_from_scope,
+)
 from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
 from tests.runner.helpers import make_test_terminal_instance
 
@@ -377,8 +384,20 @@ async def test_attach_terminal_rejects_unauthorized_user_before_runner_proxy() -
     assert factory.calls == []
 
 
-async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() -> None:
-    """Multi-user WebSocket attach requires an authenticated identity."""
+@pytest.mark.parametrize(
+    ("local_single_user", "claimed_actor"),
+    [
+        (False, None),
+        (False, "local"),
+        (True, "local"),
+        (False, "__public__"),
+        (True, "__public__"),
+    ],
+)
+async def test_attach_terminal_rejects_missing_identity_before_runner_proxy(
+    local_single_user: bool, claimed_actor: str | None
+) -> None:
+    """Missing multi-user identity and claimed reserved names cannot authenticate."""
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
     perm_store = _StubPermissionStore()
@@ -386,7 +405,9 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     app = FastAPI()
     app.include_router(
         create_terminal_attach_router(
-            auth_provider=UnifiedAuthProvider(source="header"),
+            auth_provider=UnifiedAuthProvider(
+                source="header", local_single_user=local_single_user
+            ),
             permission_store=perm_store,  # type: ignore[arg-type]
             conversation_store=conv_store,  # type: ignore[arg-type]
         ),
@@ -398,6 +419,7 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
+            headers={"X-Forwarded-Email": claimed_actor} if claimed_actor is not None else {},
         ):
             pass
 
@@ -405,18 +427,58 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     assert factory.calls == []
 
 
+@pytest.mark.parametrize(
+    ("actor", "auth_source"),
+    [
+        ("alice@example.com", "header"),
+        ("admin@example.com", "header"),
+        ("alice@example.com", "accounts"),
+        ("admin@example.com", "accounts"),
+        ("local", "local_single_user"),
+    ],
+)
+@pytest.mark.parametrize("runner_token", [False, True], ids=["human", "runner"])
 async def test_attach_terminal_allows_owner_for_interactive_proxy(
-    debug_log_rows: list[dict[str, Any]],
+    actor: str, auth_source: str, runner_token: bool, debug_log_rows: list[dict[str, Any]]
 ) -> None:
-    """The session owner may open an interactive (write) terminal attach."""
+    """Capture the provider's writer, including admins and explicit local policy."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.server.accounts_config import AccountsConfig
+    from omnigent.server.oidc import mint_session_token
+
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
     perm_store = _StubPermissionStore()
     perm_store.add_grant("alice@example.com", "conv_alice", LEVEL_OWNER)
+    perm_store._admins.add("admin@example.com")
+    generation = "generation-1" if auth_source == "accounts" else None
+    provider = UnifiedAuthProvider(source="header", local_single_user=False)
+    headers = {"X-Forwarded-Email": actor}
+    if auth_source == "local_single_user":
+        provider = UnifiedAuthProvider(source="header", local_single_user=True)
+        headers = {}
+        perm_store.add_grant(actor, "conv_alice", LEVEL_OWNER)
+    if auth_source == "accounts":
+        config = AccountsConfig(
+            cookie_secret=b"terminal-writer-test-secret-123456",
+            base_url="http://test",
+            session_ttl_hours=8,
+            init_admin_password=None,
+            invite_ttl_seconds=3600,
+            magic_ttl_seconds=600,
+        )
+        provider = UnifiedAuthProvider(source="accounts", accounts_config=config)
+        provider.set_account_check(lambda user, value: user == actor and value == generation)
+        token = mint_session_token(
+            actor, config.cookie_secret, 60, "accounts", account_generation=generation
+        )
+        headers = {"Cookie": f"{config.session_cookie_name}={token}"}
+    if runner_token:
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = "runner-binding-token"
     app = FastAPI()
     app.include_router(
         create_terminal_attach_router(
-            auth_provider=UnifiedAuthProvider(source="header"),
+            auth_provider=provider,
             permission_store=perm_store,  # type: ignore[arg-type]
             conversation_store=conv_store,  # type: ignore[arg-type]
         ),
@@ -427,18 +489,27 @@ async def test_attach_terminal_allows_owner_for_interactive_proxy(
     set_runner_ws_factory(factory)
 
     with TestClient(app).websocket_connect(
-        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
-        headers={"X-Forwarded-Email": "alice@example.com"},
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?"
+        + urlencode(
+            {TERMINAL_WRITER_QUERY: TerminalWriter(user_id="forged-owner").model_dump_json()}
+        ),
+        headers=headers,
     ) as ws:
         ws.send_bytes(b"whoami\n")
         with pytest.raises(WebSocketDisconnect):
             ws.receive_bytes()
 
-    assert factory.calls == [
-        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=false"
-    ]
+    [path] = factory.calls
+    query = parse_qs(urlsplit(path).query)
+    assert query["read_only"] == ["false"]
+    expected = (
+        TerminalWriter()
+        if runner_token
+        else TerminalWriter(user_id=actor, account_generation=generation)
+    )
+    assert TerminalWriter.model_validate_json(query[TERMINAL_WRITER_QUERY][0]) == expected
     assert b"whoami\n" in conn.received
-    assert _connected_attach_user_ids(debug_log_rows) == ["alice@example.com"]
+    assert _connected_attach_user_ids(debug_log_rows) == [actor]
 
 
 async def test_attach_terminal_attributes_logs_with_permissions_disabled(
@@ -707,10 +778,11 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The local fallback always attaches through tmux control mode."""
+    instance = _make_running_instance("bash", "s1", tmp_path)
     _seed_registry(
         server_registry,
         "conv_local_attach",
-        [_make_running_instance("bash", "s1", tmp_path)],
+        [instance],
     )
     calls: list[tuple[str, str, bool]] = []
 
@@ -720,8 +792,10 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         socket_path: str,
         tmux_target: str,
         read_only: bool,
+        writer_evidence: TerminalWriterEvidence,
     ) -> None:
-        del websocket
+        assert terminal_writer_from_scope(websocket.scope) == TerminalWriter()
+        assert writer_evidence is instance.writer_evidence
         calls.append((socket_path, tmux_target, read_only))
 
     monkeypatch.setattr(

@@ -21,6 +21,8 @@ reattach when the session moves to another host.
   agent terminal attach to the new host's terminal, not the old one.
 - `direct-attach`: when the runner is on the same machine the terminal connects
   directly, and falls back to the relay when the direct route is unreachable.
+  Host-managed Codex terminals that track requester identity always use the
+  authenticated relay, including the default local CLI attach.
 - `tmux-outage`: terminals stay usable through temporary tmux health-check
   failures and still notice a real exit afterwards.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
@@ -162,6 +164,24 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 
 ## Gotchas
+
+- Preserving terminal typing does not prove orchestration requester identity.
+  Repeat the owner/editor/fresh-owner journeys from [Session orchestration](./session-orchestration.md)
+  through the agent terminal, direct browser attachment and local CLI when
+  those paths change. A successful web Chat run does not cover typed input;
+  unknown requester work must remain unable to delegate. The real process scenario
+  `tests/e2e/test_private_session_orchestration.py` exercises authenticated terminal
+  send/create on pinned Codex, followed by Chat collaborator refusal and fresh-owner
+  recovery. Public Codex CLI typed delegation also has isolated process evidence
+  with a preconnected host and local single-user auth; follow the separate manual
+  recipe in Session orchestration. First-time onboarding, multi-user CLI auth and
+  other native terminals remain coverage gaps. The public Codex CLI uses
+  host-managed preparation; the legacy
+  internal standalone launcher is not a supported delegation path.
+- Terminal writer identity is retained for one process incarnation. Read-only
+  viewers and resize frames cannot authorize input. Unknown/programmatic input
+  or multiple identities restrict terminal delegation until restart; typing stays
+  usable and reconnect does not erase this restriction.
 
 - The terminal strip and the agent terminal behind the Chat/Terminal switcher
   are different surfaces. A reattach or reconnect fix must be checked on both.

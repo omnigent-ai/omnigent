@@ -146,6 +146,9 @@ def _load_harness_app(harness: str, module_path: str, conversation_id: str) -> F
         parent process surfaces the error immediately rather than
         waiting for a connection failure.
     """
+    # Consume before module import or app construction can launch provider/tool
+    # children. This prevents env inheritance, not hostile same-UID inspection.
+    auth_token = os.environ.pop("OMNIGENT_HARNESS_AUTH_TOKEN", None)
     try:
         module = importlib.import_module(module_path)
     except ImportError as exc:
@@ -171,14 +174,8 @@ def _load_harness_app(harness: str, module_path: str, conversation_id: str) -> F
     # state containers (per §Harness in-memory state) key off this.
     app.state.conversation_id = conversation_id
     app.state.harness = harness
-    # S1 (security): the per-spawn bearer token the parent (process_manager)
-    # presents on every ``/v1`` request, delivered via the private spawn env
-    # (``OMNIGENT_HARNESS_AUTH_TOKEN``); the scaffold's auth check compares
-    # against it. Set only on Windows (where the IPC is a loopback-TCP listener);
-    # ``None`` on POSIX (uid-isolated UDS) and when the app is built outside the
-    # runner (e.g. unit tests calling create_app() directly), which both leave
-    # the gate inert.
-    app.state.harness_auth_token = os.environ.get("OMNIGENT_HARNESS_AUTH_TOKEN")
+    # Keep the control credential in app state, never in child environments.
+    app.state.harness_auth_token = auth_token
     return app
 
 

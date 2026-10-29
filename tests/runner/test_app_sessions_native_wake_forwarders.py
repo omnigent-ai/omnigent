@@ -1056,6 +1056,7 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """Return a terminal resource view for the codex TUI."""
             del terminal_name, session_key, resource_role
@@ -1569,6 +1570,7 @@ async def test_auto_create_codex_terminal_retries_resume_until_rollout_is_found(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """Record the launch argv and return a terminal resource view."""
             del terminal_name, session_key, resource_role, parent_os_env
@@ -1819,6 +1821,7 @@ async def test_auto_create_codex_terminal_unreadable_thread_starts_fresh(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            complete_writer_observation: bool = False,
         ) -> SessionResourceView:
             """Record the launch argv and return a terminal resource view."""
             del terminal_name, session_key, resource_role, parent_os_env

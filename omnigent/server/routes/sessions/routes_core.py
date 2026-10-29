@@ -887,6 +887,16 @@ def register_core_routes(
         return await create_session(request)
 
     @router.post(
+        "/requester/sessions",
+        status_code=201,
+        response_model=None,
+        include_in_schema=False,
+        dependencies=[
+            Depends(require_json_or_multipart_content_type),
+            Depends(require_trusted_origin),
+        ],
+    )
+    @router.post(
         "/sessions",
         status_code=201,
         response_model=None,
@@ -907,6 +917,9 @@ def register_core_routes(
     ) -> SessionResponse | CreatedSessionResponse:
         """
         Create a session.
+
+        The internal ``/requester/sessions`` alias guarantees requester
+        propagation. Runners must not fall back when an older server lacks it.
 
         ``application/json`` preserves the existing contract: bind to
         an already-registered agent by ``agent_id`` and return the full
@@ -1058,6 +1071,36 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        from omnigent.db.account_authority import account_generation
+        from omnigent.runtime.requester import REQUESTER_HEADER, InputRequester
+        from omnigent.server.requester import tool_requester
+
+        if any(item.requester is not None for item in body.initial_items):
+            raise OmnigentError("Initial requester is server-owned", code=ErrorCode.FORBIDDEN)
+        # Runner credentials identify the transport, not the initiating person.
+        requester_id = None if RUNNER_TUNNEL_TOKEN_HEADER in request.headers else user_id
+        input_requester = InputRequester(
+            user_id=requester_id,
+            account_generation=account_generation(requester_id) if requester_id else None,
+        )
+        if REQUESTER_HEADER in request.headers:
+            requester_source = source
+            if requester_source is None and body.parent_session_id:
+                requester_source = await asyncio.to_thread(
+                    conversation_store.get_conversation, body.parent_session_id
+                )
+            if requester_source is None:
+                raise OmnigentError("Requester source is unavailable", code=ErrorCode.FORBIDDEN)
+            supplied_requester = tool_requester(request, requester_source)
+            assert supplied_requester is not None
+            input_requester = supplied_requester.origin
+        body.initial_items = [
+            item.model_copy(update={"requester": input_requester}) for item in body.initial_items
+        ]
+        if body.initial_input is not None:
+            body.initial_input = body.initial_input.model_copy(
+                update={"requester": input_requester}
+            )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,

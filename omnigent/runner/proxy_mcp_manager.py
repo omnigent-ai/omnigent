@@ -41,6 +41,7 @@ from omnigent.runner.mcp_execution_registry import (
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
+from omnigent.runtime.requester import requester_headers
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -471,7 +472,10 @@ class ProxyMcpManager:
                 resp = await self._omnigent_client.post(
                     url,
                     json=payload,
-                    headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},
+                    headers={
+                        **({"X-Omnigent-Session-Id": self._session_id} if managed else {}),
+                        **requester_headers(),
+                    },
                     # Short connect timeout still fails fast on an unreachable
                     # server; the read timeout covers ordinary proxy request
                     # hangs. Sub-agent dispatch returns an async handle

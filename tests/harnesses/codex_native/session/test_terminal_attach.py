@@ -244,9 +244,11 @@ async def test_attach_retains_preload_subscription_until_cleanup(
     assert client.closed
 
 
+@pytest.mark.parametrize("authenticated_attach", [False, True])
 def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    authenticated_attach: bool,
 ) -> None:
     """
     A local runner tmux socket bypasses the WebSocket terminal bridge.
@@ -262,6 +264,7 @@ def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
     socket_path = tmp_path / "tmux.sock"
     socket_path.touch()
     attached: list[tuple[Path, str]] = []
+    relayed = []
 
     async def fake_attach_direct_tmux(path: Path, target: str) -> None:
         """
@@ -273,13 +276,14 @@ def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
         """
         attached.append((path, target))
 
-    async def fail_attach_with_reconnect(**_kwargs: object) -> None:
+    async def fail_attach_with_reconnect(**kwargs: object) -> None:
         """
         Fail if the WebSocket bridge path is used.
 
         :returns: None.
         """
-        raise AssertionError("WebSocket attach path should not be used")
+        assert authenticated_attach
+        relayed.append(kwargs)
 
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.main.shutil.which", lambda _name: "/usr/bin/tmux"
@@ -302,12 +306,21 @@ def test_attach_with_forwarder_uses_direct_tmux_when_socket_is_local(
                 app_server=None,
                 event_client=None,
                 reattached=True,
+                requires_authenticated_attach=authenticated_attach,
             ),
             prompt=None,
         )
     )
 
-    assert attached == [(socket_path, "main")]
+    if authenticated_attach:
+        assert attached == []
+        assert len(relayed) == 1
+        assert relayed[0]["attach_url"].endswith(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_codex_main/attach"
+        )
+    else:
+        assert attached == [(socket_path, "main")]
+        assert relayed == []
 
 
 def test_attach_with_forwarder_attaches_before_waiting_for_fresh_thread(

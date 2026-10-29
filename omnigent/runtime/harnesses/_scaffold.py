@@ -54,6 +54,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.errors import ErrorCode, HarnessTransportClosedError, OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.policies.types import FAIL_CLOSED_PHASES
+from omnigent.runtime.requester import (
+    REQUESTER_FIELD,
+    ExecutionRequester,
+    InputRequester,
+    ToolRequester,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CompletedEvent,
@@ -221,6 +227,34 @@ class PolicyVerdictPayload:
 # validation in one place.
 
 
+class HarnessResponseRequest(CreateResponseRequest):
+    """Internal request decoded only on the authenticated runner control channel."""
+
+    requester: InputRequester = Field(default_factory=InputRequester, alias=REQUESTER_FIELD)
+
+
+class NativeRequesterQuery(BaseModel):
+    """Provider locator resolved by the live executor over authenticated control IPC."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    codex_execution: dict[str, str]
+
+
+class NativeInputRegistration(BaseModel):
+    """Terminal input accepted only over the authenticated harness control channel."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    requester: InputRequester
+    thread_id: str = Field(min_length=1, max_length=256)
+    provider_url: str = Field(min_length=1, max_length=4096)
+    expected_turn_id: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class NativeInputRefusal(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    client_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class MessageEvent(BaseModel):
     """
     Downward ``message`` event — start a new turn or steer an in-flight one.
@@ -277,7 +311,7 @@ class MessageEvent(BaseModel):
     # :meth:`MessageEvent.to_create_request`.
     model_config = ConfigDict(extra="allow")
 
-    def to_create_request(self) -> CreateResponseRequest:
+    def to_create_request(self) -> HarnessResponseRequest:
         """
         Synthesize a :class:`CreateResponseRequest` from this event.
 
@@ -295,7 +329,7 @@ class MessageEvent(BaseModel):
         payload.pop("type", None)
         payload.pop("role", None)
         payload["input"] = payload.pop("content")
-        return CreateResponseRequest(**payload)
+        return HarnessResponseRequest(**payload)
 
 
 class InterruptEvent(BaseModel):
@@ -460,9 +494,11 @@ class TurnContext:
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
         session_id: str | None = None,
+        requester: InputRequester | None = None,
     ) -> None:
         self.session_id = session_id
         self.response_id = response_id
+        self.requester = ExecutionRequester(requester or InputRequester())
         self._event_queue = event_queue
         self.cancelled = cancelled
         # Layer 3 per-tool-dispatch state: ``call_id`` →
@@ -545,7 +581,15 @@ class TurnContext:
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
 
-    async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
+    async def dispatch_tool(
+        self,
+        call_id: str,
+        name: str,
+        arguments: str,
+        agent: str,
+        *,
+        requester: ToolRequester | None = None,
+    ) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
 
@@ -587,6 +631,7 @@ class TurnContext:
             "arguments": arguments,
             "call_id": call_id,
             "agent": agent,
+            REQUESTER_FIELD: (requester or self.requester.snapshot()).model_dump(),
         }
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         try:
@@ -1024,16 +1069,18 @@ class HarnessApp:
         """
         Authenticate a ``/v1`` request with the per-spawn bearer token (S1).
 
-        The harness control channel is a uid-isolated Unix socket on POSIX but a
-        loopback-TCP listener on Windows, where any local process can connect.
-        The ``/v1`` event endpoint starts turns, runs tools, and satisfies
-        approval / policy verdicts, so it must not be reachable by an
-        unauthenticated peer that merely learns the (non-secret)
-        ``conversation_id``. The runner stashes the expected token on
-        ``app.state.harness_auth_token``; the parent (process_manager) presents
-        it as ``Authorization: Bearer <token>``. Comparison is constant-time.
+        Production spawns require a token on both transports: Unix sockets on
+        POSIX and loopback TCP on Windows. UDS permissions restrict access by
+        other users, but same-UID tool processes can still connect. Control
+        requests start turns, satisfy approvals, and resolve requester authority,
+        so knowing the ``conversation_id`` must not grant access. The parent
+        (process_manager) mints a fresh token per spawn and presents it as
+        ``Authorization: Bearer <token>``. The runner removes it from the
+        environment before loading the harness and retains it on
+        ``app.state.harness_auth_token``. Comparison is constant-time. This does
+        not isolate hostile same-UID code with arbitrary process introspection.
 
-        Checked in the event handler rather than via middleware so the SSE
+        Checked in the control handlers rather than via middleware so the SSE
         ``StreamingResponse`` and lifespan teardown are untouched
         (``BaseHTTPMiddleware`` interferes with both). ``/health`` is never
         gated. When no token is configured — the app was built outside the
@@ -1144,7 +1191,71 @@ class HarnessApp:
             # heterogeneous return type.
             response_model=None,
         )
+        router.add_api_route(
+            "/sessions/{conversation_id}/native-requester",
+            self._native_requester,
+            methods=["POST"],
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/native-input",
+            self._native_input,
+            methods=["POST"],
+        )
+        router.add_api_route(
+            "/sessions/{conversation_id}/native-input/refused",
+            self._native_input_refused,
+            methods=["POST"],
+        )
         return router
+
+    def register_native_input(self, body: NativeInputRegistration) -> str:
+        raise RuntimeError("Native input registration is unavailable")
+
+    def refuse_native_input(self, client_id: str) -> None:
+        raise RuntimeError("Native input registration is unavailable")
+
+    async def _native_input(
+        self, conversation_id: str, body: NativeInputRegistration, request: Request
+    ) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        try:
+            return JSONResponse({"client_id": self.register_native_input(body)})
+        except (RuntimeError, ValueError):
+            return JSONResponse(
+                {"detail": "Native input registration unavailable"}, status_code=503
+            )
+
+    async def _native_input_refused(
+        self, conversation_id: str, body: NativeInputRefusal, request: Request
+    ) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        try:
+            self.refuse_native_input(body.client_id)
+        except (RuntimeError, ValueError):
+            return JSONResponse(
+                {"detail": "Native input registration unavailable"}, status_code=503
+            )
+        return Response(status_code=204)
+
+    async def native_tool_requester(self, execution: dict[str, str]) -> ToolRequester | None:
+        """Unrecognized executors cannot establish native requester authority."""
+        return None
+
+    async def _native_requester(
+        self, conversation_id: str, body: NativeRequesterQuery, request: Request
+    ) -> Response:
+        denied = self._check_auth(request)
+        if denied is not None:
+            return denied
+        self._check_conversation_id(request, conversation_id)
+        requester = await self.native_tool_requester(body.codex_execution)
+        return JSONResponse({"requester": requester.model_dump() if requester else None})
 
     def _check_conversation_id(self, request: Request, conversation_id: str) -> None:
         """
@@ -1421,6 +1532,9 @@ class HarnessApp:
                 event_queue=event_queue,
                 cancelled=cancelled,
                 session_id=session_id,
+                requester=request.requester
+                if isinstance(request, HarnessResponseRequest)
+                else None,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx

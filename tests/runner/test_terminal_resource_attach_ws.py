@@ -13,6 +13,7 @@ import contextlib
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 from fastapi import FastAPI
@@ -33,6 +34,12 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
 from omnigent.terminals import TerminalRegistry
+from omnigent.terminals.writer import (
+    TERMINAL_WRITER_QUERY,
+    TerminalWriter,
+    TerminalWriterEvidence,
+    terminal_writer_from_scope,
+)
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
@@ -65,6 +72,7 @@ def _seed_registry(
 def _patch_control_attach(
     monkeypatch: pytest.MonkeyPatch,
     on_attach: Callable[[str, str, bool], None],
+    expected_evidence: TerminalWriterEvidence | None = None,
 ) -> None:
     """Patch the control bridge at the runner route boundary."""
 
@@ -75,8 +83,12 @@ def _patch_control_attach(
         tmux_target: str,
         read_only: bool,
         on_client_interaction: object = None,
+        writer_evidence: TerminalWriterEvidence | None = None,
     ) -> None:
         del websocket, on_client_interaction
+        assert isinstance(writer_evidence, TerminalWriterEvidence)
+        if expected_evidence is not None:
+            assert writer_evidence is expected_evidence
         on_attach(socket_path, tmux_target, read_only)
         raise RuntimeError("bridge stopped")
 
@@ -99,7 +111,7 @@ def test_runner_resource_attach_ignores_obsolete_transport_query(
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
     calls: list[tuple[str, str, bool]] = []
-    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
+    _patch_control_attach(monkeypatch, lambda *args: calls.append(args), instance.writer_evidence)
 
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
@@ -571,6 +583,7 @@ def _make_direct_app(
         terminal_id: str,
         read_only: bool = False,
     ) -> None:
+        assert terminal_writer_from_scope(websocket.scope) == TerminalWriter()
         events.append((session_id, terminal_id, read_only))
         await websocket.accept()  # type: ignore[attr-defined]
         await websocket.close()  # type: ignore[attr-defined]
@@ -660,18 +673,28 @@ def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -
     assert events == []
 
 
-def test_direct_attach_forwards_attach_params_to_handler() -> None:
+@pytest.mark.parametrize("read_only", [False, True])
+def test_direct_attach_forwards_attach_params_to_handler(read_only: bool) -> None:
     """The attach wrapper hands session/terminal/read-only through unchanged."""
     events: list[tuple[str, str, bool]] = []
     app = _make_direct_app(events)
     with contextlib.suppress(WebSocketDisconnect):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
-            "?token=sekret-token&read_only=true",
+            "?"
+            + urlencode(
+                {
+                    "token": "sekret-token",
+                    "read_only": str(read_only).lower(),
+                    TERMINAL_WRITER_QUERY: TerminalWriter(
+                        user_id="forged-owner"
+                    ).model_dump_json(),
+                }
+            ),
             headers={"origin": "https://app.example"},
         ):
             pass
-    assert events == [("conv1", "terminal_bash_s1", True)]
+    assert events == [("conv1", "terminal_bash_s1", read_only)]
 
 
 def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:

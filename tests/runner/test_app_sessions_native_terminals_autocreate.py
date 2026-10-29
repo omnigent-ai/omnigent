@@ -3556,12 +3556,16 @@ class _PublishedEvent:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "producer", ["native", "reused", "generic_winner", "wrong_command", "wrong_args", "failed"]
+)
 async def test_auto_create_claude_terminal_emits_resource_created_event(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    producer: str,
 ) -> None:
     """
-    Host-spawned terminal launch publishes a live ``session.resource.created``.
+    Native launch publishes the resource and attests only its own new process.
 
     The web UI sources its terminal list purely from SSE
     ``session.resource.created`` events, so the auto-create path must
@@ -3570,6 +3574,23 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
     stays gray until a refresh re-lists terminals via
     snapshot-on-connect.
     """
+    from contextvars import Context
+    from unittest.mock import AsyncMock
+
+    from omnigent.inner import terminal as terminal_module
+
+    launched: list[TerminalInstance] = []
+    spawn = AsyncMock(
+        return_value=SimpleNamespace(
+            returncode=1 if producer == "failed" else 0,
+            communicate=AsyncMock(return_value=(b"", b"")),
+        )
+    )
+    monkeypatch.setattr(
+        terminal_module,
+        "asyncio",
+        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+    )
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
@@ -3596,7 +3617,20 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
             parent_os_env: Any = None,
         ) -> SessionResourceView:
             """Return the terminal resource view the runner would launch."""
-            del spec
+            terminal = make_test_terminal_instance(
+                terminal_name, session_key, tmp_path, running=producer == "reused"
+            )
+            terminal.command = spec.command if producer != "wrong_command" else "generic"
+            terminal.args = list(spec.args)
+            if producer == "wrong_args":
+                terminal.args.append("--different-launch")
+            assert terminal.native_harness is None
+            launched.append(terminal)
+            if producer == "generic_winner":
+                # A concurrent generic launch may win the registry slot.
+                await asyncio.create_task(terminal.launch(cwd=tmp_path), context=Context())
+            else:
+                await terminal.launch(cwd=tmp_path)
             return SessionResourceView(
                 id="terminal_claude_main",
                 type="terminal",
@@ -3614,12 +3648,28 @@ async def test_auto_create_claude_terminal_emits_resource_created_event(
     def _capture(session_id: str, event: dict[str, Any]) -> None:
         published.append(_PublishedEvent(session_id=session_id, event=event))
 
-    await _auto_create_claude_terminal(
-        "c74c7a36c4736e2153ed6046d16bcf76",
-        _ViewResourceRegistry(),
-        _capture,
-        server_client=NullServerClient(),  # type: ignore[arg-type]
-    )
+    with contextlib.ExitStack() as stack:
+        if producer == "failed":
+            stack.enter_context(pytest.raises(RuntimeError, match="tmux launch failed"))
+        await _auto_create_claude_terminal(
+            "c74c7a36c4736e2153ed6046d16bcf76",
+            _ViewResourceRegistry(),
+            _capture,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+    terminal = launched[0]
+    assert terminal.native_harness == ("claude-native" if producer == "native" else None)
+    assert terminal_module.current_native_terminal_launch.get() is None
+    if producer == "failed":
+        assert not published
+        return
+    assert spawn.await_count == (0 if producer == "reused" else 1)
+    if producer == "native":
+        await terminal.launch(cwd=tmp_path)
+        assert terminal.native_harness == "claude-native"
+        terminal.running = False
+        await terminal.launch(cwd=tmp_path)
+        assert terminal.native_harness is None, "a generic relaunch must drop the native stamp"
 
     # Exactly one session.resource.created for the auto-created terminal.
     # 0 means the live publish was dropped (the bug: the toggle would stay
@@ -5653,6 +5703,7 @@ class _RecordingCodexRegistry:
         spec: Any,
         resource_role: str | None = None,
         parent_os_env: Any = None,
+        complete_writer_observation: bool = False,
     ) -> SessionResourceView:
         """Record the spec and return a terminal resource view."""
         del terminal_name, session_key, resource_role, parent_os_env

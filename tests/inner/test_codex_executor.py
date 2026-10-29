@@ -2907,35 +2907,156 @@ async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     assert session.active_turn_id is None
 
 
-async def test_run_turn_still_adopts_non_terminal_first_event() -> None:
-    """Non-terminal first events (deltas, tool calls) must still be
-    adopted; the narrowing only refuses terminal final-answer items.
-    """
+@pytest.mark.parametrize("rewrite_display", [False, True])
+@pytest.mark.parametrize(
+    ("callback_turn", "callback_thread", "before_display", "after_display"),
+    [
+        ("turn-current", "thread-1", "bound", "bound"),
+        ("turn-current", None, "bound", "bound"),
+        (None, "thread-1", "rejected", "rejected"),
+        ("", "thread-1", "rejected", "rejected"),
+        ("turn-previous", "thread-1", "rejected", "rejected"),
+        ("turn-rewritten", "thread-1", "unknown", "rejected"),
+        ("turn-display", "thread-1", "unknown", "unknown"),
+        ("turn-current", "other-thread", "rejected", "rejected"),
+        ("turn-rewritten", "other-thread", "rejected", "rejected"),
+    ],
+)
+async def test_dynamic_tool_requester_requires_original_turn_reply(
+    callback_turn: str | None,
+    callback_thread: str | None,
+    before_display: str,
+    after_display: str,
+    rewrite_display: bool,
+) -> None:
+    from omnigent.runtime.requester import ExecutionRequester, InputRequester
+
+    requester = ExecutionRequester(
+        InputRequester(user_id="owner", account_generation="generation")
+    ).snapshot()
+    expected = after_display if rewrite_display else before_display
+    dispatch = AsyncMock(return_value={"ok": True})
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=dispatch
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._reader_completed_turn = "turn-previous"
+    replies = AsyncMock()
+    session._send_response = replies
+
+    async def start_turn(method, params):
+        assert method == "turn/start"
+        # The reader may already see this turn's completion before callbacks drain.
+        session._reader_completed_turn = "turn-current"
+        callback = {
+            "callId": "producer-call",
+            "tool": "sys_session_message",
+            "arguments": {"message": "hello"},
+            **({"turnId": callback_turn} if callback_turn is not None else {}),
+            **({"threadId": callback_thread} if callback_thread is not None else {}),
+        }
+        # Deliver after turn/start returns, before any observed turn ID can be adopted.
+        loop = asyncio.get_running_loop()
+        if rewrite_display:
+            loop.call_soon(
+                session._events.put_nowait,
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"turnId": "turn-display", "itemId": "display", "delta": "text"},
+                },
+            )
+        completed_turn = "turn-display" if rewrite_display else "turn-current"
+        if expected == "unknown":
+            completed_turn = callback_turn
+        for event in (
+            {"id": 7, "method": "item/tool/call", "params": callback},
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": completed_turn}},
+            },
+        ):
+            loop.call_soon(session._events.put_nowait, event)
+        return {"result": {"turn": {"id": "turn-current"}}}
+
+    session._request = start_turn
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            model="test-model",
+            cwd=".",
+            sandbox="workspace-write",
+            requester=requester,
+        )
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    if expected != "rejected":
+        dispatch.assert_awaited_once()
+        assert dispatch.call_args.args == ("sys_session_message", {"message": "hello"})
+        assert dispatch.call_args.kwargs["call_id"] == "producer-call"
+        bound = dispatch.call_args.kwargs["requester"]
+        assert bound.execution_id == requester.execution_id
+        if expected == "bound":
+            assert bound == requester
+        else:
+            assert bound.origin.user_id is None
+            assert bound.origin.account_generation is None
+            assert bound.delegation_policy == "requester"
+        assert replies.call_args.args[1]["success"] is True
+    else:
+        dispatch.assert_not_awaited()
+        result = replies.call_args.args[1]
+        assert result["success"] is False
+        assert (
+            json.loads(result["contentItems"][0]["text"])["code"] == "runner_turn_context_desync"
+        )
+        assert not any(isinstance(event, ToolCallRequest) for event in events)
+
+
+@pytest.mark.parametrize("tool_first", [False, True])
+async def test_run_turn_still_adopts_non_terminal_first_event(tool_first: bool) -> None:
+    """Rewritten events keep ordinary tools working without borrowing requester authority."""
+    from omnigent.runtime.requester import ExecutionRequester, InputRequester
+
+    requester = ExecutionRequester(
+        InputRequester(user_id="owner", account_generation="generation")
+    ).snapshot()
+    dispatch = AsyncMock(return_value={"output": "/tmp/workspace"})
     session = _CodexAppServerSession(
         codex_path="/bin/echo",
         cwd="/tmp/workspace",
         env={},
-        tool_executor=None,
+        tool_executor=dispatch,
     )
     session.start = AsyncMock()
     session._proc = _FakeProcess()
     session.thread_id = "thread-1"
     session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-2"}}})
+    session._send_response = AsyncMock()
 
     async def _inject_events() -> None:
         await asyncio.sleep(0.01)
-        # First event: a non-terminal delta carrying a different id.
-        # Adopt should kick in (the original Codex quirk).
-        session._events.put_nowait(
-            {
-                "method": "item/agentMessage/delta",
-                "params": {
-                    "turnId": "turn-2-rewritten",
-                    "itemId": "msg-1",
-                    "delta": "Hello",
-                },
-            }
-        )
+        delta = {
+            "method": "item/agentMessage/delta",
+            "params": {"turnId": "turn-2-rewritten", "itemId": "msg-1", "delta": "Hello"},
+        }
+        tool_call = {
+            "id": 7,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-2-rewritten",
+                "callId": "producer-call",
+                "tool": "sys_os_shell",
+                "arguments": {"command": "pwd"},
+            },
+        }
+        for event in (tool_call, delta) if tool_first else (delta, tool_call):
+            session._events.put_nowait(event)
         # Final answer with the adopted id, terminating the turn.
         session._events.put_nowait(
             {
@@ -2962,6 +3083,7 @@ async def test_run_turn_still_adopts_non_terminal_first_event() -> None:
             model="gpt-5.4-mini",
             cwd=".",
             sandbox="workspace-write",
+            requester=requester,
         )
     ]
     await inject_task
@@ -2970,6 +3092,20 @@ async def test_run_turn_still_adopts_non_terminal_first_event() -> None:
     assert len(turn_completes) == 1
     # The adopted id's deltas + final answer flow through normally.
     assert turn_completes[0].response == "Hello"
+    dispatch.assert_awaited_once()
+    assert dispatch.call_args.args == ("sys_os_shell", {"command": "pwd"})
+    assert dispatch.call_args.kwargs["call_id"] == "producer-call"
+    bound = dispatch.call_args.kwargs["requester"]
+    assert bound.execution_id == requester.execution_id
+    assert bound.origin.user_id is None
+    assert bound.origin.account_generation is None
+    assert bound.delegation_policy == "requester"
+    assert requester.origin.user_id == "owner"
+    assert session._send_response.call_args.args[1]["success"] is True
+    completion = next(event for event in events if isinstance(event, ToolCallComplete))
+    assert completion.metadata == {"call_id": "producer-call"}
+    assert completion.status is ToolCallStatus.SUCCESS
+    assert completion.result == {"output": "/tmp/workspace"}
 
 
 def test_format_codex_error_params_extracts_provider_error_from_nested_error() -> None:

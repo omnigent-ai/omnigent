@@ -28,21 +28,25 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.native.owner_claim import current_pid_namespace, read_owner_claim, write_owner_claim
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
+    _HARNESS_AUTH_TOKEN_ENV,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
     NoLiveHarnessError,
@@ -774,6 +778,13 @@ async def test_get_client_respawns_when_socket_pathname_vanishes(
 
         # Control callers never trigger recovery and keep the live turn's client.
         assert await manager.get_client("conv_a", "any") is client
+        assert (
+            await manager.get_client("conv_a", _TEST_HARNESS_NAME, replace_existing=False)
+            is client
+        )
+        assert not client.is_closed
+        assert manager.has_active_turn("conv_a") is (response_id is not None)
+        assert hook_calls == []
         assert _pid_alive(original_pid)
 
         new_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
@@ -843,6 +854,11 @@ async def test_get_client_respawns_on_harness_change(
         pid_first = (await client_first.get("/pid")).json()["pid"]
         manager.mark_in_flight("conv_a", "resp_switch")
 
+        with pytest.raises(RuntimeError, match="cannot replace live harness"):
+            await manager.get_client("conv_a", "test2", replace_existing=False)
+        assert manager.has_active_turn("conv_a")
+        assert (await client_first.get("/pid")).json()["pid"] == pid_first
+
         # Same conversation, DIFFERENT harness → must respawn.
         client_second = await manager.get_client("conv_a", "test2")
         pid_second = (await client_second.get("/pid")).json()["pid"]
@@ -892,6 +908,15 @@ async def test_get_client_respawns_on_model_change(
         )
         pid_same = (await client_same.get("/pid")).json()["pid"]
         assert pid_same == pid_first
+
+        preserved = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-b"},
+            replace_existing=False,
+        )
+        assert preserved is client_first
+        assert (await preserved.get("/env/HARNESS_TEST_MODEL")).json()["value"] == "model-a"
 
         # Same conversation, DIFFERENT model → must respawn.
         client_second = await manager.get_client(
@@ -1684,6 +1709,7 @@ async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
 
 async def test_get_client_env_override_propagates_to_subprocess(
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``get_client(env=...)`` threads env vars into the spawned subprocess.
 
@@ -1693,16 +1719,26 @@ async def test_get_client_env_override_propagates_to_subprocess(
     Omnigent would have to mutate its own ``os.environ`` (which races
     across concurrent conversations with different specs).
     """
+    monkeypatch.setenv(_HARNESS_AUTH_TOKEN_ENV, "ambient-test-token")
     await manager.start()
     try:
         client = await manager.get_client(
             "conv_env",
             _TEST_HARNESS_NAME,
-            env={"HARNESS_TEST_CUSTOM": "marker_alpha"},
+            env={
+                "HARNESS_TEST_CUSTOM": "marker_alpha",
+                _HARNESS_AUTH_TOKEN_ENV: "override-test-token",
+            },
         )
         # Subprocess saw the override in its env.
         resp = await client.get("/env/HARNESS_TEST_CUSTOM")
         assert resp.json() == {"value": "marker_alpha"}
+        authorization = client.headers["Authorization"]
+        assert authorization.startswith("Bearer ")
+        assert authorization not in {"Bearer ambient-test-token", "Bearer override-test-token"}
+        resp = await client.get(f"/env/{_HARNESS_AUTH_TOKEN_ENV}")
+        assert resp.json() == {"value": None}
+        assert os.environ[_HARNESS_AUTH_TOKEN_ENV] == "ambient-test-token"
     finally:
         await manager.shutdown()
 
@@ -1766,11 +1802,53 @@ async def test_get_client_env_override_is_per_conversation(
         resp_b = await client_b.get("/env/HARNESS_TEST_CUSTOM")
         assert resp_a.json()["value"] == "alpha"
         assert resp_b.json()["value"] == "beta"
+        assert client_a.headers["Authorization"] != client_b.headers["Authorization"]
     finally:
         await manager.shutdown()
 
 
 # ── Runner subprocess cleanup ──────────────────────
+
+
+@pytest.mark.parametrize("token", [None, "test-control-token"])
+def test_runner_consumes_control_token_before_loading_harness(
+    monkeypatch: pytest.MonkeyPatch, token: str | None
+) -> None:
+    """Import/factory children inherit no control credential; app state retains it."""
+    from omnigent.runtime.harnesses import _runner
+
+    if token is None:
+        monkeypatch.delenv(_HARNESS_AUTH_TOKEN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_HARNESS_AUTH_TOKEN_ENV, token)
+    observed: list[str] = []
+
+    def check_child_environment(stage: str) -> None:
+        assert _HARNESS_AUTH_TOKEN_ENV not in os.environ
+        output = subprocess.check_output(
+            [
+                sys.executable,
+                "-c",
+                "import os; print('OMNIGENT_HARNESS_AUTH_TOKEN' in os.environ)",
+            ],
+            text=True,
+        )
+        assert output.strip() == "False"
+        observed.append(stage)
+
+    def create_app() -> FastAPI:
+        check_child_environment("factory")
+        return FastAPI()
+
+    def import_harness(module_path: str) -> SimpleNamespace:
+        assert module_path == _TEST_HARNESS_MODULE
+        check_child_environment("import")
+        return SimpleNamespace(create_app=create_app)
+
+    monkeypatch.setattr(_runner.importlib, "import_module", import_harness)
+    app = _runner._load_harness_app(_TEST_HARNESS_NAME, _TEST_HARNESS_MODULE, "conv_auth")
+    assert app.state.harness_auth_token == token
+    assert observed == ["import", "factory"]
 
 
 async def test_runner_subprocess_exits_on_sigterm(
@@ -2057,6 +2135,88 @@ async def _cancel_pending(*tasks: asyncio.Task[object] | None) -> None:
                 # as a dead statement (teardown only cares that the task settles).
                 _settled = await task
                 del _settled
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_validation_after_cold_spawn_reaps_only_unpublished_process(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+) -> None:
+    """Replacement while a real process binds cannot leave its bridge environment cached."""
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    task = None
+    ready, allow_bind = asyncio.Event(), asyncio.Event()
+    original_terminal = current_terminal = object()
+    validations = []
+    spawned = []
+
+    def validate(expected: object) -> None:
+        validations.append(expected)
+        if current_terminal is not expected:
+            raise failure("terminal replaced")
+
+    try:
+        other_client = await manager.get_client("other", _TEST_HARNESS_NAME)
+        other_entry = manager._entries["other"]
+        real_wait_for_bind = pm_mod._wait_for_bind
+
+        async def gated_bind(process, endpoint, harness, conversation_id):
+            await real_wait_for_bind(process, endpoint, harness, conversation_id)
+            spawned.append((process, endpoint))
+            ready.set()
+            await allow_bind.wait()
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", gated_bind)
+        task = asyncio.create_task(
+            manager.get_client(
+                "guarded",
+                _TEST_HARNESS_NAME,
+                env={"HARNESS_TEST_BRIDGE": "original"},
+                replace_existing=False,
+                validate=lambda: validate(original_terminal),
+            )
+        )
+        await asyncio.wait_for(ready.wait(), timeout=10)
+        assert validations == [original_terminal]
+        current_terminal = object()
+        allow_bind.set()
+        with pytest.raises(failure, match="terminal replaced"):
+            await task
+
+        [(process, endpoint)] = spawned
+        assert process.returncode is not None
+        assert not _pid_alive(process.pid)
+        assert "guarded" not in manager._entries
+        if endpoint.socket_path is not None:
+            assert not endpoint.socket_path.exists()
+        with pytest.raises(failure, match="terminal replaced"):
+            await manager.get_client(
+                "other",
+                _TEST_HARNESS_NAME,
+                replace_existing=False,
+                validate=lambda: validate(original_terminal),
+            )
+        assert manager._entries["other"] is other_entry
+        await _ping_health(other_client)
+
+        replacement = await manager.get_client(
+            "guarded",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_BRIDGE": "replacement"},
+            replace_existing=False,
+            validate=lambda: validate(current_terminal),
+        )
+        assert (await replacement.get("/env/HARNESS_TEST_BRIDGE")).json()["value"] == "replacement"
+        assert (await replacement.get("/pid")).json()["pid"] != process.pid
+        assert len(spawned) == 2
+        assert validations == [original_terminal] * 3 + [current_terminal] * 2
+    finally:
+        allow_bind.set()
+        await _cancel_pending(task)
+        await manager.shutdown()
 
 
 async def test_release_during_spawn_leaves_no_live_process(

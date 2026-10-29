@@ -25,6 +25,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
@@ -36,6 +37,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.terminals.writer import TerminalWriter, TerminalWriterEvidence
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 if TYPE_CHECKING:
@@ -79,6 +81,11 @@ from .terminal_lifecycle import (
 TerminalResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 logger = logging.getLogger(__name__)
+
+# Native launcher attestation: harness, executable and exact arguments; never spec metadata.
+current_native_terminal_launch: ContextVar[tuple[str, str, tuple[str, ...]] | None] = ContextVar(
+    "current_native_terminal_launch", default=None
+)
 
 _TMUX_CONFIG_PATH = os.devnull
 _TMUX_CONVERSATION_LINK_OPTION = "@omnigent-conversation-link"
@@ -1124,9 +1131,15 @@ class TerminalInstance:
     keep_alive_after_exit: bool = False
     running: bool = False
     launch_cwd: str | None = None
+    native_harness: str | None = field(default=None, init=False, repr=False)
     # Runtime-owned observation; never part of the portable terminal spec.
     program_status_app: str | None = None
     program_status: ProgramStatusReader | None = field(default=None, init=False, repr=False)
+    # Opt in only when every supported writer is routed through observed input.
+    complete_writer_observation: bool = False
+    writer_evidence: TerminalWriterEvidence = field(
+        default_factory=lambda: TerminalWriterEvidence(uuid.uuid4().hex), init=False, repr=False
+    )
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
     # spawn-time wrap (the ``none`` backend does nothing here). Cleaned
@@ -1624,17 +1637,30 @@ class TerminalInstance:
 
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
+        previous_evidence = self.writer_evidence
         try:
             await self._launch_impl(cwd=cwd)
         except BaseException:
             self._stop_network_brokers()
             raise
+        launch = current_native_terminal_launch.get()
+        if (
+            self.writer_evidence is not previous_evidence
+            and launch is not None
+            and self.command == launch[1]
+            and tuple(self.args) == launch[2]
+        ):
+            self.native_harness = launch[0]
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
         from omnigent.terminals import program_status
 
         if self.running:
             return
+        self.native_harness = None
+        self.writer_evidence = TerminalWriterEvidence(
+            uuid.uuid4().hex, complete_observation=self.complete_writer_observation
+        )
         self._last_exit_snapshot = None
         self._last_exit_status = None
         self._last_exit_signal = None
@@ -1818,6 +1844,8 @@ class TerminalInstance:
         if not self.running:
             return {"error": "Terminal is not running"}
 
+        if text or keys.split():
+            self.writer_evidence.record(TerminalWriter())
         try:
             if text:
                 for start in range(0, len(text), _SEND_KEYS_LITERAL_CHARS_PER_CALL):

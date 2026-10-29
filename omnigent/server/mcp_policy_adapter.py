@@ -125,5 +125,7 @@ class McpPolicyAdapter:
             actor=context.policy_actor,
             credential_user=context.credential_user,
             request=request,
+            # Registry calls always use this backend, even for names matching local tools.
+            # They cannot reach runner orchestration or inherit its requester authority.
             execute_tool=execute,
         )

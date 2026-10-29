@@ -45,6 +45,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
+from omnigent.terminals.writer import TerminalWriter
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -871,6 +872,7 @@ def build_native_controls(
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
+        instance.writer_evidence.record(TerminalWriter())
         try:
             offered = await asyncio.to_thread(
                 _inject_codex_permission_mode,
@@ -1863,6 +1865,7 @@ def build_native_controls(
         socket_path = str(instance.socket_path)
         target = instance.tmux_target
 
+        instance.writer_evidence.record(TerminalWriter())
         try:
             await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, command)
         except (RuntimeError, ValueError) as exc:

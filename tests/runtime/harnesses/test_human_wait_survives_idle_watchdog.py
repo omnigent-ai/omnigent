@@ -95,10 +95,11 @@ async def _stream_iter(response: httpx.Response) -> AsyncIterator[_ParsedSSEEven
             yield _ParsedSSEEvent(event=event_name, data=data_payload)
 
 
-def _make_side_client(socket_path: str) -> httpx.AsyncClient:
+def _make_side_client(socket_path: str, client: httpx.AsyncClient) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         transport=httpx.AsyncHTTPTransport(uds=socket_path),
         base_url="http://harness.local",
+        headers={"Authorization": client.headers["Authorization"]},
     )
 
 
@@ -275,7 +276,7 @@ async def test_heartbeat_resets_watchdog_while_elicitation_pending(
     """
     conv_id = "conv_hw_elicit_wd"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     events: list[_ParsedSSEEvent] = []
 
@@ -364,7 +365,7 @@ async def test_elicit_counter_brackets_the_pending_wait(
     """
     conv_id = "conv_hw_counter"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     events: list[_ParsedSSEEvent] = []
 

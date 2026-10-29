@@ -175,7 +175,14 @@ def test_handle_mcp_request_emits_progress_notifications(
     responses_emitted: list[dict] = []
 
     # Slow relay call – holds until released so the progress ticker has a chance to fire.
-    def _slow_relay(bridge_dir: Path, name: str, arguments: dict) -> dict:
+    def _slow_relay(
+        bridge_dir: Path,
+        name: str,
+        arguments: dict,
+        *,
+        codex_execution: object | None = None,
+    ) -> dict:
+        assert codex_execution is None
         call_started.set()
         release_call.wait(timeout=5.0)
         return {"content": [{"type": "text", "text": "done"}]}

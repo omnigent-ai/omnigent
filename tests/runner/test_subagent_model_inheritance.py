@@ -94,12 +94,12 @@ async def _dispatch_without_model(
             and request.url.path == f"/v1/sessions/{conv_id}/child_sessions"
         ):
             return httpx.Response(200, json={"data": []})
-        if request.method == "POST" and request.url.path == "/v1/sessions":
+        if request.method == "POST" and request.url.path == "/v1/requester/sessions":
             create_bodies.append(json.loads(request.content))
             return httpx.Response(201, json={"id": "conv_child_inherit"})
         if (
             request.method == "POST"
-            and request.url.path == "/v1/sessions/conv_child_inherit/events"
+            and request.url.path == "/v1/requester/sessions/conv_child_inherit/events"
         ):
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})

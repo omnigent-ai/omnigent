@@ -271,7 +271,7 @@ def _spawn_server_handler(
                 200,
                 json={"data": [existing_child] if existing_child is not None else []},
             )
-        if request.method == "POST" and path == "/v1/sessions":
+        if request.method == "POST" and path == "/v1/requester/sessions":
             return httpx.Response(201, json={"id": _CHILD_ID})
         if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/resources/files:copy":
             copies.append(json.loads(request.content))
@@ -293,7 +293,7 @@ def _spawn_server_handler(
             if meta_gets is not None:
                 meta_gets.append(path)
             return httpx.Response(404, json={"error": {"message": "should not be called"}})
-        if request.method == "POST" and path == f"/v1/sessions/{_CHILD_ID}/events":
+        if request.method == "POST" and path == f"/v1/requester/sessions/{_CHILD_ID}/events":
             events.append(json.loads(request.content))
             if events_status >= 400:
                 return httpx.Response(events_status, json={"error": {"message": "boom"}})

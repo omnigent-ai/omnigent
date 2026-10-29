@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.requester import InputRequester
 
 # ---------------------------------------------------------------------------
 # Type aliases for JSON-shaped executor boundaries
@@ -106,6 +107,8 @@ class ExecutorConfig:
     temperature: float = 0.0
     max_tokens: int = 100000
     extra: ExecutorExtra = field(default_factory=dict)
+    # Supplied by the authenticated harness transport, never by provider options.
+    requester: InputRequester = field(default_factory=InputRequester)
 
 
 # ---------------------------------------------------------------------------

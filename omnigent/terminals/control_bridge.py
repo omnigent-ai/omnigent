@@ -57,6 +57,7 @@ from typing import Final
 from fastapi import WebSocket, WebSocketDisconnect
 
 from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
+from omnigent.terminals.writer import TerminalWriterEvidence, terminal_writer_from_scope
 from omnigent.terminals.ws_common import (
     WS_CLOSE_INTERNAL_ERROR,
     WS_CLOSE_TERMINAL_DETACHED,
@@ -629,6 +630,7 @@ async def bridge_tmux_control_to_websocket(
     socket_path: str,
     tmux_target: str,
     read_only: bool,
+    writer_evidence: TerminalWriterEvidence | None = None,
     on_client_interaction: Callable[[], None] | None = None,
     reader_done: asyncio.Event | None = None,
     forward_done: asyncio.Event | None = None,
@@ -644,6 +646,8 @@ async def bridge_tmux_control_to_websocket(
     :param tmux_target: The ``-t`` target string identifying the session.
     :param read_only: When ``True``, drop inbound binary input frames and
         attach with ``ignore-size`` so the viewer can't resize the pane.
+    :param writer_evidence: Shared evidence for this terminal process incarnation.
+        Updated before input reaches tmux; absent evidence cannot grant authority.
     :param on_client_interaction: Optional callback fired on every client
         interaction (connect, disconnect, each input/resize frame) so the
         idle watcher can discount client-driven repaints.
@@ -655,6 +659,7 @@ async def bridge_tmux_control_to_websocket(
         returns (normal completion or cancellation), letting a test await the
         backlog fully flushing to the browser. Inert when ``None``.
     """
+    writer = terminal_writer_from_scope(websocket.scope) if writer_evidence is not None else None
     # Attaching reflows the pane to this client's size — stamp it as a client
     # interaction so the idle watcher discounts the resulting repaint.
     if on_client_interaction is not None:
@@ -894,6 +899,8 @@ async def bridge_tmux_control_to_websocket(
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:
+                    if data and writer_evidence is not None and writer is not None:
+                        writer_evidence.record(writer)
                     # Stamp before sending so the next %output (the echo) takes
                     # the small interactive frame cap.
                     last_client_input_at = _monotonic()

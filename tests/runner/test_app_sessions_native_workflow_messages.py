@@ -8,6 +8,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -19,7 +20,15 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runner.subagent_work import _format_subagent_wake_notice
+from omnigent.runtime.requester import (
+    REQUESTER_FIELD,
+    ExecutionRequester,
+    InputRequester,
+    ToolRequester,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _BlockingHarnessClient,
     _build_lifecycle_app,
@@ -36,7 +45,10 @@ from tests.runner.helpers import NullServerClient
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("harness", ["claude-native", "codex-native"])
-async def test_native_input_identity_reaches_the_harness_request(harness: str) -> None:
+@pytest.mark.parametrize("requester_user", [None, "bryan@example.test", "pat@example.test"])
+async def test_native_input_identity_reaches_the_harness_request(
+    harness: str, requester_user: str | None
+) -> None:
     from omnigent.runtime.harnesses._scaffold import MessageEvent
 
     hc = _ScriptedHarnessClient(
@@ -55,6 +67,7 @@ async def test_native_input_identity_reaches_the_harness_request(harness: str) -
         "delivery_attempt_id": "c" * 32,
         "input_enqueued_at_ms": 12345,
     }
+    requester = InputRequester(user_id=requester_user)
     async with _runner_client(app) as client:
         response = await client.post(
             "/v1/sessions/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/events",
@@ -65,6 +78,7 @@ async def test_native_input_identity_reaches_the_harness_request(harness: str) -
                 "content": [{"type": "input_text", "text": "private prompt"}],
                 "harness": harness,
                 "stable_id": "a" * 32,
+                REQUESTER_FIELD: requester.model_dump(),
                 **identity,
             },
         )
@@ -76,6 +90,7 @@ async def test_native_input_identity_reaches_the_harness_request(harness: str) -
     assert len(hc.posted_bodies) == 1
     request = MessageEvent.model_validate(hc.posted_bodies[0]).to_create_request()
     assert request.model_dump(include=set(identity)) == identity
+    assert request.requester == requester
 
 
 def _build_blocking_app(
@@ -137,6 +152,105 @@ async def test_proxy_stream_relays_non_json_sse_frame() -> None:
     assert response.status_code == 200
     assert "event: heartbeat\n\n" in response.text
     assert '"response.completed"' in response.text
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "absent",
+        "retained",
+        "unknown",
+        "null",
+        "invalid-id",
+        "extra-field",
+        "non-strict-origin",
+        "missing-origin",
+        "list",
+    ],
+)
+async def test_tool_requester_metadata_does_not_abort_stream(metadata, monkeypatch) -> None:
+    """Protected snapshots survive SSE decoding; malformed ones confer no authority."""
+    owner = InputRequester(user_id="bryan", account_generation="owner-generation")
+    # Harness contexts and retained native executions mint IDs independently.
+    retained = ExecutionRequester(
+        InputRequester(user_id="pat", account_generation="collaborator-generation")
+    ).snapshot()
+    if metadata == "unknown":
+        retained = ExecutionRequester(InputRequester()).snapshot()
+    payload: Any = retained.model_dump()
+    if metadata == "null":
+        payload = None
+    elif metadata == "invalid-id":
+        payload["execution_id"] = "invalid"
+    elif metadata == "extra-field":
+        payload["unexpected"] = True
+    elif metadata == "non-strict-origin":
+        payload["origin"]["user_id"] = 123
+    elif metadata == "missing-origin":
+        del payload["origin"]
+    elif metadata == "list":
+        payload = []
+
+    frames = [_sse({"type": "response.created", "response": {"id": "resp_1"}})]
+    for call_id in ("before", "protected", "after"):
+        item = {
+            "type": "function_call",
+            "status": "action_required",
+            "name": "sys_session_message",
+            "call_id": call_id,
+            "arguments": "{}",
+        }
+        if call_id == "protected" and metadata != "absent":
+            item[REQUESTER_FIELD] = payload
+        frames.append(_sse({"type": "response.output_item.done", "item": item}))
+    frames.append(_sse({"type": "response.completed", "response": {"id": "resp_1"}}))
+    hc = _ScriptedHarnessClient(frames)
+    spec = AgentSpec(spec_version=1, name="t")
+
+    async def resolver(agent_id, session_id=None):
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        spec_resolver=resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    calls: dict[str, ToolRequester] = {}
+
+    async def capture_call(**kwargs):
+        calls[kwargs["call_id"]] = kwargs["requester"]
+        return "{}"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", capture_call)
+    session_id = uuid4().hex
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "agent_id": "b" * 32,
+                "harness": "openai-agents",
+                "content": [{"type": "input_text", "text": "owner work"}],
+                REQUESTER_FIELD: owner.model_dump(),
+            },
+        )
+    assert response.status_code == 200
+    assert '"response.completed"' in response.text
+    assert '"response.failed"' not in response.text
+    assert set(calls) == {"before", "protected", "after"}
+    assert calls["before"].origin == owner
+    assert calls["after"] == calls["before"]
+    if metadata == "absent":
+        assert calls["protected"] == calls["before"]
+    elif metadata in {"retained", "unknown"}:
+        assert calls["protected"] == retained
+        assert retained.execution_id != calls["before"].execution_id
+    else:
+        assert calls["protected"].origin.user_id is None
+        assert calls["protected"].origin.account_generation is None
+        assert calls["protected"].origin.input_id != owner.input_id
 
 
 @pytest.mark.asyncio
@@ -418,6 +532,8 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
         super().__init__([])
         self._gate = gate
         self._consumed_ids: list[str] = []
+        self.probe_tools = False
+        self.retained_requester: ToolRequester | None = None
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         """Turn-1 stream: created → (gate) → consumed markers → completed."""
@@ -425,6 +541,24 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
         self.posted_bodies.append(json)
         gate = self._gate
         consumed_ids = self._consumed_ids
+        probe_tools = self.probe_tools
+        retained_requester = self.retained_requester
+        turn_number = len(self.posted_bodies)
+
+        def probe(phase: str, requester: ToolRequester | None = None) -> str:
+            return _sse(
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "status": "action_required",
+                        "name": "sys_session_message",
+                        "call_id": f"{turn_number}_{phase}",
+                        "arguments": "{}",
+                        **({REQUESTER_FIELD: requester.model_dump()} if requester else {}),
+                    },
+                }
+            )
 
         class _Ctx:
             status_code = 200
@@ -440,11 +574,20 @@ class _HandshakeHarnessClient(_ScriptedHarnessClient):
 
             async def aiter_text(self) -> AsyncIterator[str]:
                 yield _sse({"type": "response.created", "response": {"id": "resp_1"}})
+                if probe_tools:
+                    yield probe("before")
+                    if retained_requester is not None:
+                        yield probe("retained", retained_requester)
                 await gate.wait()
+                if probe_tools:
+                    yield probe("pending")
                 # Mirror the executor adapter: once injections are consumed
                 # into the running turn, echo each correlation id back.
                 for inj_id in list(consumed_ids):
                     yield _sse({"type": "injection.consumed", "injection_id": inj_id})
+                consumed_ids.clear()
+                if probe_tools:
+                    yield probe("after")
                 yield _sse({"type": "response.completed", "response": {"id": "resp_1"}})
 
         return _Ctx()
@@ -494,7 +637,7 @@ def _build_handshake_app(
 
 
 @pytest.mark.asyncio
-async def test_midturn_message_not_double_delivered_to_harness() -> None:
+async def test_midturn_message_not_double_delivered_to_harness(monkeypatch) -> None:
     """A message sent during an active turn must reach the harness once.
 
     Covers the web→TUI / claude-native duplication fix. When a user
@@ -515,6 +658,14 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
 
     gate = _aio.Event()
     app, _pm, hc = _build_handshake_app(gate)
+    hc.probe_tools = True
+    calls: dict[str, ToolRequester] = {}
+
+    async def capture_call(**kwargs):
+        calls[kwargs["call_id"]] = kwargs["requester"]
+        return "{}"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", capture_call)
 
     async with _runner_client(app) as client:
         await client.post(
@@ -536,10 +687,15 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "first"}],
                 "harness": "openai-agents",
+                REQUESTER_FIELD: InputRequester(user_id="bryan").model_dump(),
             },
         )
         assert resp1.status_code == 202
-        await _aio.sleep(0.05)
+        for _ in range(200):
+            if "1_before" in calls:
+                break
+            await _aio.sleep(0.01)
+        assert calls["1_before"].origin.user_id == "bryan"
 
         # "second" arrives while turn 1 is provably still active (blocked
         # on the gate) → the runner buffers it AND forwards it as a live
@@ -552,6 +708,7 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
                 "model": "test-agent",
                 "content": [{"type": "input_text", "text": "second"}],
                 "harness": "openai-agents",
+                REQUESTER_FIELD: InputRequester(user_id="pat").model_dump(),
             },
         )
         # 202 "buffered" confirms turn 1 was still active — the precondition
@@ -570,9 +727,34 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
         # would reach 2 within it.
         gate.set()
         for _ in range(100):
-            if len(hc.posted_bodies) >= 2:
+            if "1_after" in calls and not app.state.active_turns:
                 break
             await _aio.sleep(0.01)
+        assert calls["1_after"].origin.user_id is None
+        assert len(hc.posted_bodies) == 1
+        hc.retained_requester = calls["1_after"]
+
+        # Only a fresh owner execution restores authority, not a new actor label.
+        fresh = await client.post(
+            "/v1/sessions/ede98a0180773a70b1e81cc854ff7d8a/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "fresh owner work"}],
+                "harness": "openai-agents",
+                REQUESTER_FIELD: InputRequester(user_id="bryan").model_dump(),
+            },
+        )
+        assert fresh.status_code == 202
+        for _ in range(200):
+            if "2_after" in calls:
+                break
+            await _aio.sleep(0.01)
+        assert calls["2_after"].origin.user_id == "bryan"
+        assert calls["2_after"].execution_id != calls["1_after"].execution_id
+        assert calls["1_after"].origin.user_id is None
+        assert calls["2_retained"] == calls["1_after"]
 
     # "second" was forwarded as a live injection (channel 1)...
     midturn_injections = [b for b in hc.patched_events if _body_contains_text(b, "second")]
@@ -581,14 +763,124 @@ async def test_midturn_message_not_double_delivered_to_harness() -> None:
         f"got {len(midturn_injections)} ({hc.patched_events})"
     )
     # ...and must NOT also be re-sent in a continuation turn (channel 2).
-    # Exactly one harness turn stream means no continuation was started.
-    assert len(hc.posted_bodies) == 1, (
-        f"'second' was double-delivered: a continuation turn started after "
-        f"the injection was consumed. The runner must drop the buffered "
-        f"copy on injection.consumed.\nposted_bodies={hc.posted_bodies}"
-    )
-    continuation_has_second = any(_body_contains_text(b, "second") for b in hc.posted_bodies[1:])
-    assert not continuation_has_second
+    # The only second turn is the explicitly submitted fresh owner message.
+    assert len(hc.posted_bodies) == 2
+    assert _body_contains_text(hc.posted_bodies[1], "fresh owner work")
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "error_type", "consumed"),
+    [
+        pytest.param("client", RuntimeError, False, id="client-runtime-error"),
+        pytest.param("client", TimeoutError, False, id="client-timeout"),
+        pytest.param("post", httpx.ReadTimeout, False, id="post-read-timeout-unconfirmed"),
+        pytest.param("post", httpx.ReadTimeout, True, id="post-read-timeout-consumed"),
+        pytest.param("post", httpx.WriteError, False, id="post-write-error"),
+        pytest.param("post", RuntimeError, True, id="post-runtime-error-consumed"),
+        pytest.param("post", TimeoutError, False, id="post-timeout-unconfirmed"),
+    ],
+)
+async def test_injection_failure_preserves_requester_delivery_uncertainty(
+    failure_stage, error_type, consumed, monkeypatch
+) -> None:
+    """Only failure before POST proves an injection was never delivered."""
+    gate = asyncio.Event()
+    app, pm, hc = _build_handshake_app(gate)
+    hc.probe_tools = True
+    calls: dict[str, ToolRequester] = {}
+
+    async def capture_call(**kwargs):
+        calls[kwargs["call_id"]] = kwargs["requester"]
+        return "{}"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", capture_call)
+    get_client = pm.get_client
+
+    async def fail_get_client(conversation_id, harness, env=None):
+        if harness == "any":
+            raise error_type("client unavailable before submission")
+        return await get_client(conversation_id, harness, env)
+
+    attempted: list[dict[str, Any]] = []
+    post = hc.post
+
+    async def fail_post(url, *, json, timeout=None):
+        attempted.append(json)
+        if consumed:
+            await post(url, json=json, timeout=timeout)
+        raise error_type("delivery outcome unavailable")
+
+    session_id = uuid4().hex
+    owner = InputRequester(user_id="bryan", account_generation="owner-generation")
+    collaborator = InputRequester(user_id="pat", account_generation="collaborator-generation")
+    message = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "agent_id": "b" * 32,
+        "harness": "openai-agents",
+    }
+    async with _runner_client(app) as client:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                **message,
+                "content": [{"type": "input_text", "text": "owner work"}],
+                REQUESTER_FIELD: owner.model_dump(),
+            },
+        )
+        assert first.status_code == 202
+        await poll_until_async(lambda: "1_before" in calls)
+        assert calls["1_before"].origin == owner
+
+        monkeypatch.setattr(
+            pm if failure_stage == "client" else hc,
+            "get_client" if failure_stage == "client" else "post",
+            fail_get_client if failure_stage == "client" else fail_post,
+        )
+        second = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                **message,
+                "content": [{"type": "input_text", "text": "collaborator steer"}],
+                REQUESTER_FIELD: collaborator.model_dump(),
+            },
+        )
+        assert second.status_code == 202
+        assert second.json()["status"] == "buffered"
+
+        if failure_stage == "post":
+            # A later, definitely unsent message cannot clear an older uncertainty.
+            monkeypatch.setattr(pm, "get_client", fail_get_client)
+            third = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    **message,
+                    "content": [{"type": "input_text", "text": "owner follow-up"}],
+                    REQUESTER_FIELD: owner.model_dump(),
+                },
+            )
+            assert third.status_code == 202
+            assert third.json()["status"] == "buffered"
+            assert len(attempted) == 1
+            assert attempted[0]["injection_id"]
+            assert InputRequester.from_body(attempted[0]) == collaborator
+        else:
+            assert not attempted
+            assert not hc.patched_events
+
+        gate.set()
+        await poll_until_async(lambda: "1_after" in calls and not app.state.active_turns)
+
+    for phase in ("pending", "after"):
+        requester = calls[f"1_{phase}"]
+        assert requester.execution_id == calls["1_before"].execution_id
+        if failure_stage == "client":
+            assert requester.origin == owner
+        else:
+            assert requester.origin.user_id is None
+            assert requester.origin.account_generation is None
+    assert calls["1_before"].origin == owner
 
 
 class _RefusingSteerHarnessClient(_HandshakeHarnessClient):
@@ -613,19 +905,38 @@ class _RefusingSteerHarnessClient(_HandshakeHarnessClient):
 
 
 @pytest.mark.asyncio
-async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
-    """A steer the harness refused is not lost: it runs as the continuation turn.
+@pytest.mark.parametrize("arrival", ["before-registration", "during-stream"])
+@pytest.mark.parametrize("wake_first", [True, False], ids=["wake-first", "wake-last"])
+async def test_refused_or_early_steer_is_delivered_as_fresh_continuation_turn(
+    arrival: str, wake_first: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Queued collaborator input and an owner wake arrive with unknown authority.
 
-    The harness refuses a steer whose turn already ended, so the buffered copy
-    is the only delivery. The continuation body must not carry the steer's
-    ``injection_id``, or the harness would refuse to start that turn too.
+    Before requester registration, forwarding must wait. A later refused steer
+    also stays buffered. Both paths must deliver the combined continuation without
+    an injection_id or borrowing either input's authority.
     """
     gate = asyncio.Event()
+    resolving = asyncio.Event()
+    setup_gate = asyncio.Event()
+    if arrival == "during-stream":
+        setup_gate.set()
     spec = AgentSpec(spec_version=1, name="t")
     hc = _RefusingSteerHarnessClient(gate)
+    hc.probe_tools = True
+    calls: dict[str, ToolRequester] = {}
+
+    async def capture_call(**kwargs):
+        calls[kwargs["call_id"]] = kwargs["requester"]
+        return "{}"
+
+    monkeypatch.setattr("omnigent.runner.tool_dispatch.dispatch_tool_locally", capture_call)
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
+        # Background setup resolves the spec before registering ExecutionRequester.
+        resolving.set()
+        await setup_gate.wait()
         return spec
 
     app = create_runner_app(
@@ -633,33 +944,88 @@ async def test_refused_steer_is_delivered_as_fresh_continuation_turn() -> None:
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    sid = "5c0b6f1e2d3a4b5c6d7e8f9a0b1c2d3e"
+    sid = uuid4().hex
+    owner = InputRequester(user_id="bryan", account_generation="owner-generation")
+    collaborator = InputRequester(user_id="pat", account_generation="collaborator-generation")
     message = {
         "type": "message",
         "role": "user",
         "model": "test-agent",
+        "agent_id": "a" * 32,
         "harness": "openai-agents",
     }
+    wake_notice = _format_subagent_wake_notice(
+        agent="researcher", title="owner work", status="completed", pending=1
+    )
+    queued_inputs = [(wake_notice, owner), ("collaborator steer", collaborator)]
+    if not wake_first:
+        queued_inputs.reverse()
     async with _runner_client(app) as client:
-        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": "a" * 32})
-        first = {**message, "content": [{"type": "input_text", "text": "first"}]}
+        first = {
+            **message,
+            "content": [{"type": "input_text", "text": "first"}],
+            REQUESTER_FIELD: owner.model_dump(),
+        }
         assert (await client.post(f"/v1/sessions/{sid}/events", json=first)).status_code == 202
-        await asyncio.sleep(0.05)
-        second = {**message, "content": [{"type": "input_text", "text": "second"}]}
-        resp2 = await client.post(f"/v1/sessions/{sid}/events", json=second)
-        assert resp2.json()["status"] == "buffered"
-        gate.set()
-        for _ in range(200):
-            if len(hc.posted_bodies) >= 2:
-                break
-            await asyncio.sleep(0.01)
+        try:
+            if arrival == "before-registration":
+                await asyncio.wait_for(resolving.wait(), timeout=5)
+                assert sid in app.state.active_turns
+                assert sid not in app.state.live_response_id
+                assert not hc.posted_bodies
+                assert not calls
+            else:
+                await poll_until_async(lambda: "1_before" in calls)
+                assert calls["1_before"].origin == owner
 
-    assert len(hc.patched_events) == 1
-    assert hc.patched_events[0].get("injection_id"), "the steer forward carries its id"
+            # These are runner-facing envelopes after the server forwards each input.
+            for text, origin in queued_inputs:
+                response = await client.post(
+                    f"/v1/sessions/{sid}/events",
+                    json={
+                        **message,
+                        "content": [{"type": "input_text", "text": text}],
+                        REQUESTER_FIELD: origin.model_dump(),
+                    },
+                )
+                assert response.status_code == 202
+                assert response.json()["status"] == "buffered"
+
+            buffered = app.state.session_message_buffers[sid]
+            assert [InputRequester.from_body(body) for body in buffered] == [
+                origin for _, origin in queued_inputs
+            ]
+            if arrival == "before-registration":
+                assert not hc.patched_events
+                assert all("injection_id" not in body for body in buffered)
+            else:
+                assert len(hc.patched_events) == 2
+                assert all(body.get("injection_id") for body in hc.patched_events)
+                assert [_ordered_user_texts(body) for body in hc.patched_events] == [
+                    [text] for text, _ in queued_inputs
+                ]
+
+            setup_gate.set()
+            await poll_until_async(lambda: "1_before" in calls)
+            assert _ordered_user_texts(hc.posted_bodies[0]) == ["first"]
+        finally:
+            setup_gate.set()
+            gate.set()
+        await poll_until_async(lambda: "2_after" in calls and not app.state.active_turns)
+        assert not app.state.session_message_buffers.get(sid)
+
     assert len(hc.posted_bodies) == 2, f"expected a continuation turn: {hc.posted_bodies}"
     continuation = hc.posted_bodies[1]
-    assert _body_contains_text(continuation, "second")
+    assert _ordered_user_texts(continuation) == ["first", *(text for text, _ in queued_inputs)]
     assert "injection_id" not in continuation, continuation
+    continuation_origin = InputRequester.from_body(continuation)
+    assert continuation_origin.user_id is None
+    assert continuation_origin.account_generation is None
+    assert calls["2_before"].execution_id != calls["1_before"].execution_id
+    for phase in ("before", "pending", "after"):
+        assert calls[f"1_{phase}"].origin == owner
+        assert calls[f"2_{phase}"].origin == continuation_origin
+        assert calls[f"2_{phase}"].delegation_policy == "requester"
 
 
 @pytest.mark.asyncio

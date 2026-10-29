@@ -221,6 +221,7 @@ class _CapturingResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: Any | None = None,
         resource_role: str | None = None,
+        complete_writer_observation: bool = False,
     ) -> SessionResourceView:
         """Capture an auxiliary terminal launch."""
         return await self._launch(
@@ -1719,6 +1720,7 @@ class _LaunchReturningRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        complete_writer_observation: bool = False,
     ) -> TerminalInstance:
         """Return the fixed instance, ignoring the launch spec.
 
@@ -1742,6 +1744,7 @@ class _LaunchReturningRegistry:
             sandbox_override,
         )
         self._instance.program_status_app = program_status_app
+        self._instance.complete_writer_observation = complete_writer_observation
         return self._instance
 
 

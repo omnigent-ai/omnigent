@@ -170,6 +170,7 @@ class _StubResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: object | None = None,
         resource_role: str | None = None,
+        complete_writer_observation: bool = False,
     ) -> SessionResourceView:
         """Return an auxiliary terminal resource view for a fake instance."""
         return await self._launch(
@@ -577,9 +578,13 @@ async def test_claude_launch_starts_the_comment_relay(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "native_lookup", ["legacy", "owner", "unknown", "bad_auth", "old_harness", "missing_locator"]
+)
 async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    native_lookup: str,
 ) -> None:
     """Route relay tool execution through Omnigent ``/mcp`` for policy enforcement.
 
@@ -590,6 +595,26 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
     on these relay tools was previously bypassed; this test pins the fix.
     """
     import omnigent.harnesses.claude_native.bridge as _bridge_mod
+    from omnigent.harnesses.codex_native.execution import (
+        CodexExecutionIdentity,
+        current_codex_execution,
+    )
+    from omnigent.runtime.harnesses._scaffold import HarnessApp
+    from omnigent.runtime.requester import (
+        REQUESTER_HEADER,
+        ExecutionRequester,
+        InputRequester,
+        ToolRequester,
+        current_tool_requester,
+    )
+
+    identity = CodexExecutionIdentity("provider-session", "thread", "turn")
+    origin = ExecutionRequester(InputRequester(user_id="bryan@example.test")).snapshot()
+
+    class _NativeHarness(HarnessApp):
+        async def native_tool_requester(self, execution: dict[str, str]) -> ToolRequester | None:
+            assert execution == identity.to_wire()
+            return origin if native_lookup == "owner" else None
 
     # Records every POST sent to the fake Omnigent server.
     ap_mcp_posts: list[dict[str, Any]] = []
@@ -612,7 +637,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             """
             del timeout
             req = httpx.Request("GET", f"http://ap-server{url}")
-            return httpx.Response(200, json={"labels": {}}, request=req)
+            return httpx.Response(200, json={"labels": {}, "agent_id": "relay-agent"}, request=req)
 
         async def post(
             self,
@@ -630,7 +655,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             :returns: 200 response with a fixed MCP result.
             """
             del timeout
-            ap_mcp_posts.append({"url": url, "json": json})
+            ap_mcp_posts.append({"url": url, "json": json, "headers": headers or {}})
             req = httpx.Request("POST", f"http://ap-server{url}")
             return httpx.Response(
                 200,
@@ -665,9 +690,31 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
     session_id = f"conv_{uuid.uuid4().hex[:12]}"
     bridge_dir = bridge_dir_for_bridge_id(session_id)
     prepare_bridge_dir(session_id, workspace=tmp_path)
+    harness_app = FastAPI() if native_lookup == "old_harness" else _NativeHarness().build()
+    harness_app.state.conversation_id = session_id
+    harness_app.state.harness_auth_token = "control-test-token"
+    harness_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness_app),
+        base_url="http://harness",
+        headers={
+            "Authorization": "Bearer wrong"
+            if native_lookup == "bad_auth"
+            else "Bearer control-test-token"
+        },
+    )
+
+    async def resolve_spec(agent_id: str, sid: str) -> AgentSpec:
+        assert (agent_id, sid) == ("relay-agent", session_id)
+        return AgentSpec(
+            spec_version=1,
+            name="codex-relay",
+            executor=ExecutorSpec(type="codex-native"),
+        )
 
     try:
         app = create_runner_app(
+            process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+            spec_resolver=resolve_spec if native_lookup == "missing_locator" else None,
             resource_registry=_StubResourceRegistry(tmp_path),
             server_client=_FakeApClient(),  # type: ignore[arg-type]  # duck-typed for test
         )
@@ -690,7 +737,14 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
         executor = captured_executors[0]
 
         # Call the relay executor directly (simulates Claude Code invoking list_comments).
-        result = await executor("list_comments", {"status": "pending"})
+        locator_token = current_codex_execution.set(
+            identity if native_lookup not in {"legacy", "missing_locator"} else None
+        )
+        try:
+            result = await executor("list_comments", {"status": "pending"})
+        finally:
+            current_codex_execution.reset(locator_token)
+        assert current_tool_requester.get() is None
 
         # In Omnigent mode the executor must have POSTed a tools/call JSON-RPC to the
         # Omnigent server's /mcp endpoint, not called the direct comment handler.
@@ -706,6 +760,14 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
             "No tools/call request reached the Omnigent /mcp endpoint. "
             "The relay executor is bypassing ProxyMcpManager and policy enforcement."
         )
+        if native_lookup == "legacy":
+            assert REQUESTER_HEADER not in mcp_call["headers"]
+        else:
+            resolved = ToolRequester.model_validate_json(mcp_call["headers"][REQUESTER_HEADER])
+            if native_lookup == "owner":
+                assert resolved == origin
+            else:
+                assert resolved.origin.user_id is None
         # Tool name and arguments must be forwarded verbatim.
         assert mcp_call["json"]["params"]["name"] == "list_comments", (
             "Wrong tool name forwarded; policy would be evaluated against the wrong tool."
@@ -720,6 +782,7 @@ async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
         # The Omnigent response's text content must be parsed back to a dict.
         assert result == {"items": []}, f"Expected parsed Omnigent response dict, got {result!r}."
     finally:
+        await harness_client.aclose()
         shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
@@ -1210,6 +1273,140 @@ async def _reset_state(client: httpx.AsyncClient, session_id: str) -> None:
     """
     resp = await client.post(f"/v1/sessions/{session_id}/reset-state")
     assert resp.status_code == 200, f"reset-state failed: {resp.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "live",
+        "unobserved",
+        "generic_bridge",
+        "other_bridge",
+        "missing",
+        "stopped",
+        "replace",
+        "relaunch",
+        "refresh",
+        "strict_refresh",
+        "early_same_spec",
+        "restart",
+    ],
+)
+async def test_native_relay_fallback_keeps_terminal_incarnation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """Real relay HTTP preserves producer policy across tool refresh and terminal replacement."""
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runtime.requester import REQUESTER_HEADER, ToolRequester
+    from omnigent.terminals.writer import TerminalWriterEvidence
+
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    terminal = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal.args = ["--settings", str(bridge_dir / "claude-settings.json")]
+    if scenario != "generic_bridge":
+        terminal.native_harness = "claude-native"
+    terminals = TerminalRegistry()
+    if scenario not in {"missing", "early_same_spec"}:
+        terminals._by_conversation[session_id] = {("claude", "main"): terminal}
+    roles = SessionResourceRegistry(terminals)
+    if scenario not in {"unobserved", "strict_refresh"}:
+        roles._terminal_roles[(session_id, terminal_resource_id("claude", "main"))] = (
+            "claude-native"
+        )
+    if scenario == "other_bridge":
+        terminal.args = ["--settings", str(tmp_path / "claude-settings.json")]
+    resources = _StubResourceRegistry(tmp_path)
+    monkeypatch.setattr(resources, "terminal_registry", terminals)
+    monkeypatch.setattr(
+        resources, "terminal_resource_role", roles.terminal_resource_role, raising=False
+    )
+    requests: list[dict[str, Any]] = []
+    callbacks = []
+    start_relay = bridge.start_tool_relay
+
+    def capture_relay(**kwargs: Any) -> bridge.ClaudeNativeToolRelay:
+        callbacks.append(kwargs["tool_executor"])
+        return start_relay(**kwargs)
+
+    monkeypatch.setattr(bridge, "start_tool_relay", capture_relay)
+
+    class RecordingServer(_SwitchableServerClient):
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if kwargs.get("json", {}).get("method") == "tools/call":
+                requests.append(kwargs)
+                return httpx.Response(
+                    200,
+                    json={"result": {"content": [{"type": "text", "text": "{}"}]}},
+                    request=httpx.Request("POST", f"http://server{url}"),
+                )
+            return await super().post(url, **kwargs)
+
+    server = RecordingServer("before")
+    specs = {
+        "before": AgentSpec(spec_version=1, executor=ExecutorSpec(type="codex-native")),
+        "after": AgentSpec(spec_version=1, executor=ExecutorSpec(type="claude-native")),
+    }
+    app = _switch_app(tmp_path, server, specs, resource_registry=resources)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                relay = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+                if scenario in {"refresh", "strict_refresh"}:
+                    server.agent_id = "after"
+                    reset = await client.post(f"/v1/sessions/{session_id}/agent-cache/reset")
+                    assert reset.status_code == 200
+                    await _launch_bridged(client, session_id)
+                    refreshed = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+                    assert (refreshed["url"], refreshed["token"]) == (relay["url"], relay["token"])
+                elif scenario in {"early_same_spec", "restart"}:
+                    terminals._by_conversation[session_id] = {("claude", "main"): terminal}
+                    if scenario == "restart":
+                        terminal.writer_evidence = TerminalWriterEvidence(uuid.uuid4().hex)
+                    await _launch_bridged(client, session_id)
+                    refreshed = json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())
+                    assert refreshed["token"] != relay["token"]
+                    assert "no longer active" in (await callbacks[0]("list_comments", {}))["error"]
+                    assert not requests
+                    relay = refreshed
+                elif scenario == "stopped":
+                    terminal.running = False
+                elif scenario == "replace":
+                    terminals._by_conversation[session_id][("claude", "main")] = (
+                        make_test_terminal_instance("claude", "main", tmp_path)
+                    )
+                elif scenario == "relaunch":
+                    terminal.writer_evidence = TerminalWriterEvidence(uuid.uuid4().hex)
+                async with httpx.AsyncClient() as relay_client:
+                    response = await relay_client.post(
+                        f"{relay['url']}/tool",
+                        headers={"Authorization": f"Bearer {relay['token']}"},
+                        json={"name": "list_comments", "arguments": {}},
+                    )
+                assert response.status_code == 200, response.text
+                if scenario in {"stopped", "replace", "relaunch"}:
+                    assert "terminal incarnation is no longer active" in response.text
+                    assert not requests
+                else:
+                    assert len(requests) == 1
+                    raw = requests[0]["headers"].get(REQUESTER_HEADER)
+                    requester = ToolRequester.model_validate_json(raw) if raw else None
+                    if scenario in {"live", "refresh", "early_same_spec", "restart"}:
+                        assert requester is not None
+                        assert requester.delegation_policy == "no_edit_sharing"
+                        assert requester.origin.user_id is None
+                        assert requester.origin.account_generation is None
+                    else:
+                        assert requester is None or requester.delegation_policy == "requester"
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio

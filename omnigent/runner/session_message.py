@@ -6,7 +6,13 @@ from typing import Any
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_requests import is_wrong_replica, post_on_host, session_host_id
+from omnigent.runner.session_requests import (
+    is_wrong_replica,
+    post_on_host,
+    requester_route_error,
+    session_host_id,
+)
+from omnigent.runtime.requester import requester_headers
 from omnigent.util.uuid import uuid_to_bytes
 
 
@@ -30,9 +36,11 @@ async def execute_message_tool(
     if client is None or source_id is None:
         return json.dumps({"error": "Session messaging requires an authenticated runner"})
     try:
-        path = f"/v1/sessions/{target}/events"
+        # The accepting replica must understand requester provenance, not merely
+        # the older peer-message capability. Never retry on a legacy endpoint.
+        path = f"/v1/requester/sessions/{target}/events"
         payload = {"type": "session_message", "data": {"message": message}}
-        headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
+        headers = {ORCHESTRATION_SOURCE_HEADER: source_id, **requester_headers()}
         response = await client.post(path, headers=headers, json=payload, timeout=60)
         if is_wrong_replica(response):
             try:
@@ -55,6 +63,8 @@ async def execute_message_tool(
         return json.dumps(
             {"error": "Delivery could not be confirmed; do not automatically resend"}
         )
+    if protocol_error := requester_route_error(response):
+        return json.dumps({"error": protocol_error})
     if response.is_error:
         return json.dumps({"error": "Session message refused", "detail": response.text[:1000]})
     try:

@@ -43,12 +43,15 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, TurnContext
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.runtime.requester import REQUESTER_FIELD, InputRequester
 from omnigent.runtime.tool_output import MAX_TOOL_OUTPUT_BYTES
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
     ElicitationResult,
 )
+from tests.runtime.harnesses.test_harness_zygote_client import _client_on
+from tests.runtime.harnesses.test_harness_zygote_client import zygote as zygote
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_scaffold_harnesses"
@@ -114,7 +117,7 @@ async def _stream_iter(
             yield _ParsedSSEEvent(event=event_name, data=data_payload)
 
 
-def _make_side_client(socket_path: str) -> httpx.AsyncClient:
+def _make_side_client(socket_path: str, client: httpx.AsyncClient) -> httpx.AsyncClient:
     """
     Build a SEPARATE httpx client bound to the same Unix socket.
 
@@ -128,12 +131,14 @@ def _make_side_client(socket_path: str) -> httpx.AsyncClient:
 
     :param socket_path: Absolute Unix socket path the harness
         bound, fetched via :meth:`HarnessProcessManager.socket_path`.
+    :param client: Manager-issued client whose control credential is copied.
     :returns: An :class:`httpx.AsyncClient` ready to issue
         side-channel requests.
     """
     return httpx.AsyncClient(
         transport=httpx.AsyncHTTPTransport(uds=socket_path),
         base_url="http://harness.local",
+        headers={"Authorization": client.headers["Authorization"]},
     )
 
 
@@ -1084,9 +1089,111 @@ async def test_scaffold_response_completed_preserves_cache_tokens(
 # "Event types and direction".
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("spawn_mode", ["direct", "zygote", "zygote_fallback"])
+async def test_control_auth_is_per_spawn_and_absent_from_child_environment(
+    use_echo: None,
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    spawn_mode: str,
+) -> None:
+    """Real UDS control calls require this spawn's token, including after a fork."""
+    from omnigent.runtime.harnesses._harness_zygote_client import ZygoteHarnessProc
+
+    token_env = "OMNIGENT_HARNESS_AUTH_TOKEN"
+    monkeypatch.setenv(token_env, "ambient-test-token")
+    monkeypatch.setitem(
+        _HARNESS_MODULES, "auth_env_fixture", "tests.runtime.harnesses._test_harness"
+    )
+    zygote_client = None
+    if spawn_mode != "direct":
+        zygote_client = _client_on(request.getfixturevalue("zygote"))
+        manager._harness_zygote = zygote_client
+        if spawn_mode == "zygote_fallback":
+            assert zygote_client._sock is not None
+            zygote_client._sock.close()
+            zygote_client._sock = None
+
+    conv_id = "conv_control_auth"
+    events_url = f"/v1/sessions/{conv_id}/events"
+    requester_url = f"/v1/sessions/{conv_id}/native-requester"
+    message = {
+        "type": "message",
+        "role": "user",
+        "model": "test-agent",
+        "content": [{"type": "input_text", "text": "control-auth-round-trip"}],
+        REQUESTER_FIELD: InputRequester(user_id="pat@example.test").model_dump(),
+    }
+    native_query = {"codex_execution": {"thread_id": "test-thread", "turn_id": "test-turn"}}
+    native_registration = {
+        "thread_id": "test-thread",
+        "provider_url": "ws://127.0.0.1:12345",
+        "requester": InputRequester(user_id="pat@example.test").model_dump(),
+    }
+    protected_calls = (
+        (events_url, message),
+        (requester_url, native_query),
+        (f"/v1/sessions/{conv_id}/native-input", native_registration),
+        (f"/v1/sessions/{conv_id}/native-input/refused", {"client_id": "a" * 32}),
+    )
+    try:
+        client = await manager.get_client(
+            conv_id, _TEST_HARNESS_NAME, env={token_env: "override-test-token"}
+        )
+        sibling = await manager.get_client("conv_auth_env", "auth_env_fixture")
+        assert client.headers["Authorization"] != sibling.headers["Authorization"]
+        assert client.headers["Authorization"] not in {
+            "Bearer ambient-test-token",
+            "Bearer override-test-token",
+        }
+        assert (await sibling.get(f"/env/{token_env}")).json() == {"value": None}
+        assert os.environ[token_env] == "ambient-test-token"
+        assert isinstance(manager._entries[conv_id].process, ZygoteHarnessProc) == (
+            spawn_mode == "zygote"
+        )
+        assert manager._harness_zygote_disabled == (spawn_mode == "zygote_fallback")
+
+        async with _make_side_client(str(manager.socket_path(conv_id)), client) as peer:
+            del peer.headers["Authorization"]
+            assert (await peer.get("/health")).status_code == 200
+            for authorization in (None, "Bearer incorrect", sibling.headers["Authorization"]):
+                headers = {"Authorization": authorization} if authorization else {}
+                for url, payload in protected_calls:
+                    response = await peer.post(url, json=payload, headers=headers)
+                    assert response.status_code == 401
+                    assert response.json() == {"detail": "unauthorized"}
+
+        response = await client.post(requester_url, json=native_query)
+        assert response.status_code == 200
+        assert response.json() == {"requester": None}
+        response = await client.post(events_url, json=message)
+        assert response.status_code == 200
+        assert "control-auth-round-trip" in response.text
+        assert "response.completed" in response.text
+        assert await manager.get_client(conv_id, _TEST_HARNESS_NAME) is client
+
+        await manager.release(conv_id)
+        replacement = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+        assert replacement.headers["Authorization"] != client.headers["Authorization"]
+        async with _make_side_client(str(manager.socket_path(conv_id)), client) as stale:
+            response = await stale.post(events_url, json=message)
+            assert response.status_code == 401
+        response = await replacement.post(events_url, json=message)
+        assert response.status_code == 200
+        assert "response.completed" in response.text
+    finally:
+        # Stop harnesses before the dynamically requested zygote fixture exits.
+        await manager.shutdown()
+        if zygote_client is not None and zygote_client._sock is not None:
+            zygote_client._sock.close()
+
+
+@pytest.mark.parametrize("requester_user", [None, "bryan@example.test", "pat@example.test"])
 async def test_session_message_event_streams_initial_then_text_then_completes(
     use_echo: None,
     manager: HarnessProcessManager,
+    requester_user: str | None,
 ) -> None:
     """A ``message`` event starts a turn and streams the standard envelope.
 
@@ -1105,6 +1212,12 @@ async def test_session_message_event_streams_initial_then_text_then_completes(
         "model": "test-agent",
         "content": [{"type": "input_text", "text": "hi"}],
     }
+    requester = InputRequester(user_id=requester_user, account_generation="account-v1")
+    if requester_user is not None:
+        body[REQUESTER_FIELD] = requester.model_dump()
+    # Public response input cannot grant this internal transport authority.
+    public_request = CreateResponseRequest.model_validate({"input": body["content"], **body})
+    assert REQUESTER_FIELD not in public_request.model_dump()
     events: list[_ParsedSSEEvent] = []
     async with client.stream("POST", f"/v1/sessions/{conv_id}/events", json=body) as response:
         async for event in _stream_iter(response):
@@ -1125,6 +1238,12 @@ async def test_session_message_event_streams_initial_then_text_then_completes(
     # ``run_turn`` through the new route, not just an empty
     # delegation that lost the request.
     assert "hi" in events[2].data["delta"]
+    received = json.loads(events[2].data["delta"])["requester"]
+    if requester_user is None:
+        assert received["user_id"] is None
+        assert received["account_generation"] is None
+    else:
+        assert received == requester.model_dump()
 
 
 async def test_session_events_404s_on_conversation_id_mismatch(
@@ -1174,7 +1293,7 @@ async def test_session_tool_result_event_resolves_parked_dispatch(
     """
     conv_id = "conv_session_tool"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     events: list[_ParsedSSEEvent] = []
     start_body = {
         "type": "message",
@@ -1243,7 +1362,7 @@ async def test_session_tool_result_over_cap_streams_truncated_but_returns_full(
     """
     conv_id = "conv_session_tool_cap"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     # 2 MiB — comfortably over the 1 MiB cap so truncation is unambiguous.
     big_output = "x" * (2 * 1024 * 1024)
     start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
@@ -1322,7 +1441,7 @@ async def test_session_tool_result_event_404s_on_conversation_id_mismatch(
     """
     conv_id = "conv_session_patch_mismatch"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     start_body = {
         "type": "message",
         "role": "user",
@@ -1380,7 +1499,7 @@ async def test_session_interrupt_event_cancels_in_flight_turn(
     """
     conv_id = "conv_session_cancel"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     events: list[_ParsedSSEEvent] = []
     start_body = {
         "type": "message",
@@ -1466,7 +1585,7 @@ async def test_session_approval_event_resolves_elicitation(
     """
     conv_id = "conv_session_elicit"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     events: list[_ParsedSSEEvent] = []
     start_body = {
         "type": "message",
@@ -1515,7 +1634,7 @@ async def test_session_approval_event_404s_on_conversation_id_mismatch(
     """
     conv_id = "conv_session_elicit_mismatch"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     start_body = {
         "type": "message",
         "role": "user",
@@ -1573,7 +1692,7 @@ async def test_session_message_event_without_previous_response_id_injects_active
     """
     conv_id = "conv_session_native_inject"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     events: list[_ParsedSSEEvent] = []
     start_body = {
         "type": "message",
@@ -1630,8 +1749,8 @@ async def test_interrupt_then_message_without_prev_id_starts_fresh_turn(
     """
     conv_id = "conv_interrupt_fresh"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
-    followup_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
+    followup_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     followup_body = {
         "type": "message",
@@ -1693,9 +1812,9 @@ async def test_steer_after_interrupt_does_not_start_a_stray_turn(
     """
     conv_id = "conv_steer_after_interrupt"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
-    steer_client = _make_side_client(str(manager.socket_path(conv_id)))
-    next_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
+    steer_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
+    next_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     followup = [{"type": "input_text", "text": "say hi"}]
     steer_body = {**start_body, "content": followup, "injection_id": "inj_after_interrupt"}
@@ -1743,7 +1862,7 @@ async def test_steer_with_injection_id_injects_live_turn(
     """A runner steer (``injection_id`` set) still injects into a live turn."""
     conv_id = "conv_steer_live_turn"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     steer_body = {
         **start_body,
@@ -1783,8 +1902,8 @@ async def test_interrupt_then_message_with_prev_id_starts_fresh_turn(
     """
     conv_id = "conv_interrupt_fresh_previd"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
-    followup_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
+    followup_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
     followup_status: int | None = None
     followup_events: list[_ParsedSSEEvent] = []
@@ -1850,7 +1969,7 @@ async def test_session_message_event_in_band_injection(
     """
     conv_id = "conv_session_inject"
     stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
-    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    side_client = _make_side_client(str(manager.socket_path(conv_id)), stream_client)
     events: list[_ParsedSSEEvent] = []
     start_body = {
         "type": "message",
