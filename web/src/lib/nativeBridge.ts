@@ -270,12 +270,15 @@ interface ElectronDesktopApi extends NativeShellApi {
       command: string;
       browserViewId: string | null;
       closingQuits?: boolean;
+      quitDetail?: string | null;
     }) => void,
   ) => () => void;
   /** Report which menu commands this page can run now (fire-and-forget). */
   setDesktopCommandState?: (state: DesktopCommandState) => void;
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow?: () => Promise<boolean>;
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit?: (options: { dontAskAgain: boolean }) => Promise<boolean>;
   /** The "Show Omnigent from anywhere" shortcut; absent on shells predating it. */
   getGlobalShortcut?: () => Promise<GlobalShortcutSetting | null>;
   /** Saves the shortcut; resolves `{ ok: false, error }` when the shell refuses the chord. */
@@ -295,7 +298,8 @@ export type DesktopCommand =
   | "focus-address-bar"
   | "reopen-closed-tab"
   | "previous-tab"
-  | "next-tab";
+  | "next-tab"
+  | "quit";
 
 const DESKTOP_COMMANDS: readonly string[] = [
   "close",
@@ -310,6 +314,7 @@ const DESKTOP_COMMANDS: readonly string[] = [
   "reopen-closed-tab",
   "previous-tab",
   "next-tab",
+  "quit",
 ] satisfies DesktopCommand[];
 
 export interface DesktopCommandEvent {
@@ -318,6 +323,8 @@ export interface DesktopCommandEvent {
   browserViewId: string | null;
   /** Whether closing this window quits the app (its last window, off macOS). */
   closingQuits: boolean;
+  /** For Quit: what quitting stops (local sessions, a local server), else null. */
+  quitDetail: string | null;
 }
 
 /** What the page tells the shell so it can enable and label its menu items. */
@@ -732,13 +739,14 @@ export function onDesktopCommand(callback: (event: DesktopCommandEvent) => void)
   const electron = electronApi();
   if (!electron?.onDesktopCommand) return () => {};
   try {
-    return electron.onDesktopCommand(({ command, browserViewId, closingQuits }) => {
+    return electron.onDesktopCommand(({ command, browserViewId, closingQuits, quitDetail }) => {
       // A newer shell may send commands this page doesn't know; drop them.
       if (!DESKTOP_COMMANDS.includes(command)) return;
       callback({
         command: command as DesktopCommand,
         browserViewId: browserViewId ?? null,
         closingQuits: closingQuits === true,
+        quitDetail: typeof quitDetail === "string" ? quitDetail : null,
       });
     });
   } catch (err) {
@@ -766,6 +774,18 @@ export async function closeDesktopWindow(): Promise<boolean> {
     return (await electron.closeWindow()) === true;
   } catch (err) {
     console.warn("[nativeBridge] closeWindow failed:", err);
+    return false;
+  }
+}
+
+/** Quit the desktop app once the page's prompt confirmed. Resolves whether the shell took it. */
+export async function confirmDesktopQuit(dontAskAgain: boolean): Promise<boolean> {
+  const electron = electronApi();
+  if (!electron?.confirmQuit) return false;
+  try {
+    return (await electron.confirmQuit({ dontAskAgain })) === true;
+  } catch (err) {
+    console.warn("[nativeBridge] confirmQuit failed:", err);
     return false;
   }
 }

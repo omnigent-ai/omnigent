@@ -62,6 +62,7 @@ describe("useDesktopCommand", () => {
       command: "close",
       browserViewId: "browser-tab:s:t",
       closingQuits: false,
+      quitDetail: null,
     });
   });
 
@@ -94,9 +95,13 @@ describe("useDesktopCommand", () => {
     expect(shell).not.toHaveBeenCalled();
   });
 
-  it("ignores commands while a dialog holds focus", () => {
+  it("ignores commands while a dialog holds focus, except Quit", () => {
     const handler = vi.fn();
-    renderHook(() => useDesktopCommand("new-browser-tab", handler));
+    const quit = vi.fn();
+    renderHook(() => {
+      useDesktopCommand("new-browser-tab", handler);
+      useDesktopCommand("quit", quit);
+    });
     const dialog = document.createElement("div");
     dialog.setAttribute("role", "dialog");
     const input = document.createElement("input");
@@ -105,7 +110,9 @@ describe("useDesktopCommand", () => {
     input.focus();
 
     send("new-browser-tab");
+    send("quit");
     expect(handler).not.toHaveBeenCalled();
+    expect(quit).toHaveBeenCalledTimes(1);
   });
 
   it("uses the latest handler without re-registering", async () => {

@@ -102,9 +102,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /**
    * Subscribe to native menu commands for this window (Close, New Terminal,
    * New Browser Tab, Pin/Archive Session). `browserViewId` names the embedded
-   * browser view that held focus when Close fired, else null. Returns an
-   * unsubscribe function.
-   * @param {(payload: {command: string, browserViewId: string | null}) => void} callback
+   * browser view that held focus when Close fired, else null; `quitDetail` says
+   * what Quit stops, for its prompt. Returns an unsubscribe function.
+   * @param {(payload: {command: string, browserViewId: string | null, closingQuits: boolean, quitDetail: string | null}) => void} callback
    * @returns {() => void}
    */
   onDesktopCommand: (callback) => {
@@ -114,6 +114,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         command: payload.command,
         browserViewId: typeof payload.browserViewId === "string" ? payload.browserViewId : null,
         closingQuits: payload.closingQuits === true,
+        quitDetail: typeof payload.quitDetail === "string" ? payload.quitDetail : null,
       });
     };
     ipcRenderer.on("omnigent:desktop-command", listener);
@@ -134,6 +135,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Close this window once the page has confirmed. Resolves whether it closed. */
   closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit: (options) =>
+    ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
   /** The "Show Omnigent from anywhere" shortcut (off by default). */
   getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
   /**
