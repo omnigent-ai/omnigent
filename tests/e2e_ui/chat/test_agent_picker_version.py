@@ -42,7 +42,7 @@ def _agents_body() -> str:
                 },
                 {
                     "id": _TEMPLATE_ID,
-                    "name": "agent-a",
+                    "name": "Agent-a",
                     "description": "Agent A version 1 (template)",
                     "harness": "claude-sdk",
                     "skills": [],
@@ -63,13 +63,13 @@ def _scan_body() -> str:
                 {
                     "id": _SCAN_UPLOAD_SESSION,
                     "agent_id": _UPLOAD_ID,
-                    "agent_name": "agent-a",
+                    "agent_name": "Agent-a",
                     "created_at": 300,
                 },
                 {
                     "id": _SCAN_TEMPLATE_SESSION,
                     "agent_id": _TEMPLATE_ID,
-                    "agent_name": "agent-a",
+                    "agent_name": "Agent-a",
                     "created_at": 250,
                 },
             ],
@@ -101,7 +101,7 @@ async def _register_routes(
                 {
                     "id": _UPLOAD_ID,
                     "object": "agent",
-                    "name": "agent-a",
+                    "name": "Agent-a",
                     "description": "Agent A version 2 (upload)",
                     "harness": "claude-sdk",
                     "skills": [],
@@ -141,7 +141,7 @@ async def _register_routes(
                 "data": [
                     {
                         "id": agent_id,
-                        "name": "agent-a",
+                        "name": "Agent-a",
                         "harness": "claude-sdk",
                         "created_at": created,
                     }
@@ -216,7 +216,7 @@ async def _drive(base_url: str, created_session_id: str, agent_install: bool) ->
             await expect(option(_OLD_UPLOAD_ID)).to_have_count(0)
             await expect(option(_TEMPLATE_ID)).to_have_count(1 if agent_install else 0)
             if agent_install:
-                await expect(option(_UPLOAD_ID)).to_contain_text("agent-a (yours)")
+                await expect(option(_UPLOAD_ID)).to_contain_text("Agent-a (yours)")
                 await expect(option(_TEMPLATE_ID)).to_contain_text("(server)")
 
             # Select Agent A, send, and assert the create POST bound the upload.
