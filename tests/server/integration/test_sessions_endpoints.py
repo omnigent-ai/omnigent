@@ -3038,11 +3038,20 @@ async def test_external_native_marker_leaves_pending_input_for_real_message(
     source_id: str | None,
 ) -> None:
     """
-    Native markers must not absorb a queued user message's upload.
+    Regression: steering with an upload must not feed it to a native marker.
 
-    Interrupt records and bridge-generated peer labels have no pending input
-    of their own. Keep the marker text-only so it renders as a system row,
-    and leave the upload queued for its real transcript echo.
+    Interrupting a turn to steer makes Claude write its own ``[Request
+    interrupted by user...]`` record into the transcript BEFORE the steering
+    message. The forwarder mirrors both back as user items. The interrupt
+    record has no pending-input entry of its own, so a FIFO drain for it
+    shifts the queue by a slot: the marker absorbs the queued message's
+    uploads and the real message persists with none. In the web UI that
+    renders as the raw marker text next to the screenshots, followed by a
+    blank bubble (the real message's ``[Attached:]`` markers are stripped and
+    its file blocks are gone). Assert the marker persists bare and the
+    steering message keeps the image.
+
+    Bridge-generated peer labels also have no pending input of their own.
     """
     from omnigent.runtime import pending_inputs
 
@@ -3120,7 +3129,8 @@ async def test_external_native_marker_lookalike_still_drains_pending_input(
     A user can type a message that merely resembles the marker. Over-matching
     would skip the drain for it, stranding the pending entry and dropping the
     upload it carries — the same class of bug from the other direction. The
-    interrupt regex is anchored, and a peer label requires its synthetic source id.
+    regex is anchored, so a bracketed question is a normal message.
+    Peer labels also require their synthetic source id to skip the drain.
     """
     from omnigent.runtime import pending_inputs
 

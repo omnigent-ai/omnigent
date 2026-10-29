@@ -17,6 +17,12 @@ from omnigent.harnesses.claude_native.bridge import (
     prepare_bridge_dir,
     record_hook_event,
 )
+from tests.harnesses.claude_native.forwarder.test_failure_telemetry import (
+    _append_transcript,
+    _poll_hooks,
+    _poll_transcript,
+)
+from tests.harnesses.claude_native.test_claude_native_bridge import _read_native_user
 
 
 @pytest.mark.asyncio
@@ -447,11 +453,7 @@ async def test_peer_input_before_settle_keeps_its_label_on_the_next_poll(
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
     state = forwarder.TranscriptForwardState(
-        transcript_path=transcript_path,
-        line_cursor=0,
-        byte_offset=0,
-        current_response_id="previous",
-        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+        transcript_path, 0, byte_offset=0, current_response_id="previous"
     )
     forwarder._write_forward_state(bridge_dir, state)
     requests: list[dict[str, Any]] = []
@@ -465,78 +467,34 @@ async def test_peer_input_before_settle_keeps_its_label_on_the_next_poll(
     ) as client:
         dedupe = forwarder._ForwardDedupeState()
         record_hook_event(bridge_dir, {"hook_event_name": "Stop"})
-        await forwarder._forward_available_status_events(
-            client=client,
-            session_id="conv_peer",
-            bridge_dir=bridge_dir,
-            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-            task_subjects={},
-            task_statuses={},
-            task_order=[],
-            response_id="previous",
+        await _poll_hooks(
+            client, bridge_dir, forwarder.HookForwardState(0, byte_offset=0), dedupe, "previous"
         )
         assert dedupe.pending_settled_response_id == "previous"
         assert dedupe.settled_response_id is None
-        origin = {"kind": "peer", "handback": True, "senderTaskId": "agent-1"}
-        text = '<agent-message from="reviewer">Done</agent-message>'
-        peer = (
-            {
-                "type": "attachment",
-                "attachment": {
-                    "type": "queued_command",
-                    "commandMode": "task-notification",
-                    "prompt": text,
-                    "origin": origin,
-                    "isMeta": True,
-                },
-            }
-            if queued
-            else {
-                "type": "user",
-                "message": {"role": "user", "content": text},
-                "origin": origin,
-                "isMeta": True,
-            }
+        _read_native_user(
+            tmp_path,
+            '<agent-message from="reviewer">Done</agent-message>',
+            queued="task-notification" if queued else None,
+            isMeta=True,
+            origin={"kind": "peer", "handback": True, "senderTaskId": "agent-1"},
         )
-        transcript_path.write_text(json.dumps({"uuid": "peer-input", **peer}) + "\n")
         requests.clear()
-        after_peer = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_peer",
-            bridge_dir=bridge_dir,
-            agent_name="Claude",
-            state=state,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
-        )
+        after_peer = await _poll_transcript(client, bridge_dir, state, dedupe)
         assert after_peer.current_response_id != "previous"
         if restart:
-            restored = forwarder._read_forward_state(bridge_dir)
-            assert restored is not None
-            after_peer = restored
+            after_peer = forwarder._read_forward_state(bridge_dir)
+            assert after_peer is not None
             dedupe = forwarder._ForwardDedupeState()
-        with transcript_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "uuid": "peer-reply",
-                        "message": {"role": "assistant", "content": "Continuing."},
-                    }
-                )
-                + "\n"
-            )
-        after_reply = await forwarder._forward_available_items(
-            client=client,
-            session_id="conv_peer",
-            bridge_dir=bridge_dir,
-            agent_name="Claude",
-            state=after_peer,
-            retry_tracker=forwarder._PostRetryTracker(),
-            dedupe=dedupe,
+        _append_transcript(
+            transcript_path,
+            {
+                "type": "assistant",
+                "uuid": "peer-reply",
+                "message": {"role": "assistant", "content": "Continuing."},
+            },
         )
+        after_reply = await _poll_transcript(client, bridge_dir, after_peer, dedupe)
 
     assert [request["type"] for request in requests] == ["external_conversation_item"] * 3
     marker, hidden, reply = [request["data"] for request in requests]
