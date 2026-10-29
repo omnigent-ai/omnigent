@@ -1,15 +1,15 @@
-"""Name what holds a thread pool once its queued jobs wait too long."""
+"""Name where a thread pool's workers are once its queued jobs wait too long."""
 
 from __future__ import annotations
 
 import asyncio
-import contextvars
-import functools
 import logging
 import os
 import queue
 import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import pytest
 
@@ -41,98 +41,66 @@ def hold_worker(release: threading.Event, private_argument: str) -> str:
     return private_argument
 
 
-def read_small_file() -> str:
-    """A quick job that only needs a free worker."""
-    return "ok"
+@contextmanager
+def held_pool(workers: int, private_argument: str = "held") -> Iterator[ThreadPoolExecutor]:
+    """A pool whose every worker is inside ``hold_worker`` until the context exits."""
+    release = threading.Event()
+    started = threading.Barrier(workers + 1)
 
+    def hold() -> str:
+        started.wait(budget(5))
+        return hold_worker(release, private_argument)
 
-def read_hook_events() -> str:
-    """Another quick job, queued behind the held worker."""
-    return "events"
+    pool = ThreadPoolExecutor(workers, thread_name_prefix="runner")
+    try:
+        for _ in range(workers):
+            pool.submit(hold)
+        started.wait(budget(5))
+        yield pool
+    finally:
+        release.set()
+        pool.shutdown(wait=True)
 
 
 @pytest.mark.asyncio
-async def test_backed_up_pool_reports_occupants_once_per_interval(pool_records) -> None:
+async def test_backed_up_pool_reports_where_workers_are_once_per_interval(pool_records) -> None:
     private_argument = "private-job-argument-canary"
-    release = threading.Event()
     report_interval_s = budget(0.8)
-    pool = watchdog.MonitoredThreadPoolExecutor(
-        1,
-        thread_name_prefix="runner",
-        stall_threshold_s=0.3,
-        sample_interval_s=0.05,
-        report_interval_s=report_interval_s,
-    )
-    loop = asyncio.get_running_loop()
-    try:
-        held = loop.run_in_executor(pool, hold_worker, release, private_argument)
-        # Queue through the same path asyncio.to_thread uses, so the label names the job.
-        queued = loop.run_in_executor(
-            pool, functools.partial(contextvars.copy_context().run, read_small_file)
+    with held_pool(1, private_argument) as pool:
+        watchdog.watch_thread_pool(
+            pool,
+            thread_name_prefix="runner",
+            stall_threshold_s=0.3,
+            probe_interval_s=0.05,
+            report_interval_s=report_interval_s,
         )
 
         record = await asyncio.to_thread(pool_records.get, timeout=budget(5))
         row = record_to_row(record, source="runner")
+        message = str(row["message"])
+        stack_trace = str(row["stack_trace"])
         assert row["event_name"] == "runner_thread_pool_backed_up"
-        assert row["attributes"]["pid"] == str(os.getpid())
-        assert record.attributes["max_workers"] == 1
-        assert record.attributes["busy_workers"] == 1
-        assert record.attributes["queued_jobs"] == 1
-        assert record.attributes["oldest_queued_s"] >= 0.3
-        assert "hold_worker x1" in record.attributes["running"]
-        assert "read_small_file x1" in record.attributes["queued"]
-        assert "hold_worker x1" in row["message"]
-        assert "read_small_file x1" in row["message"]
-        assert "\n" not in row["message"]
-        assert "Worker runner_0 running" in row["stack_trace"]
-        assert "in hold_worker" in row["stack_trace"]
+        assert record.attributes["pid"] == os.getpid()
+        assert record.attributes["workers"] == 1
+        assert record.attributes["waited_s"] >= 0.3
+        assert "in hold_worker x1" in record.attributes["worker_locations"]
+        assert "in hold_worker x1" in message
+        assert "\n" not in message
+        assert "Worker runner_0" in stack_trace
+        assert "in hold_worker" in stack_trace
         assert private_argument not in str(row)
 
         # Still backed up: the next report waits out the report interval.
         second = await asyncio.to_thread(pool_records.get, timeout=budget(5))
         assert second.created - record.created >= report_interval_s - 0.05
-        assert second.attributes["queued_jobs"] == 1
-
-        release.set()
-        assert await held == private_argument
-        assert await queued == "ok"
-        assert pool.snapshot().queued == ()
-        assert pool.snapshot().running == {}
-    finally:
-        release.set()
-        pool.shutdown(wait=True)
 
 
-@pytest.mark.asyncio
-async def test_job_cancelled_while_queued_is_left_out_of_reports(pool_records) -> None:
-    release = threading.Event()
-    pool = watchdog.MonitoredThreadPoolExecutor(
-        1, stall_threshold_s=0.3, sample_interval_s=0.05, report_interval_s=budget(30)
+def test_watchdog_exits_once_the_pool_shuts_down() -> None:
+    pool = ThreadPoolExecutor(1, thread_name_prefix="runner")
+    watch_thread = watchdog.watch_thread_pool(
+        pool, thread_name_prefix="runner", stall_threshold_s=0.3, probe_interval_s=0.05
     )
-    try:
-        pool.submit(hold_worker, release, "held")
-        cancelled = pool.submit(read_small_file)
-        assert cancelled.cancel()
-        assert pool.snapshot().queued == ()
-        still_queued = pool.submit(read_hook_events)
-
-        record = await asyncio.to_thread(pool_records.get, timeout=budget(5))
-        assert record.attributes["queued_jobs"] == 1
-        assert "read_hook_events x1" in record.attributes["queued"]
-        assert "read_small_file" not in record.getMessage()
-
-        release.set()
-        assert still_queued.result(timeout=budget(5)) == "events"
-    finally:
-        release.set()
-        pool.shutdown(wait=True)
-
-
-def test_shutdown_stops_the_watchdog_thread() -> None:
-    pool = watchdog.MonitoredThreadPoolExecutor(1, sample_interval_s=0.05, stall_threshold_s=0.3)
-    assert pool.submit(read_small_file).result(timeout=budget(5)) == "ok"
-    watch_thread = pool._watch_thread
-    assert watch_thread is not None and watch_thread.is_alive()
+    assert watch_thread.is_alive()
 
     pool.shutdown(wait=True)
 
@@ -140,17 +108,35 @@ def test_shutdown_stops_the_watchdog_thread() -> None:
     assert not watch_thread.is_alive()
 
 
+def test_worker_stacks_stay_within_the_report_budget(monkeypatch) -> None:
+    with held_pool(3):
+        workers = sorted(
+            (thread for thread in threading.enumerate() if thread.name.startswith("runner_")),
+            key=lambda thread: thread.name,
+        )
+        first_section = watchdog._worker_stacks(workers[:1])
+        marker = "... 2 more workers omitted ...\n"
+        limit = len(first_section.encode()) + len(marker)
+        monkeypatch.setattr(watchdog, "_MAX_REPORT_STACK_BYTES", limit)
+
+        stacks = watchdog._worker_stacks(workers)
+
+    assert stacks == first_section + marker
+    assert len(stacks.encode()) <= limit
+
+
 @pytest.mark.parametrize(
-    ("stall_threshold_s", "sample_interval_s", "report_interval_s"),
-    [(0.0, 0.05, 1.0), (float("inf"), 0.05, 1.0), (1.0, 1.0, 1.0), (1.0, 0.1, -1.0)],
+    ("stall_threshold_s", "probe_interval_s", "report_interval_s"),
+    [(0.0, 0.05, 1.0), (float("inf"), 0.05, 1.0), (1.0, -1.0, 1.0), (1.0, 0.1, float("nan"))],
 )
 def test_rejects_unusable_intervals(
-    stall_threshold_s: float, sample_interval_s: float, report_interval_s: float
+    stall_threshold_s: float, probe_interval_s: float, report_interval_s: float
 ) -> None:
     with pytest.raises(ValueError):
-        watchdog.MonitoredThreadPoolExecutor(
-            1,
+        watchdog.watch_thread_pool(
+            ThreadPoolExecutor(1),
+            thread_name_prefix="runner",
             stall_threshold_s=stall_threshold_s,
-            sample_interval_s=sample_interval_s,
+            probe_interval_s=probe_interval_s,
             report_interval_s=report_interval_s,
         )
