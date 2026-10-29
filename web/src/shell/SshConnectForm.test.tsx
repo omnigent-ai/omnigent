@@ -1,14 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchHosts, type Host } from "@/hooks/useHosts";
 import { SshConnectForm } from "./SshConnectForm";
-
-vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn(async () => []) }));
-
-function online(...hostIds: string[]): Host[] {
-  return hostIds.map((hostId) => ({ host_id: hostId, status: "online" }) as Host);
-}
 
 interface Desktop {
   kind: "electron";
@@ -41,7 +34,6 @@ function connect(destination: string) {
 
 afterEach(() => {
   cleanup();
-  vi.mocked(fetchHosts).mockReset().mockResolvedValue([]);
   delete (window as unknown as { omnigentDesktop?: Desktop }).omnigentDesktop;
 });
 
@@ -75,13 +67,11 @@ describe("SshConnectForm", () => {
     }
   });
 
-  // Without a confirmed id the form never guesses, even when another machine comes online.
+  // Without a confirmed id the form never picks a host for the user.
   it.each([
     ["was already connected", true, "my-ec2 was already connected to this server."],
     ["connected but its id couldn't be read", false, "my-ec2 is connected. Pick it from"],
   ])("stays open for the user to pick when a machine %s", async (_name, alreadyRunning, text) => {
-    // An unrelated machine reconnects while this one connects.
-    vi.mocked(fetchHosts).mockResolvedValueOnce(online("h1")).mockResolvedValue(online("h1", "h2"));
     const { onConnected } = renderForm({ ok: true, alreadyRunning, identity: null });
 
     connect("my-ec2");

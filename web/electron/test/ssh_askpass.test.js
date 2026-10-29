@@ -106,11 +106,15 @@ describe("createAskpass", () => {
     });
     t.after(() => askpass.close());
 
-    const result = await askLikeSsh(askpass.env, "password: ", {
-      OMNIGENT_SSH_ASKPASS_TOKEN: "0".repeat(48),
-    });
-
-    assert.deepEqual(result, { code: 1, stdout: "" });
+    // A wrong token, and one the same length in characters but not in bytes.
+    for (const token of ["0".repeat(48), "\u00e9".repeat(48)]) {
+      // Sequential by design: each caller is refused before the next.
+      // oxlint-disable-next-line no-await-in-loop
+      const result = await askLikeSsh(askpass.env, "password: ", {
+        OMNIGENT_SSH_ASKPASS_TOKEN: token,
+      });
+      assert.deepEqual(result, { code: 1, stdout: "" });
+    }
     assert.equal(asked, false);
   });
 });

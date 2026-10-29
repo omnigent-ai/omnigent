@@ -65,8 +65,13 @@ function shellQuote(value) {
  * @returns {boolean}
  */
 function tokensMatch(given, expected) {
-  if (typeof given !== "string" || given.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+  if (typeof given !== "string") return false;
+  // Compare encoded bytes: timingSafeEqual throws on buffers of different lengths.
+  const givenBytes = Buffer.from(given);
+  const expectedBytes = Buffer.from(expected);
+  return (
+    givenBytes.length === expectedBytes.length && crypto.timingSafeEqual(givenBytes, expectedBytes)
+  );
 }
 
 /**

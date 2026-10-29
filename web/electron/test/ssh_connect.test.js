@@ -465,6 +465,29 @@ describe("runSshConnect", () => {
     assert.ok(session.calls.includes("cancel-exec"));
   });
 
+  // Every callback port is busy here: only a sign-in that needs no callback port can work.
+  const allBusy = {
+    "a server's own sign-in, which needs no callback port, goes through": [
+      `Opening browser for login: ${SERVER}/auth/cli?t=1`,
+      { ok: true, alreadyRunning: false, identity: { serverUrl: SERVER, hostId: HOST_ID } },
+    ],
+    "a Databricks sign-in, which does, stops with a plain message": [
+      authorizeLink(8020),
+      { ok: false, error: "No free sign-in port on this computer: 8020 to 8040 are all in use." },
+    ],
+  };
+  for (const [label, [line, expected]] of Object.entries(allBusy)) {
+    it(`with every sign-in port busy, ${label}`, async () => {
+      const session = fakeSession({ logins: [{ lines: [line], code: 0 }] });
+      const { ctx, opened } = connectContext(session, { isPortFree: async () => false });
+
+      assert.deepEqual(await runSshConnect(ctx), expected);
+      assert.deepEqual(opened, expected.ok ? [`${SERVER}/auth/cli?t=1`] : []);
+      // Nothing held or forwarded: no port here could take the callback.
+      assert.ok(!session.calls.some((call) => /^(holdRemote|forwardLocal)/.test(call)));
+    });
+  }
+
   it("stops sign-in at once when the link can't be opened", async () => {
     // The CLI would otherwise wait for a redirect that can never come.
     const session = fakeSession({ logins: [{ lines: [authorizeLink(8020)], code: 0 }] });

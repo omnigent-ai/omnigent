@@ -566,20 +566,17 @@ async function signIn(ctx) {
     (_, index) => SIGN_IN_FIRST_PORT + index,
   );
   const free = await Promise.all(ports.map((port) => portFree(port)));
-  const busy = ports.filter((_, index) => !free[index]);
-  if (busy.length > SIGN_IN_LAST_PORT - SIGN_IN_FIRST_PORT) {
-    return {
-      ok: false,
-      error: `No free sign-in port on this computer: ${SIGN_IN_FIRST_PORT} to ${SIGN_IN_LAST_PORT} are all in use.`,
-    };
-  }
+  // The first port free here is the one the CLI should land on. With none free, only a
+  // server's own sign-in (no callback port) can work, so hold nothing and let it run.
+  const expected = ports.find((_, index) => free[index]) ?? null;
+  const busy = expected === null ? [] : ports.filter((_, index) => !free[index]);
   // A port the remote machine already uses can't be held, but the CLI skips it anyway.
   const holds = await Promise.all(busy.map((port) => session.holdRemote(port)));
   const held = busy.filter((_, index) => holds[index].code === 0);
   // Take the port the CLI should pick before it starts: tools that forward new
   // remote listeners to this computer (Arca Companion, VS Code) would grab it first.
-  const expected = ports.find((_, index) => free[index]);
-  let forwarded = (await session.forwardLocal(expected)).code === 0 ? expected : null;
+  let forwarded =
+    expected !== null && (await session.forwardLocal(expected)).code === 0 ? expected : null;
   if (ctx.isCanceled()) return canceledResult();
 
   onStatus({ step: "signing-in" });
@@ -601,6 +598,11 @@ async function signIn(ctx) {
       return;
     }
     if (link.port !== null && link.port !== forwarded) {
+      if (expected === null) {
+        problem = `No free sign-in port on this computer: ${SIGN_IN_FIRST_PORT} to ${SIGN_IN_LAST_PORT} are all in use.`;
+        run.cancel();
+        return;
+      }
       // The remote machine had the expected port in use, so the CLI moved on.
       if (forwarded !== null) {
         await session.cancelLocal(forwarded);
