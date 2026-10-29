@@ -477,10 +477,13 @@ function createSshSession(options) {
      * @param {{ stdin?: string | null, holdStdin?: boolean, timeoutMs?: number, onStdout?: (t: string) => void, onStderr?: (t: string) => void }} [opts]
      */
     exec(script, opts = {}) {
-      // A shared-connection client would otherwise re-request the config's forwards,
-      // and ssh refuses a command when the alias sets RemoteCommand (say, tmux).
+      // Use the master even when the config says ControlMaster yes or ask, which skip
+      // it; don't re-request the config's forwards; and run the command even when the
+      // alias sets RemoteCommand (say, tmux), which ssh would otherwise refuse.
       return client(
         [
+          "-o",
+          "ControlMaster=no",
           "-o",
           "ClearAllForwardings=yes",
           "-o",

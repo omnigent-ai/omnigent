@@ -481,50 +481,36 @@ describe("runSshConnect", () => {
     assert.ok(session.calls.includes("cancelLocal 8020"));
   });
 
-  it("reports the last plain output line on failure, never a sign-in link", async () => {
-    const session = fakeSession({
-      logins: [{ lines: ["Could not reach server", `https://x.example/secret?t=1`], code: 1 }],
-    });
-    const { ctx } = connectContext(session);
-
-    const result = await runSshConnect(ctx);
-
-    assert.equal(result.ok, false);
-    assert.equal(result.error, "Signing in on my-ec2 failed: Could not reach server");
-  });
-
-  it("reports the CLI's own error over a trailing hint, without link values", async () => {
-    const session = fakeSession({
-      logins: [
-        {
-          lines: [
-            "Error: Could not reach https://ws.example/oidc/authorize?state=s3cret for sign-in",
-            "Is the server running?",
-            "If this is a runner tunnel rejection (HTTP 401), stale host processes may be the cause.",
-          ],
-          code: 1,
-        },
+  // What the CLI printed, and what the failure says; link values never appear.
+  const failures = {
+    "the last plain output line, never a sign-in link": [
+      ["Could not reach server", "https://x.example/secret?t=1"],
+      "Could not reach server",
+    ],
+    "the CLI's own error over a trailing hint, without link values": [
+      [
+        "Error: Could not reach https://ws.example/oidc/authorize?state=s3cret for sign-in",
+        "Is the server running?",
+        "If this is a runner tunnel rejection (HTTP 401), stale host processes may be the cause.",
       ],
+      "Could not reach https://ws.example/oidc/authorize for sign-in",
+    ],
+    "an error the CLI prints after the sign-in link": [
+      [authorizeLink(8020), "Error: Authentication was denied."],
+      "Authentication was denied.",
+    ],
+  };
+  for (const [label, [lines, detail]] of Object.entries(failures)) {
+    it(`reports ${label}`, async () => {
+      const session = fakeSession({ logins: [{ lines, code: 1 }] });
+      const { ctx } = connectContext(session);
+
+      assert.deepEqual(await runSshConnect(ctx), {
+        ok: false,
+        error: `Signing in on my-ec2 failed: ${detail}`,
+      });
     });
-    const { ctx } = connectContext(session);
-
-    assert.equal(
-      (await runSshConnect(ctx)).error,
-      "Signing in on my-ec2 failed: Could not reach https://ws.example/oidc/authorize for sign-in",
-    );
-  });
-
-  it("reports an error the CLI prints after the sign-in link", async () => {
-    const session = fakeSession({
-      logins: [{ lines: [authorizeLink(8020), "Error: Authentication was denied."], code: 1 }],
-    });
-    const { ctx } = connectContext(session);
-
-    assert.equal(
-      (await runSshConnect(ctx)).error,
-      "Signing in on my-ec2 failed: Authentication was denied.",
-    );
-  });
+  }
 
   it("explains servers that sign in with a username and password", async () => {
     const session = fakeSession({
@@ -702,9 +688,9 @@ describe("createSshSession", () => {
     await session.holdRemote(8020);
     await session.exec("true").promise;
 
-    // The user's config reaches the connection and commands, but never its
-    // forwards or RemoteCommand; control requests skip the config so it can't
-    // empty theirs, and local forwards bind loopback whatever GatewayPorts says.
+    // The user's config reaches the connection and commands, but never its ControlMaster,
+    // forwards or RemoteCommand; control requests skip the config so it can't empty
+    // theirs, and local forwards bind loopback whatever GatewayPorts says.
     const control = ["ssh", "-F", "/dev/null", "-S", "/tmp/s/m", "-O"];
     assert.deepEqual(spawned, [
       [
@@ -731,6 +717,8 @@ describe("createSshSession", () => {
         "ssh",
         "-S",
         "/tmp/s/m",
+        "-o",
+        "ControlMaster=no",
         "-o",
         "ClearAllForwardings=yes",
         "-o",

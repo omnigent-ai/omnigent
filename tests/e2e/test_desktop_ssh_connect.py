@@ -185,9 +185,9 @@ def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) ->
             "  IdentitiesOnly yes\n  IdentityAgent none\n"
             f"  UserKnownHostsFile {laptop / 'known_hosts'}\n"
             "  StrictHostKeyChecking ask\n"
-            # A user's config may clear forwards or open them to the network;
-            # the app's own must still work and stay on loopback.
-            "  ClearAllForwardings yes\n  GatewayPorts yes\n"
+            # A user's config may clear forwards, open them to the network, or make
+            # every ssh a master; the app's must still work, on loopback, over one connection.
+            "  ClearAllForwardings yes\n  GatewayPorts yes\n  ControlMaster yes\n"
         )
         ssh_config.chmod(0o600)
         laptop_env = {
@@ -233,9 +233,9 @@ def test_ssh_connect_signs_in_through_forward_and_starts_host(tmp_path: Path) ->
             assert result is not None and result["ok"] is True, diagnostics
             assert {"loopbackOnly": True} in events, diagnostics
 
-            # Both prompts came to the app: trust the new machine, then the key passphrase.
+            # Both prompts came to the app, once each: every later step reused the connection.
             prompts = [event["prompt"] for event in events if "prompt" in event]
-            assert prompts[:2] == ["confirm", "secret"], diagnostics
+            assert prompts == ["confirm", "secret"], diagnostics
             assert (laptop / "known_hosts").read_text().strip(), "trusted host key not saved"
 
             # The CLI avoided the laptop's busy port; the redirect came back through the forward.
