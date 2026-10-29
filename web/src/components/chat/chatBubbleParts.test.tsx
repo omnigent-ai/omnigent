@@ -2,10 +2,10 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bubble } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
-import { BubbleView, containsMermaidDiagram } from "./chatBubbleParts";
+import { BubbleView, containsMermaidDiagram, keyboardActiveQuestionId } from "./chatBubbleParts";
 
 const fetchMock = vi.fn();
 const initialStoreState = useChatStore.getState();
@@ -754,5 +754,52 @@ describe("AssistantBubble copy", () => {
     expect(await item.items["text/html"].text()).toBe(
       "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
     );
+  });
+});
+
+describe("keyboardActiveQuestionId", () => {
+  type Elicitation = Extract<RenderItem, { kind: "elicitation" }>;
+  const question = (elicitationId: string, extra: Partial<Elicitation> = {}): Elicitation => ({
+    kind: "elicitation",
+    itemId: null,
+    elicitationId,
+    message: "Claude has questions",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+    status: "pending",
+    response: null,
+    askUserQuestion: {
+      questions: [
+        { question: "Which framework?", options: [{ label: "React" }], multiSelect: false },
+      ],
+    },
+    ...extra,
+  });
+  const approval = (elicitationId: string): Elicitation => ({
+    ...question(elicitationId),
+    askUserQuestion: null,
+    contentPreview: "Bash({})",
+  });
+
+  it("picks the newest pending question", () => {
+    expect(keyboardActiveQuestionId([question("q_old"), question("q_new")])).toBe("q_new");
+  });
+
+  it("looks past newer approvals to the newest question", () => {
+    expect(keyboardActiveQuestionId([question("q_1"), approval("bash_2")])).toBe("q_1");
+  });
+
+  it("returns null when no question is pending", () => {
+    expect(keyboardActiveQuestionId([])).toBeNull();
+    expect(keyboardActiveQuestionId([approval("bash_1")])).toBeNull();
+  });
+
+  it("holds the keys while the newest question awaits delivery", () => {
+    const awaiting = question("q_new", {
+      nativeDelivery: { state: "sending", attempt: "attempt_1", action: "accept" },
+    });
+    expect(keyboardActiveQuestionId([question("q_old"), awaiting])).toBeNull();
   });
 });

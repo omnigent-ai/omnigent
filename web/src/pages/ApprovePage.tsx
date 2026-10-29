@@ -235,6 +235,7 @@ export function ApprovePage() {
             nativeDelivery={state.data.native_delivery}
             permissionDirectories={state.data.permission_directories}
             onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
+            keyboardActive
           />
         )}
       {state.kind === "pending" &&
