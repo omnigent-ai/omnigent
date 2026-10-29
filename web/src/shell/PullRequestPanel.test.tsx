@@ -585,23 +585,49 @@ describe("PullRequestPanel", () => {
   });
 
   it("polls only while active and refreshes stale info on reactivation", async () => {
+    const user = userEvent.setup();
+    state.info!.data!.tracking_available = true;
+    const url = state.info!.data!.pr!.url;
+    state.stored.conv_1 = [
+      { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      {
+        url: "https://github.com/acme/app/pull/6001",
+        host: "github.com",
+        repository: "acme/app",
+        number: 6001,
+        relationship: "attached",
+      },
+    ];
     const refetchQueries = vi.spyOn(QueryClient.prototype, "refetchQueries");
     onTestFinished(() => refetchQueries.mockRestore());
     const { rerender } = renderPanel(false, false);
 
     // A collapsed rail keeps the panel mounted but must not poll.
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false });
+    expect(await screen.findByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(
+      vi.mocked(usePullRequestInfo).mock.calls.every(([, options]) => options?.poll === false),
+    ).toBe(true);
+    for (const pr of state.stored.conv_1) {
+      expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: false, prUrl: pr.url });
+    }
 
     expect(refetchQueries).not.toHaveBeenCalled();
 
+    vi.mocked(usePullRequestInfo).mockClear();
     rerender(<PullRequestPanel conversationId="conv_1" active />);
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true });
+    for (const pr of state.stored.conv_1) {
+      expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: "list", prUrl: pr.url });
+    }
     // Turning the poll back on doesn't fetch by itself.
     expect(refetchQueries).toHaveBeenCalledWith({
       queryKey: ["github-info", "conv_1"],
       stale: true,
     });
+    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: url });
+    rerender(<PullRequestPanel conversationId="conv_1" active={false} />);
+    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: false, prUrl: url });
   });
 
   it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
