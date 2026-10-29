@@ -1,6 +1,69 @@
 {
   "components": {
     "schemas": {
+      "AccountTransitionResponse": {
+        "description": "Destination of a pending account move; the server's recovery state stays private.",
+        "properties": {
+          "account_id": {
+            "description": "Account the session moves to.",
+            "title": "Account Id",
+            "type": "string"
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination reasoning effort, or `None` for the default.",
+            "title": "Effort"
+          },
+          "harness": {
+            "description": "Native harness, which the move keeps.",
+            "title": "Harness",
+            "type": "string"
+          },
+          "host_id": {
+            "description": "Destination host.",
+            "title": "Host Id",
+            "type": "string"
+          },
+          "id": {
+            "description": "Identifier to send as `transition_id` when finishing the move.",
+            "title": "Id",
+            "type": "string"
+          },
+          "model": {
+            "description": "Destination model.",
+            "title": "Model",
+            "type": "string"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination working directory, or `None` to keep the current one.",
+            "title": "Workspace"
+          }
+        },
+        "required": [
+          "id",
+          "account_id",
+          "host_id",
+          "harness",
+          "model"
+        ],
+        "title": "AccountTransitionResponse",
+        "type": "object"
+      },
       "AddCommentRequest": {
         "description": "Request body for `POST /sessions/{id}/comments`.",
         "properties": {
@@ -3587,6 +3650,19 @@
       "LaunchRunnerRequest": {
         "description": "Request body for `POST /v1/hosts/{host_id}/runners`.",
         "properties": {
+          "account_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Account the session is launched under, e.g. `\"claude-personal\"`. Required to finish an account move; must match the configured registry.",
+            "title": "Account Id"
+          },
           "git": {
             "anyOf": [
               {
@@ -3602,6 +3678,19 @@
             "description": "Session to bind the new runner to, e.g. `\"conv_abc123\"`.",
             "title": "Session Id",
             "type": "string"
+          },
+          "transition_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`account_transition.id` of the pending move this launch finishes.",
+            "title": "Transition Id"
           },
           "workspace": {
             "description": "Absolute path on the host machine to use as the runner's working directory, e.g. `\"/Users/corey/projects/frontend\"`. When `git` is set, this is interpreted as the source repository directory and the runner starts in the created worktree instead.",
@@ -8214,6 +8303,17 @@
       "SessionResponse": {
         "description": "API representation of a session.\n\nReturned by `POST /v1/sessions`, `GET /v1/sessions/{id}`,\nand `PATCH /v1/sessions/{id}`.",
         "properties": {
+          "account_transition": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AccountTransitionResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination of an unfinished account move, or `None` when no move is pending. The server owns it; a client finishes the move by launching at this destination, or cancels it."
+          },
           "active_response_id": {
             "anyOf": [
               {
@@ -10211,6 +10311,31 @@
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{id}`.\n\nThe Alpha runner-state pivot makes this endpoint the mutable\nsession affinity primitive when `runner_id` is provided. The\nserver validates that the runner is online, then replaces\n`conversations.runner_id`. Existing session metadata updates\nremain supported for clients that update title, labels, or\nreasoning effort through the sessions API.",
         "properties": {
+          "abandon_transition": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`True` with `transition_id` cancels the pending move: the launch attempt is stopped, the marker is cleared and the session stays detached. Owner only.",
+            "title": "Abandon Transition"
+          },
+          "account_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "With `target_host_id`, the account the session moves to, e.g. `\"claude-personal\"`. Requires a configured host account registry.",
+            "title": "Account Id"
+          },
           "approval_mode": {
             "anyOf": [
               {
@@ -10382,6 +10507,71 @@
             "description": "Per-session subagent-routing switch: `\"on\"` routes subagent spawns, `\"off\"` leaves them unrouted. Explicit JSON `null` clears the override, which lands the session on Default (the same behavior as `\"off\"` \u2014 nothing is inherited); omitting the field leaves it unchanged (same presence-is-the-clear-signal rule as `cost_control_mode_override`). Effective on the next spawn, so it can be changed at any point in a session.",
             "title": "Subagent Routing Override"
           },
+          "target_effort": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination reasoning effort, or `None` for the model default.",
+            "title": "Target Effort"
+          },
+          "target_harness": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Native harness of the destination. It must equal the session's current harness; a session cannot change harness family.",
+            "title": "Target Harness"
+          },
+          "target_host_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination host of an account change. Together with `runner_id=\"\"` it detaches the session and records the destination as `account_transition` for the launch to finish.",
+            "title": "Target Host Id"
+          },
+          "target_model": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination model, validated against the destination's model catalog.",
+            "title": "Target Model"
+          },
+          "target_workspace": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Working directory to use at the destination.",
+            "title": "Target Workspace"
+          },
           "terminal_launch_args": {
             "anyOf": [
               {
@@ -10409,6 +10599,19 @@
             ],
             "description": "New title, e.g. `\"debugging auth flow\"`. `None` leaves unchanged.",
             "title": "Title"
+          },
+          "transition_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`account_transition.id` of the pending move. Required for runtime changes while a move is pending.",
+            "title": "Transition Id"
           }
         },
         "title": "UpdateSessionRequest",
@@ -11323,6 +11526,30 @@
           }
         },
         "summary": "Branding Logo"
+      }
+    },
+    "/v1/execution-topology": {
+      "get": {
+        "description": "Return the account registry as machines, accounts and bindings.\n\nLists only placements on non-sandbox hosts the caller owns, each with\nits availability.\n\n**Returns:** `configured`, `machines`, `accounts` and `bindings`.",
+        "operationId": "get_execution_topology_v1_execution_topology_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Execution Topology V1 Execution Topology Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Execution Topology",
+        "tags": [
+          "hosts"
+        ]
       }
     },
     "/v1/extensions": {
@@ -12399,7 +12626,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/model-options": {
       "get": {
-        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the host is unknown, 403 when not the owner, 409 when offline or the host daemon is too old to list model options, 502 on host-side failure, 504 on timeout.",
+        "description": "Return pre-launch model choices resolved by the selected host.\n\nA preview of the host's ambient default catalog, not a binding\nsnapshot: launch re-resolves with the session's agent spec, and the\nin-session picker reflects that launch snapshot once the runner is up.\n\nWith an account registry configured, the host and harness must\nbelong to an account (and to `account_id` when given).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the host is unknown, 403 when not the owner, 400 when the route is not allowed by the account registry, 409 when offline or the host daemon is too old to list model options, 502 on host-side failure, 504 on timeout.",
         "operationId": "get_host_model_options_v1_hosts__host_id__harnesses__harness__model_options_get",
         "parameters": [
           {
@@ -12418,6 +12645,22 @@
             "schema": {
               "title": "Harness",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Account Id"
             }
           }
         ],

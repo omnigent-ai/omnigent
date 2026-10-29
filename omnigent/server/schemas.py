@@ -2144,6 +2144,27 @@ class BackgroundTaskInfo(BaseModel):
     command: str | None = None
 
 
+class AccountTransitionResponse(BaseModel):
+    """Destination of a pending account move; the server's recovery state stays private.
+
+    :param id: Identifier to send as ``transition_id`` when finishing the move.
+    :param account_id: Account the session moves to.
+    :param host_id: Destination host.
+    :param harness: Native harness, which the move keeps.
+    :param model: Destination model.
+    :param effort: Destination reasoning effort, or ``None`` for the default.
+    :param workspace: Destination working directory, or ``None`` to keep the current one.
+    """
+
+    id: str
+    account_id: str
+    host_id: str
+    harness: str
+    model: str
+    effort: str | None = None
+    workspace: str | None = None
+
+
 class SessionResponse(BaseModel):
     """
     API representation of a session.
@@ -2186,6 +2207,9 @@ class SessionResponse(BaseModel):
     :param host_id: Host that launched (or should launch) the
         runner for this session, e.g. ``"host_a1b2c3d4..."``.
         ``None`` for CLI-initiated sessions.
+    :param account_transition: Destination of an unfinished account move,
+        or ``None`` when no move is pending. The server owns it; a client
+        finishes the move by launching at this destination, or cancels it.
     :param runner_online: Strict runner liveness — ``True`` iff a
         runner tunnel is currently registered for this session.
         This is the sole reachability signal: ``True`` means the
@@ -2417,6 +2441,7 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    account_transition: AccountTransitionResponse | None = None
     # Derived from the parent runner's live handshake, never persisted on the child.
     side_chat_settings_supported: bool = False
     runner_online: bool | None = None
@@ -2485,6 +2510,24 @@ class UpdateSessionRequest(BaseModel):
     :param runner_id: Identifier of a registered runner, e.g.
         ``"runner_abc123"``. ``None`` leaves runner binding
         unchanged.
+    :param account_id: With ``target_host_id``, the account the
+        session moves to, e.g. ``"claude-personal"``. Requires a configured
+        host account registry.
+    :param target_host_id: Destination host of an account change. Together
+        with ``runner_id=""`` it detaches the session and records the
+        destination as ``account_transition`` for the launch to finish.
+    :param target_harness: Native harness of the destination. It must equal
+        the session's current harness; a session cannot change harness family.
+    :param target_model: Destination model, validated against the
+        destination's model catalog.
+    :param target_effort: Destination reasoning effort, or ``None`` for the
+        model default.
+    :param target_workspace: Working directory to use at the destination.
+    :param transition_id: ``account_transition.id`` of the pending
+        move. Required for runtime changes while a move is pending.
+    :param abandon_transition: ``True`` with ``transition_id`` cancels the
+        pending move: the launch attempt is stopped, the marker is cleared
+        and the session stays detached. Owner only.
     :param title: New title, e.g. ``"debugging auth flow"``.
         ``None`` leaves unchanged.
     :param labels: Guardrails labels to upsert. Merges with existing
@@ -2589,6 +2632,14 @@ class UpdateSessionRequest(BaseModel):
     """
 
     runner_id: str | None = None
+    account_id: str | None = Field(default=None, max_length=128)
+    target_host_id: str | None = Field(default=None, max_length=64)
+    target_harness: str | None = Field(default=None, max_length=64)
+    target_model: str | None = Field(default=None, max_length=256)
+    target_effort: str | None = Field(default=None, max_length=64)
+    target_workspace: str | None = Field(default=None, max_length=1024)
+    transition_id: str | None = Field(default=None, max_length=64)
+    abandon_transition: bool | None = None
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] | None = None
     reasoning_effort: str | None = None

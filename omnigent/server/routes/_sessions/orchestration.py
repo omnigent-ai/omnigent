@@ -151,6 +151,7 @@ from omnigent.server.bundles import (
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
 from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
+from omnigent.server.host_accounts import require_account_route
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -369,6 +370,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
+    AccountTransitionResponse,
     BackgroundTaskInfo,
     ChildSessionSummary,
     CreatedSessionResponse,
@@ -1514,6 +1516,16 @@ def _build_session_response(
         labels=labels,
         runner_id=conv.runner_id,
         host_id=conv.host_id,
+        account_transition=(
+            AccountTransitionResponse.model_validate(
+                {
+                    key: conv.account_transition.get(key)
+                    for key in AccountTransitionResponse.model_fields
+                }
+            )
+            if conv.account_transition is not None
+            else None
+        ),
         runner_online=runner_online,
         host_online=host_online,
         host_resumable=host_resumable,
@@ -11794,6 +11806,8 @@ async def _create_session_from_existing_agent(
         host_store=getattr(request.app.state, "host_store", None),
         parent=_parent_for_routing,
     )
+    if body.host_id is not None and inherited_runner_id is None:
+        require_account_route(request, host_id=body.host_id, harness=selected_harness)
 
     # Git worktree options (optional). Two modes on body.git:
     #  - create (default): make a worktree; it becomes the stored

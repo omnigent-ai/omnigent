@@ -82,8 +82,18 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.host_accounts import (
+    MANAGED_HARNESSES,
+    account_registry,
+    require_account_route,
+    validate_account_selection,
+)
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
+from omnigent.server.routes._account_transition import (
+    abandon_account_transition,
+    begin_account_transition,
+)
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
 )
@@ -333,6 +343,45 @@ async def _wake_runner_for_model_change(
         conv.id, conv.runner_id, runner_client, conversation_store, conversation=conv
     )
     return conv
+
+
+# Session fields that start, address or reconfigure a runner. While a
+# account move is pending they require its transition id.
+_TRANSITION_GUARDED_FIELDS = frozenset(
+    {
+        "runner_id",
+        "model_override",
+        "reasoning_effort",
+        "terminal_launch_args",
+        "external_session_id",
+        "cost_control_mode_override",
+        "subagent_routing_override",
+        "collaboration_mode",
+        "permission_mode",
+        "approval_mode",
+    }
+)
+
+
+def _check_pending_transition(body: UpdateSessionRequest, marker: dict[str, Any]) -> None:
+    """Allow only runtime edits that match the pending account move.
+
+    :param body: The session update.
+    :param marker: The session's pending ``account_transition``.
+    :raises HTTPException: 409 when the update would change the runtime
+        without the transition id, or contradict the recorded destination.
+    """
+    mutates_runtime = bool(body.model_fields_set & _TRANSITION_GUARDED_FIELDS)
+    if body.runner_id is not None or (mutates_runtime and body.transition_id != marker["id"]):
+        raise HTTPException(409, "Account change is pending")
+    if body.model_override is not None and body.model_override != marker["model"]:
+        raise HTTPException(409, "Model differs from the pending account change")
+    if (
+        body.reasoning_effort is not None
+        and (None if body.reasoning_effort in EFFORT_CLEAR_VALUES else body.reasoning_effort)
+        != marker["effort"]
+    ):
+        raise HTTPException(409, "Effort differs from the pending account change")
 
 
 # Allow runtime recovery (15s), connect/catalog/update (12s), and confirmation
@@ -1400,6 +1449,10 @@ def register_core_routes(
             host_store=getattr(request.app.state, "host_store", None),
             parent=parent_conv,
         )
+        if parsed_metadata.host_id is not None and inherited_runner_id is None:
+            require_account_route(
+                request, host_id=parsed_metadata.host_id, harness=spec_harness(spec)
+            )
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
                 _create_session_from_bundle,
@@ -2746,6 +2799,11 @@ def register_core_routes(
         """Apply the PATCH that :func:`update_session` documents."""
         began = live_change.position() if live_change is not None else 0
         user_id = _get_user_id(request, auth_provider)
+        if body.abandon_transition and body.model_fields_set - {
+            "abandon_transition",
+            "transition_id",
+        }:
+            raise HTTPException(400, "Cancelling a move takes no other fields")
         if body.delete_worktree and body.archived is not True:
             raise OmnigentError(
                 "delete_worktree is only valid with archived=true",
@@ -2785,12 +2843,13 @@ def register_core_routes(
             or _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY in (body.labels or {})
         )
         set_share_workspace = "share_workspace_files" in body.model_fields_set
+        abandoning = bool(body.abandon_transition)
         pin_only = body.model_fields_set == {"labels"} and set(body.labels or {}) == {
             PINNED_LABEL_KEY
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project or set_launch_args:
+        elif body.archived is not None or set_project or set_launch_args or abandoning:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -2799,12 +2858,12 @@ def register_core_routes(
         await _require_access(
             user_id, session_id, required_level, permission_store, conversation_store
         )
-        if body.runner_id is not None and permission_store is not None:
+        if (body.runner_id is not None or abandoning) and permission_store is not None:
             if not check_session_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             ):
                 raise OmnigentError(
-                    f"Only the session owner can attach a runner to session {session_id!r}. "
+                    f"Only the session owner can attach a runner to or move session {session_id!r}. "
                     f"To fork this session instead, run: omnigent run --fork {session_id}",
                     code=ErrorCode.FORBIDDEN,
                 )
@@ -3039,7 +3098,53 @@ def register_core_routes(
         if conv is None:
             raise _session_not_found()
         previous_runner_id = conv.runner_id
-        if body.runner_id is not None:
+        registry = account_registry(request)
+        beginning = body.target_host_id is not None
+        harness: str | None = None
+        if beginning or registry is not None:
+            harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+        if body.abandon_transition:
+            conv = await abandon_account_transition(
+                request,
+                body,
+                conv,
+                conversation_store=conversation_store,
+                host_registry=host_registry,
+            )
+        elif beginning:
+            conv = await begin_account_transition(
+                request,
+                body,
+                conv,
+                harness,
+                user_id=user_id,
+                conversation_store=conversation_store,
+                host_registry=host_registry,
+            )
+        elif conv.account_transition is not None:
+            _check_pending_transition(body, conv.account_transition)
+        elif body.transition_id is not None:
+            raise HTTPException(409, "Account change is stale")
+        elif (
+            registry is not None
+            and conv.host_id is not None
+            and harness in MANAGED_HARNESSES
+            and (body.model_override is not None or body.reasoning_effort is not None)
+        ):
+            await validate_account_selection(
+                request,
+                host_id=conv.host_id,
+                harness=harness,
+                model=(None if clear_model else model_override)
+                if body.model_override is not None
+                else conv.model_override,
+                effort=(None if clear_effort else effort)
+                if body.reasoning_effort is not None
+                else conv.reasoning_effort,
+                host_registry=host_registry,
+                account_id=body.account_id,
+            )
+        if body.runner_id is not None and not beginning:
             add_audit_attrs(
                 previous_runner_id=previous_runner_id,
                 previous_host_id=conv.host_id,

@@ -112,6 +112,8 @@ class ConversationBase(DeclarativeBase):
 # unassigned sentinel: with no workspace bound to the request, all rows
 # live in workspace 0.
 DEFAULT_WORKSPACE_ID = 0
+# Byte cap for a pending account move; the store enforces it on every write.
+ACCOUNT_TRANSITION_MAX_BYTES = 8192
 
 # Ambient per-request workspace id. Stores are process-wide singletons, so
 # the active workspace can't ride on the store instance — it lives here.
@@ -647,6 +649,10 @@ class SqlConversationMetadata(OmnigentBase):
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    # JSON destination of a pending account change; server-owned recovery state.
+    account_transition: Mapped[str | None] = mapped_column(
+        String(ACCOUNT_TRANSITION_MAX_BYTES), nullable=True
+    )
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     task_summary: Mapped[str | None] = mapped_column(String(128), nullable=True)
     external_session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)

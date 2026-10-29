@@ -123,6 +123,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
+from omnigent.server.host_accounts import require_no_account_transition
 from omnigent.server.host_registry import (
     HostConnection,
     HostLaunchResult,
@@ -6337,6 +6338,8 @@ async def _launch_runner_on_host_impl(
                 error_code="session_not_found",
                 error="session was deleted while its relaunch was in flight",
             )
+        # A pending account move launches only at its recorded destination.
+        require_no_account_transition(fresh)
         if fresh.runner_id and fresh.runner_id != conv.runner_id:
             last = _relaunch_last_attempt.get(conv.id)
             if last is not None and last.runner_id == fresh.runner_id:

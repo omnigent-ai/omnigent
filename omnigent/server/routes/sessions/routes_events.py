@@ -107,6 +107,7 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
+from omnigent.server.host_accounts import require_no_account_transition
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -852,6 +853,10 @@ def register_events_routes(
             raise _RunnerNotBoundError(
                 "session is not bound to this runner", code=ErrorCode.FORBIDDEN
             )
+        # A pending account move blocks events until its destination runner starts.
+        require_no_account_transition(
+            conv, runner_id=request.runner_id if isinstance(request, _RunnerEventContext) else None
+        )
         return user_id, conv
 
     @event_router.post(
