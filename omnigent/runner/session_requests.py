@@ -22,7 +22,11 @@ def requester_route_error(response: httpx.Response) -> str | None:
         except ValueError:
             body = None
         error = body.get("error") if isinstance(body, dict) else None
-        if isinstance(error, dict) and error.get("code") == "not_found":
+        if (
+            isinstance(error, dict)
+            and error.get("code") == "not_found"
+            and error.get("message") != "Not found"
+        ):
             return None
     return (
         "Requester-aware delegation is unavailable on this server; "

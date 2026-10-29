@@ -134,7 +134,14 @@ async def test_create_placement(placement, monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["child", "same_host", "managed", "message", "subagent"])
 @pytest.mark.parametrize("status", [404, 405])
-async def test_requester_mutations_do_not_fall_back_on_unsupported_server(operation, status):
+@pytest.mark.parametrize(
+    "route_error",
+    [{"detail": "Not Found"}, {"error": {"code": "not_found", "message": "Not found"}}],
+    ids=["framework", "released-server"],
+)
+async def test_requester_mutations_do_not_fall_back_on_unsupported_server(
+    operation, status, route_error
+):
     requests = []
     target = uuid4().hex
     requester = ExecutionRequester(InputRequester(user_id="collaborator")).snapshot()
@@ -154,7 +161,7 @@ async def test_requester_mutations_do_not_fall_back_on_unsupported_server(operat
         requests.append(request)
         assert request.method == "POST"
         if request.url.path == expected_path:
-            return httpx.Response(status, json={"detail": "Unsupported requester route"})
+            return httpx.Response(status, json=route_error)
         # Older servers accept these mutations without preserving the requester.
         if request.url.path in {"/v1/sessions", "/v1/sessions/orchestrated"}:
             return httpx.Response(201, json={"id": target})

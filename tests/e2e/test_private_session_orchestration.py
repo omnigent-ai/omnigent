@@ -310,7 +310,10 @@ def test_private_manager_launch_send_read_and_sharing(
                     with connect(url, open_timeout=15) as terminal_ws:
                         terminal_ws.send(json.dumps({"type": "resize", "cols": 120, "rows": 40}))
                         terminal_ws.send(text.encode())
-                        poll_until(lambda: text in pane(), timeout_s=10)
+                        try:
+                            poll_until(lambda: text in pane(), timeout_s=10)
+                        finally:
+                            (stack.root / "terminal-before-submit.txt").write_text(pane())
                         terminal_ws.send(b"\r")
                         poll_until(lambda: text in json.dumps(items(session)), timeout_s=30)
                     (stack.root / "authenticated-terminal.txt").write_text(pane())
