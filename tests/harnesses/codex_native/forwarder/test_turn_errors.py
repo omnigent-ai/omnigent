@@ -26,6 +26,9 @@ from tests.harnesses.codex_native.forwarder._support import (
     _deliver_to_parent,
     _RecordingClient,
     _seed_active_turn,
+    _status_post,
+    _turn_completed,
+    _turn_started,
 )
 
 
@@ -1378,50 +1381,6 @@ def _system_error_event(thread_id: str = "thread_123") -> dict[str, Any]:
         "method": "thread/status/changed",
         "params": {"threadId": thread_id, "status": {"type": "systemError"}},
     }
-
-
-def _turn_started(turn_id: str) -> dict[str, Any]:
-    """
-    Build a Codex ``turn/started`` envelope for the parent thread.
-
-    :param turn_id: Turn that began, e.g. ``"turn_2"``.
-    :returns: Notification envelope dict.
-    """
-    return {
-        "method": "turn/started",
-        "params": {"threadId": "thread_123", "turn": {"id": turn_id, "items": []}},
-    }
-
-
-def _turn_completed(turn_id: str, status: str) -> dict[str, Any]:
-    """
-    Build a Codex ``turn/completed`` envelope for the parent thread.
-
-    :param turn_id: Turn that ended, e.g. ``"turn_1"``.
-    :param status: Turn status, e.g. ``"completed"`` or ``"failed"``.
-    :returns: Notification envelope dict.
-    """
-    return {
-        "method": "turn/completed",
-        "params": {
-            "threadId": "thread_123",
-            "turn": {
-                "id": turn_id,
-                "status": status,
-                "items": [{"type": "agentMessage", "id": "item_1", "text": "done"}],
-            },
-        },
-    }
-
-
-def _status_post(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """
-    Return the recorded post for one ``external_session_status`` edge.
-
-    :param data: Expected status data, e.g. ``{"status": "idle"}``.
-    :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
-    """
-    return ("/v1/sessions/conv_x/events", {"type": "external_session_status", "data": data})
 
 
 @pytest.mark.asyncio

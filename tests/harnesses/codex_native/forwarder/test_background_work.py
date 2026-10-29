@@ -18,9 +18,13 @@ from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from tests.harnesses.codex_native.forwarder._support import (
+    _background_work_post,
     _deliver_to_parent,
     _RecordingClient,
     _seed_active_turn,
+    _status_post,
+    _turn_completed,
+    _turn_started,
 )
 
 _EVENTS_URL = "/v1/sessions/conv_x/events"
@@ -65,16 +69,6 @@ def _goal_cleared(thread_id: str = "thread_123") -> dict[str, Any]:
     return {"method": "thread/goal/cleared", "params": {"threadId": thread_id}}
 
 
-def _background_work_post(running: bool) -> tuple[str, dict[str, Any]]:
-    """
-    Return the recorded post for one ``external_background_work`` event.
-
-    :param running: Flag value, e.g. ``True``.
-    :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
-    """
-    return (_EVENTS_URL, {"type": "external_background_work", "data": {"running": running}})
-
-
 def _failed_status_post(output: str, **data: Any) -> tuple[str, dict[str, Any]]:
     """
     Return the recorded post for one failed ``external_session_status`` edge.
@@ -92,21 +86,39 @@ def _failed_status_post(output: str, **data: Any) -> tuple[str, dict[str, Any]]:
     )
 
 
-class _GoalCodexClient:
+class _AppServerStub:
     """
-    App-server stub whose ``thread/goal/get`` answers with a fixed response.
+    App-server stub for the goal and background-terminal reads.
+
+    Every request is recorded. ``thread/goal/get`` answers ``goal_response``
+    or raises ``goal_error``. Each ``thread/backgroundTerminals/list`` answers
+    the next entry of ``listings``, then an empty list; it raises ``list_error``
+    when set, and never returns when ``hang`` is set.
 
     :param goal_response: Response envelope returned for ``thread/goal/get``.
-    :param error: Exception raised for ``thread/goal/get`` instead of answering.
+    :param goal_error: Exception raised for ``thread/goal/get`` instead.
+    :param listings: Response envelopes for successive terminal listings.
+    :param list_error: Exception raised for terminal listings.
+    :param list_error_count: How many listings raise ``list_error``; every one when ``None``.
+    :param hang: Whether a terminal listing never returns.
     """
 
     def __init__(
         self,
         goal_response: dict[str, Any] | None = None,
-        error: Exception | None = None,
+        *,
+        goal_error: Exception | None = None,
+        listings: list[dict[str, Any]] | None = None,
+        list_error: Exception | None = None,
+        list_error_count: int | None = None,
+        hang: bool = False,
     ) -> None:
         self.goal_response = goal_response or {"result": {"goal": None}}
-        self.error = error
+        self.goal_error = goal_error
+        self.listings = list(listings or [])
+        self.list_error = list_error
+        self.list_error_count = list_error_count
+        self.hang = hang
         self.requests: list[tuple[str, dict[str, Any]]] = []
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -119,9 +131,17 @@ class _GoalCodexClient:
         """
         self.requests.append((method, params))
         if method == "thread/goal/get":
-            if self.error is not None:
-                raise self.error
+            if self.goal_error is not None:
+                raise self.goal_error
             return self.goal_response
+        if method == "thread/backgroundTerminals/list":
+            if self.hang:
+                await asyncio.Event().wait()
+            if self.list_error is not None and self.list_error_count != 0:
+                if self.list_error_count is not None:
+                    self.list_error_count -= 1
+                raise self.list_error
+            return self.listings.pop(0) if self.listings else {"result": {"data": []}}
         return {"result": {"thread": {"id": "thread_123"}}}
 
     def is_subscribed_to_thread(self, _thread_id: str) -> bool:
@@ -132,6 +152,28 @@ class _GoalCodexClient:
         :returns: ``False``.
         """
         return False
+
+
+def _terminal_listing(*commands: str) -> dict[str, Any]:
+    """
+    Build a ``thread/backgroundTerminals/list`` response with running terminals.
+
+    :param commands: Command of each running terminal, e.g. ``"npm run dev"``.
+    :returns: Response envelope dict.
+    """
+    return {
+        "result": {
+            "data": [
+                {
+                    "processId": f"proc_{index}",
+                    "itemId": f"item_{index}",
+                    "command": command,
+                    "cwd": "/repo",
+                }
+                for index, command in enumerate(commands)
+            ]
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -209,12 +251,13 @@ async def test_goal_cleared_during_a_resync_post_ends_not_working(tmp_path: Path
     """A clear that arrives while the resync's ``true`` is in flight is the last word."""
     client = _PausedTrueClient()
     state = fwd._CodexForwarderState()
-    codex = _GoalCodexClient({"result": {"goal": {"status": "active"}}})
+    app_server = _AppServerStub({"result": {"goal": {"status": "active"}}})
     resync = asyncio.create_task(
-        fwd._resync_thread_goal(
-            codex,  # type: ignore[arg-type]
+        fwd._resync_background_work(
+            app_server,  # type: ignore[arg-type]
             client,  # type: ignore[arg-type]
             session_id="conv_x",
+            bridge_dir=tmp_path,
             thread_id="thread_123",
             forwarder_state=state,
         )
@@ -235,16 +278,18 @@ async def test_goal_read_overtaken_by_a_notification_is_dropped(tmp_path: Path) 
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
-    class _ClearedDuringRead(_GoalCodexClient):
+    class _ClearedDuringRead(_AppServerStub):
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            await _deliver_to_parent(client, tmp_path, state, _goal_cleared())
+            if method == "thread/goal/get":
+                await _deliver_to_parent(client, tmp_path, state, _goal_cleared())
             return await super().request(method, params)
 
-    codex = _ClearedDuringRead({"result": {"goal": {"status": "active"}}})
-    await fwd._resync_thread_goal(
-        codex,  # type: ignore[arg-type]
+    app_server = _ClearedDuringRead({"result": {"goal": {"status": "active"}}})
+    await fwd._resync_background_work(
+        app_server,  # type: ignore[arg-type]
         client,  # type: ignore[arg-type]
         session_id="conv_x",
+        bridge_dir=tmp_path,
         thread_id="thread_123",
         forwarder_state=state,
     )
@@ -448,7 +493,7 @@ async def test_reconnect_reads_the_thread_goal_and_reports_it(tmp_path: Path) ->
     Without this read, a forwarder started while a goal is active would leave the
     session idle until the next goal update.
     """
-    app_server = _GoalCodexClient(
+    app_server = _AppServerStub(
         {
             "result": {
                 "goal": {
@@ -493,7 +538,7 @@ async def test_codex_without_goals_reconnects_as_goal_free(
     tmp_path: Path, rejection: dict[str, Any]
 ) -> None:
     """A Codex build that rejects ``thread/goal/get`` has no goal, so the flag is cleared."""
-    app_server = _GoalCodexClient(error=CodexAppServerResponseError(rejection))
+    app_server = _AppServerStub(goal_error=CodexAppServerResponseError(rejection))
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
@@ -512,9 +557,42 @@ async def test_codex_without_goals_reconnects_as_goal_free(
 
 
 @pytest.mark.asyncio
-async def test_failed_goal_read_leaves_the_flag_as_it_was(tmp_path: Path) -> None:
-    """A transport failure reading the goal posts nothing rather than guessing idle."""
-    app_server = _GoalCodexClient(error=ConnectionError("app-server socket closed"))
+async def test_failed_goal_read_keeps_the_goal_the_forwarder_last_saw(tmp_path: Path) -> None:
+    """
+    A transport failure reading the goal keeps the last known goal.
+
+    The active goal was posted before the forwarder reconnected, so a failed
+    read must not drop the flag.
+    """
+    app_server = _AppServerStub(goal_error=ConnectionError("app-server socket closed"))
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(goal_status="active", posted_background_work_running=True)
+
+    await fwd._subscribe_until_ready(
+        app_server,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=state,
+    )
+
+    assert client.posts == []
+
+
+@pytest.mark.asyncio
+async def test_failed_goal_read_on_a_fresh_connection_does_not_clear_the_flag(
+    tmp_path: Path,
+) -> None:
+    """
+    A reconnect that cannot read the goal posts no false for a goal it never saw.
+
+    The server may still hold ``true`` for a goal that is active, and an empty
+    terminal listing says nothing about the goal.
+    """
+    app_server = _AppServerStub(goal_error=ConnectionError("app-server socket closed"))
     client = _RecordingClient()
     state = fwd._CodexForwarderState()
 
@@ -530,6 +608,9 @@ async def test_failed_goal_read_leaves_the_flag_as_it_was(tmp_path: Path) -> Non
     )
 
     assert client.posts == []
+    # A goal notification makes the goal known again, so its end clears the flag.
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
+    assert client.posts == [_background_work_post(False)]
 
 
 @pytest.mark.asyncio
@@ -579,3 +660,401 @@ def test_new_parent_session_starts_with_no_goal_and_no_posted_flag() -> None:
     assert state.posted_background_work_running is None
     assert state.turn_failure_surfaced is False
     assert state.background_work_running() is False
+
+
+def _record_poll_delays(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """
+    Make the forwarder's poll wait yield once instead of sleeping.
+
+    :param monkeypatch: Pytest fixture used to replace the forwarder's sleep.
+    :returns: Delays the forwarder asked to sleep for, in order.
+    """
+    delays: list[float] = []
+
+    async def yield_once(seconds: float) -> None:
+        """Record one requested delay and let other tasks run."""
+        delays.append(seconds)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(fwd, "_sleep", yield_once)
+    return delays
+
+
+def _park_poll(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """
+    Make the forwarder's poll wait until it is cancelled.
+
+    :param monkeypatch: Pytest fixture used to replace the forwarder's sleep.
+    :returns: Event set once the poll is waiting between listings.
+    """
+    waiting = asyncio.Event()
+
+    async def park(_seconds: float) -> None:
+        """Hold the poll until the forwarder cancels it."""
+        waiting.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(fwd, "_sleep", park)
+    return waiting
+
+
+@pytest.mark.asyncio
+async def test_running_background_terminal_keeps_the_session_working_after_its_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A terminal still running when a turn ends keeps the session working.
+
+    The forwarder lists terminals right after the turn, then every few seconds,
+    and clears the flag once none is left.
+    """
+    _seed_active_turn(tmp_path, "turn_1")
+    delays = _record_poll_delays(monkeypatch)
+    app_server = _AppServerStub(
+        listings=[_terminal_listing("npm run dev"), _terminal_listing("npm run dev")]
+    )
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_1", "completed"),
+        codex_client=app_server,
+    )
+    poll = state.background_terminal_poll
+    assert poll is not None
+    await poll
+
+    assert client.posts == [
+        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _background_work_post(True),
+        _background_work_post(False),
+    ]
+    assert delays == [fwd._BACKGROUND_TERMINAL_POLL_SECONDS] * 2
+    assert [method for method, _params in app_server.requests] == [
+        "thread/backgroundTerminals/list"
+    ] * 3
+
+
+@pytest.mark.asyncio
+async def test_overlapping_listings_leave_one_poll_that_shutdown_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnect listing and a turn-end listing that finish out of order start one poll."""
+    _park_poll(monkeypatch)
+    releases = [asyncio.Event(), asyncio.Event()]
+    listed = 0
+
+    class _HeldListings(_AppServerStub):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            nonlocal listed
+            if method == "thread/backgroundTerminals/list":
+                release = releases[listed]
+                listed += 1
+                await release.wait()
+                return _terminal_listing("npm run dev")
+            return await super().request(method, params)
+
+    app_server = _HeldListings()
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    def track() -> asyncio.Task[None]:
+        return asyncio.create_task(
+            fwd._track_background_terminals(
+                client,  # type: ignore[arg-type]
+                app_server,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_123",
+                forwarder_state=state,
+            )
+        )
+
+    reconnect, turn_end = track(), track()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    releases[1].set()
+    await turn_end
+    releases[0].set()
+    await reconnect
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    polls = [t for t in asyncio.all_tasks() if t.get_name() == "codex-native-background-terminals"]
+    assert polls == [state.background_terminal_poll]
+    state.cancel_background_terminal_poll()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert all(poll.done() for poll in polls)
+
+
+@pytest.mark.asyncio
+async def test_turn_start_stops_the_terminal_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that starts while terminals are polled ends the poll; the turn reports itself."""
+    _seed_active_turn(tmp_path, "turn_1")
+    waiting = _park_poll(monkeypatch)
+    app_server = _AppServerStub(listings=[_terminal_listing("npm run dev")])
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_1", "completed"),
+        codex_client=app_server,
+    )
+    poll = state.background_terminal_poll
+    assert poll is not None
+    await asyncio.wait_for(waiting.wait(), timeout=5.0)
+
+    await _deliver_to_parent(
+        client, tmp_path, state, _turn_started("turn_2"), codex_client=app_server
+    )
+
+    assert state.background_terminal_poll is None
+    with pytest.raises(asyncio.CancelledError):
+        await poll
+    assert [method for method, _params in app_server.requests] == [
+        "thread/backgroundTerminals/list"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_goal_and_terminal_share_one_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The flag stays set while either an active goal or a terminal keeps the session working.
+
+    Each change posts once: the goal and the terminal are not posted separately.
+    """
+    _seed_active_turn(tmp_path, "turn_1")
+    _record_poll_delays(monkeypatch)
+    app_server = _AppServerStub(listings=[_terminal_listing("npm run dev")])
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("active"))
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_1", "completed"),
+        codex_client=app_server,
+    )
+    poll = state.background_terminal_poll
+    assert poll is not None
+    await poll
+    await _deliver_to_parent(client, tmp_path, state, _goal_updated("complete"))
+
+    assert client.posts == [
+        _background_work_post(True),
+        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _background_work_post(False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_without_terminal_listing_is_not_asked_again(
+    tmp_path: Path,
+) -> None:
+    """A Codex build that rejects the terminal listing is asked once, then never again."""
+    app_server = _AppServerStub(
+        list_error=CodexAppServerResponseError({"code": -32601, "message": "Method not found"})
+    )
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    _seed_active_turn(tmp_path, "turn_1")
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_1", "completed"),
+        codex_client=app_server,
+    )
+    _seed_active_turn(tmp_path, "turn_2")
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_2", "completed"),
+        codex_client=app_server,
+    )
+
+    assert state.background_terminals_supported is False
+    assert state.background_terminal_poll is None
+    assert [method for method, _params in app_server.requests] == [
+        "thread/backgroundTerminals/list"
+    ]
+    assert client.posts == [
+        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _background_work_post(False),
+        _status_post({"status": "idle", "response_id": "codex_turn_2"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_listing_keeps_the_last_known_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing that fails for a transport reason keeps the flag, and polling goes on."""
+    _seed_active_turn(tmp_path, "turn_1")
+    _record_poll_delays(monkeypatch)
+    app_server = _AppServerStub(
+        list_error=ConnectionError("app-server socket closed"), list_error_count=1
+    )
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(
+        has_background_terminals=True, posted_background_work_running=True
+    )
+
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_1", "completed"),
+        codex_client=app_server,
+    )
+    assert client.posts == [_status_post({"status": "idle", "response_id": "codex_turn_1"})]
+
+    # The next listing succeeds and finds no terminal, which clears the flag.
+    poll = state.background_terminal_poll
+    assert poll is not None
+    await poll
+    assert client.posts[-1] == _background_work_post(False)
+
+
+@pytest.mark.asyncio
+async def test_failed_listing_with_no_known_terminal_does_not_poll(tmp_path: Path) -> None:
+    """With no terminal known to be running, a failed listing schedules no poll."""
+    _seed_active_turn(tmp_path, "turn_1")
+    app_server = _AppServerStub(list_error=ConnectionError("app-server socket closed"))
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await _deliver_to_parent(
+        client,
+        tmp_path,
+        state,
+        _turn_completed("turn_1", "completed"),
+        codex_client=app_server,
+    )
+
+    assert state.background_terminal_poll is None
+
+
+@pytest.mark.asyncio
+async def test_hung_terminal_listing_does_not_hold_the_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A listing that never answers is abandoned after a bound; the turn still reports."""
+    _seed_active_turn(tmp_path, "turn_1")
+    monkeypatch.setattr(fwd, "_BACKGROUND_TERMINAL_LIST_TIMEOUT_SECONDS", 0.01)
+    app_server = _AppServerStub(hang=True)
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await asyncio.wait_for(
+        _deliver_to_parent(
+            client,
+            tmp_path,
+            state,
+            _turn_completed("turn_1", "completed"),
+            codex_client=app_server,
+        ),
+        timeout=5.0,
+    )
+
+    assert client.posts == [
+        _status_post({"status": "idle", "response_id": "codex_turn_1"}),
+        _background_work_post(False),
+    ]
+    assert state.background_terminal_poll is None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_during_a_turn_does_not_list_terminals(tmp_path: Path) -> None:
+    """A reconnect while a turn runs leaves terminals to that turn's terminal event."""
+    _seed_active_turn(tmp_path, "turn_1")
+    app_server = _AppServerStub(listings=[_terminal_listing("npm run dev")])
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._subscribe_until_ready(
+        app_server,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=state,
+    )
+
+    assert "thread/backgroundTerminals/list" not in [method for method, _ in app_server.requests]
+    assert client.posts == [_background_work_post(False)]
+
+
+@pytest.mark.asyncio
+async def test_reconnect_after_a_settled_turn_reports_running_terminals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnect with no turn running lists terminals, reports them, and keeps polling."""
+    delays = _record_poll_delays(monkeypatch)
+    app_server = _AppServerStub(
+        listings=[_terminal_listing("npm run dev"), _terminal_listing("npm run dev")]
+    )
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+
+    await fwd._subscribe_until_ready(
+        app_server,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        thread_id="thread_123",
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        forwarder_state=state,
+    )
+    poll = state.background_terminal_poll
+    assert poll is not None
+    await poll
+
+    assert client.posts == [_background_work_post(True), _background_work_post(False)]
+    assert delays == [fwd._BACKGROUND_TERMINAL_POLL_SECONDS] * 2
+
+
+@pytest.mark.asyncio
+async def test_rotation_stops_the_terminal_poll_of_the_old_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread switch cancels the old thread's poll and forgets its terminals."""
+    waiting = _park_poll(monkeypatch)
+    state = fwd._CodexForwarderState(has_background_terminals=True)
+    state.background_terminal_poll = asyncio.create_task(
+        fwd._poll_background_terminals(
+            _RecordingClient(),  # type: ignore[arg-type]
+            _AppServerStub(),  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=Path("."),
+            thread_id="thread_123",
+            forwarder_state=state,
+        )
+    )
+    await asyncio.wait_for(waiting.wait(), timeout=5.0)
+    poll = state.background_terminal_poll
+
+    state.note_parent_rotation("conv_new")
+
+    assert state.background_terminal_poll is None
+    assert state.has_background_terminals is False
+    assert poll is not None
+    with pytest.raises(asyncio.CancelledError):
+        await poll
