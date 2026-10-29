@@ -800,6 +800,10 @@ def _cancel_runner_relays(session_ids: list[str]) -> None:
 # garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
+# Watchers for queued web inputs that may never be mirrored back (see _watch_unrecorded_native_input).
+_detached_expiry_tasks: set[asyncio.Task[None]] = set()
+# How often an expiry watcher re-checks a stale input while its session is busy.
+_UNRECORDED_INPUT_RECHECK_S = 30.0
 
 # Deferred archive stops still inside the undo grace, keyed by session id.
 # Scheduling a stop cancels the session's prior pending one, and an unarchive
@@ -3616,10 +3620,104 @@ def _release_drained_inputs(
             pending_inputs.release(session_id, entry)
 
 
+def _watch_unrecorded_native_input(
+    conversation_store: ConversationStore,
+    conv: Conversation,
+    session_id: str,
+    pending_id: str,
+) -> None:
+    """Start the watcher that records a queued web input as undelivered if it is never mirrored."""
+    pending_inputs.watch_expiry(session_id, pending_id)
+    task = asyncio.create_task(
+        _expire_unrecorded_native_input(conversation_store, conv, session_id, pending_id)
+    )
+    _detached_expiry_tasks.add(task)
+    task.add_done_callback(_detached_expiry_tasks.discard)
+
+
+async def _expire_unrecorded_native_input(
+    conversation_store: ConversationStore,
+    conv: Conversation,
+    session_id: str,
+    pending_id: str,
+) -> None:
+    """
+    Record a web input that outlived its TTL unmirrored as undelivered.
+
+    Waits past the TTL, then records the entry only while the session is idle:
+    a busy session can still mirror the message at a later tool boundary, which
+    would otherwise be recorded twice. An input the agent mirrors or the person
+    settles first leaves the queue, which ends the watch.
+
+    :param conversation_store: Store to append the undelivered pair to.
+    :param conv: Conversation row, used to name the agent in the error.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param pending_id: The queued entry's id returned by :func:`pending_inputs.record`.
+    """
+    await asyncio.sleep(pending_inputs.TTL_S + 1)
+    while pending_inputs.is_queued(session_id, pending_id):
+        if _session_status_from_cache(session_id) != "running":
+            drained = pending_inputs.expire_pending_input(session_id, pending_id)
+            if drained is not None:
+                await _record_unrecorded_native_input(conversation_store, conv, session_id, drained)
+                return
+        await asyncio.sleep(_UNRECORDED_INPUT_RECHECK_S)
+
+
+async def _record_unrecorded_native_input(
+    conversation_store: ConversationStore,
+    conv: Conversation,
+    session_id: str,
+    drained: pending_inputs.DrainedInput,
+) -> None:
+    """
+    Persist one expired web input as an undelivered message and error pair.
+
+    The same pair the mirror path writes for a skipped input, with wording for
+    an input that was never mirrored at all.
+
+    :param conversation_store: Store to append to.
+    :param conv: Conversation row, used to name the agent in the error.
+    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param drained: The expired entry, already removed from the queue.
+    """
+    items = _build_skipped_native_items(session_id, conv, [drained], cause="no_mirror")
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
+    except Exception:  # noqa: BLE001 — keep the entry queued for the next attempt
+        _logger.exception(
+            "Relay: could not persist the undelivered native message for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        pending_inputs.restore(session_id, drained)
+        return
+    persisted_user, persisted_error = persisted[0], persisted[1]
+    if persisted_user.deduplicated:
+        return
+    log_input_event(
+        _logger,
+        "native_input_settled",
+        session_id=session_id,
+        attributes=pending_inputs.delivery_attributes(drained),
+        outcome="expired_without_native_record",
+        item_id=persisted_user.id,
+        error_item_id=persisted_error.id,
+        response_id=persisted_error.response_id,
+        match_method="ttl_expiry",
+        cause_class="unknown",
+        reason_code="ttl_expired_without_native_record",
+    )
+    _publish_input_consumed(session_id, persisted_user, cleared_pending_id=drained.pending_id)
+    _publish_external_conversation_item(session_id, persisted_error)
+
+
 def _build_skipped_native_items(
     session_id: str,
     conv: Conversation,
     skipped_entries: list[pending_inputs.DrainedInput],
+    *,
+    cause: Literal["later_mirror", "no_mirror"] = "later_mirror",
 ) -> list[NewConversationItem]:
     """
     Build ``NewConversationItem`` pairs for web inputs the native TUI never recorded.
@@ -3635,6 +3733,8 @@ def _build_skipped_native_items(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row, used to name the harness in the error.
     :param skipped_entries: Older queue entries skipped by a text-matched drain.
+    :param cause: Why the inputs were never recorded, which selects the error
+        wording: a later message was mirrored first, or the input was never mirrored.
     :returns: The item pairs in queue order, empty when nothing was skipped.
     """
     if not skipped_entries:
@@ -3651,11 +3751,17 @@ def _build_skipped_native_items(
         display_name = native_agent.display_name if native_agent is not None else "The agent"
         harness_key = "native"
         code = "native_prompt_not_recorded"
-        message = (
-            f"{display_name} never recorded this message in its transcript before "
-            "accepting a later one, so it was not delivered. The native terminal may "
-            "have shown the underlying error."
-        )
+        if cause == "no_mirror":
+            message = (
+                f"{display_name} never recorded this message in its transcript, so it was "
+                "not delivered. The native terminal may have shown the underlying error."
+            )
+        else:
+            message = (
+                f"{display_name} never recorded this message in its transcript before "
+                "accepting a later one, so it was not delivered. The native terminal may "
+                "have shown the underlying error."
+            )
     items: list[NewConversationItem] = []
     for skipped in skipped_entries:
         turn_id = generate_task_id()
@@ -8172,6 +8278,7 @@ async def _dispatch_session_event_to_runner_impl(
                 session_id=session_id,
                 attributes=input_delivery,
             )
+            _watch_unrecorded_native_input(conversation_store, conv, session_id, pending_id)
         # ── Server-side routing for native terminal sessions ────────
         # Same logic as the SDK path in _forward_event_to_runner: if
         # the toggle is on and no model_override is set, call the
