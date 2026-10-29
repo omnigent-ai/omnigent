@@ -88,7 +88,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`agent-terminal-view`:**
   `tests/browser_ui/chat/test_terminal_auto_resume.py` covers automatic recovery
   through the desktop switch, keyboard shortcut, mobile menu and grid switch,
-  plus a failed attempt followed by manual Resume. It uses the built SPA with
+  plus failed attempts followed by manual Resume, including a cached closed
+  terminal that stays mounted during recovery. It uses the built SPA with
   mocked host, retry and terminal transports; run with
   `--browser-ui-skip-build --reruns 0 --video=on`.
   Grid cells: `tests/browser_ui/chat/test_session_grid.py` covers two real xterm

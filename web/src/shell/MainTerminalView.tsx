@@ -120,6 +120,7 @@ export function MainTerminalView({
   const resumePhase = resumeState.conversationId === conversationId ? resumeState.phase : "idle";
   const resumePending = resumePhase !== "idle";
   const resumeError = resumeState.conversationId === conversationId ? resumeState.error : null;
+  const [resumeGeneration, setResumeGeneration] = useState(0);
   const recoveryRef = useRef({ conversationId, attempted: false, pending: false });
   if (recoveryRef.current.conversationId !== conversationId) {
     recoveryRef.current = { conversationId, attempted: false, pending: false };
@@ -175,6 +176,7 @@ export function MainTerminalView({
       try {
         await onResume();
         if (recoveryRef.current === recovery) {
+          setResumeGeneration((generation) => generation + 1);
           setResumeState({ conversationId, phase: "connecting", error: null });
         }
       } catch (error) {
@@ -247,11 +249,22 @@ export function MainTerminalView({
     !recoveryRef.current.attempted;
   useEffect(() => {
     const recovery = recoveryRef.current;
-    if (!resumePending && (!visible || (agentTerminal !== null && !runnerOffline))) {
+    if (
+      !resumePending &&
+      ((!visible && resumeError === null) || (agentTerminal !== null && !runnerOffline))
+    ) {
       recovery.attempted = false;
     }
     if (autoResumeAvailable) void handleResume(true).catch(() => {});
-  }, [autoResumeAvailable, handleResume, visible, resumePending, agentTerminal, runnerOffline]);
+  }, [
+    autoResumeAvailable,
+    handleResume,
+    visible,
+    resumePending,
+    resumeError,
+    agentTerminal,
+    runnerOffline,
+  ]);
   useEffect(() => {
     if (resumePhase !== "connecting") return;
     if (agentTerminal !== null) {
@@ -377,7 +390,7 @@ export function MainTerminalView({
       className={cn("main-terminal-view flex min-h-0 flex-1 flex-col pt-12", className)}
     >
       <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
-        {!showPanes || showLoading || showResumeError ? (
+        {!showPanes ? (
           showLoading ? (
             // Passive startup state: same centered geometry as the stopped
             // state so the swap doesn't jump, and nothing actionable — the
@@ -442,6 +455,31 @@ export function MainTerminalView({
           )
         ) : (
           <>
+            {(showLoading || showResumeError) && (
+              <div className="flex shrink-0 flex-wrap items-center justify-center gap-2 border-b border-border px-3 py-2 text-sm">
+                {showLoading ? (
+                  <span role="status" className="flex items-center gap-2 text-muted-foreground">
+                    <Loader2Icon className="size-4 animate-spin" aria-hidden />
+                    Reconnecting…
+                  </span>
+                ) : (
+                  <>
+                    <p role="alert" className="text-destructive">
+                      {resumeError}
+                    </p>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void handleResume().catch(() => {})}
+                      componentId="diagnostics.main-terminal.resume"
+                    >
+                      Resume {resumeTarget}
+                    </Button>
+                  </>
+                )}
+              </div>
+            )}
             {isShellView && activeTerminal && (
               // Shell header — identity + close, nothing else.
               <div className="flex shrink-0 items-center gap-1.5 border-b border-border px-2 pt-1 pb-2">
@@ -493,9 +531,16 @@ export function MainTerminalView({
                           readOnly={readOnly}
                           active={visible && active && focused}
                           directAttachUrl={terminal.directAttachUrl}
-                          onResume={runnerOffline && onResume ? () => handleResume() : undefined}
+                          onResume={
+                            runnerOffline && onResume && !showLoading && !showResumeError
+                              ? () => handleResume()
+                              : undefined
+                          }
                           resumeTarget={resumeTarget}
                           resumePending={resumePending}
+                          resumeGeneration={
+                            AGENT_TERMINAL_IDS.has(terminal.id) ? resumeGeneration : undefined
+                          }
                           onStateChange={(state) => {
                             setTerminalConnectionState(terminal.id, state);
                           }}

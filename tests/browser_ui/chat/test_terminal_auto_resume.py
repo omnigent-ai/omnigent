@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Error, Page, Route, WebSocketRoute, expect
 
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
@@ -18,15 +18,24 @@ from tests.browser_ui.chat.session_contract import (
 
 
 @pytest.mark.parametrize(
-    ("entry", "fail_first"),
-    [("switch", False), ("shortcut", False), ("mobile", False), ("grid", False), ("switch", True)],
+    ("entry", "fail_first", "cached_terminal"),
+    [
+        ("switch", False, False),
+        ("shortcut", False, False),
+        ("mobile", False, False),
+        ("grid", False, False),
+        ("switch", True, False),
+        pytest.param("switch", True, True, id="cached-terminal"),
+    ],
 )
 def test_terminal_view_recovers_on_open(
     page: Page,
     chat_session_contract: ChatSessionContract,
     output_path: str,
+    request: pytest.FixtureRequest,
     entry: str,
     fail_first: bool,
+    cached_terminal: bool,
 ) -> None:
     chat = chat_session_contract
     contract = chat.contract
@@ -34,13 +43,29 @@ def test_terminal_view_recovers_on_open(
     chat.harness = "codex-native"
     chat.update_session(
         labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
-        runner_online=True,
+        runner_online=not cached_terminal,
         host_online=True,
     )
-    chat.set_health(runner_online=True, host_online=True)
+    chat.set_health(runner_online=not cached_terminal, host_online=True)
     contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
-    terminals: list[dict[str, object]] = []
+    resource = {
+        "id": "terminal_codex_main",
+        "object": "session.resource",
+        "type": "terminal",
+        "session_id": chat.session_id,
+        "name": "codex:main",
+        "metadata": {"terminal_name": "codex", "session_key": "main", "running": True},
+    }
+    terminals: list[dict[str, object]] = [resource] if cached_terminal else []
     pending: list[Route] = []
+    attachments: list[WebSocketRoute] = []
+
+    def release_retries() -> None:
+        for route in pending:
+            with suppress(Error):
+                route.abort()
+
+    request.addfinalizer(release_retries)
     contract.json(
         f"/v1/sessions/{chat.session_id}/resources/terminals", lambda _: list_payload(terminals)
     )
@@ -53,10 +78,15 @@ def test_terminal_view_recovers_on_open(
     contract.route(
         re.compile(rf"{re.escape(chat.url.replace('/c/', '/v1/sessions/'))}/events$"), retry
     )
-    contract.websocket(
-        "**/resources/terminals/terminal_codex_main/attach*",
-        lambda socket: socket.send(b"Terminal reconnected.\r\n$ "),
-    )
+
+    def attach(socket: WebSocketRoute) -> None:
+        attachments.append(socket)
+        if cached_terminal and len(attachments) == 1:
+            socket.send(b"Previous terminal output.\r\n$ ")
+        else:
+            socket.send(b"Terminal reconnected.\r\n$ ")
+
+    contract.websocket("**/resources/terminals/terminal_codex_main/attach*", attach)
     page.add_init_script("localStorage.setItem('omnigent:default-transcript-view', 'chat')")
     page.set_viewport_size({"width": 390 if entry == "mobile" else 1440, "height": 900})
 
@@ -94,6 +124,14 @@ def test_terminal_view_recovers_on_open(
             surface = page.locator("body")
 
         chat.wait_for_stream()
+        if cached_terminal:
+            previous_terminal = page.get_by_test_id("main-terminal-view").get_by_test_id(
+                "terminal-view"
+            )
+            expect(previous_terminal).to_have_attribute("data-state", "connected")
+            attachments[0].close(code=4404, reason="Terminal not found")
+            expect(previous_terminal).to_have_attribute("data-state", "closed")
+            previous_terminal.evaluate("element => element.dataset.recoveryOriginal = 'true'")
         assert pending == []
         page.screenshot(path=str(artifacts / "before-opening-terminal.png"))
         with page.expect_request(
@@ -114,6 +152,11 @@ def test_terminal_view_recovers_on_open(
         expect(terminal.get_by_role("status")).to_be_visible()
         expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
         assert len(pending) == 1
+        if cached_terminal:
+            expect(terminal.get_by_test_id("terminal-view")).to_have_attribute(
+                "data-recovery-original", "true"
+            )
+            assert len(attachments) == 1
         page.screenshot(path=str(artifacts / "terminal-restarting.png"))
 
         if fail_first:
@@ -126,6 +169,11 @@ def test_terminal_view_recovers_on_open(
             expect(resume).to_be_enabled()
             expect(terminal.get_by_role("alert")).to_be_visible()
             assert len(pending) == 1
+            if cached_terminal:
+                expect(terminal.get_by_test_id("terminal-view")).to_have_attribute(
+                    "data-recovery-original", "true"
+                )
+                assert len(attachments) == 1
             page.screenshot(path=str(artifacts / "terminal-restart-failed.png"))
             with page.expect_request(
                 lambda request: (
@@ -138,15 +186,8 @@ def test_terminal_view_recovers_on_open(
             expect(resume).to_have_count(0)
             assert len(pending) == 2
 
-        resource = {
-            "id": "terminal_codex_main",
-            "object": "session.resource",
-            "type": "terminal",
-            "session_id": chat.session_id,
-            "name": "codex:main",
-            "metadata": {"terminal_name": "codex", "session_key": "main", "running": True},
-        }
-        terminals.append(resource)
+        if not cached_terminal:
+            terminals.append(resource)
         pending[-1].fulfill(
             status=200,
             content_type="application/json",
@@ -157,6 +198,7 @@ def test_terminal_view_recovers_on_open(
         chat.emit({"event": "session.resource.created", "data": {"resource": resource}})
         attached = terminal.get_by_test_id("terminal-view")
         expect(attached).to_have_attribute("data-state", "connected", timeout=15_000)
+        assert len(attachments) == (2 if cached_terminal else 1)
         expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
         assert len(pending) == (2 if fail_first else 1)
         page.screenshot(path=str(artifacts / "terminal-reconnected.png"))

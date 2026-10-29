@@ -30,6 +30,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     onResume,
     resumeTarget,
     resumePending,
+    resumeGeneration,
   }: {
     sessionId: string;
     terminalId: string;
@@ -39,6 +40,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     onResume?: () => void | Promise<void>;
     resumeTarget?: string;
     resumePending?: boolean;
+    resumeGeneration?: number;
   }) => {
     // Assign once per mount (useRef(arg) evaluates arg every render but keeps
     // the first value), so the id is stable across re-renders and only changes
@@ -56,6 +58,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
         data-direct-attach-url={directAttachUrl ?? ""}
         data-resume-pending={String(resumePending ?? false)}
         data-resume-target={resumeTarget ?? ""}
+        data-resume-generation={resumeGeneration}
       >
         {onResume && (
           <button type="button" onClick={() => void onResume()}>
@@ -301,11 +304,47 @@ describe("MainTerminalView — automatic recovery", () => {
       "Couldn't reconnect the terminal automatically.",
     );
     rerender(viewTree({ ...props, onResume: () => onResume() }));
+    rerender(viewTree({ ...props, visible: false }));
+    rerender(viewTree(props));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't reconnect the terminal automatically.",
+    );
     expect(onResume).toHaveBeenCalledTimes(1);
     onResume.mockRejectedValueOnce(new Error("host offline"));
     fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
     expect(await screen.findByText("Couldn't resume session: host offline")).toBeVisible();
     expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+    expect(onResume).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves an attached terminal through automatic failure and manual recovery", async () => {
+    hostOnlineMock.mockReturnValue(true);
+    let failResume!: (error: Error) => void;
+    const onResume = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          failResume = reject;
+        }),
+    );
+    const props = { terminals: [REPL_TERMINAL], runnerOnline: true, onResume };
+    const { rerender } = renderView(props);
+    const instance = (await screen.findByTestId("terminal-view")).getAttribute("data-instance");
+
+    rerender(viewTree({ ...props, runnerOnline: false }));
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-instance", instance);
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-resume-generation", "0");
+    expect(screen.queryByRole("button", { name: /Resume/ })).toBeNull();
+
+    await act(async () => failResume(new Error("unavailable")));
+    expect(screen.getByRole("alert")).toBeVisible();
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-instance", instance);
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-resume-generation", "0");
+    onResume.mockResolvedValueOnce(undefined);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume session" })));
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-instance", instance);
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-resume-generation", "1");
+    expect(screen.queryByRole("alert")).toBeNull();
     expect(onResume).toHaveBeenCalledTimes(2);
   });
 
@@ -845,7 +884,19 @@ describe("MainTerminalView — split panes", () => {
     conversationId: string,
     terminals: TerminalInfo[],
     enabled = true,
-    { isFetching = false, listCompleteAt = 0, visible = true, readOnly = false } = {},
+    {
+      isFetching = false,
+      listCompleteAt = 0,
+      visible = true,
+      readOnly = false,
+      onResume,
+    }: {
+      isFetching?: boolean;
+      listCompleteAt?: number;
+      visible?: boolean;
+      readOnly?: boolean;
+      onResume?: () => void | Promise<void>;
+    } = {},
   ) {
     useTerminalsMock.mockReturnValue({
       terminals,
@@ -863,6 +914,7 @@ describe("MainTerminalView — split panes", () => {
             conversationId={conversationId}
             visible={visible}
             readOnly={readOnly}
+            onResume={onResume}
             splittable
           />
         </TerminalFirstContextProvider>
@@ -880,6 +932,42 @@ describe("MainTerminalView — split panes", () => {
     expect(agentPane).toHaveAttribute("data-active", "false");
     expect(bashPane).toHaveAttribute("data-active", "true");
     expect(screen.getByRole("separator", { name: "Resize terminal panes" })).toBeInTheDocument();
+  });
+
+  it("keeps the split shell mounted and usable while recovering its missing agent", async () => {
+    hostOnlineMock.mockReturnValue(true);
+    let failResume!: (error: Error) => void;
+    const onResume = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          failResume = reject;
+        }),
+    );
+    const conversationId = "conv_split_recover";
+    writeSessionWorkspaceState(conversationId, { terminalSplit: savedSplit });
+    const { rerender } = render(
+      splitTree(conversationId, [REPL_TERMINAL, BASH_SHELL], true, { onResume }),
+    );
+    const shell = (await screen.findAllByTestId("terminal-view"))[1];
+    const instance = shell.getAttribute("data-instance");
+
+    rerender(splitTree(conversationId, [BASH_SHELL], true, { onResume }));
+    expect(screen.getByRole("status")).toHaveTextContent("Reconnecting…");
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-instance", instance);
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-active", "true");
+    expect(screen.getByTestId("terminal-view")).not.toHaveAttribute("data-resume-generation");
+    await act(async () => failResume(new Error("unavailable")));
+    expect(screen.getByRole("alert")).toBeVisible();
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-instance", instance);
+    expect(screen.getByTestId("terminal-view")).toHaveAttribute("data-active", "true");
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeEnabled();
+    expect(onResume).toHaveBeenCalledTimes(1);
+    onResume.mockResolvedValueOnce(undefined);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Resume session" })));
+    rerender(splitTree(conversationId, [REPL_TERMINAL, BASH_SHELL], true, { onResume }));
+    expect(screen.getAllByTestId("terminal-view")[1]).toHaveAttribute("data-instance", instance);
+    expect(screen.getAllByTestId("terminal-view")[1]).toHaveAttribute("data-active", "true");
+    expect(screen.getAllByTestId("terminal-view")[1]).not.toHaveAttribute("data-resume-generation");
   });
 
   it("moves focus between panes with the pane-cycle chord", async () => {
