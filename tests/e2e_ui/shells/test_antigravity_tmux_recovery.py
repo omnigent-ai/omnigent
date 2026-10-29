@@ -479,9 +479,9 @@ def test_antigravity_web_turn_stays_in_progress_until_agy_replies(
     deadline = time.monotonic() + 120
     while token not in antigravity_model.replied:
         assert time.monotonic() < deadline, "the mock model never released the held reply"
-        assert composer.get_attribute("placeholder") != "Send a message…", (
-            "the turn was reported complete while agy was still waiting for its model reply"
-        )
+        assert (
+            composer.get_attribute("placeholder") == "Send a follow-up (queued) — Esc to stop"
+        ), "the turn was reported complete while agy was still waiting for its model reply"
         time.sleep(0.2)
     reply = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
     expect(reply.filter(has_text=token)).to_have_count(1, timeout=60_000)
