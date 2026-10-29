@@ -15,7 +15,15 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
+import {
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
@@ -39,6 +47,7 @@ import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/fil
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
+  closeDesktopWindow,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -148,6 +157,7 @@ import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
+import { CloseWindowDialog } from "./CloseWindowDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -279,6 +289,7 @@ function AppShellImpl() {
     gridId: string;
   }>();
   const location = useLocation();
+  const navigateTo = useNavigate();
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
   const canvasMode =
@@ -1998,8 +2009,9 @@ function AppShellImpl() {
     [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
   );
 
-  // ⌘⌥T (Ctrl+Alt+T) opens a new shell — the keyboard path for the tab-strip
-  // "+" menu, launching the remembered default type via the same create +
+  // ⌃` and ⌘⌥T (Ctrl+Alt+T) open a new shell, as does the desktop menu's New
+  // Terminal — the keyboard path for the tab-strip "+" menu, launching the
+  // remembered default type via the same create +
   // focus path the menu uses (mark-start snapshot, then focus the tab). Gated
   // on the session declaring shell access and being reachable: an offline
   // session can't be reconnected from the browser, so the chord is inert there,
@@ -2029,6 +2041,18 @@ function AppShellImpl() {
     openTerminalTab,
   ]);
   useNewShellHotkey(launchDefaultShell, shellLaunchable);
+  useDesktopCommand("new-terminal", shellLaunchable ? launchDefaultShell : null);
+
+  // Desktop Close (⌘W / Ctrl+W), once the workspace rail has passed on it:
+  // leave the open session or page for the new-session page; from the
+  // new-session page itself, confirm, then close the window.
+  const atNewSessionPage =
+    location.pathname.replace(/\/$/, "") === rebasePath("/").replace(/\/$/, "");
+  const [closeWindowPrompt, setCloseWindowPrompt] = useState<{ quits: boolean } | null>(null);
+  useDesktopCommand("close", (event) => {
+    if (atNewSessionPage) setCloseWindowPrompt({ quits: event.closingQuits });
+    else navigateTo("/");
+  });
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
@@ -2665,6 +2689,7 @@ function AppShellImpl() {
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
+                    onHide={rightPanelOpen ? toggleRightPanel : undefined}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
@@ -2835,6 +2860,14 @@ function AppShellImpl() {
             })()}
             onConfirm={confirmCloseTerminal}
             onCancel={() => setTerminalPendingClose(null)}
+          />
+          <CloseWindowDialog
+            prompt={closeWindowPrompt}
+            onConfirm={() => {
+              setCloseWindowPrompt(null);
+              void closeDesktopWindow();
+            }}
+            onCancel={() => setCloseWindowPrompt(null)}
           />
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}

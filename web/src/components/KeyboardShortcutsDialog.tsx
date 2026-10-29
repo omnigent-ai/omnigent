@@ -13,6 +13,9 @@ import { Fragment, useEffect, useState } from "react";
 
 import {
   ALT_KEY,
+  ARCHIVE_SESSION_KEYS,
+  CLOSE_KEYS,
+  CLOSE_WINDOW_KEYS,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
@@ -20,7 +23,11 @@ import {
   ENTER_KEY,
   Kbd,
   MOD_KEY,
+  NEW_BROWSER_TAB_KEYS,
+  NEW_TERMINAL_KEYS,
   newSessionShortcutKeys,
+  PIN_SESSION_KEYS,
+  QUIT_KEYS,
   SHIFT_KEY,
   SPLIT_TERMINAL_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
@@ -38,7 +45,12 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
+import {
+  isElectronShell,
+  isNativeShell,
+  supportsBrowser,
+  supportsDesktopCommands,
+} from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -121,7 +133,11 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
         lastKeySeparator: "+",
       },
       { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
-      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
+      {
+        label: "Open a new shell",
+        keys: [...NEW_TERMINAL_KEYS],
+        alternateKeys: [MOD_KEY, ALT_KEY, "T"],
+      },
     ],
   },
   {
@@ -141,6 +157,16 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Dismiss menu", keys: ["Esc"] },
     ],
   },
+];
+
+// Desktop menu commands (File → Close, Session → Pin/Archive, Quit), present
+// only when the shell hands them to the page.
+const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
+  { label: "Close tab, or leave the session", keys: [...CLOSE_KEYS] },
+  { label: "Close window", keys: [...CLOSE_WINDOW_KEYS] },
+  { label: "Pin or unpin current session", keys: [...PIN_SESSION_KEYS] },
+  { label: "Archive current session", keys: [...ARCHIVE_SESSION_KEYS] },
+  { label: "Quit Omnigent", keys: [...QUIT_KEYS] },
 ];
 
 // Numeric pinned-session jump. The chord is platform-aware (see
@@ -164,6 +190,7 @@ function shortcutGroupsFor(
   contentSearch: boolean,
   grids: boolean,
   splitTerminal: boolean,
+  desktopCommands: boolean,
 ): ShortcutGroup[] {
   const groups = SHORTCUT_GROUPS.map((group) => {
     if (group.title === "General") {
@@ -172,6 +199,7 @@ function shortcutGroupsFor(
         items: [
           { label: "Start a new session", keys: newSessionShortcutKeys(native) },
           ...group.items,
+          ...(desktopCommands ? DESKTOP_COMMAND_SHORTCUTS : []),
         ],
       };
     }
@@ -213,11 +241,16 @@ function shortcutGroupsFor(
               (browser || item.label !== "Open a new browser tab") &&
               (contentSearch || item.label !== "Search workspace contents"),
           )
-          .map((item) =>
-            contentSearch && item.label === "Select a workspace tab"
-              ? { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] }
-              : item,
-          ),
+          .map((item) => {
+            if (contentSearch && item.label === "Select a workspace tab") {
+              return { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] };
+            }
+            // The desktop menu's New Browser Tab owns ⌘T; ⌘⌥B still works.
+            if (desktopCommands && item.label === "Open a new browser tab") {
+              return { ...item, keys: [...NEW_BROWSER_TAB_KEYS], alternateKeys: item.keys };
+            }
+            return item;
+          }),
       };
     }
     if (group.title === "Panes") {
@@ -263,6 +296,7 @@ export function KeyboardShortcutsList({
     !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
     !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
     !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
+    supportsDesktopCommands(),
   );
   const settings = variant === "settings";
   return (

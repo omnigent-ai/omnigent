@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserPane } from "./BrowserPane";
 
@@ -213,6 +214,13 @@ describe("BrowserPane cold-start (no view yet)", () => {
       expect(screen.queryByText(/enter a url above to get started/i)).toBeNull();
     });
     expect(screen.getByRole("textbox", { name: /address bar/i })).toBeInTheDocument();
+  });
+
+  it("takes focus from a click on a new tab's empty page, as a loaded page does", async () => {
+    // The workspace rail's Close (⌘W) closes the tab on screen while focus is inside it.
+    const { container } = render(<BrowserPane conversationId="conv_e" />);
+    await userEvent.setup().click(screen.getByText(/enter a url above to get started/i));
+    expect(document.activeElement).toBe(container.firstElementChild);
   });
 });
 
