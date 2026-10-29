@@ -436,6 +436,22 @@ def test_config_non_uuid_host_id_raises_actionable(tmp_path: Path) -> None:
     assert "not-a-uuid" in msg
 
 
+def test_malformed_previous_host_id_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed previous host id only loses the rotation hint; the host still starts."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {"host": {"host_id": "a" * 32, "name": "my-laptop", "previous_host_id": "not-a-uuid"}}
+        )
+    )
+
+    assert load_or_create_host_identity(config_path).previous_host_id is None
+
+
 def test_if_present_env_non_uuid_host_id_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """The read-only sibling is TOLERANT: a malformed env host_id yields None, not
     a raise. This path is the passive slice-key fallback every request's header
@@ -485,6 +501,7 @@ def test_reset_host_id_mints_fresh_id_and_keeps_name(tmp_path: Path) -> None:
 
     cfg = yaml.safe_load(config_path.read_text())
     assert cfg["host"]["host_id"] == new_id
+    assert cfg["host"]["previous_host_id"] == old_id
     assert cfg["host"]["name"] == "my-laptop", "reset must not clobber the host name"
     assert cfg["server"] == "https://example.databricksapps.com", (
         "reset must not touch unrelated config keys"
@@ -507,7 +524,7 @@ def test_reset_host_id_without_existing_identity_creates_one(tmp_path: Path) -> 
 def test_reset_host_id_next_load_returns_the_new_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a reset, the normal load path picks up the fresh id."""
+    """After a reset, the normal load path picks up the fresh id and the one it replaced."""
     # The load path honors the managed-host env override; clear it so the
     # test reads the file identity regardless of the ambient environment.
     monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
@@ -520,6 +537,7 @@ def test_reset_host_id_next_load_returns_the_new_identity(
 
     assert after.host_id == new_id
     assert after.host_id != before.host_id
+    assert after.previous_host_id == before.host_id
     assert after.name == before.name
 
 

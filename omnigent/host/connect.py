@@ -5425,6 +5425,7 @@ class HostProcess:
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
             refreshed_name=self._identity.name if self._identity.stored_name else None,
+            previous_host_id=self._identity.previous_host_id,
         )
         try:
             encoded_hello = encode_host_frame(hello)
@@ -5446,9 +5447,12 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
+            requested_rename = (
+                f", requested rename to {hello.refreshed_name!r}" if hello.refreshed_name else ""
+            )
             _print_host_status(
-                f"✓ Connected as {self._identity.name!r} "
-                f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
+                f"✓ Connected as {hello.name!r} ({self._identity.host_id}){requested_rename}, "
+                f"{len(hello.runners)} live runner(s). "
                 "Listening for sessions — Ctrl-C to disconnect.",
             )
 
@@ -6083,7 +6087,8 @@ def _serve_host_until_exit(
     from omnigent.util.server_url import display_server_url
 
     _print_host_status(
-        f"Connecting to {display_server_url(server_url)} as {identity.name!r} ({identity.host_id})"
+        f"Connecting to {display_server_url(server_url)} as "
+        f"{identity.stored_name or identity.name!r} ({identity.host_id})"
     )
     # Tell the user where logs land up front — `omnigent host` used to run
     # silently, so a stuck/quiet host gave no hint where to look. Session

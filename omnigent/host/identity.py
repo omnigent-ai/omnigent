@@ -44,6 +44,9 @@ MANAGED_HOST_TOKEN_HEADER = "X-Omnigent-Host-Token"
 # kept. Writers of an explicitly chosen name set it to null.
 NAME_FROM_HOSTNAME_KEY = "name_from_hostname"
 
+# The host_id ``reset-id`` replaced, so a server can move that registration to the new id.
+PREVIOUS_HOST_ID_KEY = "previous_host_id"
+
 # EC2's private-IP hostname, e.g. ``ip-10-90-37-46``. In a config saved before
 # NAME_FROM_HOSTNAME_KEY existed, such a name was generated, never chosen.
 _EC2_PRIVATE_IP_HOSTNAME = re.compile(r"ip(-(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){4}(\..+)?")
@@ -62,11 +65,14 @@ class HostIdentity:
         refreshed it from a newer hostname, e.g. ``"ip-10-90-45-193"``. The
         hello registers it for servers that predate name refreshes. ``None``
         otherwise.
+    :param previous_host_id: The host_id ``reset-id`` replaced, e.g.
+        ``"a1ed1ab71de2311e20488a989e61701c"``, or ``None``.
     """
 
     host_id: str
     name: str
     stored_name: str | None = None
+    previous_host_id: str | None = None
 
 
 HOST_SLICE_KEY_ENABLED_ENV_VAR = "OMNIGENT_HOST_SLICE_KEY_ENABLED"
@@ -132,6 +138,16 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
             'print(uuid.uuid4().hex)"`). ' + remedy
         ) from None
     return normalized
+
+
+def parse_host_id_or_none(value: object) -> str | None:
+    """Normalize *value* as a host id, or return ``None`` when it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return uuid_to_bytes(value).hex()
+    except InvalidUuidError:
+        return None
 
 
 def _write_config(path: Path, cfg: dict[str, object]) -> None:
@@ -222,6 +238,7 @@ def load_or_create_host_identity(
 
     host_id = host_section.get("host_id")
     name = host_section.get("name")
+    previous_host_id = parse_host_id_or_none(host_section.get(PREVIOUS_HOST_ID_KEY))
     hostname = socket.gethostname()
     stored_name: str | None = None
     record_provenance = False
@@ -247,6 +264,7 @@ def load_or_create_host_identity(
             ),
             name=name,
             stored_name=stored_name,
+            previous_host_id=previous_host_id,
         )
         if record_provenance:
             # Best effort: an unwritable config only repeats this on the next start.
@@ -264,7 +282,9 @@ def load_or_create_host_identity(
     )
     if not name:
         name = host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = hostname
-    identity = HostIdentity(host_id=host_id, name=name, stored_name=stored_name)
+    identity = HostIdentity(
+        host_id=host_id, name=name, stored_name=stored_name, previous_host_id=previous_host_id
+    )
 
     host_section["host_id"] = identity.host_id
     cfg["host"] = host_section
@@ -283,8 +303,9 @@ def reset_host_id(path: Path | None = None) -> tuple[str | None, str]:
     machine register as a brand-new host under the current identity.
 
     The host ``name`` (and every other config key) is preserved; only
-    ``host_id`` changes. A missing config or host section is created, same
-    as :func:`load_or_create_host_identity`.
+    ``host_id`` changes, and the replaced id is kept as ``previous_host_id``.
+    A missing config or host section is created, same as
+    :func:`load_or_create_host_identity`.
 
     :param path: Optional config YAML path. Defaults to the user-level path,
         honoring ``OMNIGENT_CONFIG_HOME`` when set.
@@ -304,6 +325,8 @@ def reset_host_id(path: Path | None = None) -> tuple[str | None, str]:
     old_host_id = host_section.get("host_id")
     new_host_id = uuid.uuid4().hex
     host_section["host_id"] = new_host_id
+    if isinstance(old_host_id, str):
+        host_section[PREVIOUS_HOST_ID_KEY] = old_host_id
     if "name" not in host_section:
         host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = socket.gethostname()
     cfg["host"] = host_section
