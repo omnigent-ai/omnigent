@@ -2309,8 +2309,8 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Host-spawned launch emits ``--append-system-prompt-file`` holding the
-    agent's raw author instructions.
+    Host-spawned launch emits ``--append-system-prompt`` with the agent's
+    raw author instructions.
 
     The managed-host wiring in ``runner/native/orchestration.py``
     (``augment_claude_args(..., append_system_prompt=
@@ -2378,11 +2378,9 @@ async def test_auto_create_claude_terminal_passes_raw_instructions(
     )
 
     args = captured["spec"].args
-    assert "--append-system-prompt-file" in args, (
-        f"missing --append-system-prompt-file in {args!r}"
-    )
-    idx = args.index("--append-system-prompt-file")
-    assert Path(args[idx + 1]).read_text() == "Be a concise, careful coding assistant."
+    assert "--append-system-prompt" in args, f"missing --append-system-prompt in {args!r}"
+    idx = args.index("--append-system-prompt")
+    assert args[idx + 1] == "Be a concise, careful coding assistant."
 
 
 @pytest.mark.asyncio
@@ -6078,7 +6076,7 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
     # And the auto-harness extras, which only make sense alongside the router.
-    assert "--append-system-prompt-file" in spec.args
+    assert "--append-system-prompt" in spec.args
     allowed = spec.args[spec.args.index("--allowedTools") + 1]
     assert "mcp__omnigent__sys_session_create" in allowed
 

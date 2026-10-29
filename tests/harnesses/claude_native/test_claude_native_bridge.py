@@ -4111,9 +4111,11 @@ def test_augment_claude_args_appends_caller_system_prompt(
         append_system_prompt=framework_instruction,
     )
 
-    assert args.count("--append-system-prompt-file") == 1
-    index = args.index("--append-system-prompt-file")
-    assert Path(args[index + 1]).read_text(encoding="utf-8") == framework_instruction
+    assert args.count("--append-system-prompt") == 1
+    index = args.index("--append-system-prompt")
+    assert args[index + 1] == framework_instruction
+    # Inline, so Claude's /fork stays available.
+    assert "--append-system-prompt-file" not in args
 
 
 def test_augment_claude_args_keeps_long_instructions_out_of_argv(tmp_path: Path) -> None:
@@ -4147,21 +4149,75 @@ def test_augment_claude_args_keeps_long_instructions_out_of_argv(tmp_path: Path)
     [
         ("--append-system-prompt", "User addition"),
         ("--append-system-prompt=User addition",),
-        ("--append-system-prompt-file", "/home/user/prompt.md"),
     ],
 )
-def test_augment_claude_args_keeps_inline_prompt_when_user_sets_one(
+def test_augment_claude_args_keeps_instructions_inline_beside_a_user_inline_prompt(
     tmp_path: Path,
     user_args: tuple[str, ...],
 ) -> None:
     """
-    A user-supplied prompt flag keeps the agent's instructions inline.
+    A user's inline prompt keeps even long instructions inline.
 
     Claude Code refuses ``--append-system-prompt`` together with
     ``--append-system-prompt-file``, so the file form would break this launch.
     """
-    stale_prompt = tmp_path / "claude-append-system-prompt.md"
-    stale_prompt.write_text("Previous agent", encoding="utf-8")
+    instructions = "Follow the project conventions carefully.\n" * 2_000
+
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=instructions,
+    )
+
+    assert args[args.index("--append-system-prompt", len(user_args)) + 1] == instructions
+    assert "--append-system-prompt-file" not in args
+    assert not (tmp_path / "claude-append-system-prompt.md").exists()
+
+
+@pytest.mark.parametrize("joined", [False, True])
+def test_augment_claude_args_adds_instructions_to_a_user_prompt_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    joined: bool,
+) -> None:
+    """
+    A user's prompt file is copied with the instructions; no inline prompt is added.
+
+    A relative path resolves against the workspace, as Claude would resolve it.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "prompt.md").write_text("User addition\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    user_args = (
+        ("--append-system-prompt-file=prompt.md",)
+        if joined
+        else ("--append-system-prompt-file", "prompt.md")
+    )
+
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=bridge_dir,
+        workspace=workspace,
+        python_executable="/venv/bin/python",
+        append_system_prompt="Agent instructions",
+    )
+
+    prompt_path = bridge_dir / "claude-append-system-prompt.md"
+    expected_arg = f"--append-system-prompt-file={prompt_path}" if joined else str(prompt_path)
+    assert args[len(user_args) - 1] == expected_arg
+    assert "--append-system-prompt" not in args
+    assert prompt_path.read_text(encoding="utf-8") == "User addition\n\nAgent instructions"
+    assert stat.S_IMODE(prompt_path.stat().st_mode) == 0o600
+
+
+def test_augment_claude_args_leaves_an_unreadable_user_prompt_file_alone(
+    tmp_path: Path,
+) -> None:
+    """Instructions are skipped, not added inline, when the user's prompt file is unreadable."""
+    user_args = ("--append-system-prompt-file", str(tmp_path / "missing.md"))
 
     args = augment_claude_args(
         user_args,
@@ -4170,13 +4226,9 @@ def test_augment_claude_args_keeps_inline_prompt_when_user_sets_one(
         append_system_prompt="Agent instructions",
     )
 
-    assert args[args.index("--append-system-prompt", len(user_args)) + 1] == (
-        "Agent instructions"
-    )
-    assert args.count("--append-system-prompt-file") == user_args.count(
-        "--append-system-prompt-file"
-    )
-    assert not stale_prompt.exists()
+    assert args[:2] == list(user_args)
+    assert "--append-system-prompt" not in args
+    assert args.count("--append-system-prompt-file") == 1
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
