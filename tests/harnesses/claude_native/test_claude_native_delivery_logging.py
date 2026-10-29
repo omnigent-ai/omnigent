@@ -76,10 +76,8 @@ def test_delivery_diagnostics(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
-        if args[-1] == "Space":
+        if args[-1] == "Space" or (args[0] == "send-keys" and "-l" in args):
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
@@ -88,7 +86,11 @@ def test_delivery_diagnostics(
             enters += 1
             if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            pane = {
+                "empty_capture": "",
+                "missing_glyph": "terminal output",
+                "unknown_command": "──────\n❯ \n──────\n",
+            }.get(scenario, "❯ ")
 
     monkeypatch.setattr(
         bridge,
@@ -207,7 +209,8 @@ def test_delivery_diagnostics(
         assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
-        assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
+        assert attrs["stage_pasting_ms"] == 10
+        assert attrs["elapsed_ms"] == (90 if scenario == "empty_capture" else 40)
         if scenario == "empty_capture":
             assert attrs["submit_sent"] is True
             assert attrs["error_type"] == "RuntimeError"
