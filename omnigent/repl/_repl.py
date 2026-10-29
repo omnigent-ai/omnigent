@@ -1007,6 +1007,10 @@ class _FieldInputState:
         # prompting rather than advancing to — and re-prompting for —
         # the next field after the turn is already gone.
         self._aborted: bool = False
+        # Elicitation the open prompt answers, so another client's verdict
+        # for it can release the prompt; set when the abort came from there.
+        self._elicitation_id: str | None = None
+        self._resolved_elsewhere: bool = False
 
     @property
     def pending(self) -> bool:
@@ -1021,17 +1025,35 @@ class _FieldInputState:
         """:returns: ``True`` if collection was cancelled mid-prompt."""
         return self._aborted
 
-    def begin(self, field_name: str) -> asyncio.Future[str]:
+    @property
+    def resolved_elsewhere(self) -> bool:
+        """:returns: ``True`` if another client answered the open prompt."""
+        return self._resolved_elsewhere
+
+    def begin(self, field_name: str, elicitation_id: str | None = None) -> asyncio.Future[str]:
         # A fresh prompt is never pre-aborted. Cleared here (not in the
         # collection loop) so the flag spans exactly one begin/await
         # cycle: the loop reads it the instant the await returns, and
         # the only await between fields IS this ``begin``.
         self._aborted = False
+        self._resolved_elsewhere = False
         if self._future is not None and not self._future.done():
             self._future.set_result("")
         self._field_name = field_name
+        self._elicitation_id = elicitation_id
         self._future = asyncio.get_running_loop().create_future()
         return self._future
+
+    def resolve_elsewhere(self, elicitation_id: str) -> bool:
+        """Release the open prompt if another client answered its elicitation.
+
+        :returns: ``True`` when the prompt belonged to *elicitation_id*.
+        """
+        if not self.pending or not elicitation_id or elicitation_id != self._elicitation_id:
+            return False
+        self.cancel()
+        self._resolved_elsewhere = True
+        return True
 
     def resolve(self, text: str) -> bool:
         if self._future is None or self._future.done():
@@ -1047,6 +1069,140 @@ class _FieldInputState:
             self._future.set_result("")
         self._future = None
         self._field_name = None
+        self._elicitation_id = None
+
+
+def _settle_resolved_elsewhere(
+    approval_state: _ApprovalState,
+    field_input_state: _FieldInputState,
+    elicitation_id: str,
+    action: str | None,
+    reason: str | None,
+) -> str | None:
+    """Release this REPL's prompt for an elicitation another client settled.
+
+    :returns: The transcript line, e.g. ``"approved elsewhere"``, or ``None``
+        when no prompt here was waiting on *elicitation_id*.
+    """
+    if approval_state.resolve_elsewhere(
+        elicitation_id, action
+    ) or field_input_state.resolve_elsewhere(elicitation_id):
+        return _resolved_elsewhere_label(action, reason)
+    return None
+
+
+@dataclass(frozen=True)
+class _QuestionPrompt:
+    """One question from an ``ask_user_question`` elicitation extra.
+
+    :param key: Answer key the web form uses: the question ``id``, else its text.
+    :param question: Question text, e.g. ``"Which environment?"``.
+    :param header: Short badge, e.g. ``"Environment"``; empty when absent.
+    :param options: ``(label, description)`` pairs in display order.
+    :param multi_select: Whether several options may be chosen.
+    :param allow_custom: Whether a typed answer outside the options is accepted.
+    :param text_default: Prefilled text for editor-style questions, whose
+        exact text (empty allowed) is the answer; ``None`` otherwise.
+    """
+
+    key: str
+    question: str
+    header: str
+    options: tuple[tuple[str, str], ...]
+    multi_select: bool
+    allow_custom: bool
+    text_default: str | None = None
+
+
+def _question_prompts(payload: object) -> list[_QuestionPrompt]:
+    """Parse an ``ask_user_question`` extra into prompts; ``[]`` when unusable.
+
+    :param payload: The extra, e.g. ``{"questions": [{"question": "Env?", ...}]}``.
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list):
+        return []
+    prompts: list[_QuestionPrompt] = []
+    for raw in raw_questions:
+        if not isinstance(raw, dict):
+            continue
+        text = raw.get("question")
+        if not isinstance(text, str) or not text:
+            continue
+        options: list[tuple[str, str]] = []
+        for option in raw.get("options") or []:
+            if isinstance(option, str) and option:
+                options.append((option, ""))
+            elif isinstance(option, dict) and isinstance(option.get("label"), str):
+                description = option.get("description")
+                options.append(
+                    (option["label"], description if isinstance(description, str) else "")
+                )
+        question_id = raw.get("id")
+        header = raw.get("header")
+        text_input = raw.get("textInput")
+        default = text_input.get("default") if isinstance(text_input, dict) else None
+        prompts.append(
+            _QuestionPrompt(
+                key=question_id if isinstance(question_id, str) and question_id else text,
+                question=text,
+                header=header if isinstance(header, str) else "",
+                options=tuple(options),
+                multi_select=raw.get("multiSelect") is True,
+                # Matches the web form: a typed answer is allowed unless the
+                # producer says otherwise, and always when there are no options.
+                allow_custom=raw.get("isOther") is not False or not options,
+                text_default=default if isinstance(default, str) else None,
+            )
+        )
+    return prompts
+
+
+def _parse_question_answer(text: str, question: _QuestionPrompt) -> str | list[str] | None:
+    """Turn one typed line into an answer, or ``None`` to re-prompt.
+
+    Accepts option numbers (``"2"``, or ``"1,3"`` for multi-select), an exact
+    option label, or free text when the question allows a custom answer.
+    """
+    if question.text_default is not None:
+        return text if text.strip() else question.text_default
+    stripped = text.strip()
+    if not stripped:
+        return None
+    labels = [label for label, _ in question.options]
+    by_label = {label.casefold(): label for label in labels}
+    if stripped.casefold() in by_label:
+        label = by_label[stripped.casefold()]
+        return [label] if question.multi_select else label
+    tokens = [token for token in re.split(r"[,\s]+", stripped) if token]
+    if labels and all(token.isdigit() for token in tokens):
+        picked: list[str] = []
+        for token in tokens:
+            index = int(token)
+            if not 1 <= index <= len(labels):
+                return None
+            if labels[index - 1] not in picked:
+                picked.append(labels[index - 1])
+        if question.multi_select:
+            return picked
+        return picked[0] if len(picked) == 1 else None
+    if not question.allow_custom:
+        return None
+    return [stripped] if question.multi_select else stripped
+
+
+def _question_hint(question: _QuestionPrompt) -> str:
+    """Input hint shown under a question, e.g. ``"enter a number · Esc cancels"``."""
+    if question.text_default is not None:
+        return "type your answer · Enter keeps the prefilled text · Esc cancels"
+    if not question.options:
+        return "type your answer · Esc cancels"
+    hint = "enter one or more numbers, e.g. 1,3" if question.multi_select else "enter a number"
+    if question.allow_custom:
+        hint += ", or type your own answer"
+    return f"{hint} · Esc cancels"
 
 
 def _build_elicitation_content_from_schema(
@@ -2722,11 +2878,65 @@ class _SessionsChatReplAdapter:
         :param session_id: Session to post the approval to.
         :param event: The translated :class:`ElicitationRequest`.
         """
+        elicitation_id = getattr(event, "elicitation_id", "")
+        # Question prompts get a numbered picker instead of y/a/n: an accept
+        # without answers would reach the agent as an empty reply.
+        questions = _question_prompts(getattr(event, "ask_user_question", None))
+        if questions and self._field_input_state is not None:
+            resolve_payload = await self._question_payload(elicitation_id, questions)
+            if resolve_payload is None:
+                return  # another client answered it
+        else:
+            resolve_payload = await self._approval_payload(event, elicitation_id)
+
+        # URL-based elicitation: deliver the verdict to the elicitation's
+        # dedicated resolve URL rather than as an in-band ``approval`` event.
+        # A transport error can happen after the server accepted the POST but
+        # before the client received its response, so retrying is safe: the
+        # server either accepts the retry or reports the elicitation resolved.
+        for attempt in range(3):
+            try:
+                await self._client.sessions.resolve_elicitation(
+                    session_id,
+                    elicitation_id,
+                    resolve_payload,
+                )
+                return
+            except OmnigentError as exc:
+                if exc.code == "not_found":
+                    # Another client may have resolved it while the terminal
+                    # prompt was open, or the first POST reached the server.
+                    return
+                raise
+            except Exception as exc:
+                if not _is_recoverable_sse_transport_error(exc):
+                    raise
+                if attempt == 2:
+                    # One line here, postmortem behind DEBUG: the REPL
+                    # configures no log handlers, so a WARNING carrying
+                    # exc_info falls through to ``logging.lastResort`` and
+                    # paints a traceback over the TUI frame. Same split
+                    # ``_stream_pump`` makes for the same reason.
+                    _log.warning("Could not resolve elicitation after transport retries")
+                    _log.debug("elicitation resolve failed", exc_info=exc)
+                    # The elicitation is still parked server-side, so the
+                    # turn waits on a verdict that will never arrive. Say so
+                    # instead of leaving an apparently live prompt.
+                    self._emit_elicitation_resolve_error(exc)
+                    return
+                await asyncio.sleep(0.1 * (2**attempt))
+
+    async def _approval_payload(self, event: object, elicitation_id: str) -> dict[str, object]:
+        """Run the y/a/n approval hook and build the resolve payload.
+
+        :param event: The translated :class:`ElicitationRequest`.
+        :param elicitation_id: Id of the elicitation being answered.
+        :returns: ``{"action": ..., "content"?: ...}`` for the resolve POST.
+        """
         import inspect
 
         from omnigent_client._tool_handler import ElicitationRequestCtx
 
-        elicitation_id = getattr(event, "elicitation_id", "")
         hook = self._hooks.on_elicitation_request
         if hook is None:
             action = "decline"
@@ -2766,7 +2976,7 @@ class _SessionsChatReplAdapter:
                 # agent turn doesn't hang waiting on a verdict that the
                 # background task would otherwise never POST.
                 try:
-                    prompted = await self._prompt_schema_fields(schema)
+                    prompted = await self._prompt_schema_fields(schema, elicitation_id)
                 except Exception:  # noqa: BLE001
                     prompted = None
                 if prompted is not None:
@@ -2774,46 +2984,80 @@ class _SessionsChatReplAdapter:
                 else:
                     resolve_payload["action"] = "decline"
 
-        # URL-based elicitation: deliver the verdict to the elicitation's
-        # dedicated resolve URL rather than as an in-band ``approval`` event.
-        # A transport error can happen after the server accepted the POST but
-        # before the client received its response, so retrying is safe: the
-        # server either accepts the retry or reports the elicitation resolved.
-        for attempt in range(3):
-            try:
-                await self._client.sessions.resolve_elicitation(
-                    session_id,
-                    elicitation_id,
-                    resolve_payload,
-                )
-                return
-            except OmnigentError as exc:
-                if exc.code == "not_found":
-                    # Another client may have resolved it while the terminal
-                    # prompt was open, or the first POST reached the server.
-                    return
-                raise
-            except Exception as exc:
-                if not _is_recoverable_sse_transport_error(exc):
-                    raise
-                if attempt == 2:
-                    # One line here, postmortem behind DEBUG: the REPL
-                    # configures no log handlers, so a WARNING carrying
-                    # exc_info falls through to ``logging.lastResort`` and
-                    # paints a traceback over the TUI frame. Same split
-                    # ``_stream_pump`` makes for the same reason.
-                    _log.warning("Could not resolve elicitation after transport retries")
-                    _log.debug("elicitation resolve failed", exc_info=exc)
-                    # The elicitation is still parked server-side, so the
-                    # turn waits on a verdict that will never arrive. Say so
-                    # instead of leaving an apparently live prompt.
-                    self._emit_elicitation_resolve_error(exc)
-                    return
-                await asyncio.sleep(0.1 * (2**attempt))
+        return resolve_payload
+
+    async def _question_payload(
+        self,
+        elicitation_id: str,
+        questions: list[_QuestionPrompt],
+    ) -> dict[str, object] | None:
+        """Ask each question in the terminal and build the resolve payload.
+
+        :param elicitation_id: Id of the elicitation being answered.
+        :param questions: Parsed questions from the ``ask_user_question`` extra.
+        :returns: An accept carrying the web form's answer shape, a decline
+            when the user aborts, or ``None`` when another client answered.
+        """
+        try:
+            answers = await self._prompt_questions(elicitation_id, questions)
+        except Exception:  # noqa: BLE001
+            # Never leave the elicitation unresolved: a failed prompt declines.
+            answers = None
+        fis = self._field_input_state
+        if fis is not None and fis.resolved_elsewhere:
+            return None
+        if answers is None:
+            return {"action": "decline"}
+        return {"action": "accept", "content": answers}
+
+    async def _prompt_questions(
+        self,
+        elicitation_id: str,
+        questions: list[_QuestionPrompt],
+    ) -> dict[str, str | list[str]] | None:
+        """Show each question with numbered options and read the answers.
+
+        :returns: Answers keyed by question id (or text), or ``None`` on abort.
+        """
+        from rich.text import Text
+
+        fis = self._field_input_state
+        host = self._host
+        fmt = self._fmt
+        if fis is None or host is None or fmt is None:
+            return None
+
+        answers: dict[str, str | list[str]] = {}
+        for number, question in enumerate(questions, start=1):
+            # Plain styled text: question and option text come from the model
+            # and must not be parsed as Rich markup.
+            title = f"\n ? question {number} of {len(questions)}"
+            if question.header:
+                title += f" · {question.header}"
+            host.output(Text(title, style=fmt.warning))
+            host.output(Text(f"   {question.question}"))
+            for index, (label, description) in enumerate(question.options, start=1):
+                line = f"     {index}. {label}"
+                if description:
+                    line += f" — {description}"
+                host.output(Text(line))
+            hint = _question_hint(question)
+            host.output(Text(f"   {hint}", style=fmt.accent))
+            while True:
+                raw = await fis.begin(question.header or "answer", elicitation_id)
+                if fis.aborted:
+                    return None
+                answer = _parse_question_answer(raw, question)
+                if answer is not None:
+                    break
+                host.output(Text(f"     ↳ {hint}", style=fmt.warning))
+            answers[question.key] = answer
+        return answers
 
     async def _prompt_schema_fields(
         self,
         schema: dict[str, object],
+        elicitation_id: str | None = None,
     ) -> dict[str, str | int | float | bool | list[str] | None] | None:
         """Prompt the user for each schema property via the main input loop.
 
@@ -2882,7 +3126,7 @@ class _SessionsChatReplAdapter:
             # everything: a single typo on field N shouldn't decline the
             # whole form. The user aborts the turn with Esc (→ ``aborted``).
             while True:
-                raw = await fis.begin(key)
+                raw = await fis.begin(key, elicitation_id)
                 if fis.aborted:
                     return None
 
@@ -3763,8 +4007,10 @@ async def run_repl(
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            if approval_state.resolve_elsewhere(event.elicitation_id, event.action):
-                label = _resolved_elsewhere_label(event.action, event.reason)
+            label = _settle_resolved_elsewhere(
+                approval_state, field_input_state, event.elicitation_id, event.action, event.reason
+            )
+            if label is not None:
                 host.output(
                     Text.from_markup(
                         f"   [{fmt.muted}]› {label}[/{fmt.muted}]",
