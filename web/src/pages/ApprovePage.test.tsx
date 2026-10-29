@@ -26,10 +26,21 @@ function jsonResponse(body: unknown, { ok = true, status = 200 } = {}): Response
   } as unknown as Response;
 }
 
+/** A button that moves the mounted page to the next approval link, `eli_2`. */
+function OpenNextApproval() {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate("/approve/sess_1/eli_2")}>
+      Next link
+    </button>
+  );
+}
+
 /** Render the page at a concrete `/approve/:sessionId/:elicitationId` route. */
-function renderPage(sessionId = "sess_1", elicitationId = "eli_1") {
+function renderPage(sessionId = "sess_1", elicitationId = "eli_1", { withNextLink = false } = {}) {
   return render(
     <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
+      {withNextLink && <OpenNextApproval />}
       <Routes>
         <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
       </Routes>
@@ -327,22 +338,7 @@ describe("ApprovePage submission", () => {
       .mockResolvedValueOnce(jsonResponse(null, { ok: false, status: 423 }))
       .mockResolvedValueOnce(jsonResponse({ status: "pending", message: "Run the migration?" }))
       .mockResolvedValue(jsonResponse({ status: "pending", message: "Deploy the release?" }));
-    function OpenNextApproval() {
-      const navigate = useNavigate();
-      return (
-        <button type="button" onClick={() => navigate("/approve/sess_1/eli_2")}>
-          Next link
-        </button>
-      );
-    }
-    render(
-      <MemoryRouter initialEntries={["/approve/sess_1/eli_1"]}>
-        <OpenNextApproval />
-        <Routes>
-          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
-        </Routes>
-      </MemoryRouter>,
-    );
+    renderPage("sess_1", "eli_1", { withNextLink: true });
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
     expect(await screen.findByText("Resolve failed: 423")).toBeInTheDocument();
 
@@ -362,22 +358,7 @@ describe("ApprovePage submission", () => {
       const message = String(url).endsWith("/eli_2") ? "Deploy the release?" : "Run the migration?";
       return jsonResponse({ status: "pending", message });
     });
-    function OpenNextApproval() {
-      const navigate = useNavigate();
-      return (
-        <button type="button" onClick={() => navigate("/approve/sess_1/eli_2")}>
-          Next link
-        </button>
-      );
-    }
-    render(
-      <MemoryRouter initialEntries={["/approve/sess_1/eli_1"]}>
-        <OpenNextApproval />
-        <Routes>
-          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
-        </Routes>
-      </MemoryRouter>,
-    );
+    renderPage("sess_1", "eli_1", { withNextLink: true });
     fireEvent.click(await screen.findByRole("button", { name: /Approve/ }));
     expect(await screen.findByText("Approved")).toBeInTheDocument();
 

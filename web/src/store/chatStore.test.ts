@@ -31,6 +31,7 @@ import type {
   ToolGroup,
   UserMessageBlock,
 } from "@/lib/blocks";
+import { pendingOwnElicitationsInTerminal } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { latestActivityErrorState } from "@/lib/sessionError";
@@ -1500,6 +1501,87 @@ describe("chatStore — switchTo", () => {
       );
     },
   );
+
+  it("keeps a card that moved to the terminal while a focus snapshot was in flight", async () => {
+    const sid = "conv_vis_held_race";
+    const prompt = {
+      type: "response.elicitation_request",
+      elicitation_id: "elic_vis_held_race",
+      params: {
+        mode: "form",
+        message: "Approve?",
+        phase: "tool_call_approval",
+        policy_name: "test_policy",
+        content_preview: "",
+      },
+    };
+    const sink = pushableStream();
+    const base = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === `/v1/sessions/${sid}/stream`) {
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return base(input, init);
+    });
+    seedSession(sid, []);
+    seedPendingElicitations(sid, [prompt]);
+    await useChatStore.getState().switchTo(sid);
+    const entry = conversationRegistry.peek(sid)!;
+    const cards = () =>
+      entry.getState().blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    entry.setState({
+      blocks: entry
+        .getState()
+        .blocks.map((b) =>
+          b.type === "elicitation"
+            ? { ...b, status: "responded", response: { action: "accept" } }
+            : b,
+        ),
+    });
+
+    // The focus snapshot is captured during the grace, while the answer has the prompt unparked.
+    seedPendingElicitations(sid, []);
+    const route = fetchMock.getMockImplementation()!;
+    let releaseSnapshot!: () => void;
+    const snapshotHeld = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    let heldSnapshots = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).startsWith(`/v1/sessions/${sid}?`)) {
+        heldSnapshots += 1;
+        await snapshotHeld;
+      }
+      return route(input, init);
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+    await tick();
+    expect(heldSnapshots).toBe(1);
+
+    sink.push(
+      sse("response.elicitation_request", {
+        ...prompt,
+        params: { ...prompt.params, terminal_fallback: { answer_undelivered: true } },
+      }),
+    );
+    await tick();
+    expect(cards()[0]).toMatchObject({
+      status: "pending",
+      terminalFallback: { answerUndelivered: true },
+    });
+
+    releaseSnapshot();
+    await tick();
+    await tick();
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0]).toMatchObject({
+      status: "pending",
+      response: null,
+      terminalFallback: { answerUndelivered: true },
+    });
+    expect(pendingOwnElicitationsInTerminal(entry.getState().blocks, sid)).toBe(true);
+    sink.close();
+  });
 
   it("does not abort a conversation's stream when switching away", async () => {
     const sink = pushableStream();

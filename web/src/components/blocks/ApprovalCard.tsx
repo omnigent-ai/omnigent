@@ -34,7 +34,7 @@
 
 import type { ElicitationTerminalFallback } from "@/lib/events";
 import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
-import { useContext } from "react";
+import { type ReactNode, useContext } from "react";
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -650,6 +650,30 @@ export function ApprovalCard({
     // Hide Open terminal for mirrored or side-chat cards; only this session's terminal can answer.
     const canOpenTerminal =
       !requester && !scopedConversationId && Boolean(terminalFirst?.isTerminalFirst);
+    let promptDetails: ReactNode;
+    if (isAskUserQuestion) {
+      promptDetails = (
+        <AskUserQuestionForm
+          questions={askPayload.questions}
+          onSubmit={() => {}}
+          onReject={() => {}}
+          readOnly
+        />
+      );
+    } else if (isExitPlanMode) {
+      promptDetails = <PlanMarkdown plan={planMarkdown} />;
+    } else {
+      promptDetails = (
+        <>
+          <ElicitationMessage message={message} className="whitespace-pre-line" />
+          {formattedPreview && (
+            <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap break-words">
+              {formattedPreview}
+            </pre>
+          )}
+        </>
+      );
+    }
     return (
       <Alert
         data-testid="approval-card"
@@ -668,25 +692,7 @@ export function ApprovalCard({
               ? "Your answer didn't reach the agent. It is still waiting for this answer in its terminal."
               : "The agent is waiting for this answer in its terminal, not in chat."}
           </span>
-          {isAskUserQuestion ? (
-            <AskUserQuestionForm
-              questions={askPayload.questions}
-              onSubmit={() => {}}
-              onReject={() => {}}
-              readOnly
-            />
-          ) : isExitPlanMode ? (
-            <PlanMarkdown plan={planMarkdown} />
-          ) : (
-            <>
-              <ElicitationMessage message={message} className="whitespace-pre-line" />
-              {formattedPreview && (
-                <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm text-foreground whitespace-pre-wrap break-words">
-                  {formattedPreview}
-                </pre>
-              )}
-            </>
-          )}
+          {promptDetails}
           {canOpenTerminal && (
             <div className="flex flex-wrap gap-2 pt-1">
               <Button

@@ -236,9 +236,8 @@ class ErrorCode:
         indistinguishable from a completed enumeration, so the caller
         silently loses the remaining rows. The caller's remedy is to
         restart the enumeration without the cursor.
-    :cvar PROMPT_IN_TERMINAL: An answer to a prompt that now waits in the
-        agent's own terminal, where no hook can deliver it (HTTP 423). Distinct
-        from ``CONFLICT``, which existing clients read as "already resolved".
+    :cvar PROMPT_IN_TERMINAL: The prompt must be answered in the agent's
+        own terminal; no hook can deliver an answer from chat.
     """
 
     UNAUTHORIZED = "unauthorized"

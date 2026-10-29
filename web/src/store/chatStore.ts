@@ -4541,9 +4541,9 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  * event produces. This is the recovery path for a backgrounded tab that
  * missed that event (e.g. the approval was answered in the native-terminal
  * popup while the web tab was hidden). A card whose terminal hold changed,
- * including one answered locally, takes the snapshot's copy. No-op when the
- * session changed mid-fetch, the fetch fails (transient — the next focus
- * retries), or nothing is stale.
+ * including one answered locally, takes the snapshot's copy. Cards changed or
+ * added during the fetch are kept. No-op when the session changed mid-fetch,
+ * the fetch fails (transient — the next focus retries), or nothing is stale.
  *
  * @param id - Conversation/session id to reconcile.
  * @param options.fresh - Skip the shared query, whose in-flight fetch may predate a change
@@ -4587,13 +4587,9 @@ async function reconcilePendingElicitations(
         (candidate): candidate is ElicitationBlock =>
           candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
       );
-      // A live event that changed the card during the fetch is newer than the snapshot.
-      if (
-        current &&
-        !b.nativeDeliveryResolved &&
-        cardsBeforeFetch.get(b.elicitationId) === b &&
-        terminalHoldChanged(current, b)
-      ) {
+      // A live event that changed or added the card during the fetch is newer than the snapshot.
+      if (cardsBeforeFetch.get(b.elicitationId) !== b) return b;
+      if (current && !b.nativeDeliveryResolved && terminalHoldChanged(current, b)) {
         changed = true;
         return { ...current, ctx: b.ctx };
       }
