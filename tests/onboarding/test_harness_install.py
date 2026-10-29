@@ -8,7 +8,6 @@ import os
 import shutil
 import subprocess
 import sys
-import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,15 +26,17 @@ from tests._helpers.polling import poll_until
 # real installer process tree.
 _REAL_POPEN = subprocess.Popen
 
-# Installer stand-in: prints to stderr, leaves a child holding stderr, records
-# the child's pid, then sleeps and exits. argv: pid_file, sleep_s, exit_code.
+# Installer stand-in: prints to stderr, records the pid of a child that holds stderr and
+# touches a marker only if it lives 60s, then sleeps and exits.
+# argv: pid_file, marker, sleep_s, exit_code.
 _INSTALLER_LEAVING_A_CHILD = (
     "import pathlib, subprocess, sys, time\n"
     "print('npm error code EACCES', file=sys.stderr, flush=True)\n"
-    "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    "child = subprocess.Popen([sys.executable, '-c', 'import pathlib, sys, time; "
+    "time.sleep(60); pathlib.Path(sys.argv[1]).touch()', sys.argv[2]])\n"
     "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
-    "time.sleep(float(sys.argv[2]))\n"
-    "sys.exit(int(sys.argv[3]))\n"
+    "time.sleep(float(sys.argv[3]))\n"
+    "sys.exit(int(sys.argv[4]))\n"
 )
 
 
@@ -926,14 +927,14 @@ def test_installer_timeout_kills_children_holding_stderr(
     install timeout to that child's lifetime.
     """
     monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
-    pid_file = tmp_path / "child.pid"
-    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD, str(pid_file), "60", "0"]
+    pid_file, marker = tmp_path / "child.pid", tmp_path / "child-lived-60s"
+    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
+    installer += [str(pid_file), str(marker), "60", "0"]
 
-    start = time.monotonic()
     with pytest.raises(subprocess.TimeoutExpired):
         hi._run_installer(installer, timeout=3)
 
-    assert time.monotonic() - start < 20
+    assert not marker.exists(), "the timeout waited for the installer's child to finish"
     child_pid = int(pid_file.read_text())
     poll_until(lambda: not _proc.process_alive(child_pid), timeout_s=5, interval_s=0.05)
 
@@ -941,19 +942,19 @@ def test_installer_timeout_kills_children_holding_stderr(
 def test_installer_returns_when_a_child_keeps_stderr_open(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An installer that exits while its child holds stderr still returns promptly.
+    """An installer that exits while its child holds stderr returns without waiting for it.
 
     The reason comes from what was teed before the drain wait gave up.
     """
     monkeypatch.setattr(hi.subprocess, "Popen", _REAL_POPEN)
     monkeypatch.setattr(hi, "_INSTALLER_TEE_DRAIN_TIMEOUT_S", 0.5)
-    pid_file = tmp_path / "child.pid"
-    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD, str(pid_file), "0", "1"]
+    pid_file, marker = tmp_path / "child.pid", tmp_path / "child-lived-60s"
+    installer = [sys.executable, "-c", _INSTALLER_LEAVING_A_CHILD]
+    installer += [str(pid_file), str(marker), "0", "1"]
 
-    start = time.monotonic()
     try:
         returncode, stderr_tail = hi._run_installer(installer, timeout=30)
-        elapsed = time.monotonic() - start
+        returned_before_child_finished = not marker.exists()
     finally:
         if pid_file.exists():
             with contextlib.suppress(psutil.NoSuchProcess):
@@ -961,7 +962,7 @@ def test_installer_returns_when_a_child_keeps_stderr_open(
 
     assert returncode == 1
     assert "npm error code EACCES" in stderr_tail
-    assert elapsed < 20
+    assert returned_before_child_finished, "the install call waited for the installer's child"
 
 
 def test_try_install_harness_cli_success(monkeypatch: pytest.MonkeyPatch) -> None:
