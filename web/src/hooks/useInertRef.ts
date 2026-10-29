@@ -1,10 +1,13 @@
 // React 18 drops the boolean `inert` prop, so a hidden panel passed
 // `inert={true}` stays focusable. Set the DOM attribute directly instead.
 
-import { type Ref, type RefCallback, useCallback } from "react";
+import { type Ref, type RefCallback, useCallback, useLayoutEffect, useRef } from "react";
 
 /**
  * Build a ref callback that toggles the element's `inert` attribute.
+ *
+ * The callback's identity depends only on `forwardRef`, so toggling `inert`
+ * does not detach and re-attach the element's refs.
  *
  * @param inert Whether the element and its subtree should be inert, e.g.
  *   `!open` for a collapsed panel.
@@ -16,12 +19,20 @@ export function useInertRef<T extends HTMLElement>(
   inert: boolean,
   forwardRef?: Ref<T>,
 ): RefCallback<T> {
+  const elementRef = useRef<T | null>(null);
+  const inertRef = useRef(inert);
+  useLayoutEffect(() => {
+    inertRef.current = inert;
+    elementRef.current?.toggleAttribute("inert", inert);
+  }, [inert]);
   return useCallback(
     (element: T | null) => {
+      elementRef.current = element;
       if (typeof forwardRef === "function") forwardRef(element);
       else if (forwardRef) forwardRef.current = element;
-      element?.toggleAttribute("inert", inert);
+      // Covers an element that mounts while `inert` is unchanged.
+      element?.toggleAttribute("inert", inertRef.current);
     },
-    [inert, forwardRef],
+    [forwardRef],
   );
 }
