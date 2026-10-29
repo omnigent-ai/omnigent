@@ -7446,9 +7446,17 @@ def _wait_for_claude_prompt_ready(
         if (
             bridge_dir is not None
             and remaining > 0
-            and _occupying_surface(pane) == _SHELL_MODE_SURFACE
+            and (
+                _occupying_surface(pane) == _SHELL_MODE_SURFACE
+                or (
+                    _occupying_surface(pane) == _OVERLAY_SURFACE
+                    and _ESCAPE_DISMISS_HINT.search(pane)
+                    and _terminal_dialog_headline(pane) is None
+                    and not _escape_quits_claude(pane)
+                )
+            )
         ):
-            # A blank startup capture can precede a restored shell draft.
+            # Occupied input can appear after preflight or a blank startup capture.
             surface = _restore_occupied_input(
                 socket_path,
                 tmux_target,
@@ -7459,6 +7467,11 @@ def _wait_for_claude_prompt_ready(
                 raise ClaudeTerminalDialog(
                     "Claude Code's input box is occupied by shell mode, so nothing was sent. "
                     "Open the terminal, dismiss it, then retry."
+                )
+            if surface is not None:
+                raise ClaudeTerminalDialog(
+                    "A panel is covering Claude Code's input box, so nothing was sent. "
+                    "Open the terminal, dismiss the panel, then retry."
                 )
             continue
         billing_notice = auto_mode_billing_notice_visible(pane)

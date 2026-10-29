@@ -105,6 +105,242 @@ def test_mint_pi_session_id_is_safe() -> None:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("with_tail", [False, True])
+def test_compaction_snapshot_replaces_history_and_replays_retained_tail(with_tail: bool) -> None:
+    summary_text = "<summary>\nlatest checkpoint\n"
+    tail = [
+        _user_item("retained user"),
+        _function_call_item(name="read", call_id="call_a", arguments='{"path":"a.txt"}'),
+        _function_call_item(name="read", call_id="call_b", arguments='{"path":"b.txt"}'),
+        _function_output_item(call_id="call_a", output="contents call_a"),
+        _function_output_item(call_id="call_b", output="contents call_b"),
+        _assistant_item("retained answer"),
+    ]
+    # The extension writes each snapshot entry without item ids or response ids.
+    snapshot = [
+        {key: value for key, value in item.items() if key not in {"id", "response_id", "model"}}
+        for item in [_user_item(summary_text), *(tail if with_tail else [])]
+    ]
+    items = [
+        _user_item("summarized raw history"),
+        {"id": "old", "type": "compaction", "summary": "old checkpoint"},
+        _assistant_item("also summarized"),
+        {
+            "id": "latest",
+            "type": "compaction",
+            "summary": "latest checkpoint",
+            "compacted_messages": snapshot,
+        },
+        # A late duplicate must not replay a retained result twice.
+        *(
+            [_function_output_item(call_id="call_b", output="contents call_b")]
+            if with_tail
+            else []
+        ),
+        _user_item("after checkpoint", item_id="later", response_id="later"),
+        _assistant_item("after answer", item_id="later-answer", response_id="later"),
+    ]
+    original = json.dumps(items)
+    records = pi_session_records_from_session_items(
+        items,
+        session_id="conv_fork",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    messages = [record["message"] for record in records[1:]]
+    assert [record["type"] for record in records[1:]] == ["message"] * len(messages)
+    replayed = [
+        (message["role"], [block.get("text") or block.get("id") for block in message["content"]])
+        for message in messages
+    ]
+    retained = [
+        ("user", ["retained user"]),
+        ("assistant", ["call_a", "call_b"]),
+        ("toolResult", ["contents call_a"]),
+        ("toolResult", ["contents call_b"]),
+        ("assistant", ["retained answer"]),
+    ]
+    assert replayed == [
+        ("user", [summary_text]),
+        *(retained if with_tail else []),
+        ("user", ["after checkpoint"]),
+        ("assistant", ["after answer"]),
+    ]
+    if with_tail:
+        assert messages[2]["content"][0]["arguments"] == {"path": "a.txt"}
+        assert [message.get("toolName") for message in messages[3:5]] == ["read", "read"]
+    assert "summarized" not in json.dumps(records)
+    assert "old checkpoint" not in json.dumps(records)
+    assert json.dumps(items) == original
+    for previous, current in itertools.pairwise(records[1:]):
+        assert current["parentId"] == previous["id"]
+    assert records[1]["parentId"] is None
+    assert len({record["id"] for record in records[1:]}) == len(records) - 1
+
+
+@pytest.mark.parametrize(
+    "compacted_messages",
+    [
+        None,
+        # Claude-native content in the shared message envelope.
+        [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "text", "text": "foreign retained"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+            },
+        ],
+        # Raw Pi messages without the shared item envelope.
+        [
+            {"role": "compactionSummary", "summary": "foreign summary", "tokensBefore": 1},
+            {"role": "user", "content": [{"type": "text", "text": "foreign retained"}]},
+        ],
+    ],
+    ids=["legacy", "claude", "raw-pi"],
+)
+@pytest.mark.parametrize("last_item_id", ["boundary", None, "missing", "later"])
+def test_unconvertible_compaction_snapshot_preserves_unsummarized_history(
+    compacted_messages: list[dict[str, Any]] | None,
+    last_item_id: str | None,
+) -> None:
+    compaction: dict[str, Any] = {
+        "id": "compact",
+        "type": "compaction",
+        "summary": "summary",
+        "last_item_id": last_item_id,
+    }
+    if compacted_messages is not None:
+        compaction["compacted_messages"] = compacted_messages
+    records = pi_session_records_from_session_items(
+        [
+            _user_item("old raw transcript", item_id="boundary"),
+            _user_item("recent question", item_id="recent-user", response_id="recent"),
+            _assistant_item("recent answer", item_id="recent-answer", response_id="recent"),
+            compaction,
+            _user_item("after checkpoint", item_id="later", response_id="later"),
+        ],
+        session_id="conv_foreign",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    if last_item_id == "boundary":
+        assert records[1]["type"] == "compaction"
+        assert records[1]["summary"] == "summary"
+        assert records[1]["firstKeptEntryId"] == records[1]["id"]
+        messages = records[2:]
+        expected_text = ["recent question", "recent answer", "after checkpoint"]
+    else:
+        messages = records[1:]
+        expected_text = [
+            "old raw transcript",
+            "recent question",
+            "recent answer",
+            "after checkpoint",
+        ]
+    assert [record["message"]["content"][0]["text"] for record in messages] == expected_text
+    for previous, current in itertools.pairwise(records[1:]):
+        assert current["parentId"] == previous["id"]
+    assert "foreign" not in json.dumps(records)
+
+
+@pytest.mark.parametrize(
+    "snapshot,notice",
+    [
+        (
+            [_user_item("old question"), {"type": "compaction", "encrypted_content": "opaque"}],
+            "[Codex compaction — context was compacted in the terminal]",
+        ),
+        (
+            [{"role": "user", "content": [{"type": "text", "text": "native summary"}]}],
+            "[Claude Code compaction — context was compacted in the terminal]",
+        ),
+        (
+            [
+                {
+                    **_user_item("old question"),
+                    "content": [
+                        {"type": "input_text", "text": "old question"},
+                        {"type": "text", "text": "unsupported summary"},
+                    ],
+                }
+            ],
+            "[Codex compaction — context was compacted in the terminal]",
+        ),
+        (
+            [_user_item("old question"), None],
+            "[Codex compaction — context was compacted in the terminal]",
+        ),
+    ],
+    ids=["codex-encrypted", "claude-hook", "partial-message", "malformed-entry"],
+)
+@pytest.mark.parametrize("meaningful_summary", [False, True])
+def test_incomplete_foreign_checkpoint_preserves_context(
+    snapshot: list[Any], notice: str, meaningful_summary: bool
+) -> None:
+    history = [
+        _user_item("old question"),
+        _function_call_item(name="read", call_id="read_a", arguments='{"path":"a.txt"}'),
+        _function_output_item(call_id="read_a", output="file knowledge"),
+        _assistant_item("earlier answer", item_id="boundary"),
+    ]
+    tail = [_user_item("recent question", item_id="recent", response_id="recent")]
+    compaction = {
+        "id": "compact",
+        "type": "compaction",
+        "last_item_id": "boundary",
+        "summary": "Useful summary of the answer and file" if meaningful_summary else notice,
+        "compacted_messages": snapshot,
+    }
+    kwargs = {
+        "session_id": "conv_foreign",
+        "external_session_id": _EXTERNAL_ID,
+        "cwd": Path("/repo"),
+    }
+    records = pi_session_records_from_session_items([*history, *tail, compaction], **kwargs)
+    if meaningful_summary:
+        assert records[1]["type"] == "compaction"
+        assert records[1]["summary"] == compaction["summary"]
+        assert [record["message"]["content"][0]["text"] for record in records[2:]] == [
+            "recent question"
+        ]
+    else:
+        expected = pi_session_records_from_session_items([*history, *tail], **kwargs)
+        assert [record["message"] for record in records[1:]] == [
+            record["message"] for record in expected[1:]
+        ]
+        assert records[3]["message"]["toolCallId"] == "read_a"
+        assert records[3]["message"]["content"][0]["text"] == "file knowledge"
+        assert "earlier answer" in json.dumps(records)
+
+
+def test_late_result_for_retained_compaction_call_keeps_tool_name() -> None:
+    compaction = {
+        "id": "compact",
+        "type": "compaction",
+        "summary": "checkpoint",
+        "compacted_messages": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "s"}]},
+            {"type": "function_call", "call_id": "call_late", "name": "read", "arguments": "{}"},
+        ],
+    }
+    records = pi_session_records_from_session_items(
+        [compaction, _function_output_item(call_id="call_late", output="late result")],
+        session_id="conv_late",
+        external_session_id=_EXTERNAL_ID,
+        cwd=Path("/repo"),
+    )
+    result = records[-1]["message"]
+    assert records[-2]["message"]["content"][0]["id"] == "call_late"
+    assert result["role"] == "toolResult"
+    assert result["toolCallId"] == "call_late"
+    assert result["toolName"] == "read"
+
+
 def test_records_header_first_and_well_formed() -> None:
     records = pi_session_records_from_session_items(
         [_user_item("hello"), _assistant_item("hi there")],

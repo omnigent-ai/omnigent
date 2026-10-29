@@ -319,6 +319,27 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+def test_get_session_activity(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each known id maps to its update time and live status; unknown ids are omitted."""
+    a = conversation_store.create_conversation(title="alpha")
+    b = conversation_store.create_conversation(title="beta")
+    conversation_store.set_session_live_status(a.id, "waiting")
+    conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+
+    result = conversation_store.get_session_activity(
+        [a.id, b.id, a.id, "5eca720dc2bc6cdc3a99028d7bd0f917"]
+    )
+
+    assert set(result) == {a.id, b.id}
+    assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
+    assert result[a.id].live_status == "waiting"
+    # A session that never reported a status has none recorded.
+    assert result[b.id].live_status is None
+    assert conversation_store.get_session_activity([]) == {}
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -587,7 +608,7 @@ def test_update_conversation_with_changes_missing_conversation(
 def test_update_conversation_with_changes_retries_commit(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    conv = conversation_store.create_conversation()
+    conv = conversation_store.create_conversation(labels={"existing": "kept"})
     retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
     conversation_store._conv_session_immediate = retrying_maker
 
@@ -595,6 +616,7 @@ def test_update_conversation_with_changes_retries_commit(
         conv.id,
         reasoning_effort="high",
         model_override="model-a",
+        label_updates={"effort_reset": "false"},
     )
 
     assert retrying_maker.attempts == 2
@@ -603,11 +625,13 @@ def test_update_conversation_with_changes_retries_commit(
     assert result.model_override_changed is True
     assert result.conversation.reasoning_effort == "high"
     assert result.conversation.model_override == "model-a"
+    assert result.conversation.labels == {"existing": "kept", "effort_reset": "false"}
 
     committed = conversation_store.get_conversation(conv.id)
     assert committed is not None
     assert committed.reasoning_effort == "high"
     assert committed.model_override == "model-a"
+    assert committed.labels == result.conversation.labels
 
 
 def test_reported_model_round_trips_beside_the_request(

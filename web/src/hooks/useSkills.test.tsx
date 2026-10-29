@@ -11,7 +11,10 @@ const response = (catalog = skills, status = 200) =>
   new Response(JSON.stringify({ skills: catalog }), { status });
 const wrapper = function QueryWrapper({ children }: { children: ReactNode }) {
   const [client] = useState(
-    () => new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+    () =>
+      new QueryClient({
+        defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+      }),
   );
   return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
 };
@@ -22,6 +25,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("useSkills", () => {
@@ -215,6 +219,29 @@ describe("useSkills", () => {
     expect(result.current.skills).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it.each([target, { sessionId: "session-a" }])(
+    "recovers from a transient offline host without starting another session: %j",
+    async (discoveryTarget) => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      fetchMock.mockResolvedValueOnce(response([], 409)).mockImplementation(() => response());
+      const { result } = renderHook(() => useSkills({ target: discoveryTarget }), { wrapper });
+      await waitFor(() => expect(result.current.skillsStatus).toBe("error"));
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+
+      await waitFor(() => expect(result.current.skillsStatus).toBe("ready"));
+      expect(result.current.skills).toEqual(skills);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes("sessionId" in discoveryTarget ? 3 : 2);
+    },
+  );
 
   it("rejects malformed catalogs", async () => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify({})));

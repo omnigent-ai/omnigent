@@ -1919,11 +1919,7 @@ class ClaudeSDKExecutor(Executor):
         if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
             self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
-        # Retry policy → Anthropic SDK env vars passed to the Claude
-        # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
-        # ``ANTHROPIC_REQUEST_TIMEOUT_SECONDS`` are speculative — the
-        # CLI's retry budget isn't publicly documented as env-tunable.
-        # See ``RetryPolicy.claude_cli.env()``.
+        # Pass the retry budget and response-header timeout to the Claude CLI.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._extra_env.update(self._retry_policy.claude_cli.env())
 

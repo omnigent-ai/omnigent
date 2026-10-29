@@ -9896,6 +9896,86 @@ def test_claude_transcript_records_handles_native_compaction_messages() -> None:
     assert "discarded before compaction" not in json.dumps(records)
 
 
+def test_claude_transcript_records_replay_pi_compaction_snapshot() -> None:
+    """A Pi-native compaction snapshot keeps its summary and retained tool pair."""
+    summary = (
+        "The conversation history before this point was compacted into the following summary:"
+        "\n\n<summary>\nPI-CHECKPOINT\n</summary>"
+    )
+    items: list[dict[str, Any]] = [
+        {
+            "id": "msg_before",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "summarized raw history"}],
+        },
+        {
+            "id": "cmp_pi",
+            "type": "compaction",
+            "summary": "PI-CHECKPOINT",
+            "token_count": 50,
+            "compacted_messages": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": summary}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "reading"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "toolu_pi",
+                    "name": "read",
+                    "arguments": '{"path":"a.txt"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "toolu_pi",
+                    "output": "retained result",
+                },
+            ],
+        },
+        {
+            "id": "msg_after",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "after compaction"}],
+        },
+    ]
+
+    records = claude_native._claude_transcript_records_from_session_items(
+        items,
+        session_id="conv_pi",
+        external_session_id="02857840-6362-408f-b41f-309e396ed7c6",
+        cwd=Path("/tmp/test"),
+        bridge_dir=Path("/tmp/test-bridge"),
+    )
+
+    assert [record.get("subtype") or record["message"] for record in records] == [
+        "compact_boundary",
+        {"role": "user", "content": summary},
+        {"role": "assistant", "content": [{"type": "text", "text": "reading"}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "toolu_pi", "name": "read", "input": {"path": "a.txt"}}
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_pi", "content": "retained result"}
+            ],
+        },
+        {"role": "user", "content": "after compaction"},
+    ]
+    assert all(record["parentUuid"] == previous["uuid"] for previous, record in pairwise(records))
+    assert "summarized raw history" not in json.dumps(records)
+
+
 def test_claude_transcript_records_downgrades_compaction_stripped_image() -> None:
     """A compaction-stripped image block never resumes as an invalid image.
 

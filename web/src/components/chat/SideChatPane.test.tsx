@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createPortal } from "react-dom";
 import { StrictMode } from "react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
@@ -12,6 +13,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import * as sessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
@@ -31,12 +33,15 @@ vi.mock("@/components/ComposerMicButton", () => ({
     return null;
   },
 }));
-const sessionLabels = vi.hoisted(() => ({ current: {} as Record<string, string> }));
+const mockSession = vi.hoisted(() => ({
+  labels: {} as Record<string, string>,
+  snapshot: {} as Partial<Session>,
+}));
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
-    session: { labels: sessionLabels.current },
+    session: { ...mockSession.snapshot, labels: mockSession.labels },
     isLoading: id != null && id === loadingSession.id,
     error: null,
   }),
@@ -69,7 +74,8 @@ const renderPane = (ui: ReactNode) =>
   });
 
 beforeEach(() => {
-  sessionLabels.current = {};
+  mockSession.labels = {};
+  mockSession.snapshot = {};
   loadingSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
@@ -101,6 +107,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  queryClient.clear();
   vi.restoreAllMocks();
   conversationRegistry.clear();
   useChatStore.setState(initialStoreState);
@@ -188,6 +195,10 @@ describe("side-chat working indicator", () => {
     const pane = (
       <SideChatPane childId="pending:side" selectionParentId="conv_main" onStart={onStart} />
     );
+    const settings = { modelOverride: "gpt-6-sol", reasoningEffort: "max" };
+    useChatStore
+      .getState()
+      .updateSideChatComposer("pending:side", (draft) => ({ ...draft, settings }));
     const view = renderPane(pane);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Explain the approach" } });
@@ -205,6 +216,7 @@ describe("side-chat working indicator", () => {
     expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
 
     await act(async () => rejectStart?.(new Error("Fork creation failed")));
+    expect(useChatStore.getState().sideChatComposers["pending:side"].settings).toEqual(settings);
 
     expect(screen.queryByTestId("working-indicator")).toBeNull();
     expect(screen.getByTestId("side-chat-input")).toBeEnabled();
@@ -213,6 +225,68 @@ describe("side-chat working indicator", () => {
     expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
   });
 });
+
+it.each(["confirmed", "rejected"])(
+  "holds a follow-up until the child's settings update is %s, including after remount",
+  async (outcome) => {
+    mockSession.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+    mockSession.snapshot = {
+      id: childId,
+      harness: "claude-native",
+      permissionLevel: 4,
+      modelOverride: "primary",
+      codexModelOptions: [
+        { id: "primary", displayName: "Primary" },
+        { id: "alternate", displayName: "Alternate" },
+      ],
+    };
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-native",
+      sessionStatus: "idle",
+    });
+    const steerAll = vi.fn();
+    useChatStore.setState({ steerAllQueuedMessages: steerAll });
+    let settle!: () => void;
+    const patch = vi.spyOn(sessionsApi, "updateSession").mockImplementation(
+      () =>
+        new Promise<Session>((resolve, reject) => {
+          settle = () =>
+            outcome === "confirmed"
+              ? resolve({ ...mockSession.snapshot, modelOverride: "alternate" } as Session)
+              : reject(new Error("Model unavailable"));
+        }),
+    );
+    const view = renderPane(<SideChatPane childId={childId} />);
+    const user = userEvent.setup();
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "Follow up" } });
+    await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
+    await user.click(screen.getByTestId("side-chat-model-edit"));
+    await user.click(screen.getByRole("menuitemcheckbox", { name: "Alternate" }));
+    await waitFor(() => expect(patch).toHaveBeenCalledTimes(1));
+    await user.keyboard("{Escape}");
+    expect(screen.getByTestId("side-chat-send")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter", ctrlKey: true });
+    expect(send).not.toHaveBeenCalled();
+    expect(steerAll).not.toHaveBeenCalled();
+    view.unmount();
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.getByTestId("side-chat-send")).toBeDisabled();
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+    expect(send).not.toHaveBeenCalled();
+    await act(async () => settle());
+    await waitFor(() => expect(screen.getByTestId("side-chat-send")).toBeEnabled());
+    if (outcome === "rejected") expect(toast.error).toHaveBeenCalledWith("Model unavailable");
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Follow up");
+    expect(send).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith("Follow up", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    expect(useChatStore.getState().conversationId).toBe("conv_main");
+  },
+);
 
 describe("side chat opened from a text selection", () => {
   it.each([false, true])("preserves list indentation when sending (pending: %s)", (pending) => {
@@ -1151,7 +1225,7 @@ describe("unsent composer state survives the pane moving", () => {
 
 describe("side chat sealed by the server", () => {
   it("is read-only once the server marks the child closed", () => {
-    sessionLabels.current = { "omnigent.closed": "true" };
+    mockSession.labels = { "omnigent.closed": "true" };
     renderPane(<SideChatPane childId={childId} />);
 
     expect(
@@ -1308,7 +1382,7 @@ describe("side-chat slash commands", () => {
     // The child names its parent, but that snapshot is still loading, so the skill
     // target is unresolved. Reporting discovery as in-flight (not "unavailable")
     // is what later gates a quickly typed /skill from going out as plaintext.
-    sessionLabels.current = { "omnigent.side_chat.source_id": "conv_parent" };
+    mockSession.labels = { "omnigent.side_chat.source_id": "conv_parent" };
     loadingSession.id = "conv_parent";
     skillsFixture.current = { skills: [], skillsStatus: "loading" };
     renderPane(<SideChatPane childId={childId} />);

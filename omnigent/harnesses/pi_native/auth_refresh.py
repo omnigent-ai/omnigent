@@ -7,6 +7,7 @@ import logging
 from pathlib import Path
 
 from omnigent.cli_auth import databricks_request_headers
+from omnigent.harnesses.pi_native.auth_command import supervise_model_auth
 from omnigent.harnesses.pi_native.bridge import refresh_config_auth_headers
 
 _logger = logging.getLogger(__name__)
@@ -15,6 +16,21 @@ _logger = logging.getLogger(__name__)
 # stored OIDC tokens have a wider 90-second margin.
 PI_AUTH_REFRESH_INTERVAL_S = 30.0
 PI_AUTH_REFRESH_TIMEOUT_S = 30.0
+
+
+async def supervise_pi_credentials(
+    bridge_dir: Path,
+    server_url: str,
+    *,
+    auth_dir: Path | None,
+    refresh_bridge: bool,
+) -> None:
+    """Keep model and bridge credentials under the runner's existing lifecycle."""
+    async with asyncio.TaskGroup() as tasks:
+        if auth_dir is not None:
+            tasks.create_task(supervise_model_auth(auth_dir))
+        if refresh_bridge:
+            tasks.create_task(supervise_pi_auth_refresh(bridge_dir, server_url))
 
 
 async def supervise_pi_auth_refresh(

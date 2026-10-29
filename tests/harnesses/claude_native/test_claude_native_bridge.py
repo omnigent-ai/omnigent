@@ -13034,6 +13034,8 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
         lambda *_args: claude_native_bridge._ClaudePaneState(alive=None),
     )
     bridge_dir = _picker_bridge_dir(tmp_path)
+    if pane == _REVERSE_SEARCH_PANE and not slash:
+        error = claude_native_bridge.ClaudeTerminalDialog
     with pytest.raises(error):
         if slash:
             claude_native_bridge.inject_slash_command(
@@ -13725,16 +13727,20 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
 
 
 @pytest.mark.parametrize(
-    "occupied_pane",
+    ("occupied_pane", "after_preflight"),
     [
-        _REVERSE_SEARCH_PANE,
-        _INLINE_REVERSE_SEARCH_PANE,
-        _MODEL_PICKER_PANE,
-        _SHELL_MODE_PANE,
-        _REWIND_PANE,
-        _SETTINGS_PANEL_PANE,
-        _TASK_DETAILS_PANE,
-        _WRAPPED_BACKGROUND_PANEL,
+        (_REVERSE_SEARCH_PANE, False),
+        (_INLINE_REVERSE_SEARCH_PANE, False),
+        (_MODEL_PICKER_PANE, False),
+        (_SHELL_MODE_PANE, False),
+        (_REWIND_PANE, False),
+        (_SETTINGS_PANEL_PANE, False),
+        (_TASK_DETAILS_PANE, False),
+        (_WRAPPED_BACKGROUND_PANEL, False),
+        (_SHELL_MODE_PANE, True),
+        (_SETTINGS_PANEL_PANE, True),
+        (_TASK_DETAILS_PANE, True),
+        (_WRAPPED_BACKGROUND_PANEL, True),
     ],
     ids=[
         "reverse-search",
@@ -13745,10 +13751,15 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "settings-panel",
         "task-details-panel",
         "wrapped-background-panel",
+        "shell-after-preflight",
+        "settings-after-preflight",
+        "task-details-after-preflight",
+        "wrapped-background-after-preflight",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
     occupied_pane: str,
+    after_preflight: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -13775,7 +13786,9 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
         tmux_target="claude:0.0",
     )
 
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captured: list[list[str]] = []
+    first_capture = True
     # The surface covers the pane until Escape dismisses it; afterwards
     # the fake behaves like the live input box (paste deposits the
     # draft, Enter clears it).
@@ -13790,10 +13803,15 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
         :returns: Fake CompletedProcess; capture-pane returns the
             simulated pane, other calls return rc=0.
         """
+        nonlocal first_capture
         del kwargs
         if "display-message" in cmd:
             return SimpleNamespace(returncode=0, stdout="120 24 latest\n", stderr="")
         if "capture-pane" in cmd:
+            if first_capture:
+                first_capture = False
+                if after_preflight:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if cmd[-1] == "Escape":
             tui["pane"] = _composer_pane()
@@ -14034,6 +14052,7 @@ def test_terminal_dialog_headline_ignores_other_panes(pane: str) -> None:
 
 
 def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -14048,12 +14067,15 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: _MCP_APPROVAL_DIALOG_PANE,
     )
+    sends = []
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *args: sends.append(args))
     started = time.monotonic()
     with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=30.0,
+            bridge_dir=tmp_path,
         )
     assert time.monotonic() - started < 5.0
     assert not isinstance(excinfo.value, claude_native_bridge.ClaudePromptTimeout)
@@ -14063,6 +14085,37 @@ def test_wait_for_claude_prompt_ready_fails_fast_on_a_terminal_dialog(
     assert "answer the prompt" in message
     assert "resend your message" in message
     assert "Esc to cancel" in message
+    assert sends == []
+
+
+@pytest.mark.parametrize("timeout_s", [0.0, 0.2, 5.0])
+def test_wait_for_claude_prompt_ready_preserves_a_panel_that_will_not_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout_s: float
+) -> None:
+    """An ignored Escape preserves the terminal and cannot renew readiness's budget."""
+    sends = _fake_tmux(monkeypatch, [_TASK_DETAILS_PANE])
+    clock = _VirtualClock()
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    expected_error = (
+        claude_native_bridge.ClaudeTerminalDialog
+        if timeout_s
+        else claude_native_bridge.ClaudePromptTimeout
+    )
+    with pytest.raises(expected_error):
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=timeout_s,
+            bridge_dir=tmp_path,
+            extend_for_slow_boot=False,
+        )
+    assert (
+        clock.monotonic()
+        <= min(timeout_s, claude_native_bridge._OCCUPIED_INPUT_DISMISS_TIMEOUT_S)
+        + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    )
+    assert all(args[-1] == "Escape" for args in sends)
+    assert bool(sends) == bool(timeout_s)
 
 
 def test_wait_for_claude_prompt_ready_ignores_a_single_dialog_frame(

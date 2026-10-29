@@ -210,6 +210,8 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
@@ -1050,8 +1052,32 @@ describe("CreateScheduledTaskDialog project", () => {
         <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
       </CapabilitiesProvider>,
     );
+    // The trigger follows the picked project's new name.
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Bugs");
     expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("keeps the dialog open and retryable when creating its project fails", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    resolveOrCreateProjectId.mockRejectedValueOnce(new Error("500 Internal Server Error"));
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("create-error")).toHaveTextContent(
+      "500 Internal Server Error",
+    );
+    expect(mutateAsync).not.toHaveBeenCalled();
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ projectId: "proj_new" });
   });
 
   it("creates a project from a typed name", async () => {
@@ -1086,7 +1112,7 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(input).not.toHaveProperty("projectId");
   });
 
-  it("labels a deleted saved project and lets the edit unfile the task", async () => {
+  it("shows a deleted saved project as no project and clears it on save", async () => {
     renderWithProjects(
       <CreateScheduledTaskDialog
         open
@@ -1094,9 +1120,11 @@ describe("CreateScheduledTaskDialog project", () => {
         editingTask={scheduledTask({ projectId: "proj_deleted" })}
       />,
     );
-    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Deleted project");
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
     openProjectMenu();
-    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Search or create project"), { key: "Escape" });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
@@ -1118,16 +1146,18 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Loading…");
     openProjectMenu();
     expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
   });
 
-  it("does not call a saved project deleted when the projects fail to load", async () => {
+  it("can unfile a task whose project list fails to load", async () => {
     projectsQuery.current = { data: undefined, isPending: false, isSuccess: false, isError: true };
     renderEditingFiledTask();
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Project unavailable");
     openProjectMenu();
-    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
   });
 
   it("unfiles an edited task's runs when its project is removed", async () => {
@@ -1251,5 +1281,91 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
     expect(shouldGuardDialogDismiss(plain, { selectOpen: false, msSinceSelectClose: 500 })).toBe(
       false,
     );
+  });
+});
+
+describe("CreateScheduledTaskDialog session mode", () => {
+  function renderWithSessionModes(editingTask?: ScheduledTasksApiModule.ScheduledTask) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />
+      </CapabilitiesProvider>,
+    );
+  }
+
+  function chooseContinue() {
+    const trigger = screen.getByTestId("task-session-mode-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("task-session-mode-continue"));
+  }
+
+  it("hides the Session control on a server that does not accept session modes", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("sends sessionMode only when continue is chosen on create", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    chooseContinue();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
+  });
+
+  it("leaves sessionMode out of a create that keeps a new session per run", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("says a sandbox automation that continues a session keeps one sandbox", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          managed_sandboxes_enabled: true,
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    chooseContinue();
+    const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(
+      screen.getByText(
+        "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("clears the continued session when asked to start a new one on the next run", async () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionId).toBeNull();
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("offers no new-session option before the first run creates a session", () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue" }));
+    expect(screen.queryByTestId("task-start-new-session")).toBeNull();
   });
 });

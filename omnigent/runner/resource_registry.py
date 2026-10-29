@@ -286,6 +286,17 @@ def trim_terminal_output(text: str | None) -> str | None:
     return body
 
 
+def redacted_terminal_output(text: str | None) -> str | None:
+    """Redact credentials from a whole pane frame, then bound it for telemetry.
+
+    Redacting before trimming keeps a long credential from losing its
+    identifying prefix at the truncation boundary.
+    """
+    from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+
+    return trim_terminal_output(sanitize_diagnostic_text(text or ""))
+
+
 def _pane_closed_by_omnigent(private_dir: Path) -> bool:
     """Whether Omnigent killed the Claude pane in *private_dir* to fail its turn."""
     from omnigent.harnesses.claude_native.bridge import pane_closed_by_omnigent
@@ -1482,7 +1493,11 @@ class SessionResourceRegistry:
         last_activity_emit: dict[str, float | None] = {"value": None}
 
         def _publish_status(
-            status: str, blocked_on: str | None = None, *, record_activity: bool = False
+            status: str,
+            blocked_on: str | None = None,
+            *,
+            record_activity: bool = False,
+            failure_activity_epoch: int | None = None,
         ) -> None:
             # Publish one running/idle edge: dedup against the last value,
             # memo for exit classification, and hop to the loop (publishers
@@ -1493,6 +1508,24 @@ class SessionResourceRegistry:
             # :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
+            if status == "failed":
+                if failure_activity_epoch is None:
+                    epoch = self.session_activity_epoch(session_id)
+                    loop.call_soon_threadsafe(
+                        lambda: _publish_status(
+                            status,
+                            blocked_on,
+                            record_activity=record_activity,
+                            failure_activity_epoch=epoch,
+                        )
+                    )
+                    return
+                # A hook or another turn may arrive while the watcher callback is queued.
+                if (
+                    not self.session_turn_is_active(session_id)
+                    or self.session_activity_epoch(session_id) != failure_activity_epoch
+                ):
+                    return
             explicit_activity = record_activity and status in {"running", "waiting"}
             if explicit_activity:
                 self._set_session_status_memo(session_id, status)
@@ -1511,7 +1544,10 @@ class SessionResourceRegistry:
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
                 self._set_session_status_memo(session_id, status, record_activity=False)
-            loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+            if status == "failed":
+                status_publisher(session_id, status, blocked_on)
+            else:
+                loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
 
         def _structured_status_active() -> bool:
             # Explicit Claude state owns the indicator; pane changes still drive
@@ -1629,6 +1665,9 @@ class SessionResourceRegistry:
                         session_key=session_key,
                         lifecycle=lifecycle,
                         instance=instance,
+                        reached_input_ready=(
+                            native_input_ready if input_ready_probe is not None else None
+                        ),
                     )
                 )
                 self._terminal_exit_tasks.add(task)
@@ -1745,6 +1784,8 @@ class SessionResourceRegistry:
                 omnigent_session_id=session_id,
                 terminal_instance_id=instance.diagnostic_id,
                 terminal_launch_id=instance.lifecycle_trace.launch_id,
+                turn_is_active=lambda: self.session_turn_is_active(session_id),
+                turn_activity_epoch=lambda: self.session_activity_epoch(session_id),
             )
         return fallback
 
@@ -1756,8 +1797,13 @@ class SessionResourceRegistry:
         session_key: str,
         lifecycle: TerminalLifecycle,
         instance: TerminalInstance | None = None,
+        reached_input_ready: bool | None = None,
     ) -> None:
-        """Clean up and publish lifecycle events for an unexpected terminal exit."""
+        """Clean up and publish lifecycle events for an unexpected terminal exit.
+
+        :param reached_input_ready: Whether a native terminal's input-ready probe
+            ever passed, or ``None`` when the terminal has no probe.
+        """
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
             observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
@@ -1783,6 +1829,7 @@ class SessionResourceRegistry:
             lifecycle=lifecycle,
             instance=instance,
             resource_role=observed_role,
+            reached_input_ready=reached_input_ready,
         )
 
     async def _finalize_terminal_exit(
@@ -1795,6 +1842,7 @@ class SessionResourceRegistry:
         instance: TerminalInstance | None,
         resource_role: str | None,
         before_observation: bool = False,
+        reached_input_ready: bool | None = None,
     ) -> None:
         """Preserve exit evidence even when a pane dies before observation starts."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
@@ -1847,16 +1895,20 @@ class SessionResourceRegistry:
             lifecycle_context.pop("session_turn_active_before_exit", None)
             lifecycle_context.pop("session_activity_epoch", None)
 
-        # Codex keeps its existing final-screen event. New pre-observation
-        # diagnostics may include recent history only under explicit opt-in.
+        # Codex keeps its existing final-screen event. A native agent that dies
+        # before its input is ready gets one too: with no turn pending, nothing
+        # else records why its launch failed. Pre-observation diagnostics may
+        # include recent history only under explicit opt-in.
+        startup_exit = native_coding_agent_for_harness(resource_role) is not None and (
+            before_observation or reached_input_ready is False
+        )
         redacted_last_output: str | None = None
-        if resource_role == CODEX_NATIVE_TERMINAL_ROLE:
-            from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
+        output_attributes: dict[str, str] = {}
+        if resource_role == CODEX_NATIVE_TERMINAL_ROLE or startup_exit:
             from omnigent.process_logging import harness_stderr_capture_enabled
 
-            if not before_observation or harness_stderr_capture_enabled():
-                # Redact the complete frame before trimming, so a long credential
-                # cannot lose its identifying prefix at the truncation boundary.
+            output_allowed = not before_observation or harness_stderr_capture_enabled()
+            if output_allowed:
                 raw_output = last_output
                 if instance is not None:
                     raw_output = (
@@ -1864,8 +1916,15 @@ class SessionResourceRegistry:
                         if before_observation
                         else instance.last_pane_text()
                     )
-                redacted_last_output = trim_terminal_output(
-                    sanitize_diagnostic_text(raw_output or "")
+                redacted_last_output = redacted_terminal_output(raw_output)
+            if startup_exit:
+                output_attributes["terminal_exit_during_startup"] = "true"
+                output_attributes["terminal_last_output_status"] = (
+                    "captured"
+                    if redacted_last_output
+                    else "unavailable"
+                    if output_allowed
+                    else "withheld"
                 )
 
         publisher = self._terminal_exit_publisher
@@ -1890,6 +1949,7 @@ class SessionResourceRegistry:
                 terminal_last_output=redacted_last_output,
                 before_observation=before_observation,
                 superseded=superseded_by is not None,
+                **output_attributes,
                 **lifecycle_context,
             ),
         )

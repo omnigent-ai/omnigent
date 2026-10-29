@@ -21,6 +21,9 @@ export type ScheduledTaskState = "active" | "paused";
  */
 export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 
+/** Whether each run starts a new session or continues one. */
+export type ScheduledTaskSessionMode = "new" | "continue";
+
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
   "scheduled" | "starting" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
@@ -51,6 +54,10 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
+  sessionMode: ScheduledTaskSessionMode;
+  /** The session a `"continue"` task sends to; `null` until its first run creates one. */
+  sessionId: string | null;
   /** Pinned absolute workspace, or `null` (server defaults to the host home). */
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
@@ -90,6 +97,24 @@ export interface ScheduledTaskRun {
   finishedAt: number | null;
   /** Queryable failure classification, e.g. `no_online_host`; `null` on success. */
   errorCode: string | null;
+  /** Epoch seconds of the conversation's last update; `null` for runs without a conversation. */
+  conversationUpdatedAt: number | null;
+  /**
+   * The session's status as `GET /v1/sessions` reports it (`"idle"`, `"running"` or
+   * `"failed"`), without that list's sub-agent roll-up; `null` for runs without a conversation.
+   */
+  conversationStatus: string | null;
+  /**
+   * When the caller last saw the conversation (epoch seconds), as `viewer_last_seen` in
+   * `GET /v1/sessions`; `null` if never, or for runs without a conversation.
+   */
+  viewerLastSeen: number | null;
+  /**
+   * Whether the caller has explicitly marked this conversation unread (server-side
+   * `viewer_unread`); `null` for runs without a conversation. Hydrates
+   * `useUnseenConversations` on load so the dot can be computed without per-row fetches.
+   */
+  viewerUnread: boolean | null;
 }
 
 /** Body for `POST /v1/scheduled-tasks`. */
@@ -103,6 +128,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Native-harness permission mode (Claude Code); omit for the agent default. */
   permissionMode?: string | null;
+  /** `"continue"` keeps one session across runs; omit for a new session per run. */
+  sessionMode?: ScheduledTaskSessionMode;
   /** Optional pinned workspace; only valid together with `hostId`. */
   workspace?: string | null;
   /** Optional pinned host. */
@@ -137,6 +164,9 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  sessionMode?: ScheduledTaskSessionMode;
+  /** `null` makes a `"continue"` task's next run start the session later runs continue. */
+  sessionId?: string | null;
   workspace?: string;
   hostId?: string;
   /**
@@ -163,6 +193,8 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  session_mode?: ScheduledTaskSessionMode;
+  session_id?: string | null;
   workspace: string | null;
   host_id: string | null;
   execution_target: ScheduledTaskExecutionTarget;
@@ -185,6 +217,10 @@ interface ScheduledTaskRunWire {
   fired_at: number | null;
   finished_at: number | null;
   error_code: string | null;
+  conversation_updated_at: number | null;
+  conversation_status: string | null;
+  viewer_last_seen: number | null;
+  viewer_unread: boolean | null;
 }
 
 /**
@@ -241,6 +277,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    sessionMode: wire.session_mode ?? "new",
+    sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
@@ -263,6 +301,10 @@ function runFromWire(wire: ScheduledTaskRunWire): ScheduledTaskRun {
     firedAt: wire.fired_at,
     finishedAt: wire.finished_at,
     errorCode: wire.error_code,
+    conversationUpdatedAt: wire.conversation_updated_at ?? null,
+    conversationStatus: wire.conversation_status ?? null,
+    viewerLastSeen: wire.viewer_last_seen ?? null,
+    viewerUnread: wire.viewer_unread ?? null,
   };
 }
 
@@ -303,6 +345,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
@@ -333,6 +376,8 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
+  if (input.sessionId !== undefined) body.session_id = input.sessionId;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;

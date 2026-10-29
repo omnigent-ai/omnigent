@@ -376,6 +376,8 @@ _SCHEDULED_TASK_SETTINGS = (
     "execution_target",
     "project_name",
     "project_id",
+    "session_mode",
+    "session_id",
     "permission_mode",
     "max_cost_usd",
     "model_override",

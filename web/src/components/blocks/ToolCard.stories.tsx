@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
+import { StoryQueryRouter } from "@/storybook/StoryProviders";
 import { ToolCard } from "./ToolCard";
 
 const longOutput = Array.from(
@@ -110,16 +111,20 @@ export const GenericTodoListExpanded: Story = {
 };
 
 // MCP results arrive as content blocks wrapping the server's JSON.
+// A field selector stays out of the title, and the markdown description renders as prose.
 export const McpJsonResultExpanded: Story = {
   args: {
     name: "mcp__linear__get_issue",
-    arguments: { id: "OMNI-12243", includeComments: false },
+    arguments: { id: "OMNI-12243", fields: ["id", "title", "description", "state", "labels"] },
     output: JSON.stringify([
       {
         type: "text",
         text: JSON.stringify({
           id: "OMNI-12243",
           title: "Claude mod replaces tmux paste for native turns",
+          description:
+            "Follow-up to [#11607](<https://github.com/omnigent-ai/omnigent/pull/11607>).\n\n" +
+            "1. Send turns through the **mod** channel.\n2. Keep tmux paste as the fallback.",
           state: "In Review",
           priority: "P1",
           labels: ["claude-native", "harness"],
@@ -131,10 +136,18 @@ export const McpJsonResultExpanded: Story = {
     startedAt: null,
     duration: 0.412,
   },
+  // Markdown links check workspace files through React Query, as in the app.
+  decorators: [
+    (Story) => (
+      <StoryQueryRouter>
+        <Story />
+      </StoryQueryRouter>
+    ),
+  ],
   play: async ({ canvasElement }) => expand(canvasElement),
 };
 
-// A failure the tool reported reads in red on the collapsed row.
+// A failure stays out of the collapsed row; expand to inspect its result.
 export const McpFailureCollapsed: Story = {
   args: {
     name: "mcp__github__create_pull_request",
@@ -152,6 +165,66 @@ export const McpFailureCollapsed: Story = {
     startedAt: null,
     duration: 1.2,
   },
+};
+
+// A Claude edit: its line counts on the result line, its diff when expanded.
+export const EditExpanded: Story = {
+  args: {
+    name: "Edit",
+    arguments: {
+      file_path: "/repo/src/greet.py",
+      old_string:
+        "def greet(name):\n    print('Hello ' + name)\n    print('Welcome back')\n    return name\n",
+      new_string:
+        "def greet(name):\n    message = f'Hello {name}! Welcome back.'\n    print(message)\n    return name\n",
+    },
+    output: "The file /repo/src/greet.py has been updated successfully.",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.009,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A Codex patch over three files: one panel per file, named with its change kind.
+export const PatchExpanded: Story = {
+  args: {
+    name: "apply_patch",
+    arguments: {
+      changes: [
+        {
+          path: "/repo/src/greet.py",
+          kind: { type: "update" },
+          diff: "@@ -1,3 +1,3 @@\n def greet(name):\n-    print('Hello ' + name)\n+    print(f'Hello {name}')\n     return name\n",
+        },
+        {
+          path: "/repo/src/farewell.py",
+          kind: { type: "add" },
+          diff: "def farewell(name):\n    print(f'Bye {name}')\n",
+        },
+        { path: "/repo/src/legacy.py", kind: { type: "delete" }, diff: "LEGACY = True\n" },
+      ],
+    },
+    output:
+      "File change applied.\nupdate /repo/src/greet.py\nadd /repo/src/farewell.py\ndelete /repo/src/legacy.py",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.04,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A missed edit: the error, then the requested change labeled as not applied.
+export const FailedEditExpanded: Story = {
+  args: {
+    name: "Edit",
+    arguments: { file_path: "/repo/README.md", old_string: "Hi", new_string: "Hello" },
+    output: "<tool_use_error>String to replace not found in file.</tool_use_error>",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.006,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
 };
 
 export const ScheduledTaskExpanded: Story = {

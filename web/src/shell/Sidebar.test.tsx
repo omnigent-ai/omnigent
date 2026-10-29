@@ -1263,6 +1263,20 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
   });
 
+  it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/tasks/task_abc123");
+
+    // Automations is highlighted on the detail route — same pill as the list page.
+    expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
+      "bg-[var(--sidebar-active)]",
+    );
+    // The detail route must not activate New session.
+    expect(screen.getByTestId("new-chat-button").className).not.toContain(
+      "bg-[var(--sidebar-active)]",
+    );
+  });
+
   it("does NOT close the sidebar when the footer Settings is tapped", () => {
     // No onNavClick on the footer Settings link: on mobile the overlay stays
     // open and swaps to the settings section list rather than collapsing onto

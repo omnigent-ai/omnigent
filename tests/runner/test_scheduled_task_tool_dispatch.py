@@ -49,12 +49,18 @@ class _Resp:
 
 
 class _RecordingClient:
-    """Records the verb/url/json of each call and returns a scripted response."""
+    """Records the verb/url/json of each call and returns a scripted response.
+
+    ``info`` answers ``/v1/info``; by default a server that accepts task
+    projects and session modes.
+    """
 
     def __init__(self, response: _Resp | None = None, *, info: _Resp | None = None) -> None:
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
         self._response = response or _Resp(body={"id": "t1"})
-        self._info = info or _Resp(body={"scheduled_task_projects": True})
+        self._info = info or _Resp(
+            body={"scheduled_task_projects": True, "scheduled_task_session_modes": True}
+        )
 
     async def get(self, url: str, *, timeout: object = None) -> _Resp:
         self.calls.append(("GET", url, None))
@@ -87,6 +93,8 @@ async def test_create_posts_payload() -> None:
                 "workspace": "/repo",
                 "host_id": "host_1",
                 "project_id": "proj_1",
+                "session_mode": "continue",
+                "session_id": "conv_1",
                 "base_branch": "main",
                 "unexpected": "dropped",
             }
@@ -103,8 +111,59 @@ async def test_create_posts_payload() -> None:
         "workspace": "/repo",
         "host_id": "host_1",
         "project_id": "proj_1",
+        "session_mode": "continue",
+        "session_id": "conv_1",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_create_without_session_args_sends_no_session_fields() -> None:
+    """An older server rejects unknown fields, so a plain create must not send them."""
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_create",
+        json.dumps({"name": "n", "prompt": "p", "rrule": "FREQ=DAILY", "agent_id": "ag_1"}),
+        server_client=client,
+    )
+    _, _, body = client.calls[0]
+    assert not {"session_mode", "session_id"} & set(body)
+    assert "/v1/info" not in [url for _, url, _ in client.calls]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [_Resp(body={"scheduled_task_projects": True}), _Resp(status_code=500)],
+    ids=["missing", "info-fails"],
+)
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        (
+            "sys_scheduled_task_create",
+            {
+                "name": "n",
+                "prompt": "p",
+                "rrule": "FREQ=DAILY",
+                "agent_id": "ag_1",
+                "session_mode": "continue",
+            },
+        ),
+        ("sys_scheduled_task_update", {"scheduled_task_id": _TASK_ID, "session_id": None}),
+    ],
+)
+async def test_session_args_are_refused_before_an_older_server_sees_them(
+    tool_name: str, arguments: dict[str, object], info: _Resp
+) -> None:
+    """A server without session modes would reject the fields with a bare 422."""
+    client = _RecordingClient(info=info)
+    out = await _execute_scheduled_task_tool(
+        tool_name, json.dumps(arguments), server_client=client
+    )
+
+    assert [url for _, url, _ in client.calls] == ["/v1/info"]
+    assert "does not support session_mode or session_id" in json.loads(out)["error"]
 
 
 @pytest.mark.asyncio
@@ -280,6 +339,26 @@ async def test_project_args_are_refused_on_a_server_without_task_projects(
 
 
 @pytest.mark.asyncio
+async def test_update_by_name_on_an_unknown_task_creates_no_project() -> None:
+    class _MissingTaskClient(_ProjectsClient):
+        async def get(self, url: str, *, timeout: object = None) -> _Resp:
+            if url.startswith("/v1/scheduled-tasks/"):
+                self.calls.append(("GET", url, None))
+                return _Resp(status_code=404, body={"detail": "Scheduled task not found"})
+            return await super().get(url, timeout=timeout)
+
+    client = _MissingTaskClient([])
+    out = await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps({"scheduled_task_id": _TASK_ID, "project_name": "new"}),
+        server_client=client,
+    )
+    assert json.loads(out)["error"] == "server returned 404"
+    assert not [call for call in client.calls if call[1] == "/v1/projects"]
+    assert not [call for call in client.calls if call[0] == "PATCH"]
+
+
+@pytest.mark.asyncio
 async def test_calls_without_project_args_skip_the_capability_check() -> None:
     client = _RecordingClient(info=_Resp(body={}))
     await _execute_scheduled_task_tool(
@@ -390,3 +469,22 @@ def test_tools_in_dispatch_and_relay_sets() -> None:
     assert _SCHEDULED_TASK_TOOLS == _ALL_NAMES
     assert _ALL_NAMES <= _ALL_LOCAL_TOOLS
     assert _ALL_NAMES <= _NATIVE_RELAY_BUILTIN_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_update_forwards_session_fields() -> None:
+    """``session_mode`` and a null ``session_id`` reach the PATCH body."""
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps(
+            {
+                "scheduled_task_id": _TASK_ID,
+                "session_mode": "continue",
+                "session_id": None,
+            }
+        ),
+        server_client=client,
+    )
+    _, _, body = client.calls[-1]
+    assert body == {"session_mode": "continue", "session_id": None}
