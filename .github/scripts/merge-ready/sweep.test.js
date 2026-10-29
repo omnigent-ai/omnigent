@@ -108,8 +108,16 @@ test("draft, fork and unlabeled legacy PRs are included; stale head metadata is 
   const legacy = { ...pullRequest(3, { description: "All required checks green" }), labels: { nodes: [] } };
   const changedHead = pullRequest(4);
   changedHead.headRefOid = "f".repeat(40);
-  const { github } = fixture([[draft, fork, legacy, changedHead]]);
+  const { github, queries } = fixture([[draft, fork, legacy, changedHead]]);
   const result = await sweep({ github, context, core, now: NOW });
+  const connection = /pullRequests\(([^)]*)\)/.exec(queries[0].query);
+  assert.ok(connection, "query reads the repository's pull request connection");
+  assert.match(connection[1], /\bstates:\s*OPEN\b/);
+  assert.deepEqual(
+    [...connection[1].matchAll(/\b(\w+)\s*:/g)].map((match) => match[1]).sort(),
+    ["after", "first", "states"],
+    "open PR enumeration must not filter by labels, draft state or fork origin",
+  );
   assert.deepEqual(result.candidates.map((candidate) => candidate.number), [1, 2, 3]);
 });
 

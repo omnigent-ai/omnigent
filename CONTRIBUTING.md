@@ -447,6 +447,13 @@ Each sweep reevaluates at most 50 PRs, prioritizing known expiries over older
 statuses that have no expiry recorded yet. Large backlogs take multiple sweeps.
 Normal gate evaluations also enforce expiry.
 
+A `/merge` command from a user with write access records the request with the
+`automerge` label and posts an acknowledgement. Every subsequent gate evaluation
+can act on that request after checking CI freshness, so overlapping CI events
+cannot discard it. Adding the label directly uses the same path.
+To cancel the request, remove the `automerge` label and disable GitHub auto-merge
+if it is already enabled.
+
 ### Database migration reviews
 
 Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -173,11 +174,13 @@ def test_explicit_reevaluation_can_revoke_unlabelled_green(
 
 def test_all_status_writers_share_the_head_lock_even_when_resolution_is_skipped() -> None:
     evaluate = WORKFLOW["jobs"]["evaluate"]
-    assert evaluate["needs"] == "resolve-head"
+    assert evaluate["needs"] == ["resolve-head", "request-automerge"]
     assert "!cancelled()" in evaluate["if"]
     assert "needs.resolve-head.result == 'success'" in evaluate["if"]
     assert "needs.resolve-head.result == 'skipped'" in evaluate["if"]
     assert "needs.resolve-head.outputs.skip != 'true'" in evaluate["if"]
+    assert "needs.request-automerge.result == 'success'" in evaluate["if"]
+    assert "needs.request-automerge.result == 'skipped'" in evaluate["if"]
     assert evaluate["concurrency"]["cancel-in-progress"] is False
     group = evaluate["concurrency"]["group"]
     for source in (
@@ -190,3 +193,254 @@ def test_all_status_writers_share_the_head_lock_even_when_resolution_is_skipped(
     assert (
         _step("evaluate", "ctx")["env"]["RESOLVED_SHA"] == "${{ needs.resolve-head.outputs.sha }}"
     )
+
+
+def test_merge_requests_survive_replacement_of_a_pending_evaluator() -> None:
+    request = WORKFLOW["jobs"]["request-automerge"]
+    assert "needs" not in request
+    assert "contains(github.event.comment.body, '/merge')" in request["if"]
+    assert "github.event.issue.state == 'open'" in request["if"]
+    assert "concurrency" not in request
+    assert "concurrency" not in WORKFLOW
+    assert "statuses" not in request["permissions"]
+    resolve = WORKFLOW["jobs"]["resolve-head"]
+    assert resolve["needs"] == "request-automerge"
+    assert "!cancelled()" in resolve["if"]
+    assert "needs.request-automerge.result == 'success'" in resolve["if"]
+    assert "needs.request-automerge.result == 'skipped'" in resolve["if"]
+    record = next(step for step in request["steps"] if step["name"] == "Record /merge request")
+    assert record["if"] == "steps.authz.outputs.authorized == 'true'"
+    assert "steps.command.outputs.skip != 'true'" in _step("request-automerge", "authz")["if"]
+
+    steps = WORKFLOW["jobs"]["evaluate"]["steps"]
+    publish = next(
+        step for step in steps if step["name"] == "Post Merge Ready status on PR head SHA"
+    )
+    enable = next(step for step in steps if step["name"] == "Enable requested auto-merge")
+    assert steps.index(publish) < steps.index(enable)
+    assert not publish.get("continue-on-error", False)
+    assert "always()" not in enable["if"]
+    assert "!cancelled()" not in enable["if"]
+    assert "github.event" not in enable["if"]
+    assert "steps.labels.outputs.automerge == 'true'" in enable["if"]
+    assert enable["env"]["SHA"] == "${{ steps.ctx.outputs.sha }}"
+    assert enable["env"]["GATE_STATE"] == "${{ steps.gate.outputs.state }}"
+    assert enable["env"]["EXPIRES_AT"] == "${{ steps.eval.outputs.expires_at }}"
+
+
+@pytest.mark.parametrize("body", ["Please run /merge later", "/mergefoo", "`/merge`"])
+def test_incidental_mentions_do_not_record_merge_intent(tmp_path: Path, body: str) -> None:
+    process, outputs, calls = _run_step(
+        tmp_path,
+        _step("request-automerge", "command")["run"],
+        env={"COMMENT_BODY": body},
+    )
+    assert process.returncode == 0
+    assert outputs == {"skip": "true"}
+    assert not calls
+
+
+def test_required_lint_lane_runs_sweep_tests_and_shell_validation() -> None:
+    lint = yaml.safe_load((ROOT / ".github/workflows/lint.yml").read_text())
+    job = lint["jobs"]["pre-commit"]
+    assert job["name"] == "Pre-commit checks"
+    sweep = next(
+        step
+        for step in job["steps"]
+        if step.get("run") == "node --test .github/scripts/merge-ready/sweep.test.js"
+    )
+    syntax = next(
+        step for step in job["steps"] if ".github/scripts/merge-ready/*.sh" in step.get("run", "")
+    )
+    assert 'bash -n "$script"' in syntax["run"]
+    for step in (sweep, syntax):
+        assert "if" not in step
+        assert not step.get("continue-on-error", False)
+    assert not (ROOT / ".github/workflows/merge-ready-test.yml").exists()
+
+
+Reply = tuple[list[str], str, int, str | None]
+
+
+def _reply(prefix: list[str], output: str = "", code: int = 0, now: str | None = None) -> Reply:
+    return prefix, output, code, now
+
+
+def _pull_reply(*, state: str = "open", sha: str = HEAD, labelled: bool = True) -> Reply:
+    return _reply(
+        ["api", "repos/example/project/pulls/123"],
+        json.dumps(
+            {
+                "state": state,
+                "head": {"sha": sha},
+                "labels": [{"name": "automerge"}] if labelled else [],
+            }
+        ),
+    )
+
+
+def _run_helper(
+    tmp_path: Path,
+    script: str,
+    replies: list[Reply],
+    *,
+    state: str = "success",
+    expires: str = "2026-10-19T12:00:01Z",
+) -> tuple[dict[str, str], list[list[str]], str]:
+    (tmp_path / "replies.json").write_text(json.dumps(replies))
+    (tmp_path / "clock").write_text("2026-10-19T12:00:00Z")
+    gh = tmp_path / "gh"
+    gh.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "root = Path(os.environ['MERGE_READY_TEST_DIR'])\n"
+        "calls = root / 'calls'\n"
+        "index = len(calls.read_text().splitlines()) if calls.exists() else 0\n"
+        "with calls.open('a') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "replies = json.loads((root / 'replies.json').read_text())\n"
+        "if index >= len(replies):\n"
+        "    (root / 'unexpected').write_text('Unexpected gh call: ' + str(sys.argv[1:]))\n"
+        "    sys.exit(99)\n"
+        "prefix, output, code, now = replies[index]\n"
+        "if sys.argv[1:1+len(prefix)] != prefix:\n"
+        "    (root / 'unexpected').write_text('Wrong gh call: ' + str(sys.argv[1:]))\n"
+        "    sys.exit(99)\n"
+        "if now is not None: (root / 'clock').write_text(now)\n"
+        "sys.stdout.write(output)\n"
+        "sys.exit(code)\n"
+    )
+    gh.chmod(0o755)
+    date = tmp_path / "date"
+    date.write_text('#!/bin/sh\ncat "$MERGE_READY_TEST_DIR/clock"\n')
+    date.chmod(0o755)
+    output_path = tmp_path / "outputs"
+    process = subprocess.run(
+        ["bash", str(ROOT / ".github/scripts/merge-ready" / script)],
+        env=dict(
+            os.environ,
+            PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            MERGE_READY_TEST_DIR=str(tmp_path),
+            GITHUB_OUTPUT=str(output_path),
+            GH_TOKEN="test-token",
+            REPO="example/project",
+            PR="123",
+            AUTHOR="maintainer",
+            SHA=HEAD,
+            GATE_STATE=state,
+            EXPIRES_AT=expires,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert not (tmp_path / "unexpected").exists(), (
+        (tmp_path / "unexpected").read_text() if (tmp_path / "unexpected").exists() else ""
+    )
+    calls = [json.loads(line) for line in (tmp_path / "calls").read_text().splitlines()]
+    assert len(calls) == len(replies), process.stdout + process.stderr
+    outputs = (
+        dict(line.split("=", 1) for line in output_path.read_text().splitlines())
+        if output_path.exists()
+        else {}
+    )
+    return outputs, calls, process.stdout
+
+
+@pytest.mark.parametrize("permission", ["admin", "maintain", "write", "read", "none"])
+def test_only_authorized_commands_can_record_intent(tmp_path: Path, permission: str) -> None:
+    authorized = permission in {"admin", "maintain", "write"}
+    replies = [
+        _reply(["api", "repos/example/project/collaborators/maintainer/permission"], permission)
+    ]
+    if not authorized:
+        replies.append(_reply(["pr", "comment", "123"]))
+    outputs, _, _ = _run_helper(tmp_path, "authorize-merge-comment.sh", replies)
+    assert outputs == {"authorized": str(authorized).lower()}
+
+
+def test_command_records_durable_intent_without_attempting_a_merge(tmp_path: Path) -> None:
+    _, calls, _ = _run_helper(
+        tmp_path,
+        "enable-automerge-comment.sh",
+        [_reply(["pr", "edit", "123"]), _reply(["pr", "comment", "123"])],
+    )
+    assert calls[0][-2:] == ["--add-label", "automerge"]
+    assert "recorded" in calls[1][-1]
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize("state", ["success", "failure"])
+def test_surviving_evaluation_enables_the_current_request(tmp_path: Path, state: str) -> None:
+    _, calls, _ = _run_helper(
+        tmp_path,
+        "enable-automerge-label.sh",
+        [_pull_reply(), _reply(["pr", "merge", "123"])],
+        state=state,
+    )
+    assert "--auto" in calls[1]
+    assert calls[1][-2:] == ["--match-head-commit", HEAD]
+
+
+@pytest.mark.parametrize("reason", ["closed", "head-changed", "label-removed"])
+def test_obsolete_request_does_not_merge(tmp_path: Path, reason: str) -> None:
+    _run_helper(
+        tmp_path,
+        "enable-automerge-label.sh",
+        [
+            _pull_reply(
+                state="closed" if reason == "closed" else "open",
+                sha="b" * 40 if reason == "head-changed" else HEAD,
+                labelled=reason != "label-removed",
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("expires", ["", "2026-10-19T12:00:00Z", "2026-10-19T11:59:59Z"])
+def test_expired_green_cannot_merge_via_auto(tmp_path: Path, expires: str) -> None:
+    _run_helper(tmp_path, "enable-automerge-label.sh", [_pull_reply()], expires=expires)
+
+
+def test_direct_fallback_requires_fresh_green_and_the_evaluated_head(tmp_path: Path) -> None:
+    _, calls, _ = _run_helper(
+        tmp_path,
+        "enable-automerge-label.sh",
+        [
+            _pull_reply(),
+            _reply(["pr", "merge", "123"], "clean status", 1),
+            _pull_reply(),
+            _reply(["pr", "merge", "123"]),
+        ],
+    )
+    assert "--auto" in calls[1]
+    assert "--auto" not in calls[3]
+    assert calls[1][-2:] == calls[3][-2:] == ["--match-head-commit", HEAD]
+
+
+@pytest.mark.parametrize("reason", ["expired", "red", "head-changed", "label-removed"])
+def test_direct_fallback_rechecks_readiness_and_intent(tmp_path: Path, reason: str) -> None:
+    replies = [
+        _pull_reply(),
+        _reply(
+            ["pr", "merge", "123"],
+            "Base branch was modified",
+            1,
+            "2026-10-19T12:00:01Z" if reason == "expired" else None,
+        ),
+    ]
+    if reason != "red":
+        replies.append(
+            _pull_reply(
+                sha="b" * 40 if reason == "head-changed" else HEAD,
+                labelled=reason != "label-removed",
+            )
+        )
+    _, calls, _ = _run_helper(
+        tmp_path,
+        "enable-automerge-label.sh",
+        replies,
+        state="failure" if reason == "red" else "success",
+    )
+    assert sum(call[:2] == ["pr", "merge"] for call in calls) == 1

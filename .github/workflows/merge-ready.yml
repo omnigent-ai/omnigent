@@ -12,8 +12,8 @@ run-name: "${{ github.event_name == 'workflow_dispatch' && format('Merge Ready #
 # the default branch.
 #
 # Labels:
-#   automerge    enable GitHub auto-merge (one-shot on label add) + opt
-#                into continuous gate updates (green AND red).
+#   automerge    durable request to enable GitHub auto-merge after evaluation,
+#                plus continuous gate updates (green AND red).
 #
 # There is no CI bypass label. To land a PR despite red required checks,
 # fix or delete the offending test; for a genuine emergency, a repo admin
@@ -54,13 +54,18 @@ permissions:
 jobs:
   resolve-head:
     # Comments and dispatches lack a head SHA for the per-commit lock.
+    needs: request-automerge
     if: >-
+      !cancelled() &&
+      (needs.request-automerge.result == 'success' || needs.request-automerge.result == 'skipped') &&
+      (
       github.event_name == 'workflow_dispatch' ||
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request != null &&
         contains(github.event.comment.body, '/merge') &&
         !endsWith(github.actor, '[bot]')
+      )
       )
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -92,15 +97,69 @@ jobs:
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
+  request-automerge:
+    # Persist the command before entering the replaceable status-update queue.
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null &&
+      github.event.issue.state == 'open' &&
+      contains(github.event.comment.body, '/merge') &&
+      !endsWith(github.actor, '[bot]') &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out trusted command scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: .github/scripts/merge-ready
+          persist-credentials: false
+
+      - name: Validate /merge command
+        id: command
+        env:
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          if ! grep -qE '^[[:space:]]*/merge([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Authorize /merge commenter
+        id: authz
+        if: steps.command.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          PR: ${{ github.event.issue.number }}
+        run: bash .github/scripts/merge-ready/authorize-merge-comment.sh
+
+      - name: Record /merge request
+        if: steps.authz.outputs.authorized == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.issue.number }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+        run: bash .github/scripts/merge-ready/enable-automerge-comment.sh
+
   evaluate:
     name: evaluate
-    needs: resolve-head
+    needs: [resolve-head, request-automerge]
     concurrency:
       group: merge-ready-${{ needs.resolve-head.outputs.sha || github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
       cancel-in-progress: false
     permissions:
-      contents: write       # enable PR merge for `/merge`
-      pull-requests: write  # post comments + enable auto-merge
+      contents: write       # merge PRs with durable automerge intent
+      pull-requests: write  # enable auto-merge
       checks: read
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
@@ -111,6 +170,7 @@ jobs:
     if: >-
       !cancelled() &&
       (needs.resolve-head.result == 'success' || needs.resolve-head.result == 'skipped') &&
+      (needs.request-automerge.result == 'success' || needs.request-automerge.result == 'skipped') &&
       needs.resolve-head.outputs.skip != 'true' &&
       (
       (
@@ -344,44 +404,19 @@ jobs:
             -f description="$DESC" >/dev/null
           echo "Posted Merge Ready=$STATE on $SHA ($DESC)"
 
-      # Authoritative /merge authz: the job `if` pre-filters on
-      # author_association, but an org MEMBER may lack write here, so
-      # confirm write access via the permission API before merging.
-      - name: Authorize /merge commenter
-        id: authz
-        if: >-
-          github.event_name == 'issue_comment' &&
-          steps.ctx.outputs.skip != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          AUTHOR: ${{ github.event.comment.user.login }}
-          PR: ${{ steps.ctx.outputs.pr }}
-        run: bash .github/scripts/merge-ready/authorize-merge-comment.sh
-
-      - name: Enable auto-merge on /merge
-        if: >-
-          github.event_name == 'issue_comment' &&
-          steps.ctx.outputs.skip != 'true' &&
-          steps.authz.outputs.authorized == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ steps.ctx.outputs.pr }}
-          AUTHOR: ${{ github.event.comment.user.login }}
-          GATE: ${{ steps.gate.outputs.long_desc }}
-        run: bash .github/scripts/merge-ready/enable-automerge-comment.sh
-
-      - name: Enable auto-merge on automerge label
+      # Any surviving evaluation can fulfill the stored request after publishing.
+      - name: Enable requested auto-merge
         if: >-
           steps.ctx.outputs.skip != 'true' &&
-          github.event_name == 'pull_request_target' &&
-          github.event.action == 'labeled' &&
-          github.event.label.name == 'automerge'
+          steps.labels.outputs.automerge == 'true' &&
+          steps.gate.outputs.post_status == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+          GATE_STATE: ${{ steps.gate.outputs.state }}
+          EXPIRES_AT: ${{ steps.eval.outputs.expires_at }}
         run: bash .github/scripts/merge-ready/enable-automerge-label.sh
 
       # Not on pull_request_target-labeled: auto-merge was enabled in an earlier
