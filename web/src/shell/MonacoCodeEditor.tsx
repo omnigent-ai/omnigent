@@ -33,7 +33,7 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useMonacoFilePosition } from "./useMonacoFilePosition";
 // Reused as-is — the hook is editor-agnostic (drives any editor through
 // setContentRef). Named for markdown only because that was its first caller.
-import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { type FinishServerCheck, useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import {
   ensureLanguage,
@@ -152,7 +152,7 @@ export function MonacoCodeEditor({
     discardAndApplyExternal,
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } = useMarkdownEditorSync({ content, path, isSettled, onDirtyChange, setContentRef });
 
   return (
@@ -171,7 +171,7 @@ export function MonacoCodeEditor({
       discardAndApplyExternal={discardAndApplyExternal}
       dismissExternalUpdate={dismissExternalUpdate}
       markSaved={markSaved}
-      reconcileServerContent={reconcileServerContent}
+      beginServerCheck={beginServerCheck}
       setContentRef={setContentRef}
       onSaveStatusChange={onSaveStatusChange}
       searchOpen={searchOpen}
@@ -199,7 +199,7 @@ interface InnerProps extends CommentProps {
   discardAndApplyExternal: () => void;
   dismissExternalUpdate: () => void;
   markSaved: (content: string) => void;
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
   setContentRef: React.RefObject<((content: string) => void) | null>;
   onSaveStatusChange?: (status: SaveStatus) => void;
   searchOpen?: boolean;
@@ -229,7 +229,7 @@ function MonacoCodeEditorInner({
   discardAndApplyExternal,
   dismissExternalUpdate,
   markSaved,
-  reconcileServerContent,
+  beginServerCheck,
   setContentRef,
   onSaveStatusChange,
   searchOpen,
@@ -292,7 +292,7 @@ function MonacoCodeEditorInner({
   // instance (the child <Editor> unmounts first).
   const isEditorDirty = useCallback(() => latestContentRef.current !== baselineRef.current, []);
 
-  // All save orchestration — write mutation, mid-turn conflict check, teardown
+  // All save orchestration — write mutation, pre-write conflict check, teardown
   // guard, and debounce/flush wiring — lives in the shared hook, identical to
   // the markdown editor. This surface only supplies its own content access.
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
@@ -303,7 +303,7 @@ function MonacoCodeEditorInner({
     setDirty,
     hasExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
     dismissExternalUpdate,
     baselineRef,
     getContent: () => latestContentRef.current,
