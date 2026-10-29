@@ -3354,3 +3354,27 @@ def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
     # resolver: qwen consumes the openai family at spawn.
     qwen_cred = describe_active_credential(config, "qwen")
     assert qwen_cred is not None and qwen_cred.provider_name == "openai"
+
+
+def test_server_event_to_sdk_event_keeps_ask_user_question() -> None:
+    """Question prompts reach the REPL picker with their questions attached.
+
+    Failure meaning: the REPL falls back to a y/a/n card, and accepting it
+    sends the agent no answers.
+    """
+    from omnigent_client._events import ElicitationRequest
+
+    from omnigent.server.schemas import ElicitationRequestEvent, ElicitationRequestParams
+
+    questions = {"questions": [{"question": "Env?", "options": [{"label": "dev"}]}]}
+    server_event = ElicitationRequestEvent(
+        type="response.elicitation_request",
+        elicitation_id="elicit_q",
+        params=ElicitationRequestParams(
+            message="Claude wants to use **AskUserQuestion**", ask_user_question=questions
+        ),
+    )
+    result = _server_event_to_sdk_event(server_event)
+
+    assert isinstance(result, ElicitationRequest)
+    assert result.ask_user_question == questions

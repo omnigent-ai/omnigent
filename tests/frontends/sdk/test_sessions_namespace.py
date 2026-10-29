@@ -289,6 +289,26 @@ async def test_get_parses_agent_name() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_parses_pending_elicitations() -> None:
+    pending = {"type": "response.elicitation_request", "elicitation_id": "elicit_q"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=_session_response_body() | {"pending_elicitations": [pending, "junk"]}
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        session = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+
+    # The live stream doesn't replay prompts, so a late subscriber (the REPL
+    # at startup) reads outstanding ones from here.
+    assert session.pending_elicitations == [pending]
+
+
+@pytest.mark.asyncio
 async def test_get_agent_name_defaults_to_none_when_omitted() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         # Old servers omit agent_name from the payload entirely.

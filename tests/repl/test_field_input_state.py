@@ -555,3 +555,54 @@ def test_settle_resolved_elsewhere_releases_an_open_question_prompt() -> None:
 
     assert _run(_run_case()) == (None, "approved elsewhere")
     assert state.resolved_elsewhere
+
+
+def test_replay_feeds_pending_prompts_through_the_live_path() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.schemas import ElicitationRequestEvent
+
+    adapter, _, client, _ = _question_adapter()
+    raw = {
+        "type": "response.elicitation_request",
+        "elicitation_id": "elicit_q",
+        "method": "elicitation/create",
+        "params": {"mode": "form", "message": "Pick one", "ask_user_question": {"questions": []}},
+    }
+    client.sessions.get = AsyncMock(
+        return_value=SimpleNamespace(pending_elicitations=[raw, {"type": "bogus"}])
+    )
+    seen: list[Any] = []
+    adapter._on_event = seen.append
+
+    _run(adapter._replay_pending_elicitations())
+
+    # Unknown events are skipped; the prompt arrives as the same typed event
+    # the live stream would deliver.
+    assert [type(event) for event in seen] == [ElicitationRequestEvent]
+    assert seen[0].elicitation_id == "elicit_q"
+
+
+def test_a_prompt_seen_live_and_in_replay_is_handled_once() -> None:
+    adapter, fis, client, _ = _question_adapter()
+
+    async def _deliver_twice() -> None:
+        first = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        for _ in range(200):
+            if fis.pending:
+                break
+            await asyncio.sleep(0)
+        duplicate = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
+        for _ in range(50):
+            if duplicate.done():
+                break
+            await asyncio.sleep(0)
+        assert duplicate.done(), "the duplicate opened a second picker"
+        fis.resolve("1")
+        await first
+
+    _run(_deliver_twice())
+    client.sessions.resolve_elicitation.assert_awaited_once_with(
+        "conv_abc", "elicit_q", {"action": "accept", "content": {"Env?": "dev"}}
+    )

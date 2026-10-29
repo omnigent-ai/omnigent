@@ -1381,6 +1381,11 @@ def _elicitation_resolve_session_id(sdk_event: object, fallback_session_id: str)
     return getattr(sdk_event, "target_session_id", None) or fallback_session_id
 
 
+def _dict_or_none(value: object) -> dict[str, object] | None:
+    """Return *value* when it is a dict, else ``None``."""
+    return value if isinstance(value, dict) else None
+
+
 def _server_event_to_sdk_event(event: object) -> object | None:
     """Translate a server-shape ``ServerStreamEvent`` into an SDK-shape event.
 
@@ -1474,6 +1479,7 @@ def _server_event_to_sdk_event(event: object) -> object | None:
             # verdict is POSTed back to the child that parked on it, not
             # the ancestor stream the event was relayed onto.
             target_session_id=params.target_session_id,
+            ask_user_question=_dict_or_none((params.model_extra or {}).get("ask_user_question")),
         )
     if isinstance(event, CompactionInProgressEvent):
         return CompactionInProgress()
@@ -1590,6 +1596,10 @@ class _SessionsChatReplAdapter:
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
         self._field_input_state = field_input_state
+        # Prompts already handed to the terminal. A prompt can arrive twice:
+        # live on the stream and from the snapshot replayed on subscribe.
+        self._seen_elicitation_ids: set[str] = set()
+        self._replay_task: asyncio.Task[None] | None = None
         self._host = host
         self._fmt = fmt
         self._session_id: str | None = session_id
@@ -2517,8 +2527,16 @@ class _SessionsChatReplAdapter:
                         file=sys.stderr,
                         flush=True,
                     )
+                replay_scheduled = False
                 async for event in self._client.sessions.stream(self._session_id):
                     self._stream_ready.set()
+                    if not replay_scheduled:
+                        # The stream doesn't replay prompts raised before it
+                        # opened (REPL startup, reconnects); read them once.
+                        replay_scheduled = True
+                        self._replay_task = asyncio.create_task(
+                            self._replay_pending_elicitations()
+                        )
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2879,6 +2897,10 @@ class _SessionsChatReplAdapter:
         :param event: The translated :class:`ElicitationRequest`.
         """
         elicitation_id = getattr(event, "elicitation_id", "")
+        if elicitation_id:
+            if elicitation_id in self._seen_elicitation_ids:
+                return
+            self._seen_elicitation_ids.add(elicitation_id)
         # Question prompts get a numbered picker instead of y/a/n: an accept
         # without answers would reach the agent as an empty reply.
         questions = _question_prompts(getattr(event, "ask_user_question", None))
@@ -2925,6 +2947,24 @@ class _SessionsChatReplAdapter:
                     self._emit_elicitation_resolve_error(exc)
                     return
                 await asyncio.sleep(0.1 * (2**attempt))
+
+    async def _replay_pending_elicitations(self) -> None:
+        """Feed prompts raised before this subscription opened through the live path."""
+        from omnigent_client._sessions import _SERVER_STREAM_EVENT_ADAPTER
+
+        if self._on_event is None or self._session_id is None:
+            return
+        try:
+            snapshot = await self._client.sessions.get(self._session_id)
+        except Exception:  # noqa: BLE001
+            _log.debug("could not read pending prompts", exc_info=True)
+            return
+        for raw in snapshot.pending_elicitations:
+            try:
+                event = _SERVER_STREAM_EVENT_ADAPTER.validate_python(raw)
+            except ValueError:
+                continue
+            self._on_event(event)
 
     async def _approval_payload(self, event: object, elicitation_id: str) -> dict[str, object]:
         """Run the y/a/n approval hook and build the resolve payload.
