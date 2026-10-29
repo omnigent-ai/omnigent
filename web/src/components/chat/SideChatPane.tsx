@@ -934,6 +934,7 @@ function SideChatComposer({
         </TooltipProvider>
       )}
       <ChatComposer
+        data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{
           ref: tailTextareaRef,

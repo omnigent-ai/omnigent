@@ -3948,6 +3948,7 @@ function ComposerImpl(
           COMPOSER_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
+        data-suggestions-open={slashCompletion.open || mentionOpen ? "true" : undefined}
         input={{
           ref: bindTailTextarea,
           value: draft.text,
@@ -4074,7 +4075,10 @@ function ComposerImpl(
               {/* /btw side-chat overlay — transient question+answer panel,
             dismissed with Esc / ✕. Never persisted to the transcript. */}
               {btwSidechat && (
-                <div className="border-b border-border bg-card/50 p-4 backdrop-blur-sm">
+                <div
+                  data-btw-overlay="true"
+                  className="border-b border-border bg-card/50 p-4 backdrop-blur-sm"
+                >
                   <div className="mb-3 flex items-start justify-between">
                     <h3 className="text-sm font-medium">Claude Quick Answer</h3>
                     <button
