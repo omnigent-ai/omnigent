@@ -110,6 +110,27 @@ describe("browser tab titles", () => {
     expect(result.current.selected).toBe("selected");
   });
 
+  it("remembers each tab's page for a relaunch and forgets it on close", async () => {
+    openBrowserTab("session-a", "docs");
+    const viewId = browserViewId("session-a", "docs");
+    const onBrowserUrlChanged = vi.fn<(listener: Listener) => () => void>(() => vi.fn());
+    const browserHasView = vi.fn().mockResolvedValue({ exists: false });
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: { browserHasView, onBrowserUrlChanged, browserClose },
+    });
+    const first = renderHook(() => useBrowserTabs("session-a"));
+    const page = { url: "https://docs.example/guide", title: "Guide" };
+    act(() => onBrowserUrlChanged.mock.calls.at(-1)![0]({ conversationId: viewId, ...page }));
+    expect(readSessionWorkspaceState("session-a").browserTabPages).toEqual({ [viewId]: page });
+    first.unmount();
+
+    const relaunched = renderHook(() => useBrowserTabs("session-a"));
+    await waitFor(() => expect(relaunched.result.current.labelFor("docs", 0)).toBe("Guide"));
+    await act(() => relaunched.result.current.close("docs"));
+    expect(readSessionWorkspaceState("session-a").browserTabPages).toEqual({});
+  });
+
   it("discards stale probes and listeners when switching sessions or unmounting", async () => {
     openBrowserTab("session-a", "shared-tab-id");
     openBrowserTab("session-b", "shared-tab-id");

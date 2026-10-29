@@ -64,7 +64,8 @@ function buildCookieImportPrompt({ host, scope, profileName, cookieCount }) {
     detail:
       `From Chrome profile "${flattenProfileLabel(profileName, scope)}" for ${where}.\n\n` +
       "They stay available to this conversation's embedded browser tabs, including any the " +
-      "agent controls, until you quit Omnigent.",
+      "agent controls, until you quit Omnigent. With the shared browser profile on, every " +
+      "conversation's tabs get them and they are kept across restarts.",
   };
 }
 

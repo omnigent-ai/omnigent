@@ -234,5 +234,20 @@ describe("sessionWorkspaceState", () => {
     expect(readSessionWorkspaceState("conv_c")).toEqual({
       openSubagentTabs: ["subagent:a", "subagent:b"],
     });
+
+    // Saved browser pages keep only http(s) URLs with string titles.
+    const browserTabPages = {
+      a: { url: "https://docs.example/", title: "Docs" },
+      b: { url: "javascript:alert(1)" },
+      c: { url: "https://x.example/", title: 7 },
+      d: "https://not-an-object.example/",
+    };
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([{ id: "conv_d", state: { browserTabPages } }]),
+    );
+    expect(readSessionWorkspaceState("conv_d")).toEqual({
+      browserTabPages: { a: { url: "https://docs.example/", title: "Docs" } },
+    });
   });
 });

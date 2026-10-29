@@ -494,6 +494,12 @@ sequenceDiagram
     S-->>A: result JSON (or clean timeout)
 ```
 
+By default each conversation's browser tabs get their own in-memory profile.
+Set `"browser_shared_profile": true` in `settings.json` to put every
+conversation's tabs, the agent's included, on one persistent profile instead,
+so sign-ins carry across conversations and restarts. Open tabs reopen their
+last page after a relaunch either way.
+
 ### Manual previews with Companion
 
 To preview an app running on a remote development host (such as Arca), use

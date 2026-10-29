@@ -29,7 +29,11 @@ const assert = require("node:assert/strict");
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
 
-const { createBrowserViewRegistry, agentPartition } = require("../src/browserViewRegistry");
+const {
+  createBrowserViewRegistry,
+  agentPartition,
+  SHARED_PROFILE_PARTITION,
+} = require("../src/browserViewRegistry");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
 /**
@@ -42,7 +46,7 @@ const { createBrowserViewBoundsController } = require("../src/browserViewBounds"
  * also use `openOrNavigate` which embeds the conversationId so we can confirm
  * isolation per-conversation directly.
  */
-function makePartitionCapturingRegistry() {
+function makePartitionCapturingRegistry(options = {}) {
   // capturedPrefs: conversationId -> webPreferences passed at construction time.
   // Because the registry has no "which conversationId am I creating for?" arg
   // to the ctor, we correlate via call order: the Nth call to ctor corresponds
@@ -70,6 +74,7 @@ function makePartitionCapturingRegistry() {
     detachFromHost() {},
     sendToRenderer() {},
     getHostZoomFactor: () => 1,
+    ...options,
   });
 
   return { registry, createdPrefs };
@@ -171,6 +176,18 @@ describe("browserViewRegistry — storage partition isolation", () => {
 });
 
 describe("browserViewRegistry — partition storage placement", () => {
+  it("puts every conversation and window on one persistent profile when it is shared", () => {
+    const sharedProfile = () => true;
+    const one = makePartitionCapturingRegistry({ sharedProfile });
+    const two = makePartitionCapturingRegistry({ sharedProfile });
+    one.registry.openOrNavigate("conv_A", "https://example.com/");
+    one.registry.openOrNavigate("browser-tab:conv_B:t", "https://example.com/");
+    two.registry.openOrNavigate("conv_A", "https://example.com/");
+    const partitions = [...one.createdPrefs, ...two.createdPrefs].map((prefs) => prefs.partition);
+    assert.deepEqual(partitions, Array(3).fill(SHARED_PROFILE_PARTITION));
+    assert.ok(SHARED_PROFILE_PARTITION.startsWith("persist:"));
+  });
+
   it("uses an in-memory partition (no persist: prefix) so agent cookies stay off disk", () => {
     const { createdPrefs, registry } = makePartitionCapturingRegistry();
     registry.openOrNavigate("conv_A", "https://example.com/");

@@ -2682,6 +2682,49 @@ describe("browser permission wiring", () => {
   });
 });
 
+describe("shared browser profile", () => {
+  it("puts every window's views on one session and guards each view through its own window", async () => {
+    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+    try {
+      fs.writeFileSync(h.settingsPath, JSON.stringify({ browser_shared_profile: true }));
+      const installs = [];
+      const partitions = [];
+      const shared = {
+        setPermissionRequestHandler() {},
+        setPermissionCheckHandler() {},
+        webRequest: { onBeforeRequest: (_filter, fn) => installs.push(fn) },
+        resolveHost: async () => ({ endpoints: [{ address: "127.0.0.1", family: "ipv4" }] }),
+        resolveProxy: async () => "DIRECT",
+      };
+      shared.webRequest.onBeforeSendHeaders = () => {};
+      shared.webRequest.onHeadersReceived = () => {};
+      h.electron.session.fromPartition = () => shared;
+      let nextId = 1;
+      h.electron.createWebContentsView = (opts) => {
+        partitions.push(opts.webPreferences.partition);
+        const wc = Object.assign(new EventEmitter(), { id: nextId++, setWindowOpenHandler() {} });
+        wc.loadURL = () => {};
+        return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+      };
+      const first = h.api.createBrowserRegistryForWindow(h.win);
+      const second = h.api.createBrowserRegistryForWindow(h.win);
+      first.openOrNavigate("conv-a", "https://example.com/", undefined, { agent: true });
+      const view = second.openOrNavigate("conv-b", "https://example.com/", undefined, {
+        agent: true,
+      }).entry.view.webContents;
+
+      assert.deepEqual(partitions, ["persist:omnigent-browser", "persist:omnigent-browser"]);
+      assert.equal(installs.length, 1, "a shared session is hooked once");
+      const cancel = await new Promise((resolve) => {
+        installs[0]({ webContentsId: view.id, url: "http://lvh.me:8899/" }, resolve);
+      });
+      assert.deepEqual(JSON.parse(JSON.stringify(cancel)), { cancel: true });
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("setup clipboard IPC wiring", () => {
   it("exposes a narrow copy action through the setup bridge", () => {
     assert.match(

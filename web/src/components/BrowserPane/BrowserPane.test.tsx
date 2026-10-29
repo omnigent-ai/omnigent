@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { BrowserPane } from "./BrowserPane";
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
@@ -101,6 +102,32 @@ describe("BrowserPane cold-start (no view yet)", () => {
     );
     cleanup();
     expect(bridge.browserSetActive).toHaveBeenLastCalledWith(null);
+  });
+
+  it.each([
+    [{ ok: true }, null],
+    [{ ok: false, error: "Blocked." }, "Blocked."],
+  ])("reopens a tab's saved page after a relaunch (%o)", async (navigation, error) => {
+    const viewId = "browser-tab:conv_a:two";
+    writeSessionWorkspaceState("conv_a", {
+      browserTabPages: { [viewId]: { url: "https://example.com/saved" } },
+    });
+    const bridge = installBridge({ browserOpenOrNavigate: vi.fn().mockResolvedValue(navigation) });
+    render(<BrowserPane conversationId={viewId} />);
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledWith(
+        viewId,
+        "https://example.com/saved",
+        undefined,
+        undefined,
+      ),
+    );
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+      "https://example.com/saved",
+    );
+    if (error) expect(await screen.findByRole("alert")).toHaveTextContent(error);
+    else expect(screen.queryByRole("alert")).toBeNull();
+    localStorage.clear();
   });
 
   it("reattaches the retained page without navigating when its rail is reopened", async () => {
