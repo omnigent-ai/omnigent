@@ -35,6 +35,9 @@ from omnigent.native.failure_telemetry import FailureContext
         "missing_native_session",
         "missing_error_text",
         "unmarked_retained_context",
+        "legacy_owner",
+        "invalid_owner",
+        "foreign_owner",
         "no_response_placeholder",
     ],
 )
@@ -119,6 +122,7 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
             retry_tracker=forwarder._PostRetryTracker(),
             dedupe=forwarder._ForwardDedupeState(),
         )
+        failed_response_id = transcript_state.current_response_id
         if scenario in {"recovered_turn", "failed_item_after_error", "later_turn"}:
             role = "user" if scenario == "later_turn" else "assistant"
             with transcript_path.open("a") as transcript:
@@ -169,6 +173,15 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
             forwarder._write_forward_state(
                 bridge_dir, replace(transcript_state, api_error_context=retained)
             )
+        if scenario in {"legacy_owner", "invalid_owner", "foreign_owner"}:
+            checkpoint = bridge_dir / forwarder._FORWARDER_STATE_FILE
+            raw = json.loads(checkpoint.read_text())
+            raw.pop("api_error_response_id", None)
+            if scenario != "legacy_owner":
+                raw["api_error_response_id"] = (
+                    True if scenario == "invalid_owner" else "resp_foreign"
+                )
+            checkpoint.write_text(json.dumps(raw))
         checkpoint_reads: list[Path] = []
         read_forward_state = forwarder._read_forward_state
 
@@ -206,6 +219,7 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         "missing_forward_state": "forward_state_unavailable",
         "malformed_forward_state": "forward_state_unavailable",
         "different_response": "response_mismatch",
+        "foreign_owner": "response_mismatch",
         "unknown_response": "response_mismatch",
         "foreign_session": "native_session_mismatch",
         "subagent_error": "subagent_context",
@@ -222,11 +236,20 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         + (1 if failures[-1].get("response_id") is not None else 0)
     )
     assert failure["status"] == "failed"
-    assert failure.get("response_id") == response_id
+    assert failure.get("response_id") == (
+        failed_response_id if scenario == "later_turn" else response_id
+    )
     assert context["failure_source"] == "claude_hook"
     assert context["native_error_category"] == "authentication_failed"
     # A later prompt without output leaves the hook to end the failed turn.
-    if scenario in {"current_error", "multiple_error_blocks", "failed_error_item", "later_turn"}:
+    if scenario in {
+        "current_error",
+        "multiple_error_blocks",
+        "failed_error_item",
+        "later_turn",
+        "legacy_owner",
+        "invalid_owner",
+    }:
         assert failure["failure_detail"].startswith(error_text + "\n\n")
         assert "omni setup" in failure["failure_detail"]
         assert context["detail_source"] == "explicit_api_error"
@@ -351,9 +374,11 @@ def _record_events(
 
 @pytest.mark.parametrize("next_turn", ["task_notification", "queued_prompt"])
 @pytest.mark.parametrize("next_turn_poll", ["same_poll", "next_poll"])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("second_failure_poll", ["immediate", "quiet", "restart"])
 @pytest.mark.asyncio
 async def test_api_error_survives_next_turn_opening_before_stop_failure(
-    tmp_path: Path, next_turn: str, next_turn_poll: str
+    tmp_path: Path, next_turn: str, next_turn_poll: str, restart: bool, second_failure_poll: str
 ) -> None:
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -398,12 +423,42 @@ async def test_api_error_survives_next_turn_opening_before_stop_failure(
             state = await _poll_transcript(client, bridge_dir, state, dedupe)
             _append_transcript(transcript_path, _NEXT_TURN_RECORDS[next_turn])
         state = await _poll_transcript(client, bridge_dir, state, dedupe)
-        # The next turn has opened, so the transcript no longer names the failed one.
-        assert state.current_response_id != failed_response_id
+        # A queued prompt clears the active ID until Claude produces new output.
+        assert state.current_response_id is None
+        assert state.api_error_response_id == failed_response_id
+        if restart:
+            state = forwarder._read_forward_state(bridge_dir)
+            assert state is not None
+            dedupe = forwarder._ForwardDedupeState()
+        bridge.record_hook_event(bridge_dir, _MAIN_STOP_FAILURE)
+        hooks = await _poll_hooks(client, bridge_dir, hooks, dedupe, state.current_response_id)
+        assert dedupe.pending_settled_response_id == failed_response_id
+
+        # The next prompt can fail before producing its own transcript error.
+        if second_failure_poll != "immediate":
+            state = await _poll_transcript(client, bridge_dir, state, dedupe)
+        if second_failure_poll == "restart":
+            state = forwarder._read_forward_state(bridge_dir)
+            assert state is not None
+            dedupe = forwarder._ForwardDedupeState()
+        bridge.record_hook_event(bridge_dir, {**_MAIN_STOP_FAILURE, "error": "server_error"})
+        hooks = await _poll_hooks(client, bridge_dir, hooks, dedupe, state.current_response_id)
+        second_failure = failures[-1]
+        assert second_failure.get("response_id") is None
+        assert "Synthetic spend limit reached" not in second_failure["failure_detail"]
+        assert second_failure["failure_context"].get("native_record_id") is None
+
+        # Later native errors must still fail their own turn after the old settle.
+        _append_transcript(transcript_path, {**_MAIN_API_ERROR, "uuid": "next-error"})
+        state = await _poll_transcript(client, bridge_dir, state, dedupe)
+        assert state.api_error_response_id != failed_response_id
         bridge.record_hook_event(bridge_dir, _MAIN_STOP_FAILURE)
         await _poll_hooks(client, bridge_dir, hooks, dedupe, state.current_response_id)
 
-    (failure,) = failures
+    failure, _second_failure, later_failure = failures
+    assert failure["response_id"] == failed_response_id
+    assert later_failure["response_id"] == state.api_error_response_id
+    assert later_failure["failure_context"]["native_record_id"] == "next-error"
     assert failure["failure_detail"] == "Synthetic spend limit reached"
     context = failure["failure_context"]
     assert context["detail_source"] == "explicit_api_error"

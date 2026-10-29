@@ -791,9 +791,10 @@ class TranscriptForwardState:
         waits for transcript quiescence). Persisted so a restart inside
         that window doesn't lose the settle — the hook cursor has
         already advanced past the Stop edge and won't re-read it.
-    :param api_error_context: Latest explicit API error for the current response, kept
-        while the next turn has no output yet. Cleared by subsequent output and
-        persisted for hook retries after restart.
+    :param api_error_context: Latest explicit API error, kept while the next turn
+        has no output yet. Cleared by subsequent output and persisted for retries.
+    :param api_error_response_id: Response that produced the retained API error.
+        A queued prompt can clear ``current_response_id`` before its hook posts.
     """
 
     transcript_path: Path
@@ -805,6 +806,7 @@ class TranscriptForwardState:
     settled_response_id: str | None = None
     pending_settled_response_id: str | None = None
     api_error_context: FailureContext | None = None
+    api_error_response_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3783,29 +3785,40 @@ def _stop_failure_detail(
 
 
 def _transcript_api_error_for_hook(
-    bridge_dir: Path, record: ClaudeHookRecord, response_id: str | None
-) -> tuple[FailureContext | None, str]:
+    bridge_dir: Path,
+    record: ClaudeHookRecord,
+    response_id: str | None,
+    ended_response_ids: Collection[str | None] = (),
+) -> tuple[FailureContext | None, str, str | None]:
     """Match retained API-error evidence, explaining why it cannot be reused."""
     if not record.claude_session_id:
-        return None, "native_session_unavailable"
+        return None, "native_session_unavailable", None
     state = _read_forward_state(bridge_dir)
     if state is None:
-        return None, "forward_state_unavailable"
+        return None, "forward_state_unavailable", None
     # ``None`` on both sides is between turns: evidence kept then is the ended turn's.
     if state.current_response_id != response_id:
-        return None, "response_mismatch"
+        return None, "response_mismatch", None
     context = state.api_error_context
     if not context:
-        return None, "no_api_error_context"
+        return None, "no_api_error_context", None
     if context.get("native_api_error_message") is not True:
-        return None, "unmarked_error_context"
+        return None, "unmarked_error_context", None
     if context.get("native_session_id") != record.claude_session_id:
-        return None, "native_session_mismatch"
+        return None, "native_session_mismatch", None
     if context.get("native_agent_role") == "subagent" or context.get("native_agent_id"):
-        return None, "subagent_context"
+        return None, "subagent_context", None
     if not isinstance(context.get("native_error_message"), str):
-        return None, "error_text_unavailable"
-    return context, "matched"
+        return None, "error_text_unavailable", None
+    owner = state.api_error_response_id
+    if owner is not None and (
+        owner in ended_response_ids
+        or owner in (state.pending_settled_response_id, state.settled_response_id)
+    ):
+        return None, "response_already_settled", None
+    if owner is not None and response_id is not None and owner != response_id:
+        return None, "response_mismatch", None
+    return context, "matched", owner
 
 
 def _is_subagent_hook_record(
@@ -4616,14 +4629,25 @@ async def _forward_available_status_events(
             return durable
         failure_context: FailureContext | None = None
         transcript_context: FailureContext | None = None
+        status_response_id = response_id
         if status == "failed":
             failure_context_phase = "transcript_lookup"
             try:
                 transcript_context_state = "hook_details_present"
                 if record.failure_message is None:
-                    transcript_context, transcript_context_state = await asyncio.to_thread(
-                        _transcript_api_error_for_hook, bridge_dir, record, response_id
+                    (
+                        transcript_context,
+                        transcript_context_state,
+                        error_response_id,
+                    ) = await asyncio.to_thread(
+                        _transcript_api_error_for_hook,
+                        bridge_dir,
+                        record,
+                        response_id,
+                        (dedupe.pending_settled_response_id, dedupe.settled_response_id),
                     )
+                    if error_response_id is not None:
+                        status_response_id = error_response_id
                 failure_context_phase = "context_assembly"
                 failure_context = _stop_failure_context(
                     record,
@@ -4666,7 +4690,7 @@ async def _forward_available_status_events(
                 client,
                 session_id=session_id,
                 status=status,
-                response_id=response_id,
+                response_id=status_response_id,
                 # The ``Stop`` hook fires exactly once per finished turn and
                 # never on an interrupt, so its ``idle`` edge is a confirmed
                 # turn completion, unlike quiescence-derived idles.
@@ -4712,7 +4736,7 @@ async def _forward_available_status_events(
                         reason=f"hook status {status} rejected",
                         source_id=retry_key,
                         http_error=exc,
-                        response_id=response_id,
+                        response_id=status_response_id,
                     )
                 durable = next_durable
                 await _write_hook_state_async(bridge_dir, durable)
@@ -4733,11 +4757,11 @@ async def _forward_available_status_events(
             )
             return durable
         retry_tracker.clear(retry_key)
-        if response_id is not None:
+        if status_response_id is not None:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
             # wake (see _promote_pending_settle and the bridge parser).
-            dedupe.pending_settled_response_id = response_id
+            dedupe.pending_settled_response_id = status_response_id
         durable = next_durable
         await _write_hook_state_async(
             bridge_dir, durable, pending_settled_response_id=dedupe.pending_settled_response_id
@@ -5188,7 +5212,7 @@ async def _forward_available_items(
         state
         if state.current_response_id == current_response_id
         or (current_response_id is None and state.current_response_id not in ended_response_ids)
-        else replace(state, api_error_context=None)
+        else replace(state, api_error_context=None, api_error_response_id=None)
     )
     if updated != state:
         await _write_forward_state_async(bridge_dir, updated)
@@ -5215,6 +5239,7 @@ async def _forward_available_items(
                 updated = replace(
                     updated,
                     api_error_context=context or None,
+                    api_error_response_id=item.response_id if context else None,
                     # An error needs its response ID for hooks even if the POST fails.
                     # Ordinary output must not advance it before a wake marker lands.
                     current_response_id=item.response_id
@@ -7910,6 +7935,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
     line_cursor = raw.get("line_cursor")
     byte_offset = raw.get("byte_offset")
     current_response_id = raw.get("current_response_id")
+    api_error_response_id = raw.get("api_error_response_id")
     settled_response_id = raw.get("settled_response_id")
     pending_settled_response_id = raw.get("pending_settled_response_id")
     cursor_fingerprint = raw.get("cursor_fingerprint")
@@ -7922,6 +7948,8 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         return None
     if current_response_id is not None and not isinstance(current_response_id, str):
         return None
+    if not isinstance(api_error_response_id, str) or not api_error_response_id:
+        api_error_response_id = None
     if settled_response_id is not None and not isinstance(settled_response_id, str):
         settled_response_id = None
     if pending_settled_response_id is not None and not isinstance(
@@ -7944,6 +7972,7 @@ def _read_forward_state(bridge_dir: Path) -> TranscriptForwardState | None:
         settled_response_id=settled_response_id,
         pending_settled_response_id=pending_settled_response_id,
         api_error_context=normalize_failure_context(raw.get("api_error_context")) or None,
+        api_error_response_id=api_error_response_id,
     )
 
 
@@ -7971,6 +8000,8 @@ def _write_forward_state(bridge_dir: Path, state: TranscriptForwardState) -> Non
         payload["cursor_fingerprint"] = state.cursor_fingerprint
     if state.api_error_context is not None:
         payload["api_error_context"] = normalize_failure_context(state.api_error_context)
+        if state.api_error_response_id is not None:
+            payload["api_error_response_id"] = state.api_error_response_id
     _write_json_atomic(bridge_dir / _FORWARDER_STATE_FILE, payload)
 
 
