@@ -150,7 +150,8 @@ def test_gateway_claude_version_remediation_uses_existing_installation_method() 
     "probe_output",
     [
         "'Databricks CLI v1.22.1'",
-        "\"<error reading version: Command '['databricks', '--version']' timed out after 10\nseconds>\"",
+        "\"<error reading version: Command '['databricks', '--version']' timed out "
+        'after 10\nseconds>"',
     ],
 )
 def test_classifies_gateway_databricks_cli_version_failure(probe_output: str) -> None:
