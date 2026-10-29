@@ -110,7 +110,7 @@ def test_resolve_databricks_codex_model_catalog_miss_keeps_discovery(
 ) -> None:
     from types import SimpleNamespace
 
-    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+    from omnigent.harnesses.codex_native.databricks import resolve_model
     from omnigent.models import model_catalog_store
 
     path = model_catalog_store.catalog_path("codex-native", _databricks_catalog)
@@ -137,9 +137,7 @@ def test_resolve_databricks_codex_model_catalog_miss_keeps_discovery(
     )
 
     assert (
-        _resolve_databricks_codex_model(
-            "https://h.example.com", "prof", requested, codex_path=sys.executable
-        )
+        resolve_model("https://h.example.com", "prof", requested, codex_path=sys.executable)
         == expected
     )
     credentials.assert_called_once_with("prof")
@@ -155,7 +153,7 @@ def test_resolve_databricks_codex_model_does_not_reuse_other_catalog(
 ) -> None:
     from types import SimpleNamespace
 
-    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+    from omnigent.harnesses.codex_native.databricks import resolve_model
 
     profile = "other" if changed == "profile" else "prof"
     host = (
@@ -176,9 +174,7 @@ def test_resolve_databricks_codex_model_does_not_reuse_other_catalog(
     )
 
     assert (
-        _resolve_databricks_codex_model(
-            host, profile, "databricks-gpt-1-2-test", codex_path=codex_path
-        )
+        resolve_model(host, profile, "databricks-gpt-1-2-test", codex_path=codex_path)
         == "system.ai.gpt-1-2-test"
     )
     discovery.assert_called_once_with(host, "tok")
@@ -197,7 +193,7 @@ def test_resolve_databricks_codex_model_matches_servable_ids(
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+    from omnigent.harnesses.codex_native.databricks import resolve_model
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
@@ -212,18 +208,13 @@ def test_resolve_databricks_codex_model_matches_servable_ids(
             return_value=servable,
         ),
     ):
+        assert resolve_model("https://h.example.com", "prof", None) == "system.ai.gpt-5-6-sol"
         assert (
-            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
-            == "system.ai.gpt-5-6-sol"
-        )
-        assert (
-            _resolve_databricks_codex_model(
-                "https://h.example.com", "prof", "databricks-gpt-5-6-luna"
-            )
+            resolve_model("https://h.example.com", "prof", "databricks-gpt-5-6-luna")
             == "system.ai.gpt-5-6-luna"
         )
         assert (
-            _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-9-9")
+            resolve_model("https://h.example.com", "prof", "databricks-gpt-9-9")
             == "databricks-gpt-9-9"
         )
 
@@ -237,7 +228,7 @@ def test_resolve_databricks_codex_model_discovery_failure_warns_without_tracebac
     import logging
     from unittest.mock import patch
 
-    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+    from omnigent.harnesses.codex_native.databricks import resolve_model
 
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
@@ -254,11 +245,9 @@ def test_resolve_databricks_codex_model_discovery_failure_warns_without_tracebac
             side_effect=_raise,
         ),
         patch("omnigent.onboarding.ucode_state.read_ucode_state", return_value=None),
-        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.app_server"),
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.databricks"),
     ):
-        resolved = _resolve_databricks_codex_model(
-            "https://h.example.com", "prof", "databricks-gpt-9-9"
-        )
+        resolved = resolve_model("https://h.example.com", "prof", "databricks-gpt-9-9")
 
     assert resolved == "databricks-gpt-9-9"
     warning = next(

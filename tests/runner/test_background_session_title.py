@@ -832,7 +832,7 @@ async def test_codex_native_title_keeps_loop_responsive_during_profile_resolutio
     )
     monkeypatch.setattr("omnigent.harnesses.codex_native.app_server._clean_codex_env", dict)
     monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server._databricks_gateway_host", resolve_host
+        "omnigent.inner.databricks_executor._databricks_gateway_host", resolve_host
     )
     monkeypatch.setattr(
         "omnigent.inner.codex_executor._codex_home_config_source_from_env",

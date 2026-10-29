@@ -454,7 +454,9 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
     monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
-    monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._databricks_gateway_host", resolve_host
+    )
     monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", resolve_launch)
 
     task = asyncio.create_task(

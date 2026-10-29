@@ -26,7 +26,6 @@ from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
-from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -84,9 +83,6 @@ from omnigent.inner.codex_executor import (
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
-    _databricks_codex_auth_command,
-    _databricks_codex_base_url,
-    _databricks_codex_config_overrides,
     _find_codex_cli,
     _populate_codex_home_config,
     _provider_codex_config_overrides,
@@ -100,11 +96,7 @@ from omnigent.inner.codex_executor import (
     read_codex_model_catalog,
     write_codex_hooks_file,
 )
-from omnigent.inner.databricks_executor import (
-    _databricks_gateway_host,
-    _read_databrickscfg_host,
-)
-from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
+from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.process_logging import (
     harness_stderr_capture_enabled,
     log_info_once,
@@ -1835,8 +1827,10 @@ async def probe_codex_model_options(
     pinned_model = launch.model
     env = _clean_codex_env()
     if launch.profile is not None:
+        from omnigent.harnesses.codex_native.databricks import materialize_launch
+
         databricks = await asyncio.to_thread(
-            _databricks_launch_materialization,
+            materialize_launch,
             model=launch.model,
             profile=launch.profile,
             codex_path=resolved_codex,
@@ -1917,7 +1911,11 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     """
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
 
-    profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
+    profile_host = None
+    if launch.profile is not None:
+        from omnigent.harnesses.codex_native.databricks import profile_host as read_profile_host
+
+        profile_host = read_profile_host(launch.profile)
     return fingerprint_of(
         "codex-native",
         "isolated-picker-v4",
@@ -3433,214 +3431,6 @@ def _add_codex_writable_roots(codex_home: Path, roots: Sequence[str]) -> None:
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
-@dataclass(frozen=True)
-class _DatabricksLaunchMaterialization:
-    """
-    The Databricks-profile pieces of a Codex launch, shared by the real
-    app-server build and the model-options probe so the two cannot drift.
-
-    :param config_overrides: ``-c`` overrides routing Codex through the
-        profile's Unity Gateway (provider block + auth command + model pin).
-    :param model: The model the overrides pin, e.g. ``"databricks-gpt-5-4"``
-        — the explicit *model* when given, else the catalog default.
-    :param host: The profile's workspace origin for ``DATABRICKS_HOST``.
-    """
-
-    config_overrides: list[str]
-    model: str
-    host: str
-
-
-class CodexDatabricksProfileMissingError(OmnigentError, OSError):
-    """The provider config names a Databricks profile the runner cannot resolve.
-
-    Coded ``HARNESS_NOT_CONFIGURED``: only the person can fix the profile, and
-    the message says how, so a terminal start failure shows it verbatim.
-    Subclasses :class:`OSError`, the documented error of this launch step.
-    """
-
-    def __init__(self, profile: str) -> None:
-        """
-        :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
-        """
-        super().__init__(
-            f"Native Codex with Databricks profile {profile!r} (from your "
-            "provider config) requires a matching ~/.databrickscfg section "
-            "with a host visible to the runner process. Add it with "
-            f"`databricks auth login --profile {profile}`, or point the provider "
-            "at an existing profile.",
-            code=ErrorCode.HARNESS_NOT_CONFIGURED,
-        )
-
-
-def _databricks_launch_materialization(
-    *, model: str | None, profile: str, codex_path: str | None = None
-) -> _DatabricksLaunchMaterialization:
-    """
-    Resolve the Databricks-profile routing pieces of a Codex launch.
-
-    Uses the profile's own host, so a ``DATABRICKS_HOST`` override in the
-    runner env must not point the launch at another workspace. The gateway
-    and auth come from ucode state for that host when present (see
-    :func:`_databricks_codex_gateway`). Model discovery still uses the
-    profile's credentials; ucode state is keyed by the same host, so both
-    see that workspace's catalog.
-
-    :param model: Optional explicit model pin; ``None`` resolves the
-        catalog default.
-    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
-    :param codex_path: Executable whose shared catalog may resolve the model.
-    :returns: The materialized overrides, pinned model, and host.
-    :raises CodexDatabricksProfileMissingError: When the profile resolves no
-        workspace host.
-    """
-    host = _databricks_gateway_host(profile)
-    if not host:
-        raise CodexDatabricksProfileMissingError(profile)
-    host = host.rstrip("/")
-    resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
-    base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
-        host, profile
-    )
-    return _DatabricksLaunchMaterialization(
-        config_overrides=_databricks_codex_config_overrides(
-            model=resolved_model,
-            base_url=base_url,
-            auth_command=auth_command,
-            auth_refresh_interval_ms=auth_refresh_interval_ms,
-            auth_config=auth_config,
-        ),
-        model=resolved_model,
-        host=host,
-    )
-
-
-def _databricks_codex_gateway(
-    host: str, profile: str
-) -> tuple[str, str, int | None, dict[str, object] | None]:
-    """
-    Return the Codex gateway URL, shell helper, cadence and structured auth for *host*.
-
-    ucode state is the source of truth for the gateway and auth; the
-    profile-derived gateway is the fallback.
-
-    :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
-    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
-    :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
-        an auth command, else the profile-derived gateway with default auth settings.
-    """
-    from omnigent.onboarding.ucode_state import read_ucode_state
-
-    try:
-        workspace_state = read_ucode_state(host)
-    except (OSError, ValueError):  # unreadable ucode state keeps the profile path
-        # Host logging mirrors WARNINGs to the terminal; frames are debug-only.
-        _logger.warning(
-            "native-codex: could not read ucode state for %r",
-            host,
-            exc_info=_logger.isEnabledFor(logging.DEBUG),
-        )
-        workspace_state = None
-    agent = workspace_state.agent("codex") if workspace_state is not None else None
-    if agent is not None and agent.base_url and agent.auth_command:
-        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms, agent.auth
-    return (
-        _databricks_codex_base_url(host),
-        _databricks_codex_auth_command(host, profile),
-        None,
-        None,
-    )
-
-
-# DATABRICKS-PATCH(codex-live-model-discovery)
-def _resolve_databricks_codex_model(
-    host: str, profile: str, requested: str | None, *, codex_path: str | None = None
-) -> str:
-    """Resolve the codex launch model against what the workspace serves.
-
-    Codex used to take its model from the bundled MLflow catalog — a
-    third-party listing whose Databricks ids carry the legacy
-    ``databricks-`` spelling the gateway now answers with ``501
-    NOT_IMPLEMENTED ... Use Unity Catalog model services (v3)`` — so a launch
-    could pin a model the workspace will not serve. Resolve from the workspace
-    instead, as claude-native already does: the live Unity Catalog listing,
-    then ucode's cached copy of it, then the bundled catalog as the documented
-    last resort.
-
-    An explicit model first reuses its fresh shared Codex catalog row's model
-    for the same profile, workspace and executable. A miss keeps discovery.
-    The explicit model is matched against the servable ids, so a legacy
-    ``model_override`` persisted before this change still launches; one the
-    workspace does not serve passes through untouched, because the gateway's
-    error beats a silent substitution.
-
-    :param host: Workspace origin, e.g. ``"https://example.com"``.
-    :param profile: Databricks CLI profile backing the launch.
-    :param requested: Explicit model id, or ``None`` to take the newest
-        servable one.
-    :param codex_path: Executable whose shared catalog may resolve the model.
-    :returns: The model id to pin on the codex launch.
-    """
-    from omnigent.models import model_catalog_store
-    from omnigent.models.databricks_model_discovery import (
-        discover_databricks_codex_models,
-        select_servable_model,
-    )
-
-    if requested:
-        profile_host = _read_databrickscfg_host(profile)
-        if profile_host and profile_host.rstrip("/") == host.rstrip("/"):
-            fingerprint = codex_catalog_fingerprint(
-                NativeCodexLaunch([], None, profile), codex_path=codex_path
-            )
-            rows = model_catalog_store.read_catalog("codex-native", fingerprint)
-            if rows and not model_catalog_store.catalog_is_stale("codex-native", fingerprint):
-                slug = codex_reachable_model_slug(requested, rows)
-                model = next((row.get("model") for row in rows if row.get("id") == slug), None)
-                if isinstance(model, str) and model.strip():
-                    return model.strip()
-
-    servable: tuple[str, ...] = ()
-    try:
-        from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
-
-        creds = resolve_databricks_workspace(profile)
-        # Discover against the host the launch actually posts to. This resolver
-        # honors ``DATABRICKS_HOST`` while the launch host comes from the
-        # profile section alone (``_databricks_gateway_host``), so using
-        # ``creds.host`` here can pin a model discovered on workspace A onto a
-        # launch targeting workspace B. A token that does not match ``host``
-        # simply fails the listing and drops to the ucode-state fallback below,
-        # which is already keyed by ``host``.
-        servable = discover_databricks_codex_models(host, creds.token)
-    except Exception as exc:  # cached ucode state is the launch fallback
-        # Recoverable fallback; frames are debug-only so a TTY-mirrored
-        # host console stays concise.
-        _logger.warning(
-            "native-codex: live Databricks model discovery failed for profile %r; "
-            "falling back to ucode state (%s)",
-            profile,
-            exc,
-            exc_info=_logger.isEnabledFor(logging.DEBUG),
-        )
-        try:
-            from omnigent.onboarding.ucode_state import read_ucode_state
-
-            workspace_state = read_ucode_state(host)
-            if workspace_state is not None:
-                servable = tuple(workspace_state.codex_models)
-        except Exception:  # the bundled catalog is the last resort
-            _logger.warning(
-                "native-codex: could not read ucode state for %r", profile, exc_info=True
-            )
-
-    if requested:
-        return select_servable_model(requested, servable) or requested
-    if servable:
-        return servable[0]
-    return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
-
-
 def build_codex_native_server(
     *,
     socket_path: Path,
@@ -3739,9 +3529,9 @@ def build_codex_native_server(
     config_overrides: list[str] = []
     pinned_model = model
     if profile is not None:
-        databricks = _databricks_launch_materialization(
-            model=model, profile=profile, codex_path=resolved_codex
-        )
+        from omnigent.harnesses.codex_native.databricks import materialize_launch
+
+        databricks = materialize_launch(model=model, profile=profile, codex_path=resolved_codex)
         config_overrides.extend(databricks.config_overrides)
         env["DATABRICKS_HOST"] = databricks.host
         # A launch that names no model still routes through the profile's
@@ -3863,7 +3653,7 @@ def codex_session_meta_model_provider(launch: NativeCodexLaunch) -> str:
       basic string, which is also valid JSON;
     - a Databricks profile launch carries no override here; the provider
       table is generated at app-server start under the fixed
-      ``omnigent_databricks`` id (see ``_databricks_codex_config_overrides``);
+      ``omnigent_databricks`` id;
     - otherwise the launch defers to Codex's own login, the built-in
       ``openai`` provider.
 
@@ -3888,7 +3678,7 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
 
     Mirrors how the launch is actually applied: the Databricks-profile branch of
     :func:`build_native_codex_app` takes the base URL from ucode state for the
-    profile host, else derives it from that host (:func:`_databricks_codex_gateway`),
+    profile host, else derives it from that host, through the Databricks adapter,
     while a generic provider carries it inside the generated
     ``model_providers.…`` config override.
 
@@ -3900,10 +3690,9 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     # Profiles are pins too, but must resolve through their Databricks host
     # before the generic provider-name path below.
     if launch.profile is not None:
-        host = _databricks_gateway_host(launch.profile)
-        if not host:
-            return None
-        return _databricks_codex_gateway(host.rstrip("/"), launch.profile)[0]
+        from omnigent.harnesses.codex_native.databricks import profile_base_url
+
+        return profile_base_url(launch.profile)
     for override in launch.config_overrides:
         _, sep, table = override.partition("=")
         if not sep or not override.startswith("model_providers."):
@@ -4448,41 +4237,12 @@ def resolve_native_codex_launch(
             summary=f"Codex config.toml provider {provider_id!r} (ambient fallback)",
         )
 
-    from omnigent.host.databricks_credential import api_key_auth_precludes_broker
+    if entry is None:
+        from omnigent.harnesses.codex_native.databricks import managed_broker_launch
 
-    if entry is None and not api_key_auth_precludes_broker(spec):
-        # Use the managed host's Databricks broker only when no provider or
-        # explicit API-key auth selected a route. Host boot populated ucode
-        # state so the model resolves to a served id.
-        from omnigent.host.databricks_credential import (
-            HOST_DATABRICKS_PROFILE,
-            broker_token_command,
-        )
-        from omnigent.inner.databricks_executor import _read_databrickscfg_host
-
-        connect_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
-        if connect_host and broker_token_command(connect_host.rstrip("/")):
-            connect_host = connect_host.rstrip("/")
-            resolved_model = _resolve_databricks_codex_model(
-                connect_host, HOST_DATABRICKS_PROFILE, model
-            )
-            log_info_once(
-                _logger,
-                "native-codex routing: managed connect host — Databricks Unity Gateway "
-                "via the credential broker (host-only [omnigent] profile + sidecar).",
-            )
-            return NativeCodexLaunch(
-                config_overrides=_databricks_codex_config_overrides(
-                    model=resolved_model,
-                    base_url=_databricks_codex_base_url(connect_host),
-                    auth_command=_databricks_codex_auth_command(
-                        connect_host, HOST_DATABRICKS_PROFILE
-                    ),
-                ),
-                model=resolved_model,
-                profile=None,
-                summary="Databricks Unity Gateway (managed connect host, broker-minted)",
-            )
+        broker_launch = managed_broker_launch(model=model, spec=spec)
+        if broker_launch is not None:
+            return broker_launch
 
     if entry is None:
         try:

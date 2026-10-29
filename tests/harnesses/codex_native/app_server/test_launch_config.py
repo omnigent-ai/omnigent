@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shlex
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -20,15 +23,50 @@ except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native.app_server import (
-    CodexDatabricksProfileMissingError,
+    NativeCodexLaunch,
     build_codex_native_server,
+    codex_catalog_fingerprint,
     codex_terminal_env,
+)
+from omnigent.harnesses.codex_native.databricks import (
+    CodexDatabricksProfileMissingError,
+    DatabricksLaunchMaterialization,
 )
 from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
 )
+
+
+@pytest.mark.parametrize(
+    "overrides", [[], ['model_provider="openai"'], ['model_provider="custom"']]
+)
+def test_profile_free_codex_launch_without_ucode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, overrides: list[str]
+) -> None:
+    """CLI login and configured providers do not load the Databricks adapter or ucode."""
+    for module in (
+        "omnigent.harnesses.codex_native.databricks",
+        "omnigent.onboarding.ucode_state",
+        "omnigent.onboarding.ucode_setup",
+    ):
+        monkeypatch.setitem(sys.modules, module, None)
+
+    server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model="test-model",
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path=sys.executable,
+        extra_config_overrides=overrides,
+    )
+
+    assert server.pinned_model == "test-model"
+    assert all(override in server.config_overrides for override in overrides)
+    assert codex_catalog_fingerprint(NativeCodexLaunch(overrides, "test-model", None))
 
 
 def test_build_codex_native_server_profile_error_names_profile(
@@ -48,7 +86,7 @@ def test_build_codex_native_server_profile_error_names_profile(
         lambda: sys.executable,
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.codex_native.app_server._databricks_gateway_host",
+        "omnigent.inner.databricks_executor._databricks_gateway_host",
         lambda _profile: None,
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
@@ -227,6 +265,43 @@ def test_build_codex_native_server_defaults_cadence_without_one_in_ucode_state(
     assert "refresh_interval_ms=900000" in overrides
 
 
+@pytest.mark.parametrize("installed", [False, True])
+def test_ucode_auth_survives_removed_uv_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installed: bool
+) -> None:
+    """A regenerated launch uses a usable helper without changing its authority."""
+    expired = tmp_path / "uv" / "archive-v0" / "removed" / "bin" / "ucode"
+    helper = tmp_path / "current helper" / "ucode"
+    helper.parent.mkdir()
+    helper.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    helper.chmod(0o700)
+    argv = ["auth-token", "--host", _UCODE_HOST, "--profile", "profile with space", "--use-pat"]
+    command = shlex.join([str(expired), *argv])
+    from omnigent.onboarding.ucode_setup import _UCODE_UVX_SOURCE
+
+    prefix = [str(helper)] if installed else [str(helper), "--from", _UCODE_UVX_SOURCE, "ucode"]
+
+    def find_tool(name: str, path: str | None = None) -> str | None:
+        return str(helper) if name == ("ucode" if installed else "uvx") else None
+
+    monkeypatch.setattr("omnigent.onboarding.ucode_setup.shutil.which", find_tool)
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": command, "auth_refresh_interval_ms": 60000},
+    )
+    config = tomllib.loads(overrides)
+    provider = config["model_providers"]["omnigent_databricks"]
+    assert provider["base_url"] == _UCODE_BASE_URL
+    auth = provider["auth"]
+    assert auth["refresh_interval_ms"] == 60000
+    assert auth["command"] == "sh"
+    assert shlex.split(auth["args"][1]) == [*prefix, *argv]
+    completed = subprocess.run([auth["command"], *auth["args"]], capture_output=True, text=True)
+    assert completed.returncode == 0
+    assert completed.stdout.splitlines() == [*prefix[1:], *argv]
+
+
 def test_build_codex_native_server_preserves_structured_ucode_auth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -245,6 +320,69 @@ def test_build_codex_native_server_preserves_structured_ucode_auth(
     provider = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]
     assert provider["auth"] == auth
     assert provider["base_url"] == _UCODE_BASE_URL
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uv POSIX archive layout and shell helper")
+@pytest.mark.parametrize("fallback", ["installed", "uvx"])
+@pytest.mark.parametrize("launcher_name", ["ucode", "ug"])
+@pytest.mark.parametrize("auth_form", ["direct", "shell"])
+def test_build_codex_native_server_repairs_archived_ucode_auth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_form: str,
+    launcher_name: str,
+    fallback: str,
+) -> None:
+    """Codex's emitted auth helper works after the generated uv archive is removed."""
+    archived = tmp_path / "archive-v0" / "removed" / "bin" / launcher_name
+    launcher = tmp_path / (launcher_name if fallback == "installed" else "uvx")
+    launcher.write_text(
+        f"#!{sys.executable}\n# from ucode.cli import main\n"
+        "import sys\nprint('\\n'.join(sys.argv[1:]))\n"
+    )
+    launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    args = [
+        "auth-token",
+        "--host",
+        _UCODE_HOST,
+        "--profile",
+        'gateway "profile"',
+        "--browser-login",
+    ]
+    command = shlex.join([str(archived), *args])
+    auth = {
+        "command": str(archived) if auth_form == "direct" else "/bin/sh",
+        "args": args if auth_form == "direct" else ["-c", command],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 60000,
+    }
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": command, "auth": auth},
+    )
+    emitted_auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    from omnigent.onboarding.ucode_setup import _UCODE_UVX_SOURCE
+
+    prefix = [str(launcher)]
+    if fallback == "uvx":
+        prefix.extend(["--from", _UCODE_UVX_SOURCE, "ucode"])
+    assert emitted_auth == {
+        **auth,
+        "command": str(launcher) if auth_form == "direct" else "/bin/sh",
+        "args": [*prefix[1:], *args]
+        if auth_form == "direct"
+        else ["-c", shlex.join([*prefix, *args])],
+    }
+    result = subprocess.run(
+        [emitted_auth["command"], *emitted_auth["args"]],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    assert result.stdout.splitlines() == [*prefix[1:], *args]
 
 
 def test_build_codex_native_server_preserves_legacy_auth_timeout(
@@ -321,7 +459,7 @@ def test_build_codex_native_server_keeps_profile_path_when_ucode_state_is_unread
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
     monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", _unreadable)
-    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.codex_native.app_server"):
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.codex_native.databricks"):
         overrides = _ucode_codex_overrides(tmp_path, monkeypatch, None)
 
     assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
@@ -514,21 +652,17 @@ def test_build_codex_native_server_pins_profile_resolved_model(
     ``config.toml`` and every reader of it — including the web catalog's
     row ids — compare in.
     """
-    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.app_server._find_codex_cli",
         lambda: sys.executable,
     )
     monkeypatch.setattr(
-        codex_native_app_server,
-        "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
-                model=model or "databricks-gpt-5-4-mini",
-                host="https://ws.example",
-            )
+        "omnigent.harnesses.codex_native.databricks.materialize_launch",
+        lambda *, model, profile, codex_path: DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
+            model=model or "databricks-gpt-5-4-mini",
+            host="https://ws.example",
         ),
     )
 
@@ -579,7 +713,6 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     compare in) while argv carries the wire spelling; the guard asserts
     they name the same model, and byte-identity everywhere else.
     """
-    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models.codex_model_vocabulary import comparable_model_id
 
     monkeypatch.setattr(
@@ -587,14 +720,11 @@ def test_launch_argv_and_config_pin_name_the_same_model(
         lambda: sys.executable,
     )
     monkeypatch.setattr(
-        codex_native_app_server,
-        "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
-                model=model or "databricks-gpt-5-6-luna",
-                host="https://ws.example",
-            )
+        "omnigent.harnesses.codex_native.databricks.materialize_launch",
+        lambda *, model, profile, codex_path: DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
+            model=model or "databricks-gpt-5-6-luna",
+            host="https://ws.example",
         ),
     )
 

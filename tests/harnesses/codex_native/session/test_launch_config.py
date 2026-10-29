@@ -589,8 +589,7 @@ def test_resolve_native_codex_launch_connect_broker_managed_host(
         lambda host, *a, **k: "python3 -m omnigent.host.databricks_credential token --coords /x",
     )
     monkeypatch.setattr(
-        codex_native_app_server,
-        "_resolve_databricks_codex_model",
+        "omnigent.harnesses.codex_native.databricks.resolve_model",
         lambda host, profile, model: "system.ai.gpt-6-astra",
     )
 

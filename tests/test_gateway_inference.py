@@ -196,8 +196,7 @@ def test_codex_gateway_backed_for_databricks_profile(
     # A profile launch's base URL is read from ucode state first; keep it empty here.
     monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(
-        codex_native_app_server,
-        "_databricks_gateway_host",
+        "omnigent.inner.databricks_executor._databricks_gateway_host",
         lambda _profile: "https://example.cloud.databricks.com/",
     )
     _stub_codex(
@@ -242,7 +241,9 @@ def test_codex_not_gateway_backed_for_cli_login(
 def test_codex_not_gateway_backed_when_profile_has_no_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(codex_native_app_server, "_databricks_gateway_host", lambda _profile: None)
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._databricks_gateway_host", lambda _profile: None
+    )
     _stub_codex(
         monkeypatch,
         NativeCodexLaunch(config_overrides=[], model=None, profile="dev"),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -19,7 +20,7 @@ except ImportError:  # pragma: no cover - non-POSIX platforms have no flock
 import click
 
 from omnigent.onboarding.databricks_config import normalize_workspace_url
-from omnigent.onboarding.ucode_state import read_ucode_state
+from omnigent.onboarding.ucode_state import is_generated_ucode_auth_argv, read_ucode_state
 
 _logger = logging.getLogger(__name__)
 
@@ -35,6 +36,57 @@ _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
 # defeat a mutable branch's stale cache.
 _UCODE_GIT_REF = "304e4a29c5ca73b3bfaaf1911e38d0080833fda4"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
+
+
+def _refresh_ucode_auth_argv(argv: list[str]) -> list[str]:
+    """Resolve missing generated archive helpers using the pinned setup command."""
+    if not is_generated_ucode_auth_argv(argv):
+        return argv
+    executable = Path(argv[0])
+    if (
+        not executable.is_absolute()
+        or executable.name not in {"ucode", "ug"}
+        or executable.parent.name != "bin"
+        or executable.parent.parent.parent.name != "archive-v0"
+        or executable.exists()
+    ):
+        return argv
+    try:
+        prefix = find_ucode_command()
+    except click.ClickException:
+        return argv
+    return [*prefix, *argv[1:]]
+
+
+def refresh_ucode_auth_command(command: str) -> str:
+    """Replace a deleted uv archive helper while retaining its auth-token arguments."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    # Only the generated literal shell form is eligible, never a shell pipeline.
+    if shlex.join(argv) != command:
+        return command
+    repaired = _refresh_ucode_auth_argv(argv)
+    return shlex.join(repaired) if repaired != argv else command
+
+
+def refresh_ucode_auth_config(auth: dict[str, object]) -> dict[str, object]:
+    """Repair structured direct or shell auth without changing its other settings."""
+    command = auth.get("command")
+    args = auth.get("args")
+    if not (
+        isinstance(command, str)
+        and isinstance(args, list)
+        and all(isinstance(arg, str) for arg in args)
+    ):
+        return auth
+    if command in {"sh", "/bin/sh"} and len(args) == 2 and args[0] == "-c":
+        repaired_command = refresh_ucode_auth_command(args[1])
+        return {**auth, "args": ["-c", repaired_command]} if repaired_command != args[1] else auth
+    argv = [command, *args]
+    repaired = _refresh_ucode_auth_argv(argv)
+    return {**auth, "command": repaired[0], "args": repaired[1:]} if repaired != argv else auth
 
 
 def model_gateway_workspace_urls() -> list[str]:
