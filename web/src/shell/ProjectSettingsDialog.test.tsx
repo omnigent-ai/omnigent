@@ -4,7 +4,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { getProject, updateProjectConfig, createProject } from "@/lib/projectsApi";
-import { writeProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
+import {
+  readProjectLaunchDefaults,
+  writeProjectLaunchDefaults,
+} from "@/lib/projectLaunchPreferences";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
 vi.mock("@/lib/projectsApi", () => ({
@@ -707,5 +710,49 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() =>
       expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_1", host_id: "h1" }),
     );
+  });
+
+  it("saves a last-start agent still resolving with its own model and effort", async () => {
+    // Discovery so far holds only catalog rows, without the remembered agent.
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()], isPlaceholderData: true });
+    const stored = { agent_id: "ag_claude", model: "opus", effort: "low" };
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: stored });
+    writeProjectLaunchDefaults(
+      "p_1",
+      {
+        agentId: "ag_custom",
+        harness: "claude-native",
+        harnessOptions: { model: "sonnet", effort: "high" },
+      },
+      stored,
+    );
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_custom",
+        model: "sonnet",
+        effort: "high",
+      }),
+    );
+  });
+
+  it("leaves the last start in place when the filled-in dialog is cancelled", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    const launch = { agentId: "ag_1", hostId: "h1", workspace: "/repo-b" };
+    writeProjectLaunchDefaults("p_1", launch, {});
+    renderDialog();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-last-start")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-worktree"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(readProjectLaunchDefaults("p_1", {})).toEqual(launch);
   });
 });

@@ -204,9 +204,16 @@ export function ProjectSettingsDialog({
     // Guard against submitting a blank draft seeded from a failed load, which
     // the server would read as "clear the stored defaults".
     if (loadFailed) return;
-    // Preserve config keys owned by other dialogs, then replace only the fields
-    // this form edits.
-    const config: ProjectConfig = { ...(stored ?? {}) };
+    // A last-start agent that no longer exists saves as the stored agent, even
+    // before the fallback effect below has re-rendered the field.
+    const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
+    // Preserve keys owned by other dialogs and replace only this form's fields,
+    // starting from what the fields were filled in with when saving that agent,
+    // so an agent still resolving keeps its own model and effort (agentUnresolved).
+    const seeded = projectConfigWithLaunch(stored ?? {}, launch);
+    const config: ProjectConfig = {
+      ...(savedAgentId === (seeded.agent_id ?? null) ? seeded : (stored ?? {})),
+    };
     if (hostId !== NONE) config.host_id = hostId;
     else delete config.host_id;
     // A workspace is host-relative and only meaningful with a concrete host —
@@ -216,9 +223,6 @@ export function ProjectSettingsDialog({
       hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE ? trimOrUndef(workspace) : undefined;
     if (ws) config.workspace = ws;
     else delete config.workspace;
-    // A last-start agent that no longer exists saves as the stored agent, even
-    // before the fallback effect below has re-rendered the field.
-    const savedAgentId = launchAgentGone ? (stored?.agent_id ?? null) : agentId;
     if (savedAgentId) config.agent_id = savedAgentId;
     else delete config.agent_id;
     // Store the worktree choice only when it overrides the user-global default;

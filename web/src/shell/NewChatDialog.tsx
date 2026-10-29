@@ -2281,13 +2281,21 @@ export function NewChatLandingScreen() {
         : readProjectLaunchDefaults(configProjectId, storedProjectConfig ?? {}),
     [configProjectId, projectConfigLoading, storedProjectConfig],
   );
+  // Option keys picked per harness during this visit. A pick also updates the
+  // app-global memory, so those keys keep coming from there.
+  const pickedOptionKeysRef = useRef(new Map<string, Set<string>>());
   // The options the last start's harness launched with outrank the app-global
-  // per-harness memory for that harness.
+  // per-harness memory for that harness, except keys picked during this visit.
   const readRememberedHarnessOptions = useCallback(
-    (harness: string | null | undefined): HarnessOptions =>
-      harness != null && projectLaunch?.harness === harness
-        ? { ...readHarnessOptions(harness), ...projectLaunch.harnessOptions }
-        : readHarnessOptions(harness),
+    (harness: string | null | undefined): HarnessOptions => {
+      const remembered = readHarnessOptions(harness);
+      if (harness == null || projectLaunch?.harness !== harness) return remembered;
+      const picked = pickedOptionKeysRef.current.get(harness);
+      const launched = Object.entries(projectLaunch.harnessOptions ?? {}).filter(
+        ([key]) => !picked?.has(key),
+      );
+      return { ...remembered, ...Object.fromEntries(launched) };
+    },
     [projectLaunch],
   );
   // Normalize into the machine's shape. `undefined` = still loading (the machine
@@ -2981,6 +2989,7 @@ export function NewChatLandingScreen() {
     seededHostRef.current = null;
     worktreeSeededForRef.current = null;
     setPickerEdits(null);
+    pickedOptionKeysRef.current.clear();
     seededConfigSigRef.current = prefillConfigSig;
     setPrefill(initialPrefillState(projectParam));
   }, [projectParam, prefill.project, prefillConfigSig]);
@@ -3903,6 +3912,9 @@ export function NewChatLandingScreen() {
               ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
             : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
+    const picked = pickedOptionKeysRef.current.get(harness) ?? new Set<string>();
+    for (const key of Object.keys(options)) picked.add(key);
+    pickedOptionKeysRef.current.set(harness, picked);
     const previous = pickerEdits;
     setPickerEdits({
       agentId: effectiveAgentId,

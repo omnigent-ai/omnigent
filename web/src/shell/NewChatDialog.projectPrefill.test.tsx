@@ -1293,12 +1293,7 @@ describe("NewChatLandingScreen project prefill", () => {
     expectAlphaStart(await submitAndReadBody());
   });
 
-  // Smart Routing binds the Claude Code wrapper as its placeholder, so only the
-  // saved harness pick tells it apart from a direct Claude Code start.
-  it.each([
-    { alpha: "Claude Code", beta: "Smart Routing" },
-    { alpha: "Smart Routing", beta: "Claude Code" },
-  ])("reopens Alpha on $alpha after Beta starts $beta", async ({ alpha, beta }) => {
+  function setClaudeAndCodexAgents(): void {
     setClaudeAgentAndModels();
     vi.mocked(useAvailableAgents).mockReturnValue({
       data: [
@@ -1312,6 +1307,15 @@ describe("NewChatLandingScreen project prefill", () => {
         agent({ id: CODEX_AGENT_ID, name: "codex-native-ui", harness: "codex-native" }),
       ],
     } as ReturnType<typeof useAvailableAgents>);
+  }
+
+  // Smart Routing binds the Claude Code wrapper as its placeholder, so only the
+  // saved harness pick tells it apart from a direct Claude Code start.
+  it.each([
+    { alpha: "Claude Code", beta: "Smart Routing" },
+    { alpha: "Smart Routing", beta: "Claude Code" },
+  ])("reopens Alpha on $alpha after Beta starts $beta", async ({ alpha, beta }) => {
+    setClaudeAndCodexAgents();
     const pick = (choice: string) => {
       if (choice === "Smart Routing") {
         fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
@@ -1347,6 +1351,55 @@ describe("NewChatLandingScreen project prefill", () => {
         : expect(trigger).toHaveAccessibleName(/Claude Code/),
     );
     expectStart(await submitAndReadBody(), alpha);
+  });
+
+  it("reopens Alpha on its own permission mode after Beta starts with another", async () => {
+    setClaudeAgentAndModels();
+    const pickPermission = (value: string) => {
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-permission-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId(`new-chat-landing-permission-option-${value}`));
+    };
+    renderLanding();
+    selectAgent(CLAUDE_AGENT_ID);
+    await waitForClaudeAgent();
+    pickPermission("plan");
+    await startAndLeave();
+    searchParams = new URLSearchParams("project=Beta");
+    renderLanding();
+    await waitForClaudeAgent();
+    pickPermission("acceptEdits");
+    await startAndLeave();
+
+    searchParams = new URLSearchParams("project=Alpha");
+    renderLanding();
+    await waitForClaudeAgent();
+    expect((await submitAndReadBody()).terminal_launch_args).toEqual(["--permission-mode", "plan"]);
+  });
+
+  it("keeps a model picked during the visit over the last start's after switching agents", async () => {
+    setClaudeAndCodexAgents();
+    writeProjectLaunchDefaults(
+      "proj_alpha",
+      {
+        agentId: CLAUDE_AGENT_ID,
+        pickedHarness: null,
+        harness: "claude-native",
+        harnessOptions: { model: "opus" },
+      },
+      {},
+    );
+    renderLanding();
+    await waitForClaudeAgent();
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    closeAgentConfig();
+    selectAgent(CODEX_AGENT_ID);
+    selectAgent(CLAUDE_AGENT_ID);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Sonnet/),
+    );
+    expect((await submitAndReadBody()).model_override).toBe("sonnet");
   });
 
   it.each([
