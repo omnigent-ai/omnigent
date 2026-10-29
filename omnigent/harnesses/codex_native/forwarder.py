@@ -1249,7 +1249,12 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
     approval_policy = payload.get("approvalPolicy")
     if approval_policy is None:
         approval_policy = payload.get("approval_policy")
-    if approval_policy not in {"never", "on-failure", "on-request", "untrusted"}:
+    if not isinstance(approval_policy, str) or approval_policy not in {
+        "never",
+        "on-failure",
+        "on-request",
+        "untrusted",
+    }:
         return None
 
     args: list[str] = []
@@ -1269,12 +1274,16 @@ def _codex_terminal_launch_args_from_settings(payload: _JsonObject) -> list[str]
         if not isinstance(sandbox_policy, dict):
             return None
         sandbox_mode = sandbox_policy.get("type")
-        if sandbox_mode not in {"read-only", "workspace-write", "danger-full-access"}:
+        if not isinstance(sandbox_mode, str) or sandbox_mode not in {
+            "read-only",
+            "workspace-write",
+            "danger-full-access",
+        }:
             return None
         if approval_policy != "on-request" or sandbox_mode != "workspace-write":
             args.extend(["--sandbox", sandbox_mode, "--ask-for-approval", approval_policy])
 
-    if reviewer in {"user", "auto_review", "guardian_subagent"}:
+    if isinstance(reviewer, str) and reviewer in {"user", "auto_review", "guardian_subagent"}:
         args.extend(["-c", f"approvals_reviewer={json.dumps(reviewer)}"])
     return args
 
@@ -2390,6 +2399,7 @@ async def supervise_forwarder(
             name="codex-native-forwarder-side-chat",
         )
         await _sleep(0)
+        stream_error: BaseException | None = None
         try:
             async for event in client.iter_events():
                 try:
@@ -2453,22 +2463,41 @@ async def supervise_forwarder(
                     )
                 except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
+        except BaseException as exc:
+            stream_error = exc
+            raise
         finally:
+            # Stop producers before draining their output while the HTTP client is open.
+            background_tasks = [subscribe_task, side_chat_task]
             if mcp_settle_timer is not None:
-                mcp_settle_timer.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await mcp_settle_timer
-            await target.delta_coalescer.close()
-            await target.usage_coalescer.close()
-            await target.elicitation_tracker.close()
-            subscribe_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await subscribe_task
-            side_chat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await side_chat_task
-            await forwarder_state.close_child_streams()
-            await client.close()
+                background_tasks.append(mcp_settle_timer)
+            for task in background_tasks:
+                task.cancel()
+            results = await asyncio.gather(*background_tasks, return_exceptions=True)
+            cleanup_errors = [
+                result
+                for result in results
+                if isinstance(result, BaseException)
+                and not isinstance(result, asyncio.CancelledError)
+            ]
+            for close in (
+                target.delta_coalescer.close,
+                target.usage_coalescer.close,
+                target.elicitation_tracker.close,
+                forwarder_state.close_child_streams,
+                client.close,
+            ):
+                try:
+                    await close()
+                except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
+                    cleanup_errors.append(exc)
+            for error in cleanup_errors[1 if stream_error is None else 0 :]:
+                _logger.warning(
+                    "Codex forwarder cleanup failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            if stream_error is None and cleanup_errors:
+                raise cleanup_errors[0]
 
 
 async def _drive_side_chat_requests(

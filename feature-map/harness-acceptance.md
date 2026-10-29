@@ -144,6 +144,43 @@ matrices at the lowest reliable layer; retain browser/process cases for distinct
 boundaries. Do not move or replace working regression coverage just to fit the
 checklist.
 
+### Pi SDK large tool requests
+
+For the transport portion of `tool-history`, run
+`pytest tests/inner/test_pi_executor.py -k TestToolServer --reruns 0 -q`
+with Node installed. The
+generated bridge sends a request larger than 64 KiB, then another tool call in
+the same Node process. The oversized case checks the exact size-limit error,
+no rejected tool execution, redacted diagnostics, and a successful next call.
+Real TCP cases cover a sender still writing and bounded cleanup of truncated
+or stalled input. Rejection tests reduce the production 16 MiB request limit.
+
+These checks use the production generated extension and loopback server with
+a test tool executor and Pi registration stub. They do not launch Pi, exercise
+the server/runner or browser entry points, or establish later-turn model recall.
+Native Pi uses a separate tool path. To verify the SDK CLI/API journey, use a
+Pi custom agent with a harmless tool accepting a large string; send a request
+over 64 KiB but below 16 MiB, then one above the limit, and confirm another small
+tool call succeeds after each. The limit includes the serialized request
+envelope, not only its arguments.
+
+### Pi SDK compaction and restart (own environment)
+
+For `compaction`, `reload-resume` and `fork`, run
+`tests/e2e/test_pi_compact_restart_resume.py::test_pi_compacted_session_resumes_compacted_after_restart`.
+It drives the real Pi CLI through a server/runner with a scripted provider and
+a 32k context limit. After repeated compactions, restart both processes and
+continue the session, then fork it and continue the copy. Both outgoing requests
+must retain the summary and recent context, omit summarized turns and fit the
+window; the fork must leave its parent unchanged.
+
+This is an API/process check, not browser reload or live-provider acceptance.
+Existing sessions without a saved compaction checkpoint are not repaired by
+this recipe. After compaction, a failed streamed retry is aborted and drained
+to settlement before exporting context and evicting Pi; retry text is suppressed.
+If settlement or context export fails, the fallback retains only the summary
+and loses recent kept context. Component tests cover these failure paths separately.
+
 ### Pi SDK bundled resources (own environment)
 
 For `launch-reply`, launch an uploaded Pi agent bundle through the server/runner,

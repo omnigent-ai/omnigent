@@ -6,7 +6,10 @@ name: CI
 # bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
 # out within a file. The `misc` group is a catch-all so new top-level
 # tests/<dir>/ are picked up automatically (it ignores the dirs that have their
-# own group). Draft PRs are skipped (ready_for_review re-fires the workflow).
+# own group). When Python tests run, `ci-tooling` (tests/scripts) is kept only
+# if the PR touches CI, release or dev tooling or a manifest (see
+# dependency_scope.py); push, scheduled and manual runs always include it.
+# Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
 on:
@@ -104,7 +107,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Node.js for local relay and harness CLI tests
-        if: matrix.group == 'misc' || matrix.group == 'inner-rest'
+        if: matrix.group == 'misc' || matrix.group == 'inner-rest' || matrix.group == 'ci-tooling'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -113,13 +116,13 @@ jobs:
       # pinned CLI only in the lanes that run them.
       - name: Install Codex CLI
         if: matrix.group == 'misc'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex
 
       - name: Install Pi CLI
         if: matrix.group == 'inner-rest'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: pi
 
@@ -428,7 +431,7 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex
 

@@ -2025,7 +2025,11 @@ def test_host_stop_stops_sessions_before_daemon(
         path = str(kwargs["path"])
         events.append((method, path))
         if method == "GET" and path == "/v1/sessions":
-            assert kwargs["params"] == {
+            params = kwargs["params"]
+            assert isinstance(params, dict)
+            if params.get("kind") == "sub_agent":
+                return cli._HostHttpResult(status_code=200, body={"data": []})
+            assert params == {
                 "limit": 1000,
                 "include_archived": "true",
                 "visibility": "all",
@@ -2080,6 +2084,7 @@ def test_host_stop_stops_sessions_before_daemon(
     assert result.exit_code == 0, result.output
     assert events == [
         ("GET", "/v1/sessions"),
+        ("GET", "/v1/sessions"),
         ("GET", "/v1/sessions/conv_owned"),
         ("POST", "/v1/sessions/conv_owned/events"),
         ("TERM", "https://server.example.com"),
@@ -2094,10 +2099,14 @@ def test_host_stop_bounds_parallel_session_stops(monkeypatch: pytest.MonkeyPatch
     sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(12)]
 
     def _fake_sessions(
-        record: cli._HostDaemonRecord, *, connected_only: bool = False
+        record: cli._HostDaemonRecord,
+        *,
+        connected_only: bool = False,
+        include_sub_agents: bool = False,
     ) -> cli._DaemonSessionsResult:
         del record
         assert connected_only is False
+        assert include_sub_agents is True
         return cli._DaemonSessionsResult(
             base_url="https://server.example.com",
             sessions=sessions,
@@ -2160,13 +2169,15 @@ def test_host_stop_failure_leaves_daemon_running(
     monkeypatch.setattr(
         cli,
         "_sessions_for_daemon",
-        lambda record, *, connected_only=False: cli._DaemonSessionsResult(
-            base_url="https://server.example.com",
-            sessions=[
-                {"id": "conv_ok", "status": "waiting"},
-                {"id": "conv_failed", "status": "running"},
-            ],
-            error=None,
+        lambda record, *, connected_only=False, include_sub_agents=False: (
+            cli._DaemonSessionsResult(
+                base_url="https://server.example.com",
+                sessions=[
+                    {"id": "conv_ok", "status": "waiting"},
+                    {"id": "conv_failed", "status": "running"},
+                ],
+                error=None,
+            )
         ),
     )
 
@@ -4278,3 +4289,175 @@ def test_mixed_case_server_gets_the_same_workspace_key_and_pin() -> None:
     assert cli._build_host_daemon_env(server_url=server)[PINNED_DATABRICKS_ORG_ENV_VAR].endswith(
         "?o=111"
     )
+
+
+def test_daemon_owned_sessions_adds_sub_agents_of_owned_sessions() -> None:
+    """A sub-agent has no host id, so it is owned only through its parent chain."""
+    sessions: list[cli._HostSessionRow] = [
+        {"id": "conv_top", "host_id": "host_a"},
+        {
+            "id": "conv_child",
+            "host_id": None,
+            "parent_session_id": "conv_top",
+        },
+        {
+            "id": "conv_grandchild",
+            "host_id": None,
+            "parent_session_id": "conv_child",
+        },
+        {
+            "id": "conv_other_child",
+            "host_id": None,
+            "parent_session_id": "conv_elsewhere",
+        },
+        {"id": "conv_other_host", "host_id": "host_b"},
+    ]
+
+    with_children = cli._daemon_owned_sessions(
+        [sessions[0], sessions[-1]], host_id="host_a", sub_agents=sessions[1:-1]
+    )
+    top_only = cli._daemon_owned_sessions(
+        [sessions[0], sessions[-1]], host_id="host_a", sub_agents=[]
+    )
+
+    assert [s["id"] for s in with_children] == ["conv_top", "conv_child", "conv_grandchild"]
+    assert [s["id"] for s in top_only] == ["conv_top"]
+
+
+def test_daemon_session_request_params_lists_sub_agents_only_when_asked() -> None:
+    """The drain fetches roots and sub-agents separately using the server kind filter."""
+    default = cli._daemon_session_request_params(connected_only=False, after=None)
+    drain = cli._daemon_session_request_params(connected_only=False, after=None, kind="sub_agent")
+
+    assert "kind" not in default
+    assert drain["kind"] == "sub_agent"
+
+
+@pytest.mark.parametrize("sub_agents_error", [False, True])
+def test_host_stop_drains_sub_agent_sessions_before_signalling(
+    monkeypatch: pytest.MonkeyPatch, sub_agents_error: bool
+) -> None:
+    """API rows omit kind; only the sub-agent query identifies child sessions."""
+    roots: list[cli._HostSessionRow] = [
+        {"id": "conv_top", "host_id": "host_a", "status": "running"},
+        {
+            "id": "conv_fork",
+            "host_id": "host_b",
+            "parent_session_id": "conv_top",
+            "status": "running",
+        },
+    ]
+    children: list[cli._HostSessionRow] = [
+        {
+            "id": "conv_grandchild",
+            "host_id": None,
+            "parent_session_id": "conv_child",
+            "status": "running",
+        },
+        {
+            "id": "conv_child",
+            "host_id": None,
+            "parent_session_id": "conv_top",
+            "status": "running",
+        },
+        {
+            "id": "conv_unrelated_child",
+            "host_id": None,
+            "parent_session_id": "conv_fork",
+            "status": "running",
+        },
+    ]
+    requests: list[dict[str, str | int]] = []
+
+    def _fake_http(**kwargs: Any) -> cli._HostHttpResult:
+        params = kwargs["params"]
+        requests.append(params)
+        kind = params.get("kind", "default")
+        if kind == "sub_agent":
+            if sub_agents_error:
+                return cli._HostHttpResult(
+                    status_code=0, body="Connection refused", unreachable=True
+                )
+            after = params.get("after")
+            rows = children[:1] if after is None else children[1:]
+            has_more = after is None
+        else:
+            rows = roots + children if kind == "any" else roots
+            has_more = False
+        return cli._HostHttpResult(
+            status_code=200,
+            body={"data": rows, "last_id": rows[-1]["id"], "has_more": has_more},
+        )
+
+    stopped: list[str] = []
+    monkeypatch.setattr(cli, "_host_http_json", _fake_http)
+    monkeypatch.setattr(cli, "_daemon_base_url", lambda record: "https://server.example.com")
+    monkeypatch.setattr(
+        cli,
+        "_stop_session_on_server",
+        lambda *, base_url, session_id: stopped.append(session_id),
+    )
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+        host_id="host_a",
+    )
+
+    if sub_agents_error:
+        with pytest.raises(click.ClickException, match="retry with --force"):
+            cli._stop_daemon_sessions(record)
+        assert stopped == []
+        return
+
+    assert cli._stop_daemon_sessions(record) == 3
+    assert sorted(stopped) == ["conv_child", "conv_grandchild", "conv_top"]
+    assert [(params.get("kind"), params.get("after")) for params in requests] == [
+        (None, None),
+        ("sub_agent", None),
+        ("sub_agent", "conv_grandchild"),
+    ]
+
+
+def test_stop_request_row_skips_a_stale_daemon_record(monkeypatch, caplog) -> None:
+    """A dead or recycled record has no daemon to stop, so no stop request is logged."""
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com",
+        mode="server",
+        server_url="https://server.example.com",
+        log_path=None,
+        started_at=1,
+    )
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda _record: False)
+
+    with caplog.at_level("INFO", logger="omnigent.host.daemon_stop"):
+        cli._record_daemon_stop_requested(record, reason="host_stop", force=False)
+
+    assert [r for r in caplog.records if r.name == "omnigent.host.daemon_stop"] == []
+
+
+def test_stop_request_row_carries_reason_and_uptime(monkeypatch, caplog) -> None:
+    """The stop-request row names the reason and the daemon's uptime."""
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda _record: True)
+    record = cli._HostDaemonRecord(
+        pid=42,
+        target="https://server.example.com/omnigent",
+        mode="server",
+        server_url="https://server.example.com/omnigent",
+        log_path=None,
+        started_at=0,
+    )
+
+    with caplog.at_level("INFO", logger="omnigent.host.daemon_stop"):
+        cli._record_daemon_stop_requested(record, reason="host_stop", force=True)
+
+    (row,) = [r for r in caplog.records if r.name == "omnigent.host.daemon_stop"]
+    assert row.event_name == "host_daemon_stop_requested"
+    assert row.attributes["reason"] == "host_stop"
+    assert row.attributes["force"] is True
+    assert row.attributes["daemon_pid"] == 42
+    assert float(row.attributes["daemon_uptime_s"]) > 0

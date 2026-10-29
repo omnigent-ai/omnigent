@@ -1709,6 +1709,15 @@ def create_runner_app(
         blocked_on: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if status == "failed":
+            # Structured status has no provider detail when its terminal hook is lost.
+            event["error"] = {
+                "code": "native_failure_detail_unavailable",
+                "message": (
+                    "The native agent reported an error, but its failure details did not "
+                    "arrive. Open the terminal to inspect the error before retrying."
+                ),
+            }
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
@@ -2538,6 +2547,12 @@ def create_runner_app(
         # endpoint at all.
         _routing_class = init_context.routing_class
         remember_session_routing_class(session_id, _routing_class)
+        from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
+
+        surface_labels = init_context.labels or {}
+        resource_registry.set_client_surface(
+            session_id, surface_labels.get(CLIENT_SURFACE_LABEL_KEY)
+        )
         if init_context.envelope is not None:
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
@@ -5926,6 +5941,9 @@ def create_runner_app(
                     # order instead of racing.
                     _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
                     _text_acc: list[str] = []
+                    # Parts of _text_acc the server stored before the last completed tool
+                    # call, so a later compaction snapshot already covers them.
+                    _text_acc_before_tool = 0
                     _stream_failed_error: _JsonObject | None = None
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
@@ -6019,6 +6037,7 @@ def create_runner_app(
                                             }
                                         )
                                         _text_acc.clear()
+                                    _text_acc_before_tool = 0
                                 elif _evt_type == "response.failed":
                                     _err = event.get("error") or (event.get("response") or {}).get(
                                         "error"
@@ -6033,6 +6052,8 @@ def create_runner_app(
                                     if isinstance(_item, dict):
                                         _it = _item.get("type")
                                         if _it == "function_call":
+                                            if _item.get("status") == "completed":
+                                                _text_acc_before_tool = len(_text_acc)
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "function_call",
@@ -6056,7 +6077,9 @@ def create_runner_app(
                                     # the up-front spinner, so drop the pending flag and
                                     # skip the stream-end `failed` fallback.
                                     _sdk_compact_inprogress.discard(conv_id)
-                                    await _handle_harness_compaction(conv_id, event)
+                                    if await _handle_harness_compaction(conv_id, event):
+                                        del _text_acc[:_text_acc_before_tool]
+                                        _text_acc_before_tool = 0
 
                                 if is_action_required(event):
                                     tool_name = get_tool_name(event)
@@ -6492,7 +6515,14 @@ def create_runner_app(
                     )
                 else:
                     await side_chat.submit_side_turn(
-                        _side_client, str(_side_thread_id), _side_text
+                        _side_client,
+                        str(_side_thread_id),
+                        _side_text,
+                        transport=_side_state.socket_path,
+                        model=body.get("model_override"),
+                        effort=body.get("reasoning_effort"),
+                        reset_effort="reasoning_effort" in body
+                        and body["reasoning_effort"] is None,
                     )
             except CodexAppServerResponseError as exc:
                 # Codex refused the turn (e.g. typing into a multi-agent-v2
@@ -6513,6 +6543,17 @@ def create_runner_app(
                         if _missing
                         else "codex_side_chat_rejected",
                         "detail": _rpc_message,
+                    },
+                )
+            except side_chat.SideChatEffortUnavailable:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "codex_side_chat_settings_unavailable",
+                        "detail": (
+                            "Could not resolve the side chat's default effort. "
+                            "Select an explicit effort and retry."
+                        ),
                     },
                 )
             except (ConnectionError, OSError, TimeoutError, WebSocketException) as exc:
@@ -8412,6 +8453,8 @@ def _build_spawn_env_from_spec(
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
+        if resource_registry is not None and session_id is not None:
+            env.update(resource_registry.client_surface_env(session_id))
 
     if (
         env is not None

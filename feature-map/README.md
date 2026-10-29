@@ -153,8 +153,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
-- [Tool calls in chat](./tool-calls.md) covers tool-call rows, their result
-  lines, the expanded field and Raw views, and tool-run folding.
+- [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
+  counts, the expanded field, error and Raw views, and tool-run folding.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.

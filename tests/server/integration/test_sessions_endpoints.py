@@ -4638,7 +4638,7 @@ async def test_get_session_labels_returns_labels_only(
     assert resp.headers["cache-control"] == "no-store"
     assert resp.json() == {
         "id": session["id"],
-        "labels": {"mode": "debug", "team": "infra"},
+        "labels": {"mode": "debug", "team": "infra", "omnigent.client_surface": "cli"},
     }
 
 

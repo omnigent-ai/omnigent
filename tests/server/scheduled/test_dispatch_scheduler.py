@@ -2167,6 +2167,47 @@ async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) 
     assert (lease.run.id, lease.run.host_id) == (run.id, new_host)
 
 
+async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
+    store,
+) -> None:
+    """Replica A holds the session's host and B owns the workspace key. Once the
+    first run records the session, its host is pinned, so A claims every run."""
+    task = _task(store, "continue_unpinned", session_mode="continue")
+    assert task.host_id is None
+    session_host = uuid.uuid4().hex
+    assert (
+        store.adopt_session(task.id, uuid.uuid4().hex, snapshot=task, host_id=session_host)
+        == "adopted"
+    )
+    task = store.get(task.id)
+    clock = FakeClock(task.created_at + 60)
+    fired = {"a": AsyncMock(), "b": AsyncMock()}
+
+    def replica(name, owns):
+        async def owned_hosts(keys):
+            return [key for key in keys if owns(key)]
+
+        return PersistentTaskScheduler(
+            store, fired[name], AsyncMock(), owned_hosts=owned_hosts, now=clock.now
+        )
+
+    a = replica("a", lambda key: key == session_host)
+    b = replica("b", lambda key: key == str(task.workspace_id))
+    run = await b.run_now(task)
+    await b.poll_once()
+    await _drain(b)
+    await a.poll_once()
+    await _drain(a)
+
+    fired["b"].assert_not_awaited()
+    [(snapshot, lease)] = [call.args for call in fired["a"].await_args_list]
+    assert (snapshot.session_id, lease.run.id, lease.run.host_id) == (
+        task.session_id,
+        run.id,
+        session_host,
+    )
+
+
 async def test_claim_checks_ownership_once_per_page_with_workspace_fallback(store) -> None:
     host_id = uuid.uuid4().hex
     with workspace_scope(42):

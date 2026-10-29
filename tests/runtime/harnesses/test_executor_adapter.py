@@ -1047,7 +1047,7 @@ def test_classify_anthropic_exception_maps_known_types(
     monkeypatch arranges.
 
     Regression: Phase 1d/1e wires
-    ``ANTHROPIC_MAX_RETRIES`` into the Claude CLI subprocess,
+    ``CLAUDE_CODE_MAX_RETRIES`` into the Claude CLI subprocess,
     which can still surface raw :class:`anthropic.RateLimitError`
     upward when the SDK's framing layer fails. Without this
     classifier, those would render as ``[llm] RateLimitError``
