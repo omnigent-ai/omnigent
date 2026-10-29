@@ -187,6 +187,39 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
+describe("resolveServerInfo session_search_scope", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).session_search_scope).toBe(false);
+  });
+});
+
+describe("resolveServerInfo scheduled_task_projects", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["yes", false],
+  ])("reads %j as %j", async (advertised, expected) => {
+    const payload = advertised === undefined ? {} : { scheduled_task_projects: advertised };
+    expect((await probe(payload)).scheduled_task_projects).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo scheduled_task_session_modes", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ scheduled_task_session_modes: true })).scheduled_task_session_modes).toBe(
+      true,
+    );
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).scheduled_task_session_modes).toBe(false);
+  });
+});
+
 describe("resolveServerInfo archive_worktree_cleanup", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);
@@ -205,6 +238,21 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   ])("parses %s strictly as %s", async (advertised, expected) => {
     const parsed = await probe({ request_managed_sandbox_host_id: advertised });
     expect(parsed.request_managed_sandbox_host_id).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_event_types", () => {
+  it.each([
+    [undefined, []],
+    ["clear", []],
+    [
+      ["message", 1, "clear"],
+      ["message", "clear"],
+    ],
+  ])("parses %o as %o", async (advertised, expected) => {
+    expect((await probe({ session_event_types: advertised })).session_event_types).toEqual(
+      expected,
+    );
   });
 });
 
@@ -291,6 +339,14 @@ describe("custom agents settings capability", () => {
     const parsed = await probe({ agent_detail: detail });
     expect(parsed.agent_detail).toBe(detail === true);
   });
+
+  it.each([undefined, false, "true", true])(
+    "parses session_pull_requests strictly: %s",
+    async (stored) => {
+      const parsed = await probe({ session_pull_requests: stored });
+      expect(parsed.session_pull_requests).toBe(stored === true);
+    },
+  );
 
   it.each([undefined, false, "true", true])(
     "requires a boolean install capability: %s",

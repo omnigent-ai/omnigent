@@ -9,6 +9,8 @@
 // with the edited content.
 
 import { Schema, type Node } from "@tiptap/pm/model";
+import type * as TipTapEditorHelpers from "./TipTapEditorHelpers";
+import type * as FileContentModule from "@/hooks/useFileContent";
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -29,7 +31,6 @@ interface FakeEditor {
   getMarkdown: () => string;
   on: (evt: string, h: UpdateHandler) => void;
   off: (evt: string, h: UpdateHandler) => void;
-  commands: { setContent: (c: string) => void };
   setEditable: () => void;
   state: { doc: Node; selection: { empty: boolean; from: number; to: number } };
   emit: (evt: string, payload?: UpdatePayload) => void;
@@ -54,12 +55,6 @@ function makeFakeEditor(initial: string): FakeEditor {
     },
     off: (evt, h) => {
       handlers[evt]?.delete(h);
-    },
-    commands: {
-      setContent: (c: string) => {
-        markdown = c;
-        state.doc = documentFor(c);
-      },
     },
     setEditable: () => {},
     state,
@@ -127,6 +122,12 @@ vi.mock("./TipTapCommentExtension", () => ({
   commentDecorationKey: {},
 }));
 vi.mock("./MarkdownCommentPlugin", () => ({ MarkdownCommentPlugin: () => null }));
+// The fake editor has no schema or Markdown parser: an external update simply
+// replaces its Markdown (TipTapEditorHelpers.test.ts covers the real editor).
+vi.mock("./TipTapEditorHelpers", async (importOriginal) => ({
+  ...(await importOriginal<typeof TipTapEditorHelpers>()),
+  applyExternalMarkdown: (editor: FakeEditor, markdown: string) => editor.setMarkdown(markdown),
+}));
 // Capture the onSave the viewer wires so a test can fire a "manual save" (⌘S / pill).
 const toolbar = vi.hoisted(() => ({ onSave: null as ((md: string) => void) | null }));
 vi.mock("./MarkdownEditorToolbar", () => ({
@@ -137,6 +138,11 @@ vi.mock("./MarkdownEditorToolbar", () => ({
 }));
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn().mockReturnValue(true) }));
 vi.mock("@/hooks/useWriteFileContent", () => ({ useWriteFileContent: vi.fn() }));
+// The pre-write conflict check GETs the live file before every save.
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof FileContentModule>()),
+  fetchFileContent: vi.fn(),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
@@ -146,6 +152,7 @@ import { MarkdownRichTextViewer } from "./MarkdownRichTextViewer";
 import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 import * as writeHook from "@/hooks/useWriteFileContent";
 import * as runnerHook from "@/hooks/RunnerHealthProvider";
+import { fetchFileContent } from "@/hooks/useFileContent";
 
 const PATH = "/doc.md";
 const INITIAL = "# Doc\n\ninitial body\n";
@@ -185,9 +192,16 @@ beforeEach(() => {
   fakeEditor = makeFakeEditor(INITIAL);
   toolbar.onSave = null;
   mockWrite();
-  // Online → auto-save enabled. The session is idle (this conversation isn't
-  // the focused running one), so the pre-write conflict GET is skipped and the
-  // write goes straight through.
+  // The pre-write conflict check finds the content the viewer loaded.
+  vi.mocked(fetchFileContent).mockResolvedValue({
+    object: "session.environment.filesystem.file_content",
+    path: PATH,
+    content_type: "text/markdown",
+    encoding: "utf-8",
+    content: INITIAL,
+    bytes: INITIAL.length,
+  });
+  // Online → auto-save enabled.
   vi.mocked(runnerHook.useSessionRunnerOnline).mockReturnValue(true);
 });
 
@@ -282,6 +296,35 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     await act(async () => fakeEditor!.emit("blur"));
     expect(mutateAsync).toHaveBeenCalledTimes(2);
     expect(serialize).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps edits typed during a save when another writer's update arrives", async () => {
+    let resolveWrite!: () => void;
+    mutateAsync.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveWrite = resolve;
+        }),
+    );
+    const { rerender } = render(makeViewer());
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    // Typed while the save is in flight; its own debounce hasn't fired yet.
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED + "newer");
+      fakeEditor!.emit("update");
+    });
+    await act(async () => resolveWrite());
+    await act(async () => rerender(makeViewer("# Doc\n\nanother writer\n")));
+
+    expect(fakeEditor!.getMarkdown()).toBe(EDITED + "newer");
+    expect(screen.getByText(/modified externally/)).toBeInTheDocument();
+    await act(async () => vi.advanceTimersByTime(1000));
+    // Unresolved conflict: auto-save waits for Keep mine / Load latest.
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
   });
 
   it("uses an external replacement as the new undo baseline", async () => {
@@ -393,12 +436,9 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
   });
 
   it("marks the editor clean after a save even if getMarkdown() drifts (no stuck 'Unsaved')", async () => {
-    // Regression guard: TipTap's markdown round-trip is NOT byte-stable, so
-    // re-deriving dirtiness from a live getMarkdown()-vs-baseline string
-    // compare after a save (instead of forcing clean) left the editor stuck on
-    // "Unsaved" and looping autosave. Simulate the drift: the write persists X,
-    // but the editor's getMarkdown afterward is X + whitespace (≠ X) — with no
-    // user edit. A successful save must still end clean.
+    // TipTap's Markdown round-trip isn't byte-stable: the write persists X, then
+    // getMarkdown() returns X plus whitespace with no user edit. The post-save
+    // check compares document snapshots, so a successful save still ends clean.
     const saved: string[] = [];
     vi.mocked(writeHook.useWriteFileContent).mockReturnValue({
       isPending: false,
@@ -421,7 +461,6 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     });
 
     // Saved once, and clean afterward despite getMarkdown() != the saved text.
-    // With setDirty(isEditorDirty()) this would be stuck "Unsaved".
     expect(saved).toEqual([EDITED]);
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
   });

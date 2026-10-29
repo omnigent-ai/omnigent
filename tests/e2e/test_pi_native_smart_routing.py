@@ -357,6 +357,15 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
 
         send("What did the command return?")
         items = _await_answer(child, server, conv, "ROUTED_FOLLOWUP_ANSWER")
+        for prompt in (_COMPLEX_PROMPT, "What did the command return?"):
+            assert (
+                sum(
+                    item.get("role") == "user"
+                    and any(part.get("text") == prompt for part in item.get("content", []))
+                    for item in items
+                )
+                == 1
+            ), items
         assert _served_pi_models(mock_llm) == [_TARGET_MODEL] * 3
         assert _judge_call_count(mock_llm) == judge_after
         requests = get_mock_requests(mock_llm, key=_TARGET_MODEL)
