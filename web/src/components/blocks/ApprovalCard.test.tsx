@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { BlockStream } from "@/lib/blockStream";
@@ -35,6 +36,28 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
+  });
+
+  it("shows the approve chord in the Approve button tooltip", async () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_chord"
+        message="Approve running ls?"
+        phase="tool_call"
+        policyName="approve_shell_commands"
+        contentPreview="ls"
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+      />,
+    );
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Approve" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Approve");
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ENTER_KEY]);
   });
 
   it("shows the harness name instead of the synthetic policy stamp on native prompts", () => {

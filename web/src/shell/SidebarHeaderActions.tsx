@@ -1,14 +1,15 @@
 import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  ARIA_MOD_KEY,
+  COMMAND_PALETTE_KEYS,
+  SETTINGS_KEYS,
+  SIDEBAR_TOGGLE_KEYS,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-
-const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
-const SEARCH_KEYS = [MOD_KEY, "K"] as const;
-const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
@@ -142,7 +143,7 @@ export function SidebarSearchButton({
       </TooltipTrigger>
       {/* Bottom placement keeps the tooltip clear of the macOS Electron
       shell's traffic lights at the window's top edge. */}
-      <TooltipContent side="bottom" shortcut={SEARCH_KEYS}>
+      <TooltipContent side="bottom" shortcut={COMMAND_PALETTE_KEYS}>
         <span>Search</span>
       </TooltipContent>
     </Tooltip>

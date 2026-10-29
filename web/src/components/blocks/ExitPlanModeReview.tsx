@@ -21,7 +21,9 @@
 
 import { CheckIcon, XIcon, ZapIcon } from "lucide-react";
 import { useState } from "react";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { APPROVE_KEYS } from "@/hooks/useApproveHotkey";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -81,10 +83,12 @@ export function ExitPlanModeReview({
             <ZapIcon className="mr-1 size-3.5" />
             Yes, and use auto mode
           </Button>
-          <Button size="sm" variant="outline" onClick={onAccept} componentId="plan.accept_manual">
-            <CheckIcon className="mr-1 size-3.5" />
-            Yes, manually approve edits
-          </Button>
+          <KeyboardShortcutTooltip label="Yes, manually approve edits" keys={APPROVE_KEYS}>
+            <Button size="sm" variant="outline" onClick={onAccept} componentId="plan.accept_manual">
+              <CheckIcon className="mr-1 size-3.5" />
+              Yes, manually approve edits
+            </Button>
+          </KeyboardShortcutTooltip>
           <Button size="sm" variant="outline" onClick={() => setRejecting(true)}>
             <XIcon className="mr-1 size-3.5" />
             Reject with feedback

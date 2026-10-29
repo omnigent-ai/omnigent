@@ -77,6 +77,15 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ALT_KEY,
+  ARROW_LEFT_KEY,
+  ARROW_RIGHT_KEY,
+  CompactShortcutKeys,
+  ESC_KEY,
+  KeyboardShortcutTooltip,
+  MOD_KEY,
+} from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
@@ -1118,6 +1127,8 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
+    /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
+    shortcut?: readonly string[];
   }
   interface ToolbarAction {
     key: string;
@@ -1294,6 +1305,8 @@ function FileViewerBody({
       icon: <SearchIcon className="size-4" />,
       active: false,
       onSelect: openSearch,
+      // Cmd+F only opens find on the Monaco and code surfaces (see isMonacoFindSurface).
+      shortcut: isMonacoFindSurface ? [MOD_KEY, "F"] : undefined,
     },
   ];
   if (revealTarget && !isDeletedFile) {
@@ -1422,6 +1435,9 @@ function FileViewerBody({
               >
                 {item.icon}
                 {item.label}
+                {item.shortcut && (
+                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                )}
                 {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
               </DropdownMenuItem>
             ))}
@@ -1499,49 +1515,52 @@ function FileViewerBody({
               the back button would be a redundant "exit viewer" mode. */}
           {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Close file viewer"
-                      onClick={() => guardDirty(onClose)}
-                    >
-                      <ArrowLeftIcon className="size-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Close</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
+              {/* Esc runs onCloseTab; the hint applies only when the back button runs that same handler. */}
+              <KeyboardShortcutTooltip
+                label="Close"
+                keys={onCloseTab !== undefined && onClose === onCloseTab ? [ESC_KEY] : undefined}
+              >
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Close file viewer"
+                  onClick={() => guardDirty(onClose)}
+                >
+                  <ArrowLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {showNavButtons && (
             <div ref={toolbarNavRef} className="flex items-center gap-0.5 shrink-0">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Previous file"
-                disabled={!prevPath}
-                onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
-              >
-                <ChevronLeftIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Previous file" keys={[ALT_KEY, ARROW_LEFT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Previous file"
+                  disabled={!prevPath}
+                  onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
+                >
+                  <ChevronLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
               <span className="text-[10px] text-muted-foreground tabular-nums">
                 {currentNavIdx + 1}/{navigableFiles.length}
               </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Next file"
-                disabled={!nextPath}
-                onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
-              >
-                <ChevronRightIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Next file" keys={[ALT_KEY, ARROW_RIGHT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Next file"
+                  disabled={!nextPath}
+                  onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
+                >
+                  <ChevronRightIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}

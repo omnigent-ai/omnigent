@@ -515,4 +515,45 @@ describe("QueuedMessagesStrip", () => {
       "overscroll-contain",
     );
   });
+
+  it("shows the ↑ chord on the edit tooltip of the row an empty composer recalls", async () => {
+    const queue = [msg("q_1", "first"), msg("q_2", "second")];
+    const { unmount } = render(
+      <QueuedMessagesStrip
+        messages={queue}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        arrowUpRecallQueueId="q_2"
+      />,
+    );
+    fireEvent.pointerMove(screen.getAllByRole("button", { name: "Edit queued message" })[1]!, {
+      pointerType: "mouse",
+    });
+    const recallTooltip = await screen.findByRole("tooltip");
+    expect(recallTooltip).toHaveTextContent("Edit queued message");
+    expect(tooltipKeys(recallTooltip)).toEqual(["↑"]);
+    unmount();
+
+    render(
+      <QueuedMessagesStrip
+        messages={queue}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        arrowUpRecallQueueId="q_2"
+      />,
+    );
+    fireEvent.pointerMove(screen.getAllByRole("button", { name: "Edit queued message" })[0]!, {
+      pointerType: "mouse",
+    });
+    const plainTooltip = await screen.findByRole("tooltip");
+    expect(plainTooltip).toHaveTextContent("Edit queued message");
+    expect(tooltipKeys(plainTooltip)).toEqual([]);
+  });
 });
+
+/** The chord chips inside a tooltip, in display order. */
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
+}
