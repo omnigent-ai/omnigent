@@ -12,8 +12,14 @@ from types import SimpleNamespace
 import click
 import httpx
 import pytest
+from omnigent_client import (
+    TERMINAL_FALLBACK_HEADER,
+    PaginatedList,
+    QueryResult,
+    RegisteredAgent,
+    SessionsNamespace,
+)
 from omnigent_client import OmnigentError as ClientOmnigentError
-from omnigent_client import PaginatedList, QueryResult, RegisteredAgent, SessionsNamespace
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
@@ -3936,8 +3942,6 @@ def test_run_repl_client_asks_for_prompts_held_in_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The REPL opts into held prompts; other SDK clients keep seeing them expire."""
-    from omnigent.server.routes._sessions.helpers import _client_supports_terminal_fallback
-
     client_kwargs: list[dict[str, object]] = []
 
     class _RecordingClientCtx(_FakeClientCtx):
@@ -3952,7 +3956,7 @@ def test_run_repl_client_asks_for_prompts_held_in_terminal(
     [kwargs] = client_kwargs
     headers = kwargs["headers"]
     assert isinstance(headers, dict)
-    assert _client_supports_terminal_fallback(httpx.Headers(headers))
+    assert headers[TERMINAL_FALLBACK_HEADER] == "on"
 
 
 class _FakeSessionsForResume:

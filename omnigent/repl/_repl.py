@@ -976,12 +976,8 @@ class _ApprovalState:
 
     def move_to_terminal(self, elicitation_id: str) -> bool:
         """
-        Retire the pending approval, without a verdict, once its prompt
-        waits in the agent's terminal.
-
-        The server refuses answers sent from here, so the future is
-        cancelled rather than resolved: the hook's task then ends without
-        posting an accept or decline.
+        Cancel the pending approval once its prompt waits in the agent's
+        terminal, which refuses a verdict from here.
 
         :param elicitation_id: Id carried by the held re-publish.
         :returns: ``True`` iff the pending approval was for this
@@ -1233,9 +1229,7 @@ def _retire_prompt_held_in_terminal(
     state: _ApprovalState,
 ) -> None:
     """
-    Retire the REPL's prompt for a request that now waits in the agent's terminal.
-
-    Without this the ``y/a/n`` prompt stays up for an answer the server refuses.
+    Retire the REPL's ``y/a/n`` prompt, without a verdict, once its request waits in the terminal.
 
     :param event: A server stream event, e.g. an ``ElicitationRequestEvent``.
     :param host: Terminal host the notice is written to.
