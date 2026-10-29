@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import shutil
 import sqlite3
@@ -79,6 +80,17 @@ def _host_link_target(link: Path) -> Path | None:
     return target
 
 
+def _login_rotates(login: Path) -> bool:
+    """Return whether Codex may refresh this login; only an API-key login never does."""
+    try:
+        document = json.loads(login.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(document, dict):
+        return True
+    return not document.get("OPENAI_API_KEY") or bool(document.get("tokens"))
+
+
 def _snapshot_sqlite(source: Path, target: Path) -> None:
     try:
         with (
@@ -108,7 +120,7 @@ def _contain_host_codex_home_links(
     if host_login is None:
         return policy
     if not share_host_login:
-        # Native tools share this sandbox; keep them away from the host login file.
+        # Native tools share this sandbox; an API-key login never rotates, so a copy is safe.
         login.unlink()
         shutil.copy(host_login, login)
         return policy
@@ -177,6 +189,8 @@ def prepare_codex_worker(
     A network-denying sandbox with no signer and no ``egress_rules`` gives the
     app-server no route to the model. The worker then keeps its filesystem
     sandbox but shares the host network, with Codex's native tools disabled.
+    A worker given the host's refreshable ChatGPT login also runs without
+    native tools, because Codex must rotate that login in place.
     """
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
         if signer_readiness is not None:
@@ -213,6 +227,14 @@ def prepare_codex_worker(
         )
         policy = replace(policy, allow_network=True)
         native_tools_allowed = False
+    if signer_readiness is None and native_tools_allowed:
+        host_login = _host_link_target(codex_home / "auth.json")
+        if host_login is not None and _login_rotates(host_login):
+            logger.warning(
+                "Sharing the host's Codex login with the sandboxed worker so token "
+                "refreshes reach it; disabling Codex's native tools so they cannot read it."
+            )
+            native_tools_allowed = False
 
     codex_dir = Path(codex_path).resolve(strict=False).parent
     policy = with_additional_read_roots(policy, [codex_dir, _FRAMEWORK_PACKAGE_ROOT])

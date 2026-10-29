@@ -291,14 +291,27 @@ def test_worker_grants_plain_host_login_and_snapshots_host_memories(
         worker.close()
 
 
-def test_worker_with_native_tools_gets_private_copy_of_host_login(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("login_text", "native_tools_allowed"),
+    [
+        ('{"OPENAI_API_KEY": "sk-test", "tokens": null}', True),
+        ('{"auth_mode": "chatgpt", "tokens": {"refresh_token": "rt"}}', False),
+        ('{"OPENAI_API_KEY": "sk-test", "tokens": {"refresh_token": "rt"}}', False),
+        ("not json", False),
+    ],
+    ids=["api-key", "chatgpt", "api-key-and-chatgpt", "unparseable"],
+)
+def test_worker_copies_host_login_only_when_it_cannot_rotate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    login_text: str,
+    native_tools_allowed: bool,
 ) -> None:
-    """Native tools share the worker sandbox, so they never get the host login file."""
+    """Native tools may see only a private copy of a login that Codex never refreshes."""
     host_codex = tmp_path / "host-codex"
     host_codex.mkdir()
     host_login = host_codex / "auth.json"
-    host_login.write_text('{"auth_mode": "chatgpt"}')
+    host_login.write_text(login_text)
     host_login.chmod(0o600)
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
@@ -324,17 +337,21 @@ def test_worker_with_native_tools_gets_private_copy_of_host_login(
         spawn_env_names=["PATH", "CODEX_HOME"],
     )
     try:
-        assert worker.native_tools_allowed
+        assert worker.native_tools_allowed is native_tools_allowed
+        granted = [] if native_tools_allowed else [host_login.resolve()]
         for policy in (
             backend.wrap_launcher_argv.call_args.args[1],
             create_launcher.call_args.args[1],
         ):
-            assert policy.write_files == []
+            assert policy.write_files == granted
         private_login = codex_home / "auth.json"
-        assert not private_login.is_symlink()
-        assert private_login.stat().st_mode & 0o777 == 0o600
-        private_login.write_text('{"auth_mode": "changed"}')
-        assert host_login.read_text() == '{"auth_mode": "chatgpt"}'
+        if native_tools_allowed:
+            assert not private_login.is_symlink()
+            assert private_login.stat().st_mode & 0o777 == 0o600
+            private_login.write_text('{"auth_mode": "changed"}')
+            assert host_login.read_text() == login_text
+        else:
+            assert os.readlink(private_login) == str(host_login.resolve())
     finally:
         worker.close()
 
@@ -1273,16 +1290,23 @@ def test_real_bwrap_worker_reads_bridged_codex_home_files(
     [(True, None), (False, ["* chatgpt.com/**"])],
     ids=["allow-network", "egress-rules"],
 )
-def test_real_bwrap_worker_with_native_tools_cannot_reach_host_login(
+@pytest.mark.parametrize("rotating_login", [True, False], ids=["chatgpt", "api-key"])
+def test_real_bwrap_worker_keeps_host_login_from_native_tools(
     tmp_path: Path,
     allow_network: bool,
     egress_rules: list[str] | None,
+    rotating_login: bool,
 ) -> None:
-    """Native tools share the worker sandbox, so it gets only a private copy of the login."""
+    """A ChatGPT login refreshes in place with native tools off; an API-key login is copied."""
     user_codex_home = tmp_path / "home" / ".codex"
     user_codex_home.mkdir(parents=True)
     host_login = user_codex_home / "auth.json"
-    host_login.write_text('{"auth_mode": "chatgpt"}', encoding="utf-8")
+    login_text = (
+        '{"auth_mode": "chatgpt", "tokens": {"refresh_token": "rt"}}'
+        if rotating_login
+        else '{"OPENAI_API_KEY": "sk-test"}'
+    )
+    host_login.write_text(login_text, encoding="utf-8")
     workspace = tmp_path / "project"
     workspace.mkdir()
     codex = tmp_path / "install" / "bin" / "codex"
@@ -1290,7 +1314,7 @@ def test_real_bwrap_worker_with_native_tools_cannot_reach_host_login(
     codex.write_text(
         '#!/bin/sh\ncat "$CODEX_HOME/auth.json" >/dev/null || exit 91\n'
         'echo \'{"refreshed": true}\' >"$CODEX_HOME/auth.json" || exit 92\n'
-        'if cat "$HOST_LOGIN" >/dev/null 2>&1; then exit 93; fi\n',
+        + ("" if rotating_login else 'if cat "$HOST_LOGIN" >/dev/null 2>&1; then exit 93; fi\n'),
         encoding="utf-8",
     )
     codex.chmod(0o755)
@@ -1335,6 +1359,8 @@ def test_real_bwrap_worker_with_native_tools_cannot_reach_host_login(
         worker.close()
         shutil.rmtree(codex_home, ignore_errors=True)
 
-    assert worker.sandboxed and worker.native_tools_allowed
+    assert worker.sandboxed
+    assert worker.native_tools_allowed is not rotating_login
     assert completed.returncode == 0, (completed.returncode, completed.stderr)
-    assert host_login.read_text(encoding="utf-8") == '{"auth_mode": "chatgpt"}'
+    expected_login = '{"refreshed": true}\n' if rotating_login else login_text
+    assert host_login.read_text(encoding="utf-8") == expected_login
