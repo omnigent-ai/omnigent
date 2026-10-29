@@ -239,3 +239,60 @@ describe("useApproveHotkey", () => {
     }
   });
 });
+
+describe("useApproveHotkey Esc", () => {
+  const pending = { type: "elicitation", elicitationId: "e1", status: "pending" };
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  function pressEscapeFrom(target: HTMLElement): KeyboardEvent {
+    target.focus();
+    const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    target.dispatchEvent(event);
+    return event;
+  }
+
+  function mount(html: string, selector: string): HTMLElement {
+    document.body.innerHTML = html;
+    return document.querySelector<HTMLElement>(selector)!;
+  }
+
+  it("declines the newest plain prompt", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    press({}, "Escape");
+    expect(submitApproval).toHaveBeenCalledWith("e1", "decline");
+  });
+
+  it("declines from the chat composer unless its suggestion list is open", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    const composer = mount("<div data-composer-card><textarea></textarea></div>", "textarea");
+    expect(pressEscapeFrom(composer).defaultPrevented).toBe(true);
+    expect(submitApproval).toHaveBeenCalledTimes(1);
+
+    composer.closest<HTMLElement>("[data-composer-card]")!.dataset.suggestionsOpen = "true";
+    pressEscapeFrom(composer);
+    expect(submitApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves question prompts and other text fields alone", () => {
+    blocks = [{ ...pending, askUserQuestion: {} }];
+    renderHook(() => useApproveHotkey(true));
+    press({}, "Escape");
+    expect(submitApproval).not.toHaveBeenCalled();
+
+    blocks = [pending];
+    pressEscapeFrom(mount('<input type="search" />', "input"));
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+
+  it("yields to an open dialog", () => {
+    blocks = [pending];
+    renderHook(() => useApproveHotkey(true));
+    pressEscapeFrom(mount('<div role="dialog"><button>Close</button></div>', "button"));
+    expect(submitApproval).not.toHaveBeenCalled();
+  });
+});

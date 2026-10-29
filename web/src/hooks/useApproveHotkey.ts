@@ -1,6 +1,6 @@
 // Cmd+Enter (Ctrl+Enter on Win/Linux) accepts the pending harness approval
-// prompt — the keyboard equivalent of clicking "Accept" on an ApprovalCard.
-// Bind ONCE at the app shell.
+// prompt — the keyboard equivalent of clicking "Accept" on an ApprovalCard —
+// and Esc declines it, as in the Claude Code terminal UI. Bind ONCE at the app shell.
 //
 // Runs in the CAPTURE phase so it can intercept the keystroke before the
 // composer's own Enter-to-send handler (which fires during bubble and would
@@ -24,13 +24,48 @@
 import { useEffect } from "react";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
-import { ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
-import type { ElicitationBlock } from "@/lib/blocks";
+import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  hasCommandModifier,
+  isFocusInDialogOrMenu,
+  isMacPlatform,
+  isTextEntry,
+} from "@/lib/hotkeys";
+import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
 
 /** Glyphs for the chord this hook matches; shown on plain Approve buttons. */
 export const APPROVE_KEYS = [MOD_KEY, ENTER_KEY] as const;
+/** Glyph for the key that declines; shown on plain Reject buttons. */
+export const DECLINE_KEYS = [ESC_KEY] as const;
+
+/**
+ * The newest pending prompt when it takes a plain accept/decline verdict.
+ * Checking the newest first keeps a form or an unconfirmed delivery from
+ * exposing an older approval.
+ */
+function newestPlainPrompt(blocks: readonly AnyBlock[]): ElicitationBlock | null {
+  const newest = [...blocks]
+    .reverse()
+    .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
+  if (!newest) return null;
+  if (newest.nativeDelivery && newest.nativeDelivery.state !== "ready") return null;
+  const takesAPlainVerdict =
+    !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
+  return takesAPlainVerdict ? newest : null;
+}
+
+/**
+ * Whether Esc belongs to something else: an open dialog, menu, composer
+ * suggestion list, or /btw answer, or a text field other than the chat composer.
+ */
+function escapeBelongsElsewhere(target: EventTarget | null): boolean {
+  if (isFocusInDialogOrMenu() || document.querySelector("[data-btw-overlay]") !== null) return true;
+  if (!(target instanceof HTMLElement)) return false;
+  const composer = target.closest<HTMLElement>("[data-composer-card]:not([data-side-chat])");
+  if (composer) return composer.dataset.suggestionsOpen === "true";
+  return isTextEntry(target);
+}
 
 /**
  * Whether the keystroke landed in a text field that holds a draft — the
@@ -60,6 +95,18 @@ export function isDraftingTarget(target: EventTarget | null): boolean {
 export function useApproveHotkey(isMac = isMacPlatform()): void {
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
+      if (e.key === "Escape") {
+        if (e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+        if (escapeBelongsElsewhere(e.target)) return;
+        const { blocks, submitApproval } = useChatStore.getState();
+        const pending = newestPlainPrompt(blocks);
+        if (!pending) return;
+        // Ahead of the composer's Esc-to-stop: declining is what Esc means here.
+        e.preventDefault();
+        e.stopPropagation();
+        void submitApproval(pending.elicitationId, "decline");
+        return;
+      }
       // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
       // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
       if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
@@ -71,17 +118,8 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       if (isDraftingTarget(e.target)) return;
 
       const { blocks, submitApproval } = useChatStore.getState();
-      // Select the newest pending prompt before checking eligibility, so a
-      // form or an unconfirmed delivery cannot expose an older approval.
-      const newest = [...blocks]
-        .reverse()
-        .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
-      if (!newest) return;
-      if (newest.nativeDelivery && newest.nativeDelivery.state !== "ready") return;
-      const takesAPlainVerdict =
-        !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
-      if (!takesAPlainVerdict) return;
-      const pending = newest;
+      const pending = newestPlainPrompt(blocks);
+      if (!pending) return;
 
       // Intercept before the composer's Enter-to-send handler runs.
       e.preventDefault();

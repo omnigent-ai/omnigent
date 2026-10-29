@@ -35,3 +35,23 @@ export function hasCommandModifier(
 export function isFocusInDialogOrMenu(): boolean {
   return !!document.activeElement?.closest('[role="dialog"], [role="alertdialog"], [role="menu"]');
 }
+
+// Input types that take a click or a choice rather than typed text.
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "image",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+]);
+
+/** Whether the target takes typed text, so keys such as digits and Escape belong to it. */
+export function isTextEntry(target: HTMLElement): boolean {
+  if (target instanceof HTMLTextAreaElement) return true;
+  if (target instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(target.type);
+  return target.closest("[contenteditable]:not([contenteditable='false'])") !== null;
+}

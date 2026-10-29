@@ -13,7 +13,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
-import { isFocusInDialogOrMenu } from "@/lib/hotkeys";
+import { isFocusInDialogOrMenu, isTextEntry } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 
 /**
@@ -78,26 +78,6 @@ const ENTER_OWNING_SELECTOR =
   "a[href], button, input, select, textarea, summary, [contenteditable]:not([contenteditable='false']), [role='button'], [role='link'], [role='checkbox'], [role='radio'], [role='switch'], [role='tab'], [role='menuitem'], [role='option'], [role='combobox'], [role='textbox'], [role='searchbox'], [role='slider']";
 // Buttons and links inside the form, which Enter activates natively.
 const NATIVE_CLICK_SELECTOR = "button, a[href], [role='button'], [role='link']";
-// Input types that take a click or a choice rather than typed text.
-const NON_TEXT_INPUT_TYPES = new Set([
-  "button",
-  "checkbox",
-  "color",
-  "file",
-  "image",
-  "radio",
-  "range",
-  "reset",
-  "submit",
-]);
-
-/** Whether the target takes typed text, so digits and Escape belong to it. */
-function isTextEntry(target: HTMLElement): boolean {
-  if (target instanceof HTMLTextAreaElement) return true;
-  if (target instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(target.type);
-  return target.closest("[contenteditable]:not([contenteditable='false'])") !== null;
-}
-
 export function AskUserQuestionForm({
   questions,
   onSubmit,
