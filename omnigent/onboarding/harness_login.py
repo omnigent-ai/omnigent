@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import shutil
 from dataclasses import dataclass
 from typing import Any, cast
 from urllib.parse import urlparse
+
+from omnigent.onboarding.harness_install import harness_cli_binary
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
 _RPC_TIMEOUT_S = 10.0
 
@@ -61,7 +63,7 @@ class CodexLoginSession:
 
     async def start_app_server(self) -> None:
         """Spawn and initialize the underlying Codex app-server."""
-        codex = shutil.which("codex")
+        codex = harness_cli_binary(OPENAI_FAMILY)
         if codex is None:
             raise RuntimeError("codex is not installed")
         self._process = await asyncio.create_subprocess_exec(
@@ -197,7 +199,7 @@ async def codex_logout() -> None:
 
 async def claude_logout() -> None:
     """Log Claude out through its supported CLI command."""
-    claude = shutil.which("claude")
+    claude = harness_cli_binary(ANTHROPIC_FAMILY)
     if claude is None:
         raise RuntimeError("claude is not installed")
     process = await asyncio.create_subprocess_exec(

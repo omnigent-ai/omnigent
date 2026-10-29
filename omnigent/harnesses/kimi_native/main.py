@@ -120,8 +120,12 @@ class PreparedKimiTerminal:
 
 def _configured_kimi_command(env: Mapping[str, str]) -> str:
     """Return the configured kimi executable name/path from *env*."""
-    value = env.get(_KIMI_PATH_ENV, "").strip()
-    return value or _DEFAULT_KIMI_COMMAND
+    from omnigent.config import load_global_config
+    from omnigent.harness_startup_config import resolve_harness_command
+
+    return resolve_harness_command(
+        "kimi-native", default=_DEFAULT_KIMI_COMMAND, cfg=load_global_config(), env=env
+    )
 
 
 def resolve_kimi_executable(

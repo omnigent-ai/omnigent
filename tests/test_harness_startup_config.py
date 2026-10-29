@@ -220,6 +220,25 @@ def test_resolve_harness_path_canonical_env_wins(monkeypatch: pytest.MonkeyPatch
     assert resolve_harness_path("codex") == "/canonical/codex"
 
 
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [
+        (
+            {"OMNIGENT_KIMI_PATH": " /custom/kimi ", "HARNESS_KIMI_PATH": "/legacy/kimi"},
+            "/custom/kimi",
+        ),
+        ({"HARNESS_KIMI_PATH": "/legacy/kimi"}, "/legacy/kimi"),
+        ({}, "/config/kimi"),
+    ],
+)
+def test_command_uses_supplied_environment(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], expected: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_KIMI_PATH", "/unrelated/ambient/kimi")
+    cfg = {"harness": {"kimi-native": {"command": "/config/kimi"}}}
+    assert resolve_harness_command("kimi-native", default="kimi", cfg=cfg, env=env) == expected
+
+
 def test_resolve_harness_path_legacy_env_warns(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
     """A legacy ``HARNESS_<NAME>_PATH`` value is returned + a deprecation warning."""
     from omnigent.harness_startup_config import _LEGACY_PATH_WARNED

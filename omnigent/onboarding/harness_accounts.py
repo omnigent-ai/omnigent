@@ -12,7 +12,9 @@ from typing import Any, cast
 
 from omnigent.harness_accounts import HarnessAccount, HarnessAccounts
 from omnigent.inner import _proc
+from omnigent.onboarding.harness_install import PI_KEY, harness_cli_binary
 from omnigent.onboarding.opencode_auth import _ENV_PROVIDER_VARS, opencode_auth_summary
+from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, OPENAI_FAMILY
 
 _PROBE_TIMEOUT_S = 5.0
 HARNESS_ACCOUNT_KEYS = ("codex", "claude", "pi", "opencode")
@@ -30,7 +32,7 @@ class _StdioJsonRpc:
         timeout_s: float = _PROBE_TIMEOUT_S,
         cancel_event: threading.Event | None = None,
     ) -> None:
-        codex = shutil.which("codex")
+        codex = harness_cli_binary(OPENAI_FAMILY)
         if codex is None:
             raise FileNotFoundError("codex is not installed")
         self._deadline = time.monotonic() + timeout_s
@@ -125,7 +127,7 @@ def _codex_account(
     deadline: float,
     cancel_event: threading.Event | None,
 ) -> HarnessAccount | None:
-    if shutil.which("codex") is None:
+    if harness_cli_binary(OPENAI_FAMILY) is None:
         return None
     rpc: _StdioJsonRpc | None = None
     try:
@@ -222,7 +224,7 @@ def _run_json_command(
 def _claude_account(
     *, deadline: float, cancel_event: threading.Event | None
 ) -> HarnessAccount | None:
-    claude = shutil.which("claude")
+    claude = harness_cli_binary(ANTHROPIC_FAMILY)
     if claude is None:
         return None
     return_code, payload = _run_json_command(
@@ -254,7 +256,7 @@ def _claude_account(
 
 
 def _pi_account(*, deadline: float, cancel_event: threading.Event | None) -> HarnessAccount | None:
-    pi = shutil.which("pi")
+    pi = harness_cli_binary(PI_KEY)
     if pi is None:
         return None
     providers: list[dict[str, str]] = []

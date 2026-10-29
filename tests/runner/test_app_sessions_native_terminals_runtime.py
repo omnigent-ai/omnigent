@@ -2768,10 +2768,12 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("authenticated", [False, True])
+@pytest.mark.parametrize("command_source", ["canonical", "legacy", "config"])
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     authenticated: bool,
+    command_source: str,
 ) -> None:
     """
     Snapshot ``terminal_launch_args`` reach the launched kimi argv.
@@ -2785,7 +2787,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     """
     import omnigent.harnesses.kimi_native.credentials as kimi_creds_mod
     import omnigent.harnesses.kimi_native.forwarder as kimi_fwd_mod
-    import omnigent.harnesses.kimi_native.main as kimi_mod
+    from omnigent.config import save_global_config
     from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
     from omnigent.runner import app as runner_app_mod
     from omnigent.runner.app import _auto_create_kimi_terminal
@@ -2810,7 +2812,18 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
         "omnigent.runner._entry._make_auth_token_factory",
         lambda: auth_factory if authenticated else None,
     )
-    monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    for name in ("OMNIGENT_KIMI_PATH", "HARNESS_KIMI_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    command = tmp_path / "custom-tools" / "kimi"
+    command.parent.mkdir()
+    command.write_text("#!/bin/sh\nexit 0\n")
+    command.chmod(0o755)
+    save_global_config({"harness": {"kimi-native": {"command": str(command)}}})
+    if command_source != "config":
+        save_global_config({"harness": {"kimi-native": {"command": "/wrong/config"}}})
+        name = "OMNIGENT_KIMI_PATH" if command_source == "canonical" else "HARNESS_KIMI_PATH"
+        monkeypatch.setenv(name, str(command))
     # Keep the session-home build off the user's real kimi config.
     monkeypatch.setattr(
         kimi_creds_mod,
@@ -2889,7 +2902,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     assert len(launched_specs) == 1
     spec = launched_specs[0]
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.
-    assert spec.command == "/fake/bin/kimi"
+    assert spec.command == str(command)
     assert spec.args == ["--yolo"]
 
 

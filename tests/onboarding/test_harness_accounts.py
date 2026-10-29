@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent import _platform
 from omnigent import harness_accounts as account_types
 from omnigent.inner import _proc
 from omnigent.onboarding import harness_accounts, harness_login
@@ -23,8 +24,9 @@ def _executable(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
+@pytest.mark.parametrize("discovery", ["path", "global-install"])
 def test_codex_probe_reads_chatgpt_identity_from_app_server(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, discovery: str
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -42,6 +44,10 @@ for line in sys.stdin:
 """,
     )
     monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    if discovery == "global-install":
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (bin_dir,))
 
     assert harness_accounts.harness_account_map() == {
         "codex": {
@@ -53,8 +59,9 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("discovery", ["path", "global-install"])
 async def test_codex_login_and_logout_use_app_server(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, discovery: str
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -80,6 +87,10 @@ for line in sys.stdin:
 """,
     )
     monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    if discovery == "global-install":
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (bin_dir,))
 
     session = harness_login.CodexLoginSession()
     try:
@@ -127,8 +138,9 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("discovery", ["path", "global-install"])
 async def test_claude_logout_uses_supported_cli(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, discovery: str
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -139,12 +151,17 @@ raise SystemExit(0 if sys.argv[1:] == ['auth', 'logout'] else 2)
 """,
     )
     monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    if discovery == "global-install":
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (bin_dir,))
 
     await harness_login.claude_logout()
 
 
+@pytest.mark.parametrize("discovery", ["path", "global-install"])
 def test_claude_and_pi_probes_use_supported_json_commands(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, discovery: str
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -169,6 +186,10 @@ else:
 """,
     )
     monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: ())
+    if discovery == "global-install":
+        monkeypatch.setenv("PATH", "")
+        monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (bin_dir,))
 
     accounts = harness_accounts.harness_account_map()
     assert accounts["claude"] == {
@@ -478,3 +499,39 @@ def test_opencode_probe_includes_env_and_config_sources(
         ],
     }
     assert "must-not-leak" not in json.dumps(account)
+
+
+@pytest.mark.parametrize("key,command", [("anthropic", "claude"), ("openai", "codex")])
+def test_subscription_auth_uses_the_discovered_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, command: str
+) -> None:
+    from omnigent.onboarding import harness_install
+
+    state = tmp_path / "logged-in"
+    _executable(
+        tmp_path / command,
+        f"""import json, sys
+from pathlib import Path
+state = Path({str(state)!r})
+args = sys.argv[1:]
+if args in (['auth', 'login', '--claudeai'], ['login']):
+    state.touch()
+elif args in (['auth', 'logout'], ['logout']):
+    state.unlink(missing_ok=True)
+elif args in (['auth', 'status'], ['login', 'status']):
+    print(json.dumps({{'loggedIn': state.exists()}}))
+    sys.exit(0 if state.exists() else 1)
+else:
+    sys.exit(2)
+""",
+    )
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+    assert harness_install.harness_cli_binary(key) == str(tmp_path / command)
+    assert not harness_install.harness_cli_logged_in(key)
+    assert harness_install.harness_login(key)
+    assert state.exists()
+    assert harness_install.harness_logout(key)
+    assert not state.exists()
