@@ -18,6 +18,7 @@ will start instantiating them as those phases ship.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import UTC
 from typing import Any
@@ -112,13 +113,19 @@ _SESSION_OWNER_CACHE: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.LRUCache(maxsize=4096)
 )
 
+_POLICY_SPECS_CACHE_TTL_S = 30.0
+
+# Cached policy lists are stored with the ``time.monotonic()`` of the store read,
+# so a no-policy answer can say how old it is (see policy_specs_cache_age).
+_CachedPolicySpecs = tuple[list[PolicySpec], float]
+
 # TTL cache of ``workspace_id -> list[PolicySpec]`` for DB-stored default
 # policies. Default policies are admin-managed and change infrequently, so
 # a short TTL (30 s) avoids one ``list_defaults()`` DB query per tool-call
 # evaluation while still propagating changes within half a minute.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed solely by workspace_id
-_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachetools.TTLCache(
-    maxsize=256, ttl=30
+_DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, _CachedPolicySpecs] = cachetools.TTLCache(
+    maxsize=256, ttl=_POLICY_SPECS_CACHE_TTL_S
 )
 
 # TTL+LRU cache of ``conversation_id -> list[PolicySpec]`` for session-scoped
@@ -129,8 +136,8 @@ _DEFAULT_POLICY_SPECS_CACHE: cachetools.TTLCache[int, list[PolicySpec]] = cachet
 # cannot evict another replica's in-process cache — without it, a deleted session
 # policy would remain enforced on other replicas indefinitely (no natural expiry).
 # TTLCache subsumes LRU eviction, bounding memory the same way.
-_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, list[PolicySpec]] = WorkspaceScopedCache(
-    lambda: cachetools.TTLCache(maxsize=4096, ttl=30)
+_SESSION_POLICY_SPECS_CACHE: WorkspaceScopedCache[str, _CachedPolicySpecs] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=_POLICY_SPECS_CACHE_TTL_S)
 )
 
 
@@ -1727,9 +1734,10 @@ def _load_default_policy_specs(
     from omnigent.db.db_models import current_workspace_id
 
     workspace_id = current_workspace_id()
-    cached: list[PolicySpec] | None = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
+    cached = _DEFAULT_POLICY_SPECS_CACHE.get(workspace_id)
     if cached is not None:
-        return cached
+        return cached[0]
+    loaded_at = time.monotonic()
     specs: list[PolicySpec] = []
     for policy in policy_store.list_defaults():
         if not policy.enabled:
@@ -1750,7 +1758,7 @@ def _load_default_policy_specs(
             )
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = specs
+    _DEFAULT_POLICY_SPECS_CACHE[workspace_id] = (specs, loaded_at)
     return specs
 
 
@@ -1816,17 +1824,44 @@ def _load_session_policy_specs(
     """
     if policy_store is None:
         return []
-    cached: list[PolicySpec] | None = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
+    cached = _SESSION_POLICY_SPECS_CACHE.get(conversation_id)
     if cached is not None:
-        return cached
+        return cached[0]
+    loaded_at = time.monotonic()
     stored = policy_store.list_for_session(conversation_id)
     specs: list[PolicySpec] = []
     for policy in stored:
         if not policy.enabled:
             continue
         specs.append(_stored_policy_to_spec(policy))
-    _SESSION_POLICY_SPECS_CACHE[conversation_id] = specs
+    _SESSION_POLICY_SPECS_CACHE[conversation_id] = (specs, loaded_at)
     return specs
+
+
+def policy_specs_cache_age(conversation_id: str, policy_store: PolicyStore | None) -> float:
+    """
+    Return how old the store reads behind a session's cached policy lists are.
+
+    A no-policy answer from :func:`any_policies_apply` is only as fresh as the
+    older of the default and session lists it read, so anything that lets
+    callers reuse that answer must subtract this age. A list no longer cached
+    counts as a full cache TTL old.
+
+    :param conversation_id: The session, e.g. ``"conv_abc123"``.
+    :param policy_store: The policy store; ``None`` means there are no stored
+        policies to go stale.
+    :returns: Age in seconds, e.g. ``12.5``.
+    """
+    if policy_store is None:
+        return 0.0
+    from omnigent.db.db_models import current_workspace_id
+
+    now = time.monotonic()
+    entries = (
+        _DEFAULT_POLICY_SPECS_CACHE.get(current_workspace_id()),
+        _SESSION_POLICY_SPECS_CACHE.get(conversation_id),
+    )
+    return max(_POLICY_SPECS_CACHE_TTL_S if entry is None else now - entry[1] for entry in entries)
 
 
 def _stored_policy_to_spec(policy: StoredPolicy) -> PolicySpec:

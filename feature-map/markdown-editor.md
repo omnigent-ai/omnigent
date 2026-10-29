@@ -234,6 +234,15 @@ instead of treating one comparison clip as complete feature verification.
   TipTap 3.31.4. `web/src/shell/tiptapBoundedTokenizers.test.ts` checks upstream
   token compatibility and line-splitting volume using the CUJ fixture. Remove
   these bounds when upstream avoids the repeated whole-remainder scans.
+- Footnote references (`[^1]`) render as superscripts when the file defines
+  them, and definition lines as read-only source text; edit definitions in
+  Source. Typing, pasting or Enter over a selected footnote keeps it;
+  Backspace or Delete removes it. Saves keep footnotes and the final newline,
+  except a reference inside bold or italic moves just outside those marks;
+  reference syntax in link text stays literal, so the link is kept.
+- Reference-style links (`[text][label]`, `[text][]`, `[text]`) save in that
+  form while their URL, title and label still match a definition; otherwise
+  they save inline. Link definition lines show read-only, like footnotes.
 - Load measurements do not establish typing latency. Dirty detection compares
   immutable editor documents; autosave still serializes the whole document.
   Changes that serialize identically become clean when autosave checks them.

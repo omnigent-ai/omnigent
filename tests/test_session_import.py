@@ -15,6 +15,7 @@ from omnigent.harnesses.kiro_native.session_forwarder import (
     KiroConversationMessage,
     parse_kiro_jsonl_line,
 )
+from omnigent.harnesses.pi_native.resume import pi_session_records_from_session_items
 from omnigent.session_import import local as local_import
 from omnigent.session_import.local import (
     list_recent_local_session_ids,
@@ -2214,3 +2215,121 @@ def test_list_recent_sessions_across_harnesses_normalizes_millisecond_recency(
     result = local_import.list_recent_sessions_across_harnesses(limit=1)
 
     assert result == [("claude", "c1")]
+
+
+@pytest.mark.parametrize("version", [1, 3])
+@pytest.mark.parametrize(
+    "boundary", ["recent", "recent-image", "recent-image-only", "all", "missing", "repeated"]
+)
+def test_pi_import_retains_compaction_for_resume(
+    tmp_path: Path, version: int, boundary: str
+) -> None:
+    """Keep readable history while resuming only the summary and retained tail."""
+    keep_recent = boundary.startswith("recent")
+    records = [
+        {"type": "session", "version": version, "id": "old-pi", "cwd": "/repo"},
+        {"type": "message", "message": {"role": "user", "content": "old large prompt"}},
+        {"type": "message", "message": {"role": "assistant", "content": "old large answer"}},
+        {"type": "message", "message": {"role": "user", "content": "recent question"}},
+        {
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "read-1",
+                        "name": "read",
+                        "arguments": {"path": "a.txt"},
+                    }
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "read-1",
+                "content": [{"type": "text", "text": "recent file"}],
+            },
+        },
+        {
+            "type": "compaction",
+            "summary": "Remember the migration decision.",
+            "tokensBefore": 10000,
+        },
+        {"type": "message", "message": {"role": "user", "content": "continue after compaction"}},
+    ]
+    if "image" in boundary:
+        records[3]["message"]["content"] = [
+            *([] if boundary.endswith("only") else [{"type": "text", "text": "recent question"}]),
+            {"type": "image", "mimeType": "image/png", "data": "aW1hZ2U="},
+        ]
+    for index, record in enumerate(records[1:], 1):
+        record.update(id=f"entry-{index}", parentId=f"entry-{index - 1}" if index > 1 else None)
+    records[6]["firstKeptEntryId"] = "entry-3" if keep_recent else "entry-6"
+    if boundary == "missing":
+        records[6]["firstKeptEntryId"] = "missing"
+    if boundary == "repeated":
+        records.append(
+            {
+                "type": "compaction",
+                "id": "entry-8",
+                "parentId": "entry-7",
+                "summary": "Updated migration decision.",
+                "firstKeptEntryId": "entry-7",
+                "firstKeptEntryIndex": 7,
+            }
+        )
+    if version == 1:
+        # Pi's migrateV1ToV2 indexes entries including the session header.
+        records[6]["firstKeptEntryIndex"] = (
+            3 if keep_recent else 99 if boundary == "missing" else 6
+        )
+        records[6].pop("firstKeptEntryId")
+        for record in records[1:]:
+            record.pop("id")
+            record.pop("parentId")
+            record.pop("firstKeptEntryId", None)
+    path = tmp_path / "sessions" / "repo" / "old.jsonl"
+    path.parent.mkdir(parents=True)
+    original = "".join(json.dumps(record) + "\n" for record in records)
+    path.write_text(original)
+
+    imported = load_pi_session("old-pi", pi_home=tmp_path)
+    assert path.read_text() == original
+    assert "old large answer" in json.dumps([item.data.model_dump() for item in imported.items])
+    checkpoints = [item for item in imported.items if item.type == "compaction"]
+    assert len(checkpoints) == {"missing": 0, "repeated": 2}.get(boundary, 1)
+    if "image" in boundary:
+        assert "data:image/png;base64,aW1hZ2U=" in json.dumps(
+            [item.data.model_dump() for item in imported.items]
+        )
+    rebuilt = pi_session_records_from_session_items(
+        [
+            {"type": item.type, "response_id": item.response_id, **item.data.model_dump()}
+            for item in imported.items
+        ],
+        session_id="imported",
+        external_session_id="old-pi",
+        cwd=Path("/repo"),
+    )
+    context = json.dumps(rebuilt)
+    assert "continue after compaction" in context
+    if boundary == "missing":
+        assert "old large answer" in context
+        assert "recent file" in context
+        return
+    if boundary == "repeated":
+        assert "Updated migration decision." in context
+        assert "Remember the migration decision." not in context
+    else:
+        assert "Remember the migration decision." in context
+    assert "old large" not in context
+    assert ("recent question" in context) is (keep_recent and not boundary.endswith("only"))
+    assert ("recent file" in context) is keep_recent
+    if keep_recent:
+        result = next(
+            row["message"] for row in rebuilt if row.get("message", {}).get("role") == "toolResult"
+        )
+        assert result["toolName"] == "read"

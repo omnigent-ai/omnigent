@@ -735,7 +735,8 @@ async function importLocalSessionsBuffered(
  * @param metadata - Session-level metadata (host_id, workspace, labels, etc.).
  *   A `project_id` files the session into that project atomically at create
  *   and lets the server default-fill absent fields from the project config.
- * @returns The created session's id.
+ * @returns The created session's id, and the id of the session-scoped agent
+ *   created from the bundle.
  */
 export async function createBundledSession(
   bundle: File,
@@ -749,7 +750,7 @@ export async function createBundledSession(
     git?: { branch_name: string; base_branch?: string };
     mcp_registry_services?: string[];
   } = {},
-): Promise<{ id: string }> {
+): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
@@ -770,8 +771,9 @@ export async function createBundledSession(
   // so callers don't need to care which path was taken.
   const body = (await res.json()) as {
     session_id: string;
+    agent_id?: string;
   };
-  return { id: body.session_id };
+  return { id: body.session_id, agentId: body.agent_id };
 }
 
 /**

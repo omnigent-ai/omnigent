@@ -167,6 +167,23 @@ def _parse_model_prefixes(
     return [p.strip() for p in raw if isinstance(p, str) and p.strip()]
 
 
+def _parse_native_hook_allow_cache_seconds(raw: object) -> Callable[[], float] | None:
+    """Parse the ``native_hook_allow_cache_seconds`` server config value.
+
+    :param raw: The configured window in seconds, e.g. ``60``; ``None`` when
+        the key is absent.
+    :returns: A resolver for ``RuntimeCaps.native_hook_allow_cache_seconds``,
+        or ``None`` to keep every native policy hook a server round trip.
+    :raises click.ClickException: If the value is not a number.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise click.ClickException("native_hook_allow_cache_seconds must be a number of seconds")
+    seconds = float(raw)
+    return lambda: seconds
+
+
 def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     value = routing_cfg.get(key)
     if isinstance(value, str):
@@ -4832,6 +4849,9 @@ def server(
         routing_client=routing_backends.any(),
         routing_backends=routing_backends,
         routing_settings=routing_settings,
+        native_hook_allow_cache_seconds=_parse_native_hook_allow_cache_seconds(
+            cfg.get("native_hook_allow_cache_seconds")
+        ),
     )
     init_runtime(
         conversation_store=conversation_store,
