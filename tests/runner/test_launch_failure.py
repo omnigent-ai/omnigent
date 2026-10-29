@@ -119,6 +119,36 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Error: Invalid MCP configuration:\nMCP config file not found: /tmp/mcp.json",
+        "Error: Invalid MCP configuration:\nFailed to parse JSON in /tmp/mcp.json",
+        "MCP config file not found: /tmp/mcp.json\n"
+        "No such file or directory\nClaude Code exited with code 1",
+    ],
+)
+def test_classifies_mcp_configuration_failure_before_missing_binary(output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=0, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Agent MCP configuration is invalid or missing"
+    assert diagnosis.category is ErrorCategory.CONFIG
+    assert diagnosis.remediation is not None
+    assert "configuration" in diagnosis.remediation.lower()
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Checking available disk space before launch",
+        "MCP server disconnected",
+        "Configuration loaded successfully",
+    ],
+)
+def test_generic_environment_messages_remain_unclassified(output: str) -> None:
+    assert classify_terminal_failure(command="env", exit_status=1, output=output) is None
+
+
 def test_classifies_gateway_claude_version_failure() -> None:
     diagnosis = classify_terminal_failure(
         command="env",

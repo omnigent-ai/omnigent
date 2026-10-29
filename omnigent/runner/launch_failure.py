@@ -147,6 +147,24 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
     _TerminalMatcher(
+        "invalid_mcp_configuration",
+        lambda s: s.output_contains_any(
+            ("invalid mcp configuration", "mcp config file not found")
+        ),
+        FailureDiagnosis(
+            title="Agent MCP configuration is invalid or missing",
+            cause=(
+                "The agent CLI could not load its MCP configuration, so the session "
+                "could not start."
+            ),
+            remediation=(
+                "Check the MCP configuration file named in the terminal output on the "
+                "agent's host. Restore a missing file or correct its contents, or remove "
+                "the stale configuration argument from the launcher, then retry."
+            ),
+        ),
+    ),
+    _TerminalMatcher(
         "missing_binary",
         lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),
         FailureDiagnosis(
