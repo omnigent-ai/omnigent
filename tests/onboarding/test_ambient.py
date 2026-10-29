@@ -1051,16 +1051,11 @@ def test_claude_code_managed_mcp_presence_counts_unparseable_file(tmp_path, monk
 
 
 @pytest.mark.parametrize(
-    ("platform", "deployed_for", "expected"),
-    [
-        ("darwin", "macos", True),
-        ("darwin", "linux", False),
-        ("linux", "linux", True),
-        ("linux", "macos", False),
-    ],
+    ("platform", "own_dir", "other_dir"),
+    [("darwin", "macos", "linux"), ("linux", "linux", "macos")],
 )
-def test_claude_code_managed_mcp_presence_reads_only_this_platforms_directory(
-    tmp_path, monkeypatch, platform: str, deployed_for: str, expected: bool
+def test_claude_code_managed_mcp_reads_only_this_platforms_directory(
+    tmp_path, monkeypatch, platform: str, own_dir: str, other_dir: str
 ) -> None:
     managed_dirs = {"macos": tmp_path / "macos", "linux": tmp_path / "linux"}
     for managed_dir in managed_dirs.values():
@@ -1073,9 +1068,12 @@ def test_claude_code_managed_mcp_presence_reads_only_this_platforms_directory(
         tuple(managed_dir / "managed-settings.json" for managed_dir in managed_dirs.values()),
     )
     monkeypatch.setattr(ambient.sys, "platform", platform)
-    (managed_dirs[deployed_for] / "managed-mcp.json").write_text("{}")
 
-    assert ambient.claude_code_managed_mcp_present() is expected
+    assert ambient.claude_code_managed_mcp_paths() == (managed_dirs[own_dir] / "managed-mcp.json",)
+    (managed_dirs[other_dir] / "managed-mcp.json").write_text("{}")
+    assert not ambient.claude_code_managed_mcp_present()
+    (managed_dirs[own_dir] / "managed-mcp.json").write_text("{}")
+    assert ambient.claude_code_managed_mcp_present()
 
 
 @pytest.mark.skipif(

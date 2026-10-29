@@ -636,13 +636,18 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
 def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
     """Claude Code's enterprise MCP config, which sits beside its managed settings.
 
-    Only locations that are absolute on this platform: the chain names every OS, and
-    a Windows path read on POSIX would resolve against the working directory.
+    Claude Code reads only its own platform's directory, so this skips the other POSIX
+    one, and Windows paths on POSIX, which would resolve against the working directory.
     """
+    other_platform_dir = (
+        _CLAUDE_CODE_LINUX_MANAGED_DIR
+        if sys.platform == "darwin"
+        else _CLAUDE_CODE_MACOS_MANAGED_DIR
+    )
     return tuple(
         path.with_name("managed-mcp.json")
         for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
-        if path.is_absolute()
+        if path.is_absolute() and path.parent != other_platform_dir
     )
 
 
@@ -652,17 +657,7 @@ def claude_code_managed_mcp_present() -> bool:
     Like Claude Code, an unreadable file still counts but an inaccessible directory
     does not, which is why this uses ``os.path.exists`` rather than ``Path.exists``.
     """
-    # Claude Code reads only its own platform's directory, unlike the chain.
-    other_platform_dir = (
-        _CLAUDE_CODE_LINUX_MANAGED_DIR
-        if sys.platform == "darwin"
-        else _CLAUDE_CODE_MACOS_MANAGED_DIR
-    )
-    return any(
-        os.path.exists(path)
-        for path in claude_code_managed_mcp_paths()
-        if path.parent != other_platform_dir
-    )
+    return any(os.path.exists(path) for path in claude_code_managed_mcp_paths())
 
 
 def _claude_login_detected() -> bool:
