@@ -647,7 +647,7 @@ export function ApprovalCard({
   }
 
   if (status === "pending" && terminalFallback) {
-    // Only this session's own terminal can answer; a mirrored or side-chat card names another one.
+    // Hide Open terminal for mirrored or side-chat cards; only this session's terminal can answer.
     const canOpenTerminal =
       !requester && !scopedConversationId && Boolean(terminalFirst?.isTerminalFirst);
     return (

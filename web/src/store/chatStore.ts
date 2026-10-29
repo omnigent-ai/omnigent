@@ -78,11 +78,12 @@ import {
   updateSession,
 } from "@/lib/sessionsApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
-import type {
-  McpServerStartup,
-  SessionInputConsumedEvent,
-  SessionViewer,
-  StreamEvent,
+import {
+  PROMPT_IN_TERMINAL_STATUS,
+  type McpServerStartup,
+  type SessionInputConsumedEvent,
+  type SessionViewer,
+  type StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
@@ -3460,7 +3461,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
-    } catch {
+    } catch (err) {
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.
@@ -3483,6 +3484,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             : b,
         ),
       }));
+      // The stream missed the prompt moving to the terminal; fetch the held card.
+      if (err instanceof ApiError && err.status === PROMPT_IN_TERMINAL_STATUS) {
+        void reconcilePendingElicitations(sessionId);
+      }
     }
   },
 
@@ -4535,7 +4540,8 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  * elsewhere" — the same end state the `response.elicitation_resolved` SSE
  * event produces. This is the recovery path for a backgrounded tab that
  * missed that event (e.g. the approval was answered in the native-terminal
- * popup while the web tab was hidden). No-op when the session changed mid-
+ * popup while the web tab was hidden). A still-pending card whose terminal
+ * hold changed takes the snapshot's copy. No-op when the session changed mid-
  * fetch, the fetch fails (transient — the next focus retries), or nothing
  * is stale.
  *
@@ -4543,6 +4549,7 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  */
 async function reconcilePendingElicitations(id: string): Promise<void> {
   if (queryClient === null) return;
+  const cardsBeforeFetch = captureElicitationIdsByStatus(setterForState(id)?.blocks ?? []).cards;
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
@@ -4564,14 +4571,25 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
       .map((e) => (typeof e.elicitation_id === "string" ? e.elicitation_id : null))
       .filter((x): x is string => x !== null),
   );
+  const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   setterFor(id)((s) => {
     let changed = false;
     const blocks = s.blocks.map((b) => {
+      if (b.type !== "elicitation" || b.status !== "pending") return b;
+      const current = snapshotPending.find(
+        (candidate): candidate is ElicitationBlock =>
+          candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
+      );
+      // A live event that changed the card during the fetch is newer than the snapshot.
       if (
-        b.type === "elicitation" &&
-        b.status === "pending" &&
-        !stillPending.has(b.elicitationId)
+        current &&
+        cardsBeforeFetch.get(b.elicitationId) === b &&
+        terminalHoldChanged(current, b)
       ) {
+        changed = true;
+        return { ...current, ctx: b.ctx };
+      }
+      if (!stillPending.has(b.elicitationId)) {
         changed = true;
         const updated: ElicitationBlock = {
           ...b,

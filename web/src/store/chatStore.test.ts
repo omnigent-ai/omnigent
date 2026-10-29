@@ -10914,6 +10914,47 @@ describe("chatStore — submitApproval", () => {
     expect(useChatStore.getState().blocks).toEqual([]);
   });
 
+  it("shows the terminal card when an answer is refused for a hold the stream missed", async () => {
+    const prompt = {
+      type: "response.elicitation_request",
+      elicitation_id: "elic_held",
+      params: {
+        mode: "form",
+        message: "Approve?",
+        phase: "tool_call_approval",
+        policy_name: "test_policy",
+        content_preview: "",
+      },
+    };
+    seedSession("conv_held", []);
+    seedPendingElicitations("conv_held", [prompt]);
+    await useChatStore.getState().switchTo("conv_held");
+    // The re-publish with the hold never reached this stream; only the snapshot has it.
+    seedPendingElicitations("conv_held", [
+      { ...prompt, params: { ...prompt.params, terminal_fallback: { answer_undelivered: false } } },
+    ]);
+    fetchMock.mockImplementation((input, init) =>
+      String(input).endsWith("/v1/sessions/conv_held/elicitations/elic_held/resolve")
+        ? mockResponse({ error: { code: "prompt_in_terminal" } }, { ok: false, status: 423 })
+        : defaultFetchHandler(input, init),
+    );
+
+    await useChatStore.getState().submitApproval("elic_held", "accept");
+    await tick();
+    await tick();
+
+    const cards = conversationRegistry
+      .peek("conv_held")!
+      .getState()
+      .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      status: "pending",
+      response: null,
+      terminalFallback: { answerUndelivered: false },
+    });
+  });
+
   it("only updates the matching elicitation by id (other pending blocks untouched)", async () => {
     useChatStore.setState({
       conversationId: "conv_abc",

@@ -187,6 +187,9 @@ export interface ElicitationTerminalFallback {
   answerUndelivered: boolean;
 }
 
+/** The server refuses an answer with 423 once its prompt waits in the agent's terminal. */
+export const PROMPT_IN_TERMINAL_STATUS = 423;
+
 export interface ElicitationRequest {
   nativeDelivery?: NativePermissionDelivery;
   terminalFallback?: ElicitationTerminalFallback;
