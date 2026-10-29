@@ -165,6 +165,23 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             category=ErrorCategory.UPSTREAM,
         ),
     ),
+    # The same launcher upgrades a too-old Databricks CLI itself; when the
+    # installer fails (e.g. an older CLI already holds its target path) it exits.
+    _TerminalMatcher(
+        "gateway_databricks_cli_install_failed",
+        lambda s: "failed to install/upgrade databricks cli automatically" in s.output,
+        FailureDiagnosis(
+            title="The Databricks gateway launcher couldn't install the Databricks CLI",
+            cause=(
+                "The launcher exited before starting Claude Code because it couldn't "
+                "install or upgrade the Databricks CLI on the host."
+            ),
+            remediation=(
+                "Install a current Databricks CLI on the host, removing an older one first "
+                "if the terminal output names it. Then send your message again."
+            ),
+        ),
+    ),
     _TerminalMatcher(
         "missing_binary",
         lambda s: s.exit_code == 127 or s.output_contains_any(_MISSING_MARKERS),

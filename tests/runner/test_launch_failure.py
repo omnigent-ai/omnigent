@@ -174,6 +174,25 @@ def test_classifies_gateway_databricks_cli_version_failure(probe_output: str) ->
     assert diagnosis.category is ErrorCategory.UPSTREAM
 
 
+def test_classifies_gateway_databricks_cli_install_failure() -> None:
+    # The installer's own advice mentions an existing file, which must not read as a missing CLI.
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=0,
+        output=(
+            "! Databricks CLI v0.17.0 is too old (need v1.0.0 or newer).\nUpgrading...\n"
+            "Target path /usr/local/bin/databricks already exists.\n"
+            "  sudo rm '/usr/local/bin/databricks'\n"
+            "ERROR Failed to install/upgrade Databricks CLI automatically.\n"
+            "│ Claude Code exited with code 1 │"
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "The Databricks gateway launcher couldn't install the Databricks CLI"
+    assert diagnosis.remediation is not None
+    assert "Install a current Databricks CLI" in diagnosis.remediation
+
+
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     # Ordering guard: the root case also reads like a permission problem, so it
     # must be matched before any broader rule.
