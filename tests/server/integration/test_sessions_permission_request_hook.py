@@ -31,7 +31,7 @@ import json
 import threading
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock
 
 import httpx
@@ -2531,9 +2531,10 @@ async def _sever_hook_mid_turn(
     grace_s: float = 0.2,
     release_grace: asyncio.Event | None = None,
     parent_session_id: str | None = None,
+    turn_status: Literal["running", "waiting"] = "running",
 ) -> tuple[str, dict[str, Any], Any]:
     """
-    Park a native hook prompt in a running session, then sever its hook.
+    Park a native hook prompt in a session mid-turn, then sever its hook.
 
     :param client: Test HTTP client.
     :param monkeypatch: Pytest monkeypatch fixture.
@@ -2546,6 +2547,7 @@ async def _sever_hook_mid_turn(
         the test can act within it without racing the clock.
     :param parent_session_id: Session to create the prompting session under,
         or ``None`` for a top-level session.
+    :param turn_status: The session's mid-turn status.
     :returns: The session id, the hook payload, and a collector that has
         already consumed the original elicitation request.
     """
@@ -2581,7 +2583,7 @@ async def _sever_hook_mid_turn(
         )
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
-    monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
+    monkeypatch.setitem(sessions_route._session_status_cache, session_id, turn_status)
     payload = {
         **(await _claude_permission_payload()),
         "_omnigent_elicitation_id": elicitation_id,
@@ -2608,10 +2610,14 @@ async def _finish_deferred_clears() -> None:
         await asyncio.wait_for(task, timeout=5.0)
 
 
-@pytest.mark.parametrize("ancestor_mirror_fails", [False, True])
+@pytest.mark.parametrize(
+    ("turn_status", "ancestor_mirror_fails"),
+    [("running", False), ("running", True), ("waiting", False)],
+)
 async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    turn_status: Literal["running", "waiting"],
     ancestor_mirror_fails: bool,
 ) -> None:
     """
@@ -2641,7 +2647,10 @@ async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
             _mirror_fails_for_terminal_card,
         )
     session_id, _payload, collector = await _sever_hook_mid_turn(
-        client, monkeypatch, f"test-terminal-fallback-unanswered-{ancestor_mirror_fails}"
+        client,
+        monkeypatch,
+        f"test-terminal-fallback-unanswered-{turn_status}-{ancestor_mirror_fails}",
+        turn_status=turn_status,
     )
     try:
         waiting = await _next_elicitation_event(collector)
