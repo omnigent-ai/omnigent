@@ -1896,7 +1896,9 @@ class SessionResourceRegistry:
             and instance.session_closed_on_live_server()
             and not _pane_killed_by_omnigent(instance.private_dir)
         )
-        lifecycle_context["terminal_closed_outside_omnigent"] = str(closed_outside_omnigent).lower()
+        lifecycle_context["terminal_closed_outside_omnigent"] = str(
+            closed_outside_omnigent
+        ).lower()
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
