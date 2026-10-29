@@ -3141,6 +3141,8 @@ async def _persist_external_conversation_item_unlocked(
                 # The mirror's true owner may be any entry still queued, so none
                 # of them can be declared undelivered later.
                 pending_inputs.mark_uncertain(session_id)
+        if drained is None and not agent_message_candidate:
+            _log_late_native_record(session_id, text)
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
@@ -3229,6 +3231,8 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    for skipped in skipped_pending:
+        pending_inputs.remember_declared_missing(session_id, skipped)
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)
@@ -3605,6 +3609,26 @@ def _release_drained_inputs(
     for entry in entries:
         if entry is not None:
             pending_inputs.release(session_id, entry)
+
+
+def _log_late_native_record(session_id: str, text: str) -> None:
+    """
+    Log a transcript record for a message already reported missing.
+
+    Such a record means the harness wrote the message after the detector gave
+    up on it. Only the pending id and age are logged, never the text.
+    """
+    late = pending_inputs.take_declared_missing(session_id, text)
+    if late is None:
+        return
+    pending_id, age_ms = late
+    log_input_event(
+        _logger,
+        "native_input_late_record",
+        session_id=session_id,
+        attributes={"pending_id": pending_id, "pending_age_ms": age_ms},
+        outcome="recorded_after_reported_missing",
+    )
 
 
 def _build_skipped_native_items(

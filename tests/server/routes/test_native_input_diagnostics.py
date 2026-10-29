@@ -342,3 +342,49 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     assert all(item.type != "error" for item in saved.values())
     assert "item_id" not in attrs and "error_item_id" not in attrs
     assert pending_inputs.snapshot_for(conv.id) == []
+
+
+@pytest.mark.asyncio
+async def test_transcript_record_after_a_missing_report_is_logged_as_late(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "claude-native-ui"})
+    lost_text = "lost late message text"
+    lost = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": lost_text}], stable_id="c" * 32
+    )
+    pending_inputs.mark_delivery_stage(conv.id, lost, "forward_accepted")
+    pending_inputs.record(conv.id, [{"type": "input_text", "text": "later message"}])
+    monkeypatch.setattr(session_stream, "publish", Mock())
+
+    def mirror(text: str, source_id: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": "resp_late",
+                "source_id": source_id,
+            },
+        )
+
+    await _persist_external_conversation_item(
+        conv.id, conv, mirror("later message", "native:late:0"), store
+    )
+    caplog.set_level(logging.INFO)
+    await _persist_external_conversation_item(
+        conv.id, conv, mirror(lost_text, "native:late:1"), store
+    )
+
+    late = [
+        record_to_row(r, "server")
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_input_late_record"
+    ]
+    assert len(late) == 1
+    assert late[0]["attributes"]["pending_id"] == lost
+    assert late[0]["attributes"]["outcome"] == "recorded_after_reported_missing"
+    assert lost_text not in json.dumps(late)
