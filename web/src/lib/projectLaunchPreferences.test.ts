@@ -5,6 +5,7 @@ import { readProjectLaunchDefaults, writeProjectLaunchDefaults } from "./project
 const STORAGE_KEY = "omnigent:project-launch-defaults";
 const START = {
   agentId: "ag_codex",
+  pickedHarness: null,
   harness: "codex-native",
   harnessOptions: { model: "gpt-5.6-sol", effort: "high", mode: "on-request" },
   hostId: "host_1",

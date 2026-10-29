@@ -1,12 +1,6 @@
-// Persisted, per-project memory of how the project's last session started, so
-// the project's new-session composer reopens on the same agent, harness options
-// (model, effort, permission mode), host and working directory instead of the
-// app-global last picks.
-//
-// Keyed by first-class project id, so a rename keeps the memory. Each entry
-// records a signature of the project's stored defaults (Project settings) at
-// the time of the start; once those defaults change, the entry is ignored, so
-// an explicit settings edit made after the start wins.
+// Per-project memory of how the project's last session started (agent, harness
+// pick and options, host, working directory), keyed by project id and ignored
+// once the project's stored settings change after that start.
 
 import { z } from "zod";
 import type { HarnessOptions } from "./modePreferences";
@@ -16,6 +10,7 @@ const STORAGE_KEY = "omnigent:project-launch-defaults";
 
 const entrySchema = z.object({
   agentId: z.string().optional(),
+  pickedHarness: z.string().nullable().optional(),
   harness: z.string().optional(),
   harnessOptions: z.record(z.string(), z.string()).optional(),
   hostId: z.string().optional(),
@@ -27,6 +22,9 @@ const entrySchema = z.object({
 export interface ProjectLaunchDefaults {
   /** Agent the session ran. */
   agentId?: string;
+  /** The composer's harness pick for that agent (Smart Routing, or a bundle
+   *  agent's brain harness); `null` = the agent's own harness. */
+  pickedHarness?: string | null;
   /** Native harness the agent ran on, with the options it launched with, in
    *  the per-harness shape modePreferences remembers (`""` = harness default). */
   harness?: string;

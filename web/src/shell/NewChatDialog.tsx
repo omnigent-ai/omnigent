@@ -2258,9 +2258,7 @@ export function NewChatLandingScreen() {
     [pickerCacheKey],
   );
   // Project prefill source: a project-driven visit seeds the composer from the
-  // project's stored defaults (host / working directory / agent / worktree),
-  // overlaid with how the project's last session started (agent / harness
-  // options / host / working directory, remembered in localStorage).
+  // project's stored defaults, overlaid with its last start (localStorage).
   // `?project=` carries the project NAME, so resolve it to the first-class id
   // the config endpoint needs; a label-only folder (id null) or plain visit
   // has no config to read. Resolved before the agent catalog below so the
@@ -2331,7 +2329,9 @@ export function NewChatLandingScreen() {
     isError: agentsError,
     isPlaceholderData: agentsArePlaceholder,
   } = useAvailableAgents({
-    pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
+    pinnedAgentIds: [prefillConfig?.agentId, prefillConfig?.launchAgentId].filter(
+      (id): id is string => id != null,
+    ),
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
@@ -4881,7 +4881,13 @@ export function NewChatLandingScreen() {
     if (writes.agentId !== undefined) {
       setPickedAgentId((cur) => cur ?? writes.agentId!);
       if (pickedAgentId === null) {
-        setPickedHarness(readLastHarness(writes.agentId));
+        // The last start's own harness pick (e.g. Smart Routing) outranks the
+        // app-global one, which another project's start may have changed.
+        setPickedHarness(
+          writes.agentId === projectLaunch?.agentId && projectLaunch.pickedHarness !== undefined
+            ? projectLaunch.pickedHarness
+            : readLastHarness(writes.agentId),
+        );
         // Config-sourced seed into an empty slot (as opposed to the last-agent
         // fallback): the create omits the field until any other write flips this.
         agentFromConfigRef.current = writes.agentId === prefillConfig?.agentId;
@@ -4909,6 +4915,7 @@ export function NewChatLandingScreen() {
     selectedHostId,
     pickedAgentId,
     prefillConfig,
+    projectLaunch,
     defaultSandboxProvider,
   ]);
 
@@ -5848,9 +5855,7 @@ export function NewChatLandingScreen() {
       // from the config. Any user interaction — even re-picking the exact
       // config value — cleared the ref, so an explicit choice is always SENT
       // (the server treats it as authoritative and only warns on mismatch).
-      // The value-equality guard compares against the server's copy of the
-      // config: it covers seeds later displaced without a write, and seeds from
-      // the project's last start, which the server would not fill in.
+      // The value-equality guard checks the server's config, so it also sends last-start seeds.
       const agentFromProjectConfig =
         createProjectId !== null &&
         agentFromConfigRef.current &&
@@ -5894,6 +5899,8 @@ export function NewChatLandingScreen() {
               data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
             };
       let data: { id: string };
+      // The agent the create ran; a custom agent's id comes back from its create.
+      let launchedAgentId = effectiveAgentId;
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
         // Custom agents upload their bundle with the session, then launch on the host below.
@@ -5918,6 +5925,7 @@ export function NewChatLandingScreen() {
           metadata as Parameters<typeof createBundledSession>[1],
         );
         data = { id: bundled.id };
+        launchedAgentId = bundled.agentId ?? null;
         // Register create_session for the custom-agent (bundled) path too —
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
@@ -6211,15 +6219,15 @@ export function NewChatLandingScreen() {
           // still shows it under the project.
         }
       }
-      // This start becomes the project's default for its next session. A
-      // just-created custom agent is skipped: its id only exists server-side.
+      // This start becomes the project's default for its next session.
       if (launchProjectId !== null) {
         writeProjectLaunchDefaults(
           launchProjectId,
           {
-            ...(effectiveAgentId !== PENDING_AGENT_ID
+            ...(launchedAgentId !== null && launchedAgentId !== PENDING_AGENT_ID
               ? {
-                  agentId: effectiveAgentId ?? undefined,
+                  agentId: launchedAgentId,
+                  pickedHarness,
                   ...(launchedOptions !== null
                     ? {
                         harness: selectedNativeHarness ?? undefined,

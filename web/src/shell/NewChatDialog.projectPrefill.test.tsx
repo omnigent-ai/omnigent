@@ -1293,6 +1293,83 @@ describe("NewChatLandingScreen project prefill", () => {
     expectAlphaStart(await submitAndReadBody());
   });
 
+  // Smart Routing binds the Claude Code wrapper as its placeholder, so only the
+  // saved harness pick tells it apart from a direct Claude Code start.
+  it.each([
+    { alpha: "Claude Code", beta: "Smart Routing" },
+    { alpha: "Smart Routing", beta: "Claude Code" },
+  ])("reopens Alpha on $alpha after Beta starts $beta", async ({ alpha, beta }) => {
+    setClaudeAgentAndModels();
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: CLAUDE_AGENT_ID,
+          name: "claude-native-ui",
+          display_name: "Claude Code",
+          harness: "claude-native",
+        }),
+        agent({ id: CODEX_AGENT_ID, name: "codex-native-ui", harness: "codex-native" }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    const pick = (choice: string) => {
+      if (choice === "Smart Routing") {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-harness-smart-routing"));
+        return;
+      }
+      selectAgent(CLAUDE_AGENT_ID);
+      openAgentConfig(CLAUDE_AGENT_ID);
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+      closeAgentConfig();
+    };
+    const expectStart = (body: Record<string, unknown>, choice: string) => {
+      const routed = choice === "Smart Routing";
+      expect(body.agent_id).toBe(CLAUDE_AGENT_ID);
+      expect(body.harness_override).toBe(routed ? "auto" : undefined);
+      expect(body.model_override).toBe(routed ? undefined : "sonnet");
+    };
+
+    renderRoutingLanding();
+    pick(alpha);
+    expectStart(await startAndLeave(), alpha);
+    searchParams = new URLSearchParams("project=Beta");
+    renderRoutingLanding();
+    pick(beta);
+    expectStart(await startAndLeave(), beta);
+
+    searchParams = new URLSearchParams("project=Alpha");
+    renderRoutingLanding();
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    await waitFor(() =>
+      alpha === "Smart Routing"
+        ? expect(trigger.textContent).toContain("Smart Routing")
+        : expect(trigger).toHaveAccessibleName(/Claude Code/),
+    );
+    expectStart(await submitAndReadBody(), alpha);
+  });
+
+  it.each([
+    { config: {}, name: "Other", sentAgentId: "ag_other" },
+    // The configured agent is left to the server's default-fill.
+    { config: { agent_id: "ag_hello" }, name: "Hello World", sentAgentId: undefined },
+  ])(
+    "falls back to $name when the last start's agent no longer exists",
+    async ({ config, name, sentAgentId }) => {
+      localStorage.setItem("omnigent:last-agent-id", "ag_other");
+      writeProjectLaunchDefaults("proj_alpha", { agentId: "ag_gone", pickedHarness: null }, config);
+      setProjectConfig(config);
+      renderLanding();
+
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+          new RegExp(name),
+        ),
+      );
+      expect((await submitAndReadBody()).agent_id).toBe(sentAgentId);
+    },
+  );
+
   it("lets project settings edited after the last start win", async () => {
     writeProjectLaunchDefaults(
       "proj_alpha",

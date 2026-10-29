@@ -30,14 +30,16 @@ export interface ProjectPrefillConfig {
   /** Default reasoning effort for the configured agent; consumed by the same
    *  harness-seed effect as `model`. */
   effort?: string;
+  /** Agent the project's last session started with. Unlike `agentId` it is a
+   *  hint: it seeds only once the pickable list confirms it still exists. */
+  launchAgentId?: string;
 }
 
 /**
- * Overlay how a project's last session started on its stored defaults. A
- * started agent replaces the stored agent and drops the stored model and
- * effort, which belong to the stored agent's harness (the start's own model and
- * effort ride in its harness options instead). A started host replaces the
- * stored host together with its working directory, which is a path on that host.
+ * Overlay how a project's last session started on its stored defaults. The
+ * started agent becomes `launchAgentId`; when it is the stored agent and the
+ * start recorded its own harness options, those replace the stored model and
+ * effort. A started host replaces the stored host and its working directory.
  */
 export function withProjectLaunchDefaults(
   config: ProjectPrefillConfig,
@@ -46,9 +48,11 @@ export function withProjectLaunchDefaults(
   if (launch === null) return config;
   const merged = { ...config };
   if (launch.agentId !== undefined) {
-    merged.agentId = launch.agentId;
-    merged.model = undefined;
-    merged.effort = undefined;
+    merged.launchAgentId = launch.agentId;
+    if (launch.agentId === config.agentId && launch.harnessOptions !== undefined) {
+      merged.model = undefined;
+      merged.effort = undefined;
+    }
   }
   if (launch.hostId !== undefined) {
     merged.hostId = launch.hostId;
@@ -126,12 +130,19 @@ export function projectPrefillStep(
   // can't win the race against a stored default.
   if (inputs.config === undefined) return null;
 
-  if (!state.agentSeeded) {
+  // The last start's agent is a hint like the last-used agent: the agent track
+  // waits for the pickable list to confirm it, and a missing one falls through.
+  const launchAgentId = inputs.config.launchAgentId;
+  if (!state.agentSeeded && (launchAgentId == null || inputs.agents !== undefined)) {
     const { agents, lastAgentId, config } = inputs;
+    if (launchAgentId != null && agents?.some((a) => a.id === launchAgentId)) {
+      next = { ...next, agentSeeded: true };
+      writes.agentId = launchAgentId;
+    }
     // A blank/whitespace-only stored id is "not configured", not a real agent
     // — fall through to the generic default instead of seeding a value the
     // composer could only surface as "agent unavailable".
-    if (config?.agentId != null && config.agentId.trim() !== "") {
+    else if (config?.agentId != null && config.agentId.trim() !== "") {
       // A configured agent seeds verbatim, without waiting for (or checking)
       // the picker list — the create API accepts session-scoped agents the
       // caller can read, so absence from the list doesn't mean unusable.

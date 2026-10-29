@@ -1,16 +1,17 @@
 // Pure state-machine tests for the project-prefill config seeding. The
 // component-level rules live in NewChatDialog.projectPrefill.test.tsx; these
 // pin the transitions that need mid-flight timing (a user acting between the
-// config loading and resolving), which the rendered harness can't sequence,
-// plus the precedence rules for overlaying a project's last start.
+// config loading and resolving), which the rendered harness can't sequence.
 import { describe, expect, it } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import type { ProjectLaunchDefaults } from "@/lib/projectLaunchPreferences";
 import {
   initialPrefillState,
   projectPrefillStep,
   withProjectLaunchDefaults,
+  type ProjectPrefillConfig,
 } from "./projectPrefill";
 
 const hosts: Host[] = [
@@ -229,6 +230,43 @@ describe("projectPrefill agent seeding", () => {
   });
 });
 
+describe("projectPrefill last start's agent", () => {
+  it("waits for the pickable list before seeding any agent", () => {
+    const step = projectPrefillStep(
+      initialPrefillState("Alpha"),
+      inputs({ agents: undefined, config: { agentId: "ag_cfg", launchAgentId: "ag_launch" } }),
+    );
+    expect(step!.state.agentSeeded).toBe(false);
+    expect(step!.writes.agentId).toBeUndefined();
+  });
+
+  it.each([
+    {
+      label: "the last start's agent while the list has it",
+      agents: ["ag_launch", "ag_cfg", "ag_hello"],
+      config: { agentId: "ag_cfg", launchAgentId: "ag_launch" },
+      seeded: "ag_launch",
+    },
+    {
+      label: "the configured agent once the last start's is gone",
+      agents: ["ag_cfg", "ag_hello"],
+      config: { agentId: "ag_cfg", launchAgentId: "ag_gone" },
+      seeded: "ag_cfg",
+    },
+    {
+      label: "the last-used agent without a configured one",
+      agents: ["ag_hello"],
+      config: { launchAgentId: "ag_gone" },
+      seeded: "ag_hello",
+    },
+  ])("seeds $label", ({ agents, config, seeded }) => {
+    const { writes } = runToDone(
+      inputs({ agents: agents.map((id) => ({ id })), lastAgentId: "ag_hello", config }),
+    );
+    expect(writes.agentId).toBe(seeded);
+  });
+});
+
 describe("withProjectLaunchDefaults", () => {
   const stored = {
     hostId: "host_1",
@@ -243,20 +281,25 @@ describe("withProjectLaunchDefaults", () => {
     expect(withProjectLaunchDefaults(stored, null)).toEqual(stored);
   });
 
-  it("replaces the stored agent and drops the stored agent's model and effort", () => {
-    // "opus" / "low" belong to Claude's harness; the Codex start's own model and
-    // effort ride in its harness options, which the composer seeds instead.
-    const launch = {
-      agentId: "ag_codex",
-      harness: "codex-native",
-      harnessOptions: { model: "", effort: "high" },
-    };
-    expect(withProjectLaunchDefaults(stored, launch)).toEqual({
-      ...stored,
-      agentId: "ag_codex",
-      model: undefined,
-      effort: undefined,
-    });
+  it.each<{ label: string; launch: ProjectLaunchDefaults; expected: ProjectPrefillConfig }>([
+    {
+      label: "keeps the stored model and effort for another agent's start",
+      launch: { agentId: "ag_codex", harness: "codex-native", harnessOptions: { effort: "high" } },
+      expected: { ...stored, launchAgentId: "ag_codex" },
+    },
+    {
+      label: "drops them when the stored agent started with its own options",
+      launch: { agentId: "ag_claude", harness: "claude-native", harnessOptions: { model: "" } },
+      expected: { ...stored, launchAgentId: "ag_claude", model: undefined, effort: undefined },
+    },
+    {
+      // A Smart Routing start records no harness options.
+      label: "keeps them when the stored agent started without options",
+      launch: { agentId: "ag_claude", pickedHarness: "auto-native" },
+      expected: { ...stored, launchAgentId: "ag_claude" },
+    },
+  ])("$label", ({ launch, expected }) => {
+    expect(withProjectLaunchDefaults(stored, launch)).toEqual(expected);
   });
 
   it("replaces the stored host together with its working directory", () => {

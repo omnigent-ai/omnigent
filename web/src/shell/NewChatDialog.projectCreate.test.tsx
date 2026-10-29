@@ -64,8 +64,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 // creates the session WITH `project_id`: the server files it atomically and
 // default-fills config-seeded fields the composer omits. These tests pin the
 // new request shape, the field-omission semantics, the skipped follow-up
-// move, the untouched legacy paths (label-only folders, plain visits), and the
-// start each create remembers as the project's next defaults.
+// move, the legacy paths (label-only, plain visits), and the saved start.
 const navigateMock = vi.fn();
 
 const RECENT_KEY = "omnigent:recent-workspaces";
@@ -433,6 +432,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // The start is remembered under the project row the move created.
     expect(readProjectLaunchDefaults("proj_new", {})).toEqual({
       agentId: "ag_hello",
+      pickedHarness: null,
       hostId: "host_1",
       workspace: RECENT_WORKSPACE,
     });
@@ -556,6 +556,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // The sandbox, not the config host, is remembered for the next session.
     expect(readProjectLaunchDefaults("proj_alpha", config)).toEqual({
       agentId: "ag_other",
+      pickedHarness: null,
       hostId: SANDBOX_HOST_CHOICE,
     });
   });
@@ -563,7 +564,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
   it("carries project_id and the omission rules through the multipart (bundled) path", async () => {
     const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
     setProjectConfig(config);
-    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
+    vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
     renderLanding();
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
@@ -590,9 +591,10 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     // The runner still launches with the explicit client-side workspace.
     expect(vi.mocked(launchRunner)).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined);
     expect(vi.mocked(moveConversationToProject)).not.toHaveBeenCalled();
-    // The just-created custom agent has no client-side id, so only the
-    // location is remembered.
+    // The session-scoped agent the create registered is the start's agent.
     expect(readProjectLaunchDefaults("proj_alpha", config)).toEqual({
+      agentId: "ag_pending",
+      pickedHarness: null,
       hostId: "host_1",
       workspace: REPO,
     });
