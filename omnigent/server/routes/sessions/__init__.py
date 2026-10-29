@@ -672,6 +672,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _schedule_deferred_elicitation_clear as _schedule_deferred_elicitation_clear,
     _spawn_native_approval_popup_forward as _spawn_native_approval_popup_forward,
     _spawn_native_blocked_notice_forward as _spawn_native_blocked_notice_forward,
+    _wait_for_host_bound_runner as _wait_for_host_bound_runner,
     _wait_for_host_bound_runner_client as _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect as _wait_for_host_reconnect,
     _wake_parent_for_blocked_child as _wake_parent_for_blocked_child,

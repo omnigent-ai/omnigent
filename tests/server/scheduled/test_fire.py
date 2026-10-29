@@ -1211,20 +1211,35 @@ async def test_explicit_owner_is_granted() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pending_sign_in", [False, True])
 async def test_connected_host_dispatch_uses_resolved_local_owner(
     monkeypatch: pytest.MonkeyPatch,
+    pending_sign_in: bool,
 ) -> None:
     import omnigent.server.routes._host_launch as host_launch
     import omnigent.server.routes.sessions as sessions_routes
+    from omnigent.server.routes._sessions import orchestration
 
     captured: dict[str, Any] = {}
+    waits: list[float] = []
+    connection = SimpleNamespace(host_id="host_1")
+    conversation = _FakeConversation(id="conv_1", agent_id="ag_1", runner_id="runner_1")
+    conversation_store = FakeConversationStore()
+    host_registry = FakeHostRegistry(online={"host_1"})
+    monkeypatch.setattr(conversation_store, "get_conversation", lambda _sid: conversation)
+    monkeypatch.setattr(host_registry, "get", lambda _hid: connection)
+    monkeypatch.setattr(
+        orchestration,
+        "_query_host_runner_status",
+        AsyncMock(return_value="sign_in_pending" if pending_sign_in else "alive"),
+    )
 
     def _resolve_host_launch(**kwargs: Any) -> Any:
         captured["user_id"] = kwargs["user_id"]
         return type(
             "Target",
             (),
-            {"conv": kwargs["conversation_store"].get_conversation("conv_1"), "conn": object()},
+            {"conv": kwargs["conversation_store"].get_conversation("conv_1"), "conn": connection},
         )()
 
     async def _launch_runner_on_host(
@@ -1233,6 +1248,9 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
         return type("Attempt", (), {"error": None, "runner_id": "runner_1"})()
 
     async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> object:
+        waits.append(kwargs["timeout_s"])
+        if pending_sign_in and len(waits) == 1:
+            await asyncio.Future()
         return object()
 
     async def _ensure_runner_session_initialized(*args: Any, **kwargs: Any) -> None:
@@ -1259,9 +1277,9 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     dispatch = fire_mod._make_connected_host_dispatch(
         _deps(
             store,
-            conversation_store=FakeConversationStore(),
+            conversation_store=conversation_store,
             host_store=FakeHostStore({"host_1": _FakeHost("host_1", RESERVED_USER_LOCAL)}),
-            host_registry=FakeHostRegistry(online={"host_1"}),
+            host_registry=host_registry,
             agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/rev1")}),
         )
     )
@@ -1269,6 +1287,11 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     await dispatch(_FakeConversation(id="conv_1", agent_id="ag_1"), _task(user_id=None))
 
     assert captured["user_id"] == RESERVED_USER_LOCAL
+    assert waits[0] == 30.0
+    if pending_sign_in:
+        assert len(waits) == 2 and 30.0 < waits[1] <= 150.0
+    else:
+        assert len(waits) == 1
     # The kickoff names the bundle it runs, so the runner sees a later reinstall.
     assert captured["agent_revision"] == "ag_1/rev1"
 

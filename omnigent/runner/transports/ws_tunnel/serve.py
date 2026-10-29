@@ -459,6 +459,7 @@ async def serve_tunnel(
         record_websocket_connected("runner", reconnect=ever_connected)
         # Tell the launching host's connect watchdog this runner made it.
         touch_connect_marker()
+        mark_sign_in_pending(runner_id, None)
         connected_this_attempt = True
         ever_connected = True
         login_redirect_streak = 0
@@ -549,6 +550,8 @@ async def serve_tunnel(
                         waited_s=round(waited_s, 1),
                     ),
                 )
+        if auth_token is not None:
+            mark_sign_in_pending(runner_id, None)
         reconnecting = ever_connected
         retry_reason = "connection closed cleanly"
         recycle = False
@@ -637,16 +640,13 @@ async def serve_tunnel(
                             or getattr(auth_token_factory, "declined_without_proxy_bearer", False)
                         )
                     )
-                    if (
-                        not ever_connected
-                        and no_credential_to_send
-                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
-                    ):
-                        # A transient mint failure (factory returned None) clears on a later
-                        # re-mint, so only a missing credential that outlasts the window ends
-                        # the launch; the message then names the local cause.
-                        waited_s = time.monotonic() - (http_auth_rejection_started or 0.0)
-                        if waited_s >= _NO_CREDENTIAL_FATAL_WINDOW_S:
+                    if not ever_connected and no_credential_to_send:
+                        assert http_auth_rejection_started is not None
+                        waited_s = time.monotonic() - http_auth_rejection_started
+                        if (
+                            http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                            and waited_s >= _NO_CREDENTIAL_FATAL_WINDOW_S
+                        ):
                             raise RunnerTunnelAuthRejectedError(
                                 f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
                                 f"(HTTP {http_status} persisted across "
@@ -655,6 +655,11 @@ async def serve_tunnel(
                                 "e.g. the host credential service's grant expired or was "
                                 f"rejected); {_reauth_hint(server_url)}"
                             ) from exc
+                        # Let the host and server preserve this launch while the
+                        # credential recovers, without renewing its deadline.
+                        mark_sign_in_pending(
+                            runner_id, http_auth_rejection_started + _NO_CREDENTIAL_FATAL_WINDOW_S
+                        )
                     elif (
                         not ever_connected
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
@@ -686,7 +691,8 @@ async def serve_tunnel(
                             http_status,
                             extra={"session_id": runner_primary_session_id()},
                         )
-                        delay_s = _INITIAL_RECONNECT_DELAY_S
+                        if not no_credential_to_send:
+                            delay_s = _INITIAL_RECONNECT_DELAY_S
                 else:
                     close_code = _websocket_close_code(exc)
                     if close_code in _FATAL_SERVER_CLOSE_CODES:
@@ -737,6 +743,7 @@ async def serve_tunnel(
             if terminal_error is not None or (
                 shutdown_event is not None and shutdown_event.is_set()
             ):
+                mark_sign_in_pending(runner_id, None)
                 close = (
                     _CloseDetails.from_error(disconnect_error)
                     if disconnect_error is not None
@@ -847,7 +854,11 @@ async def serve_tunnel(
         )
         if connected_this_attempt:
             attempt = 0
-        await asyncio.sleep(jittered)
+        try:
+            await asyncio.sleep(jittered)
+        except BaseException:
+            mark_sign_in_pending(runner_id, None)
+            raise
         # Match the host tunnel (connect.py): escalate the backoff only on
         # non-recycle failures. A routine ingress recycle keeps reconnecting
         # promptly at the base delay instead of doubling toward the cap.
@@ -865,7 +876,7 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
         return False
     try:
         return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
-    except Exception:  # optional status cannot prevent a tunnel upgrade.
+    except Exception:  # noqa: BLE001 — optional status cannot prevent a tunnel upgrade.
         _logger.warning(
             "sign_in_pending read failed; continuing with the available credential",
             exc_info=True,

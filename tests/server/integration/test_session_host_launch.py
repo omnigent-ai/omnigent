@@ -2739,13 +2739,14 @@ async def test_first_message_during_host_spawn_does_not_launch_replacement(
         await comm.wait(timeout=budget(5.0))
 
 
-@pytest.mark.parametrize("sign_in_pending", [False, True])
+@pytest.mark.parametrize("startup_state", ["alive", "sign_in_pending", "missing_credential"])
 async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    sign_in_pending: bool,
+    tmp_path: Path,
+    startup_state: str,
 ) -> None:
     """The first message waits for the already-bound runner to register.
 
@@ -2763,12 +2764,12 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     conversation ``runner_id``.
     """
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
 
-    if sign_in_pending:
-        from omnigent.server.routes._sessions import orchestration
-
+    if startup_state != "alive":
         monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.05)
         monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01, raising=False)
+    if startup_state == "sign_in_pending":
         monkeypatch.setattr(
             orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
         )
@@ -2777,6 +2778,58 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     session = await _inline_launch_session(client, comm)
     session_id = session["id"]
     original_runner_id = session["runner_id"]
+    credential_ready = asyncio.Event()
+    pending_reported = asyncio.Event()
+    tunnel_task: asyncio.Task[None] | None = None
+
+    if startup_state == "missing_credential":
+        from websockets.exceptions import InvalidStatus
+        from websockets.http11 import Response
+
+        from omnigent.host.connect import _RunnerHandle
+        from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR
+        from omnigent.runner.transports.ws_tunnel import serve as serve_module
+
+        marker = tmp_path / "runner.connected"
+        monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+        monkeypatch.setattr(serve_module, "_INITIAL_RECONNECT_DELAY_S", 0.01)
+        monkeypatch.setattr(serve_module, "_MAX_RECONNECT_DELAY_S", 0.02)
+        host = HostProcess(
+            identity=HostIdentity(host_id=_HOST_ID, name="test"), server_url="http://testserver"
+        )
+        host._runners[original_runner_id] = _RunnerHandle(
+            proc=Mock(poll=Mock(return_value=None)),
+            log_path=tmp_path / "runner.log",
+            session_id=session_id,
+            connect_marker=marker,
+        )
+
+        async def _status(_conn: object, _registry: object, runner_id: str) -> str:
+            result = await host._handle_runner_status(HostRunnerStatusFrame("status", runner_id))
+            if result.status == "sign_in_pending":
+                pending_reported.set()
+            return result.status
+
+        async def _upgrade(_app: object, *, auth_token: str | None, **kwargs: Any) -> None:
+            if auth_token is None:
+                raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+            kwargs["on_connected"]()
+            app.state.tunnel_registry.register(
+                original_runner_id, _NoopRunnerWS(), _runner_hello()
+            )
+            await asyncio.Future()
+
+        monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
+        monkeypatch.setattr(serve_module, "_serve_tunnel_once", _upgrade)
+        tunnel_task = asyncio.create_task(
+            serve_module.serve_tunnel(
+                app,
+                server_url="http://testserver",
+                runner_id=original_runner_id,
+                runner_version="0.1.0",
+                auth_token_factory=lambda: "tok-recovered" if credential_ready.is_set() else None,
+            )
+        )
 
     runner_paths: list[str] = []
     init_bodies: list[dict[str, Any]] = []
@@ -2843,17 +2896,29 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
             )
         )
         await _wait_for_runner_connect_waiter(app, original_runner_id)
-        if sign_in_pending:
+        if startup_state == "missing_credential":
+            await asyncio.wait_for(pending_reported.wait(), timeout=budget(5.0))
+        if startup_state != "alive":
             # Longer than normal startup grace, still inside the explicit sign-in window.
             await asyncio.sleep(0.1)
             current = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
             assert current is not None and current.runner_id == original_runner_id
             assert not post_task.done()
-        app.state.tunnel_registry.register(original_runner_id, _NoopRunnerWS(), _runner_hello())
-        resp = await post_task
+        if startup_state == "missing_credential":
+            credential_ready.set()
+        else:
+            app.state.tunnel_registry.register(
+                original_runner_id, _NoopRunnerWS(), _runner_hello()
+            )
+        resp = await asyncio.wait_for(post_task, timeout=budget(5.0))
     finally:
         post_task.cancel()
-        await asyncio.gather(post_task, return_exceptions=True)
+        if tunnel_task is not None:
+            tunnel_task.cancel()
+        await asyncio.gather(
+            *[task for task in (post_task, tunnel_task) if task is not None],
+            return_exceptions=True,
+        )
         await fake_runner.aclose()
 
     saw_launch = await _expect_no_launch(comm, budget_s=budget(0.2))

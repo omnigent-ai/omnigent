@@ -430,6 +430,7 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
     assert event.attributes["attempts"] == 0
 
 
+@pytest.mark.parametrize("wait_kind", ["client", "managed"])
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -443,8 +444,9 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
         "expired",
     ],
 )
-async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) -> None:
+async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, wait_kind) -> None:
     from omnigent.errors import OmnigentError
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
     from omnigent.server.routes._sessions import orchestration
 
     # Only the orchestration deadline uses this clock; asyncio keeps its real clock.
@@ -507,8 +509,20 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
 
     monkeypatch.setattr(orchestration, "_wait_for_runner_client", wait)
     monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
-    task = asyncio.create_task(
-        orchestration._wait_for_host_bound_runner_client(
+    if wait_kind == "managed":
+        tracker = ManagedLaunchTracker()
+        tracker.begin("session-owned")
+        pending = helpers._wait_for_managed_runner_tunnel(
+            "session-owned",
+            "runner-owned",
+            SimpleNamespace(wait_for_runner=wait),
+            tracker,
+            host_conn=connection,
+            host_registry=registry,
+            conversation_store=store,
+        )
+    else:
+        pending = orchestration._wait_for_host_bound_runner_client(
             "session-owned",
             None,
             None,
@@ -519,7 +533,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
             host_registry=registry,
             conversation_store=store,
         )
-    )
+    task = asyncio.create_task(pending)
     try:
         async with asyncio.timeout(budget(5)):
             if outcome == "late_pending":
@@ -536,7 +550,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
             if outcome in {"connected", "deadline_tie", "late_pending"}:
                 assert not task.done(), "ordinary startup grace discarded pending sign-in"
                 connection_results.put_nowait(client)
-                assert await task is client
+                assert await task is (True if wait_kind == "managed" else client)
             elif outcome == "stopped":
                 monkeypatch.setitem(
                     orchestration._intentional_stop_sessions, "session-owned", "runner-owned"
@@ -555,7 +569,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                     await task
             elif outcome == "dead":
                 next_status.put_nowait("dead")
-                assert await task is None
+                assert await task is (False if wait_kind == "managed" else None)
             else:
                 clock.now = 149.0
                 connection_results.put_nowait(clock_tick)
@@ -563,7 +577,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 assert not task.done(), "sign-in wait expired before its deadline"
                 clock.now = 150.0
                 connection_results.put_nowait(clock_tick)
-                assert await task is None
+                assert await task is (False if wait_kind == "managed" else None)
             assert not active
             assert len(waits) == 2
     finally:
