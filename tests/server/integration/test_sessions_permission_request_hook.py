@@ -93,6 +93,7 @@ async def _post_approval(
     action: str,
     content: dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> httpx.Response:
     """
     Resolve a published elicitation through the session event API.
@@ -106,6 +107,7 @@ async def _post_approval(
     :param content: Optional MCP ``ElicitResult.content`` payload.
     :param meta: Optional MCP ``_meta`` payload, e.g. a persistence
         choice ``{"persist": "always"}``.
+    :param headers: Optional request headers, e.g. a client capability.
     :returns: The HTTP response from the session event route.
     """
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
@@ -119,6 +121,7 @@ async def _post_approval(
             "type": "approval",
             "data": data,
         },
+        headers=headers,
     )
 
 
@@ -2496,6 +2499,7 @@ async def _sever_hook_mid_turn(
     elicitation_id: str = _REATTACH_ELICITATION_ID,
     executor: dict[str, Any] | None = None,
     grace_s: float = 0.2,
+    release_grace: asyncio.Event | None = None,
     parent_session_id: str | None = None,
 ) -> tuple[str, dict[str, Any], Any]:
     """
@@ -2508,6 +2512,8 @@ async def _sever_hook_mid_turn(
     :param elicitation_id: Hook-supplied id, e.g. ``"elicit_kimi_" + "0" * 32``.
     :param executor: Agent executor config, or ``None`` for the default agent.
     :param grace_s: Re-park grace in seconds.
+    :param release_grace: When given, the grace ends only once this is set, so
+        the test can act within it without racing the clock.
     :param parent_session_id: Session to create the prompting session under,
         or ``None`` for a top-level session.
     :returns: The session id, the hook payload, and a collector that has
@@ -2528,6 +2534,19 @@ async def _sever_hook_mid_turn(
     monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _sever)
     monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", grace_s)
     monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_POLL_S", 0.02)
+    if release_grace is not None:
+
+        async def _sleep_until_grace_released(delay: float) -> None:
+            if delay == grace_s:
+                await release_grace.wait()
+            else:
+                await asyncio.sleep(delay)
+
+        monkeypatch.setattr(
+            sessions_orchestration,
+            "asyncio",
+            SimpleNamespace(**{**vars(asyncio), "sleep": _sleep_until_grace_released}),
+        )
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, agent_name, executor=executor)
     if parent_session_id is None:
@@ -2620,8 +2639,21 @@ async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
         assert approval_page.json()["terminal_fallback"] == {"answer_undelivered": False}
 
         # No live hook can carry a chat answer to Claude now.
-        refused = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
+        terminal_fallback_client = {sessions_orchestration.TERMINAL_FALLBACK_CLIENT_HEADER: "on"}
+        refused = await _post_approval(
+            client,
+            session_id,
+            _REATTACH_ELICITATION_ID,
+            "accept",
+            headers=terminal_fallback_client,
+        )
         assert refused.status_code == 409, refused.text
+        refused_by_url = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{_REATTACH_ELICITATION_ID}/resolve",
+            json={"action": "accept"},
+            headers=terminal_fallback_client,
+        )
+        assert refused_by_url.status_code == 409, refused_by_url.text
         assert pending_elicitations.count_for(session_id) == 1
         assert _REATTACH_ELICITATION_ID not in _harness_pre_resolved_elicitations
 
@@ -2636,6 +2668,44 @@ async def test_unanswered_claude_prompt_waits_in_terminal_until_turn_ends(
         await _finish_deferred_clears()
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
         assert failed_mirrors == ([_REATTACH_ELICITATION_ID] if ancestor_mirror_fails else [])
+    finally:
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
+async def test_older_client_answer_to_prompt_waiting_in_terminal_is_kept_for_retry(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A client without the terminal-fallback header keeps the old answer contract.
+
+    It shows the held card as an ordinary prompt, so its answer is accepted
+    and kept for a late hook retry, as for any prompt with no parked hook.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    session_id, payload, collector = await _sever_hook_mid_turn(
+        client, monkeypatch, "test-terminal-fallback-older-client"
+    )
+    try:
+        waiting = await _next_elicitation_event(collector)
+        assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
+
+        answer = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
+        assert answer.status_code == 202, answer.text
+        cleared = await _next_elicitation_event(collector)
+        assert cleared["type"] == "response.elicitation_resolved"
+        assert cleared["action"] == "accept"
+        assert pending_elicitations.count_for(session_id) == 0
+        await _finish_deferred_clears()
+        assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+
+        retry = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+        )
+        assert retry.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+        assert _REATTACH_ELICITATION_ID not in _harness_pre_resolved_elicitations
     finally:
         await collector.stop()
         pending_elicitations.reset_for_tests()
@@ -2714,11 +2784,13 @@ async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
     """
     from omnigent.runtime import pending_elicitations
 
+    release_grace = asyncio.Event()
     session_id, payload, collector = await _sever_hook_mid_turn(
         client,
         monkeypatch,
         f"test-terminal-fallback-late-retry-{answered_in_gap}-{answer_expired}",
         sever_every_poll=False,
+        release_grace=release_grace,
     )
     hook_task: asyncio.Task[httpx.Response] | None = None
     try:
@@ -2730,6 +2802,7 @@ async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
             accepted = await _next_elicitation_event(collector)
             assert accepted["type"] == "response.elicitation_resolved"
             assert accepted["action"] == "accept"
+        release_grace.set()
 
         waiting = await _next_elicitation_event(collector)
         assert waiting["type"] == "response.elicitation_request"
@@ -2797,15 +2870,17 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
             "_publish_elicitation_resolved_to_ancestors",
             _ancestor_clear_fails,
         )
+    release_grace = asyncio.Event()
     session_id, payload, collector = await _sever_hook_mid_turn(
         client,
         monkeypatch,
         f"test-terminal-fallback-answered-{answered_during_grace}-{ancestor_clear_fails}"
         f"-{hook_retries_after_answer}",
-        grace_s=1.0 if answered_during_grace else 0.2,
+        release_grace=release_grace,
     )
     try:
         if not answered_during_grace:
+            release_grace.set()
             waiting = await _next_elicitation_event(collector)
             assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
 
@@ -2818,6 +2893,7 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
             )
             assert retry.status_code == 200, retry.text
             assert retry.content == b""
+        release_grace.set()
         resolved = await _next_elicitation_event(collector)
         assert resolved == {
             "type": "response.elicitation_resolved",
@@ -2851,12 +2927,13 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
     parent_agent = await create_test_agent(client, f"{name}-parent")
     parent_id = await _create_session(client, parent_agent["id"])
     parent_collector = await start_session_stream_collector(parent_id)
+    release_grace = asyncio.Event()
     try:
         session_id, _payload, collector = await _sever_hook_mid_turn(
             client,
             monkeypatch,
             name,
-            grace_s=0.2 if waiting_in_terminal else 2.0,
+            release_grace=release_grace,
             parent_session_id=parent_id,
         )
     except BaseException:
@@ -2867,6 +2944,7 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         mirrored = await _next_elicitation_event(parent_collector)
         assert "terminal_fallback" not in mirrored["params"]
         if waiting_in_terminal:
+            release_grace.set()
             waiting = await _next_elicitation_event(collector)
             assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
             mirrored = await _next_elicitation_event(parent_collector)
@@ -2879,6 +2957,7 @@ async def test_deleting_session_releases_prompt_waiting_in_terminal(
         deleted = await client.delete(f"/v1/sessions/{parent_id if delete_parent else session_id}")
         assert deleted.status_code == 200, deleted.text
         assert sessions_route._session_status_cache.get(session_id) == "running"
+        release_grace.set()
         await _finish_deferred_clears()
         assert unparked.in_terminal is waiting_in_terminal
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations

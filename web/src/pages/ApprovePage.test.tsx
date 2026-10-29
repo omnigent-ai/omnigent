@@ -119,6 +119,7 @@ describe("ApprovePage states", () => {
     expect(posts).toHaveLength(1);
     expect(posts[0]![0]).toBe("/v1/sessions/sess_1/elicitations/eli_1/resolve");
     expect(JSON.parse(posts[0]![1]!.body as string)).toEqual(verdict);
+    expect(new Headers(posts[0]![1]!.headers).get("X-Omnigent-Terminal-Fallback")).toBe("on");
     expect(
       await screen.findByText(verdict.action === "accept" ? "Approved" : "Rejected"),
     ).toBeInTheDocument();

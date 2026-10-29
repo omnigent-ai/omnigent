@@ -22,7 +22,7 @@ import {
   type NativePermissionDelivery,
 } from "@/lib/nativePermissionDelivery";
 import { parseTerminalFallback } from "@/lib/sse";
-import type { ElicitationTerminalFallback } from "@/lib/events";
+import { TERMINAL_FALLBACK_CLIENT_HEADERS, type ElicitationTerminalFallback } from "@/lib/events";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { CheckIcon, MessageCircleQuestionMark, XIcon } from "lucide-react";
@@ -166,7 +166,7 @@ export function ApprovePage() {
           `/v1/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/resolve`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...TERMINAL_FALLBACK_CLIENT_HEADERS },
             body: JSON.stringify({
               action,
               ...(content ? { content } : {}),

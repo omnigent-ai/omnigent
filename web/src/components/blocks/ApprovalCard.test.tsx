@@ -1818,7 +1818,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
     ],
   };
 
-  function terminalCardItem(answerUndelivered: boolean) {
+  function terminalCardItem(answerUndelivered: boolean, questions = [question]) {
     const events = [
       ...parseEventLines([
         JSON.stringify({
@@ -1832,7 +1832,7 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
               phase: "pre_tool_use",
               policy_name: "claude_native_permission",
               requestedSchema: {},
-              ask_user_question: { questions: [question] },
+              ask_user_question: { questions },
               terminal_fallback: { answer_undelivered: answerUndelivered },
             },
           },
@@ -1867,6 +1867,30 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       expect(screen.queryByTestId("approval-card-open-terminal")).toBeNull();
     },
   );
+
+  it("pages through every question read-only", () => {
+    const followUp = {
+      question: "Should I run the migrations first?",
+      header: "Migrations",
+      multiSelect: false,
+      options: [
+        { label: "Run them", description: "Migrate before deploying" },
+        { label: "Skip them", description: "Deploy without migrating" },
+      ],
+    };
+    render(<ElicitationCard item={terminalCardItem(false, [question, followUp])} />);
+    const card = screen.getByTestId("approval-card");
+
+    fireEvent.click(within(card).getByTestId("ask-user-question-next"));
+    expect(within(card).getByText(followUp.question)).toBeDefined();
+    expect(within(card).getByRole("radio", { name: /Run them/ })).toBeDisabled();
+    expect(within(card).queryByTestId("ask-user-question-submit")).toBeNull();
+    expect(within(card).queryByRole("button", { name: /cancel/i })).toBeNull();
+
+    fireEvent.click(within(card).getByTestId("ask-user-question-prev"));
+    expect(within(card).getByText(question.question)).toBeDefined();
+    expect(within(card).getByRole("radio", { name: /Staging/ })).toBeDisabled();
+  });
 
   it.each([
     { viewer: "the session itself", requester: null, sideChatId: null, opensTerminal: true },

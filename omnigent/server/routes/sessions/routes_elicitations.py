@@ -43,6 +43,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_pending_policy_ask_writes,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _client_supports_terminal_fallback,
     _resolve_elicitation,
 )
 from omnigent.server.schemas import (
@@ -109,7 +110,7 @@ def register_elicitations_routes(
         :func:`_resolve_elicitation`.
 
         :param request: The inbound request, used for identity
-            extraction.
+            extraction and the terminal-fallback client header.
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         :param elicitation_id: Correlation id of the elicitation to
@@ -132,7 +133,13 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+        await _resolve_elicitation(
+            session_id,
+            _resolve_data,
+            runner_router,
+            conversation_store,
+            client_supports_terminal_fallback=_client_supports_terminal_fallback(request.headers),
+        )
         # Apply any policy writes deferred by the relay tool-call ASK gate
         # (e.g. a cost-budget checkpoint) now that the verdict is in.
         await _apply_pending_policy_ask_writes(

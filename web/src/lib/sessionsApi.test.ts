@@ -1774,6 +1774,8 @@ describe("approve", () => {
       action: "accept",
       content: { confirm: true },
     });
+    // Only clients that show a held prompt read-only get the server's refusal.
+    expect(new Headers(init.headers).get("X-Omnigent-Terminal-Fallback")).toBe("on");
   });
 
   it("omits content when not supplied", async () => {

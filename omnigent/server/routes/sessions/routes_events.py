@@ -248,6 +248,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
+    _client_supports_terminal_fallback,
     _codex_side_chat_fork_lost,
     _codex_side_chat_thread_id,
     _dispatch_session_event_to_runner,
@@ -1935,7 +1936,15 @@ def register_events_routes(
             # to the runner for runner-side (policy) elicitations.
             # The dedicated URL endpoint (``.../elicitations/{eid}/
             # resolve``) routes through the same helper.
-            await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
+            await _resolve_elicitation(
+                session_id,
+                body.data,
+                runner_router,
+                conversation_store,
+                client_supports_terminal_fallback=_client_supports_terminal_fallback(
+                    request.headers
+                ),
+            )
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
             await _apply_pending_policy_ask_writes(
