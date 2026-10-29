@@ -1642,6 +1642,106 @@ def test_requester_registry_tracks_consumption_pending_and_delayed_calls() -> No
     assert lost is not None and lost.origin.user_id is None
 
 
+@pytest.mark.parametrize("restriction", ["mixed_input", "copied_id"])
+def test_requester_registry_capacity_retires_authority_and_recovers(
+    monkeypatch, restriction
+) -> None:
+    from omnigent.harnesses.codex_native.requester import CodexRequesterRegistry
+    from omnigent.runtime.requester import InputRequester
+
+    monkeypatch.setattr(CodexRequesterRegistry, "_MAX_RECORDS", 2)
+    registry = CodexRequesterRegistry()
+    owner = InputRequester(user_id="bryan", account_generation="b1")
+    collaborator = InputRequester(user_id="pat", account_generation="p1")
+    identity = CodexExecutionIdentity("native_session", "thread", "old")
+    first = registry.begin(owner, "thread", None)
+    items = [{"type": "userMessage", "clientId": first}]
+    turns = [{"id": "old", "items": items}]
+    response = {
+        "result": {"thread": {"id": "thread", "sessionId": "native_session", "turns": turns}}
+    }
+    assert registry.snapshot(identity, response, revision=registry.revision).origin == owner
+    second = (
+        registry.begin(collaborator, "thread", "old") if restriction == "mixed_input" else first
+    )
+    items.append({"type": "userMessage", "clientId": second})
+    assert registry.snapshot(identity, response, revision=registry.revision).origin.user_id is None
+    if restriction == "copied_id":
+        turns.append({"id": "unknown", "items": [{"type": "userMessage", "clientId": "external"}]})
+        unknown = CodexExecutionIdentity("native_session", "thread", "unknown")
+        assert (
+            registry.snapshot(unknown, response, revision=registry.revision).origin.user_id is None
+        )
+        # A later full read can omit previously observed ambiguity.
+        items.pop()
+    before_retirement = registry.revision
+
+    for index in range(6):
+        fresh_id = registry.begin(owner, "thread", None)
+        assert len(registry._submissions) <= 2
+        fresh_turn = f"fresh-{index}"
+        turns.append({"id": fresh_turn, "items": [{"type": "userMessage", "clientId": fresh_id}]})
+        fresh_identity = CodexExecutionIdentity("native_session", "thread", fresh_turn)
+        fresh = registry.snapshot(fresh_identity, response, revision=registry.revision)
+        assert fresh is not None and fresh.origin == owner
+        assert len(registry._executions) <= 2
+        delayed = registry.snapshot(identity, response, revision=registry.revision)
+        assert delayed is None or delayed.origin.user_id is None
+        if restriction == "copied_id" and index == 0:
+            assert first in registry._submissions
+
+    assert first not in registry._submissions and second not in registry._submissions
+    assert registry.snapshot(identity, response, revision=before_retirement) is None
+    # Even an older full snapshot which omits the mixed input cannot restore authority.
+    items[:] = [{"type": "userMessage", "clientId": first}]
+    delayed = registry.snapshot(identity, response, revision=registry.revision)
+    assert delayed is None or delayed.origin.user_id is None
+    items.append({"type": "userMessage", "clientId": fresh_id})
+    copied = registry.snapshot(identity, response, revision=registry.revision)
+    assert copied is None or copied.origin.user_id is None
+    assert len(registry._executions) <= 2
+
+
+def test_requester_registry_capacity_preserves_unresolved_inputs(monkeypatch) -> None:
+    from omnigent.harnesses.codex_native.requester import CodexRequesterRegistry
+    from omnigent.runtime.requester import InputRequester
+
+    monkeypatch.setattr(CodexRequesterRegistry, "_MAX_RECORDS", 2)
+    registry = CodexRequesterRegistry()
+    owner = InputRequester(user_id="bryan")
+    first = registry.begin(owner, "thread", None)
+    pending = registry.begin(InputRequester(user_id="pat"), "thread", None)
+    registry.finish(pending, refused=False)
+    with pytest.raises(RuntimeError, match="unresolved"):
+        registry.begin(owner, "thread", None)
+    assert len(registry._submissions) == 2
+
+    response = {
+        "result": {
+            "thread": {
+                "id": "thread",
+                "sessionId": "native_session",
+                "turns": [{"id": "old", "items": [{"type": "userMessage", "clientId": first}]}],
+            }
+        }
+    }
+    identity = CodexExecutionIdentity("native_session", "thread", "old")
+    blocked = registry.snapshot(identity, response, revision=registry.revision)
+    assert blocked is not None and blocked.origin.user_id is None
+    fresh_id = registry.begin(owner, "thread", None)
+    assert pending in registry._submissions
+    response["result"]["thread"]["turns"].append(
+        {"id": "fresh", "items": [{"type": "userMessage", "clientId": fresh_id}]}
+    )
+    fresh_identity = CodexExecutionIdentity("native_session", "thread", "fresh")
+    blocked = registry.snapshot(fresh_identity, response, revision=registry.revision)
+    assert blocked is not None and blocked.origin.user_id is None
+    registry.finish(pending, refused=True)
+    recovered = registry.snapshot(fresh_identity, response, revision=registry.revision)
+    assert recovered is not None and recovered.origin == owner
+    assert len(registry._submissions) <= 2 and len(registry._executions) <= 2
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -1652,6 +1752,8 @@ def test_requester_registry_tracks_consumption_pending_and_delayed_calls() -> No
         "wrong_thread",
         "missing_turn",
         "summary",
+        "other_summary",
+        "other_malformed_turn",
         "malformed_item",
         "refused_input",
         "copied_from_parent",
@@ -1688,6 +1790,10 @@ def test_requester_registry_missing_or_ambiguous_evidence_is_unknown(fault: str)
             turn["id"] = "other"
         case "summary":
             turn["itemsView"] = "summary"
+        case "other_summary":
+            thread["turns"].append({"id": "other", "items": items, "itemsView": "summary"})
+        case "other_malformed_turn":
+            thread["turns"].append({"id": "other", "items": None})
         case "malformed_item":
             items.append(None)
         case "refused_input":

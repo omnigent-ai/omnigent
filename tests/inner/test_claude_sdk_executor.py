@@ -6012,8 +6012,9 @@ def _make_recovery_fake_sdk():
             def __init__(self, options, *, transport=None):
                 self.options = options
                 self.prompts = []
+                self.submissions = []
                 self._query = None
-                self._transport = _make_transport_with_process(None)
+                self._transport = transport or _make_transport_with_process(None)
                 _FakeSDK.created_clients.append(self)
 
             async def connect(self):
@@ -6023,6 +6024,7 @@ def _make_recovery_fake_sdk():
                 if not isinstance(prompt, str):
                     [submission] = [message async for message in prompt]
                     assert submission["uuid"]
+                    self.submissions.append(submission)
                     prompt = submission["message"]["content"]
                 self.prompts.append(prompt)
 
@@ -6240,8 +6242,10 @@ def test_tool_call_metadata_marks_only_omnigent_mcp_tools_as_dispatched() -> Non
         "queued-input",
     ],
 )
-def test_claude_requester_transport_never_guesses_missing_or_conflicting_provenance(fault):
-    from omnigent.inner.claude_sdk_executor import _ClaudeRequesterTransport
+async def test_claude_requester_transport_never_guesses_missing_or_conflicting_provenance(
+    fault, monkeypatch
+):
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeRequesterTransport
     from omnigent.runtime.requester import InputRequester, ToolRequester
 
     transport = _ClaudeRequesterTransport(options=None)
@@ -6287,16 +6291,115 @@ def test_claude_requester_transport_never_guesses_missing_or_conflicting_provena
         del params["_meta"]
     elif fault == "wrong-name":
         params["name"] = "another-tool"
-    assert (
-        transport._observe(
-            {
-                "type": "control_request",
-                "request": {
-                    "subtype": "mcp_message",
-                    "server_name": "omnigent",
-                    "message": {"method": "tools/call", "params": params},
-                },
-            }
+    callback = {
+        "type": "control_request",
+        "request": {
+            "subtype": "mcp_message",
+            "server_name": "omnigent",
+            "message": {"method": "tools/call", "params": params},
+        },
+    }
+    assert transport._observe(callback) is None
+
+    if fault != "capacity":
+        return
+
+    # Completed turns retain IDs, including native tools, until the client rotates.
+    monkeypatch.setattr(_ClaudeRequesterTransport, "_MAX_RECORDS", 3)
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._find_system_claude", lambda: None)
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    bindings = []
+    transports = []
+
+    class CapacityClient(fake_sdk.ClaudeSDKClient):
+        async def receive_response(self):
+            active = self._transport
+            transports.append(active)
+            submission = self.submissions[-1]
+            call_id = ("call", "second-call", "fresh-call")[index]
+            content = [{"type": "tool_use", "id": call_id, "name": "mcp__omnigent__echo"}]
+            if index == 0:
+                content.append({"type": "tool_use", "id": "native-call", "name": "Agent"})
+            elif index == 2:
+                content.append({"type": "tool_use", "id": "call", "name": "mcp__omnigent__echo"})
+            active._observe(
+                {
+                    **frame,
+                    "user_message_uuid": submission["uuid"],
+                    "user_message_uuids": [submission["uuid"]],
+                    "message": {"content": content},
+                }
+            )
+            params["_meta"]["claudecode/toolUseId"] = call_id
+            binding = active._observe(callback)
+            assert binding is not None
+            assert binding.requester == requester
+            bindings.append(binding)
+            if index == 1:
+                assert len(active._tools) == 3
+                active._observe(
+                    {
+                        "type": "assistant",
+                        "parent_tool_use_id": None,
+                        "message": {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "overflow",
+                                    "name": "mcp__omnigent__echo",
+                                }
+                            ]
+                        },
+                    }
+                )
+                params["_meta"]["claudecode/toolUseId"] = "overflow"
+                assert active._observe(callback) is None
+            active._observe({"type": "result"})
+            async for result in super().receive_response():
+                yield result
+
+    fake_sdk.ClaudeSDKClient = CapacityClient
+    monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: fake_sdk)
+    messages = []
+    try:
+        for index, user in enumerate(("owner", "collaborator", "owner")):
+            requester = ToolRequester(
+                execution_id=str(index) * 32, origin=InputRequester(user_id=user)
+            )
+            messages.append(
+                {"role": "user", "content": f"question {index}", "session_id": "capacity"}
+            )
+            events = [
+                event async for event in executor.run_turn(messages, [], "", requester=requester)
+            ]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            assert any(isinstance(event, TurnComplete) for event in events)
+            messages.append({"role": "assistant", "content": f"answer {index}"})
+
+        assert len(fake_sdk.created_clients) == 2
+        assert transports[0] is transports[1]
+        assert transports[2] is not transports[0]
+        assert fake_sdk.created_clients[0].prompts == ["question 0", "question 1"]
+        replay = fake_sdk.created_clients[1].prompts[0]
+        assert all(
+            text in replay
+            for text in ("question 0", "answer 0", "question 1", "answer 1", "question 2")
         )
-        is None
-    )
+        # A repeated ID on the new producer cannot revive callbacks from the old one.
+        params["_meta"]["claudecode/toolUseId"] = "call"
+        reused_binding = transports[2]._observe(callback)
+        assert reused_binding is not None
+        assert reused_binding.requester == bindings[2].requester
+        assert bindings[0].call_id == reused_binding.call_id == "call"
+        assert bindings[0].requester.execution_id != bindings[2].requester.execution_id
+        retired = transports[0]
+        assert retired._observe(callback) is None
+        old_uuid = fake_sdk.created_clients[0].submissions[0]["uuid"]
+        retired._observe(
+            {**frame, "user_message_uuid": old_uuid, "user_message_uuids": [old_uuid]}
+        )
+        assert retired._observe(callback) is None
+        assert transports[2]._observe(callback) == reused_binding
+    finally:
+        await executor.close_session("capacity")

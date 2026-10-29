@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
@@ -98,6 +99,16 @@ class _StubPermissionStore:
         if public_grant is not None:
             return public_grant.level
         return None
+
+
+def _connected_attach_user_ids(rows: list[dict[str, Any]]) -> list[str | None]:
+    """User ids on the terminal-attach connected rows, in emit order."""
+    return [
+        row["user_id"]
+        for row in rows
+        if row["event_name"] == "attach_terminal_by_resource_id"
+        and row["attributes"].get("phase") == "connected"
+    ]
 
 
 class _StubConversationStore:
@@ -428,7 +439,7 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy(
 )
 @pytest.mark.parametrize("runner_token", [False, True], ids=["human", "runner"])
 async def test_attach_terminal_allows_owner_for_interactive_proxy(
-    actor: str, auth_source: str, runner_token: bool
+    actor: str, auth_source: str, runner_token: bool, debug_log_rows: list[dict[str, Any]]
 ) -> None:
     """Capture the provider's writer, including admins and explicit local policy."""
     from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
@@ -498,6 +509,29 @@ async def test_attach_terminal_allows_owner_for_interactive_proxy(
     )
     assert TerminalWriter.model_validate_json(query[TERMINAL_WRITER_QUERY][0]) == expected
     assert b"whoami\n" in conn.received
+    assert _connected_attach_user_ids(debug_log_rows) == [actor]
+
+
+async def test_attach_terminal_attributes_logs_with_permissions_disabled(
+    debug_log_rows: list[dict[str, Any]], runner_client_reset: None
+) -> None:
+    """With no permission store, the attach still attributes its rows to the caller."""
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(auth_provider=UnifiedAuthProvider(source="header")),
+        prefix="/v1",
+    )
+    set_runner_ws_factory(_FakeRunnerWSFactory(_FakeRunnerWSConn(wait_close_after=1)))
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    ) as ws:
+        ws.send_bytes(b"ls\n")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert _connected_attach_user_ids(debug_log_rows) == ["alice@example.com"]
 
 
 async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> None:

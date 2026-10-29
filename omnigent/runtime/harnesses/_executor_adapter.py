@@ -362,6 +362,7 @@ class ExecutorAdapter(HarnessApp):
         # OpenAI Runner creates its tool tasks per run. Claude's persistent reader
         # inherits the first run's context, so it must supply explicit provenance.
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+        from omnigent.inner.codex_executor import CodexExecutor
         from omnigent.inner.openai_agents_sdk_executor import OpenAIAgentsSDKExecutor
 
         execution_token = self._task_tool_execution.set(
@@ -400,7 +401,7 @@ class ExecutorAdapter(HarnessApp):
                     config=config,
                     **(
                         {"requester": ctx.requester.snapshot()}
-                        if isinstance(executor, ClaudeSDKExecutor)
+                        if isinstance(executor, (ClaudeSDKExecutor, CodexExecutor))
                         else {}
                     ),
                 ):
@@ -888,7 +889,8 @@ class ExecutorAdapter(HarnessApp):
 
         Claude SDK MCP binds raw producer tool IDs to registered submissions before
         the SDK parses them. Its persistent reader's context is never authority.
-        Currently unbound paths are Codex SDK MCP, Pi tool callbacks,
+        Codex SDK binds dynamic calls to the exact turn/start reply, independently
+        of display event correlation. Currently unbound paths are Pi tool callbacks,
         Cursor/Copilot/Antigravity custom tools, and the generic ACP/Goose/Qwen Omnigent
         MCP relay. Their callbacks dispatch with explicit unknown authority. Ordinary
         tools still route through policies, but owner-verified cross-session messages

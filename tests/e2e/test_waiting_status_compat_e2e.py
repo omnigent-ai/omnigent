@@ -151,8 +151,7 @@ def test_runner_does_not_500_old_server_emitting_waiting_status(
         poll_until(tool_outputs, timeout_s=60)
         output = ast.literal_eval(tool_outputs()[-1])
         if expect_refusal:
-            expected_error = f"Error: failed to create child session: {capability.status_code} "
-            assert output["result"].startswith(expected_error), output
+            assert "upgrade server and runner together" in output["result"], output
         else:
             handle = output
             assert handle["kind"] == "sub_agent", output

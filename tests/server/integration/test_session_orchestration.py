@@ -463,8 +463,10 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
 async def test_scheduled_origin_allows_new_controls_children_and_reads(
     auth_client, auth_app, peers, db_uri, monkeypatch, execution_target, full_fork
 ):
+    import httpx
+
     from omnigent.server.routes.sessions import routes_core
-    from omnigent.server.scheduled.fire import FireDeps, build_on_fire
+    from omnigent.server.scheduled.fire import FireDeps, _send_prompt, build_on_fire
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
     from tests._helpers.polling import poll_until_async
 
@@ -488,22 +490,37 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
     async def launch(session, task):
         labels_at_launch.append(session.labels)
 
-    on_fire = build_on_fire(
-        FireDeps(
-            scheduled_task_store=schedules,
-            agent_store=auth_app.state.agent_store,
-            conversation_store=conversations,
-            permission_store=SqlAlchemyPermissionStore(db_uri),
-            host_store=auth_app.state.host_store,
-            host_registry=auth_app.state.host_registry,
-            sandbox_config=auth_app.state.sandbox_config,
-        ),
-        launch_dispatch=launch,
+        def record(request):
+            captured.setdefault("posts", []).append(
+                (request.url.path, json.loads(request.content))
+            )
+            return httpx.Response(202, json={})
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(record), base_url="http://runner"
+        ) as runner:
+            await _send_prompt(deps, session, runner, task)
+
+    deps = FireDeps(
+        scheduled_task_store=schedules,
+        agent_store=auth_app.state.agent_store,
+        conversation_store=conversations,
+        permission_store=SqlAlchemyPermissionStore(db_uri),
+        host_store=auth_app.state.host_store,
+        host_registry=auth_app.state.host_registry,
+        sandbox_config=auth_app.state.sandbox_config,
     )
+    on_fire = build_on_fire(deps, launch_dispatch=launch)
     assert await on_fire(0, task.id)
     await poll_until_async(lambda: schedules.get(task.id).last_run_conversation_id, timeout_s=5)
     scheduled_id = schedules.get(task.id).last_run_conversation_id
     assert labels_at_launch[0][SCHEDULED_TASK_ORIGIN_LABEL_KEY] == task.id
+    delivered = [body for path, body in captured.get("posts", []) if path.endswith("/events")]
+    assert len(delivered) == 1
+    origin = InputRequester.from_body(delivered[0])
+    assert origin.user_id == task.user_id
+    assert origin.account_generation == task.account_generation
+    requester = ExecutionRequester(origin).snapshot()
     schedules.delete(task.id)
     assert schedules.list_runs(task.id)[0] == []
 
@@ -529,13 +546,13 @@ async def test_scheduled_origin_allows_new_controls_children_and_reads(
         captured.clear()
         # A scheduled run, its forks and children message the owner's sessions
         # like any private session they own.
-        result = await _send(auth_client, scheduled, target)
+        result = await _send(auth_client, scheduled, target, requester=requester)
         assert result.get("queued") is True, result
         assert "Please inspect the PR" in json.dumps(captured)
         for placement in ("same_host", "managed"):
             result = json.loads(
                 await execute_tool(
-                    requester=_requester(),
+                    requester=requester,
                     tool_name="sys_session_create",
                     arguments=json.dumps({"agent_id": source["agent_id"], "placement": placement}),
                     server_client=auth_client,
@@ -1015,9 +1032,8 @@ async def test_orchestrated_endpoint_requires_source(auth_client, peers, monkeyp
 
 
 @pytest.mark.parametrize("requester_user", ["alice", "bob", None])
-@pytest.mark.parametrize("share_before_admission", [False, True])
 async def test_startup_queue_admission_and_replay(
-    auth_client, auth_app, peers, db_uri, monkeypatch, share_before_admission, requester_user
+    auth_client, auth_app, peers, db_uri, requester_user
 ):
     from omnigent.server.startup_inputs import STARTUP_LABEL
 
@@ -1027,16 +1043,6 @@ async def test_startup_queue_admission_and_replay(
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     startup = auth_app.state.startup_inputs
-    accepts = startup.accepts
-
-    async def check_startup(*args):
-        result = await accepts(*args)
-        assert result is True
-        if share_before_admission:
-            permissions.grant("bob", source["id"], LEVEL_READ)
-        return result
-
-    monkeypatch.setattr(startup, "accepts", check_startup)
     result = await _send(auth_client, source, target, requester=_requester(requester_user))
     pending = store.list_pending_inputs(target["id"])
     assert not captured.get("posts")

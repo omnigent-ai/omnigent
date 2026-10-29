@@ -12,6 +12,24 @@ from omnigent.util.uuid import uuid_to_bytes
 REQUEST_HOST_EXTENSION = "omnigent_host_id"
 
 
+def requester_route_error(response: httpx.Response) -> str | None:
+    """Distinguish a missing requester route from a structured resource error."""
+    if response.status_code not in (404, 405):
+        return None
+    if response.status_code == 404:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict) and error.get("code") == "not_found":
+            return None
+    return (
+        "Requester-aware delegation is unavailable on this server; "
+        "upgrade server and runner together"
+    )
+
+
 async def post_on_host(
     client: httpx.AsyncClient,
     path: str,

@@ -68,6 +68,7 @@ from omnigent.models.codex_model_vocabulary import (
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
+from omnigent.runtime.requester import ToolRequester
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
 
@@ -3634,6 +3635,7 @@ class _CodexAppServerSession:
         cwd: str,
         sandbox: str,
         reasoning_effort: str | None = None,
+        requester: ToolRequester | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         await self.start()
         assert self._proc is not None
@@ -3946,7 +3948,23 @@ class _CodexAppServerSession:
                     continue
 
                 if method == "item/tool/call":
-                    if not _event_turn_matches(params):
+                    # Display events may adopt a rewritten ID; authority must match
+                    # the original turn/start reply from this app-server connection.
+                    if requester is not None and (
+                        params.get("turnId") != raw_active_turn_id
+                        or params.get("threadId", self.thread_id) != self.thread_id
+                    ):
+                        await self._send_response(
+                            int(message["id"]),
+                            _dynamic_tool_result_payload(
+                                {
+                                    "error": "tool callback has no matching originating turn",
+                                    "code": "runner_turn_context_desync",
+                                }
+                            ),
+                        )
+                        continue
+                    if requester is None and not _event_turn_matches(params):
                         continue
                     raw_call_id = params.get("callId")
                     raw_tool_name = params.get("tool")
@@ -3967,7 +3985,9 @@ class _CodexAppServerSession:
                         args=tool_args,
                         metadata={"call_id": call_id},
                     )
-                    result = await self._execute_dynamic_tool(tool_name, tool_args)
+                    result = await self._execute_dynamic_tool(
+                        tool_name, tool_args, call_id=call_id, requester=requester
+                    )
                     classification = classify_tool_result(result)
                     duration_ms = (time.monotonic() - started) * 1000
                     pending_tool_results[call_id] = _PendingToolResult(
@@ -4292,11 +4312,21 @@ class _CodexAppServerSession:
         self,
         tool_name: str,
         tool_args: ToolArgs,
+        *,
+        call_id: str | None = None,
+        requester: ToolRequester | None = None,
     ) -> CodexToolResult:
         if self._tool_executor is None:
             return {"error": f"No tool executor available for '{tool_name}'"}
         try:
-            raw = self._tool_executor(tool_name, tool_args)
+            if requester is None:
+                raw = self._tool_executor(tool_name, tool_args)
+            else:
+                bound_executor = cast(
+                    Callable[..., Awaitable[CodexToolResult] | CodexToolResult],
+                    self._tool_executor,
+                )
+                raw = bound_executor(tool_name, tool_args, call_id=call_id, requester=requester)
             resolved: CodexToolResult = await raw if isinstance(raw, Awaitable) else raw
             if isinstance(resolved, dict):
                 return resolved
@@ -5009,6 +5039,8 @@ class CodexExecutor(Executor):
         tools: list[ToolSpec],
         system_prompt: str,
         config: ExecutorConfig | None = None,
+        *,
+        requester: ToolRequester | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
         binary_identity = _codex_binary_identity(self._codex_path)
@@ -5083,6 +5115,7 @@ class CodexExecutor(Executor):
                 cwd=effective_cwd,
                 sandbox=sandbox_mode,
                 reasoning_effort=reasoning_effort,
+                requester=requester,
             ):
                 yield event
         except (HarnessTransportClosedError, ProviderAuthRequired):

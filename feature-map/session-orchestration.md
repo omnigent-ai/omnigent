@@ -148,6 +148,14 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   | OpenAI Agents SDK Chat/API | Implemented | Real process send/create, editor refusal, fresh owner recovery and kill switch. |
   | Codex native web Chat | Implemented | Pinned CLI consumption IDs, authenticated harness lookup, browser actions and destination history. |
   | Claude SDK Chat/API | Implemented | Raw provider UUID echoes and exact SDK control tasks retain input/tool lineage before typed parsing. Isolated pinned-process rows cover owner/editor/recovery, worker creation and kill switch; component tests cover delayed callbacks. |
+  | Codex SDK dynamic tools | Implemented | Match callbacks to the exact `turn/start` reply and originating execution. `tests/runtime/harnesses/test_executor_adapter_requester.py` drives the real stdio reader; `tests/inner/test_codex_executor.py` covers callback forwarding. These are scripted-producer checks, not live-provider evidence. |
+  | Pi SDK tool bridge | Refused; unresolved | Call IDs do not yet bind a tool-server callback to a consumed execution. `tests/inner/test_pi_executor.py` is the producer entry point; owner/editor/delayed-turn attribution coverage is still required. |
+  | Cursor SDK custom tools | Refused; unresolved | `tests/inner/test_cursor_executor.py` covers the producer; callback-to-execution attribution is still required before owner delegation can work. |
+  | Copilot SDK custom tools | Refused; unresolved | `tests/inner/test_copilot_executor.py` covers the producer; persistent callbacks need originating-execution attribution. |
+  | Antigravity SDK custom tools | Refused; unresolved | `tests/inner/test_antigravity_executor.py` covers the producer; shared tool callbacks lack a verified turn binding. |
+  | Generic ACP MCP relay | Refused; unresolved | `tests/inner/test_acp_executor.py` covers the session-scoped relay; call/display IDs alone do not establish the originating execution. |
+  | Goose ACP MCP relay | Refused; unresolved | `tests/inner/test_goose_executor.py` plus the generic ACP relay checks; inherits the same missing requester binding. |
+  | Qwen ACP MCP relay | Refused; unresolved | `tests/inner/test_qwen_executor.py` plus the generic ACP relay checks; inherits the same missing requester binding. |
   | Claude native Chat/terminal | Unavailable; deferred | Edit sharing and typing remain available. Peer sends and independent worker creation refuse without verified requester binding, including from private sources. Native Claude requester support is not a release prerequisite. |
   | Codex host-managed terminal / default CLI attach | Implemented | Authenticated relay captures writers; the TUI proxy registers input before submission. Real terminal WebSocket send/create passes. A separate public CLI drive proves typed owner send with a preconnected host and local single-user auth; first-time onboarding and multi-user CLI auth remain unverified. |
   | Legacy internal Codex standalone launcher | Delegation blocked | No in-tree production caller found; the public CLI uses host-managed preparation. Direct internal calls lack trusted input registration. |
@@ -205,8 +213,20 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   the runner; independent creation has no automatic routing fallback.
 - Runner creation and message mutations use the internal `/v1/requester/sessions`
   route family, which reuses the ordinary handlers but cannot exist on a server
-  predating requester preservation. There is no fallback to ordinary or legacy
-  orchestrated routes. Public UI/API routes keep their existing paths.
+  predating requester preservation. Missing routes report a coordinated server/runner
+  upgrade requirement, separately from structured resource-not-found errors. There
+  is no fallback to ordinary or legacy orchestrated routes. Public UI/API routes
+  keep their existing paths.
+- Requester retention is bounded. Claude SDK rotates a full transport before the
+  next conversational turn and replays history; old transport callbacks cannot
+  bind to the replacement. Codex retires consumed registrations with execution
+  records at capacity; retired IDs stay unknown. If 8,192 unresolved Codex inputs
+  fill the registry, new submissions refuse until consumption/refusal is known or
+  the provider scope is replaced. Display-alias eviction only changes old history
+  IDs, never authority. Verify with the capacity scenarios in
+  `tests/inner/test_claude_sdk_executor.py`,
+  `tests/harnesses/codex_native/test_codex_native_bridge.py` and the real WebSocket
+  proxy scenarios in `tests/harnesses/codex_native/app_server/test_client.py`.
 - Codex terminal identity accumulates across the terminal process incarnation.
   Unknown or mixed writers keep terminal-origin delegation restricted until the
   terminal restarts; reconnecting cannot clear it. Fresh authenticated owner Chat

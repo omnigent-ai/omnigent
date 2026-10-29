@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.runner.session_requests import requester_route_error
 from omnigent.runtime.requester import (
     InputRequester,
     ToolRequester,
@@ -2986,6 +2987,8 @@ async def _execute_subagent_tool(
                 f"committed the session — reaping any orphaned cluster.{_suffix} "
                 "Retry the same send to continue in a fresh child."
             )
+        if resp is not None and (protocol_error := requester_route_error(resp)):
+            return f"Error: {protocol_error}"
         if resp is None or resp.status_code >= 400:
             status = resp.status_code if resp is not None else 0
             text = resp.text[:200] if resp is not None else "(no response)"
@@ -3621,13 +3624,8 @@ async def _execute_session_create(
         # Host loss can be reported before persistence or during the later launch.
         if is_wrong_replica(resp) or resp.status_code == 409:
             return json.dumps(unconfirmed_creation)
-    if placement != "child" and resp.status_code in (404, 405):
-        return json.dumps(
-            {
-                "error": "Independent session creation is unavailable on this server "
-                "or the agent was not found",
-            }
-        )
+    if protocol_error := requester_route_error(resp):
+        return json.dumps({"error": protocol_error})
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
@@ -3834,6 +3832,8 @@ async def _upload_config_bundle(
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
+    if protocol_error := requester_route_error(resp):
+        return json.dumps({"error": protocol_error})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
     if resp.status_code >= 400:

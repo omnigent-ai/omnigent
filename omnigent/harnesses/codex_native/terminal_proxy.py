@@ -33,7 +33,11 @@ class CodexTerminalProxy:
     Registration callbacks obtain identity from the authenticated terminal writer.
     The provider retains the registered client ID; only the TUI sees its original
     display ID. A lost acknowledgement never releases pending input evidence.
+    Display aliases are a bounded FIFO cache, independent of requester evidence:
+    old history falls back to its provider ID instead of another input's alias.
     """
+
+    _MAX_DISPLAY_IDS = 8192
 
     def __init__(self, upstream: str, register: RegisterInput) -> None:
         self._upstream = upstream
@@ -62,6 +66,7 @@ class CodexTerminalProxy:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        self._display_ids.clear()
 
     def _authorize(self, connection: ServerConnection, request: Request) -> Response | None:
         values = request.headers.get_all("Authorization")
@@ -147,6 +152,8 @@ class CodexTerminalProxy:
                             self._display_ids[client_id] = (
                                 display_id if isinstance(display_id, str) else None
                             )
+                            if len(self._display_ids) > self._MAX_DISPLAY_IDS:
+                                del self._display_ids[next(iter(self._display_ids))]
                             params["clientUserMessageId"] = client_id
                             if type(rpc_id) in (int, str):
                                 pending[(type(rpc_id), rpc_id)] = registration
@@ -170,6 +177,7 @@ class CodexTerminalProxy:
                             else None
                         )
                         if registration is not None and isinstance(message.get("error"), dict):
+                            self._display_ids.pop(registration.client_id, None)
                             # Pinned start/steer error responses precede input enqueue.
                             with contextlib.suppress(OSError, RuntimeError, ValueError):
                                 await registration.refuse()

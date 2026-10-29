@@ -155,16 +155,15 @@ def test_sidebar_peek_is_opaque_in_dark_mode(
     page.get_by_role("button", name="Open sidebar").hover()
     expect(conversations).to_have_class(_PEEK_CLASS)
 
-    expected_background = page.evaluate(
-        """() => {
+    colors = conversations.evaluate(
+        """element => {
           const probe = document.createElement("div");
           probe.style.backgroundColor = "var(--card-solid)";
           document.body.appendChild(probe);
           const expected = getComputedStyle(probe).backgroundColor;
+          const actual = getComputedStyle(element).backgroundColor;
           probe.remove();
-          return expected;
+          return { actual, expected };
         }"""
     )
-    # The peek class appears before its background-color transition finishes.
-    expect(conversations).to_have_css("background-color", expected_background)
-    expect(conversations).to_have_class(_PEEK_CLASS)
+    assert colors["actual"] == colors["expected"]

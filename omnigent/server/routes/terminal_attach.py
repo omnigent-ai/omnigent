@@ -73,7 +73,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketE
 from starlette import status
 
 from omnigent.db.account_authority import account_generation
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runtime import (
@@ -169,6 +169,8 @@ def create_terminal_attach_router(
             conversation_store=conversation_store,
         )
         bind_terminal_writer(websocket.scope, writer)
+        # WebSockets bypass HTTP log attribution; this task is per connection.
+        set_current_user_id(auth_provider.get_user_id(websocket) if auth_provider else None)
         await websocket.accept()
         _logger.info(
             "terminal attach connected for session %s terminal %s",

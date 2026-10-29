@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -173,7 +174,9 @@ def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[s
     raise AssertionError(f"no frame in {wanted} after {max_frames} frames")
 
 
-def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> None:
+def test_watch_returns_snapshot_of_accessible_sessions(
+    app: FastAPI, stores, debug_log_rows: list[dict[str, Any]]
+) -> None:
     """A ``watch`` for owned ids returns a snapshot containing exactly
     those sessions, with their persisted titles."""
     s1 = _seed_session(stores, owner=ALICE, title="first")
@@ -198,6 +201,14 @@ def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> 
         # would drop the key (stream dumps full rows, so it must be present).
         assert items[s1]["runner_online"] is True
         assert items[s1]["host_online"] is None
+    # WebSockets skip the HTTP middleware that attributes debug-log rows, so
+    # the handler binds the caller itself.
+    connected = [
+        row
+        for row in debug_log_rows
+        if row["event_name"] == "session_updates" and row["attributes"].get("phase") == "connected"
+    ]
+    assert [row["user_id"] for row in connected] == [ALICE]
 
 
 def test_child_busy_rollup_flows_through_updates_stream(

@@ -6,7 +6,12 @@ from typing import Any
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.runner.session_requests import is_wrong_replica, post_on_host, session_host_id
+from omnigent.runner.session_requests import (
+    is_wrong_replica,
+    post_on_host,
+    requester_route_error,
+    session_host_id,
+)
 from omnigent.runtime.requester import requester_headers
 from omnigent.util.uuid import uuid_to_bytes
 
@@ -58,6 +63,8 @@ async def execute_message_tool(
         return json.dumps(
             {"error": "Delivery could not be confirmed; do not automatically resend"}
         )
+    if protocol_error := requester_route_error(response):
+        return json.dumps({"error": protocol_error})
     if response.is_error:
         return json.dumps({"error": "Session message refused", "detail": response.text[:1000]})
     try:

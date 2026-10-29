@@ -2088,13 +2088,31 @@ def test_build_spawn_env_applies_model_override(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    base = _build_spawn_env_from_spec(spec, "claude-sdk")
-    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = SessionResourceRegistry()
+    registry.set_client_surface("desktop-session", "desktop")
+    base = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="desktop-session", resource_registry=registry
+    )
+    overridden = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        model_override="claude-sonnet-4-6",
+        session_id="desktop-session",
+        resource_registry=registry,
+    )
     assert base is not None and overridden is not None
     # Baseline uses the provider/catalog default (not the override) …
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    assert base["OMNIGENT_CLIENT_SURFACE"] == overridden["OMNIGENT_CLIENT_SURFACE"] == "desktop"
+    unknown = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="legacy-session", resource_registry=registry
+    )
+    assert unknown is not None
+    assert unknown["OMNIGENT_CLIENT_SURFACE"] == "unknown"
 
 
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8267,7 +8285,9 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, json={"error": "no agent"})
+        return httpx.Response(
+            404, json={"error": {"code": "not_found", "message": "Agent not found: ag_missing"}}
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
@@ -8405,10 +8425,12 @@ def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("create_status", [201, 404, 405])
 @pytest.mark.parametrize("requester_user", [None, "bryan", "pat"])
 async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     tmp_path: Path,
     requester_user: str | None,
+    create_status: int,
 ) -> None:
     """
     Bundle mode bundles a local agent config, POSTs the multipart
@@ -8440,6 +8462,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path == "/v1/requester/sessions":
             create_requests.append(request)
+            if create_status != 201:
+                return httpx.Response(create_status, json={"detail": "Not Found"})
             return httpx.Response(
                 201,
                 json={
@@ -8487,6 +8511,11 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         member = tf.extractfile("helper.yaml")
         assert member is not None
         assert member.read().decode() == config_text
+
+    if create_status != 201:
+        assert event_bodies == []
+        assert "upgrade server and runner together" in json.loads(output)["error"]
+        return
 
     # The optional message was queued as the child's first user event —
     # this is what starts the child's turn (same pattern as named send).

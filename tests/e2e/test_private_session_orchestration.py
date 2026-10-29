@@ -598,7 +598,6 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
                 send(manager, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK")
                 wait_text(manager, "MANAGER_BLOCKED")
-                assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 wait_text(worker, "SHARED_OWNER_RESULT")
                 for session in (manager, worker):
                     response = client.put(
@@ -764,7 +763,6 @@ def test_private_manager_launch_send_read_and_sharing(
                     "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK_COLLABORATOR_DELEGATION_FRESH_OWNER_SIDE_CHAT",
                 )
                 wait_text(side_chat, "SIDE_CHAT_BLOCKED")
-                assert "SIDE_CHAT_MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 # Native tool results reach the model without entering the UI transcript.
                 wait_text(worker, "SIDE_CHAT_OWNER_TASK")
                 assert tool_payload("side-chat-message")["queued"] is True

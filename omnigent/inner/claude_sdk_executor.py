@@ -933,6 +933,11 @@ class _ClaudeRequesterTransport:
         self._root: ToolRequester | None = None
         self._root_input: str | None = None
 
+    @property
+    def at_capacity(self) -> bool:
+        """Rotate the producer before another turn; retained IDs cannot be safely reused."""
+        return len(self._submitted) >= self._MAX_RECORDS or len(self._tools) >= self._MAX_RECORDS
+
     def register(self, requester: ToolRequester | None) -> str:
         """Mint an input UUID at the trusted submission boundary, before writing it."""
         input_uuid = str(uuid.uuid4())
@@ -2834,9 +2839,18 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
-            # turns, but let /compact operate on the existing client's context.
+        if (
+            state is not None
+            and prompt != "/compact"
+            and (
+                state.effort != reasoning_effort
+                or (
+                    state.requester_transport is not None and state.requester_transport.at_capacity
+                )
+            )
+        ):
+            # Rebuild for launch-option changes or full provenance maps. Keep IDs
+            # scoped to their producer, and let /compact use the existing context.
             await self._close_live_client(session_key)
             resume_session = False
             prompt = self._build_prompt(messages, resume_session=False)

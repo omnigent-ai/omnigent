@@ -2907,6 +2907,95 @@ async def test_run_turn_refuses_to_adopt_stale_final_answer_event() -> None:
     assert session.active_turn_id is None
 
 
+@pytest.mark.parametrize("rewrite_display", [False, True])
+@pytest.mark.parametrize(
+    ("callback_turn", "callback_thread", "allowed"),
+    [
+        ("turn-current", "thread-1", True),
+        ("turn-current", None, True),
+        (None, "thread-1", False),
+        ("turn-previous", "thread-1", False),
+        ("turn-rewritten", "thread-1", False),
+        ("turn-current", "other-thread", False),
+    ],
+)
+async def test_dynamic_tool_requester_requires_original_turn_reply(
+    callback_turn: str | None, callback_thread: str | None, allowed: bool, rewrite_display: bool
+) -> None:
+    from omnigent.runtime.requester import ExecutionRequester, InputRequester
+
+    requester = ExecutionRequester(InputRequester(user_id="owner")).snapshot()
+    dispatch = AsyncMock(return_value={"ok": True})
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=dispatch
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    replies = AsyncMock()
+    session._send_response = replies
+
+    async def start_turn(method, params):
+        assert method == "turn/start"
+        callback = {
+            "callId": "producer-call",
+            "tool": "sys_session_message",
+            "arguments": {"message": "hello"},
+            **({"turnId": callback_turn} if callback_turn is not None else {}),
+            **({"threadId": callback_thread} if callback_thread is not None else {}),
+        }
+        # Deliver after turn/start returns, before any observed turn ID can be adopted.
+        loop = asyncio.get_running_loop()
+        if rewrite_display:
+            loop.call_soon(
+                session._events.put_nowait,
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"turnId": "turn-display", "itemId": "display", "delta": "text"},
+                },
+            )
+        for event in (
+            {"id": 7, "method": "item/tool/call", "params": callback},
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-display" if rewrite_display else "turn-current"}},
+            },
+        ):
+            loop.call_soon(session._events.put_nowait, event)
+        return {"result": {"turn": {"id": "turn-current"}}}
+
+    session._request = start_turn
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+            model="test-model",
+            cwd=".",
+            sandbox="workspace-write",
+            requester=requester,
+        )
+    ]
+    assert isinstance(events[-1], TurnComplete)
+    if allowed:
+        dispatch.assert_awaited_once_with(
+            "sys_session_message",
+            {"message": "hello"},
+            call_id="producer-call",
+            requester=requester,
+        )
+        assert replies.call_args.args[1]["success"] is True
+    else:
+        dispatch.assert_not_awaited()
+        result = replies.call_args.args[1]
+        assert result["success"] is False
+        assert (
+            json.loads(result["contentItems"][0]["text"])["code"] == "runner_turn_context_desync"
+        )
+        assert not any(isinstance(event, ToolCallRequest) for event in events)
+
+
 async def test_run_turn_still_adopts_non_terminal_first_event() -> None:
     """Non-terminal first events (deltas, tool calls) must still be
     adopted; the narrowing only refuses terminal final-answer items.

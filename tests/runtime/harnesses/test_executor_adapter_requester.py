@@ -7,8 +7,8 @@ SSE serialization and teardown rather than the adjacent recording-context stand-
 
 The OpenAI scenario runs the actual SDK in-process with a mocked HTTP model transport.
 Claude coverage includes an unbound reader and the real Client/Query/control tasks
-with a scripted CLI transport. Neither validates a live provider or the SDK harness
-subprocess startup path; that requires a separate process regression before landing.
+with a scripted CLI transport. Codex uses a real JSONL subprocess with a scripted
+app-server. These do not validate live providers or SDK/home/sandbox startup.
 """
 
 from __future__ import annotations
@@ -16,11 +16,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -265,6 +267,261 @@ async def test_delayed_bound_callback_cannot_rebind_to_a_new_execution() -> None
         cancelled = await executor._tool_executor("echo", {})
         assert cancelled["code"] == "runner_turn_context_desync"
         assert not second._pending_tool_calls
+
+
+async def test_codex_stdio_producer_binding_survives_reused_reader_and_call_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Real JSONL subprocess/reader/adapter/SSE; scripted model and mocked auth stores."""
+    from fastapi import Request
+
+    from omnigent.errors import OmnigentError
+    from omnigent.inner.codex_executor import CodexExecutor, _CodexAppServerSession
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
+    from omnigent.runtime.requester import REQUESTER_HEADER
+    from omnigent.server import requester as server_requester
+    from omnigent.server import session_orchestration
+
+    script = """
+import json, sys
+turn = 0
+def emit(value):
+    print(json.dumps(value), flush=True)
+def call(request_id, call_id, turn_id):
+    emit({"id": request_id, "method": "item/tool/call", "params": {
+        "threadId": "thread", "turnId": turn_id, "callId": call_id,
+        "tool": "sys_session_message", "arguments": {"message": "hello"}}})
+for line in sys.stdin:
+    frame = json.loads(line)
+    method = frame.get("method")
+    if method == "thread/start":
+        emit({"id": frame["id"], "result": {"thread": {"id": "thread"}}})
+    elif method == "turn/start":
+        turn += 1
+        turn_id = f"turn-{turn}"
+        emit({"id": frame["id"], "result": {"turn": {"id": turn_id}}})
+        emit({"method": "turn/started", "params": {"turnId": turn_id}})
+        if turn > 1:
+            call(900, "reused-call", f"turn-{turn-1}")
+        call(901, "reused-call", turn_id)
+    elif method == "turn/steer":
+        assert frame["params"]["expectedTurnId"] == turn_id
+        emit({"id": frame["id"], "result": {"turnId": turn_id}})
+    elif frame.get("id") == 901:
+        call(902, "second-call", turn_id)
+    elif frame.get("id") == 902:
+        emit({"method": "item/agentMessage/delta", "params": {
+            "turnId": turn_id, "itemId": "answer", "delta": "done"}})
+        emit({"method": "turn/completed", "params": {"turn": {"id": turn_id}}})
+"""
+    source = SimpleNamespace(
+        id="a" * 32,
+        runner_id="runner",
+        archived=False,
+        labels={},
+        title="private",
+        parent_conversation_id=None,
+    )
+    conversations = Mock(get_conversation=Mock(return_value=source))
+    permissions = Mock(
+        get=Mock(return_value=SimpleNamespace(level=session_orchestration.LEVEL_OWNER))
+    )
+    for module in (session_orchestration, server_requester):
+        monkeypatch.setattr(module, "token_bound_runner_id", lambda _: "runner")
+    monkeypatch.setattr(session_orchestration, "account_generation", lambda _: "generation")
+    release_delayed = asyncio.Event()
+    delayed = None
+    sessions = []
+    replies = []
+
+    def factory(**kwargs):
+        bridge = kwargs.pop("tool_executor")
+
+        async def dispatch(name, args, **binding):
+            nonlocal delayed
+            if delayed is None:
+
+                async def invoke_later():
+                    await release_delayed.wait()
+                    return await bridge(name, args, **binding)
+
+                delayed = asyncio.create_task(invoke_later())
+            return await bridge(name, args, **binding)
+
+        session = _CodexAppServerSession(**kwargs, tool_executor=dispatch)
+        sessions.append(session)
+
+        async def start():
+            if session._proc is None:
+                session._proc = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-I",
+                    "-u",
+                    "-c",
+                    script,
+                    cwd=tmp_path,
+                    env={},
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                session._reader_task = asyncio.create_task(session._reader_loop())
+
+        send_response = session._send_response
+
+        async def record_response(request_id, result):
+            replies.append((request_id, result))
+            await send_response(request_id, result)
+
+        monkeypatch.setattr(session, "start", start)
+        monkeypatch.setattr(session, "_send_response", record_response)
+        # This test owns its fake subprocess; production SDK/home/sandbox startup is bypassed.
+        monkeypatch.setattr(session, "close", AsyncMock())
+        return session
+
+    executor = CodexExecutor(
+        codex_path=sys.executable, model="test-model", app_session_factory=factory
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    readers = []
+    try:
+        for index, user in enumerate(("owner", "collaborator", "owner")):
+            response = await adapter._start_or_inject_turn(
+                _message(
+                    InputRequester(user_id=user, account_generation="generation"),
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "sys_session_message",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"message": {"type": "string"}},
+                            },
+                        }
+                    ],
+                ).to_create_request(),
+                session_id="test-session",
+            )
+            assert isinstance(response, StreamingResponse)
+            ctx = adapter._active_turn_ctx
+            assert ctx is not None
+            if index == 1:
+                release_delayed.set()
+            dispatched = []
+            async with asyncio.timeout(10):
+                async for frame in response.body_iterator:
+                    event = json.loads(frame.decode().split("data: ", 1)[1])
+                    item = event.get("item", {})
+                    if item.get("status") != "action_required":
+                        continue
+                    bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+                    assert bound.execution_id == ctx.requester.execution_id
+                    expected_user = None if index == 2 and dispatched else user
+                    assert bound.origin.user_id == expected_user
+                    request = Request(
+                        {
+                            "type": "http",
+                            "app": SimpleNamespace(
+                                state=SimpleNamespace(
+                                    feature_flags=SimpleNamespace(enabled=lambda _: True)
+                                )
+                            ),
+                            "headers": [
+                                (name.lower().encode(), value.encode())
+                                for name, value in {
+                                    REQUESTER_HEADER: bound.model_dump_json(),
+                                    RUNNER_TUNNEL_TOKEN_HEADER: "test-token",
+                                    ORCHESTRATION_SOURCE_HEADER: source.id,
+                                }.items()
+                            ],
+                        }
+                    )
+                    if expected_user == "owner":
+                        assert (
+                            session_orchestration.require_orchestration_source(
+                                request, "owner", conversations, permissions
+                            )
+                            is source
+                        )
+                    else:
+                        with pytest.raises(OmnigentError, match="verified owner execution"):
+                            session_orchestration.require_orchestration_source(
+                                request, "owner", conversations, permissions
+                            )
+                    dispatched.append(item)
+                    if index == 2 and len(dispatched) == 1:
+                        injected = await adapter._start_or_inject_turn(
+                            _message(
+                                InputRequester(user_id="collaborator"), injection_id="steer"
+                            ).to_create_request()
+                        )
+                        assert injected.status_code == 204
+                        await poll_until_async(
+                            lambda ctx=ctx: (
+                                ctx.requester.origin.user_id is None and not ctx.requester._pending
+                            ),
+                            timeout_s=3,
+                        )
+                    assert ctx._complete_tool(item["call_id"], '{"ok": true}')
+            assert [item["call_id"] for item in dispatched] == ["reused-call", "second-call"]
+            readers.append(sessions[0]._reader_task)
+        assert len(sessions) == 1
+        assert readers[0] is readers[1] is readers[2]
+        assert delayed is not None
+        assert (await delayed)["code"] == "runner_turn_context_desync"
+        stale_results = [result for request_id, result in replies if request_id == 900]
+        assert len(stale_results) == 2
+        for result in stale_results:
+            assert result["success"] is False
+            assert (
+                json.loads(result["contentItems"][0]["text"])["code"]
+                == "runner_turn_context_desync"
+            )
+    finally:
+        release_delayed.set()
+        if delayed is not None:
+            delayed.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await delayed
+        await adapter.on_shutdown()
+        for session in sessions:
+            if session._reader_task is not None:
+                session._reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await session._reader_task
+            if session._proc is not None:
+                if session._proc.returncode is None:
+                    session._proc.terminate()
+                await asyncio.wait_for(session._proc.wait(), timeout=3)
+
+
+async def test_codex_unbound_callback_cannot_borrow_later_owner_or_ambient_requester() -> None:
+    from omnigent.inner.codex_executor import _CodexAppServerSession
+
+    executor = _CallbackExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    async with _turn(adapter, executor, InputRequester(user_id="owner")) as (first, _, _):
+        original = first.requester.snapshot()
+        session = _CodexAppServerSession(
+            codex_path="unused", cwd=".", env={}, tool_executor=executor._tool_executor
+        )
+
+    async with _turn(adapter, executor, InputRequester(user_id="owner")) as (later, events, _):
+        token = current_tool_requester.set(original)
+        try:
+            dispatch = asyncio.create_task(
+                session._execute_dynamic_tool(
+                    "sys_session_message", {REQUESTER_FIELD: original.model_dump()}
+                )
+            )
+        finally:
+            current_tool_requester.reset(token)
+        item = await _next_call(events)
+        bound = ToolRequester.model_validate(item[REQUESTER_FIELD])
+        assert bound.origin.user_id is None
+        assert bound.execution_id not in {original.execution_id, later.requester.execution_id}
+        assert later._complete_tool(item["call_id"], "{}")
+        assert await dispatch == {}
 
 
 async def test_bound_parallel_calls_keep_exact_ids_and_immutable_requesters() -> None:

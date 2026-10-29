@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from functools import partial
+from typing import Any
 
 import httpx
 import pytest
@@ -1289,6 +1290,15 @@ async def test_ws_tunnel_route_is_not_double_prefixed(app: FastAPI) -> None:
     assert registry.online_runner_ids() == []
 
 
+def _connected_row_user_ids(rows: list[dict[str, Any]]) -> list[str | None]:
+    """User ids on the tunnel's ``runner_tunnel`` connected rows, in emit order."""
+    return [
+        row["user_id"]
+        for row in rows
+        if row["event_name"] == "runner_tunnel" and row["attributes"].get("phase") == "connected"
+    ]
+
+
 # ── runner tunnel must fail closed on null owner ──
 #
 # These tests drive the REAL WS route (not register_test_runner, which
@@ -1356,7 +1366,9 @@ async def test_ws_tunnel_rejects_unauthenticated_non_loopback_peer(
     assert route_app.registry.online_runner_ids() == []
 
 
-async def test_ws_tunnel_registers_authenticated_non_loopback_owner() -> None:
+async def test_ws_tunnel_registers_authenticated_non_loopback_owner(
+    debug_log_rows: list[dict[str, Any]],
+) -> None:
     """An authenticated remote runner registers under its owner.
 
     The fix must not break the legitimate ``run --server`` flow: a
@@ -1388,13 +1400,16 @@ async def test_ws_tunnel_registers_authenticated_non_loopback_owner() -> None:
         # Owner recorded as the authenticated caller (not None, not
         # "local") — this is what the binding ownership check enforces on.
         assert route_app.registry.runner_owner(runner_id) == "alice@example.com"
+        assert _connected_row_user_ids(debug_log_rows) == ["alice@example.com"]
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):
             await communicator.wait(timeout=budget(1.0))
 
 
-async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token() -> None:
+async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token(
+    debug_log_rows: list[dict[str, Any]],
+) -> None:
     """A managed-sandbox runner registers under its launch owner.
 
     Server-managed sandboxes authenticate with a server-minted binding
@@ -1439,6 +1454,9 @@ async def test_ws_tunnel_managed_runner_resolves_owner_from_binding_token() -> N
         # Registered under the launch owner the resolver returned — not
         # rejected, and not the owner-less registration the gate forbids.
         assert route_app.registry.runner_owner(runner_id) == "owner@example.com"
+        # No user credential on the handshake: the resolved launch owner is
+        # what attributes the tunnel's debug-log rows.
+        assert _connected_row_user_ids(debug_log_rows) == ["owner@example.com"]
     finally:
         await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
         with contextlib.suppress(asyncio.TimeoutError):

@@ -24,10 +24,17 @@ class _Submission:
 class CodexRequesterRegistry:
     """Retain inputs and execution restrictions in an explicitly owned instance.
 
-    Consumed inputs and executions live until scope replacement: completion
-    cannot rule out delayed calls. Each lookup checks the full provider history
-    for copied IDs; eviction or cached authority would lose that evidence.
+    At capacity, retire consumed registrations together with execution records.
+    Retired IDs become unknown, including in delayed or older full snapshots.
+    Unresolved inputs remain barriers until consumption or a proven refusal;
+    if they alone fill the limit, admission requires resolution or scope replacement.
+
+    A full thread/read checks copied IDs, but is not an immutable history:
+    rollback can remove turns, and absent input may still be queued. Absence
+    therefore never retires a registration or proves that pending input is safe.
     """
+
+    _MAX_RECORDS = 8192
 
     def __init__(self) -> None:
         self.revision = 0
@@ -36,10 +43,26 @@ class CodexRequesterRegistry:
 
     def begin(self, origin: InputRequester, thread_id: str, expected_turn_id: str | None) -> str:
         """Register before submission; starts may race into an existing turn."""
+        if max(len(self._submissions), len(self._executions)) >= self._MAX_RECORDS:
+            self._retire_consumed()
+        if len(self._submissions) >= self._MAX_RECORDS:
+            raise RuntimeError("Native requester capacity exhausted by unresolved inputs")
         client_id = uuid4().hex
         self._submissions[client_id] = _Submission(thread_id, expected_turn_id, origin)
         self.revision += 1
         return client_id
+
+    def _retire_consumed(self) -> None:
+        self._submissions = {
+            client_id: submission
+            for client_id, submission in self._submissions.items()
+            if submission.consumed_by is None
+        }
+        # A retained ambiguous input must not reconstruct an evicted execution's authority.
+        for submission in self._submissions.values():
+            submission.origin = InputRequester()
+        self._executions.clear()
+        self.revision += 1
 
     def finish(self, client_id: str, *, refused: bool) -> None:
         """Release proven refusals; acknowledgements cannot establish consumption."""
@@ -75,10 +98,10 @@ class CodexRequesterRegistry:
         consumed: dict[str, list[str]] = {}
         for turn in turns:
             if not isinstance(turn, dict) or turn.get("itemsView", "full") != "full":
-                continue
+                return None
             turn_id, items = turn.get("id"), turn.get("items")
             if not isinstance(turn_id, str) or not isinstance(items, list):
-                continue
+                return None
             if turn_id == identity.turn_id:
                 if target_items is not None:
                     return None
@@ -113,6 +136,8 @@ class CodexRequesterRegistry:
             return None
         execution = self._executions.get(identity)
         if execution is None:
+            if len(self._executions) >= self._MAX_RECORDS:
+                return None
             execution = ExecutionRequester(origins[0])
             self._executions[identity] = execution
         for origin in origins:

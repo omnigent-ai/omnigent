@@ -132,7 +132,7 @@ async def test_create_placement(placement, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", ["same_host", "managed", "message", "subagent"])
+@pytest.mark.parametrize("operation", ["child", "same_host", "managed", "message", "subagent"])
 @pytest.mark.parametrize("status", [404, 405])
 async def test_requester_mutations_do_not_fall_back_on_unsupported_server(operation, status):
     requests = []
@@ -188,19 +188,11 @@ async def test_requester_mutations_do_not_fall_back_on_unsupported_server(operat
             if operation == "subagent"
             else None,
         )
-    if operation == "subagent":
-        assert output == (
-            f"Error: failed to create child session: {status} "
-            '{"detail":"Unsupported requester route"}'
-        )
-    else:
-        result = json.loads(output)
-        if operation == "message":
-            assert result["error"] == "Session message refused"
-        else:
-            assert "unavailable on this server" in result["error"]
+    error = output if operation == "subagent" else json.loads(output)["error"]
+    assert "unavailable on this server" in error
+    assert "upgrade server and runner together" in error
     assert [r.url.path for r in requests] == [expected_path]
-    if operation == "subagent":
+    if operation in ("subagent", "child"):
         assert json.loads(requests[0].content)["parent_session_id"] == "manager"
     else:
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
