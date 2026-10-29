@@ -676,7 +676,7 @@ describe("BrowserPane Chrome cookie import", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Import cookies from Chrome" }));
     const dialog = await screen.findByRole("dialog");
     expect(
-      within(dialog).getByText(/tabs share one cookie jar, including any tab the agent controls/),
+      within(dialog).getByText(/tabs share this cookie jar, including any tab the agent/),
     ).toBeInTheDocument();
   });
 

@@ -124,12 +124,12 @@ the header menu), and each place is a separate entry point.
   uses the latest summary, retained context and subsequent turns.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
-- `browser-storage`: browser soft tabs, including one opened by the agent, share
-  cookies within a session; different sessions stay isolated. Navigation stays
-  per-tab. On macOS the browser toolbar can also import the current site's
-  cookies from a local Chrome profile into that same session jar (Site scope
-  picks the host or a parent domain); the copy is in-memory and never written
-  back to Chrome.
+- `browser-storage`: every session's browser soft tabs, including ones opened by
+  the agent, share one persistent profile, so sign-ins carry across sessions,
+  windows and relaunches. Navigation stays per-tab. On macOS the browser toolbar
+  can also import the current site's cookies from a local Chrome profile into
+  that profile (Site scope picks the host or a parent domain); the copy is never
+  written back to Chrome.
 - `browser-tab-restore`: a session's open browser tabs, including the agent's,
   come back after the desktop app relaunches. Each is listed under its last
   page's title and reopens that page when selected; a closed tab stays closed.
@@ -885,13 +885,14 @@ plain `uv run pytest`, which starts a private server for the test.
   Control and press Tab to show the five most recent, cycle with Tab and
   Shift+Tab, release Control to switch, then reopen and press Escape to cancel.
 - **`browser-storage` (real Electron, own environment):**
-  `web/electron/e2e/desktop_cookie_isolation.e2e.js`. Sign into a site in one
-  tab, open it in another tab and the agent browser, and confirm both are signed
-  in. Another session should be signed out. Log out and refresh the same-session
-  tabs; all should be signed out. Chrome cookie import needs a real Keychain and
-  Chrome profile, so it is manual: sign into a site in Chrome, open that site in
-  the pane, click the cookie button, confirm the native prompt, and check the
-  page is signed in while an unrelated site in the same session is not.
+  `web/electron/e2e/desktop_browser_profile.e2e.js`. Sign into a site in one
+  tab, open it in another tab, the agent browser and another session, and
+  confirm all are signed in. Quit and relaunch the app, open the site again, and
+  confirm it is still signed in (sites that sign in with session cookies log
+  out on quit). Chrome cookie import needs a real Keychain and Chrome profile,
+  so it is manual: sign into a site in Chrome, open that site in the pane, click
+  the cookie button, confirm the native prompt, and check the page is signed in
+  while an unrelated site is not.
 - **`browser-tab-restore` (real Electron, own environment):**
   `web/electron/e2e/desktop_browser_tab_restore.e2e.js`. Open two Browser tabs
   on different sites, quit and relaunch, and return to the session: both tabs

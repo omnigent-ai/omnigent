@@ -2,7 +2,7 @@
  * Per-conversation WebContentsView registry.
  *
  * Keyed by the agent's conversation ID or a user tab's view ID. Each entry owns
- * its bounds and navigation; tabs in one conversation share storage.
+ * its bounds and navigation; storage comes from the view's browser profile.
  *
  * Pure factory — no Electron imports at module scope. All deps are injected
  * so a unit test can drive create/swap/close/closeAll/cap behavior with a
@@ -24,47 +24,14 @@ const {
   isProxyAddress,
   lookupHostAddresses,
 } = require("./browserUrlPolicy");
+const { DEFAULT_BROWSER_PROFILE_ID, browserProfilePartition } = require("./browserProfiles");
 
 const DEFAULT_CAP = 10;
 
-/**
- * Storage partition shared by one conversation's browser views. Without an
- * explicit partition, Electron places the view on
- * `session.defaultSession`, sharing one cookie/localStorage/cache store across
- * all agents and the main window (agent A's login bleeds into agent B's view).
- * Deliberately NOT `persist:`-prefixed — an in-memory partition keeps
- * agent-visited cookies off disk and leaves nothing to clean up when a
- * conversation is deleted, while Electron still reuses the same in-memory
- * session for the name within an app run (a reopened view keeps its login).
- *
- * `scope` namespaces the partition per REGISTRY (i.e. per shell window):
- * Electron sessions are app-global, but conversation ids are only unique per
- * server — two windows connected to different servers could carry the same
- * conversationId and would otherwise share a cookie jar.
- *
- * @param {string} scope Registry-unique namespace (one per shell window).
- * @param {string} viewId Conversation ID or encoded browser-tab view ID.
- * @returns {string}
- */
-function agentPartition(scope, viewId) {
-  let conversationId = viewId;
-  // Session IDs are UUID hex strings; tab keys follow browserViewId in
-  // web/src/hooks/useBrowserTabs.ts. Only storage uses the owning session ID.
-  const tab = /^browser-tab:([^:]+):[^:]+$/.exec(viewId);
-  if (tab) {
-    try {
-      conversationId = decodeURIComponent(tab[1]);
-    } catch {
-      // An invalid tab key keeps its own isolated partition.
-    }
-  }
-  return `omnigent-agent-${scope}-${conversationId}`;
-}
-
-// Monotonic per-process counter: each registry (shell window) gets a distinct
-// default partition scope. In-memory partitions never outlive the process, so
-// no cross-run uniqueness is needed.
-let registrySeq = 0;
+// Every view runs on the persistent default profile (see browserProfiles.js).
+// An explicit partition also keeps views off `session.defaultSession`, which
+// the shell window itself uses.
+const defaultProfilePartition = () => browserProfilePartition(DEFAULT_BROWSER_PROFILE_ID);
 
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
@@ -87,9 +54,8 @@ function createBrowserViewRegistry({
   resolveHost = lookupHostAddresses,
   resolveProxy = async () => "DIRECT",
   cap = DEFAULT_CAP,
-  // Partition namespace for this registry's views — see agentPartition.
-  // Injectable so tests can pin it; defaults to a per-instance unique value.
-  partitionScope = `w${++registrySeq}`,
+  // (viewId) => storage partition for a conversation's agent view or user tab.
+  resolvePartition = defaultProfilePartition,
 } = {}) {
   const entries = new Map(); // conversationId -> BrowserViewEntry
   const pendingNavigations = new Map();
@@ -179,8 +145,7 @@ function createBrowserViewRegistry({
     }
     const view = WebContentsViewCtor({
       webPreferences: {
-        // Per-conversation storage isolation — see agentPartition.
-        partition: agentPartition(partitionScope, conversationId),
+        partition: resolvePartition(conversationId),
         nodeIntegration: false,
         contextIsolation: true,
         sandbox: true,
@@ -389,7 +354,7 @@ function createBrowserViewRegistry({
   // (literal checks only), so browserIpc awaits this before it: a name that
   // resolves internally fails with an error instead of creating a blank view.
   function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+    const partition = resolvePartition(conversationId);
     return checkAgentNavigation(url, {
       allowLocalhost: isArcaAgentContext(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
@@ -462,7 +427,7 @@ function createBrowserViewRegistry({
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
+    const partition = resolvePartition(entry.conversationId);
     const proxied =
       !!ip &&
       (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
@@ -684,6 +649,5 @@ function createBrowserViewRegistry({
 
 module.exports = {
   createBrowserViewRegistry,
-  agentPartition,
   DEFAULT_CAP,
 };
