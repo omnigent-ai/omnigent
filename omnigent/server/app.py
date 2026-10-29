@@ -4283,6 +4283,7 @@ def create_app(
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
+        from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
         from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
@@ -4297,6 +4298,8 @@ def create_app(
             runner_exit_reports.was_connected(runner_id)
             or session_live_state.last_liveness_stamp(runner_id) is not None
         )
+        # Only a runner that never connected failed to start; one that ran and died is a crash.
+        failure_code = RUNNER_PROCESS_CRASH if runner_ran else "runner_failed_to_start"
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -4311,7 +4314,7 @@ def create_app(
             log_runner_exited(host_id, runner_id, error, session_id=session_id)
         await _mark_runner_sessions_offline(
             affected,
-            ErrorDetail(code="runner_failed_to_start", message=error),
+            ErrorDetail(code=failure_code, message=error),
             conversation_store,
             fail_idle_top_level=not runner_ran,
         )

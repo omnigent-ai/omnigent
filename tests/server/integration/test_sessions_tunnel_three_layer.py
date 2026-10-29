@@ -2337,7 +2337,9 @@ async def test_patch_rebind_stamps_runner_liveness(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error_code", ["runner_disconnected", "runner_failed_to_start"])
+@pytest.mark.parametrize(
+    "error_code", ["runner_disconnected", "runner_failed_to_start", "runner_process_crash"]
+)
 @pytest.mark.parametrize("child_runner", ["previous-runner", _RUNNER_ID])
 @pytest.mark.parametrize("fail_first", [None, "parent", "child"])
 async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
