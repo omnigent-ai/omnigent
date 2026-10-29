@@ -22,6 +22,9 @@ session is patched into the ``host_asleep`` shape via route interception:
   ``host_online=false``; the open-session poll overrides the WS stream.
 - ``WS /v1/sessions/updates`` → blocked so a stream push can't re-add the
   session to the sidebar or revert its liveness to the real (online) values.
+
+The same view also offers **Reconnect host**, which asks the real server to
+wake the host with a ``retry_session`` event instead of sending a message.
 """
 
 from __future__ import annotations
@@ -140,3 +143,35 @@ def test_host_asleep_keeps_composer_open(
     # "Session offline — reconnect" disabled dead-end.
     expect(composer).to_have_attribute("placeholder", _COMPOSER_PLACEHOLDER, timeout=15_000)
     expect(composer).not_to_be_disabled()
+
+
+def test_reconnect_host_asks_server_to_wake_asleep_host(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Reconnect host sends ``retry_session`` and reports the server's answer.
+
+    The seeded session's runner is really connected, so the real server answers
+    ``already_connected`` and the toast says the sandbox is already online.
+
+    :param page: Playwright page fixture.
+    :param seeded_session: ``(base_url, session_id)`` for a real server-backed
+        session; the browser view is patched to the host_asleep shape.
+    :returns: None.
+    """
+    base_url, session_id = seeded_session
+    _force_host_asleep(page, session_id)
+
+    page.goto(f"{base_url}/c/{session_id}")
+
+    page.get_by_test_id("composer-host-select").click()
+    with page.expect_request(
+        lambda request: (
+            request.method == "POST"
+            and urlparse(request.url).path == f"/v1/sessions/{session_id}/events"
+            and "retry_session" in (request.post_data or "")
+        )
+    ) as wake:
+        page.get_by_role("menuitem", name="Reconnect host").click()
+    assert wake.value.post_data_json == {"type": "retry_session", "data": {}}
+    expect(page.get_by_text("Sandbox is already online.")).to_be_visible(timeout=15_000)

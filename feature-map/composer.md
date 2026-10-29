@@ -1,12 +1,16 @@
 # Composer
 
 The composer is where a user writes a message and chooses how the agent runs
-it. It appears in two places that look alike but are separate surfaces: the
-in-session composer at the bottom of a chat, and the new-session composer on
+it. The main surfaces are the in-session composer at the bottom of a chat
+and the new-session composer on
 the landing page. Both show a model/effort pill with a hover tooltip, open a
 configuration menu for harness, model, reasoning effort, and permission mode,
 and accept attachments and slash commands. The in-session composer also queues
 and steers messages while the agent is busy.
+
+Side chats have their own composer. Supported generic side chats reuse the
+model/effort picker before their first message and for later turns; changes
+apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
@@ -29,12 +33,56 @@ and steers messages while the agent is busy.
   and a launching or failed sandbox with its stage; before launch also a
   selected sandbox and connecting.
 - `model-picker`: lists the host's live model catalog, highlights the current
-  model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
+  model, and keeps the selection. Long catalogs scroll inside a compact menu
+  capped at 40% of viewport height, between 20rem and 36rem, and never taller
+  than the available space.
+  Ctrl+Shift+M opens it in both composers.
+  Hovering a row shows the model ID it launches, except when the label already
+  shows it and on the Fusion row.
+  A catalog of ten or more models adds a search box above the list that stays
+  visible while scrolling. When it spans several creators, models group under
+  collapsible headings with counts (Anthropic, OpenAI, Google, Moonshot AI,
+  Z.ai, ..., Other models), and the selected model's group opens. The heading
+  names who made the model, not who hosts it: Claude on Bedrock is Anthropic,
+  GLM on Databricks is Z.ai. Search matches names, IDs, and creators and shows
+  matches inside collapsed groups. Same-named rows from different hosts show
+  the host. Shorter or single-creator catalogs stay a flat list.
   States: catalog loading, delayed catalog,
-  alias vs. full model ID, refused switch (the pill keeps the applied model).
+  alias vs. full model ID, refused switch (the pill keeps the applied model),
+  a managed sandbox launching before its host is bound (its provider's default catalog),
+  long mixed catalog (grouped), search with no matches, unidentified models
+  (Other models).
+  Equivalent model-ID spellings use the catalog's display name consistently,
+  including case, gateway-prefix, and version-punctuation differences; context
+  variants keep their own labels and checked rows, including in side chats.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
+- `side-chat-settings`: the side-chat model/effort pill uses the same catalog
+  and capability rules. Draft selections apply when the child is created;
+  live selections update that child's session. A live Claude picker follows
+  the runner's reported model if a requested change is refused. Native Codex
+  side chats show these controls after creation; selections apply to the next
+  turn without changing the parent;
+  older runners hide these controls.
+- `project-session-defaults`: Project settings store a default agent and, for
+  Claude Code, Codex, and Pi, a default model and reasoning effort; the
+  new-session composer opened in that project (`/?project=<name>`) starts with
+  them. The Fork dialog and CLI, API, and scheduled creates don't apply model
+  or effort. States: no default, a Codex
+  effort the pinned model lacks (or, with no project model, the remembered
+  model lacks), an explicit composer pick, remembered Smart Routing, another
+  agent chosen.
+- `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
+  in both composers (Ctrl on every platform). The relevant menu briefly opens
+  with the selected choice highlighted, preserving draft and input focus. In an
+  existing session, cycling stages choices locally and applies only the final
+  choice after two seconds without another press. Enter applies immediately
+  without sending the draft; Escape cancels. Wrapping back to the applied choice
+  sends no change. Before launch, choices update the local launch configuration.
+  Choices follow menu order and wrap, skipping unavailable options.
+  States: default, model-specific effort, staged/pending/refused changes, read-only,
+  unreachable, smart-routing effort disabled, terminal/editor focus untouched.
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
@@ -59,7 +107,9 @@ and steers messages while the agent is busy.
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI.
+  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
+  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
+  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -104,16 +154,29 @@ and steers messages while the agent is busy.
   opens and focuses the new-session composer in browsers. Native shells retain
   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn.
+  can be steered into the running turn. Side-chat composers queue and steer the
+  same way, with their own queue strip.
+  A message sent mid-turn to a native session says the agent will read it
+  after its current step until it does.
+- `host-offline-hold`: a message sent to a native session whose host is offline
+  waits in the queue as "Waiting for host", ahead of other queued messages, and
+  sends once the host reconnects; no failed turn is recorded.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
+- `prompt-history`: Up starts history recall only from empty text in an existing
+  session. Up/Down at the text boundaries browse recalled messages; editing one
+  returns to normal caret navigation. Whitespace and queued messages recalled
+  for editing remain drafts.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
-  untouched draft; user edits remain.
+  untouched draft; user edits remain. The "Something went wrong" card from the
+  failed POST clears once the delivered message appears, live or on reconnect.
+  A reload while the server still holds a main-composer send (for example during
+  a sandbox wake) gives its text back unless the session already has that message.
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
@@ -156,6 +219,12 @@ and steers messages while the agent is busy.
   dial, distinct from the new-session composer's effort choice.
 - Press Ctrl+Shift+M (Ctrl on every platform) to open the model picker without
   the gear; press Ctrl+Shift+L to focus the message box.
+- In a new native session on a managed sandbox, open the model picker while it
+  shows **Provisioning sandbox…**: it lists the provider's default catalog, the
+  rows the new-session picker offered, until the session's host or its own
+  catalog can answer. A pick is saved for the launch.
+- Press Ctrl+Alt+M or Ctrl+Alt+E to cycle models or effort; keep typing while
+  the temporary menu shows the selected choice.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
@@ -171,6 +240,10 @@ and steers messages while the agent is busy.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
+- With the in-session message box empty, press Up to recall a previous prompt
+  (or the last queued message). While writing a draft, Up stops at the top.
+- With a native session's host offline, send a message; it waits in the queue
+  as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
 
@@ -216,6 +289,8 @@ and steers messages while the agent is busy.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi, Devin), and permission mode before the session exists. Ctrl+Shift+M also
   opens the agent/model picker here.
+- Press Ctrl+Alt+M or Ctrl+Alt+E to cycle models or effort before launch.
+  The menu previews the choice briefly while focus stays in the message box.
 - With a managed sandbox selected and no connected host, the model picker lists
   the sandbox's default catalog when `/v1/info` advertises `default_models` (an
   unbound gateway with `sandbox.model_discovery`, or a provider hook): rows under
@@ -235,6 +310,9 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_sandbox_harness_without_reachable_models_blocks_launch`.
+- Open a project's actions menu in the sidebar → **Project settings**, pick
+  Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
+  Click **New session in project** and check the pill shows both.
 - Attach files or type `/` before the first send.
 - For a managed sandbox, submit a prompt and close the browser once the session
   URL appears, while provisioning is still in progress. Reopen that URL after
@@ -246,6 +324,14 @@ and steers messages while the agent is busy.
   resumes after the first input is delivered.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session.
+- With an Arca connected, choose **Arclet Sandbox** with a native terminal agent
+  and type `/` for Claude or `$` for Codex before the first send. The menu previews that Arca's home-level
+  catalog; selecting a skill completes the prompt while the launch stays on Arclet.
+  Runtime availability follows Arclet's existing skill sync and plugin installation;
+  custom skill roots or plugins installed only on Arca may be absent on Arclet.
+  With no connected Arca, host skills become available after the sandbox starts.
+  SDK agents continue using their bundled skills before the sandbox starts.
+  Browser coverage: `tests/browser_ui/chat/test_arclet_skills.py`.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections
@@ -269,6 +355,15 @@ pickers, seeded from the source session when its harness family is kept.
 
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
+
+**Side chat** (from an existing session): choose **+ → Start a new side chat**
+in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
+text. For native Codex, send the first message before using its model/effort
+pill; later selections apply on the next turn. For other supported harnesses,
+open the side-chat model pill to choose model/effort before or after its
+first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
+for draft persistence and parent-isolation checks. The microphone beside
+**Ask a side question...** starts dictation.
 
 ## Driving it with the repro environment
 
@@ -327,7 +422,39 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_lists_only_live_databricks_models`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_updates_after_delayed_catalog`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_highlights_the_reported_model`,
-  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`.
+  These cases patch browser session/catalog responses; they do not drive a
+  native model change.
+  A launching sandbox's provider catalog (Claude, Codex, and Pi) and its
+  replacement by the host's or the session's own catalog:
+  `tests/browser_ui/chat/test_model_catalog.py::test_launching_sandbox_offers_its_provider_catalog`,
+  `tests/browser_ui/chat/test_model_catalog.py::test_bound_host_catalog_replaces_the_launch_preview`,
+  `tests/browser_ui/chat/test_model_catalog.py::test_session_catalog_replaces_the_launch_preview`
+- **`model-picker`, in-session with a real Claude terminal (nightly):**
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
+  selects pinned Opus through the gear, repeats it through the model pill,
+  then returns to Sonnet through Ctrl+Shift+M. Each uses the real browser,
+  server, owned isolated host, runner and Claude CLI. Subsequent mock requests
+  retain the wire model's exact generation; native status and `requestedModel`
+  retain the selected `[1m]` suffix, and the correlated API request includes
+  the `context-1m` beta. Chat and the persisted transcript each contain the
+  reply once, with no model-change error. Requires Claude Code and tmux. Use
+  a clean container when machine-managed Claude settings override the mock
+  endpoint; this does not establish live gateway compatibility.
+- **`model-picker`, row hover (both composers):** no browser-level coverage;
+  `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
+  a family name and expect its full model ID; the Fusion row shows none.
+- **`model-picker`, long mixed catalog:** in session,
+  `tests/browser_ui/chat/test_model_catalog.py::test_long_catalog_groups_by_creator_and_searches_by_keyboard`
+  opens on the selected creator, keeps the height cap and search while
+  scrolling, and picks a model in a collapsed group by keyboard. Creator
+  attribution is in `web/src/lib/modelCreators.test.ts`; grouping, search,
+  and keyboard cases for every composer are in
+  `web/src/components/composer/ComposerConfigSections.test.tsx`. The mock
+  environment has no long multi-creator catalog, so check the new-session
+  composer and side chat manually: pick Pi on a host whose Pi lists models
+  from several labs, open its configuration, expand a creator, search for
+  another creator's model, and pick it.
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -337,6 +464,12 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
+- **`project-session-defaults`:**
+  `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_effort_default_seeds_new_session`
+  (real host and Claude CLI against the mock model),
+  `tests/e2e_ui/sessions/test_project_settings_model_default.py::test_project_settings_model_and_effort_defaults_round_trip`;
+  ladder and precedence cases in `web/src/shell/ProjectSettingsDialog.test.tsx`
+  and `web/src/shell/NewChatDialog.projectPrefill.test.tsx`.
 - **`effort-picker`, SDK in-session composer:**
   `tests/e2e_ui/chat/test_sdk_effort_dial.py::test_claude_sdk_session_offers_the_effort_dial`
   covers selection, persistence and reload. The stale-catalog cases in
@@ -352,6 +485,14 @@ Other connection providers alone do not enable the managed MCP picker.
   not become ready within the recovery budget, the pill keeps the previous
   selection; server/runner coverage is in
   `tests/server/integration/test_codex_model_change_after_idle_reap.py`.
+  Real Claude refusal coverage (nightly):
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
+  pauses only its owned CLI while a browser model change is pending, then
+  repeats that selection in a newer silent API write with a different effort.
+  The real request returns 503 and an actionable error card; the pending
+  indicator clears, the reported model stays unchanged, and the newer saved
+  model/effort survive. Cleanup kills the paused CLI, so this case does not
+  prove a retry after refusal.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
@@ -473,9 +614,14 @@ Other connection providers alone do not enable the managed MCP picker.
   server's fake transcription engine, which only the test's own server enables;
   run it with plain `uv run pytest`. It covers the button, the hotkey, Enter
   keeping the text, Escape discarding it, and insertion at the caret.
-- **`dictation`, new-session composer:** no browser-level coverage. Manually:
-  on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
-  and expect the text in the message box; Escape restores the previous draft.
+- **`dictation`, both composers and side chat (own environment):**
+  `tests/e2e_ui/chat/test_dictation.py::test_speech_service_denial_falls_back_to_client_audio`
+  covers a browser speech service refusing access while the client microphone
+  remains available, through the buttons on both composers and in side chat.
+  It streams client audio through the fake server
+  engine and keeps the transcript on Enter.
+  Manually on the landing page: dictate with ⌘/Ctrl+Alt+V, then press Escape
+  to restore the previous draft.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -493,9 +639,32 @@ Other connection providers alone do not enable the managed MCP picker.
   session click the transcript, press Ctrl+Shift+L and expect the message box
   focused. In a session whose gear is disabled (read-only or unreachable),
   Ctrl+Shift+M does nothing.
+- **`config-cycle-hotkeys`, both composers:** component coverage in
+  `web/src/hooks/useComposerConfigCycleHotkeys.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `web/src/shell/NewChatDialog.test.tsx`. Manually: enter a draft, press
+  Ctrl+Alt+M several times and observe the model preview advance and wrap;
+  press Ctrl+Alt+E and observe effort change. In a session, press either shortcut
+  three times quickly: no change request should occur during the burst, then
+  only the final choice applies two seconds after the last press. Repeat with
+  Enter to apply immediately, Escape to cancel, and a full wrap to send no change.
+  Verify model then effort cycling applies both final choices. Wait for the
+  preview to close without moving focus or changing the draft. Repeat before
+  launch; reload the session to check persistence. The fork dialog has no composer cycle shortcuts; mobile
+  without a physical keyboard continues to use the pickers.
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
-  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`
+  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
+  The native mid-turn notice has component coverage in
+  `web/src/pages/ChatPage.userBubble.test.tsx`.
+- **`host-offline-hold`:** no browser-level coverage.
+  `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
+  (plain `uv run pytest`) checks that a held send is refused with nothing
+  recorded; the queue and release have component coverage in
+  `web/src/store/chatStore.test.ts` and
+  `web/src/hooks/useReleaseHostHeldSends.test.tsx`. Manually: stop a native
+  session's host, send, and expect a "Waiting for host" queue row with no
+  failed turn; restart the host and expect the message to be sent once.
 - **`browser-pointer-queue`, desktop:** manually hold an agent turn open, then
   send a normal composer follow-up and two pointer instructions (Send and Enter).
   With Always steer off, all three stay queued and the popup says "Queued for
@@ -511,11 +680,22 @@ Other connection providers alone do not enable the managed MCP picker.
   once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
+- **`prompt-history`, in-session composer with a keyboard:**
+  `tests/browser_ui/chat/test_composer_acceptance.py::test_prompt_history_preserves_drafts_during_real_arrow_navigation`
+  checks wrapped-text caret movement, empty-composer recall, and edited recall.
+  Multiline, whitespace, quotes, and queued drafts have component coverage in
+  `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
+  composers have no prompt recall; the vendor terminal owns its own history.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
   user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+  `tests/e2e_ui/mobile/test_offline_send_failure_card.py::test_failure_card_clears_once_reconnect_recovers_the_delivered_send`
+  cuts the browser's network while the server holds the send for a runner
+  relaunch, then checks the failure card clears when the reconnect shows the
+  delivered turn.
+  A send cut off by a reload is covered in `web/src/store/chatStore.test.ts`.
 - **`managed-first-input`, new-session composer (own environments):**
   `tests/e2e_ui/start_session/test_managed_first_input_tab_close.py::test_managed_first_input_runs_after_browser_closes`
   closes the entire browser during provisioning, on both the creating replica
@@ -599,13 +779,20 @@ Other connection providers alone do not enable the managed MCP picker.
   terminal command actually landed before blaming the mirror.
 - The mock environment configures Claude and Codex only. Other harnesses'
   catalogs need real CLIs or credentials.
+- Creator groups appear only for ten or more models from at least two
+  creators, so Claude and Codex catalogs normally stay flat. A model whose IDs
+  don't name a known creator (a router alias such as Pi's `radius/balanced`)
+  lands in Other models; that is expected, not a missing catalog.
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.
 - Managed MCP browser tests stub launch and authentication. They prove composer
   wiring; the HTTP integration test proves the real provider boundary.
 - Dictation normally uses browser speech recognition, with server fallback
-  when unavailable or a network error occurs. The desktop app prefers the
+  when unavailable or the browser speech service fails. Audio still comes from
+  the client device; choosing a remote host does not change the microphone.
+  Denying microphone permission must not start a fallback recording.
+  The desktop app prefers the
   server when available. A verification instance without a transcription engine
   depends on browser support; a missing microphone there does not prove that
   dictation is unavailable on a configured server.

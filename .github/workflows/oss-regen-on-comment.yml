@@ -40,7 +40,7 @@ jobs:
       github.repository == 'omnigent-ai/omnigent'
       && github.event.issue.pull_request
       && startsWith(github.event.comment.body, '/regen')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       ok: ${{ steps.authz.outputs.ok }}
@@ -143,7 +143,7 @@ jobs:
       issues: write        # comment the result on the PR thread
     needs: authorize
     if: needs.authorize.outputs.ok == 'true' && needs.authorize.outputs.cross == 'false'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     # One regen per PR at a time; a second /regen waits rather than racing a push.
     concurrency:
@@ -160,9 +160,10 @@ jobs:
           persist-credentials: false
 
       - name: Set up uv (clean public resolution, no proxy cache)
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: false
+          version: "0.13.4"
 
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
@@ -195,10 +196,9 @@ jobs:
           python3 scripts/normalize_uv_lock_registry.py --check uv.lock
           # `/regen upgrade <py pkgs>` is a targeted Python bump: leave the npm
           # lockfile alone so the PR diff stays reviewable. Plain `/regen`
-          # refreshes both lockfiles, as before.
+          # repairs both lockfiles while preserving existing npm resolutions.
           if [ "$REGEN_MODE" != "upgrade" ]; then
-            rm -f pnpm-lock.yaml
-            pnpm install --lockfile-only
+            pnpm install --lockfile-only --ignore-scripts
           fi
 
       # Mint the App token only AFTER `uv lock` so untrusted PR build backends
@@ -231,7 +231,7 @@ jobs:
             exit 0
           fi
           git add uv.lock pnpm-lock.yaml
-          git commit -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
+          git commit -s -m "chore(oss): regenerate public lockfiles against public PyPI/npm"
           git push "https://x-access-token:${PUSH_TOKEN}@github.com/${REPO}.git" "HEAD:$HEAD_REF"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 

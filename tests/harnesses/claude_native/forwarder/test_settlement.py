@@ -15,6 +15,7 @@ import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     prepare_bridge_dir,
+    record_hook_event,
 )
 
 
@@ -261,15 +262,17 @@ def test_promote_pending_settle_waits_for_turn_quiescence(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("retry_mode", ["none", "same_process", "restart"])
+@pytest.mark.parametrize("settle_restart", [False, True])
+@pytest.mark.parametrize("hook_event", ["Stop", "StopFailure"])
 @pytest.mark.asyncio
 async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
-    tmp_path: Path, retry_mode: str
+    tmp_path: Path, retry_mode: str, settle_restart: bool, hook_event: str
 ) -> None:
     """
     The full wake pipeline: settle → quiet-poll promote → marked new turn.
 
-    Poll 1 forwards a turn; its Stop edge records the pending settle
-    (covered by the status-events test — recorded directly here). Poll 2
+    Poll 1 forwards a turn and its Stop edge records the pending settle.
+    A restart before the next transcript poll must retain it. Poll 2
     is quiet and promotes the settle, persisting it. Poll 3 sees new
     assistant entries — a cron firing writes no user entry — and must POST
     the scheduled-wake marker ahead of the resumed output, all under a new
@@ -314,6 +317,7 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         if (
             retry_mode != "none"
             and not failed_marker
+            and payload["type"] == "external_conversation_item"
             and payload["data"]["item_data"].get("role") == "user"
         ):
             failed_marker = True
@@ -335,8 +339,28 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         turn_one_id = after_turn.current_response_id
         assert turn_one_id is not None
 
-        # The turn ends: the Stop edge records the pending settle.
-        dedupe.pending_settled_response_id = turn_one_id
+        # Restart after hook acknowledgement, before any transcript checkpoint.
+        record_hook_event(
+            bridge_dir, {"hook_event_name": hook_event, "error_details": "Synthetic refusal"}
+        )
+        hooks = await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id=turn_one_id,
+        )
+        assert hooks.event_cursor == 1
+        if settle_restart:
+            after_turn = forwarder._read_forward_state(bridge_dir)
+            assert after_turn is not None
+            assert after_turn.pending_settled_response_id == turn_one_id
+            dedupe = forwarder._ForwardDedupeState()
         quiet = await forwarder._forward_available_items(
             client=client,
             session_id="conv_abc",
@@ -410,3 +434,59 @@ async def test_scheduled_wake_forwards_marker_under_a_new_turn_id(
         {"type": "input_text", "text": "[System: scheduled prompt fired]"}
     ]
     assert {item["response_id"] for item in items} == {wake_turn_id}
+
+
+@pytest.mark.asyncio
+async def test_failed_settle_checkpoint_leaves_hook_available_for_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript_state = forwarder.TranscriptForwardState(
+        transcript_path=tmp_path / "session.jsonl",
+        line_cursor=0,
+        current_response_id="resp_ended",
+    )
+    forwarder._write_forward_state(bridge_dir, transcript_state)
+    record_hook_event(bridge_dir, {"hook_event_name": "Stop"})
+    posts: list[dict[str, Any]] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        return httpx.Response(202)
+
+    async def unavailable_checkpoint(*_args: object, **_kwargs: object) -> None:
+        raise OSError("Synthetic checkpoint write failure")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(receive), base_url="http://test"
+    ) as client:
+        for fail_write in (True, False):
+            with monkeypatch.context() as patch:
+                if fail_write:
+                    # The persistence boundary fails after the server accepted the edge.
+                    patch.setattr(forwarder, "_write_forward_state_async", unavailable_checkpoint)
+                pending = forwarder._forward_available_status_events(
+                    client=client,
+                    session_id="conv_abc",
+                    bridge_dir=bridge_dir,
+                    state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+                    retry_tracker=forwarder._PostRetryTracker(),
+                    dedupe=forwarder._ForwardDedupeState(),
+                    task_subjects={},
+                    task_statuses={},
+                    task_order=[],
+                    response_id="resp_ended",
+                )
+                if fail_write:
+                    with pytest.raises(OSError, match="Synthetic checkpoint write failure"):
+                        await pending
+                    assert not (bridge_dir / forwarder._HOOK_STATE_FILE).exists()
+                else:
+                    completed = await pending
+                    assert completed.event_cursor == 1
+
+    assert len(posts) == 2
+    assert posts[0] == posts[1]
+    loaded = forwarder._read_forward_state(bridge_dir)
+    assert loaded is not None
+    assert loaded.pending_settled_response_id == "resp_ended"

@@ -320,6 +320,58 @@
         "title": "AgentDetailObject",
         "type": "object"
       },
+      "AgentList": {
+        "description": "The built-in agent list, plus the packaged names this deployment hides.",
+        "properties": {
+          "data": {
+            "items": {},
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          },
+          "suppressed_agent_names": {
+            "description": "Packaged built-ins `OMNIGENT_SEEDED_AGENTS` trimmed from `data`. The web picker also discovers agents from a user's recent sessions, so it needs these names to keep a hidden built-in with prior sessions from resurfacing as a custom agent.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Suppressed Agent Names",
+            "type": "array"
+          }
+        },
+        "title": "AgentList",
+        "type": "object"
+      },
       "AgentMCPConfig": {
         "description": "Editable MCP projection without credential values.",
         "properties": {
@@ -4151,6 +4203,18 @@
             ],
             "title": "Model"
           },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assistant-only harness label for the message, e.g. Codex `\"commentary\"` (progress), `\"partial_answer\"` or `\"final_answer\"`. Stored as given so clients can act on values added later; `None` when unset, not a string, or longer than 64 characters.",
+            "title": "Phase"
+          },
           "role": {
             "description": "`\"user\"` or `\"assistant\"`.",
             "enum": [
@@ -4402,7 +4466,7 @@
         "type": "object"
       },
       "NativeUsageBaseline": {
-        "description": "Own-session cumulative tokens for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
+        "description": "Own-session cumulative usage for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
         "properties": {
           "cumulative_cache_read_input_tokens": {
             "default": 0,
@@ -4410,6 +4474,19 @@
             "minimum": 0.0,
             "title": "Cumulative Cache Read Input Tokens",
             "type": "integer"
+          },
+          "cumulative_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Cost Usd"
           },
           "cumulative_input_tokens": {
             "default": 0,
@@ -5853,6 +5930,11 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automations_enabled": {
+            "default": false,
+            "title": "Automations Enabled",
+            "type": "boolean"
+          },
           "branding": {
             "$ref": "#/components/schemas/BrandingInfo"
           },
@@ -5970,9 +6052,37 @@
             "title": "Sandbox Providers",
             "type": "array"
           },
+          "scheduled_task_projects": {
+            "default": false,
+            "title": "Scheduled Task Projects",
+            "type": "boolean"
+          },
+          "scheduled_task_session_modes": {
+            "default": true,
+            "title": "Scheduled Task Session Modes",
+            "type": "boolean"
+          },
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_event_types": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Session Event Types",
+            "type": "array"
+          },
+          "session_pull_requests": {
+            "default": false,
+            "title": "Session Pull Requests",
+            "type": "boolean"
+          },
+          "session_search_scope": {
+            "default": true,
+            "title": "Session Search Scope",
+            "type": "boolean"
           },
           "sharing_mode": {
             "enum": [
@@ -7110,6 +7220,18 @@
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
           },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical effective harness, including per-session overrides.",
+            "title": "Harness"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -7200,6 +7322,29 @@
               }
             ],
             "title": "Project Id"
+          },
+          "pull_request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionPullRequestSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The session's first linked pull request, or `None` when it has none."
+          },
+          "pull_requests_synced": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the server has imported the session's PRs from its host, so a missing `pull_request` means \"none\" rather than \"not known yet\". `None` on servers without PR storage.",
+            "title": "Pull Requests Synced"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -7562,6 +7707,266 @@
           "name"
         ],
         "title": "SessionProjectSummary",
+        "type": "object"
+      },
+      "SessionPullRequest": {
+        "description": "A pull request linked to a session, as `GET /v1/sessions/{id}/pull-requests` lists it.",
+        "properties": {
+          "first_seen_at": {
+            "description": "Epoch seconds the session first saw the PR.",
+            "format": "double",
+            "title": "First Seen At",
+            "type": "number"
+          },
+          "host": {
+            "description": "Forge host, e.g. `\"github.com\"`.",
+            "title": "Host",
+            "type": "string"
+          },
+          "is_draft": {
+            "default": false,
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "last_seen_at": {
+            "description": "Epoch seconds of the PR's latest activity in the session.",
+            "format": "double",
+            "title": "Last Seen At",
+            "type": "number"
+          },
+          "number": {
+            "format": "int64",
+            "title": "Number",
+            "type": "integer"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_display": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Display"
+          },
+          "relationship": {
+            "description": "How the PR joined the session: `\"created\"`, `\"worked_on\"`, `\"attached\"`, or `\"inferred\"` from the branch.",
+            "enum": [
+              "created",
+              "worked_on",
+              "attached",
+              "inferred"
+            ],
+            "title": "Relationship",
+            "type": "string"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "state_checked_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Checked At"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "provider",
+          "repository",
+          "number",
+          "host",
+          "relationship",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "title": "SessionPullRequest",
+        "type": "object"
+      },
+      "SessionPullRequestList": {
+        "description": "A page of a session's linked pull requests in display order, keyed by URL.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SessionPullRequest"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          },
+          "synced": {
+            "default": false,
+            "description": "Whether the server has imported the session's PRs from its host. Until then an empty list means \"not known yet\", not \"none\".",
+            "title": "Synced",
+            "type": "boolean"
+          }
+        },
+        "title": "SessionPullRequestList",
+        "type": "object"
+      },
+      "SessionPullRequestSummary": {
+        "description": "The first pull request linked to a session, for list surfaces.\n\nStored on the server from what the session's host last reported, so it\nis available while the host is offline.",
+        "properties": {
+          "is_draft": {
+            "default": false,
+            "description": "Whether the PR was a draft when last fetched.",
+            "title": "Is Draft",
+            "type": "boolean"
+          },
+          "number": {
+            "description": "The PR number.",
+            "format": "int64",
+            "title": "Number",
+            "type": "integer"
+          },
+          "provider": {
+            "description": "Git provider id, e.g. `\"github\"`.",
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_display": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The provider's labels (`display_name`, `request_name`, `number_prefix`), or `None` for an unknown provider.",
+            "title": "Provider Display"
+          },
+          "repository": {
+            "description": "Base repository, e.g. `\"owner/repo\"`.",
+            "title": "Repository",
+            "type": "string"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`\"OPEN\"`, `\"MERGED\"` or `\"CLOSED\"` as last fetched, or `None` before the host fetched the PR.",
+            "title": "State"
+          },
+          "state_checked_at": {
+            "anyOf": [
+              {
+                "format": "double",
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Epoch seconds of the request that last fetched the PR's state, or `None` before one did. Open PRs older than five minutes are refreshed when their host is online; clients show older ones as stale.",
+            "title": "State Checked At"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last title the host looked up, or `None`.",
+            "title": "Title"
+          },
+          "url": {
+            "description": "The PR's URL.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "provider",
+          "repository",
+          "number"
+        ],
+        "title": "SessionPullRequestSummary",
         "type": "object"
       },
       "SessionReasoningEffortEvent": {
@@ -8213,6 +8618,11 @@
             "default": false,
             "description": "Whether the owner opted into letting view-level collaborators browse the workspace (Files/Changes/GitHub surfaces). `False` by default \u2014 read grants share the conversation only. The web share dialog reads this to render the toggle, and the rail reads it to decide whether to mount the file surfaces for a view-only viewer.",
             "title": "Share Workspace Files",
+            "type": "boolean"
+          },
+          "side_chat_settings_supported": {
+            "default": false,
+            "title": "Side Chat Settings Supported",
             "type": "boolean"
           },
           "status": {
@@ -10427,7 +10837,7 @@
     },
     "/v1/agents": {
       "get": {
-        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\n**Returns:** A `PaginatedList` of agents.",
+        "description": "List server agents, or with `scope=user` the caller's own agents.\n\nServer agents come from `agent_store.list()`, which never returns\nuser agents. `scope=user` returns the caller's user agents newest\nfirst, at most 50 per page and paged with `after` only; `last_id`\nis the last row the server read, which may not be in `data`.\n\nPackaged built-ins the deployment suppressed via\n`OMNIGENT_SEEDED_AGENTS` are filtered out after the store page is\nread, so `first_id`, `last_id` and `has_more` describe the rows\nread, not the rows returned. A page can hold fewer than `limit` rows,\nor none; keep following `last_id` while `has_more` is true.\nSuppressing hides a row without deleting it, so a session already\nbound to one keeps working.\n\n**Returns:** An `AgentList` of agents; for server agents it also names the packaged built-ins the deployment suppressed.",
         "operationId": "list_builtin_agents_v1_agents_get",
         "parameters": [
           {
@@ -10513,7 +10923,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PaginatedList"
+                  "$ref": "#/components/schemas/AgentList"
                 }
               }
             },
@@ -11543,6 +11953,51 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/accounts/refresh": {
+      "post": {
+        "description": "Probe non-secret harness accounts, using a recent connection result.",
+        "operationId": "refresh_host_harness_accounts_v1_hosts__host_id__harnesses_accounts_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh Host Harness Accounts V1 Hosts  Host Id  Harnesses Accounts Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Host Harness Accounts",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/harnesses/refresh": {
       "post": {
         "description": "Force an immediate full harness-readiness probe on a host.",
@@ -11705,6 +12160,238 @@
           }
         },
         "summary": "Install Host Harness",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/login": {
+      "post": {
+        "description": "Start a Codex device-code login on a connected host.",
+        "operationId": "start_host_harness_login_v1_hosts__host_id__harnesses__harness__login_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/login/{login_id}": {
+      "delete": {
+        "description": "Cancel an active device login.",
+        "operationId": "cancel_host_harness_login_v1_hosts__host_id__harnesses__harness__login__login_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login  Login Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "get": {
+        "description": "Return the current device-login status without exposing its code.",
+        "operationId": "get_host_harness_login_v1_hosts__host_id__harnesses__harness__login__login_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login  Login Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/logout": {
+      "post": {
+        "description": "Log Codex or Claude out and return freshly probed account state.",
+        "operationId": "logout_host_harness_v1_hosts__host_id__harnesses__harness__logout_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Logout Host Harness V1 Hosts  Host Id  Harnesses  Harness  Logout Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Host Harness",
         "tags": [
           "hosts"
         ]
@@ -13202,6 +13889,18 @@
             }
           },
           {
+            "description": "Which `search_query` matches to return. `\"all\"` (default) returns title or content matches. `\"title\"` returns only title matches. `\"content\"` returns content matches whose title does not match; `title` and `content` never overlap. Ignored without a `search_query`.",
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|title|content)$",
+              "title": "Search Scope",
+              "type": "string"
+            }
+          },
+          {
             "description": "When `False` (default), archived sessions are omitted. When `True`, archived sessions are returned alongside active ones (the sidebar groups them into an \"Archived\" section). Powers the sidebar's \"Show archived\" toggle.",
             "in": "query",
             "name": "include_archived",
@@ -13252,7 +13951,7 @@
             }
           },
           {
-            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
+            "description": "Ownership/archive filter for the sidebar tabs. `\"mine\"` returns only sessions the caller owns (owner-level grant). `\"shared\"` returns only sessions accessible but not owned. `\"archived\"` returns only archived sessions; with `project`, only owned sessions are returned so first-class project names resolve within the caller's projects. `\"all\"` (default) returns all accessible non-archived sessions, matching the legacy behaviour.",
             "in": "query",
             "name": "visibility",
             "required": false,
@@ -13369,6 +14068,17 @@
             "schema": {
               "default": false,
               "title": "Delete Branch",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Opt-in, as a query param (`?capture_logs=true`). When `True` and the session runs on a managed sandbox, the server logs the sandbox's host and runner log tails before terminating it, so a client that saw a turn fail keeps the evidence. Ignored for sessions without a managed sandbox. Defaults to `False`.",
+            "in": "query",
+            "name": "capture_logs",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Capture Logs",
               "type": "boolean"
             }
           }
@@ -15382,6 +16092,134 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/pull-requests": {
+      "delete": {
+        "description": "Unlink a pull request from the session, whether or not its host is online.\n\nThe server's unlink stands on its own; it is also passed to the runner\nor host when one is reachable, so its local list stops reporting the PR.\n\n**Returns:** The first page of the session's remaining linked PRs.",
+        "operationId": "unlink_session_pull_request_v1_sessions__session_id__pull_requests_delete",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The linked PR's URL.",
+            "in": "query",
+            "name": "url",
+            "required": true,
+            "schema": {
+              "maxLength": 2048,
+              "title": "Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPullRequestList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Unlink Session Pull Request",
+        "tags": [
+          "sessions"
+        ]
+      },
+      "get": {
+        "description": "List the session's linked pull requests from the server.\n\nNever contacts the runner or host, so it answers while both are\noffline. Each entry carries the state the host last fetched, and\n`synced` says whether the server has imported the session's PRs yet.\n\n**Returns:** A page of linked PRs in display order.",
+        "operationId": "list_session_pull_requests_v1_sessions__session_id__pull_requests_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The most PRs to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `last_id` (PR URL) of the previous page.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 2048,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPullRequestList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Pull Requests",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/read-state": {
       "put": {
         "description": "Set the calling user's read-state for one session.\n\nRequires `LEVEL_READ` on the session in multi-user mode \u2014 you can\nonly track read-state for sessions you can see. Stores the values\nverbatim (the client enforces the baseline's monotonicity and the\nunread semantics); the server does not interpret them against\nsession status. Returns `204` \u2014 the client already has the\noptimistic state and re-reads the authoritative value on the next\n`GET /v1/sessions` poll.\n\n**Parameters**\n\n- `body` \u2014 The validated `ReadStatePutRequest`.\n\n**Returns:** An empty `204 No Content` response.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks read access.",
@@ -16990,6 +17828,47 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/comments": {
+      "post": {
+        "description": "Post a top-level comment using the host's selected GitHub account.",
+        "operationId": "create_session_github_comment_v1_sessions__session_id__resources_github_comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Github Comment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/details": {
       "post": {
         "description": "Replace the selected PR's title and/or description.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_details` with the PR's resulting title and body.",
@@ -17304,9 +18183,11 @@
     },
     "/v1/sessions/{session_id}/resources/github/prs": {
       "post": {
+        "description": "Link a pull request the session's host can read, or unlink one.\n\nBoth need the runner or host online: linking verifies the PR with its\nprovider account, and the server records an unlink once the host accepts\nit. `DELETE /pull-requests` unlinks while they are offline.\n\n**Returns:** The refreshed `session.github.info` object.",
         "operationId": "update_session_github_pr_v1_sessions__session_id__resources_github_prs_post",
         "parameters": [
           {
+            "description": "Session/conversation identifier.",
             "in": "path",
             "name": "session_id",
             "required": true,

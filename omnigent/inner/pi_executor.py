@@ -57,9 +57,11 @@ from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
 from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
+    global_pi_agent_dir,
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
@@ -68,11 +70,13 @@ from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
+    PiModelEntry,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_is_reasoning,
     pi_model_json_entry,
+    pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
@@ -95,6 +99,8 @@ from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactedMessages,
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
@@ -115,6 +121,9 @@ _GATEWAY_AUTH_REFRESH_MS = 900_000
 # Leave time for the bridge round trip within Pi's 10-second command deadline.
 _GATEWAY_AUTH_TIMEOUT_S = 7
 _GATEWAY_BRIDGE_TIMEOUT_S = 8
+# Tool arguments can include files; match the other adapters' bounded stream limit.
+_TOOL_REQUEST_LIMIT = 16 * 1024 * 1024
+_TOOL_REQUEST_DRAIN_TIMEOUT_S = 2
 
 
 class _GatewayAuthError(OSError):
@@ -297,6 +306,7 @@ class _ToolServer:
             self._handle_client,
             "127.0.0.1",
             0,
+            limit=_TOOL_REQUEST_LIMIT,
         )
         addr = self._server.sockets[0].getsockname()
         self.port = addr[1]
@@ -324,7 +334,31 @@ class _ToolServer:
         self._clients.add(task)
         try:
             while True:
-                raw = await reader.readline()
+                try:
+                    raw = await reader.readline()
+                except ValueError:
+                    logger.warning(
+                        "Pi tool request exceeded the frame limit",
+                        extra=debug_event(
+                            "pi_tool_request_rejected",
+                            request_limit_bytes=_TOOL_REQUEST_LIMIT,
+                        ),
+                    )
+                    writer.write(
+                        json.dumps(
+                            {"error": f"tool request exceeds {_TOOL_REQUEST_LIMIT}-byte limit"}
+                        ).encode()
+                        + b"\n"
+                    )
+                    await writer.drain()
+                    writer.write_eof()
+                    # Unread input can reset the socket and discard the error response.
+                    with contextlib.suppress(TimeoutError):
+                        async with asyncio.timeout(_TOOL_REQUEST_DRAIN_TIMEOUT_S):
+                            while chunk := await reader.read(64 * 1024):
+                                if b"\n" in chunk:
+                                    break
+                    break
                 if not raw:
                     break
                 line = raw.decode("utf-8", errors="replace").strip()
@@ -869,7 +903,10 @@ def _build_models_json(
             registered_model = replace(catalog_model, id=model)
         # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
         # not assignable to it (dict value types are invariant), so copy.
-        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        model_entry: PiModelEntry = pi_model_json_entry(registered_model)
+        if provider_name == "databricks-anthropic":
+            model_entry = pi_model_with_thinking_defaults(model_entry)
+        entry: _JsonObject = dict(model_entry)
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
@@ -964,11 +1001,17 @@ def _build_models_json(
                 url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
                 for url in (base_urls or {}).values()
             ):
-                entry = dict(pi_generic_model_json_entry(model))
+                model_entry = pi_generic_model_json_entry(model)
             else:
-                entry = {"id": model, "input": ["text", "image"]}
-                if pi_model_is_reasoning(model):
-                    entry["reasoning"] = True
+                model_entry = {"id": model, "input": ["text", "image"]}
+                if pi_model_is_reasoning(model) or (
+                    provider["api"] == "anthropic-messages"
+                    and model_catalog.model_family_token(model) == "claude"
+                ):
+                    model_entry["reasoning"] = True
+            if provider["api"] == "anthropic-messages":
+                model_entry = pi_model_with_thinking_defaults(model_entry)
+            entry = dict(model_entry)
             provider["models"] = [*provider["models"], entry]
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
@@ -1484,6 +1527,69 @@ def _extract_latest_user_content(
                 return cast(list[_JsonObject], content)
             return str(content)
     return ""
+
+
+# Pi's own framing for a compaction summary in model context (core/messages.js).
+_PI_COMPACTION_SUMMARY_PREFIX = (
+    "The conversation history before this point was compacted into the following "
+    "summary:\n\n<summary>\n"
+)
+_PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>"
+
+
+def _pi_compacted_history(pi_messages: list[JsonValue]) -> CompactedMessages:
+    """
+    Convert Pi's post-compaction context into Omnigent replay messages.
+
+    The current turn's text up to its last tool result is persisted before
+    the compaction item, so it is kept. The reply after that result is
+    persisted after the item, so it is left out. Tool calls and results are
+    dropped because Pi replay carries text only.
+
+    :param pi_messages: ``get_messages`` data from Pi after compaction.
+    :returns: Text messages for the runner's compaction item.
+    """
+    messages = [m for m in pi_messages if isinstance(m, dict)]
+    last_prompt = max(
+        (index for index, m in enumerate(messages) if m.get("role") == "user"),
+        default=-1,
+    )
+    persisted_end = max(
+        (
+            index
+            for index, m in enumerate(messages)
+            if index > last_prompt and m.get("role") == "toolResult"
+        ),
+        default=last_prompt,
+    )
+    history: CompactedMessages = []
+    for message in messages[: persisted_end + 1]:
+        role = message.get("role")
+        if role == "compactionSummary":
+            summary = message.get("summary")
+            text = (
+                _PI_COMPACTION_SUMMARY_PREFIX + summary + _PI_COMPACTION_SUMMARY_SUFFIX
+                if isinstance(summary, str)
+                else ""
+            )
+            history_role, block_type = "user", "input_text"
+        elif role in ("user", "custom"):
+            text = _extract_text(message)
+            history_role, block_type = "user", "input_text"
+        elif role == "assistant":
+            text = _extract_text(message)
+            history_role, block_type = "assistant", "output_text"
+        else:
+            continue
+        if text:
+            history.append(
+                {
+                    "type": "message",
+                    "role": history_role,
+                    "content": [{"type": block_type, "text": text}],
+                }
+            )
+    return history
 
 
 def _split_pi_prompt(blocks: list[_JsonObject]) -> tuple[str, list[dict[str, str]]]:
@@ -2568,6 +2674,9 @@ class PiExecutor(Executor):
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
+                global_agent_dir=global_pi_agent_dir(
+                    env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
+                ),
             )
             from omnigent.inner.pi_gateway import pi_gateway_extension_args
 
@@ -2657,6 +2766,92 @@ class PiExecutor(Executor):
         if not isinstance(levels, list):
             return None
         return [level for level in levels if isinstance(level, str)]
+
+    async def _compaction_complete(
+        self,
+        rpc: _PiRpcSession | None,
+        result: dict[str, JsonValue],
+        model: str | None,
+    ) -> CompactionComplete:
+        """Report a settled turn's compaction with Pi's compacted context.
+
+        :param rpc: A settled Pi session, or ``None`` for a summary-only fallback.
+        :param result: The ``compaction_end`` result carrying Pi's summary.
+        :param model: The turn's model.
+        :returns: The compaction event; summary-only if Pi did not export its context.
+        """
+        response = None
+        if rpc is not None:
+            try:
+                response = await rpc.request(
+                    {"type": "get_messages", "id": "compacted_messages"},
+                    "get_messages",
+                )
+            except Exception:  # a failed export still persists the summary
+                logger.debug("PiExecutor: get_messages failed after compaction", exc_info=True)
+        data = response.get("data") if response else None
+        pi_messages = data.get("messages") if isinstance(data, dict) else None
+        tokens_after = result.get("estimatedTokensAfter")
+        return CompactionComplete(
+            summary=cast(str, result["summary"]),
+            token_count=tokens_after if isinstance(tokens_after, int) else 0,
+            model=model,
+            compacted_messages=(
+                _pi_compacted_history(pi_messages) or None
+                if isinstance(pi_messages, list)
+                else None
+            ),
+        )
+
+    async def _evict_with_compaction(
+        self,
+        session_key: str,
+        rpc: _PiRpcSession,
+        result: dict[str, JsonValue],
+        model: str | None,
+    ) -> CompactionComplete:
+        """Stop a failed turn and preserve its checkpoint before eviction.
+
+        Discard retry output while abort settles. If settlement fails, retain
+        only the summary rather than exporting context from an active turn.
+
+        :param session_key: Session to evict.
+        :param rpc: The failed turn's Pi process.
+        :param result: Latest successful compaction result.
+        :param model: The turn's model.
+        :returns: A full checkpoint when settled, otherwise its summary only.
+        """
+        settled = False
+        try:
+            try:
+                async with asyncio.timeout(_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S):
+                    await rpc.send_command({"type": "abort", "id": "compaction_abort"})
+                    while (line := await rpc.read_line()) is not None:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") == "agent_settled":
+                            settled = True
+                            break
+                        if event.get("type") == "compaction_end":
+                            latest = event.get("result")
+                            if isinstance(latest, dict) and isinstance(latest.get("summary"), str):
+                                result = latest
+            except Exception:  # preserve the summary even if abort or settlement fails
+                logger.debug(
+                    "PiExecutor: compaction settlement failed before eviction", exc_info=True
+                )
+            if not settled:
+                logger.warning(
+                    "PiExecutor: preserving only the compaction summary before eviction; "
+                    "recent kept context is unavailable"
+                )
+            return await self._compaction_complete(rpc if settled else None, result, model)
+        finally:
+            await self._evict_rpc(session_key, rpc)
 
     async def _apply_thinking_level(
         self,
@@ -2906,6 +3101,9 @@ class PiExecutor(Executor):
         # True between an errored ``message_end`` and the ``agent_end`` pi
         # emits right after it; only that gap uses the short drain budget.
         awaiting_error_agent_end = False
+        # Latest successful compaction this turn, reported at settlement so a
+        # restarted Pi process resumes from the compacted context.
+        compaction_result: dict[str, JsonValue] | None = None
 
         while True:
             line = await rpc.read_line(
@@ -3139,6 +3337,9 @@ class PiExecutor(Executor):
             # ``agent_settled``: no retry, compaction or queued continuation is
             # left, so the stream is clean for the next turn on this session.
             if event_type == "agent_settled" and settled_boundary:
+                # A failed turn still reports it: the kept pi process stays compacted.
+                if compaction_result is not None:
+                    yield await self._compaction_complete(rpc, compaction_result, model)
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
@@ -3161,21 +3362,21 @@ class PiExecutor(Executor):
                         message_usages.append(captured)
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop == "aborted":
-                        # pi still emits agent_end/agent_settled after an abort;
-                        # drop the session so the next turn cannot read them.
+                    if stop == "aborted" or (
+                        stop == "error" and settled_boundary and message_streamed_text
+                    ):
+                        # Never append regenerated text after a failed streamed reply.
                         if settled_boundary:
-                            await self._evict_rpc(session_key, rpc)
+                            if compaction_result is not None:
+                                yield await self._evict_with_compaction(
+                                    session_key, rpc, compaction_result, model
+                                )
+                            else:
+                                await self._evict_rpc(session_key, rpc)
                         yield ExecutorError(message=str(msg.get("errorMessage", stop)))
                         return
                     if stop == "error":
                         error = str(msg.get("errorMessage", stop))
-                        if settled_boundary and message_streamed_text:
-                            # pi regenerates this message on retry; its partial
-                            # text is already on screen, so stop here.
-                            await self._evict_rpc(session_key, rpc)
-                            yield ExecutorError(message=error)
-                            return
                         # pi emits the run's ``agent_end`` right after an errored
                         # call; consume it (and on pi >= 0.80.4 the retry or
                         # settlement that follows) rather than leave it queued.
@@ -3187,10 +3388,18 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "compaction_end" and settled_boundary:
+                result = event.get("result")
+                if isinstance(result, dict) and isinstance(result.get("summary"), str):
+                    compaction_result = result
                 if event.get("willRetry") and message_streamed_text:
                     # Overflow recovery re-runs the prompt, replacing a
                     # truncated message whose text already streamed.
-                    await self._evict_rpc(session_key, rpc)
+                    if compaction_result is not None:
+                        yield await self._evict_with_compaction(
+                            session_key, rpc, compaction_result, model
+                        )
+                    else:
+                        await self._evict_rpc(session_key, rpc)
                     yield ExecutorError(
                         message=(
                             "Pi's response was truncated and it compacted the context to "
