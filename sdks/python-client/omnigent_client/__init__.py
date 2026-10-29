@@ -52,7 +52,7 @@ from ._child_status import (
     child_session_busy,
     child_summary_busy,
 )
-from ._client import OmnigentClient
+from ._client import TERMINAL_FALLBACK_HEADER, OmnigentClient
 from ._errors import (
     OmnigentError,
     RateLimitedError,
@@ -84,6 +84,7 @@ from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
     "MCP_ELICITATION_METHOD",
+    "TERMINAL_FALLBACK_HEADER",
     "TERMINAL_TASK_STATUSES",
     "AgentCatalogEntry",
     "AnyBlock",

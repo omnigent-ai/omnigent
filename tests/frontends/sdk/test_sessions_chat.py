@@ -759,7 +759,7 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint(
 @pytest.mark.parametrize("opted_in", [False, True])
 async def test_client_asks_for_prompts_held_in_terminal_only_when_told(opted_in: bool) -> None:
     """Raw ``stream()`` callers keep seeing a held prompt expire unless they send the header."""
-    from omnigent_client._client import TERMINAL_FALLBACK_HEADER, OmnigentClient
+    from omnigent_client import TERMINAL_FALLBACK_HEADER, OmnigentClient
 
     from omnigent.server.routes._sessions.helpers import _client_supports_terminal_fallback
 

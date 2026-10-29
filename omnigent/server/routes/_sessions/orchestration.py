@@ -711,6 +711,7 @@ async def _publish_and_wait_for_harness_elicitation(
                 conversation_store,
                 native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
                 unparked=unparked,
+                parked=parked,
             )
         elif owns_card:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
@@ -731,6 +732,7 @@ def _schedule_deferred_elicitation_clear(
     *,
     native_delivery_attempt: str | None = None,
     unparked: _UnparkedHarnessElicitation | None = None,
+    parked: _ParkedHarnessElicitation | None = None,
 ) -> None:
     """
     Clear one elicitation's approval card after the re-park grace, unless
@@ -755,6 +757,8 @@ def _schedule_deferred_elicitation_clear(
     :param unparked: State of a prompt the harness may still show in its
         terminal. Mid-turn, the card is then held as waiting in the
         terminal (see :func:`_hold_elicitation_for_terminal_answer`).
+    :param parked: The wait that scheduled this clear. Once a session delete
+        releases it, the delete has already expired the card.
     """
 
     async def _clear_after_grace() -> None:
@@ -768,6 +772,8 @@ def _schedule_deferred_elicitation_clear(
         from omnigent.server.routes import sessions as _facade
 
         await asyncio.sleep(_facade._HARNESS_ELICITATION_REPARK_GRACE_S)
+        if parked is not None and parked.released:
+            return
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
             return
@@ -1057,6 +1063,12 @@ async def _release_deleted_session_prompts(
             for elicitation_id, entry in registry.items()
             if entry.session_id in deleted
         ]
+        # A hook exiting mid-delete still schedules a clear; releasing its wait cancels it.
+        waits = [
+            parked
+            for parked in _harness_parked_elicitations.values()
+            if parked.session_id in deleted
+        ]
         # Parent links are gone after the delete, so read the mirrors' targets now.
         ancestor_ids: dict[str, list[str]] = {}
         for session_id in {prompt_session_id for prompt_session_id, _ in prompts}:
@@ -1070,8 +1082,8 @@ async def _release_deleted_session_prompts(
                 )
         yield
         # Mark parked hooks before any await so a later disconnect cannot open a hold.
-        for parked in _harness_parked_elicitations.values():
-            if parked.session_id in deleted and not parked.released:
+        for parked in waits:
+            if not parked.released:
                 parked.released = True
                 parked.resolved_elsewhere.set()
         for elicitation_id, unparked in _harness_unparked_elicitations.items():

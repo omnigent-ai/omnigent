@@ -28,9 +28,7 @@ import click
 import httpx
 import yaml
 from omnigent_client import (
-    AgentCatalogEntry as _AgentChoice,
-)
-from omnigent_client import (
+    TERMINAL_FALLBACK_HEADER,
     OmnigentClient,
     RegisteredAgent,
     RegisteredAgentCatalog,
@@ -40,9 +38,11 @@ from omnigent_client import (
     ToolHandler,
 )
 from omnigent_client import (
+    AgentCatalogEntry as _AgentChoice,
+)
+from omnigent_client import (
     OmnigentError as ClientOmnigentError,
 )
-from omnigent_client._client import TERMINAL_FALLBACK_HEADER
 from omnigent_client._http import is_loopback_url
 from omnigent_client._sessions import Session as SessionSnapshot
 from rich.console import Console

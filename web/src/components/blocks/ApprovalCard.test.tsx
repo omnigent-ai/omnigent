@@ -2003,6 +2003,8 @@ describe("ApprovalCard — prompt waiting in the terminal", () => {
       expect(ownerOnly !== null).toBe(ownerOnlyNote);
       if (opensTerminal || ownerOnlyNote || isOwner === null) {
         expect(vi.mocked(useIsSessionOwner)).toHaveBeenCalledWith("conv_parent");
+      } else {
+        expect(vi.mocked(useIsSessionOwner)).not.toHaveBeenCalled();
       }
       if (!opensTerminal) {
         expect(screen.queryByTestId("approval-card-open-terminal")).toBeNull();
