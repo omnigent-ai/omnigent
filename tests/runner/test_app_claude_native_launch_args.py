@@ -482,6 +482,12 @@ def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> No
     )
 
 
+def test_build_native_claude_terminal_env_marks_only_unattended_launches() -> None:
+    """Only a runner-launched terminal tells ucode that nobody is watching it."""
+    assert "UG_NONINTERACTIVE" not in build_native_claude_terminal_env(None)
+    assert build_native_claude_terminal_env(None, unattended=True)["UG_NONINTERACTIVE"] == "1"
+
+
 @pytest.mark.parametrize("credential", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
 def test_build_native_claude_terminal_env_rejects_credentials_on_helper_path(
     credential: str,
@@ -546,7 +552,7 @@ def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
 
 
 @pytest.mark.parametrize(
-    ("base_url", "configured_flag", "expected_flag"),
+    ("provider_url", "configured_flag", "expected_flag"),
     [
         ("https://gateway.example/anthropic", "0", "1"),
         ("https://api.anthropic.com", "0", "0"),
@@ -554,11 +560,13 @@ def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
     ],
 )
 def test_claude_terminal_env_refusal_fallback_provider_override(
-    base_url: str, configured_flag: str, expected_flag: str
+    provider_url: str, configured_flag: str, expected_flag: str
 ) -> None:
     """Gateway launches force the guard; direct Anthropic keeps explicit preferences."""
     flag = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
-    config = ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": base_url, flag: configured_flag})
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": provider_url, flag: configured_flag}
+    )
 
     assert build_native_claude_terminal_env(config)[flag] == expected_flag
 
@@ -1339,6 +1347,35 @@ async def _auto_create_claude_terminal_for_test(
         auth_token_factory=lambda: None,
         resolve_launch_config=AsyncMock(return_value=None),
     )
+
+
+async def test_auto_create_claude_terminal_launches_with_noninteractive_ucode(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal the runner creates for a web turn must not block on a ucode prompt.
+
+    Nobody is attached to a runner-created pane, so a sudo password or a browser
+    sign-in in it would wait until the runner gives up. The launch spec sets
+    ``UG_NONINTERACTIVE`` so ucode prints the sign-in link instead.
+    """
+    from unittest.mock import Mock
+
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = Mock(spec=SessionResourceRegistry)
+    registry.launch_required_terminal.side_effect = RuntimeError("stop after capture")
+
+    with pytest.raises(RuntimeError, match="stop after capture"):
+        await _auto_create_claude_terminal_for_test(
+            monkeypatch,
+            session_id="conv_unattended_ucode",
+            workspace=bridge_dir,
+            registry=registry,
+        )
+
+    spec = registry.launch_required_terminal.call_args.kwargs["spec"]
+    assert spec.env["UG_NONINTERACTIVE"] == "1"
 
 
 async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(

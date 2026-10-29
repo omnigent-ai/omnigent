@@ -2582,6 +2582,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     assert spec.env == {
         **gateway_env,
         "ENABLE_TOOL_SEARCH": "true",
+        "UG_NONINTERACTIVE": "1",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
