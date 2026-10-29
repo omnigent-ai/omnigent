@@ -241,6 +241,9 @@ _TMUX_FILE = "tmux.json"
 # Written into the pane's private dir just before Omnigent kills the pane, so the
 # runner reads the exit as Omnigent's own close rather than the terminal dying.
 _EXPECTED_CLOSE_FILE = "expected_close"
+# Written there before every Omnigent kill (stop, reap), so an exit without it
+# that tmux reports as a killed session came from outside Omnigent.
+_OMNIGENT_KILL_FILE = "omnigent_kill"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -4794,8 +4797,11 @@ def kill_session(
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    marker = Path(info["socket_path"]).parent / _EXPECTED_CLOSE_FILE
+    private_dir = Path(info["socket_path"]).parent
+    markers = [private_dir / _OMNIGENT_KILL_FILE]
     if expected_close:
+        markers.append(private_dir / _EXPECTED_CLOSE_FILE)
+    for marker in markers:
         with contextlib.suppress(OSError):
             marker.touch()
     try:
@@ -4807,7 +4813,7 @@ def kill_session(
             allow_missing_target=True,
         )
     except RuntimeError:
-        if expected_close:
+        for marker in markers:
             marker.unlink(missing_ok=True)
         raise
 
@@ -4822,6 +4828,18 @@ def pane_closed_by_omnigent(private_dir: Path) -> bool:
         close and the kill did not fail.
     """
     return (private_dir / _EXPECTED_CLOSE_FILE).exists()
+
+
+def pane_killed_by_omnigent(private_dir: Path) -> bool:
+    """
+    Return whether Omnigent itself killed the Claude pane in *private_dir*.
+
+    :param private_dir: The terminal instance's private dir, which holds its
+        tmux socket, e.g. ``/tmp/omnigent-terminal-abc/``.
+    :returns: ``True`` when :func:`kill_session` ran for this pane (a stop or a
+        reap) and the kill did not fail.
+    """
+    return (private_dir / _OMNIGENT_KILL_FILE).exists()
 
 
 @_serialize_bridge_injection

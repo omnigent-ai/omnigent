@@ -383,6 +383,14 @@ def _tmux_process_start_error(cmd: list[str], exc: OSError) -> RuntimeError:
     return RuntimeError(detail)
 
 
+# has-session stderr when tmux answered but the session no longer exists.
+_TMUX_SESSION_GONE_ON_LIVE_SERVER_MARKERS = (
+    "no current target",
+    "can't find session",
+    "session not found",
+    "no such session",
+)
+
 # Unrecognized failures leave liveness unknown and are retried.
 _TMUX_TARGET_GONE_STDERR_MARKERS = (
     "no server running on",
@@ -1499,6 +1507,17 @@ class TerminalInstance:
     def last_exit_signal(self) -> str | None:
         """Return tmux's observed signal, without attributing who sent it."""
         return self._last_exit_signal
+
+    def session_closed_on_live_server(self) -> bool:
+        """Whether tmux, still running, reported this terminal's session gone.
+
+        With ``keep_alive_after_exit`` an inner-CLI exit leaves a dead pane, so
+        a missing session on a live server means a tmux kill command ended it.
+        """
+        error = (self._last_session_probe_error or "").lower()
+        return self.keep_alive_after_exit and any(
+            marker in error for marker in _TMUX_SESSION_GONE_ON_LIVE_SERVER_MARKERS
+        )
 
     def _remember_exit_status(self, fields: str) -> None:
         """Record the exit code from a ``#{pane_dead} #{pane_dead_status}`` row.

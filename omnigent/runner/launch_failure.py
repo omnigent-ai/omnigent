@@ -24,6 +24,7 @@ from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
 from omnigent.llms.errors import detect_request_size_overflow
 
 __all__ = [
+    "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
     "FailureDiagnosis",
     "classify_native_turn_error",
     "classify_terminal_failure",
@@ -205,6 +206,22 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
+)
+
+
+# A tmux kill run inside the pane acts on Omnigent's private server via $TMUX.
+TERMINAL_CLOSED_OUTSIDE_OMNIGENT = FailureDiagnosis(
+    title="Claude Code's terminal was closed outside Omnigent",
+    cause=(
+        "Claude Code's tmux session was ended while tmux was still running, and Omnigent "
+        "did not end it. A tmux command run inside the session, such as `tmux kill-session` "
+        "or `tmux kill-pane`, or another tool on the host closes it this way."
+    ),
+    remediation=(
+        "Send your message again to relaunch Claude Code. Commands run in the agent's terminal "
+        "should not kill its own tmux session; give them their own server with `tmux -L <name>`."
+    ),
+    category=ErrorCategory.USER,
 )
 
 

@@ -253,3 +253,39 @@ def test_socket_stat_failure_does_not_hide_probe_error(
     record = next(r for r in caplog.records if "tmux unavailable after" in r.getMessage())
     assert record.attributes["socket_state"] == "stat_failed"
     assert record.attributes["socket_stat_errno"] == errno.EACCES
+
+
+@pytest.mark.parametrize(
+    ("stderr", "keep_alive_after_exit", "closed_on_live_server"),
+    [
+        ("no current target", True, True),
+        ("can't find session: main", True, True),
+        ("no server running on /tmp/omnigent-terminal-x/tmux.sock", True, False),
+        ("no current target", False, False),
+    ],
+)
+async def test_session_closed_on_live_server_reads_the_has_session_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    keep_alive_after_exit: bool,
+    closed_on_live_server: bool,
+) -> None:
+    """Only a live tmux that lost a kept-alive session reads as a killed session."""
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+        keep_alive_after_exit=keep_alive_after_exit,
+    )
+
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, b"", stderr.encode())
+
+    _patch_tmux(monkeypatch, run)
+    await _run_watcher(instance, False, lambda: None)
+
+    assert not instance.running
+    assert instance.session_closed_on_live_server() is closed_on_live_server

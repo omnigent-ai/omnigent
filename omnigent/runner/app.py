@@ -103,7 +103,11 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
-from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.launch_failure import (
+    TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
+    FailureDiagnosis,
+    classify_terminal_failure,
+)
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -1915,6 +1919,8 @@ def create_runner_app(
             exit_status=event.exit_status,
             output=event.last_output,
         )
+        if diagnosis is None and event.closed_outside_omnigent:
+            diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
         error = _build_required_terminal_error(event, diagnosis)
         _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.

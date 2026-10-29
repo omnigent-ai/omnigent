@@ -55,6 +55,7 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     pane_closed_by_omnigent,
+    pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -6051,13 +6052,14 @@ def test_failed_expected_close_kill_leaves_no_marker(
         kill_session(bridge_dir, expected_close=True)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert not pane_killed_by_omnigent(private_dir)
 
 
 def test_kill_session_without_expected_close_leaves_no_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    """The stop affordance marks Omnigent's kill but not an expected close."""
     private_dir = tmp_path / "omnigent-terminal-pane"
     private_dir.mkdir()
     bridge_dir = tmp_path / "bridge"
@@ -6074,6 +6076,7 @@ def test_kill_session_without_expected_close_leaves_no_marker(
     kill_session(bridge_dir)
 
     assert not pane_closed_by_omnigent(private_dir)
+    assert pane_killed_by_omnigent(private_dir)
 
 
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
