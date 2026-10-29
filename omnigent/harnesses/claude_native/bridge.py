@@ -2821,7 +2821,6 @@ def augment_claude_args(
         ``False`` keeps every prompt off the routing round trip.
     :returns: Augmented argument list for the terminal resource.
     """
-    mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
     hook_settings = build_hook_settings(
         bridge_dir,
         python_executable=python_executable,
@@ -2840,14 +2839,18 @@ def augment_claude_args(
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
-    args.extend(
-        [
-            "--mcp-config",
-            json.dumps(mcp_config, separators=(",", ":")),
-            "--settings",
-            str(settings_path),
-        ]
-    )
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+
+    if claude_code_managed_mcp_present():
+        # Claude Code exits at startup on --mcp-config while an enterprise MCP config exists.
+        _logger.warning(
+            "Claude Code has an enterprise managed-mcp.json; launching without "
+            "Omnigent's MCP tools."
+        )
+    else:
+        mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
+        args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
+    args.extend(["--settings", str(settings_path)])
     if append_system_prompt:
         args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.

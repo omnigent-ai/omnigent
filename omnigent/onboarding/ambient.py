@@ -631,6 +631,28 @@ def claude_managed_gateway_display_name(paths: tuple[Path, ...] | None = None) -
     return urlsplit(base_url).hostname or "Claude Code gateway"
 
 
+def claude_code_managed_mcp_paths() -> tuple[Path, ...]:
+    """Claude Code's enterprise MCP config, which sits beside its managed settings.
+
+    Only locations that are absolute on this platform: the chain names every OS, and
+    a Windows path read on POSIX would resolve against the working directory.
+    """
+    return tuple(
+        path.with_name("managed-mcp.json")
+        for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS
+        if path.is_absolute()
+    )
+
+
+def claude_code_managed_mcp_present() -> bool:
+    """Whether an enterprise MCP config is deployed, so Claude Code refuses ``--mcp-config``.
+
+    Like Claude Code, an unreadable file still counts but an inaccessible directory
+    does not, which is why this uses ``os.path.exists`` rather than ``Path.exists``.
+    """
+    return any(os.path.exists(path) for path in claude_code_managed_mcp_paths())
+
+
 def _claude_login_detected() -> bool:
     """Return whether a usable Claude Code subscription login is present.
 
