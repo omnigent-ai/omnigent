@@ -219,7 +219,9 @@ Quoted replies recover as serialized text.
 **Import:** open Settings → Import sessions, or choose **Import your recent
 sessions** on the empty landing. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
-progress and links back to Settings. Imported sessions appear in the normal list.
+progress and links back to Settings. Imported sessions appear in the normal list,
+except Codex threads archived in Codex, which land in Archived, so the list can
+show fewer sessions than the import count.
 On phones, the progress link opens the Import panel directly; its header arrow
 returns to the Settings menu.
 For a local Pi session, the CLI also accepts

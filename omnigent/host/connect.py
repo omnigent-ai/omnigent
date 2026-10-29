@@ -2871,7 +2871,11 @@ class HostProcess:
             source: str, session_id: str
         ) -> tuple[HostImportedLocalSession | None, str | None]:
             from omnigent.session_import.local import load_local_session
-            from omnigent.session_import.models import ImportSource, SessionImportNotFoundError
+            from omnigent.session_import.models import (
+                ImportSource,
+                SessionImportNotFoundError,
+                import_item_payload,
+            )
 
             try:
                 local = load_local_session(cast(ImportSource, source), session_id)
@@ -2888,16 +2892,10 @@ class HostProcess:
                 HostImportedLocalSession(
                     external_session_id=local.external_session_id,
                     workspace=local.workspace,
-                    items=[
-                        {
-                            "type": item.type,
-                            "response_id": item.response_id,
-                            "data": item.data.model_dump(mode="json", exclude_none=True),
-                        }
-                        for item in local.items
-                    ],
+                    items=[import_item_payload(item) for item in local.items],
                     title=local.title,
                     source=local.source,
+                    archived=local.archived,
                 ),
                 None,
             )

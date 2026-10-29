@@ -368,6 +368,22 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
 )
 
 
+# A host that confirmed the spawn has a runner process that may still be
+# booting (slow imports on a busy machine), so it earns a longer connect wait.
+_ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR = 2.0
+
+
+def _relaunch_connect_timeout_s(*, acknowledged: bool) -> float:
+    """Seconds a relaunch waits for its runner to connect.
+
+    :param acknowledged: Whether the host confirmed it spawned the runner.
+    :returns: The base relaunch budget (30 s), doubled for a confirmed spawn.
+    """
+    if acknowledged:
+        return _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S * _ACKNOWLEDGED_RELAUNCH_CONNECT_FACTOR
+    return _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S
+
+
 def _is_batchable_external_item(event: SessionEventInput) -> bool:
     """
     Whether a batch entry can skip :func:`_post_event_impl` and be appended
@@ -2994,9 +3010,12 @@ def register_events_routes(
                 and relaunched_runner_id is not None
                 and not relaunched_launch_refused
             ):
+                relaunch_connect_timeout_s = _relaunch_connect_timeout_s(
+                    acknowledged=relaunched_launch_acknowledged
+                )
                 _logger.info(
                     "Waiting up to %.0fs for host %s to spawn a runner for session %s",
-                    _HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    relaunch_connect_timeout_s,
                     conv.host_id,
                     session_id,
                 )
@@ -3006,7 +3025,7 @@ def register_events_routes(
                     runner_router,
                     _tunnel_registry,
                     runner_id=relaunched_runner_id,
-                    timeout_s=_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    timeout_s=relaunch_connect_timeout_s,
                     runner_exit_reports=runner_exit_reports,
                     host_conn=_host_conn,
                     host_registry=_host_reg,
@@ -3217,7 +3236,7 @@ def register_events_routes(
                     event_name = "runner_never_connected"
                     launch_detail = (
                         "it never connected to the server within "
-                        f"{_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S:.0f}s — the "
+                        f"{_relaunch_connect_timeout_s(acknowledged=True):.0f}s — the "
                         "runner process may be hung or unable to reach the "
                         "server. Check the runner log on the host."
                     )

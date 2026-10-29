@@ -384,6 +384,8 @@ _UNKNOWN_COMMAND_REJECTION_PREFIX = "Unknown command: "
 # Claude Code collapses large pastes into this placeholder in the
 # input box instead of rendering the text itself.
 _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
+# Hint Claude Code shows in the empty input box while a submitted message is queued.
+_QUEUED_MESSAGE_HINT = "Press up to edit queued messages"
 # How many characters of the draft's first line to use when checking
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
@@ -6697,6 +6699,8 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
+    # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
+    tail = tail.replace(_QUEUED_MESSAGE_HINT, "")
     target = _comparable_draft_text(needle)
     return bool(target) and target in _comparable_draft_text(tail)
 

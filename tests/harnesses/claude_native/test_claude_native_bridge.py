@@ -9840,6 +9840,33 @@ def test_claude_prompt_rendered_sees_chat_input_below_menu_glyph() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+@pytest.mark.parametrize("needle", ["to", "a", "edit queued"])
+def test_queued_message_hint_is_not_a_draft_for_submit_verification(needle: str) -> None:
+    """
+    A queued message leaves Claude's empty input box showing its hint, not a draft.
+
+    The hint's words are substrings of short messages, so a one-word
+    message matched the hint and its submit was reported as rejected.
+    """
+    rule = "─" * 40
+    pane = "\n".join(
+        [
+            rule,
+            "❯ Press up to edit queued messages",
+            rule,
+            "  Opus 4.8 (1M context) | effort:high",
+        ]
+    )
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is False
+
+
+def test_typed_draft_is_still_seen_beside_the_queued_message_hint() -> None:
+    """A real draft in the box is still detected when the same words appear in it."""
+    rule = "─" * 40
+    pane = "\n".join([rule, "❯ to fix the bug", rule, "  Opus 4.8 (1M context) | effort:high"])
+    assert claude_native_bridge._draft_in_input_box(pane, "to") is True
+
+
 def test_claude_prompt_rendered_sees_numbered_draft_in_framed_input() -> None:
     """A numbered composer draft is distinguished from an unframed menu row."""
     pane = "\n".join(
