@@ -644,6 +644,8 @@ async def _publish_and_wait_for_harness_elicitation(
             _harness_elicitation_owners.pop(elicitation_id, None)
         if _harness_parked_elicitations.get(elicitation_id) is parked:
             _harness_parked_elicitations.pop(elicitation_id, None)
+        if not settled and not future.done() and parked.resolved_elsewhere.is_set():
+            settled = True  # A cancelled wait skips the check above; honor the terminal answer.
         delivery = getattr(params, "native_delivery", None)
         # Deleting the session expires its card and the ancestors' mirrors itself.
         owns_card = published_request and not parked.released

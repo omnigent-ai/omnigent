@@ -49,6 +49,7 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.routes import sessions as sessions_route
 from omnigent.server.routes._sessions import orchestration as sessions_orchestration
+from omnigent.server.schemas import ElicitationRequestParams
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
@@ -2857,6 +2858,89 @@ async def test_terminal_answer_clears_card_waiting_in_terminal(
         await _finish_deferred_clears()
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
     finally:
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
+@pytest.mark.parametrize("answered_in_chat", [False, True])
+async def test_answer_during_cancelled_hook_cleanup_is_kept(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    answered_in_chat: bool,
+) -> None:
+    """
+    An answer that lands while a cancelled hook cleans up is not lost.
+
+    A terminal answer clears the card. A chat answer never reached the hook,
+    so the card waits in the terminal and keeps the answer for a retry.
+    """
+    from omnigent.runtime import pending_elicitations
+
+    monkeypatch.setattr(sessions_route, "_HARNESS_ELICITATION_REPARK_GRACE_S", 0.05)
+    monkeypatch.setattr(sessions_route, "_HARNESS_TERMINAL_FALLBACK_POLL_S", 0.02)
+    pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(
+        client, f"test-terminal-fallback-cancelled-hook-{answered_in_chat}"
+    )
+    session_id = await _create_session(client, agent["id"])
+    monkeypatch.setitem(sessions_route._session_status_cache, session_id, "running")
+    tool_input = {"command": "ls -la"}
+
+    async def _answer_once_cancelled(_request: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if answered_in_chat:
+                verdict = await _post_approval(
+                    client, session_id, _REATTACH_ELICITATION_ID, "accept"
+                )
+                assert verdict.status_code == 202, verdict.text
+            else:
+                sessions_route._signal_terminal_resolved_harness_elicitation(
+                    session_id, "Bash", tool_input
+                )
+            raise
+
+    monkeypatch.setattr(sessions_route, "_poll_request_disconnect", _answer_once_cancelled)
+    collector = await start_session_stream_collector(session_id)
+    hook = asyncio.create_task(
+        sessions_orchestration._publish_and_wait_for_harness_elicitation(
+            cast(Any, None),
+            session_id=session_id,
+            params=ElicitationRequestParams(mode="form", message="Run ls?", requestedSchema={}),
+            timeout_s=60.0,
+            elicitation_id=_REATTACH_ELICITATION_ID,
+            tool_name="Bash",
+            tool_input=tool_input,
+            terminal_fallback=True,
+        )
+    )
+    try:
+        request_event = await _next_elicitation_event(collector)
+        assert request_event["type"] == "response.elicitation_request"
+        hook.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await hook
+        resolved = await _next_elicitation_event(collector)
+        if answered_in_chat:
+            assert resolved["type"] == "response.elicitation_resolved"
+            assert resolved["action"] == "accept"
+            held = await _next_elicitation_event(collector)
+            assert held["params"]["terminal_fallback"] == {"answer_undelivered": True}
+            assert _harness_pre_resolved_elicitations[_REATTACH_ELICITATION_ID].result is not None
+        else:
+            assert resolved == {
+                "type": "response.elicitation_resolved",
+                "elicitation_id": _REATTACH_ELICITATION_ID,
+            }
+            await _finish_deferred_clears()
+            assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations
+            assert pending_elicitations.count_for(session_id) == 0
+    finally:
+        hook.cancel()
+        await asyncio.gather(hook, return_exceptions=True)
+        _harness_unparked_elicitations.pop(_REATTACH_ELICITATION_ID, None)
+        await _finish_deferred_clears()
         await collector.stop()
         pending_elicitations.reset_for_tests()
 
