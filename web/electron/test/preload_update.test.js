@@ -178,3 +178,23 @@ describe("desktop command bridge", () => {
     assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
   });
 });
+
+describe("global show shortcut bridge", () => {
+  it("reads the saved shortcut and forwards only plain setting values", async () => {
+    const h = loadPreload();
+
+    await h.desktop.getGlobalShortcut();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:get-global-shortcut");
+
+    await h.desktop.setGlobalShortcut({ enabled: true, accelerator: "Control+Shift+K", extra: 1 });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
+      channel: "omnigent:set-global-shortcut",
+      args: { enabled: true, accelerator: "Control+Shift+K" },
+    });
+
+    await h.desktop.recordGlobalShortcut();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
+    await h.desktop.cancelGlobalShortcutRecording();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
+  });
+});
