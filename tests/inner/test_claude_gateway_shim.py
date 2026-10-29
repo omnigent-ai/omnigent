@@ -53,6 +53,9 @@ def _body(model: str, thinking: dict[str, Any] | None) -> bytes:  # type: ignore
         ("databricks-claude-opus-4-7", {"type": "enabled", "budget_tokens": 1024}),
         # Fable shares Opus 4.7+'s display="omitted" default.
         ("databricks-claude-fable-5", {"type": "adaptive"}),
+        # Unity Catalog spellings of the same Databricks-hosted tiers.
+        ("system.ai.claude-opus-4-8", {"type": "adaptive"}),
+        ("system.ai.claude-fable-5", {"type": "adaptive"}),
     ],
 )
 def test_restore_injects_display_for_adaptive_tiers(model: str, thinking: dict[str, Any]) -> None:  # type: ignore[explicit-any]  # parametrized API dict
@@ -78,6 +81,7 @@ def test_restore_injects_display_for_adaptive_tiers(model: str, thinking: dict[s
         ("databricks-claude-opus-4-8", {"type": "disabled"}),
         # Sonnet streams visible thinking by default — never touched.
         ("databricks-claude-sonnet-4-6", {"type": "adaptive"}),
+        ("system.ai.claude-sonnet-4-6", {"type": "adaptive"}),
         # First-party ids (no databricks- prefix) are out of scope.
         ("claude-opus-4-8", {"type": "adaptive"}),
         ("claude-fable-5", {"type": "adaptive"}),

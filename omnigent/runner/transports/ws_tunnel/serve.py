@@ -624,7 +624,10 @@ async def serve_tunnel(
                         not ever_connected
                         and auth_token is None
                         and auth_token_factory is not None
-                        and not getattr(auth_token_factory, "declined", False)
+                        and (
+                            not getattr(auth_token_factory, "declined", False)
+                            or getattr(auth_token_factory, "declined_without_proxy_bearer", False)
+                        )
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
                         # Same streak as the rejection below: a transient mint
@@ -648,12 +651,8 @@ async def serve_tunnel(
                             f"{http_auth_rejection_streak} attempts); "
                             f"{_reauth_hint(server_url)}"
                         ) from exc
-                    # Invalidate the cached token so the loop-top _refresh_auth_token
-                    # fetches a fresh one on the next attempt. The loop-top call is
-                    # already guarded against transient factory errors (OSError etc.),
-                    # so we don't call the factory directly here. Also clear a
-                    # 5xx-latched mint decline: the rejection proves the server
-                    # requires auth, so the next refresh must re-mint.
+                    # The rejection proves the server requires auth: drop the cached token
+                    # and any recoverable mint decline so the guarded loop-top refresh re-mints.
                     await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     if ever_connected:
@@ -864,7 +863,7 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
 def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
     """Reset rejected credentials without making transient failures fatal."""
     try:
-        _reset_server_error_decline(factory)
+        _reset_recoverable_decline(factory)
         _invalidate_auth_token_factory(factory)
     except (ValueError, OSError, ImportError):
         _logger.warning(
@@ -886,22 +885,24 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> 
     return bool(invalidate())
 
 
-def _reset_server_error_decline(factory: Callable[[], str | None] | None) -> None:
-    """Clear a mint decline latched by an intermediary 5xx.
+def _reset_recoverable_decline(factory: Callable[[], str | None] | None) -> bool:
+    """Clear a 5xx or bearer-less 401/403 mint decline after a re-auth rejection.
 
-    The tunnel upgrade was rejected with a re-auth signal, so the server
-    DOES require auth and a decline latched while it was unreachable (a
-    5xx answered for the mint endpoint) is wrong. Clearing it lets the
-    loop-top refresh re-mint on the next attempt. A genuine no-auth
-    refusal (HTTP 400/404) stays latched.
+    Definitive 400/404 declines stay latched.
 
     :param factory: Runner token factory, or ``None``.
+    :returns: ``True`` when a decline was cleared.
     """
-    if not getattr(factory, "declined_by_server_error", False):
-        return
+    if not (
+        getattr(factory, "declined_by_server_error", False)
+        or getattr(factory, "declined_without_proxy_bearer", False)
+    ):
+        return False
     reset = getattr(factory, "reset_decline", None)
-    if callable(reset):
-        reset()
+    if not callable(reset):
+        return False
+    reset()
+    return True
 
 
 async def _refresh_auth_token(
@@ -1499,6 +1500,7 @@ async def _send_hello(
     except Exception:  # noqa: BLE001 — telemetry errors must not abort hello
         pass
 
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
     from omnigent.host.frames import CAP_MCP_REGISTRY
     from omnigent.inner.native_attachments import (
         CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -1514,6 +1516,7 @@ async def _send_hello(
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
+                    CAP_SIDE_CHAT_SETTINGS,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,
