@@ -90,9 +90,7 @@ def set_elicitation_observer(
 # Optional per-session count sink, fired with the new count whenever the
 # index changes. The server wires it to persist the count on the
 # conversation row so replicas that don't hold this session's runner
-# tunnel still show parked approvals. The count leaves out prompts held in
-# the agent's terminal, which older clients don't show. Must be cheap +
-# non-blocking.
+# tunnel still show parked approvals. Must be cheap + non-blocking.
 _count_persist_hook: Callable[[str, int], None] | None = None
 
 

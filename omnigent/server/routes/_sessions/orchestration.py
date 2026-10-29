@@ -676,6 +676,8 @@ async def _publish_and_wait_for_harness_elicitation(
                 and event_payload is not None
                 and elicitation_id not in _harness_elicitation_registry
             ):
+                # A reclaimed card this retry never re-published still shows as held.
+                still_held = reclaimed_terminal_card and event_payload is reclaimed_event_payload
                 unparked = _UnparkedHarnessElicitation(
                     session_id=session_id,
                     tool_name=tool_name,
@@ -683,6 +685,7 @@ async def _publish_and_wait_for_harness_elicitation(
                     event_payload=event_payload,
                     request_fingerprint=request_fingerprint,
                     resolved_elsewhere=asyncio.Event(),
+                    in_terminal=still_held,
                 )
                 _harness_unparked_elicitations[elicitation_id] = unparked
             # Retain the card during reconnect or native delivery. Abandoned

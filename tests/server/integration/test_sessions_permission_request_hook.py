@@ -2898,13 +2898,18 @@ async def test_hook_retry_after_grace_takes_over_card_waiting_in_terminal(
         pending_elicitations.reset_for_tests()
 
 
-@pytest.mark.parametrize("cleared_by", ["terminal_answer", "turn_end"])
+@pytest.mark.parametrize("cleared_by", ["terminal_answer", "turn_end", "older_client_answer"])
 async def test_failed_hook_retry_keeps_card_waiting_in_terminal(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     cleared_by: str,
 ) -> None:
-    """A retry that fails before re-asking leaves the card held until the terminal or turn ends."""
+    """
+    A retry that fails before re-asking leaves the card held until it is answered or the turn ends.
+
+    Until the next grace ends, an opted-in client's answer is refused and an
+    older client's answer is kept for the next hook retry.
+    """
     from omnigent.runtime import pending_elicitations
     from omnigent.server.routes.sessions import routes_hooks
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -2937,29 +2942,54 @@ async def test_failed_hook_retry_keeps_card_waiting_in_terminal(
         waiting = await _next_elicitation_event(collector)
         assert waiting["params"]["terminal_fallback"] == {"answer_undelivered": False}
 
-        monkeypatch.setattr(
-            SqlAlchemyConversationStore, "get_conversation", _get_conversation_fails_once
+        release_grace.clear()
+        with monkeypatch.context() as failing_retry:
+            failing_retry.setattr(
+                SqlAlchemyConversationStore, "get_conversation", _get_conversation_fails_once
+            )
+            failing_retry.setattr(
+                routes_hooks, "_publish_and_wait_for_harness_elicitation", _fail_retry_lookup
+            )
+            with pytest.raises(RuntimeError, match="session lookup failed"):
+                await client.post(
+                    f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+                )
+        refused = await _post_approval(
+            client,
+            session_id,
+            _REATTACH_ELICITATION_ID,
+            "accept",
+            headers=_TERMINAL_FALLBACK_HEADERS,
         )
-        monkeypatch.setattr(
-            routes_hooks, "_publish_and_wait_for_harness_elicitation", _fail_retry_lookup
-        )
-        with pytest.raises(RuntimeError, match="session lookup failed"):
-            await client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+        assert refused.status_code == 423, refused.text
+        older_client_answered = cleared_by == "older_client_answer"
+        if older_client_answered:
+            kept = await _post_approval(client, session_id, _REATTACH_ELICITATION_ID, "accept")
+            assert kept.status_code == 202, kept.text
+        assert pending_elicitations.count_for(session_id) == 1
+        release_grace.set()
         held_again = await _next_elicitation_event(collector)
         assert held_again["type"] == "response.elicitation_request"
-        assert held_again["params"]["terminal_fallback"] == {"answer_undelivered": False}
+        assert held_again["params"]["terminal_fallback"] == {
+            "answer_undelivered": older_client_answered
+        }
         assert pending_elicitations.count_for(session_id) == 1
 
         if cleared_by == "terminal_answer":
             sessions_route._signal_terminal_resolved_harness_elicitation(
                 session_id, payload["tool_name"], {"command": "ls -la"}
             )
-        else:
+        elif cleared_by == "turn_end":
             sessions_route._session_status_cache[session_id] = "idle"
+        else:
+            retry = await client.post(
+                f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+            )
+            assert retry.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
         cleared = await _next_elicitation_event(collector)
         assert cleared["type"] == "response.elicitation_resolved"
         assert cleared["elicitation_id"] == _REATTACH_ELICITATION_ID
-        assert cleared.get("reason") == (None if cleared_by == "terminal_answer" else "unanswered")
+        assert cleared.get("reason") == ("unanswered" if cleared_by == "turn_end" else None)
         await _finish_deferred_clears()
         assert pending_elicitations.count_for(session_id) == 0
         assert _REATTACH_ELICITATION_ID not in _harness_unparked_elicitations

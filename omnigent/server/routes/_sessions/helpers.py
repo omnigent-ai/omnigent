@@ -11435,10 +11435,8 @@ def _child_session_summary_from_conversation(
         labels=labels,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,
-        # Surface the sub-agent's parked-elicitation count from the same
-        # in-memory index that feeds the sidebar badge, so the Agents
-        # rail can flag a child that's awaiting user input. Every client
-        # receives this summary, so prompts held in the terminal are left out.
+        # Same index as the sidebar badge, so the Agents rail can flag a child awaiting
+        # input. Every client gets this summary, so prompts held in the terminal are left out.
         pending_elicitations_count=pending_elicitations.count_for(
             conv.id, include_terminal_held=False
         ),

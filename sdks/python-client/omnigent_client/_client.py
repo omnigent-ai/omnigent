@@ -19,7 +19,7 @@ from ._sessions import SessionsNamespace
 from ._sessions_chat import SessionsChat, ToolCallable
 from ._tool_handler import StreamHooks, ToolHandler
 
-# Opt-in header for prompts held in the agent's terminal; SessionsChat.send() skips them.
+# Opt-in header: the server then sends prompts held in the agent's terminal and refuses answers.
 TERMINAL_FALLBACK_HEADER = "X-Omnigent-Terminal-Fallback"
 
 
