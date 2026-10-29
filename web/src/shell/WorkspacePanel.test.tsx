@@ -1583,9 +1583,13 @@ describe("WorkspacePanel desktop menu commands", () => {
   type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
   let sendCommand: CommandListener = () => {};
   const browserClose = vi.fn();
+  const browserHasView = vi.fn();
+  const browserOpenOrNavigate = vi.fn();
 
   beforeEach(() => {
     browserClose.mockResolvedValue({ ok: true });
+    browserHasView.mockResolvedValue({ exists: false });
+    browserOpenOrNavigate.mockResolvedValue({ ok: true });
     Object.assign(window, {
       omnigentDesktop: {
         kind: "electron",
@@ -1595,6 +1599,8 @@ describe("WorkspacePanel desktop menu commands", () => {
         },
         setDesktopCommandState: () => {},
         browserClose,
+        browserHasView,
+        browserOpenOrNavigate,
       },
     });
   });
@@ -1710,5 +1716,57 @@ describe("WorkspacePanel desktop menu commands", () => {
     sendCommand({ command: "new-browser-tab", browserViewId: null });
     expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
     expect(onReveal).toHaveBeenCalled();
+  });
+
+  it("steps through the tabs in strip order, wrapping at either end, and shows the rail", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    const { openFileViewer, openTerminalTab, onReveal } = renderWorkspace({
+      open: false,
+      openFiles: ["src/a.ts"],
+      openTerminals: ["terminal:zsh"],
+    });
+    sendCommand({ command: "next-tab", browserViewId: null });
+    sendCommand({ command: "previous-tab", browserViewId: null });
+    expect(openFileViewer).toHaveBeenCalledWith("src/a.ts");
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+    expect(onReveal).toHaveBeenCalledTimes(2);
+  });
+
+  it("reopens closed tabs newest first, loading a browser tab's last page", async () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_reopen", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { openFileViewer, onRightRailTabChange, onReveal } = renderWorkspace({
+      conversationId: "conv_reopen",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openPanels: ["changes"],
+      openFiles: ["src/a.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    reopen();
+    expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+      expect.stringMatching(/^browser-tab:conv_reopen:/),
+      "https://example.com/",
+      undefined,
+      { force: true },
+    );
+    reopen();
+    expect(onRightRailTabChange).toHaveBeenLastCalledWith("changes");
+    reopen();
+    reopen();
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    expect(onReveal).toHaveBeenCalledTimes(3);
   });
 });

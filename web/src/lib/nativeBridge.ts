@@ -288,7 +288,10 @@ export type DesktopCommand =
   | "go-back"
   | "go-forward"
   | "reload"
-  | "focus-address-bar";
+  | "focus-address-bar"
+  | "reopen-closed-tab"
+  | "previous-tab"
+  | "next-tab";
 
 const DESKTOP_COMMANDS: readonly string[] = [
   "close",
@@ -300,6 +303,9 @@ const DESKTOP_COMMANDS: readonly string[] = [
   "go-forward",
   "reload",
   "focus-address-bar",
+  "reopen-closed-tab",
+  "previous-tab",
+  "next-tab",
 ] satisfies DesktopCommand[];
 
 export interface DesktopCommandEvent {
