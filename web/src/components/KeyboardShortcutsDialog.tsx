@@ -126,8 +126,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
-      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
+      { label: "Go back", keys: [MOD_KEY, BRACKET_LEFT] },
+      { label: "Go forward", keys: [MOD_KEY, BRACKET_RIGHT] },
     ],
   },
   {

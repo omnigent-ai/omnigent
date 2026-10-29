@@ -1,8 +1,8 @@
 // Cmd+1..9/0 (Ctrl on Win/Linux) jumps to the Nth pinned sidebar session:
-// 1–9 → the first nine, 0 → the tenth (browser-tab-style mapping). Sibling to
-// useSessionSwitchHotkey — same once-bound, ref-backed, platform-aware shape
-// (only ⌘ fires on macOS, only Ctrl on Win/Linux). Fires even in a focused text
-// field so you can jump mid-compose. Bind ONCE.
+// 1–9 → the first nine, 0 → the tenth (browser-tab-style mapping). Once-bound,
+// ref-backed, and platform-aware (only ⌘ fires on macOS, only Ctrl on
+// Win/Linux). Fires even in a focused text field so you can jump mid-compose.
+// Bind ONCE.
 //
 // Platform-aware chord: a browser tab reserves plain Cmd/Ctrl+digit for native
 // tab-switching, so in the browser the binding adds Alt (Cmd/Ctrl+Alt+digit) to

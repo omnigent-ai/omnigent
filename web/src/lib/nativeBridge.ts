@@ -280,7 +280,13 @@ interface ElectronDesktopApi extends NativeShellApi {
 
 /** Native menu commands the desktop shell hands to the page (see lib/desktopCommands). */
 export type DesktopCommand =
-  "close" | "new-terminal" | "new-browser-tab" | "archive-session" | "toggle-pin-session";
+  | "close"
+  | "new-terminal"
+  | "new-browser-tab"
+  | "archive-session"
+  | "toggle-pin-session"
+  | "go-back"
+  | "go-forward";
 
 const DESKTOP_COMMANDS: readonly string[] = [
   "close",
@@ -288,6 +294,8 @@ const DESKTOP_COMMANDS: readonly string[] = [
   "new-browser-tab",
   "archive-session",
   "toggle-pin-session",
+  "go-back",
+  "go-forward",
 ] satisfies DesktopCommand[];
 
 export interface DesktopCommandEvent {
