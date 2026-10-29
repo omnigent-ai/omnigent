@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import socket
 import tempfile
 import uuid
@@ -37,6 +38,14 @@ HOST_TOKEN_ENV_VAR = identity_env.HOST_TOKEN_ENV_VAR
 # confused with a user Bearer token by intermediate proxies or the
 # auth provider.
 MANAGED_HOST_TOKEN_HEADER = "X-Omnigent-Host-Token"
+
+# Records the hostname a generated ``name`` came from. While ``name`` still
+# equals it, ``name`` follows later hostname changes; a user-edited name is kept.
+NAME_FROM_HOSTNAME_KEY = "name_from_hostname"
+
+# EC2's private-IP hostname, e.g. ``ip-10-90-37-46``. In a config saved before
+# NAME_FROM_HOSTNAME_KEY existed, such a name was generated, never chosen.
+_EC2_PRIVATE_IP_HOSTNAME = re.compile(r"ip(-\d{1,3}){4}(\..+)?")
 
 
 @dataclass
@@ -119,6 +128,33 @@ def _validated_host_id(host_id: str, *, source: str, remedy: str) -> str:
     return normalized
 
 
+def _write_config(path: Path, cfg: dict[str, object]) -> None:
+    """Atomically replace *path* with *cfg* as YAML.
+
+    A truncated config would make the next load mint a new host_id. The rename
+    adopts mkstemp's 0600 mode on purpose; keep it for this per-user file.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+def _name_is_stale_hostname(host_section: dict[object, object], name: str, hostname: str) -> bool:
+    """Whether *name* was generated from a hostname this machine no longer has."""
+    if name == hostname:
+        return False
+    if NAME_FROM_HOSTNAME_KEY in host_section:
+        return name == host_section[NAME_FROM_HOSTNAME_KEY]
+    return _EC2_PRIVATE_IP_HOSTNAME.fullmatch(name) is not None
+
+
 def load_or_create_host_identity(
     path: Path | None = None,
 ) -> HostIdentity:
@@ -128,6 +164,10 @@ def load_or_create_host_identity(
     section does not exist, generates a fresh ``host_id``, sets
     ``name`` to the machine's hostname, writes the section back,
     and returns the identity.
+
+    A name generated from the hostname follows later hostname changes
+    (e.g. a VM re-provisioned with a new IP-based hostname while its
+    home directory persists), keeping the same ``host_id``.
 
     A *partial* host section is completed rather than discarded: a
     config.yaml that names the host (``host: {name: my-box}``) but
@@ -177,6 +217,9 @@ def load_or_create_host_identity(
 
     host_id = host_section.get("host_id")
     name = host_section.get("name")
+    hostname = socket.gethostname()
+    if isinstance(name, str) and _name_is_stale_hostname(host_section, name, hostname):
+        name = None
 
     # A host_id read from config.yaml must be a valid (UUID-shaped) id, same
     # as the env override — an invalid one would only fail later, remotely, as
@@ -203,15 +246,15 @@ def load_or_create_host_identity(
         if host_id
         else uuid.uuid4().hex
     )
-    name = name or socket.gethostname()
+    if not name:
+        name = hostname
+        host_section[NAME_FROM_HOSTNAME_KEY] = hostname
     identity = HostIdentity(host_id=host_id, name=name)
 
     host_section["host_id"] = identity.host_id
     host_section["name"] = identity.name
     cfg["host"] = host_section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+    _write_config(path, cfg)
 
     return identity
 
@@ -247,24 +290,10 @@ def reset_host_id(path: Path | None = None) -> tuple[str | None, str]:
     old_host_id = host_section.get("host_id")
     new_host_id = uuid.uuid4().hex
     host_section["host_id"] = new_host_id
-    host_section.setdefault("name", socket.gethostname())
+    if "name" not in host_section:
+        host_section["name"] = host_section[NAME_FROM_HOSTNAME_KEY] = socket.gethostname()
     cfg["host"] = host_section
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write: reset-id is a recovery command run when things are already
-    # broken, so a crash mid-write must not truncate the whole config. Write a
-    # sibling temp file and rename it over the target (rename is atomic on the
-    # same filesystem). The rename adopts mkstemp's 0600 mode intentionally —
-    # config.yaml holds only host identity, and 0600 is the right posture for a
-    # per-user file; do not "restore" a wider umask mode here.
-    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
-        os.replace(tmp_name, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
+    _write_config(path, cfg)
 
     return (old_host_id if isinstance(old_host_id, str) else None), new_host_id
 

@@ -185,6 +185,86 @@ def test_name_only_config_host_id_stable_across_calls(tmp_path: Path) -> None:
     assert first.name == second.name == "my-custom-host"
 
 
+def test_hostname_derived_name_follows_hostname_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-provisioned box's generated name follows its new hostname; host_id persists."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"server": "http://example.com"}))
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-a")
+    first = load_or_create_host_identity(config_path)
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-b")
+    second = load_or_create_host_identity(config_path)
+
+    assert first.name == "devbox-a"
+    assert second.name == "devbox-b", "a hostname-derived name must follow the hostname"
+    assert second.host_id == first.host_id
+    data = yaml.safe_load(config_path.read_text())
+    assert data["host"]["name"] == "devbox-b"
+    assert data["server"] == "http://example.com"
+    assert load_or_create_host_identity(config_path) == second
+
+
+def test_user_renamed_host_keeps_name_after_hostname_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name the user wrote over the generated one is never replaced."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-a")
+    load_or_create_host_identity(config_path)
+    data = yaml.safe_load(config_path.read_text())
+    data["host"]["name"] = "my-box"
+    config_path.write_text(yaml.safe_dump(data))
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-b")
+
+    assert load_or_create_host_identity(config_path).name == "my-box"
+
+
+@pytest.mark.parametrize(
+    ("saved_name", "hostname", "expected_name"),
+    [
+        ("ip-10-90-45-193", "ip-10-90-37-46", "ip-10-90-37-46"),
+        (
+            "ip-10-90-45-193.us-west-2.compute.internal",
+            "ip-10-90-37-46.us-west-2.compute.internal",
+            "ip-10-90-37-46.us-west-2.compute.internal",
+        ),
+        ("ip-10-90-45-193", "dev-laptop", "dev-laptop"),
+        ("my-laptop", "ip-10-90-37-46", "my-laptop"),
+        ("ip-10-90-37-46-dev", "ip-10-90-18-185", "ip-10-90-37-46-dev"),
+    ],
+)
+def test_legacy_config_regenerates_only_a_stale_ec2_hostname_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    saved_name: str,
+    hostname: str,
+    expected_name: str,
+) -> None:
+    """Without a recorded source, only a stale EC2 private-IP name is regenerated."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {"host": {"host_id": "d6d0ccebce7b4b706d21e23696bb462a", "name": saved_name}}
+        )
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: hostname)
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity.name == expected_name
+    assert identity.host_id == "d6d0ccebce7b4b706d21e23696bb462a"
+    assert yaml.safe_load(config_path.read_text())["host"]["name"] == expected_name
+
+
 def test_env_override_returns_identity_without_touching_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

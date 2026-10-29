@@ -369,9 +369,14 @@ class HostStore:
                     )
                 # Known host_id (same user_id, or reown opted in): update
                 # user_id/name in case they changed, then refresh status and timestamp.
+                # A name another of the owner's hosts holds (e.g. an IP-based
+                # hostname reused by an earlier machine) is unavailable; keep ours.
+                if name != row.name and not self._name_held_by_other_host(
+                    session, host_id=host_id, user_id=user_id, name=name
+                ):
+                    row.name = name
                 row.user_id = user_id
                 row.account_generation = generation
-                row.name = name
                 row.status = encode_host_status("online")
                 row.updated_at = now
                 row.configured_harnesses = harnesses_json
@@ -439,6 +444,30 @@ class HostStore:
             # A concurrent reservation or connection can win the first insert.
             # Retry in a fresh transaction, rechecking ownership and deletion.
             return run_write_transaction(self._session_immediate, "upsert_host_on_connect", write)
+
+    @staticmethod
+    def _name_held_by_other_host(
+        session: Session, *, host_id: str, user_id: str, name: str
+    ) -> bool:
+        """Whether another row holds *name* for *user_id*, including deleted tombstones.
+
+        :param session: The active SQLAlchemy session.
+        :param host_id: The host being renamed, excluded from the check.
+        :param user_id: The owner the unique ``(user_id, name)`` key applies to.
+        :param name: The requested name, e.g. ``"ip-10-90-37-46"``.
+        :returns: ``True`` when renaming *host_id* to *name* would collide.
+        """
+        held_by = session.execute(
+            select(SqlHost.host_id)
+            .where(
+                SqlHost.workspace_id == current_workspace_id(),
+                SqlHost.user_id == user_id,
+                SqlHost.name == name,
+                SqlHost.host_id != host_id,
+            )
+            .limit(1)
+        ).first()
+        return held_by is not None
 
     @staticmethod
     def _rotate_host_id(

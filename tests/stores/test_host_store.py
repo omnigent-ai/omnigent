@@ -815,6 +815,28 @@ def test_upsert_conflict_preserves_created_at(
     assert fetched[0].updated_at >= original_created
 
 
+def test_reconnect_renames_known_host_unless_another_host_holds_the_name(
+    host_store: HostStore,
+) -> None:
+    """A reconnect renames in place unless another of the owner's hosts holds the name."""
+    owner = "grace@example.com"
+    earlier_box, current_box = "11" * 16, "22" * 16
+    host_store.upsert_on_connect(earlier_box, "ip-10-90-37-46", owner)
+    host_store.set_offline(earlier_box)
+    host_store.upsert_on_connect(current_box, "ip-10-90-45-193", owner)
+
+    renamed = host_store.upsert_on_connect(current_box, "ip-10-90-18-185", owner)
+    collided = host_store.upsert_on_connect(current_box, "ip-10-90-37-46", owner)
+
+    assert renamed.name == "ip-10-90-18-185"
+    assert collided.name == "ip-10-90-18-185"
+    assert collided.status == "online"
+    hosts = {host.host_id: host for host in host_store.list_hosts(owner)}
+    assert hosts[current_box].name == "ip-10-90-18-185"
+    assert hosts[earlier_box].name == "ip-10-90-37-46"
+    assert hosts[earlier_box].status == "offline"
+
+
 _RESERVED_HOST_ID = "ab" * 16
 
 
