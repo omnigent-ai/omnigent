@@ -530,6 +530,14 @@ and observe the SPA's error/recovery UI (the error pill, retry, reconnect) — t
 observed error state is the reproduction. The same journey driver can film it
 in Step 4, even when permanent coverage uses a narrower test.
 
+**Do not manufacture the symptom and call it reproduced.** Injecting a reported
+upstream fault is valid when the product still performs the failing transition.
+Writing the suspected final state directly only shows how the product displays
+that state. If the reported actions do not reach it, the verdict is
+`not_reproduced` (or `needs_more_info` for a missing product detail), never
+`likely_repro`. Keep the injected state as a hypothesis in `evidence`, and
+changing `environment_fidelity` does not change this.
+
 **A mid-stream symptom must be driven mid-stream.** The mock is not
 single-batch: `chunk_delay` paces the SSE stream on both `/v1/responses` (the
 default openai-agents e2e_ui fixture) and `/v1/messages`. When the report ties

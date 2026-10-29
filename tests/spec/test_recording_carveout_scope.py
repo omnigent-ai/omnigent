@@ -103,3 +103,11 @@ def test_caption_rules_reach_the_agent_without_treating_hidden_labels_as_visible
     assert "Quote only text the viewer can see" in lanes
     assert "quote only visibly rendered text" in instructions
     assert "hidden accessibility labels and backend logs are not screen evidence" in instructions
+
+
+def test_repro_agent_does_not_accept_injected_state_as_reproduction() -> None:
+    instructions = _loaded_repro_instructions()
+
+    assert "Do not manufacture the symptom and call it reproduced" in instructions
+    assert "the verdict is `not_reproduced`" in instructions
+    assert "never `likely_repro`" in instructions
