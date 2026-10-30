@@ -431,7 +431,12 @@ describe("index.css native header glass", () => {
     );
     expect(glass).toBeDefined();
     expect(glass![0]).toContain(
-      "top: calc(-1 * max(0px, calc(var(--omnigent-safe-top) - 0.5rem)))",
+      "--status-bar-extension: max(0px, calc(var(--omnigent-safe-top) - 0.5rem))",
+    );
+    expect(glass![0]).toContain("top: calc(-1 * var(--status-bar-extension))");
+    // The 55% fade stop stays relative to the header box, not the taller glass.
+    expect(glass![0]).toContain(
+      "black calc(var(--status-bar-extension) + (100% - var(--status-bar-extension)) * 0.55)",
     );
     const before = cssSource.slice(0, glass!.index!);
     expect((before.match(/\{/g) ?? []).length - (before.match(/\}/g) ?? []).length).toBe(0);
