@@ -1607,7 +1607,7 @@ def _codex_login_probe_listing(spec: object) -> ModelListing | None:
     :returns: A probe-backed listing, or ``None`` when the launch is rerouted,
         cannot authenticate, or its catalog is not cached.
     """
-    from omnigent.harness_startup_config import _harness_path_env_var
+    from omnigent.harness_startup_config import _harness_path_env_var, resolve_harness_path
     from omnigent.harnesses.codex_native.app_server import (
         NativeCodexLaunch,
         _ambient_builtin_codex_provider,
@@ -1654,9 +1654,9 @@ def _codex_login_probe_listing(spec: object) -> ModelListing | None:
         builtin = _ambient_builtin_codex_provider(None)
         overrides = [f"model_provider={json.dumps(builtin)}"] if builtin else []
     launch = NativeCodexLaunch(config_overrides=overrides, model=None, profile=None)
-    fingerprint = codex_catalog_fingerprint(
-        launch, codex_path=spawn_env.get(_harness_path_env_var("codex"))
-    )
+    # The wrap finds its binary the same way: the spawn env's path, else the env's.
+    codex_path = spawn_env.get(_harness_path_env_var("codex")) or resolve_harness_path("codex")
+    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
     return _probe_catalog_listing("codex-native", fingerprint, "Codex")
 
 

@@ -1815,6 +1815,9 @@ def test_codex_login_catalog_follows_the_child_launch_env(
             True,
             id="codex-native-command",
         ),
+        pytest.param(
+            "codex", {}, {"HARNESS_CODEX_PATH": "OTHER/codex"}, False, id="codex-legacy-path"
+        ),
     ],
 )
 def test_sdk_workers_read_only_the_catalog_of_the_cli_they_launch(
@@ -1831,7 +1834,7 @@ def test_sdk_workers_read_only_the_catalog_of_the_cli_they_launch(
     _isolate_config(monkeypatch, tmp_path, f"{_CLI_SUBSCRIPTION_CONFIG}harness: {config}\n")
     _isolate_native_probe_store(monkeypatch, tmp_path)
     for name, value in env.items():
-        monkeypatch.setenv(name, value)
+        monkeypatch.setenv(name, value.replace("OTHER", str(other)))
     _seed_cli_login_catalogs(codex_pinned=True)
 
     row = catalog_for_spec(_worker_spec(harness))["self"]
