@@ -713,6 +713,14 @@ async def test_auto_create_pi_terminal_unmanaged_refuses_slash_bearing_managed_m
     args = captured["spec"].args
     assert "--model" not in args
     assert "--provider" not in args
+    # The pick is not dropped: it is replayed through the extension, which
+    # resolves against Pi's live registry instead of Pi's --model parser.
+    inbox = pi_native_bridge.bridge_dir_for_session_id(_PI_SESSION_ID) / "inbox"
+    payloads = [json.loads(path.read_text()) for path in inbox.glob("*.json")]
+    assert [payload.get("model") for payload in payloads] == ["omnigent/moonshotai/kimi-k2.5"], (
+        payloads
+    )
+    assert payloads[0]["ack_id"] == payloads[0]["id"]
 
 
 def _pi_launch_test_stubs(

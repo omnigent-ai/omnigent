@@ -371,6 +371,10 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # references keep the tasks alive after session creation returns.
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
 
+# Pi own-login startup model replays awaiting Pi's acknowledgement. Kept
+# referenced so a slow Pi cannot have its wait garbage-collected mid-flight.
+_STARTUP_MODEL_REPLAY_TASKS: set[asyncio.Task[None]] = set()
+
 # Tool-relay starts that follow a Claude terminal launch, kept referenced
 # until they finish.
 _CLAUDE_RELAY_START_TASKS: set[asyncio.Task[None]] = set()
@@ -2612,6 +2616,37 @@ async def _resolve_pi_resume_session(
     return None
 
 
+async def _await_startup_model_replay_ack(
+    *,
+    bridge_dir: Path,
+    change_id: str,
+    session_id: str,
+    model: str,
+) -> None:
+    """Log when Pi never acknowledged a startup model replay.
+
+    Replaying a model Pi cannot resolve leaves the session on Pi's own default,
+    which is otherwise indistinguishable from a successful switch. The
+    extension acknowledges only after ``setModel`` resolves, so a missing
+    acknowledgement is the one signal that the pick did not take.
+
+    :param bridge_dir: Native Pi bridge directory for the session.
+    :param change_id: Model-change id the extension acknowledges.
+    :param session_id: Omnigent conversation id, for the log.
+    :param model: Persisted model selection being replayed, for the log.
+    """
+    from omnigent.harnesses.pi_native.bridge import wait_for_model_change_ack
+
+    if await wait_for_model_change_ack(bridge_dir, change_id):
+        return
+    _logger.warning(
+        "Pi-native startup model replay was not acknowledged for session %s (model=%s)",
+        session_id,
+        model,
+        extra={"session_id": session_id},
+    )
+
+
 async def _auto_create_pi_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -2884,29 +2919,31 @@ async def _auto_create_pi_terminal(
         ),
     )
     if startup_model_replay_model is not None:
-        from omnigent.harnesses.pi_native.bridge import (
-            enqueue_model_change,
-            wait_for_model_change_ack,
-        )
+        from omnigent.harnesses.pi_native.bridge import enqueue_model_change
 
         # The launch API has returned, so Pi has been spawned. Queue the
-        # persisted UI selection now; the extension will acknowledge only
-        # after its session_start handler has installed the inbox poller and
-        # Pi's setModel call has completed.
+        # persisted UI selection now; the extension acknowledges only after its
+        # session_start handler has installed the inbox poller and Pi's
+        # setModel call has completed. The wait is detached: Pi may need the
+        # whole ack budget to answer, and a pick it cannot resolve must never
+        # delay the launch itself.
         startup_model_replay_id = await asyncio.to_thread(
             enqueue_model_change,
             bridge_dir,
             startup_model_replay_model,
             wait_for_ack=True,
         )
-        applied = await wait_for_model_change_ack(bridge_dir, startup_model_replay_id)
-        if not applied:
-            _logger.warning(
-                "Pi-native startup model replay was not acknowledged for session %s (model=%s)",
-                session_id,
-                startup_model_replay_model,
-                extra={"session_id": session_id},
-            )
+        replay_task = asyncio.create_task(
+            _await_startup_model_replay_ack(
+                bridge_dir=bridge_dir,
+                change_id=startup_model_replay_id,
+                session_id=session_id,
+                model=startup_model_replay_model,
+            ),
+            name=f"pi-startup-model-replay-{session_id}",
+        )
+        _STARTUP_MODEL_REPLAY_TASKS.add(replay_task)
+        replay_task.add_done_callback(_STARTUP_MODEL_REPLAY_TASKS.discard)
     publish_event(
         session_id,
         {
