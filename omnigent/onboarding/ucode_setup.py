@@ -118,12 +118,13 @@ def _lacks_macos_admin_rights() -> bool:
         return admin_gid not in os.getgrouplist(user_name, os.getgid())
 
 
-def _machine_managed_settings_exist(agents: Sequence[str]) -> bool:
-    """Return whether a selected harness already has machine-wide managed settings.
+def _existing_machine_managed_settings(agents: Sequence[str]) -> list[Path]:
+    """Return the machine-wide managed settings files the selected harnesses already have.
 
     :param agents: ucode agent names being configured, e.g. ``("claude",)``.
-    :returns: ``True`` when Claude Code's managed-settings file or Codex's
-        managed config exists for a selected agent.
+    :returns: Existing Claude Code managed-settings or Codex managed-config
+        paths for the selected agents, e.g.
+        ``[Path("/etc/codex/managed_config.toml")]``.
     """
     from omnigent.onboarding.ambient import CLAUDE_CODE_MANAGED_SETTINGS_PATHS
 
@@ -132,25 +133,26 @@ def _machine_managed_settings_exist(agents: Sequence[str]) -> bool:
         paths.extend(CLAUDE_CODE_MANAGED_SETTINGS_PATHS)
     if "codex" in agents:
         paths.append(_CODEX_MANAGED_CONFIG_PATH)
-    return any(path.exists() for path in paths)
+    return [path for path in paths if path.exists()]
 
 
 def _ucode_user_scope_preferred(agents: Sequence[str] = _UCODE_AGENT_NAMES) -> bool:
     """Return whether ``ucode configure`` should run with ``--user``.
 
-    Keeps a ``--user`` scope already recorded in ucode's state, since a run
-    without it resets ucode to machine-wide settings. A macOS account without
-    admin rights also gets ``--user``, because ucode's default writes managed
-    settings through sudo. Existing managed files rule that out: ucode refuses
-    ``--user`` over them.
+    ucode refuses ``--user`` over existing managed files, so they always keep
+    the default scope, even over a saved user scope. Otherwise a ``--user``
+    scope already recorded in ucode's state is kept, since a run without it
+    resets ucode to machine-wide settings. A macOS account without admin rights
+    also gets ``--user``, because ucode's default writes managed settings
+    through sudo.
 
     :param agents: ucode agent names being configured, e.g.
         ``("claude", "codex", "pi")``.
     :returns: ``True`` when Omnigent should pass ``--user``.
     """
-    if read_ucode_config_scope() == "user":
-        return True
-    return _lacks_macos_admin_rights() and not _machine_managed_settings_exist(agents)
+    if _existing_machine_managed_settings(agents):
+        return False
+    return read_ucode_config_scope() == "user" or _lacks_macos_admin_rights()
 
 
 def run_ucode_configure(
@@ -181,10 +183,12 @@ def run_ucode_configure(
         f"`ucode configure` exited with code {result.returncode}; "
         "see the command output above for details."
     )
-    if _machine_managed_settings_exist(agents):
+    managed_paths = _existing_machine_managed_settings(agents)
+    if managed_paths:
         message += (
-            " Machine-wide managed settings exist, so ucode does not allow --user; "
-            "if it could not update them, ask an administrator to run setup."
+            " ucode cannot use --user while machine-wide managed settings exist. "
+            "If it could not update them, ask an administrator to update or remove "
+            f"{', '.join(map(str, managed_paths))}, then rerun setup."
         )
     elif not user_scope:
         message += (

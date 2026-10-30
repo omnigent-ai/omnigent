@@ -298,6 +298,7 @@ def test_configure_ucode_for_workspace_keeps_global_scope_for_macos_admin(
     assert _configure_and_record() == [_GLOBAL_SCOPE_ARGV]
 
 
+@pytest.mark.parametrize("saved_user_scope", [False, True])
 @pytest.mark.parametrize(
     "managed_file",
     [
@@ -309,9 +310,12 @@ def test_configure_ucode_for_workspace_keeps_global_scope_over_managed_settings(
     macos_account: Callable[[list[int]], None],
     tmp_path: Path,
     managed_file: str,
+    saved_user_scope: bool,
 ) -> None:
     """ucode refuses ``--user`` over existing managed settings, so Omnigent never sends it."""
     macos_account([20])
+    if saved_user_scope:
+        (tmp_path / "state.json").write_text(json.dumps({"config_scope": "user"}))
     managed_path = tmp_path / managed_file
     managed_path.parent.mkdir(parents=True)
     managed_path.write_text("{}")
@@ -335,7 +339,7 @@ def test_configure_ucode_for_workspace_managed_settings_failure_asks_for_adminis
         _configure_and_record(returncode=1)
 
     assert "configure your user only" not in excinfo.value.message
-    assert "ask an administrator" in excinfo.value.message
+    assert f"ask an administrator to update or remove {managed_path}" in excinfo.value.message
 
 
 def test_configure_ucode_for_workspace_keeps_saved_user_scope(tmp_path: Path) -> None:
