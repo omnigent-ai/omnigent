@@ -72,9 +72,12 @@ export function launchEditorLink(url: string): void {
     window.open(url, "_blank", "noopener,noreferrer");
     return;
   }
-  const frame = document.createElement("iframe");
-  frame.hidden = true;
-  frame.src = url;
-  document.body.appendChild(frame);
-  window.setTimeout(() => frame.remove(), 1000);
+  // A frame-src CSP can block custom schemes in iframes, even with a wildcard.
+  const link = document.createElement("a");
+  link.href = url;
+  link.target = "_self";
+  link.rel = "noreferrer";
+  document.body.append(link);
+  link.click();
+  link.remove();
 }

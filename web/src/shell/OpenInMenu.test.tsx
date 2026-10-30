@@ -5,6 +5,7 @@ import type { Host } from "@/hooks/useHosts";
 
 const fetchHost = vi.fn();
 const open = vi.fn();
+const browserOpen = vi.fn();
 const revealFile = vi.fn();
 let client: QueryClient;
 let serverHosts: Host[];
@@ -54,6 +55,12 @@ beforeEach(() => {
     return new Response("", { status: 404 });
   });
   open.mockReset();
+  browserOpen.mockReset();
+  vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    browserOpen(this.href);
+  });
   revealFile.mockReset().mockResolvedValue(true);
   vi.stubGlobal("fetch", fetchHost);
   vi.stubGlobal("open", open);
@@ -67,8 +74,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   client.clear();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  document.querySelectorAll("iframe").forEach((frame) => frame.remove());
 });
 
 function contextFor(sessionHostId: string | null, conversationId = "conv_1") {
@@ -154,9 +161,7 @@ it.each([
     if (provider === null) metadata.set(labelsUrl, textFile("arca_type arca\n"));
     if (platform === "browser") vi.stubGlobal("omnigentDesktop", undefined);
     const latestLink = () =>
-      platform === "desktop"
-        ? open.mock.calls.at(-1)?.[0]
-        : Array.from(document.querySelectorAll("iframe")).at(-1)?.getAttribute("src");
+      platform === "desktop" ? open.mock.calls.at(-1)?.[0] : browserOpen.mock.calls.at(-1)?.[0];
     const { changeTarget } = await renderMenu("/workspace", "remote", true);
     fireEvent.click(await screen.findByRole("button", { name: "Open in VS Code" }));
     expect(latestLink()).toBe(`vscode://vscode-remote/ssh-remote+${sshTarget}/workspace`);

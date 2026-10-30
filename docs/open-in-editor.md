@@ -9,6 +9,8 @@ editor and configure its Remote SSH support on the machine where you click the
 button. The browser or desktop shell may ask permission to open the editor's
 protocol link. Local file links are offered only when the desktop app can
 identify the session's host as its own machine. Mobile shells hide the controls.
+The browser uses a normal link to invoke the editor, so the page's `frame-src`
+policy does not need to allow editor protocol schemes.
 
 Remote controls require the host to be online. The UI infers standard SSH
 aliases from the existing host list: provider

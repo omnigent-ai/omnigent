@@ -8,9 +8,8 @@ import {
 } from "./editorLinks";
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
-  vi.useRealTimers();
-  document.querySelectorAll("iframe").forEach((frame) => frame.remove());
 });
 
 it.each([
@@ -142,15 +141,18 @@ it("uses the existing Electron protocol handler", () => {
   expect(document.querySelector("iframe")).toBeNull();
 });
 
-it("hands browser links off synchronously without navigating the tab", () => {
+it("hands browser links off synchronously through a same-context anchor, avoiding frame-src CSP", () => {
   vi.stubGlobal("omnigentDesktop", undefined);
-  vi.useFakeTimers();
-  const before = location.href;
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+    this: HTMLAnchorElement,
+  ) {
+    expect(this.isConnected).toBe(true);
+    expect(this.href).toBe("vscode://vscode-remote/ssh-remote+arca.ssh/repo");
+    expect(this.target).toBe("_self");
+    expect(this.rel).toBe("noreferrer");
+  });
   launchEditorLink("vscode://vscode-remote/ssh-remote+arca.ssh/repo");
-  const frame = document.querySelector("iframe");
-  expect(frame).toHaveAttribute("src", "vscode://vscode-remote/ssh-remote+arca.ssh/repo");
-  expect(frame?.hidden).toBe(true);
-  expect(location.href).toBe(before);
-  vi.advanceTimersByTime(1000);
+  expect(click).toHaveBeenCalledOnce();
+  expect(document.querySelector('a[href^="vscode:"]')).toBeNull();
   expect(document.querySelector("iframe")).toBeNull();
 });

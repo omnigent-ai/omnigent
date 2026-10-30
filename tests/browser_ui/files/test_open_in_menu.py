@@ -125,15 +125,20 @@ def test_open_folder_and_file_in_app(
     )
     page.add_init_script("""
       window.__openInCalls = [];
+      window.__openInCspViolations = [];
       window.open = (url) => { window.__openInCalls.push(url); return null; };
-      const originalAppend = Node.prototype.appendChild;
-      Node.prototype.appendChild = function(child) {
-        if (child instanceof HTMLIFrameElement && /^(cursor|vscode):/.test(child.src)) {
-          window.__openInCalls.push(child.src);
-          child.removeAttribute('src');
+      document.addEventListener('securitypolicyviolation', (event) => {
+        if (event.effectiveDirective === 'frame-src') {
+          window.__openInCspViolations.push(event.blockedURI);
         }
-        return originalAppend.call(this, child);
-      };
+      });
+      document.addEventListener('click', (event) => {
+        const link = event.target.closest?.('a');
+        if (link && /^(cursor|vscode):/.test(link.href)) {
+          window.__openInCalls.push(link.href);
+          event.preventDefault();
+        }
+      }, true);
     """)
     if desktop:
         page.add_init_script("""
@@ -145,6 +150,12 @@ def test_open_folder_and_file_in_app(
         """)
     page.set_viewport_size({"width": 1800, "height": 1000})
     page.goto(f"{session.contract.base_url}/c/{sid}")
+    page.evaluate("""() => {
+      const policy = document.createElement('meta');
+      policy.httpEquiv = 'Content-Security-Policy';
+      policy.content = 'frame-src *';
+      document.head.appendChild(policy);
+    }""")
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
     folder_open = rail.get_by_role("button", name="Choose app to open in", exact=True)
@@ -169,7 +180,10 @@ def test_open_folder_and_file_in_app(
     default_folder.click()
     location = "file" if host_id == "local" else f"vscode-remote/ssh-remote+{ssh_host}"
     expected_folder = f"vscode://{location}/workspace"
-    page.wait_for_function("window.__openInCalls.length === 1")
+    page.wait_for_function(
+        "window.__openInCalls.length === 1 || window.__openInCspViolations.length > 0"
+    )
+    assert page.evaluate("window.__openInCspViolations") == []
     assert page.evaluate("window.__openInCalls") == [expected_folder]
     expect(page.get_by_role("menu")).to_have_count(0)
     folder_open.click()
@@ -201,3 +215,4 @@ def test_open_folder_and_file_in_app(
     expect(page.get_by_role("dialog")).to_have_count(0)
     expected_file = f"vscode://{location}/workspace/{quote(path, safe='/')}{selection}"
     assert page.evaluate("window.__openInCalls")[3] == expected_file
+    assert page.evaluate("window.__openInCspViolations") == []
