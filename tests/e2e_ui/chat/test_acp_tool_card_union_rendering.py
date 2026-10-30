@@ -9,7 +9,7 @@ This test registers a generic ACP agent (a hermetic stdio fake, same shape as
 ``tests/e2e_ui/files/test_files_tab_survives_acp_reply.py``) whose one turn
 reports a ``content``, a ``diff``, and a ``terminal`` tool result, sends a
 message from the web composer, expands the settled turn's tool cards, and asserts
-each Output panel shows readable text rather than the raw union JSON.
+each Result section shows readable text rather than the raw union JSON.
 """
 
 from __future__ import annotations
@@ -264,15 +264,17 @@ def test_acp_union_tool_cards_render_readable_output(
     _drive_turn(page, base_url, session_id)
     _expand_worked_fold(page)
 
-    content_card = _reveal_tool_card(page, re.compile("read_auth_keys"))
-    expect(content_card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
+    content_card = _reveal_tool_card(page, re.compile("Read auth keys"))
+    expect(content_card.get_by_text("Result", exact=True)).to_be_visible(timeout=10_000)
     expect(content_card).to_contain_text(_CONTENT_RESULT_TEXT, timeout=10_000)
     expect(content_card).not_to_contain_text('"type": "content"')
+    # JSON results render as labeled fields, so a leaked union shows up as a "Type" field.
+    expect(content_card.get_by_text("Type", exact=True)).to_have_count(0)
 
-    diff_card = _reveal_tool_card(page, re.compile("apply_config_diff"))
-    terminal_card = _reveal_tool_card(page, re.compile("tail_build_log"))
-    expect(diff_card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
-    expect(terminal_card.get_by_text("Output", exact=True)).to_be_visible(timeout=10_000)
+    diff_card = _reveal_tool_card(page, re.compile("Apply config diff"))
+    terminal_card = _reveal_tool_card(page, re.compile("Tail build log"))
+    expect(diff_card.get_by_text("Result", exact=True)).to_be_visible(timeout=10_000)
+    expect(terminal_card.get_by_text("Result", exact=True)).to_be_visible(timeout=10_000)
 
     expect(diff_card).to_contain_text("diff /work/config.py (1 line)", timeout=10_000)
     expect(diff_card).to_contain_text("timeout = 60")
