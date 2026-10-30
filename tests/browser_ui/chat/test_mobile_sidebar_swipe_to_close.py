@@ -64,6 +64,14 @@ def _open_app(page: Page, chat: ChatSessionContract) -> CDPSession:
     return page.context.new_cdp_session(page)
 
 
+def _turn_off_row_swipe_left(page: Page) -> None:
+    """Clear the rows' swipe-left action, so a left swipe on a row reaches the drawer."""
+    page.add_init_script(
+        "localStorage.setItem('omnigent:swipe-actions', "
+        "JSON.stringify({ left: 'none', right: 'archive' }))"
+    )
+
+
 def _drawer_left(page: Page) -> float:
     return page.evaluate(f"() => document.querySelector('{_DRAWER}').getBoundingClientRect().x")
 
@@ -117,6 +125,7 @@ def test_swipe_left_closes_open_drawer(page: Page, chat_session_contract) -> Non
     """CUJ-1: a left swipe on a row, or on the exposed chat strip, closes the drawer."""
     chat = chat_session_contract
     chat.seed_sidebar_sessions([f"Swipe demo session {index:02d}" for index in range(1, 7)])
+    _turn_off_row_swipe_left(page)
     cdp = _open_app(page, chat)
 
     _native_edge_swipe_open(page)
@@ -155,6 +164,7 @@ def test_drawer_stays_open_for_scroll_and_short_drag(page: Page, chat_session_co
     """CUJ-2: scrolling the list or a short, slow drag leaves the drawer open."""
     chat = chat_session_contract
     chat.seed_sidebar_sessions([f"Scroll demo session {index:02d}" for index in range(1, 23)])
+    _turn_off_row_swipe_left(page)
     cdp = _open_app(page, chat)
 
     page.get_by_role("button", name="Open sidebar").tap()
@@ -167,5 +177,32 @@ def test_drawer_stays_open_for_scroll_and_short_drag(page: Page, chat_session_co
 
     left_before_lift = _drag(cdp, page, x=260, y=420, dx=-70, steps=10, step_ms=60)
     assert left_before_lift < -30, f"the drawer did not follow the short drag: {left_before_lift}"
+    _expect_drawer_open(page)
+    assert page.url == chat.url
+
+
+def test_row_swipe_left_action_keeps_its_swipe(page: Page, chat_session_contract) -> None:
+    """CUJ-3: a left swipe on a row with a swipe-left action moves the row, not the drawer."""
+    chat = chat_session_contract
+    chat.seed_sidebar_sessions([f"Row swipe session {index:02d}" for index in range(1, 7)])
+    cdp = _open_app(page, chat)
+
+    _native_edge_swipe_open(page)
+    row = page.locator(f"{_DRAWER} a", has_text="Row swipe session 02")
+    expect(row).to_be_visible()
+    box = row.bounding_box()
+    assert box is not None
+    x, y = box["x"] + box["width"] * 0.8, box["y"] + box["height"] / 2
+
+    # Short of the row's commit distance, so releasing springs the row back.
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]})
+    for step in range(1, 9):
+        point = {"x": x - 6 * step, "y": y}
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [point]})
+        page.wait_for_timeout(30)
+    expect(page.locator(_DRAWER).get_by_test_id("conversation-swipe-reveal")).to_be_visible()
+    assert _drawer_left(page) > -1, "the drawer moved under a row's own swipe"
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
     _expect_drawer_open(page)
     assert page.url == chat.url
