@@ -81,6 +81,21 @@ const AUTO_RESOLVED_DETAIL =
   "This request was answered outside this view, for example in the " +
   "agent's own terminal, another tab, or the approve page.";
 
+const QUESTION_TITLES = [
+  ["agy_", "Antigravity needs your input"],
+  ["codex_", "Codex needs input"],
+  ["cursor_", "Cursor has questions"],
+  ["pi_", "Pi needs your input"],
+  ["devin_", "Devin needs your input"],
+] as const;
+
+function questionPromptTitle(policyName: string, phase: string): string {
+  const match = QUESTION_TITLES.find(
+    ([prefix]) => policyName.startsWith(prefix) || phase.startsWith(prefix),
+  );
+  return match?.[1] ?? "Claude has questions";
+}
+
 /**
  * Extract the answer-option labels from an AskUserQuestion-shaped
  * ``requestedSchema``. Returns an empty array for any other schema.
@@ -392,16 +407,7 @@ export function ApprovalCard({
   // ("pre_tool_use", "codex_command_approval", ...). It carries no
   // information the card doesn't already show, so hide it for them.
   const showPhase = phase !== "" && !isNativePolicy;
-  const askUserQuestionTitle =
-    policyName.startsWith("agy_") || phase.startsWith("agy_")
-      ? "Antigravity needs your input"
-      : policyName.startsWith("codex_") || phase.startsWith("codex_")
-        ? "Codex needs input"
-        : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
-          ? "Cursor has questions"
-          : policyName.startsWith("pi_") || phase.startsWith("pi_")
-            ? "Pi needs your input"
-            : "Claude has questions";
+  const askUserQuestionTitle = questionPromptTitle(policyName, phase);
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
