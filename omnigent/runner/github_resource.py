@@ -409,7 +409,13 @@ def _actions_workflow_run(check: dict[str, Any]) -> tuple[str, int] | None:
     if not isinstance(url, str):
         return None
     match = re.fullmatch(r"(https?://[^/]+/[^/]+/[^/]+)/actions/runs/(\d+)(?:/.*)?", url)
-    return (match[1].lower(), int(match[2])) if match else None
+    if not match:
+        return None
+    try:
+        run_id = int(match[2])
+    except ValueError:
+        return None
+    return match[1].lower(), run_id
 
 
 def _filter_superseded_actions_runs(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
@@ -461,7 +467,7 @@ def _filter_superseded_actions_runs(data: dict[str, Any], *, cwd: str, token: st
         return
     if not isinstance(pages, list):
         return
-    latest_runs: dict[tuple[int, str, str], int] = {}
+    latest_runs: dict[tuple[int, str, str], tuple[int, int, dict[str, Any]]] = {}
     workflow_runs: list[tuple[int, tuple[int, str, str], int, bool]] = []
     for page in pages:
         rows = page.get("workflow_runs") if isinstance(page, dict) else None
@@ -489,19 +495,52 @@ def _filter_superseded_actions_runs(data: dict[str, Any], *, cwd: str, token: st
             ):
                 continue
             identity = (workflow_id, event, branch)
-            latest_runs[identity] = max(latest_runs.get(identity, 0), number)
+            latest = latest_runs.get(identity)
+            if latest is None or number > latest[0]:
+                latest_runs[identity] = (number, run_id, row)
             workflow_runs.append((run_id, identity, number, row.get("conclusion") == "cancelled"))
     # Cancelled workflows can leave failed result jobs while their replacements run.
     superseded = {
-        (repository_url, run_id)
+        (repository_url, run_id): identity
         for run_id, identity, number, cancelled in workflow_runs
-        if cancelled and number < latest_runs[identity]
+        if cancelled and number < latest_runs[identity][0]
     }
-    data[_PR_CHECKS_FIELD] = [
-        check
-        for check in checks
-        if not isinstance(check, dict) or _actions_workflow_run(check) not in superseded
-    ]
+    remaining_checks = []
+    removed_workflows: dict[tuple[int, str, str], str] = {}
+    for check in checks:
+        run = _actions_workflow_run(check) if isinstance(check, dict) else None
+        identity = superseded.get(run) if run else None
+        if identity is None:
+            remaining_checks.append(check)
+            continue
+        name = check.get("workflowName")
+        removed_workflows.setdefault(
+            identity, name if isinstance(name, str) and name else "GitHub Actions"
+        )
+    visible_runs = {run for _, run in actions_checks}
+    for identity, fallback_name in removed_workflows.items():
+        _, run_id, row = latest_runs[identity]
+        if (repository_url, run_id) in visible_runs:
+            continue
+        status, conclusion = row.get("status"), row.get("conclusion")
+        if status == "completed":
+            if not isinstance(conclusion, str) or not conclusion:
+                continue
+        elif (
+            status not in ("queued", "in_progress", "waiting", "requested", "pending")
+            or conclusion is not None
+        ):
+            continue
+        name = row.get("name")
+        remaining_checks.append(
+            {
+                "name": name if isinstance(name, str) and name else fallback_name,
+                "status": "COMPLETED" if status == "completed" else "IN_PROGRESS",
+                "conclusion": conclusion,
+                "detailsUrl": f"{repository_url}/actions/runs/{run_id}",
+            }
+        )
+    data[_PR_CHECKS_FIELD] = remaining_checks
 
 
 def _summarize_checks(rollup: Any) -> dict[str, Any]:

@@ -1037,8 +1037,9 @@ def test_github_checks_ignore_confirmed_superseded_cancelled_runs(
         },
         {
             "workflow_runs": [
-                _actions_run(10, conclusion=None),
+                _actions_run(10, conclusion=None, status="in_progress", name="Native CI"),
                 _actions_run(11, conclusion="cancelled", run_number=1),
+                _actions_run(99, workflow_id=3, conclusion=None, status="queued"),
             ]
         },
     ]
@@ -1203,14 +1204,43 @@ def test_github_checks_preserve_failures_when_actions_metadata_is_unavailable(
 
 
 @pytest.mark.parametrize("conclusion", ["FAILURE", "CANCELLED"])
-@pytest.mark.parametrize("replacement", [False, True])
-def test_github_checks_find_queued_replacement_without_visible_check(
-    monkeypatch: pytest.MonkeyPatch, conclusion: str, replacement: bool
+@pytest.mark.parametrize("independent_success", [False, True])
+@pytest.mark.parametrize(
+    ("replacement_status", "replacement_conclusion", "native_name", "old_workflow_name", "bucket"),
+    [
+        (None, None, "Native CI", "CI", None),
+        ("queued", None, "Native CI", "CI", "pending"),
+        ("in_progress", None, None, "CI", "pending"),
+        ("waiting", None, None, None, "pending"),
+        ("completed", "failure", "Native CI", "CI", "failing"),
+        ("completed", "success", "Native CI", "CI", "passing"),
+        ("completed", "cancelled", "Native CI", "CI", "cancelled"),
+        ("unknown", None, "Native CI", "CI", None),
+    ],
+)
+def test_github_checks_report_replacement_without_visible_check(
+    monkeypatch: pytest.MonkeyPatch,
+    conclusion: str,
+    independent_success: bool,
+    replacement_status: str | None,
+    replacement_conclusion: str | None,
+    native_name: str | None,
+    old_workflow_name: str | None,
+    bucket: str | None,
 ) -> None:
-    checks = [_actions_check(100, "result", conclusion)]
+    checks = [{**_actions_check(100, "result", conclusion), "workflowName": old_workflow_name}]
+    if independent_success:
+        checks.append(_actions_check(300, "independent", "SUCCESS"))
     metadata = [_actions_run(100, conclusion="cancelled")]
-    if replacement:
-        metadata.append(_actions_run(200, conclusion=None, status="queued"))
+    if replacement_status:
+        metadata.append(
+            _actions_run(
+                200,
+                conclusion=replacement_conclusion,
+                status=replacement_status,
+                name=native_name,
+            )
+        )
     _stub_gh(
         monkeypatch,
         {
@@ -1230,22 +1260,40 @@ def test_github_checks_find_queued_replacement_without_visible_check(
     )
     data = github_resource._gh_pr_view([], "url,headRefOid,statusCheckRollup", cwd="/workspace")
     assert data is not None
-    assert data["statusCheckRollup"] == ([] if replacement else checks)
     result = github_resource._checks_fields(data)["checks"]
-    assert result["runs"] == (
-        []
-        if replacement
-        else [
+    expected_runs = []
+    if not replacement_status:
+        expected_runs.append(
             {
                 "name": "result",
                 "bucket": "failing" if conclusion == "FAILURE" else "cancelled",
                 "url": "https://github.com/acme/app/actions/runs/100/job/1",
             }
-        ]
-    )
+        )
+    if independent_success:
+        expected_runs.append(
+            {
+                "name": "independent",
+                "bucket": "passing",
+                "url": "https://github.com/acme/app/actions/runs/300/job/1",
+            }
+        )
+    if bucket:
+        expected_runs.append(
+            {
+                "name": native_name or old_workflow_name or "GitHub Actions",
+                "bucket": bucket,
+                "url": "https://github.com/acme/app/actions/runs/200",
+            }
+        )
+    assert result["runs"] == expected_runs
+    assert result["pending"] == int(bucket == "pending")
+    assert result["total"] == len(expected_runs)
 
 
-@pytest.mark.parametrize("variant", ["clean", "external", "no_head", "enterprise_auth"])
+@pytest.mark.parametrize(
+    "variant", ["clean", "external", "invalid_run_id", "no_head", "enterprise_auth"]
+)
 def test_github_checks_skip_unnecessary_actions_metadata_requests(
     monkeypatch: pytest.MonkeyPatch, variant: str
 ) -> None:
@@ -1259,6 +1307,8 @@ def test_github_checks_skip_unnecessary_actions_metadata_requests(
         checks[0]["conclusion"] = "SUCCESS"
     elif variant == "external":
         checks[0]["detailsUrl"] = "https://ci.example/result"
+    elif variant == "invalid_run_id":
+        checks[0]["detailsUrl"] = f"https://github.com/acme/app/actions/runs/{'9' * 5000}/job/1"
     elif variant == "no_head":
         data.pop("headRefOid")
     elif variant == "enterprise_auth":
