@@ -81,6 +81,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    read_fresh_submit_records,
 )
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
@@ -633,7 +634,16 @@ def validate_claude_hook_interpreter_compatibility(
 
 
 class ClaudePromptTimeout(RuntimeError):
-    """Claude Code's input box did not render before delivery timed out."""
+    """Claude Code's input box did not render before delivery timed out.
+
+    :param message: Readiness failure details.
+    :param transcript_progress: Native output arrived during this readiness wait;
+        killing the pane could discard work unrelated to the undelivered input.
+    """
+
+    def __init__(self, message: str, *, transcript_progress: bool = False) -> None:
+        super().__init__(message)
+        self.transcript_progress = transcript_progress
 
 
 class ClaudeTerminalExited(ClaudePromptTimeout):
@@ -4709,6 +4719,33 @@ def _fresh_matching_hook_block(
     )
 
 
+def _fresh_native_output(bridge_dir: Path, boundary: SubmitBoundary) -> bool:
+    """Check this wait's transcript append without interpreting old work as still running."""
+    try:
+        if read_claude_session_id(bridge_dir) != boundary.native_session_id:
+            return False
+        path = read_transcript_path(bridge_dir)
+        if path is None or path.resolve() != boundary.path:
+            return False
+    except (OSError, ValueError, RuntimeError):
+        return False
+    for entry in read_fresh_submit_records(boundary):
+        if entry.get("sessionId") != boundary.native_session_id or entry.get("isApiErrorMessage"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if entry.get("type") == "assistant" and content:
+            return True
+        if entry.get("type") == "user" and isinstance(content, list):
+            if any(
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
+            ):
+                return True
+    return False
+
+
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
     """
     Count rejections of one command name in a captured pane.
@@ -7023,7 +7060,9 @@ def _wait_for_claude_prompt_ready(
         sign-in that another process started.
     :raises ClaudePromptTimeout: If the prompt never renders in time
         (Claude failed to boot, or a slow boot outlasted even the hard
-        cap). The message carries the seconds actually waited, a poll
+        cap). Fresh native output during this wait marks the timeout so the
+        executor preserves the pane. Quiet or unreadable work is not inferred.
+        The message carries the seconds actually waited, a poll
         count, how many of those polls saw an empty capture, how many
         repaints were requested, and the tail
         of the last non-empty capture the loop actually observed (see
@@ -7032,6 +7071,13 @@ def _wait_for_claude_prompt_ready(
         a box that never appeared — is diagnosable from the error alone.
     """
     started = time.monotonic()
+    activity_boundary = None
+    if bridge_dir is not None:
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
+            transcript_path = read_transcript_path(bridge_dir)
+            native_session_id = read_claude_session_id(bridge_dir)
+            if transcript_path is not None and native_session_id is not None:
+                activity_boundary = capture_submit_boundary(transcript_path, native_session_id)
     next_liveness_probe = started + min(timeout_s, _CLAUDE_LIVENESS_POLL_INTERVAL_S)
     hard_deadline = started + (
         max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
@@ -7204,7 +7250,12 @@ def _wait_for_claude_prompt_ready(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "
         f"(input prompt never rendered in {polls} polls, "
         f"{empty_polls} empty captures, {repaint_requests} repaint requests). "
-        "The message was not delivered." + _format_terminal_failure_tail(last_nonempty)
+        "The message was not delivered." + _format_terminal_failure_tail(last_nonempty),
+        transcript_progress=(
+            bridge_dir is not None
+            and activity_boundary is not None
+            and _fresh_native_output(bridge_dir, activity_boundary)
+        ),
     )
 
 

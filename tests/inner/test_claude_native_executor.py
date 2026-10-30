@@ -1697,6 +1697,96 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "activity",
+    ["assistant", "tool_result", "old", "foreign", "metadata", "api_error", "unreadable"],
+)
+async def test_readiness_timeout_preserves_new_native_work_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activity: str
+) -> None:
+    """Parent completion must not make new background output disposable or pin later retries."""
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    transcript = tmp_path / "native.jsonl"
+    output = {
+        "type": "assistant",
+        "sessionId": "native-session",
+        "uuid": "reply",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "Worker result"}]},
+    }
+    transcript.write_text(json.dumps(output) + "\n")
+    claude_bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "native-session",
+            "transcript_path": str(transcript),
+            "background_tasks": [{"type": "subagent", "status": "running"}],
+        },
+    )
+    appended = False
+
+    def capture(*_args: object) -> str:
+        nonlocal appended
+        if not appended:
+            appended = True
+            entry = {**output, "uuid": "new-reply"}
+            if activity == "foreign":
+                entry["sessionId"] = "other-session"
+            elif activity == "metadata":
+                entry["type"] = "progress"
+            elif activity == "api_error":
+                entry["isApiErrorMessage"] = True
+            elif activity == "tool_result":
+                entry["type"] = "user"
+                entry["message"] = {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "tool", "content": "done"}],
+                }
+            if activity != "old":
+                with transcript.open("a") as handle:
+                    handle.write(json.dumps(entry) + "\n")
+        return "Background worker is finishing; composer unavailable"
+
+    def inject(path: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del content, timeout_s
+        claude_bridge._wait_for_claude_prompt_ready(
+            "unused.sock", "main", timeout_s=0, bridge_dir=path, extend_for_slow_boot=False
+        )
+
+    killed: list[Path] = []
+    if activity == "unreadable":
+
+        def unreadable(_path: Path) -> Path:
+            raise PermissionError("Unreadable bridge state")
+
+        monkeypatch.setattr(claude_bridge, "read_transcript_path", unreadable)
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(
+        claude_bridge, "_claude_pane_state", lambda *_: claude_bridge._ClaudePaneState(True)
+    )
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(
+        claude_native_executor, "kill_session", lambda path, **_: killed.append(path)
+    )
+    executor = ClaudeNativeExecutor(bridge_dir)
+    for attempt in range(2):
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "Follow-up"}], tools=[], system_prompt=""
+            )
+        ]
+        preserved = attempt == 0 and activity in {"assistant", "tool_result"}
+        assert killed == ([] if preserved else [bridge_dir])
+        assert len(events) == 1 and isinstance(events[0], ExecutorError)
+        assert events[0].undelivered is True
+        assert events[0].title == ("Message not delivered" if preserved else None)
+        killed.clear()
+
+
+@pytest.mark.asyncio
 async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
