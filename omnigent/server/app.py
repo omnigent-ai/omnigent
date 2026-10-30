@@ -66,6 +66,7 @@ from omnigent.harness_plugins import (
     NativeHarnessProvider,
     native_provider_for_key,
 )
+from omnigent.host.launch_audit import request_client_audit_attributes
 from omnigent.resources import examples as _examples_resources
 from omnigent.runtime import (
     get_terminal_registry,
@@ -253,6 +254,8 @@ class ServerInfoResponse(BaseModel):
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
+    # A managed fork accepts ``workspaces``; older servers reject the field.
+    session_fork_workspaces: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -2021,6 +2024,8 @@ def create_app(
                     on_fire=dispatch_hooks.on_fire or executor.fire,
                     on_expired=dispatch_hooks.on_expired or executor.recover,
                     owned_hosts=dispatch_hooks.owned_hosts,
+                    dispatch_enabled=dispatch_hooks.dispatch_enabled,
+                    poll_interval=dispatch_hooks.poll_interval,
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
@@ -2273,6 +2278,42 @@ def create_app(
         if _owner_credentials:
             sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
             app.state.sandbox_config = sandbox_config
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    sandbox_profiles = (
+        SandboxProfileCatalog(conversation_store, sandbox_config, host_store)
+        if host_store is not None and resolved_feature_flags.enabled(Feature.SANDBOX_PROFILES)
+        else None
+    )
+    app.state.sandbox_profiles = sandbox_profiles
+    if host_store is not None and sandbox_profiles is not None:
+
+        def admit_profiled_launch(
+            host_id: str,
+            session_id: str,
+            owner: str | None,
+            generation: str | None,
+            allow_unbound: bool = False,
+            transfer_from_host_id: str | None = None,
+        ) -> None:
+            _admit_host_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+            host = host_store.get_host(host_id)
+            sandbox_profiles.require_session_host(
+                session_id,
+                host_id,
+                bind=not allow_unbound and transfer_from_host_id is None,
+                sandbox_provider=host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
+            )
+
+        host_registry.launch_authorizer = admit_profiled_launch
     # Admin roster: the config ``admins:`` list (canonical) union'd with the
     # runtime-editable ``<data_dir>/admins`` file. Built once here so BOTH the
     # admin-gated auth routes AND ``/v1/me``'s is_admin computation consult the
@@ -2501,6 +2542,8 @@ def create_app(
         operation, audit_route, audit_session_id = _resolve_audit_route(request)
         set_current_session_id(audit_session_id)
         reset_request_audit_attrs()
+        client_audit = request_client_audit_attributes(request.headers)
+        add_audit_attrs(**client_audit)
         if operation == "create_session":
             _logger.info(
                 "Session creation requested",
@@ -2518,6 +2561,7 @@ def create_app(
                 route=audit_route,
                 method=request.method,
                 request_id=request_id,
+                **client_audit,
             )
 
         failed = False
@@ -3497,6 +3541,7 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
+                "session_fork_workspaces": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
@@ -3719,6 +3764,13 @@ def create_app(
         tags=["extensions"],
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+    from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+
+    app.include_router(
+        create_sandbox_profiles_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["sandbox profiles"],
+    )
 
     app.include_router(
         create_sandbox_inference_router(
@@ -3996,6 +4048,15 @@ def create_app(
                         f"within {HOST_OFFLINE_HOLD_S / 3600:g} hours."
                     ),
                 )
+            elif hold == "host_back_relaunched":
+                # Not runner_disconnected: a passive reconnect clears that code to idle.
+                error = ErrorDetail(
+                    code="runner_interrupted",
+                    message=(
+                        "The host restarted during this turn, so the turn was interrupted. "
+                        "The session is running again; send the message again to retry."
+                    ),
+                )
             elif hold == "host_back_without_runner":
                 error = ErrorDetail(
                     code="runner_disconnected",
@@ -4051,17 +4112,48 @@ def create_app(
             return False
         return await _host_row_offline(host_store, host_id)
 
+    async def _relaunch_held_sessions(held: "list[Conversation]", host_id: str | None) -> bool:
+        """Relaunch the runner of each held root session on a host that came back without it.
+
+        The held turn is not redelivered: its prompt may already have reached the
+        harness, so a resend could run it twice. The relaunch restores the session,
+        so the user's next message runs without a manual resume.
+
+        :returns: ``True`` when the host acknowledged every relaunch.
+        """
+        from omnigent.server.routes.sessions import _launch_runner_on_host
+
+        host_conn = None if host_id is None else host_registry.get(host_id)
+        roots = [conv for conv in held if conv.kind != "sub_agent"]
+        if host_conn is None or not roots:
+            return False
+        acknowledged = True
+        for conv in roots:
+            try:
+                attempt = await _launch_runner_on_host(
+                    conv, conversation_store, host_registry, host_conn
+                )
+            except Exception:  # a failed relaunch keeps the plain failure
+                _logger.warning(
+                    "Relaunch after host return failed for session=%s", conv.id, exc_info=True
+                )
+                return False
+            acknowledged = acknowledged and attempt.acknowledged
+        return acknowledged
+
     async def _hold_for_offline_host(runner_id: str, affected: "list[Conversation]") -> str | None:
         """Wait for a runner whose user-run host dropped with it mid-turn.
 
         A laptop that sleeps or loses Wi-Fi takes its runner along and usually
         resumes the turn when it wakes, so the turn waits for it instead of
-        failing. A host that comes back without its runner gets one more grace.
-        A crash report cancels this task and fails the turn as before.
+        failing. A host that comes back without its runner gets one more grace,
+        then its runner is relaunched. A crash report cancels this task and
+        fails the turn as before.
 
         :returns: ``None`` when nothing was held, else how the hold ended:
-            ``"runner_reconnected"``, ``"server_shutdown"``,
-            ``"host_back_without_runner"`` or ``"expired"``.
+            ``"runner_reconnected"``, ``"server_shutdown"``, ``"expired"``,
+            ``"host_back_relaunched"`` (the host came back and its runner was
+            relaunched) or ``"host_back_without_runner"`` (the relaunch failed).
         """
         from omnigent.server.routes.sessions import (
             _MID_TURN_STATUSES,
@@ -4125,7 +4217,10 @@ def create_app(
                     if host_back_deadline is None:
                         host_back_deadline = min(deadline, now + RUNNER_DISCONNECT_GRACE_S)
                     if now >= host_back_deadline:
-                        outcome = "host_back_without_runner"
+                        relaunched = await _relaunch_held_sessions(held, host_id)
+                        outcome = (
+                            "host_back_relaunched" if relaunched else "host_back_without_runner"
+                        )
                         break
                 else:
                     # A brief host return cannot end a sleeping host's absolute hold.
@@ -4279,6 +4374,7 @@ def create_app(
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
+        from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
         from omnigent.server.routes.host_tunnel import log_runner_exited
         from omnigent.server.routes.sessions import _mark_runner_sessions_offline
         from omnigent.server.schemas import ErrorDetail
@@ -4293,6 +4389,8 @@ def create_app(
             runner_exit_reports.was_connected(runner_id)
             or session_live_state.last_liveness_stamp(runner_id) is not None
         )
+        # Only a runner that never connected failed to start; one that ran and died is a crash.
+        failure_code = RUNNER_PROCESS_CRASH if runner_ran else "runner_failed_to_start"
         try:
             affected = await asyncio.to_thread(
                 conversation_store.list_conversations_by_runner_id, runner_id
@@ -4307,7 +4405,7 @@ def create_app(
             log_runner_exited(host_id, runner_id, error, session_id=session_id)
         await _mark_runner_sessions_offline(
             affected,
-            ErrorDetail(code="runner_failed_to_start", message=error),
+            ErrorDetail(code=failure_code, message=error),
             conversation_store,
             fail_idle_top_level=not runner_ran,
         )
@@ -4692,6 +4790,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            admit_managed_runner=(
+                sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
+            ),
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),

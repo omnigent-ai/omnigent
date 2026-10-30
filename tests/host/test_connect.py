@@ -283,6 +283,22 @@ async def test_host_skills_distinguishes_empty_and_failure(
         assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
     assert rows == []
 
+    from omnigent.spec.skill_sources import SkillSourceContext
+    from omnigent.spec.types import SkillSpec
+
+    warning = "Codex plugin skills unavailable: `codex plugin list` exited 1"
+
+    def incomplete(ctx: SkillSourceContext, _harness: str) -> list[SkillSpec]:
+        assert ctx.warnings is not None
+        ctx.warnings.append(warning)
+        return []
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", incomplete)
+    host = _make_host_process()
+    assert host._handle_skills(frame) == HostSkillsResultFrame(
+        request_id="r", status="ok", warnings=[warning]
+    )
+
     def fail(*_args: object) -> None:
         raise OSError("unreadable skill directory")
 
@@ -9835,6 +9851,7 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
             items=[item],
             title=f"{source} title",
             source=source,
+            archived=source == "codex",
         )
 
     monkeypatch.setattr(
@@ -9857,10 +9874,11 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
     session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
     done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
 
-    # One frame per session, each tagged with its own source + title + the total.
+    # One frame per session, each tagged with its own source, title, archive state and the total.
     assert {
-        (f.session.external_session_id, f.session.source, f.session.title) for f in session_frames
-    } == {("c1", "claude", "claude title"), ("x1", "codex", "codex title")}
+        (f.session.external_session_id, f.session.source, f.session.title, f.session.archived)
+        for f in session_frames
+    } == {("c1", "claude", "claude title", False), ("x1", "codex", "codex title", True)}
     assert all(f.total == 2 for f in session_frames)
     assert len(done_frames) == 1 and done_frames[0].status == "ok"
 
@@ -9889,6 +9907,7 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
             items=[item],
             title="Exact session",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -9951,6 +9970,7 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -10024,6 +10044,7 @@ async def test_handle_import_local_unexpected_error_skips_only_that_session(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -10093,6 +10114,7 @@ async def test_handle_import_local_send_failure_skips_only_that_session(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -10149,6 +10171,7 @@ async def test_handle_import_local_send_connection_closed_aborts_batch(
             items=[item],
             title="ok",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -10205,6 +10228,7 @@ async def test_handle_import_local_slices_oversized_session_into_chunks(
             items=[item],
             title=f"{session_id} title",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -10279,6 +10303,7 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
             items=[item],
             title=f"{session_id} title",
             source=source,
+            archived=False,
         )
 
     monkeypatch.setattr(
@@ -10377,6 +10402,54 @@ def test_host_serves_a_pr_the_server_vouches_for(
     assert "not associated" in (refused.error or "")
     assert served.status == "ok", served
     assert written.status == "ok", written
+
+
+async def test_host_repository_branches_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_registry(*_args: object) -> None:
+        pytest.fail("Branch lookup must not initialize change tracking")
+
+    monkeypatch.setattr("omnigent.workspace_fs.create_filesystem_registry", unexpected_registry)
+    host = _make_host_process()
+    url = "https://github.com/org/repo"
+    try:
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="repository-branches",
+                op="repository_branches",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"repositories": [{"url": url, "path": ""}]},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert result.status == "ok", result
+    assert result.payload == {"repositories": [{"url": url, "branch": None, "pushed": None}]}
+
+
+def test_host_reads_a_file_named_as_the_workspace_root(tmp_path: Path) -> None:
+    """An absolute file target sent as the root is read rather than refused as a missing dir."""
+    target = tmp_path / "notes.md"
+    target.write_text("# hello\n")
+    host = _make_host_process()
+    try:
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="read-file",
+                op="list_or_read",
+                workspace=str(target),
+                session_id="session",
+                params={"path": ""},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert result.status == "ok", result
+    assert result.payload is not None
+    assert result.payload["content"] == "# hello\n"
+    assert result.payload["content_type"] == "text/markdown"
 
 
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
@@ -10624,9 +10697,9 @@ def test_github_reviewer_ops_are_served_on_host(
     ]
 
 
-@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
+@pytest.mark.parametrize("kind", ["details", "comment", "review_reply"])
 async def test_github_details_update_is_served_on_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, comment: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     """The host writes PR text when the runner is offline, as the session's tracked PR."""
     from omnigent.host.frames import HostFsWriteFrame
@@ -10635,6 +10708,7 @@ async def test_github_details_update_is_served_on_host(
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    comment = kind != "details"
     sent: list[dict[str, str]] = []
     answer = (
         {
@@ -10647,7 +10721,30 @@ async def test_github_details_update_is_served_on_host(
     )
 
     def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        sent.append(json.loads(Path(argv[argv.index("--input") + 1]).read_text()))
+        payload = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
+        if "query" in payload:
+            assert payload["variables"]["id"] == "thread-1"
+            return (
+                0,
+                json.dumps(
+                    {
+                        "data": {
+                            "node": {
+                                "id": "thread-1",
+                                "viewerCanReply": True,
+                                "pullRequest": {"url": url},
+                                "root": {
+                                    "nodes": [{"fullDatabaseId": "123", "state": "SUBMITTED"}]
+                                },
+                            }
+                        }
+                    }
+                ),
+                "",
+            )
+        if kind == "review_reply":
+            assert "repos/example/one/pulls/42/comments/123/replies" in argv
+        sent.append(payload)
         return 0, json.dumps(answer), ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -10660,11 +10757,16 @@ async def test_github_details_update_is_served_on_host(
         edited = host._handle_fs_write(
             HostFsWriteFrame(
                 request_id="details-update",
-                op="github_comment_create" if comment else "github_details_update",
+                op={
+                    "details": "github_details_update",
+                    "comment": "github_comment_create",
+                    "review_reply": "github_review_thread_reply",
+                }[kind],
                 workspace=str(tmp_path),
                 session_id="session",
                 params={
                     "pr_url": url,
+                    **({"thread_id": "thread-1"} if kind == "review_reply" else {}),
                     **({"body": "Body"} if comment else {"title": " Renamed ", "body": None}),
                 },
             )
@@ -10673,6 +10775,12 @@ async def test_github_details_update_is_served_on_host(
         _cleanup_host(host)
 
     assert edited.status == "ok", edited
+    if kind == "review_reply":
+        assert edited.payload["thread_id"] == "thread-1"
+        assert edited.payload["comment"]["id"] == "99"
+        assert edited.payload["comment"]["body"] == "Body"
+        assert sent == [{"body": "Body"}]
+        return
     assert edited.payload == (
         {
             "object": "session.github.pr_comment",

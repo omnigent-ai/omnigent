@@ -31,6 +31,15 @@ import {
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
+import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
+import {
+  emptyTriggerFields,
+  renderTriggerPrompt,
+  TRIGGER_TEMPLATES,
+  triggerFieldsComplete,
+  type TriggerFields,
+  type TriggerSource,
+} from "@/components/scheduled/triggerTemplates";
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
@@ -67,6 +76,8 @@ export function CreateScheduledTaskDialog({
   onOpenChange,
   initialName,
   initialPrompt,
+  initialTrigger = null,
+  sessionLink = "",
   editingTask = null,
 }: {
   open: boolean;
@@ -75,6 +86,10 @@ export function CreateScheduledTaskDialog({
    *  "Suggestions" suggestion chip). Omitted → the fields start empty. */
   initialName?: string;
   initialPrompt?: string;
+  /** Open on a Jira/Slack/GitHub trigger template instead of a plain prompt. */
+  initialTrigger?: TriggerSource | null;
+  /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
+  sessionLink?: string;
   editingTask?: ScheduledTask | null;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
@@ -223,7 +238,9 @@ export function CreateScheduledTaskDialog({
       event.preventDefault();
     }
   }
-  // Optional pinned host/workspace. "" = unset (server resolves at fire time).
+  // Pinned host/workspace. "" = none: a new task waits for a pick (it starts on
+  // the first online host), and an older unpinned task keeps resolving its host
+  // when it fires.
   const [hostId, setHostId] = useState<string>("");
   const [workspace, setWorkspace] = useState<string>("");
   // When on, each fire runs in a FRESH managed sandbox (execution_target =
@@ -237,6 +254,12 @@ export function CreateScheduledTaskDialog({
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
   const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
+  // An active trigger template replaces the Prompt field; the saved prompt is
+  // rendered from its fields. Create-only: an edit always shows the prompt.
+  const [trigger, setTrigger] = useState<TriggerSource | null>(null);
+  const [triggerFields, setTriggerFields] = useState<TriggerFields>(() =>
+    emptyTriggerFields("jira"),
+  );
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
 
@@ -267,16 +290,20 @@ export function CreateScheduledTaskDialog({
         setPickedProjectId(null);
         setSessionMode(editingTask.sessionMode);
         setStartNewSession(false);
+        setTrigger(null);
       } else {
-        setName(initialName ?? "");
+        setName(initialTrigger ? TRIGGER_TEMPLATES[initialTrigger].name : (initialName ?? ""));
         setPrompt(initialPrompt ?? "");
         setPickedAgentId(null);
         setPickedModel("");
         setPickedEffort("");
         setPickedPermission("");
-        setSessionMode("new");
+        // The manager session must persist: it dedupes against its own workers.
+        setSessionMode(initialTrigger ? "continue" : "new");
         setStartNewSession(false);
-        setSchedule(DEFAULT_SCHEDULE_MODEL);
+        setTrigger(initialTrigger);
+        setTriggerFields(emptyTriggerFields(initialTrigger ?? "jira"));
+        setSchedule(initialTrigger ? HOURLY_SCHEDULE_MODEL : DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(false);
         setHostId("");
         setWorkspace("");
@@ -287,7 +314,15 @@ export function CreateScheduledTaskDialog({
       setError(null);
     }
     wasOpen.current = open;
-  }, [open, initialName, initialPrompt, editingTask]);
+  }, [open, initialName, initialPrompt, initialTrigger, editingTask]);
+
+  // A new task pins a host, starting on the first online one as New Chat does.
+  const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
+  useEffect(() => {
+    if (open && !isEdit && !sandboxMode && hostId === "" && defaultHostId !== undefined) {
+      setHostId(defaultHostId);
+    }
+  }, [open, isEdit, sandboxMode, hostId, defaultHostId]);
 
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
@@ -309,17 +344,11 @@ export function CreateScheduledTaskDialog({
   );
 
   const hostOptions = hosts ?? [];
-  const preservePinnedHost = isEdit && editingTask?.hostId != null;
   // The resolved Host for the pinned id, or undefined when none is pinned.
   const selectedHost = hostId === "" ? undefined : hostOptions.find((h) => h.host_id === hostId);
   // Host whose `configured_harnesses` drives the picker's "needs setup" badges.
-  // Host is optional on scheduled tasks; unset means resolve the connected host
-  // at fire time, so we must not require the user to pin one before the
-  // readiness affordance appears. Fall back to the first ONLINE host for badge
-  // computation only — this does NOT change the form's `hostId` value (which
-  // stays "" = resolve-at-fire); it just gives the picker a readiness map so
-  // unconfigured agents show "needs setup" immediately, matching how the
-  // interactive New Chat dialog auto-selects the first online host on mount.
+  // Before a host is picked (or for an older unpinned task), fall back to the
+  // first ONLINE host so unconfigured agents show "needs setup" right away.
   const badgeHost =
     selectedHost ?? hostOptions.find((h) => h.status === "online") ?? hostOptions[0];
 
@@ -330,13 +359,26 @@ export function CreateScheduledTaskDialog({
   // Block submit on an invalid schedule (bad interval, empty multi-select) so
   // the form never posts an RRULE the server's validate_rrule would 400.
   const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
+  const renderedTriggerPrompt =
+    trigger !== null && triggerFieldsComplete(triggerFields)
+      ? renderTriggerPrompt(trigger, triggerFields, {
+          // Workers run where the manager runs: beside it on a connected host,
+          // or each in its own sandbox.
+          placement: sandboxMode ? "managed" : "same_host",
+          sessionLink,
+          model: showModelEffort && pickedModel !== "" ? pickedModel : undefined,
+          effort: showModelEffort && pickedEffort !== "" ? pickedEffort : undefined,
+        })
+      : "";
+  const effectivePrompt = trigger !== null ? renderedTriggerPrompt : prompt;
   // Set across the whole submit, which may first find or create a project.
   const [submitting, setSubmitting] = useState(false);
   const mutationPending = submitting || createMutation.isPending || updateMutation.isPending;
   const canSubmit =
     name.trim() !== "" &&
-    prompt.trim() !== "" &&
+    effectivePrompt.trim() !== "" &&
     (isEdit || effectiveAgentId !== null) &&
+    (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
     !mutationPending;
@@ -355,6 +397,8 @@ export function CreateScheduledTaskDialog({
     setSandboxMode(false);
     setProjectChoice(null);
     setPickedProjectId(null);
+    setTrigger(null);
+    setTriggerFields(emptyTriggerFields("jira"));
     setError(null);
     setScheduleUnsupported(false);
   }
@@ -381,7 +425,7 @@ export function CreateScheduledTaskDialog({
         : sandboxMode;
       const input = {
         name: name.trim(),
-        prompt: prompt.trim(),
+        prompt: effectivePrompt.trim(),
         rrule: buildRRule(schedule),
         timezone: editingTask?.timezone ?? localTimezone(),
         ...(executionTargetChanged ? { executionTarget } : {}),
@@ -494,20 +538,34 @@ export function CreateScheduledTaskDialog({
             />
           </div>
 
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor="task-prompt">Prompt</Label>
-            <Textarea
-              id="task-prompt"
-              value={prompt}
-              rows={3}
-              placeholder="What should the agent do each run?"
-              data-testid="task-prompt-input"
-              componentId="tasks.scheduled.prompt"
-              // No native resize grip — match the clean styling of the other fields.
-              className="resize-none text-ui"
-              onChange={(e) => setPrompt(e.target.value)}
+          {trigger !== null ? (
+            <TriggerTemplateFields
+              source={trigger}
+              fields={triggerFields}
+              onChange={setTriggerFields}
+              onSelectOpenChange={handleSelectOpenChange}
+              renderedPrompt={renderedTriggerPrompt}
+              onEditAsPrompt={() => {
+                setPrompt(renderedTriggerPrompt);
+                setTrigger(null);
+              }}
             />
-          </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="task-prompt">Prompt</Label>
+              <Textarea
+                id="task-prompt"
+                value={prompt}
+                rows={3}
+                placeholder="What should the agent do each run?"
+                data-testid="task-prompt-input"
+                componentId="tasks.scheduled.prompt"
+                // No native resize grip — match the clean styling of the other fields.
+                className="resize-none text-ui"
+                onChange={(e) => setPrompt(e.target.value)}
+              />
+            </div>
+          )}
 
           <div className="flex flex-col gap-1.5">
             {/* "Runs with" — the unified picker offers BOTH harnesses (Claude
@@ -608,6 +666,7 @@ export function CreateScheduledTaskDialog({
               <Select
                 value={sessionMode}
                 componentId="tasks.scheduled.session_mode"
+                disabled={trigger !== null}
                 onValueChange={(v) => setSessionMode(v as ScheduledTaskSessionMode)}
                 onOpenChange={handleSelectOpenChange}
               >
@@ -621,14 +680,16 @@ export function CreateScheduledTaskDialog({
                 <SelectContent position="popper" align="start">
                   <SelectItem value="new">New session each run</SelectItem>
                   <SelectItem value="continue" data-testid="task-session-mode-continue">
-                    Continue one session
+                    Continue in the same session
                   </SelectItem>
                 </SelectContent>
               </Select>
               <p className="text-sm text-muted-foreground">
-                {sessionMode === "continue"
-                  ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
-                  : "Each run starts a new session."}
+                {trigger !== null
+                  ? "Trigger automations keep one session, which remembers its last check and the sessions it already started."
+                  : sessionMode === "continue"
+                    ? "The first run starts a session, and later runs send their prompt to it so the agent keeps its context, even while an earlier run is still working."
+                    : "Each run starts a new session."}
               </p>
               {isEdit && sessionMode === "continue" && editingTask?.sessionId && (
                 <div className="flex items-center gap-2">
@@ -704,11 +765,11 @@ export function CreateScheduledTaskDialog({
               composer): choosing it provisions a FRESH sandbox per fire, or one
               kept sandbox for a continue task (execution_target=managed_sandbox,
               hostless), instead of a connected host. Otherwise the picker is the
-              optional connected-host pin. */}
+              connected-host pin. */}
           <div className="flex flex-col gap-1.5" data-testid="task-host-field">
-            <Label htmlFor="task-host">Host (optional)</Label>
+            <Label htmlFor="task-host">Host</Label>
             <Select
-              value={sandboxMode ? SANDBOX_HOST : hostId === "" ? UNSET_HOST : hostId}
+              value={sandboxMode ? SANDBOX_HOST : hostId}
               componentId="tasks.scheduled.host"
               onValueChange={(v) => {
                 if (v === SANDBOX_HOST) {
@@ -719,23 +780,19 @@ export function CreateScheduledTaskDialog({
                   setWorkspaceBrowserOpen(false);
                   return;
                 }
-                if (preservePinnedHost && v === UNSET_HOST) return;
                 setSandboxMode(false);
-                const next = v === UNSET_HOST ? "" : v;
-                setHostId(next);
-                // Clearing the host invalidates any pinned workspace.
-                if (next === "") setWorkspace("");
+                // Keep the workspace on a host switch: an update omits an empty
+                // one, which leaves the saved path in place, so the form must
+                // show what gets saved. The server checks it against the new host.
+                setHostId(v);
                 setWorkspaceBrowserOpen(false);
               }}
               onOpenChange={handleSelectOpenChange}
             >
               <SelectTrigger id="task-host" data-testid="task-host-trigger" className="w-full">
-                <SelectValue />
+                <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
               </SelectTrigger>
               <SelectContent position="popper" align="start">
-                <SelectItem value={UNSET_HOST} disabled={preservePinnedHost}>
-                  Resolve at fire time
-                </SelectItem>
                 {(managedSandboxesEnabled || sandboxMode) && (
                   <SelectItem value={SANDBOX_HOST} data-testid="task-host-sandbox-option">
                     {sandboxLabel}
@@ -753,7 +810,11 @@ export function CreateScheduledTaskDialog({
                 ? sessionMode === "continue"
                   ? "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration."
                   : "Provisions a fresh sandbox for each run. Shutdown follows the server’s sandbox configuration."
-                : "Leave unset to run on your connected host when the automation fires."}
+                : hostId === ""
+                  ? isEdit
+                    ? "Runs on the connected host you used most recently. Pick a host to pin it."
+                    : "Pick the host this automation runs on."
+                  : "Runs on this host. A run fails while the host is offline."}
             </p>
           </div>
 
@@ -859,8 +920,10 @@ async function projectChangeInput(
   return { projectId: await resolveProjectId(choice) };
 }
 
-/** Sentinel Select value for "no pinned host" — Radix Select disallows "". */
-const UNSET_HOST = "__unset_host__";
+const HOURLY_SCHEDULE_MODEL: ScheduleModel = { ...DEFAULT_SCHEDULE_MODEL, preset: "hourly" };
+
+/** How an older task with no pinned host reads; the task detail page uses the same words. */
+const UNPINNED_HOST_LABEL = "Most recently active host";
 
 /** Sentinel Select value for the "New Sandbox" option (execution_target=managed_sandbox). */
 const SANDBOX_HOST = "__sandbox__";

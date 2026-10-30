@@ -61,7 +61,7 @@ const {
   parseManifestAuth,
   sanitizeServerName,
 } = require("./url");
-const { parseOmnigentDeepLink, chooseDeepLinkStrategy } = require("./deepLink");
+const { parseOmnigentDeepLink, chooseDeepLinkStrategy, acceptCliDeepLink } = require("./deepLink");
 const {
   parseServerLabels,
   serverLabel,
@@ -91,6 +91,8 @@ const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
+const sshConnect = require("./ssh_connect");
+const { createSshConnectFlow } = require("./ssh_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
 const {
@@ -367,6 +369,26 @@ const arcaConnectFlow = createArcaConnectFlow({
       return "arca ssh isaac omni host …"; // the run itself re-validates and fails loud
     }
   },
+  log: (message) => console.log(`[omnigent] ${message}`),
+});
+
+/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
+const sshConnectFlow = createSshConnectFlow({
+  BrowserWindow,
+  ipcMain,
+  pagePath: path.join(__dirname, "..", "ssh-connect", "index.html"),
+  preloadPath: path.join(__dirname, "ssh_connect_preload.js"),
+  startConnect: (serverUrl, destination, hooks) =>
+    sshConnect.startSshConnect(serverUrl, destination, {
+      hooks,
+      openExternal: (url) => shell.openExternal(url),
+      readInstallScript: () => {
+        const script = cliInstall.resolveInstallScript();
+        return script ? fs.readFileSync(script, "utf8") : null;
+      },
+      log: (message) => console.log(`[omnigent] ${message}`),
+    }),
+  commandLines: (serverUrl, destination) => sshConnect.describeCommands(serverUrl, destination),
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
@@ -2750,6 +2772,9 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  // The menu item opens the bar without a page keydown; the page must still
+  // render every transcript row for find to reach off-screen messages.
+  target.webContents.send("omnigent:find-opened");
   const existing = findBars.get(target);
   if (existing && !existing.isDestroyed()) {
     existing.focus();
@@ -2784,9 +2809,15 @@ function openFindBar(target) {
       matches: result.matches,
     });
   };
+  // Results belong to the searched conversation, so switching closes the bar.
+  const openedIn = findConversationId(target.webContents.getURL());
+  const onNavigate = (_event, url, isMainFrame) => {
+    if (isMainFrame && findConversationId(url) !== openedIn) bar.close();
+  };
   target.on("resize", reposition);
   target.on("move", reposition);
   target.webContents.on("found-in-page", onFound);
+  target.webContents.on("did-navigate-in-page", onNavigate);
 
   bar.once("ready-to-show", () => {
     reposition();
@@ -2798,12 +2829,18 @@ function openFindBar(target) {
     target.removeListener("resize", reposition);
     target.removeListener("move", reposition);
     target.webContents.removeListener("found-in-page", onFound);
+    target.webContents.removeListener("did-navigate-in-page", onNavigate);
     // Closing the parent (Cmd+W) destroys its webContents before this child's
     // "closed" fires, while the parent window itself is not yet destroyed.
     if (target.webContents.isDestroyed()) return;
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+/** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */
+function findConversationId(url) {
+  return /\/c\/([^/]+)\/?$/.exec(URL.parse(url)?.pathname ?? "")?.[1] ?? null;
 }
 
 /**
@@ -4856,6 +4893,31 @@ function registerIpc() {
     };
   });
 
+  // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
+  // and revalidates the destination before the shell-owned console asks consent.
+  ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("ssh-connect is only available to a connected server page");
+    }
+    if (process.platform === "win32") {
+      return { ok: false, error: "Connecting over SSH isn't available on Windows yet." };
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    // Where Run on Arca is offered, it replaces this path. Re-checked here: the
+    // server's own page decides what it shows.
+    if (databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)) {
+      return { ok: false, error: "Connecting over SSH is off here. Use Run on Arca instead." };
+    }
+    let target;
+    try {
+      target = sshConnect.validateDestination(destination);
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
+  });
+
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
   // the window's server as a host, by running `isaac omni host --background`
   // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
@@ -5218,7 +5280,7 @@ async function confirmOpenDeepLink(parent, targetOrigin) {
     title: "Omnigent",
     message: `Open this Omnigent link?`,
     detail:
-      `This link will connect Omnigent to ${host} and open a conversation.\n\n` +
+      `This link will connect Omnigent to ${host}.\n\n` +
       `Only open links from a server you trust — once connected, it can show ` +
       `notifications and (when you allow it) manage this machine as a runner.`,
     buttons: ["Cancel", "Open"],
@@ -5298,7 +5360,7 @@ function drainPendingDeepLinks() {
  */
 async function handleDeepLink(raw) {
   const parsed = parseOmnigentDeepLink(raw);
-  if (!parsed) return;
+  if (!parsed || !(await acceptCliDeepLink(raw))) return;
 
   // The origin is fixed by the link itself — no network request needed for the
   // decision. expandDatabricksWorkspaceUrl only appends a mount path under this

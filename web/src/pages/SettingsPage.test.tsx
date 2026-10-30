@@ -7,9 +7,12 @@ import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import {
@@ -221,13 +224,21 @@ function LocationProbe() {
 }
 
 function renderPage(path = "/settings") {
+  // The Appearance section lists the agent catalog (picker visibility), so the
+  // page needs a query client like it has in the real app. Retries off so a
+  // failed fetch surfaces as an empty list instead of hanging the test.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={[path]}>
-        <SettingsPage />
-        <LocationProbe />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <SettingsPage />
+          <LocationProbe />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -336,6 +347,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
+    localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
@@ -372,6 +384,31 @@ describe("SettingsPage", () => {
 
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
+
+  it("opens sub-agents full screen by default and persists the panel setting", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("open-subagents-in-panel-toggle");
+    expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
+    expect(toggle).toHaveAccessibleName("Open sub-agents in the Workspace panel");
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBe("on");
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBeNull();
+
+    // A save that storage refuses leaves the switch showing what is stored.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => "");
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(toastError).toHaveBeenCalledTimes(1);
   });
 
   it("asks before terminal copying by default and explains the scope", () => {
@@ -988,6 +1025,7 @@ describe("SettingsPage", () => {
       target: { value: "Fira Code" },
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
+    localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -1055,6 +1093,7 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

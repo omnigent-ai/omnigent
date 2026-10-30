@@ -1424,6 +1424,15 @@ html[data-electron-mac] .breadcrumb-folder {
   --diffs-font-features: "liga" 0, "calt" 0;
 }
 
+/* Share one opaque comment surface so diff selection cannot tint the cards. */
+.pull-request-comment-surface {
+  background-color: var(--card-solid);
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--muted) 20%, transparent),
+    color-mix(in srgb, var(--muted) 20%, transparent)
+  );
+}
+
 /* The transcript draws its own constant-height scrollbar (TranscriptScrollbar);
  * hide the native one so both don't show. */
 .transcript-hide-native-scrollbar {
@@ -2296,6 +2305,18 @@ html[data-electron-mac] .breadcrumb-folder {
   color: var(--muted-foreground);
   font-weight: 500;
   margin: 0.75em 0 0.25em;
+}
+/* Footnote definitions show their source, read-only (see TipTapFootnotes). */
+.tiptap-md-content .ProseMirror .md-footnote-definitions,
+.tiptap-md-content .ProseMirror .md-link-definitions {
+  color: var(--muted-foreground);
+  font-size: 0.875em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0.75em 0;
+}
+.tiptap-md-content .ProseMirror .md-footnote-reference {
+  color: var(--muted-foreground);
 }
 /* GitHub-style images: never overflow the editor column. Explicit <img
    width/height> are applied as inline styles by the node view (see

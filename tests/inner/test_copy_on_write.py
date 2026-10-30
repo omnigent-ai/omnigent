@@ -480,7 +480,7 @@ def test_keeper_timeout_stops_process_tree(monkeypatch):
     process = Mock()
     process.wait.side_effect = [subprocess.TimeoutExpired("bwrap", 5), 0]
     kill = Mock()
-    monkeypatch.setattr("omnigent.sandbox.copy_on_write.kill_tree", kill)
+    monkeypatch.setattr("omnigent.inner._proc.kill_tree", kill)
     CopyOnWriteEnvironment._stop(process)
     process.stdin.close.assert_called_once()
     kill.assert_called_once_with(process)

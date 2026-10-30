@@ -47,9 +47,6 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     _ensure_chat_view(page)
     if mobile:
         page.set_viewport_size({"width": 390, "height": 844})
-        page.get_by_role("button", name="Close sidebar", exact=True).click(
-            position={"x": 375, "y": 400}
-        )
 
     parent_question = f"native-turn-1-{session_id}: remember our parent context"
     parent_reply = "The native parent context is ready."

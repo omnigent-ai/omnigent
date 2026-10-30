@@ -99,6 +99,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /**
+   * Subscribe to the find bar opening (Cmd/Ctrl+F or Edit > Find…), so the
+   * page can render content it would otherwise virtualize away. Returns an
+   * unsubscribe function.
+   * @param {() => void} callback
+   * @returns {() => void}
+   */
+  onFindOpened: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("omnigent:find-opened", listener);
+    return () => ipcRenderer.removeListener("omnigent:find-opened", listener);
+  },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -153,6 +165,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  // Windows' built-in ssh can't share one connection, so it gets this later.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Connect a machine the user reaches over SSH to the window's server as
+         * a host. Consent and ssh prompts happen in a shell-owned window.
+         * Resolves `{ ok, error?, canceled?, identity? }`.
+         */
+        connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**

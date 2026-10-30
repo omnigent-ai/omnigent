@@ -1,6 +1,12 @@
-import { useCallback } from "react";
+import { useCallback, useLayoutEffect, useRef } from "react";
 
-import { usePullRequestInfo } from "@/hooks/usePullRequests";
+import {
+  type PullRequest,
+  type PullRequestAssociation,
+  type PullRequestInfo,
+  usePullRequestInfo,
+  usePullRequestInfos,
+} from "@/hooks/usePullRequests";
 import {
   storedListToShow,
   type StoredPullRequests,
@@ -9,6 +15,15 @@ import {
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import { gitProviderCopy } from "@/lib/gitProviders";
+import {
+  getPullRequestStatus,
+  hasNewerPullRequestLifecycle,
+  sortPullRequestsByStatus,
+  type PullRequestStatus,
+  type PullRequestStatusSummary,
+} from "@/lib/pullRequestStatus";
+
+export type ComposerPullRequest = PullRequestAssociation & PullRequestStatusSummary;
 
 /** How much we actually know about the session's checked-out branch. */
 export type ComposerBranchState =
@@ -36,6 +51,9 @@ export interface ComposerGitStatus {
   repoNameWithOwner: string | null;
   /** GitHub association query state for fail-closed worktree and PR UI. */
   githubState: "loading" | "ready" | "unknown";
+  /** Linked PRs ordered by action needed, with live status where available. */
+  prs: ComposerPullRequest[];
+  prStatus: PullRequestStatus | null;
   prCount: number;
   prNumber: number | null;
   /** Precedes `prNumber` in the PR's provider style: "#" for GitHub, "!" for Azure DevOps. */
@@ -71,6 +89,64 @@ function githubStateOf(
   return github.isLoading ? "loading" : "unknown";
 }
 
+function linkedPullRequests(
+  info: PullRequestInfo | undefined,
+  stored: StoredPullRequests | undefined,
+): PullRequestAssociation[] {
+  const fromStored = storedListToShow(stored, !!info);
+  if (fromStored && (!info || info.tracking_available === true)) return fromStored;
+  if (info?.prs) return info.prs;
+  if (!info?.pr) return [];
+  // Hosts that predate PR tracking expose only the branch's single PR.
+  return [
+    {
+      url: info.pr.url,
+      host: "",
+      repository: info.repo?.name_with_owner ?? "",
+      number: info.pr.number,
+      title: info.pr.title,
+      relationship: "inferred",
+      provider: info.provider ?? undefined,
+      provider_display: info.provider_display ?? undefined,
+      state: info.pr.state,
+      is_draft: info.pr.is_draft,
+    },
+  ];
+}
+
+interface PullRequestStatusSource {
+  pr: PullRequest;
+  updatedAt: number;
+  live: boolean;
+}
+
+function enrichPullRequest(
+  association: PullRequestAssociation,
+  source: PullRequestStatusSource | undefined,
+): ComposerPullRequest {
+  if (!source) return association;
+  if (hasNewerPullRequestLifecycle(association, source.pr, source.updatedAt)) {
+    return association;
+  }
+  const { pr } = source;
+  const terminal = ["MERGED", "CLOSED"].includes(pr.state?.toUpperCase());
+  // An offline or failed refresh retains terminal lifecycle, not stale merge readiness.
+  if (!source.live && !terminal) return association;
+  const lifecycle = {
+    ...association,
+    title: pr.title,
+    state: pr.state,
+    is_draft: pr.is_draft,
+  };
+  if (!source.live) return lifecycle;
+  return {
+    ...lifecycle,
+    checks: pr.checks,
+    checks_supported: pr.checks_supported,
+    merge_state_status: pr.merge_state_status,
+  };
+}
+
 export function useComposerGitStatus({
   sessionId,
   hostId,
@@ -83,10 +159,36 @@ export function useComposerGitStatus({
   creationBranch?: string | null;
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
-  const github = usePullRequestInfo(sessionId ?? undefined);
+  const github = usePullRequestInfo(sessionId ?? undefined, { poll: "linked" });
   const stored = useSessionPullRequests(sessionId ?? undefined, github.data);
   const info = github.data;
   const result = worktrees.data;
+  const associations = linkedPullRequests(info, stored.data);
+  // The default query already reads its selected PR; merged PRs cannot become actionable again.
+  const detailUrls = associations
+    .filter((pr) => pr.url && pr.url !== info?.pr?.url && pr.state?.toUpperCase() !== "MERGED")
+    .map((pr) => pr.url);
+  const details = usePullRequestInfos(sessionId ?? undefined, detailUrls);
+  const statusSources = new Map<string, PullRequestStatusSource>();
+  const sources = [
+    { query: github, url: info?.pr?.url },
+    ...details.map((query, index) => ({ query, url: detailUrls[index] })),
+  ];
+  for (const { query, url } of sources) {
+    const pr = query.data?.pr;
+    if (pr && pr.url === url) {
+      statusSources.set(pr.url, {
+        pr,
+        updatedAt: query.dataUpdatedAt,
+        live: !query.isError && query.isEnabled !== false,
+      });
+    }
+  }
+  const prs = sortPullRequestsByStatus(
+    associations.map((association) =>
+      enrichPullRequest(association, statusSources.get(association.url)),
+    ),
+  );
 
   let branchState: ComposerBranchState;
   let branch: string | null = null;
@@ -120,24 +222,26 @@ export function useComposerGitStatus({
     }
   }
 
-  // Servers that store PRs decide which PRs the session links once they have
-  // imported them, unless the host doesn't track PRs; older servers only have live info.
-  const fromStored = storedListToShow(stored.data, !!info);
-  const prs = fromStored && (!info || info.tracking_available === true) ? fromStored : info?.prs;
-  const prNumber = prs?.[0]?.number ?? info?.pr?.number ?? null;
-  const prCount = prs?.length ?? (prNumber !== null ? 1 : 0);
+  const primaryPr = prs[0];
+  const prNumber = primaryPr?.number ?? null;
+  const prCount = prs.length;
   // The primary PR's own provider first, then the session's.
   const prNumberPrefix = gitProviderCopy(
-    prs?.[0]?.provider ?? info?.provider,
+    primaryPr?.provider ?? info?.provider,
     undefined,
-    prs?.[0]?.provider_display ?? info?.provider_display,
+    primaryPr?.provider_display ?? info?.provider_display,
   ).prNumberPrefix;
 
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
+  const detailQueriesRef = useRef(details);
+  useLayoutEffect(() => {
+    detailQueriesRef.current = details;
+  }, [details]);
   const refresh = useCallback(() => {
     void worktreeRefetch();
     void githubRefetch();
+    for (const detail of detailQueriesRef.current) void detail.refetch();
   }, [worktreeRefetch, githubRefetch]);
 
   return {
@@ -148,10 +252,13 @@ export function useComposerGitStatus({
     creationBranch: creationBranch?.trim() || null,
     repoNameWithOwner: info?.repo?.name_with_owner ?? null,
     githubState: githubStateOf(github, stored.data),
+    prs,
+    prStatus: primaryPr ? getPullRequestStatus(primaryPr) : null,
     prCount,
     prNumber,
     prNumberPrefix,
     refresh,
-    refreshing: worktrees.isFetching || github.isFetching,
+    refreshing:
+      worktrees.isFetching || github.isFetching || details.some((detail) => detail.isFetching),
   };
 }

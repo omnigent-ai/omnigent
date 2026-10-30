@@ -13,11 +13,21 @@
 // can't collide with the rail.
 
 import { XIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
 
 import { Button } from "@/components/ui/button";
+import { useInertRef } from "@/hooks/useInertRef";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { cn } from "@/lib/utils";
+
+const MobilePanelHeaderContext = createContext<
+  { actions: HTMLElement | null; title: HTMLElement | null } | undefined
+>(undefined);
+
+/** Header destinations; undefined outside a drawer, targets null before mounting. */
+export function useMobilePanelHeaderTarget() {
+  return useContext(MobilePanelHeaderContext);
+}
 
 interface MobilePanelDrawerProps {
   /** Whether the drawer is slid in (visible) or off-screen. */
@@ -70,8 +80,16 @@ export function MobilePanelDrawer({
   // .app-shell, so this fixed overlay must reserve the docked keyboard itself;
   // otherwise its bottom content (the side-chat composer) stays under it.
   const keyboardInset = useIOSNativeKeyboardInset(open);
+  const [headerTarget, setHeaderTarget] = useState<HTMLDivElement | null>(null);
+  const [titleTarget, setTitleTarget] = useState<HTMLDivElement | null>(null);
+  const headerTargets = useMemo(
+    () => ({ actions: headerTarget, title: titleTarget }),
+    [headerTarget, titleTarget],
+  );
+  const inertRef = useInertRef<HTMLElement>(!open);
   return (
     <aside
+      ref={inertRef}
       data-testid={testId}
       data-state={open ? "open" : "closed"}
       style={keyboardInset > 0 ? { paddingBottom: keyboardInset } : undefined}
@@ -85,16 +103,22 @@ export function MobilePanelDrawer({
       )}
       aria-hidden={!open}
       data-collapsed={!open || undefined}
-      inert={!open}
     >
-      <header className="flex shrink-0 items-center justify-between border-border border-b px-4 py-2">
-        <h2 className="font-medium text-ui">{title}</h2>
-        <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
-          <XIcon className="size-4" />
-        </Button>
+      <header className="flex shrink-0 items-center justify-between border-border border-b pl-4 pr-2 py-2">
+        <div ref={setTitleTarget} className="min-w-0 [&:has(>[data-mobile-panel-title])>h2]:hidden">
+          <h2 className="font-medium text-ui">{title}</h2>
+        </div>
+        <div className="ml-auto flex items-center gap-1">
+          <div ref={setHeaderTarget} className="flex items-center gap-1" />
+          <Button type="button" variant="ghost" size="icon-sm" aria-label="Close" onClick={onClose}>
+            <XIcon className="size-4" />
+          </Button>
+        </div>
       </header>
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {(open || keepMounted) && children}
+        <MobilePanelHeaderContext.Provider value={headerTargets}>
+          {(open || keepMounted) && children}
+        </MobilePanelHeaderContext.Provider>
       </div>
     </aside>
   );
