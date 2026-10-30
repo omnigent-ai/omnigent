@@ -82,6 +82,14 @@ the header menu), and each place is a separate entry point.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
+- `fork-sandbox-repositories`: edit the inherited repository list before cloning
+  onto a fresh sandbox. Add repositories from connected GitHub search or by URL,
+  remove repositories, and choose each branch independently. Providers that
+  support multiple repositories allow several; switching to a single-repository
+  provider keeps the selection visible and asks you to remove the extras.
+  Each repository starts on its current branch if pushed, otherwise its original
+  launch branch. A quiet note explains an unpushed branch's fallback; unavailable
+  source workspaces retain their original selections.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
@@ -268,6 +276,14 @@ mode pickers. Your custom
 agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
+
+**Sandbox fork repositories:** from the header menu, sidebar row menu,
+right-click menu, or a message's Fork action, choose a sandbox destination. The
+repository list appears directly in the dialog with the source's repositories
+preselected. Search connected GitHub repositories or paste a repository URL,
+choose a branch for each, and remove any repositories the clone does not need.
+Removing every repository starts an empty sandbox. The phone header's Fork
+action offers the same choices.
 
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
@@ -589,6 +605,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/fork_session/test_fork_switch_agent.py::test_fork_switch_agent_carries_history`.
   Its SDK-to-SDK target is a built-in agent that only the test's own server
   loads; run it with plain `uv run pytest` so that target is available.
+- **`fork-sandbox-repositories`, header, message, sidebar row, right-click, and phone header:**
+  `tests/browser_ui/chat/test_fork_sandbox_repositories.py::test_sandbox_fork_edits_multiple_repositories_and_branches`
+  runs without a repro instance using `uv run pytest <test>
+--browser-ui-skip-build --video=on --output=<evidence-directory>`.
+  Each entry checks current-branch prefilling and the unpushed-branch fallback.
+  Desktop and phone header variants remove a repo, search for another, choose
+  independent branches, and check the fork request and navigation. The message
+  variant submits the inherited selection and checks the history cutoff; sidebar
+  variants stop after opening and checking the prefill. The built SPA uses mocked
+  sandbox and GitHub responses and advertises support for editable fork workspaces;
+  this proves browser behavior and the submitted payload, not sandbox provisioning.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>

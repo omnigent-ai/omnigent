@@ -10336,6 +10336,31 @@ def test_host_serves_a_pr_the_server_vouches_for(
     assert written.status == "ok", written
 
 
+async def test_host_repository_branches_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_registry(*_args: object) -> None:
+        pytest.fail("Branch lookup must not initialize change tracking")
+
+    monkeypatch.setattr("omnigent.workspace_fs.create_filesystem_registry", unexpected_registry)
+    host = _make_host_process()
+    url = "https://github.com/org/repo"
+    try:
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="repository-branches",
+                op="repository_branches",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"repositories": [{"url": url, "path": ""}]},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert result.status == "ok", result
+    assert result.payload == {"repositories": [{"url": url, "branch": None, "pushed": None}]}
+
+
 def test_host_reads_a_file_named_as_the_workspace_root(tmp_path: Path) -> None:
     """An absolute file target sent as the root is read rather than refused as a missing dir."""
     target = tmp_path / "notes.md"
@@ -10604,9 +10629,9 @@ def test_github_reviewer_ops_are_served_on_host(
     ]
 
 
-@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
+@pytest.mark.parametrize("kind", ["details", "comment", "review_reply"])
 async def test_github_details_update_is_served_on_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, comment: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
     """The host writes PR text when the runner is offline, as the session's tracked PR."""
     from omnigent.host.frames import HostFsWriteFrame
@@ -10615,6 +10640,7 @@ async def test_github_details_update_is_served_on_host(
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    comment = kind != "details"
     sent: list[dict[str, str]] = []
     answer = (
         {
@@ -10627,7 +10653,30 @@ async def test_github_details_update_is_served_on_host(
     )
 
     def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
-        sent.append(json.loads(Path(argv[argv.index("--input") + 1]).read_text()))
+        payload = json.loads(Path(argv[argv.index("--input") + 1]).read_text())
+        if "query" in payload:
+            assert payload["variables"]["id"] == "thread-1"
+            return (
+                0,
+                json.dumps(
+                    {
+                        "data": {
+                            "node": {
+                                "id": "thread-1",
+                                "viewerCanReply": True,
+                                "pullRequest": {"url": url},
+                                "root": {
+                                    "nodes": [{"fullDatabaseId": "123", "state": "SUBMITTED"}]
+                                },
+                            }
+                        }
+                    }
+                ),
+                "",
+            )
+        if kind == "review_reply":
+            assert "repos/example/one/pulls/42/comments/123/replies" in argv
+        sent.append(payload)
         return 0, json.dumps(answer), ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
@@ -10640,11 +10689,16 @@ async def test_github_details_update_is_served_on_host(
         edited = host._handle_fs_write(
             HostFsWriteFrame(
                 request_id="details-update",
-                op="github_comment_create" if comment else "github_details_update",
+                op={
+                    "details": "github_details_update",
+                    "comment": "github_comment_create",
+                    "review_reply": "github_review_thread_reply",
+                }[kind],
                 workspace=str(tmp_path),
                 session_id="session",
                 params={
                     "pr_url": url,
+                    **({"thread_id": "thread-1"} if kind == "review_reply" else {}),
                     **({"body": "Body"} if comment else {"title": " Renamed ", "body": None}),
                 },
             )
@@ -10653,6 +10707,12 @@ async def test_github_details_update_is_served_on_host(
         _cleanup_host(host)
 
     assert edited.status == "ok", edited
+    if kind == "review_reply":
+        assert edited.payload["thread_id"] == "thread-1"
+        assert edited.payload["comment"]["id"] == "99"
+        assert edited.payload["comment"]["body"] == "Body"
+        assert sent == [{"body": "Body"}]
+        return
     assert edited.payload == (
         {
             "object": "session.github.pr_comment",

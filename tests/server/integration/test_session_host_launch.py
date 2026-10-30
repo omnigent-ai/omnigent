@@ -1212,6 +1212,51 @@ async def test_offline_host_gets_real_grace_before_native_failure(
     assert wait_event.attributes["outcome"] == "host_offline"
 
 
+async def test_side_chat_send_names_its_source_host_offline(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side chat whose source's host is offline fails with the host-offline cause.
+
+    The side chat has no host of its own; it runs on its source's runner, so
+    the source's offline host is why no runner could start.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    source_id = await _offline_native_host_session(client, app)
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.get_conversation(source_id)
+    assert source is not None and source.runner_id is not None
+    side_chat = store.create_conversation(
+        agent_id=source.agent_id,
+        runner_id=source.runner_id,
+        labels={
+            **(source.labels or {}),
+            "omnigent.side_chat": "1",
+            "omnigent.side_chat.source_id": source_id,
+        },
+    )
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+
+    response = await client.post(
+        f"/v1/sessions/{side_chat.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+    assert response.status_code == 202, response.text
+    items = (await client.get(f"/v1/sessions/{side_chat.id}/items")).json()["data"]
+    errors = [item for item in items if item["type"] == "error"]
+    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
+    assert errors[0]["message"] == _host_offline_message()
+
+
 async def test_offline_host_send_held_by_client_records_nothing(
     client: httpx.AsyncClient,
     app: FastAPI,

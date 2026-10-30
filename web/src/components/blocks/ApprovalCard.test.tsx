@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
-import type { ClaudeQuestion } from "@/lib/askUserQuestion";
+import type { ClaudeQuestion, ClaudeQuestionOption } from "@/lib/askUserQuestion";
 import {
   askUserQuestionSignature,
   clearAskUserQuestionDraft,
@@ -904,7 +904,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(checkboxes[0]!.getAttribute("type")).toBe("checkbox");
   });
 
-  it("gates Submit until every question has at least one selection", () => {
+  it("gates Submit until a multi-select question has at least one selection", () => {
     // Without this gate Submit fires with half-filled answers and
     // the user can't tell which questions still need attention.
     render(
@@ -913,7 +913,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         message="Claude wants to call AskUserQuestion"
         phase="pre_tool_use"
         policyName="claude_native_permission"
-        contentPreview={sampleSinglePreview}
+        contentPreview={sampleMultiPreview}
         requestedSchema={{}}
         status="pending"
         response={null}
@@ -923,11 +923,13 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     const submit = screen.getByRole("button", { name: /submit/i });
     expect(submit.hasAttribute("disabled")).toBe(true);
 
-    fireEvent.click(screen.getByLabelText("React"));
+    fireEvent.click(screen.getByLabelText("Popcorn"));
     expect(submit.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(screen.getByLabelText("Popcorn"));
+    expect(submit.hasAttribute("disabled")).toBe(true);
   });
 
-  it("submits gathered answers via submitApproval on click", () => {
+  it.each(["React", "Vue"])("submits the chosen answer %s only on Submit", (answer) => {
     // The chat store gets ``{action: "accept", content}`` where
     // ``content`` IS the flat answers map — each question text is
     // a top-level key, with the selected label as the value.
@@ -941,7 +943,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     render(
       <ApprovalCard
-        elicitationId="elic_submit"
+        elicitationId={`elic_submit_${answer}`}
         message="Claude wants to call AskUserQuestion"
         phase="pre_tool_use"
         policyName="claude_native_permission"
@@ -952,11 +954,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       />,
     );
 
-    fireEvent.click(screen.getByLabelText("Vue"));
+    expect(screen.getByLabelText("React")).toBeChecked();
+    expect(screen.getByLabelText("Vue")).not.toBeChecked();
+    expect(submitSpy).not.toHaveBeenCalled();
+    if (answer === "Vue") fireEvent.click(screen.getByLabelText("Vue"));
     fireEvent.click(screen.getByRole("button", { name: /submit/i }));
 
-    expect(submitSpy).toHaveBeenCalledWith("elic_submit", "accept", {
-      "Which framework?": "Vue",
+    expect(submitSpy).toHaveBeenCalledWith(`elic_submit_${answer}`, "accept", {
+      "Which framework?": answer,
     });
   });
 
@@ -1196,7 +1201,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       ).toBeDefined();
       expect(screen.queryByText("Claude has questions")).toBeNull();
       const submit = screen.getByTestId("ask-user-question-submit");
-      expect(submit.hasAttribute("disabled")).toBe(!textInput);
+      expect(submit.hasAttribute("disabled")).toBe(!textInput && options.length === 0);
       if (textInput) {
         expect(screen.getByTestId("ask-user-question-custom-input")).toHaveValue(textInput.default);
       }
@@ -1208,7 +1213,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         }
       } else {
         expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
-        fireEvent.click(screen.getByLabelText(value));
+        expect(screen.getByLabelText(value)).toBeChecked();
       }
       expect(submit.hasAttribute("disabled")).toBe(false);
       fireEvent.click(submit);
@@ -1326,11 +1331,15 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByText("First?")).toBeDefined();
   });
 
-  it("hides Submit until the carousel is on the final question", () => {
+  it("submits every default after navigating to the final question", () => {
     // Submit is the only path to commit the form, so it only
     // makes sense on the last slide — earlier slides expose Next.
     // Without this, users could submit prematurely and the LLM
     // sees half-filled answers.
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
     render(
       <ApprovalCard
         elicitationId="elic_submit_last"
@@ -1361,8 +1370,12 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.queryByTestId("ask-user-question-submit")).toBeNull();
+    expect(screen.getByLabelText("A")).toBeChecked();
     fireEvent.click(screen.getByTestId("ask-user-question-next"));
-    expect(screen.getByTestId("ask-user-question-submit")).toBeDefined();
+    expect(screen.getByLabelText("B")).toBeChecked();
+    expect(submitSpy).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+    expect(submitSpy).toHaveBeenCalledWith("elic_submit_last", "accept", { Q1: "A", Q2: "B" });
   });
 
   it("accepts a custom-text answer that wins over the radio selection", () => {
@@ -1466,10 +1479,15 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     expect(screen.getByTestId("ask-user-question-submit").hasAttribute("disabled")).toBe(false);
   });
 
-  it("renders the preview of selected options that carry a preview field", () => {
-    // Selected option's `preview` ride through into a <pre> below
-    // the options. Unselected previews stay hidden so the card
-    // doesn't dump every preview at once.
+  const twoPane = {
+    label: "Two-pane",
+    description: "Side-by-side",
+    preview: "[editor] | [output]",
+  };
+  const single = { label: "Single", description: "One pane", preview: "[editor only]" };
+  const keepCurrent = { label: "Keep current", description: "No change" };
+
+  function renderLayoutQuestion(options: ClaudeQuestionOption[], multiSelect = false) {
     render(
       <ApprovalCard
         elicitationId="elic_preview"
@@ -1480,39 +1498,61 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         requestedSchema={{}}
         status="pending"
         response={null}
-        askUserQuestion={{
-          questions: [
-            {
-              question: "Layout?",
-              header: "",
-              options: [
-                {
-                  label: "Two-pane",
-                  description: "Side-by-side",
-                  preview: "[editor] | [output]",
-                },
-                { label: "Single", description: "One pane", preview: "[editor only]" },
-              ],
-              multiSelect: false,
-            },
-          ],
-        }}
+        askUserQuestion={{ questions: [{ question: "Layout?", header: "", options, multiSelect }] }}
       />,
     );
+  }
 
-    // No selection yet → no preview block.
-    expect(screen.queryByTestId("ask-user-question-previews")).toBeNull();
+  const previewText = () => screen.queryByTestId("ask-user-question-previews")?.textContent ?? null;
+
+  it("preselects the first option and previews it, then follows the selection", () => {
+    renderLayoutQuestion([twoPane, single, keepCurrent]);
+
+    expect(previewText()).toContain("[editor] | [output]");
+    expect(previewText()).not.toContain("[editor only]");
+    expect(screen.getByLabelText(/Two-pane/)).toBeChecked();
+    expect(screen.getAllByRole("radio", { checked: true })).toHaveLength(1);
+    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
 
     // Description is concatenated into the label text by the DOM
-    // so a literal ``getByLabelText("Two-pane")`` doesn't match;
+    // so a literal ``getByLabelText("Single")`` doesn't match;
     // a regex picks out the label by its prefix.
-    fireEvent.click(screen.getByLabelText(/Two-pane/));
-    const previews = screen.getByTestId("ask-user-question-previews");
-    expect(previews.textContent).toContain("[editor] | [output]");
-    expect(previews.textContent).not.toContain("[editor only]");
+    fireEvent.click(screen.getByLabelText(/Single/));
+    expect(previewText()).toContain("[editor only]");
+    expect(previewText()).not.toContain("[editor] | [output]");
+
+    fireEvent.click(screen.getByLabelText(/Keep current/));
+    expect(previewText()).toBeNull();
+
+    fireEvent.click(screen.getByTestId("ask-user-question-custom-toggle"));
+    expect(previewText()).toBeNull();
+    expect(screen.getByTestId("ask-user-question-submit")).toBeDisabled();
+    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+      target: { value: "A different layout" },
+    });
+    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
+    expect(previewText()).toBeNull();
+  });
+
+  it("preselects the first option even when it has no preview", () => {
+    renderLayoutQuestion([keepCurrent, twoPane, single]);
+
+    expect(previewText()).toBeNull();
+    expect(screen.getByLabelText(/Keep current/)).toBeChecked();
+    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
+  });
+
+  it("shows multi-select previews only for checked options", () => {
+    renderLayoutQuestion([twoPane, single, keepCurrent], true);
+    expect(previewText()).toBeNull();
+    expect(screen.queryAllByRole("checkbox", { checked: true })).toHaveLength(0);
 
     fireEvent.click(screen.getByLabelText(/Single/));
-    expect(screen.getByTestId("ask-user-question-previews").textContent).toContain("[editor only]");
+    expect(previewText()).toContain("[editor only]");
+    expect(previewText()).not.toContain("[editor] | [output]");
+
+    fireEvent.click(screen.getByLabelText(/Single/));
+    expect(previewText()).toBeNull();
   });
 
   it("renders 'Submitted' with the answer summary in the responded state", () => {
@@ -1587,7 +1627,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     }
 
     function answerFirstAndTypeSecond() {
-      fireEvent.click(screen.getByLabelText("Alpha"));
+      fireEvent.click(screen.getByLabelText("Bravo"));
       fireEvent.click(screen.getByTestId("ask-user-question-next"));
       fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
         target: { value: "Keep this partial answer" },
@@ -1596,7 +1636,8 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
     function expectFreshCard() {
       expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
-      expect((screen.getByLabelText("Alpha") as HTMLInputElement).checked).toBe(false);
+      expect(screen.getByLabelText("Alpha")).toBeChecked();
+      expect(screen.getByLabelText("Bravo")).not.toBeChecked();
       fireEvent.click(screen.getByTestId("ask-user-question-next"));
       expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
         "",
@@ -1618,7 +1659,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         (screen.getByTestId("ask-user-question-custom-toggle") as HTMLInputElement).checked,
       ).toBe(true);
       fireEvent.click(screen.getByTestId("ask-user-question-prev"));
-      expect((screen.getByLabelText("Alpha") as HTMLInputElement).checked).toBe(true);
+      expect(screen.getByLabelText("Bravo")).toBeChecked();
     });
 
     it("starts fresh when a mounted card's questions change", () => {
@@ -1629,7 +1670,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
 
       first.rerender(pendingQuestionsCard("elic_draft_replaced", replaced));
       expect(screen.getByTestId("ask-user-question-progress").textContent).toBe("Question 1 of 2:");
-      expect((screen.getByLabelText("Alpha") as HTMLInputElement).checked).toBe(false);
+      expect(screen.getByLabelText("Alpha")).toBeChecked();
       first.unmount();
 
       renderPendingQuestions("elic_draft_replaced", replaced);
@@ -1697,13 +1738,13 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
             target: { value: "sk-not-for-storage" },
           }),
       ],
-      ["chosen", () => fireEvent.click(screen.getByLabelText("Use the saved token"))],
+      ["chosen", () => fireEvent.click(screen.getByLabelText("Use another saved token"))],
     ])("does not keep a %s answer to a secret question", (how, answerSecret) => {
       const secretQuestions: ClaudeQuestion[] = [
         {
           id: "token",
           question: "Paste the API token",
-          options: [{ label: "Use the saved token", description: "" }],
+          options: [{ label: "Use the saved token" }, { label: "Use another saved token" }],
           multiSelect: false,
           isSecret: true,
         },
@@ -1725,9 +1766,8 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
         "eu-west",
       );
       fireEvent.click(screen.getByTestId("ask-user-question-prev"));
-      expect((screen.getByLabelText("Use the saved token") as HTMLInputElement).checked).toBe(
-        false,
-      );
+      expect(screen.getByLabelText("Use the saved token")).toBeChecked();
+      expect(screen.getByLabelText("Use another saved token")).not.toBeChecked();
       expect((screen.getByTestId("ask-user-question-custom-input") as HTMLInputElement).value).toBe(
         "",
       );

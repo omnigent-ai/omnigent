@@ -75,7 +75,7 @@ function initialAnswers(questions: ClaudeQuestion[]): Omit<AskUserQuestionDraft,
   };
   for (const q of questions) {
     const key = questionKey(q);
-    answers.selections[key] = q.multiSelect ? [] : "";
+    answers.selections[key] = q.multiSelect ? [] : (q.options[0]?.label ?? "");
     answers.customSelected[key] = q.textInput !== undefined;
     answers.customInputs[key] = q.textInput?.default ?? "";
   }

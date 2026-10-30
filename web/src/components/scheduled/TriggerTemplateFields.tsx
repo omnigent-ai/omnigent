@@ -1,6 +1,6 @@
 // Trigger-template fields shown in place of the scheduled-task prompt.
 
-import { PlusIcon, XIcon } from "lucide-react";
+import { PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -15,6 +15,7 @@ import { Label } from "@/components/scheduled/Label";
 import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
+  OMNIGENT_ATTRIBUTION,
   TRIGGER_TEMPLATES,
   triggerOperatorLabel,
   triggerServiceName,
@@ -308,10 +309,23 @@ export function TriggerTemplateFields({
         )}
       </div>
 
+      <p
+        className="flex items-start gap-1.5 text-sm text-warning"
+        data-testid="task-trigger-tools-note"
+      >
+        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+        <span>
+          This only works if the agent has {template.toolsExample} where this task runs. Without
+          one, each run stops and says so in its reply.
+        </span>
+      </p>
+
       <p className="text-sm text-muted-foreground" data-testid="task-trigger-untrusted-note">
         Anyone who can write in what you watch can try to steer these sessions, which run with your
         tools.
-        {fields.linkBack && ` Link-back posts to ${triggerServiceName(source)} with your account.`}
+        {fields.linkBack &&
+          ` Link-back posts to ${triggerServiceName(source)} with your account.`}{" "}
+        Anything posted with your account ends with &quot;{OMNIGENT_ATTRIBUTION}&quot;.
       </p>
 
       {renderedPrompt !== "" && (
