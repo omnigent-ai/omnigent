@@ -46,6 +46,10 @@ on:
         description: Head SHA to post on (defaults to the PR's current head).
         required: false
         type: string
+      expire_only:
+        description: Only invalidate a green status whose recorded deadline has passed.
+        type: boolean
+        default: false
 
 # Read-only at top level; write scopes live on the job below.
 permissions:
@@ -98,7 +102,7 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
   request-automerge:
-    # Persist the command before entering the replaceable status-update queue.
+    # Persist the command before waiting for status updates.
     if: >-
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request != null &&
@@ -157,6 +161,8 @@ jobs:
     concurrency:
       group: merge-ready-${{ needs.resolve-head.outputs.sha || github.event.pull_request.head.sha || github.event.workflow_run.head_sha || github.event.check_run.head_sha }}
       cancel-in-progress: false
+      # Expiry jobs must not replace pending full evaluations.
+      queue: max
     permissions:
       contents: write       # merge PRs with durable automerge intent
       pull-requests: write  # enable auto-merge
@@ -291,9 +297,25 @@ jobs:
           echo "pr=$PR"   >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Invalidate expired Merge Ready
+        id: expiry
+        if: steps.ctx.outputs.skip != 'true' && inputs.expire_only == true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        env:
+          PR: ${{ steps.ctx.outputs.pr }}
+          SHA: ${{ steps.ctx.outputs.sha }}
+        with:
+          retries: 3
+          script: |
+            const { expire } = require("./.github/scripts/merge-ready/expiry.js");
+            await expire({
+              github, context, core,
+              pr: Number(process.env.PR), sha: process.env.SHA,
+            });
+
       - name: Read PR labels and author
         id: labels
-        if: steps.ctx.outputs.skip != 'true'
+        if: steps.ctx.outputs.skip != 'true' && inputs.expire_only != true
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -317,7 +339,7 @@ jobs:
       # Explicit reevaluations (including expiry sweeps) must revoke old green.
       - name: Determine eligibility
         id: eligible
-        if: steps.ctx.outputs.skip != 'true'
+        if: steps.ctx.outputs.skip != 'true' && inputs.expire_only != true
         env:
           EVENT:       ${{ github.event_name }}
           AUTOMERGE:   ${{ steps.labels.outputs.automerge }}

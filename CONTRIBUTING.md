@@ -445,7 +445,13 @@ PRs, including those without the `automerge` label. GitHub can delay scheduled
 runs, so idle PRs become blocked when the sweep and gate evaluation complete.
 Each sweep reevaluates at most 50 PRs, prioritizing known expiries over older
 statuses that have no expiry recorded yet. Large backlogs take multiple sweeps.
-Normal gate evaluations also enforce expiry.
+Known expiries use a lightweight job that rereads the current status under the
+same per-head lock as full gate evaluations, then marks it red only if it is
+still expired. This skips check enumeration and dependency-report evaluation;
+legacy statuses without a valid expiry still need a full evaluation. Status
+writers queue without replacing pending evaluations (up to 100 pending jobs
+per head; GitHub cancels additional arrivals). Normal gate evaluations also
+enforce expiry, and only a full evaluation can restore green.
 
 A `/merge` command from a user with write access records the request with the
 `automerge` label and posts an acknowledgement. Every subsequent gate evaluation

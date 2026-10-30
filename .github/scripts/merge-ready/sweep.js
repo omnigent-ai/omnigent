@@ -1,3 +1,5 @@
+const { refreshMetadata } = require("./expiry.js");
+
 const OPEN_PULL_REQUESTS = `
   query($owner: String!, $repo: String!, $cursor: String) {
     repository(owner: $owner, name: $repo) {
@@ -20,29 +22,6 @@ const OPEN_PULL_REQUESTS = `
     }
   }
 `;
-
-function refreshMetadata(pullRequest, now) {
-  const commit = pullRequest.commits?.nodes?.[0]?.commit;
-  if (!commit || commit.oid !== pullRequest.headRefOid) return null;
-
-  const status = commit.status?.contexts?.find(
-    (entry) => entry.context === "Merge Ready",
-  );
-  if (status?.state !== "SUCCESS") return null;
-
-  const match = /^All required checks green; expires (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$/.exec(
-    status.description ?? "",
-  );
-  const expiry = match && Date.parse(match[1]);
-  if (
-    !match ||
-    !Number.isFinite(expiry) ||
-    new Date(expiry).toISOString().replace(".000Z", "Z") !== match[1]
-  ) {
-    return { reason: "green status has no valid CI expiry", expired: false };
-  }
-  return expiry <= now ? { reason: `CI expired at ${match[1]}`, expired: true } : null;
-}
 
 module.exports = async function sweep({
   github,
@@ -78,6 +57,7 @@ module.exports = async function sweep({
           number: pullRequest.number,
           sha: pullRequest.headRefOid,
           reason: metadata.reason,
+          expireOnly: metadata.expired,
         });
       }
     }
@@ -106,7 +86,10 @@ module.exports = async function sweep({
         repo,
         workflow_id: "merge-ready.yml",
         ref: defaultBranch,
-        inputs: { pr: String(candidate.number), sha: candidate.sha },
+        inputs: {
+          pr: String(candidate.number), sha: candidate.sha,
+          expire_only: String(candidate.expireOnly),
+        },
       });
       dispatched += 1;
     } catch (error) {

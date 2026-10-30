@@ -182,6 +182,7 @@ def test_all_status_writers_share_the_head_lock_even_when_resolution_is_skipped(
     assert "needs.request-automerge.result == 'success'" in evaluate["if"]
     assert "needs.request-automerge.result == 'skipped'" in evaluate["if"]
     assert evaluate["concurrency"]["cancel-in-progress"] is False
+    assert evaluate["concurrency"]["queue"] == "max"
     group = evaluate["concurrency"]["group"]
     for source in (
         "needs.resolve-head.outputs.sha",
@@ -193,6 +194,98 @@ def test_all_status_writers_share_the_head_lock_even_when_resolution_is_skipped(
     assert (
         _step("evaluate", "ctx")["env"]["RESOLVED_SHA"] == "${{ needs.resolve-head.outputs.sha }}"
     )
+
+
+def test_expiry_dispatch_skips_full_evaluation_and_uses_the_locked_head() -> None:
+    inputs = WORKFLOW["on" if "on" in WORKFLOW else True]["workflow_dispatch"]["inputs"]
+    assert inputs["expire_only"]["type"] == "boolean"
+    assert inputs["expire_only"]["default"] is False
+    expiry = _step("evaluate", "expiry")
+    assert expiry["if"] == "steps.ctx.outputs.skip != 'true' && inputs.expire_only == true"
+    assert expiry["env"] == {
+        "PR": "${{ steps.ctx.outputs.pr }}",
+        "SHA": "${{ steps.ctx.outputs.sha }}",
+    }
+    assert 'require("./.github/scripts/merge-ready/expiry.js")' in expiry["with"]["script"]
+    assert "pr: Number(process.env.PR), sha: process.env.SHA" in expiry["with"]["script"]
+    for step_id in ("labels", "eligible"):
+        assert "inputs.expire_only != true" in _step("evaluate", step_id)["if"]
+    for step_id in ("eval", "gate"):
+        assert "steps.eligible.outputs.run == 'true'" in _step("evaluate", step_id)["if"]
+    for step_id in ("parser", "dependency"):
+        assert (
+            "steps.labels.outputs.dependency_required == 'true'"
+            in _step("evaluate", step_id)["if"]
+        )
+    steps = WORKFLOW["jobs"]["evaluate"]["steps"]
+    for name in ("Post Merge Ready status on PR head SHA", "Fail job when gate is red"):
+        step = next(step for step in steps if step["name"] == name)
+        assert "steps.eligible.outputs.run == 'true'" in step["if"]
+    enable = next(step for step in steps if step["name"] == "Enable requested auto-merge")
+    assert "steps.labels.outputs.automerge == 'true'" in enable["if"]
+
+
+@pytest.mark.parametrize("expires", ["2000-01-01T00:00:00Z", "2099-01-01T00:00:00Z"])
+def test_expiry_action_executes_with_workflow_inputs(expires: str) -> None:
+    step = _step("evaluate", "expiry")
+    script = """
+const assert = require("node:assert/strict");
+const { script, expires, sha } = JSON.parse(process.argv[1]);
+const writes = [];
+const github = {
+  graphql: async (_query, variables) => {
+    assert.deepEqual(variables, { owner: "example", repo: "project", pr: 123 });
+    return { repository: { pullRequest: {
+      state: "OPEN", headRefOid: sha,
+      commits: { nodes: [{ commit: { oid: sha, status: { contexts: [{
+        context: "Merge Ready", state: "SUCCESS",
+        description: `All required checks green; expires ${expires}`,
+      }] } } }] },
+    } } };
+  },
+  rest: { repos: { createCommitStatus: async (request) => writes.push(request) } },
+};
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+await new AsyncFunction("require", "github", "context", "core", script)(
+  require, github, { repo: { owner: "example", repo: "project" } }, { info: () => {} },
+);
+console.log(JSON.stringify(writes));
+"""
+    # github-script supplies CommonJS require and awaits the workflow's script body.
+    process = subprocess.run(
+        [
+            "node",
+            "-e",
+            "(async () => {" + script + "})()",
+            json.dumps(
+                {
+                    "script": step["with"]["script"],
+                    "expires": expires,
+                    "sha": HEAD,
+                }
+            ),
+        ],
+        cwd=ROOT,
+        env=dict(os.environ, PR="123", SHA=HEAD),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    )
+    writes = json.loads(process.stdout)
+    if expires.startswith("2000"):
+        assert writes == [
+            {
+                "owner": "example",
+                "repo": "project",
+                "sha": HEAD,
+                "context": "Merge Ready",
+                "state": "failure",
+                "description": "CI freshness not satisfied (24h); update branch and run fresh CI",
+            }
+        ]
+    else:
+        assert writes == []
 
 
 def test_merge_requests_survive_replacement_of_a_pending_evaluator() -> None:

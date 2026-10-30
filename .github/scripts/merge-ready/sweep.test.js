@@ -1,6 +1,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const sweep = require("./sweep.js");
+const { expire } = require("./expiry.js");
 
 const NOW = Date.parse("2026-10-29T12:00:00Z");
 const EXPIRED = "All required checks green; expires 2026-10-29T11:59:59Z";
@@ -12,6 +13,7 @@ function pullRequest(number, { description = EXPIRED, state = "SUCCESS" } = {}) 
   const sha = number.toString(16).padStart(40, "0");
   return {
     number,
+    state: "OPEN",
     headRefOid: sha,
     commits: {
       nodes: [{
@@ -81,7 +83,10 @@ test("only expired or legacy successful Merge Ready statuses need reevaluation",
     repo: "project",
     workflow_id: "merge-ready.yml",
     ref: "trunk",
-    inputs: { pr: String(number), sha: pullRequest(number).headRefOid },
+    inputs: {
+      pr: String(number), sha: pullRequest(number).headRefOid,
+      expire_only: String(number !== 4),
+    },
   })));
 });
 
@@ -249,4 +254,106 @@ test("invalid pagination fails instead of looping forever", async () => {
     sweep({ github, context, core, now: NOW }),
     /pagination did not advance/,
   );
+});
+
+function expiryApi(github, currentPull) {
+  const queries = [];
+  const writes = [];
+  const graphql = github.graphql;
+  github.graphql = async (query, variables) => {
+    if (variables.pr === undefined) return graphql(query, variables);
+    queries.push({ query, variables });
+    return { repository: { pullRequest: currentPull } };
+  };
+  github.rest.repos = {
+    createCommitStatus: async (request) => writes.push(request),
+  };
+  return { queries, writes };
+}
+
+test("sweep dispatch expires the current green status without enumerating CI", async () => {
+  const pull = pullRequest(123);
+  const { github, dispatches } = fixture([[pull]]);
+  const { queries, writes } = expiryApi(github, pull);
+  await sweep({ github, context, core, now: NOW, dryRun: false });
+  const { inputs } = dispatches[0];
+  assert.equal(inputs.expire_only, "true");
+  assert.equal(await expire({
+    github, context, core, pr: Number(inputs.pr), sha: inputs.sha, now: NOW,
+  }), true);
+  assert.equal(queries.length, 1);
+  assert.deepEqual(queries[0].variables, { owner: "example", repo: "project", pr: 123 });
+  assert.match(queries[0].query, /pullRequest\(number: \$pr\)/);
+  assert.deepEqual(writes, [{
+    owner: "example", repo: "project", sha: pull.headRefOid,
+    context: "Merge Ready", state: "failure",
+    description: "CI freshness not satisfied (24h); update branch and run fresh CI",
+  }]);
+});
+
+test("a full evaluation refreshing green while expiry waits is preserved", async () => {
+  const stale = pullRequest(1);
+  const { github, dispatches } = fixture([[stale]]);
+  const { writes } = expiryApi(github, pullRequest(1, { description: FRESH }));
+  await sweep({ github, context, core, now: NOW, dryRun: false });
+  assert.equal(dispatches.length, 1);
+  const { inputs } = dispatches[0];
+  assert.equal(await expire({
+    github, context, core, pr: Number(inputs.pr), sha: inputs.sha, now: NOW,
+  }), false);
+  assert.deepEqual(writes, []);
+});
+
+test("expiry is inclusive and repeated jobs do not write the same failure again", async () => {
+  const pull = pullRequest(1, { description: "All required checks green; expires 2026-10-29T12:00:00Z" });
+  const { github } = fixture([]);
+  const { writes } = expiryApi(github, pull);
+  const args = { github, context, core, pr: 1, sha: pull.headRefOid, now: NOW };
+  assert.equal(await expire(args), true);
+  pull.commits.nodes[0].commit.status.contexts[0].state = "FAILURE";
+  assert.equal(await expire(args), false);
+  assert.equal(writes.length, 1);
+});
+
+test("obsolete, non-green, missing and unverifiable statuses are not invalidated", async () => {
+  const closed = { ...pullRequest(1), state: "CLOSED" };
+  const merged = { ...pullRequest(1), state: "MERGED" };
+  const changedHead = { ...pullRequest(1), headRefOid: "f".repeat(40) };
+  const missingStatus = pullRequest(1);
+  missingStatus.commits.nodes[0].commit.status = null;
+  const oldCommit = pullRequest(1);
+  oldCommit.commits.nodes[0].commit.oid = "f".repeat(40);
+  const otherStatus = pullRequest(1);
+  otherStatus.commits.nodes[0].commit.status.contexts[0].context = "CI";
+  for (const pull of [
+    null, closed, merged, changedHead, oldCommit, missingStatus, otherStatus,
+    pullRequest(1, { state: "FAILURE" }),
+    pullRequest(1, { state: "PENDING" }),
+    pullRequest(1, { description: FRESH }),
+    pullRequest(1, { description: "All required checks green" }),
+    pullRequest(1, { description: "All required checks green; expires invalid" }),
+    pullRequest(1, { description: "All required checks green; expires 2026-02-30T12:00:00Z" }),
+  ]) {
+    const { github } = fixture([]);
+    const { writes } = expiryApi(github, pull);
+    assert.equal(await expire({
+      github, context, core, pr: 1, sha: pullRequest(1).headRefOid, now: NOW,
+    }), false);
+    assert.deepEqual(writes, []);
+  }
+});
+
+test("expiry API failures propagate without claiming a successful invalidation", async () => {
+  for (const endpoint of ["read", "write"]) {
+    const pull = pullRequest(1);
+    const { github } = fixture([]);
+    const { writes } = expiryApi(github, pull);
+    const fail = async () => { throw new Error("API unavailable"); };
+    if (endpoint === "read") github.graphql = fail;
+    else github.rest.repos.createCommitStatus = fail;
+    await assert.rejects(expire({
+      github, context, core, pr: 1, sha: pull.headRefOid, now: NOW,
+    }), /API unavailable/);
+    assert.deepEqual(writes, []);
+  }
 });
