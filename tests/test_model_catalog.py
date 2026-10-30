@@ -1749,9 +1749,20 @@ def test_codex_login_catalog_requires_a_usable_child_launch(
         ),
         pytest.param("{}", {"HARNESS_CODEX_GATEWAY": "0"}, True, id="gateway-off"),
         pytest.param("{}", {"HARNESS_CODEX_GATEWAY": "1"}, False, id="gateway-on"),
+        # Gateway settings apply only in gateway mode, so alone they leave the route alone.
         pytest.param(
-            "{}", {"HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "print-token"}, False, id="auth-command"
+            "{}",
+            {"HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "print-token"},
+            True,
+            id="auth-command-off",
         ),
+        pytest.param(
+            _CODEX_SUBSCRIPTION_CONFIG,
+            {"HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "print-token"},
+            True,
+            id="subscription-auth-command-off",
+        ),
+        pytest.param("{}", {"HARNESS_CODEX_SIGNER_PROVIDER": "ucode"}, False, id="signer"),
     ],
 )
 def test_codex_login_catalog_follows_the_child_launch_env(
@@ -1921,6 +1932,24 @@ def test_claude_transport_overrides_skip_login_catalog(
     assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
     _seed_cli_login_catalogs(codex_pinned=True)
     assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"]
+
+
+def test_managed_api_key_helper_alone_keeps_the_login_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A managed helper with no base URL targets Anthropic for the probe and the child alike."""
+    _isolate_config(monkeypatch, tmp_path, _CLI_SUBSCRIPTION_CONFIG)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(json.dumps({"apiKeyHelper": "echo test-token"}))
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    _seed_cli_login_catalogs(codex_pinned=True)
+
+    row = catalog_for_spec(_worker_spec("claude-sdk"))["self"]
+
+    assert [model["id"] for model in row["models"]] == _CLI_LOGIN_CLAUDE_IDS
 
 
 def test_native_only_binding_does_not_feed_the_sdk_worker(

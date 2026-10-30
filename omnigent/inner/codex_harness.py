@@ -90,6 +90,7 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -161,29 +162,44 @@ def _parse_truthy(env_var: str, default: bool, env: Mapping[str, str] | None = N
     return raw in _TRUTHY_STRINGS
 
 
+@dataclass(frozen=True)
+class _CodexRoute:
+    """How a Codex child launched with some environment reaches its model.
+
+    :param signer: Whether a model signer carries the launch.
+    :param gateway: Whether the gateway transport carries it. Only then do the
+        gateway host, base URL, auth command and Databricks profile apply.
+    :param model_provider: The ``model_provider`` pinned otherwise, e.g. ``"openai"``.
+    """
+
+    signer: bool
+    gateway: bool
+    model_provider: str | None
+
+
+def _codex_route(env: Mapping[str, str]) -> _CodexRoute:
+    """Read the route :func:`_build_codex_executor` launches with from *env*.
+
+    :param env: The wrap's environment.
+    :returns: The launch's route.
+    """
+    signer = bool(env.get(_ENV_SIGNER_PROVIDER, "").strip())
+    return _CodexRoute(
+        signer=signer,
+        gateway=not signer and _parse_truthy(_ENV_GATEWAY, default=False, env=env),
+        model_provider=None if signer else env.get(_ENV_MODEL_PROVIDER) or None,
+    )
+
+
 def codex_child_model_provider(env: Mapping[str, str]) -> str | None:
     """Return the ``model_provider`` a Codex child launched with *env* pins.
 
-    Reads the same variables :func:`_build_codex_executor` does: a gateway,
-    Databricks profile, gateway host or URL, auth command, or model signer
-    routes the child through a generated provider.
-
     :param env: The child's environment, e.g. the runner env plus its spawn env.
-    :returns: The pinned provider id, e.g. ``"openai"``; ``""`` when the child is
-        routed through a generated provider; ``None`` when ``config.toml`` decides.
+    :returns: The pinned provider id, e.g. ``"openai"``; ``""`` when a gateway or
+        model signer carries the launch; ``None`` when ``config.toml`` decides.
     """
-    if _parse_truthy(_ENV_GATEWAY, default=False, env=env) or any(
-        env.get(name, "").strip()
-        for name in (
-            _ENV_DATABRICKS_PROFILE,
-            _ENV_GATEWAY_HOST,
-            _ENV_GATEWAY_BASE_URL,
-            _ENV_GATEWAY_AUTH_COMMAND,
-            _ENV_SIGNER_PROVIDER,
-        )
-    ):
-        return ""
-    return env.get(_ENV_MODEL_PROVIDER, "").strip() or None
+    route = _codex_route(env)
+    return "" if route.signer or route.gateway else route.model_provider
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -376,20 +392,17 @@ def _build_codex_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     signer_launch_config = _resolve_signer_launch_config()
+    route = _codex_route(os.environ)
     return CodexExecutor(
         cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         codex_path=resolve_harness_path("codex"),
-        gateway=False
-        if signer_launch_config is not None
-        else _parse_truthy(_ENV_GATEWAY, default=False),
+        gateway=route.gateway,
         databricks_profile=None
         if signer_launch_config is not None
         else os.environ.get(_ENV_DATABRICKS_PROFILE),
-        model_provider_override=None
-        if signer_launch_config is not None
-        else os.environ.get(_ENV_MODEL_PROVIDER) or None,
+        model_provider_override=route.model_provider,
         gateway_host=None
         if signer_launch_config is not None
         else os.environ.get(_ENV_GATEWAY_HOST) or None,
