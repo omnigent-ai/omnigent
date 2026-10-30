@@ -1160,6 +1160,8 @@ class CreateResponseRequest(BaseModel):
     pending_id: str | None = None
     delivery_attempt_id: str | None = None
     input_enqueued_at_ms: int | None = None
+    # Runner-validated authorization for one delivery, separate from user content/history.
+    authorized_native_shell_command: str | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
@@ -2839,11 +2841,18 @@ class SessionForkRequest(_SandboxProfileSelection):
     :param workspace: Git repository URL (optionally ``#<branch>``) the
         server clones into the fork's sandbox as its working directory,
         e.g. ``"https://github.com/org/repo#release-1.2"``. **Omitting**
-        the field inherits the repository the source session recorded, so
-        cloning a sandbox session lands the fork in the same checkout; an
+        both workspace fields inherits all repositories the source session
+        recorded, so cloning a sandbox session preserves its checkouts; an
         explicit value overrides it and an explicit ``null`` gives the
         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
         an external fork's directory is chosen when it binds a host.
+    :param workspaces: Repository URLs (each optionally ``#<branch>``) to
+        clone into the fork's sandbox, replacing the source's repositories.
+        Send only when ``GET /v1/info`` reports ``session_fork_workspaces``.
+        Several repositories require a provider with ``multi_repo`` support.
+        Mutually exclusive with ``workspace``; explicitly sending ``[]`` or
+        ``null`` gives the fork an empty sandbox. Only valid with
+        ``host_type: "managed"``.
     """
 
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
@@ -2857,6 +2866,7 @@ class SessionForkRequest(_SandboxProfileSelection):
     sandbox_provider: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
     # side-chat tab). It may share its parent's runner.
@@ -2870,8 +2880,8 @@ class SessionForkRequest(_SandboxProfileSelection):
         Enforce the per-``host_type`` contract for a fork.
 
         Mirrors :meth:`_SessionCreateRequestBase._check_managed_host_fields`:
-        a managed fork's ``workspace``, when given, must be a git repository
-        URL (optionally ``#<branch>``) the server clones into the sandbox —
+        a managed fork's workspace(s), when given, must be git repository
+        URLs (optionally ``#<branch>``) the server clones into the sandbox —
         a filesystem path points at nothing in a sandbox that doesn't exist
         yet. Both ``sandbox_provider`` and ``workspace`` are meaningless on
         an external fork, which picks its host and directory afterwards.
@@ -2881,8 +2891,8 @@ class SessionForkRequest(_SandboxProfileSelection):
         :returns: The validated instance.
         :raises ValueError: On a managed workspace that isn't a valid
             repository URL, a malformed managed ``host_id``, or
-            ``host_id`` / ``sandbox_provider`` / ``workspace`` without
-            ``host_type: "managed"``.
+            conflicting or oversized workspace selections, or ``host_id`` /
+            ``sandbox_provider`` / workspace(s) without ``host_type: "managed"``.
         """
         # Lazy import: schemas is imported by nearly every module, so
         # pulling the (FastAPI/click-importing) managed-hosts module in
@@ -2894,13 +2904,26 @@ class SessionForkRequest(_SandboxProfileSelection):
                 raise ValueError(
                     "host_type 'managed' takes a host_id of 32 lowercase hex characters"
                 )
-            if self.workspace is not None:
+            if {"workspace", "workspaces"} <= self.model_fields_set:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            workspaces = self.workspaces or (
+                [self.workspace] if self.workspace is not None else []
+            )
+            for workspace in workspaces:
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(workspace)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') for each workspace: {exc}"
                     ) from exc
             return self
         if self.host_id is not None:
@@ -2916,6 +2939,11 @@ class SessionForkRequest(_SandboxProfileSelection):
         if self.workspace is not None:
             raise ValueError(
                 "workspace only applies to host_type 'managed' — an external "
+                "fork picks its directory when it binds a host"
+            )
+        if "workspaces" in self.model_fields_set:
+            raise ValueError(
+                "workspaces only applies to host_type 'managed' — an external "
                 "fork picks its directory when it binds a host"
             )
         return self
@@ -2994,6 +3022,25 @@ class SessionPullRequest(SessionPullRequestSummary):
     relationship: Literal["created", "worked_on", "attached", "inferred"]
     first_seen_at: float
     last_seen_at: float
+
+
+class SessionRepositoryBranch(BaseModel):
+    """Current branch and remote availability for one managed repository.
+
+    ``pushed`` is true when the branch exists at the original clone URL,
+    false when confirmed absent, and null when availability is unknown.
+    It does not indicate whether local commits or working-tree changes are pushed.
+    """
+
+    url: str
+    branch: str | None = None
+    pushed: bool | None = None
+
+
+class SessionRepositoryBranchList(BaseModel):
+    """Managed repositories in their original launch order."""
+
+    repositories: list[SessionRepositoryBranch]
 
 
 class SessionPullRequestList(BaseModel):

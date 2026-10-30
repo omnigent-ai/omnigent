@@ -534,7 +534,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {
     renderWithSandboxes();
     expect(
-      screen.getByText("Leave unset to run on your connected host when the automation fires."),
+      screen.getByText("Runs on this host. A run fails while the host is offline."),
     ).toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
@@ -568,7 +568,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
 });
 
 describe("CreateScheduledTaskDialog submit", () => {
-  it("submits required fields with the built RRULE and omits host/workspace when unset", async () => {
+  it("submits required fields with the built RRULE on the first online host", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
@@ -587,8 +587,8 @@ describe("CreateScheduledTaskDialog submit", () => {
       agentId: "ag_claude_native",
       // Default schedule model is daily at 09:00.
       rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      hostId: "host_1",
     });
-    expect(arg).not.toHaveProperty("hostId");
     expect(arg).not.toHaveProperty("workspace");
     // Timezone has no visible control but is still inferred + sent: a non-empty
     // IANA-ish string (whatever the test env's local zone resolves to).
@@ -650,6 +650,66 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByTestId("schedule-frequency-control")).toHaveClass("w-full");
     expect(screen.getByTestId("schedule-time-control")).toHaveClass("w-full");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveClass("w-full");
+  });
+
+  it("waits for a host pick when no host is online", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+
+    // There is no unpinned choice, so a new task needs a host or a sandbox.
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    expect(screen.queryByRole("option", { name: /fire time/i })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+
+    await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
+  });
+
+  it("keeps the saved workspace in view and in the update when the host changes", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_2", name: "desktop", owner: "me", status: "online" },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ hostId: "host_1", workspace: "/home/me/repo" })}
+      />,
+    );
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /desktop/ }));
+
+    // Omitting the workspace would keep the saved one, so the form keeps showing it.
+    expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      hostId: "host_2",
+      workspace: "/home/me/repo",
+    });
+  });
+
+  it("keeps an older unpinned task unpinned until a host is picked", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Most recently active host");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("hostId");
   });
 
   it("lays out Host full-width like the other top-level fields", () => {
@@ -1423,7 +1483,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Hourly");
     expect(screen.getByTestId("task-session-mode-trigger")).toBeDisabled();
     expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
-      "Continue one session",
+      "Continue in the same session",
     );
     expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
       "Each run starts a session for each of these tickets created since the previous run that meets every condition by then. To allow for slow search indexing, the window starts 5 minutes early, so one created just before the previous run can still count. Older tickets don't, even if they change or start matching later.",
@@ -1432,8 +1492,16 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     const note = screen.getByTestId("task-trigger-untrusted-note");
     expect(note).toHaveTextContent("Anyone who can write in what you watch can try to steer");
     expect(note).toHaveTextContent("Link-back posts to Jira with your account.");
+    expect(note).toHaveTextContent(
+      'Anything posted with your account ends with "Sent with Omnigent".',
+    );
+    // Runs can only search where the agent has the service's tools.
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a Jira MCP server where this task runs. Without one, each run stops and says so in its reply.",
+    );
     pick("task-trigger-then", "task-trigger-then-none");
     expect(note).not.toHaveTextContent("Link-back posts");
+    expect(note).toHaveTextContent("Sent with Omnigent");
   });
 
   it("keeps submit disabled until the scope, every condition and the instructions are filled", () => {
@@ -1497,7 +1565,7 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain(
       'Comment "Omnigent session: https://host.example.com/embed#/c/CONVERSATION_ID?o=42" on each ticket',
     );
-    expect(prompt).toMatch(/Instructions for each session:\nTriage it\.$/);
+    expect(prompt).toContain("Instructions for each session:\nTriage it.\n");
   });
 
   it("hides the value box for an assignee row that is unassigned", async () => {

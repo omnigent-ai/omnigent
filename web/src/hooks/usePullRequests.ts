@@ -34,7 +34,14 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  queryOptions,
+  skipToken,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -422,6 +429,7 @@ export async function fetchPullRequestInfo(
  *  git/gh checks — and the waiting-for-a-PR / CI-running states, which cost a
  *  `gh` API call but only while the panel is actually focused. */
 const PULL_REQUEST_POLL_MS = 5_000;
+const PULL_REQUEST_LIST_POLL_MS = 30_000;
 
 /**
  * The panel's poll interval for the current GitHub info, or `false` to stop.
@@ -447,7 +455,7 @@ export function computePullRequestPollInterval(
   listRow = false,
 ): number | false {
   // List rows refresh less often and rest once closed; explicit Refresh still refetches them.
-  if (listRow) return info?.pr && info.pr.state !== "OPEN" ? false : 30_000;
+  if (listRow) return info?.pr && info.pr.state !== "OPEN" ? false : PULL_REQUEST_LIST_POLL_MS;
   // No usable info yet — an initial error, or a transient fetch failure with no
   // cached data. Keep trying; runner-offline is gated off by `enabled`.
   if (!info) return PULL_REQUEST_POLL_MS;
@@ -466,13 +474,57 @@ export function computePullRequestPollInterval(
   return pr.checks.pending > 0 || pr.checks.total === 0 ? PULL_REQUEST_POLL_MS : false;
 }
 
+/** Poll linked PRs until all known states are terminal; unknown states keep refreshing. */
+export function computeLinkedPullRequestPollInterval(
+  info: Pick<PullRequestInfo, "pr" | "prs"> | undefined,
+): number | false {
+  const selected = info?.pr;
+  const associations = info?.prs?.filter((pr) => pr.url !== selected?.url) ?? [];
+  const summaries = selected ? [...associations, selected] : associations;
+  return summaries.some((pr) => !["MERGED", "CLOSED"].includes(pr.state?.toUpperCase() ?? ""))
+    ? PULL_REQUEST_LIST_POLL_MS
+    : false;
+}
+
+function usePullRequestQueryContext(rawConversationId: string | undefined) {
+  // A `temp:*` id (navigate-first new-chat window) has no server session.
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  const serveable = useWorkspaceServeable(conversationId);
+  // Use the health poll so hovering sidebar rows does not load their session snapshots.
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return { conversationId, enabled: !!conversationId && serveable !== false, retry };
+}
+
+function pullRequestInfoQueryOptions(
+  { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
+) {
+  return queryOptions({
+    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
+    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
+    enabled,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    refetchInterval: options?.poll
+      ? (query) => {
+          const info = query.state.data;
+          if (options.poll === "linked") return computeLinkedPullRequestPollInterval(info);
+          if (options.poll === "list") return computePullRequestPollInterval(info, true);
+          return info?.tracking_available ? 10_000 : computePullRequestPollInterval(info);
+        }
+      : false,
+    refetchIntervalInBackground: false,
+  });
+}
+
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  *
- * Refetch is driven two ways, both harness-agnostic:
+ * Refetch follows the session lifecycle and the caller's polling mode:
  *   - Turn end: a trailing invalidate on the focused session's active→idle
  *     transition, so a PR the agent opened during the turn shows up (in the
  *     status-line indicator and the panel) without a manual refresh. This is
@@ -482,40 +534,28 @@ export function computePullRequestPollInterval(
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
- *
- * Disabled when the runner is known offline. Retries the runner-offline case
- * with capped backoff so a cold-booting runner resolves before any error UI.
+ *   - Composer: `{ poll: "linked" }` uses the list cadence for open or unknown
+ *     PR states. Empty and terminal lists rest until a turn end or explicit refresh.
  */
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
-  options?: { poll?: boolean | "list"; prUrl?: string },
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
-  // A `temp:*` id (navigate-first new-chat window) has no server session.
-  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
-  const serveable = useWorkspaceServeable(conversationId);
-  // Gate on the health poll rather than the session snapshot: the sidebar
-  // tooltip reuses this hook, and must not load every hovered session.
-  const retry = useRunnerOfflineRetry(serveable !== false);
-  // Turn-end backstop: refetch when the focused session goes active→idle, so a
-  // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
-  // so it works for every harness (no per-harness tool detection).
-  useTrailingInvalidate(conversationId, useSessionActive(conversationId), "github-info");
-  return useQuery({
-    queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
-    queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
-    enabled: !!conversationId && serveable !== false,
-    retry,
-    retryDelay: runnerOfflineRetryDelay,
-    staleTime: 30_000,
-    refetchInterval: options?.poll
-      ? (query) =>
-          options.poll === "list"
-            ? computePullRequestPollInterval(query.state.data, true)
-            : query.state.data?.tracking_available
-              ? 10_000
-              : computePullRequestPollInterval(query.state.data)
-      : false,
-    refetchIntervalInBackground: false,
+  const context = usePullRequestQueryContext(rawConversationId);
+  // Prefix invalidation also refreshes usePullRequestInfos queries for this session.
+  useTrailingInvalidate(
+    context.conversationId,
+    useSessionActive(context.conversationId),
+    "github-info",
+  );
+  return useQuery(pullRequestInfoQueryOptions(context, options));
+}
+
+/** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
+export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
+  const context = usePullRequestQueryContext(rawConversationId);
+  return useQueries({
+    queries: prUrls.map((prUrl) => pullRequestInfoQueryOptions(context, { poll: "list", prUrl })),
   });
 }
 

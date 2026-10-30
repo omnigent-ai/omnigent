@@ -2,12 +2,12 @@ name: CI
 
 # Unit-test pytest matrix on every non-draft PR and on push to main. Tests are
 # split across directory-based matrix groups (runtime-*, server-*, inner-rest,
-# tools, repl-sdk, spec-llms, runner-app, stores, misc) so slow files don't
-# bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
-# out within a file. The `misc` group is a catch-all so new top-level
-# tests/<dir>/ are picked up automatically (it ignores the dirs that have their
-# own group). When Python tests run, `ci-tooling` (tests/scripts) is kept only
-# if the PR touches CI, release or dev tooling or a manifest (see
+# tools, repl-sdk, spec-llms, runner-app, stores, db, harnesses, misc) so slow
+# files don't bottleneck one runner; the slowest groups use `--dist=worksteal`
+# to fan tests out within a file. The `misc` group is a catch-all so new
+# top-level tests/<dir>/ are picked up automatically (it ignores the dirs that
+# have their own group). When Python tests run, `ci-tooling` (tests/scripts) is
+# kept only if the PR touches CI, release or dev tooling or a manifest (see
 # dependency_scope.py); push, scheduled and manual runs always include it.
 # Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
@@ -107,7 +107,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Node.js for local relay and harness CLI tests
-        if: matrix.group == 'misc' || matrix.group == 'inner-rest' || matrix.group == 'ci-tooling'
+        if: >-
+          matrix.group == 'misc' || matrix.group == 'harnesses' ||
+          matrix.group == 'inner-rest' || matrix.group == 'ci-tooling'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
@@ -115,7 +117,7 @@ jobs:
       # Tests that exercise a real harness CLI skip without it; install the
       # pinned CLI only in the lanes that run them.
       - name: Install Codex CLI
-        if: matrix.group == 'misc'
+        if: matrix.group == 'misc' || matrix.group == 'harnesses'
         uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex

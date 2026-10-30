@@ -6158,6 +6158,11 @@
             "title": "Session Event Types",
             "type": "array"
           },
+          "session_fork_workspaces": {
+            "default": true,
+            "title": "Session Fork Workspaces",
+            "type": "boolean"
+          },
           "session_pull_requests": {
             "default": false,
             "title": "Session Pull Requests",
@@ -6945,8 +6950,23 @@
                 "type": "null"
               }
             ],
-            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** the field inherits the repository the source session recorded, so cloning a sandbox session lands the fork in the same checkout; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
+            "description": "Git repository URL (optionally `#<branch>`) the server clones into the fork's sandbox as its working directory, e.g. `\"https://github.com/org/repo#release-1.2\"`. **Omitting** both workspace fields inherits all repositories the source session recorded, so cloning a sandbox session preserves its checkouts; an explicit value overrides it and an explicit `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"` \u2014 an external fork's directory is chosen when it binds a host.",
             "title": "Workspace"
+          },
+          "workspaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Repository URLs (each optionally `#<branch>`) to clone into the fork's sandbox, replacing the source's repositories. Send only when `GET /v1/info` reports `session_fork_workspaces`. Several repositories require a provider with `multi_repo` support. Mutually exclusive with `workspace`; explicitly sending `[]` or `null` gives the fork an empty sandbox. Only valid with `host_type: \"managed\"`.",
+            "title": "Workspaces"
           }
         },
         "title": "SessionForkRequest",
@@ -8125,6 +8145,59 @@
           "conversation_id"
         ],
         "title": "SessionReasoningEffortEvent",
+        "type": "object"
+      },
+      "SessionRepositoryBranch": {
+        "description": "Current branch and remote availability for one managed repository.\n\n`pushed` is true when the branch exists at the original clone URL,\nfalse when confirmed absent, and null when availability is unknown.\nIt does not indicate whether local commits or working-tree changes are pushed.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "pushed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pushed"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "SessionRepositoryBranch",
+        "type": "object"
+      },
+      "SessionRepositoryBranchList": {
+        "description": "Managed repositories in their original launch order.",
+        "properties": {
+          "repositories": {
+            "items": {
+              "$ref": "#/components/schemas/SessionRepositoryBranch"
+            },
+            "title": "Repositories",
+            "type": "array"
+          }
+        },
+        "required": [
+          "repositories"
+        ],
+        "title": "SessionRepositoryBranchList",
         "type": "object"
       },
       "SessionResourceCreatedEvent": {
@@ -18561,6 +18634,49 @@
           }
         },
         "summary": "Update Session Github Reviewers",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/repository-branches": {
+      "get": {
+        "description": "Suggest fork branches without waking or modifying the source sandbox.",
+        "operationId": "get_session_repository_branches_v1_sessions__session_id__resources_repository_branches_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRepositoryBranchList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Repository Branches",
         "tags": [
           "session_resources"
         ]

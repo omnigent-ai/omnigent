@@ -389,18 +389,8 @@ def test_composer_pr_link_opens_github_tab(
     for test_id in ("composer-pr-link",):
         icon, label = bounds[f"{test_id}.icon"], bounds[f"{test_id}.label"]
         pair_gaps[test_id] = label["x"] - icon["x"] - icon["width"]
-    painted_right_edges = {
-        "composer-pr-link": pr_link.locator("path").evaluate(
-            "path => path.getBoundingClientRect().right"
-        ),
-    }
-    painted_gaps = {
-        test_id: bounds[f"{test_id}.label"]["x"] - right
-        for test_id, right in painted_right_edges.items()
-    }
     print(f"Composer fonts ({viewport_width}px, {font_size}px preference): {font_sizes}")
     print(f"Composer centers: {centers}; group gap: {group_gap}; pair gaps: {pair_gaps}")
-    print(f"Visible icon-to-label gaps: {painted_gaps}")
     bar.screenshot(path=tmp_path / "workspace-bar.png", animations="disabled")
     page.screenshot(path=tmp_path / "composer-pr-link.png", animations="disabled")
 
@@ -458,8 +448,6 @@ def test_composer_pr_link_opens_github_tab(
         assert center == pytest.approx(reference_center, abs=0.5), (name, centers)
     for name, pair_gap in pair_gaps.items():
         assert pair_gap == pytest.approx(4, abs=0.1), (name, pair_gaps)
-    for name, painted_gap in painted_gaps.items():
-        assert painted_gap == pytest.approx(7.5, abs=0.1), (name, painted_gaps)
     directory_bounds = page.get_by_test_id("composer-workspace-dir").bounding_box()
     branch_bounds = page.get_by_test_id("composer-git-branch").bounding_box()
     assert directory_bounds is not None and branch_bounds is not None

@@ -10336,6 +10336,31 @@ def test_host_serves_a_pr_the_server_vouches_for(
     assert written.status == "ok", written
 
 
+async def test_host_repository_branches_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_registry(*_args: object) -> None:
+        pytest.fail("Branch lookup must not initialize change tracking")
+
+    monkeypatch.setattr("omnigent.workspace_fs.create_filesystem_registry", unexpected_registry)
+    host = _make_host_process()
+    url = "https://github.com/org/repo"
+    try:
+        result = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="repository-branches",
+                op="repository_branches",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"repositories": [{"url": url, "path": ""}]},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert result.status == "ok", result
+    assert result.payload == {"repositories": [{"url": url, "branch": None, "pushed": None}]}
+
+
 def test_host_reads_a_file_named_as_the_workspace_root(tmp_path: Path) -> None:
     """An absolute file target sent as the root is read rather than refused as a missing dir."""
     target = tmp_path / "notes.md"

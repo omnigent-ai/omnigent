@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import functools
+import json
 import mimetypes
 import ntpath
 import re
@@ -109,6 +110,7 @@ from omnigent.server.schemas import (
     CopyFilesRequest,
     CopyFilesResponse,
     SessionPullRequestList,
+    SessionRepositoryBranchList,
     SessionResourceObject,
     SessionResourcePaginatedList,
 )
@@ -3509,6 +3511,62 @@ def register_resources_routes(
     # Registered BEFORE the generic ``/{resource_id}`` lookup so
     # ``/resources/github`` is not captured as a resource id. The diff route
     # lives on ``file_read_router`` (gzip) above.
+
+    @router.get(
+        "/sessions/{session_id}/resources/repository-branches",
+        response_model=SessionRepositoryBranchList,
+    )
+    async def get_session_repository_branches(request: Request, session_id: str) -> dict[str, Any]:
+        """Suggest fork branches without waking or modifying the source sandbox."""
+        from omnigent.onboarding.sandboxes.types import clone_dir_names
+        from omnigent.server.managed_hosts import (
+            parse_repo_workspace,
+            read_managed_repo_workspaces,
+        )
+
+        conversation = await _validate_session(session_id, request, LEVEL_READ)
+        workspaces = read_managed_repo_workspaces(conversation.labels)
+        try:
+            repositories = [parse_repo_workspace(workspace) for workspace in workspaces]
+        except ValueError:
+            return {"repositories": []}
+        unknown = {
+            "repositories": [
+                {"url": repository.url, "branch": None, "pushed": None}
+                for repository in repositories
+            ]
+        }
+        if not repositories or not conversation.workspace:
+            return unknown
+        targets = [
+            {"url": repository.url, "path": name if len(repositories) > 1 else ""}
+            for repository, name in zip(repositories, clone_dir_names(repositories), strict=True)
+        ]
+        try:
+            async with asyncio.timeout(7.0):
+                return await _fs_get_with_host_fallback(
+                    session_id,
+                    conversation,
+                    op="repository_branches",
+                    host_params={"repositories": targets},
+                    runner_path=f"/v1/sessions/{session_id}/resources/repository-branches",
+                    runner_params={"repositories": json.dumps(targets)},
+                    runner_timeout=7.0,
+                )
+        except TimeoutError:
+            return unknown
+        except OmnigentError as exc:
+            if exc.code not in {
+                ErrorCode.RUNNER_UNAVAILABLE,
+                ErrorCode.CONFLICT,
+                ErrorCode.NOT_FOUND,
+                ErrorCode.SESSION_AGENT_MISSING,
+            }:
+                raise
+        except HTTPException as exc:
+            if exc.status_code not in {400, 404, 410, 502, 503, 504}:
+                raise
+        return unknown
 
     @router.get(
         "/sessions/{session_id}/resources/github",
