@@ -162,6 +162,7 @@ function PullRequestMergeDialog({
   pr,
   headSha,
   warning,
+  unavailable = false,
   onClose,
   onMerged,
 }: {
@@ -171,6 +172,7 @@ function PullRequestMergeDialog({
   headSha: string;
   /** A caveat GitHub still merges with, e.g. failing optional checks. */
   warning?: string;
+  unavailable?: boolean;
   onClose: () => void;
   onMerged: () => void;
 }) {
@@ -186,7 +188,7 @@ function PullRequestMergeDialog({
   // `isPending` updates after a render, so a fast second click needs this guard.
   const submitting = useRef(false);
   const confirm = () => {
-    if (!method || submitting.current) return;
+    if (!method || unavailable || submitting.current) return;
     submitting.current = true;
     merge.mutate(
       { prUrl, mergeMethod: method, expectedHead: headSha },
@@ -239,7 +241,7 @@ function PullRequestMergeDialog({
           </Button>
           <Button
             className={MERGE_BUTTON_CLASS}
-            disabled={!method || merge.isPending}
+            disabled={!method || unavailable || merge.isPending}
             onClick={confirm}
           >
             {merge.isPending && <Spinner aria-hidden />}
@@ -301,50 +303,73 @@ export function PullRequestMerge({
   conversationId,
   prUrl,
   pr,
+  compact = false,
+  showTrigger = true,
+  unavailable = false,
 }: {
+  compact?: boolean;
+  showTrigger?: boolean;
+  unavailable?: boolean;
   conversationId: string;
   prUrl: string;
   pr: PullRequest;
 }) {
-  // The repository's default method names the button, so it loads with the button.
-  const options = usePullRequestMergeOptions(conversationId, prUrl, !pr.auto_merge);
+  // The full button uses the default method; compact rows load methods on confirmation.
+  const options = usePullRequestMergeOptions(conversationId, prUrl, !pr.auto_merge && !compact);
   // The head the user confirms, kept while the dialog is open even if a poll moves it.
   const [confirmingHead, setConfirmingHead] = useState<string | null>(null);
   // GitHub accepted a merge of this head; the PR stays open here until the refetch lands.
   const [mergedHead, setMergedHead] = useExpiringValue<string>();
 
-  if (pr.auto_merge) {
+  if (pr.auto_merge && !confirmingHead) {
+    if (!showTrigger) return null;
     return (
       <section className="flex flex-wrap items-center gap-2" aria-label="Merge">
         <PullRequestAutoMerge conversationId={conversationId} prUrl={prUrl} pr={pr} />
       </section>
     );
   }
+  if (!showTrigger && !confirmingHead) return null;
   const state: MergeButtonState =
     mergedHead && mergedHead === pr.head_sha
       ? { kind: "checking", hint: "Merge requested. Refreshing…" }
       : mergeButtonState(pr);
   const defaultMethod = options.data?.default;
-  const label = defaultMethod ? MERGE_BUTTON_LABELS[defaultMethod] : "Merge pull request";
+  const label = compact
+    ? mergedHead === pr.head_sha
+      ? "Merging…"
+      : "Merge"
+    : defaultMethod
+      ? MERGE_BUTTON_LABELS[defaultMethod]
+      : "Merge pull request";
   return (
     <section className="flex flex-wrap items-center gap-2" aria-label="Merge">
-      <Button
-        size="sm"
-        variant={state.kind === "ready" ? "default" : "outline"}
-        className={cn(state.kind === "ready" && MERGE_BUTTON_CLASS)}
-        disabled={state.kind !== "ready"}
-        onClick={() => state.kind === "ready" && setConfirmingHead(state.headSha)}
-      >
-        {state.kind === "checking" ? <Spinner aria-hidden /> : <GitMergeIcon aria-hidden />}
-        {label}
-      </Button>
-      {"hint" in state && <span className="text-ui text-muted-foreground">{state.hint}</span>}
+      {showTrigger && (
+        <Button
+          size="sm"
+          variant={!compact && state.kind === "ready" ? "default" : "outline"}
+          className={cn(
+            compact
+              ? "border-green-600 text-green-700 hover:bg-green-500/10 dark:text-green-400"
+              : state.kind === "ready" && MERGE_BUTTON_CLASS,
+          )}
+          disabled={unavailable || state.kind !== "ready"}
+          onClick={() => !unavailable && state.kind === "ready" && setConfirmingHead(state.headSha)}
+        >
+          {state.kind === "checking" ? <Spinner aria-hidden /> : <GitMergeIcon aria-hidden />}
+          {label}
+        </Button>
+      )}
+      {!compact && "hint" in state && (
+        <span className="text-ui text-muted-foreground">{state.hint}</span>
+      )}
       {confirmingHead && (
         <PullRequestMergeDialog
           conversationId={conversationId}
           prUrl={prUrl}
           pr={pr}
           headSha={confirmingHead}
+          unavailable={unavailable}
           warning={state.kind === "ready" ? state.hint : undefined}
           onMerged={() => setMergedHead(confirmingHead)}
           onClose={() => setConfirmingHead(null)}
