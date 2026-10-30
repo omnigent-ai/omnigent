@@ -25,6 +25,7 @@ from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.native.input_diagnostics import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -1984,15 +1985,23 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exit_status", "expect_error_level"),
-    [("0", False), ("1", True), ("137", True), (None, True)],
+    ("exit_status", "killed_by_omnigent", "expect_error_level", "expect_resend"),
+    [
+        ("0", False, False, False),
+        ("1", False, True, True),
+        ("137", False, True, True),
+        (None, False, True, True),
+        (None, True, True, False),
+    ],
 )
 async def test_run_turn_logs_a_closed_terminal_below_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     exit_status: str | None,
+    killed_by_omnigent: bool,
     expect_error_level: bool,
+    expect_resend: bool,
 ) -> None:
     """
     Closing Claude Code is not an Omnigent defect, so it is not an ERROR.
@@ -2001,7 +2010,8 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     afterwards must still fail — the pane is gone — but logging that as an
     ERROR reports the person's own teardown as a mid-session failure. A
     pane that died on its own (any other wait-status, or none recorded)
-    keeps the ERROR and its traceback.
+    keeps the ERROR and its traceback, and its code lets the server send the
+    untyped message again; a quit or an Omnigent kill does not.
     """
     bridge_dir = tmp_path / "bridge"
 
@@ -2010,6 +2020,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
         raise ClaudeTerminalExited(
             "The Claude Code terminal has exited, so the message was not delivered.",
             exit_status=exit_status,
+            killed_by_omnigent=killed_by_omnigent,
         )
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
@@ -2033,6 +2044,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert events[0].undelivered is True
+    assert events[0].code == (TERMINAL_EXITED_BEFORE_DELIVERY_CODE if expect_resend else None)
 
     records = [r for r in caplog.records if "terminal exited" in r.getMessage()]
     assert len(records) == 1
