@@ -9283,6 +9283,11 @@ async def test_sys_session_send_session_id_routes_non_child_through_peer_gate(
     def respond(request):
         if request.method == "GET":
             assert request.url.path == f"/v1/sessions/{target}"
+            assert dict(request.url.params) == {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            }
             return httpx.Response(
                 200,
                 json={
@@ -9321,6 +9326,35 @@ async def test_sys_session_send_session_id_routes_non_child_through_peer_gate(
     else:
         assert result["error"] == "Session message refused"
         assert "reply_mode" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["not-a-session-id", "b" * 32 + "?unexpected"])
+async def test_sys_session_send_rejects_invalid_destination_without_delivery(target) -> None:
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert request.method == "GET"
+        return httpx.Response(404, json={"detail": "Session not found"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": target, "args": "Continue the task"}),
+            server_client=client,
+            conversation_id="a" * 32,
+        )
+    if "?" in target:
+        assert result.startswith("Error: sys_session_send failed to look up session:")
+        assert requests == []
+    else:
+        assert json.loads(result)["error"] == "session_not_found"
+        assert len(requests) == 1
 
 
 @pytest.mark.parametrize("empty_output", ["", "   ", "\n\t "])

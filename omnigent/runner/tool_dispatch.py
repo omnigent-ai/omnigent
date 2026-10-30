@@ -3186,7 +3186,16 @@ async def _send_to_existing_session(
     from omnigent.runner import subagent_work as _subagent_work
 
     try:
-        snap = await server_client.get(f"{_session_url(target_session_id)}", timeout=30.0)
+        # Keep live status for child steering; transcript, liveness and usage are unused.
+        snap = await server_client.get(
+            _session_url(target_session_id),
+            params={
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+            },
+            timeout=30.0,
+        )
     except Exception as exc:  # noqa: BLE001
         return f"Error: sys_session_send failed to look up session: {exc}"
     if snap.status_code == 404:
