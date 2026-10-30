@@ -49,6 +49,7 @@ import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useOpenSubagentInPanel } from "./subagentPanelOpener";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
@@ -507,6 +508,7 @@ function SubagentRow({
   const RoleIcon = iconForAgentType(iconRoleForChild(child));
   const primary = childPrimaryLabel(child);
   const isActive = conversationId === child.id;
+  const openInPanel = useOpenSubagentInPanel();
   // De-emphasize settled rows (done/idle) so working/failed agents dominate
   // — but never the row the user is currently viewing.
   const dim = !isActive && SETTLED_STATE[status.activity];
@@ -570,6 +572,9 @@ function SubagentRow({
           to={{ pathname: `/c/${child.id}`, search }}
           data-testid="subagent-row"
           data-child-session-id={child.id}
+          onClick={(event) => {
+            openInPanel(child.id, event);
+          }}
           data-depth={depth}
           // Left gutter (depth-stepped) + connector glyph nests this row
           // under its parent, signaling where it sits in the tree.

@@ -1,9 +1,15 @@
-// Display label for a child (sub-agent) session, shared by the Agents rail
-// rows and the approval cards a sub-agent's prompts mirror into, so a card
-// names the sub-agent exactly as the rail lists it.
+// Display labels for a child (sub-agent) session: the Agents rail rows and the
+// approval cards a sub-agent's prompts mirror into share one, so a card names
+// the sub-agent exactly as the rail lists it; the composer tray uses the other.
 
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
-import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+import {
+  claudeNativeSubagentLabel,
+  codexNativeSubagentLabel,
+  nativeCodingAgentForSubagentWrapper,
+  WRAPPER_LABEL_KEY,
+} from "@/lib/nativeCodingAgents";
+import type { Session } from "@/lib/types";
 
 // User-added rows use this reserved title sentinel (``"ui:<agent>:<name>"``);
 // LLM-spawned titles cannot start with it because the spec validator rejects
@@ -58,5 +64,46 @@ export function childPrimaryLabel(child: ChildSessionInfo, fallback: string = ch
     trimmed(titleWithoutSentinel(child.title)) ??
     trimmed(child.tool) ??
     fallback
+  );
+}
+
+/**
+ * Resolve the sub-agent instance label for the composer's "Chatting with
+ * sub-agent …" tray: the orchestrator-chosen handle (``titleHandle``), which
+ * the Agents rail's child-row label (``childPrimaryLabel`` above) also ends
+ * with after any generated task summary.
+ *
+ * The spawn tool seeds a sub-agent's title as ``"{tool}:{name}"`` (e.g.
+ * ``"claude_code:check-account-eligibility"``), so the human instance name
+ * is the suffix after the first ``":"``; user-added rows carry a reserved
+ * ``"ui:"`` sentinel that is stripped first. Falls back to the bare title,
+ * then the sub-agent type, then the bound agent name.
+ *
+ * @param session - The active session snapshot, or ``null`` while it loads
+ *   / on the new-chat landing.
+ * @returns The tray label, e.g. ``"check-account-eligibility"``; ``null``
+ *   for a top-level session (no ``parentSessionId``) or when no snapshot is
+ *   loaded — both hide the tray.
+ */
+export function subAgentComposerLabel(
+  session: Pick<
+    Session,
+    "parentSessionId" | "title" | "subAgentName" | "agentName" | "labels"
+  > | null,
+): string | null {
+  if (!session || session.parentSessionId == null) return null;
+  const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
+  if (claudeLabel) return claudeLabel;
+  // Codex children (incl. /side forks) title as "codex-native-ui-subagent:<uuid>";
+  // show the friendly nickname label ("Side chat") instead of that UUID suffix.
+  const codexLabel = codexNativeSubagentLabel(session.labels);
+  if (codexLabel) return codexLabel;
+  const handle = titleHandle(session.title);
+  if (handle) return handle;
+  // Last-resort display string: a sub-agent session always has a seeded
+  // title in practice, so the final "sub-agent" only guards a degenerate
+  // all-null snapshot (the tray still needs something to render).
+  return (
+    titleWithoutSentinel(session.title) ?? session.subAgentName ?? session.agentName ?? "sub-agent"
   );
 }

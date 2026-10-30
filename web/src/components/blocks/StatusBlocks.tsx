@@ -105,6 +105,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "The AI gateway refused this turn because a spending budget or usage limit is exhausted. Contact an admin to raise it, or use a different budget.",
   codex_compaction_model_failed:
     "Codex couldn't compact the conversation on the previous model, so this turn didn't run.",
+  codex_provider_auth_failed:
+    "Codex couldn't get a token from the model provider's sign-in command on the host.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
 };
@@ -118,6 +120,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "terminal_launch_failed",
   "runner_disconnected",
   "runner_failed_to_start",
+  "runner_process_crash",
   "runner_unavailable",
   "rate_limit_exceeded",
   "transient_upstream_error",
@@ -256,7 +259,10 @@ function ErrorForkAction({
   const scopedForkSource =
     forkDialog.currentSessionId != null && conversationId !== forkDialog.currentSessionId;
   if (!scopedForkSource && !forkDialog.canFork) return null;
-  const disabledReason = scopedForkSource ? undefined : forkDialog.disabledReason;
+  const disabledReason = scopedForkSource
+    ? undefined
+    : (forkDialog.disabledReason ??
+      (workspaceRecovery ? forkDialog.workspaceRecoveryDisabledReason : undefined));
   return (
     <div className={className} onClick={(event) => event.stopPropagation()}>
       <DisabledActionTooltip reason={disabledReason} label={label} className="max-w-full">

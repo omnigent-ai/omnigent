@@ -46,7 +46,7 @@ runs:
   steps:
     - name: Set up uv
       # This action also runs from repositories checked out below the workspace root.
-      uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+      uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
       with:
         enable-cache: true
 
@@ -63,7 +63,7 @@ runs:
       run: uv sync --extra all
 
     - name: Install Claude Code CLI
-      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+      uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
       with:
         harness: claude
         version: ${{ inputs.claude-code-version }}
