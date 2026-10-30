@@ -509,7 +509,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     expect(input.permissionMode).toBe("bypassPermissions");
   });
 
-  it.each(["Every day", "Every hour"])(
+  it.each(["Every day", "Every hour", "Custom schedule"])(
     "blocks unsupported rules until explicitly replaced with %s",
     async (frequency) => {
       render(
@@ -530,13 +530,25 @@ describe("CreateScheduledTaskDialog edit mode", () => {
       expect(updateMutateAsync).not.toHaveBeenCalled();
       fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name: frequency }));
+      if (frequency === "Custom schedule") {
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+        fireEvent.keyDown(screen.getByLabelText("Repeat every"), { key: "Escape" });
+        expect(screen.getByLabelText("Frequency")).toHaveTextContent("Choose frequency");
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+        fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: frequency }));
+        fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "2" } });
+        fireEvent.click(screen.getByRole("button", { name: "Apply" }));
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      }
       fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
       await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-      expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
-        frequency === "Every day"
-          ? "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3"
-          : "FREQ=HOURLY;BYMINUTE=0;COUNT=3",
-      );
+      const expectedRules: Record<string, string> = {
+        "Every day": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3",
+        "Every hour": "FREQ=HOURLY;BYMINUTE=0;COUNT=3",
+        "Custom schedule": "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0;COUNT=3",
+      };
+      expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(expectedRules[frequency]);
     },
   );
 });
@@ -984,6 +996,54 @@ describe("CreateScheduledTaskDialog submit", () => {
     });
   });
 
+  it("keeps the saved preset when the first Custom draft is cancelled", async () => {
+    const rule = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: rule })}
+      />,
+    );
+    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Custom schedule" }));
+    fireEvent.change(screen.getByLabelText("Repeat every"), { target: { value: "3" } });
+    fireEvent.keyDown(screen.getByLabelText("Repeat every"), { key: "Escape" });
+    expect(screen.getByLabelText("Frequency")).toHaveTextContent("Every day");
+    expect(screen.queryByTestId("custom-schedule-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(rule);
+  });
+
+  it("allows metadata edits on an expired schedule but validates a replacement", async () => {
+    const rule = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;UNTIL=20200101T235959Z";
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ rrule: rule, timezone: "UTC" })}
+      />,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), {
+      target: { value: "Updated prompt" },
+    });
+    expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Every hour" }));
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Every day" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      name: "Renamed",
+      prompt: "Updated prompt",
+      rrule: rule,
+    });
+  });
+
   it("reopens a yearly schedule and discards unapplied custom changes", async () => {
     render(
       <CreateScheduledTaskDialog
@@ -1046,9 +1106,13 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByLabelText("End date")).toHaveValue("9999-12-31");
     expect(screen.queryByTestId("schedule-error")).not.toBeInTheDocument();
     fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2027-06-10" } });
+    await userEvent.click(screen.getByLabelText("Timezone"));
+    fireEvent.change(screen.getByLabelText("Search timezones"), { target: { value: "New_York" } });
+    await userEvent.click(await screen.findByRole("option", { name: "America/New York" }));
+    expect(screen.getByLabelText("End date")).toHaveValue("2027-06-10");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
-    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toContain(";UNTIL=20270610T155959Z");
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toContain(";UNTIL=20270611T035959Z");
   });
 
   it("does not render the 'Reads as' schedule preview", () => {

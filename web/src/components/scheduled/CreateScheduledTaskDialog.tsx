@@ -266,6 +266,10 @@ export function CreateScheduledTaskDialog({
   );
   const [error, setError] = useState<string | null>(null);
   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
+  const savedSchedule = useMemo(
+    () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
+    [editingTask],
+  );
 
   // Seed Name/Prompt on the closed→open transition ONLY. Keying off the
   // transition (not `open` being true) means we never clobber the user's edits
@@ -279,7 +283,7 @@ export function CreateScheduledTaskDialog({
       setAdvancedOpen(true);
       setTimezone(editingTask?.timezone ?? localTimezone());
       if (editingTask) {
-        const parsedSchedule = parseRRuleToScheduleModel(editingTask.rrule);
+        const parsedSchedule = savedSchedule;
         setName(editingTask.name);
         setPrompt(editingTask.prompt);
         setPickedAgentId(editingTask.agentId);
@@ -320,7 +324,7 @@ export function CreateScheduledTaskDialog({
       setError(null);
     }
     wasOpen.current = open;
-  }, [open, initialName, initialPrompt, initialTrigger, editingTask]);
+  }, [open, initialName, initialPrompt, initialTrigger, editingTask, savedSchedule]);
 
   // A new task pins a host, starting on the first online one as New Chat does.
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
@@ -362,9 +366,13 @@ export function CreateScheduledTaskDialog({
   // the user gets inline feedback instead of a 400. In sandbox mode there is no
   // host/workspace pairing at all, so the rule doesn't apply.
   const workspaceWithoutHost = !sandboxMode && workspace.trim() !== "" && hostId === "";
-  // Block submit on an invalid schedule (bad interval, empty multi-select) so
-  // the form never posts an RRULE the server's validate_rrule would 400.
-  const scheduleInvalid = scheduleUnsupported || validateSchedule(schedule) !== null;
+  // Metadata edits can preserve an expired schedule; rescheduling requires a future cutoff.
+  const allowPastEnd =
+    savedSchedule !== null &&
+    timezone === editingTask?.timezone &&
+    buildRRule(schedule) === buildRRule(savedSchedule);
+  const scheduleInvalid =
+    scheduleUnsupported || validateSchedule(schedule, { allowPastEnd }) !== null;
   const renderedTriggerPrompt =
     trigger !== null && triggerFieldsComplete(triggerFields)
       ? renderTriggerPrompt(trigger, triggerFields, {
@@ -626,6 +634,7 @@ export function CreateScheduledTaskDialog({
             onTimezoneChange={setTimezone}
             model={schedule}
             recurrenceUnsupported={scheduleUnsupported}
+            allowPastEnd={allowPastEnd}
             onChange={setSchedule}
             onRecurrenceSelect={() => setScheduleUnsupported(false)}
             onSelectOpenChange={handleSelectOpenChange}
@@ -787,10 +796,7 @@ export function CreateScheduledTaskDialog({
                 effectiveAgentId={effectiveAgentId}
                 agentLabel={agentLabel}
                 hasAgents={agentList.length > 0}
-                // Drives the per-row "needs setup" badges from
-                // host.configured_harnesses. Uses the pinned host if any, else
-                // falls back to the first online host so the badges show in the
-                // fresh/default state (host is optional here — see `badgeHost`).
+                // Needs-setup badges use the pinned host, else the first online host.
                 host={badgeHost}
                 onSelectAgent={handleSelectAgent}
                 pendingAgent={null}
@@ -812,9 +818,7 @@ export function CreateScheduledTaskDialog({
                 contentClassName="w-80"
                 // Full-width trigger → left-align the menu's edge to it.
                 contentAlign="start"
-                // Match the sibling <Select> fields (Frequency / host): full
-                // width, bordered, h-8, normal foreground text — not the compact
-                // muted ghost styling the composer footer uses.
+                // Match the Host select's full-width, bordered h-8 styling.
                 triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
                 triggerLabelClassName="max-w-none text-ui"
               />

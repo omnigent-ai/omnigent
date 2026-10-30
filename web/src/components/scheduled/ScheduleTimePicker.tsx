@@ -150,7 +150,12 @@ export function ScheduleTimePicker({
         className="w-64 rounded-sm p-1.5"
         onOpenAutoFocus={(event) => event.preventDefault()}
         onInteractOutside={(event) => {
-          if (event.target === inputRef.current) event.preventDefault();
+          if (
+            event.target instanceof Node &&
+            inputRef.current?.parentElement?.contains(event.target)
+          ) {
+            event.preventDefault();
+          }
         }}
       >
         <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">

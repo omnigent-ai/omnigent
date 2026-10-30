@@ -48,7 +48,7 @@ it("closes the active picker without sending Escape to the parent dialog", () =>
   }
 });
 
-it("defers to a nested picker and ignores other keys", () => {
+it("allows later handlers when dismissal declines and ignores other keys", () => {
   const outer = vi.fn(() => false);
   const inner = vi.fn(() => true);
   renderHook(() => {
@@ -75,3 +75,20 @@ it("ignores Escape already handled by an earlier listener", () => {
     window.removeEventListener("keydown", prevent, true);
   }
 });
+
+it.each([{ isComposing: true }, { keyCode: 229 }])(
+  "ignores composition Escape %j",
+  (composition) => {
+    const dismiss = vi.fn(() => true);
+    renderHook(() => useScheduleEscape(true, dismiss));
+    const event = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+      ...composition,
+    });
+    document.body.dispatchEvent(event);
+    expect(dismiss).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  },
+);

@@ -143,6 +143,7 @@ describe("parseRRuleToScheduleModel", () => {
 
 describe("visual schedule validation", () => {
   it.each([
+    { customFreq: "weekly", interval: 209, weekdays: ["MO"] },
     { customFreq: "yearly", month: 2, monthDays: [30, 31] },
     { customFreq: "yearly", month: 4, monthDays: [31] },
     { customFreq: "monthly", monthDays: Array.from({ length: 25 }, (_, index) => index + 1) },
@@ -154,6 +155,7 @@ describe("visual schedule validation", () => {
   });
 
   it.each([
+    { customFreq: "weekly", interval: 209, weekdays: ["FR"] },
     { customFreq: "yearly", month: 2, monthDays: [29, 30] },
     { customFreq: "yearly", interval: 4, month: 2, monthDays: [29] },
     { customFreq: "yearly", interval: 8, hour: 0, month: 1, monthDays: [1] },

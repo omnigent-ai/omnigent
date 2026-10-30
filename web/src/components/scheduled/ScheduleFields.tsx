@@ -80,6 +80,7 @@ export function ScheduleFields({
   onSelectOpenChange,
   onRecurrenceSelect,
   recurrenceUnsupported = false,
+  allowPastEnd = false,
 }: {
   model: ScheduleModel;
   onChange: (next: ScheduleModel) => void;
@@ -88,6 +89,7 @@ export function ScheduleFields({
   onSelectOpenChange?: (open: boolean) => void;
   onRecurrenceSelect?: () => void;
   recurrenceUnsupported?: boolean;
+  allowPastEnd?: boolean;
 }) {
   const [customOpen, setCustomOpen] = useState(false);
   const [draft, setDraft] = useState(model);
@@ -117,7 +119,7 @@ export function ScheduleFields({
     dateInput.timezone === timezone
       ? dateInput
       : null;
-  const error = activeDateInput?.error ?? validateSchedule(model);
+  const error = activeDateInput?.error ?? validateSchedule(model, { allowPastEnd });
   const recurrence = { ...model, end: undefined };
   const recurrenceError = validateSchedule(recurrence);
   const draftError = validateSchedule({ ...draft, end: undefined });
@@ -140,9 +142,10 @@ export function ScheduleFields({
       setDraft(next);
       setCustomOpen(true);
       onSelectOpenChange?.(true);
+      return;
     }
     onChange(next);
-    if (value !== "custom") onRecurrenceSelect?.();
+    onRecurrenceSelect?.();
   }
 
   function changeEnd(value: string) {
@@ -179,6 +182,9 @@ export function ScheduleFields({
     onSelectOpenChange?.(false);
   }
 
+  let selectedFrequency = recurrenceUnsupported ? "" : model.preset;
+  if (customOpen) selectedFrequency = "custom";
+
   return (
     <div className="flex min-w-0 flex-col gap-1.5" data-testid="schedule-fields">
       <Label>Schedule</Label>
@@ -188,13 +194,13 @@ export function ScheduleFields({
           className="min-w-36"
           testId="schedule-preset-trigger"
           preventCloseAutoFocus={customOpen}
-          value={recurrenceUnsupported ? "" : model.preset}
+          value={selectedFrequency}
           placeholder="Choose frequency"
           options={PRESETS}
           onChange={changePreset}
           onOpenChange={onSelectOpenChange}
         />
-        {model.preset === "custom" ? (
+        {model.preset === "custom" || customOpen ? (
           <Popover open={customOpen} onOpenChange={changeCustomOpen}>
             <PopoverTrigger asChild>
               <Button
@@ -203,7 +209,9 @@ export function ScheduleFields({
                 data-testid="custom-schedule-trigger"
               >
                 <span className="truncate">
-                  {recurrenceError ? "Select schedule…" : describeSchedule(buildRRule(recurrence))}
+                  {model.preset !== "custom" || recurrenceError
+                    ? "Select schedule…"
+                    : describeSchedule(buildRRule(recurrence))}
                 </span>
                 <ChevronDownIcon className="size-3.5 shrink-0" />
               </Button>
@@ -357,15 +365,7 @@ export function ScheduleFields({
                       className="h-8 px-2.5 font-normal"
                       aria-label="Days of the week"
                     >
-                      {model.weekdays.length
-                        ? WEEKDAY_CODES.filter((day) => model.weekdays.includes(day))
-                            .map((day) =>
-                              model.weekdays.length === 1
-                                ? WEEKDAY_NAMES[day]
-                                : WEEKDAY_NAMES[day].slice(0, 3),
-                            )
-                            .join(", ")
-                        : "Select days"}
+                      {weekdayLabel(model.weekdays)}
                       <ChevronDownIcon className="size-3.5" />
                     </Button>
                   </PopoverTrigger>
@@ -488,11 +488,7 @@ export function ScheduleFields({
         </div>
       </div>
       {model.preset === "hourly" && Number.isInteger(model.minute) && (
-        <p className="text-sm text-muted-foreground">
-          {model.minute === 0
-            ? "Runs at the start of every hour."
-            : `Runs at ${model.minute} ${model.minute === 1 ? "minute" : "minutes"} past every hour.`}
-        </p>
+        <p className="text-sm text-muted-foreground">{hourlyHint(model.minute)}</p>
       )}
       {error && (
         <p className="text-sm text-destructive" role="alert" data-testid="schedule-error">
@@ -602,4 +598,18 @@ function WeekdayButtons({
       ))}
     </div>
   );
+}
+
+function hourlyHint(minute: number): string {
+  if (minute === 0) return "Runs at the start of every hour.";
+  const unit = minute === 1 ? "minute" : "minutes";
+  return `Runs at ${minute} ${unit} past every hour.`;
+}
+
+function weekdayLabel(days: WeekdayCode[]): string {
+  if (days.length === 0) return "Select days";
+  if (days.length === 1) return WEEKDAY_NAMES[days[0]];
+  return WEEKDAY_CODES.filter((day) => days.includes(day))
+    .map((day) => WEEKDAY_NAMES[day].slice(0, 3))
+    .join(", ");
 }

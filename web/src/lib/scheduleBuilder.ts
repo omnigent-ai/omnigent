@@ -89,7 +89,10 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
   const customFreq = frequency as CustomFreq;
   const interval = parseNumberPart(parts.get("INTERVAL") ?? "1", 1, 366);
   const minute = parseNumberPart(parts.get("BYMINUTE"), 0, 59);
-  const hour = customFreq === "hourly" ? 9 : parseNumberPart(parts.get("BYHOUR"), 0, 23);
+  const hour =
+    customFreq === "hourly"
+      ? DEFAULT_SCHEDULE_MODEL.hour
+      : parseNumberPart(parts.get("BYHOUR"), 0, 23);
   if (interval === null || hour === null || minute === null) return null;
   const allowed = ["FREQ", "INTERVAL", "BYMINUTE", "COUNT", "UNTIL"];
   if (customFreq !== "hourly") allowed.push("BYHOUR");
@@ -288,7 +291,9 @@ export function validateSchedule(
   }
   if (
     model.preset === "custom" &&
-    (model.customFreq === "monthly" || model.customFreq === "yearly")
+    (model.customFreq === "weekly" ||
+      model.customFreq === "monthly" ||
+      model.customFreq === "yearly")
   ) {
     // Match the server's fixed validation window without excluding multiple dates in one period.
     const occurrences = new RRule({
