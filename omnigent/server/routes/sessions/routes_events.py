@@ -3796,20 +3796,9 @@ def register_events_routes(
             worktree cleanup cannot run.
         """
         user_id = _require_user(request, auth_provider)
-        if permission_store is not None and user_id is not None:
-            is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-            if not is_admin:
-                grant = await asyncio.to_thread(permission_store.get, user_id, session_id)
-                if grant is None or grant.level < LEVEL_OWNER:
-                    if grant is not None:
-                        raise OmnigentError(
-                            "Only the session owner can delete this session",
-                            code=ErrorCode.FORBIDDEN,
-                        )
-                    raise OmnigentError(
-                        "Conversation not found",
-                        code=ErrorCode.NOT_FOUND,
-                    )
+        await _require_access(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
@@ -3946,7 +3935,14 @@ def register_events_routes(
         host_store_for_managed = getattr(request.app.state, "host_store", None)
         if conv.host_id is not None and host_store_for_managed is not None:
             bound_host = await asyncio.to_thread(host_store_for_managed.get_host, conv.host_id)
-            if bound_host is not None and bound_host.sandbox_provider is not None:
+            remaining_host_sessions = await asyncio.to_thread(
+                conversation_store.list_host_conversation_ids, conv.host_id, limit=1
+            )
+            if (
+                bound_host is not None
+                and bound_host.sandbox_provider is not None
+                and not remaining_host_sessions
+            ):
                 from omnigent.server.managed_hosts import terminate_managed_host
 
                 await terminate_managed_host(

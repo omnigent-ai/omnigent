@@ -262,6 +262,25 @@ describe("createSession", () => {
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
 
+  it("forwards related source and model without fabricating parent or role labels", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ id: "peer", agent_id: "agent_xyz", created_at: 0 }),
+    );
+    await createSession("agent_xyz", [], {
+      relatedToSessionId: "source_peer",
+      modelOverride: "model-1",
+      title: "Review",
+    });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      agent_id: "agent_xyz",
+      initial_items: [],
+      related_to_session_id: "source_peer",
+      model_override: "model-1",
+      title: "Review",
+    });
+  });
+
   it("forwards parent_session_id, sub_agent_name and title for the Add-agent path", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

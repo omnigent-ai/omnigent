@@ -9890,6 +9890,40 @@ async def test_post_external_mcp_startup_all_ready_evicts_snapshot_cache(
         sessions_module._session_mcp_startup_cache.pop(session["id"], None)
 
 
+async def test_delete_peer_keeps_shared_managed_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    host_store = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="shared",
+        user_id="local",
+        token="test-token",
+        provider="modal",
+        sandbox_id="sandbox-test",
+        token_expires_at=2_000_000_000,
+    )
+    app.state.host_store = host_store
+    root = store.create_conversation(host_id=host_id, workspace="/workspace")
+    peer = store.create_conversation(
+        parent_conversation_id=root.id, host_id=host_id, workspace="/workspace"
+    )
+    with patch(
+        "omnigent.server.managed_hosts.terminate_managed_host", new_callable=AsyncMock
+    ) as terminate:
+        response = await client.delete(f"/v1/sessions/{peer.id}")
+        assert response.status_code == 200, response.text
+        terminate.assert_not_awaited()
+        assert host_store.get_host(host_id) is not None
+        response = await client.delete(f"/v1/sessions/{root.id}")
+        assert response.status_code == 200, response.text
+        terminate.assert_awaited_once()
+
+
 async def test_delete_session_evicts_mcp_startup_cache(
     client: httpx.AsyncClient,
 ) -> None:

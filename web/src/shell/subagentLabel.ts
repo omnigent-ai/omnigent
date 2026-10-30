@@ -21,6 +21,7 @@ import type { Session } from "@/lib/types";
  * @returns The label shown beside the child icon.
  */
 export function childPrimaryLabel(child: ChildSessionInfo): string {
+  if (child.labels?.["omnigent.session_role"] === "peer") return child.title || "Session";
   // User-added rows use the reserved "ui:<agent>:<name>" title sentinel;
   // LLM-spawned titles cannot start with "ui:" because the spec validator
   // rejects "ui" as a sub-agent name.
@@ -70,7 +71,12 @@ export function subAgentComposerLabel(
     "parentSessionId" | "title" | "subAgentName" | "agentName" | "labels"
   > | null,
 ): string | null {
-  if (!session || session.parentSessionId == null) return null;
+  if (
+    !session ||
+    session.parentSessionId == null ||
+    session.labels?.["omnigent.session_role"] === "peer"
+  )
+    return null;
   const claudeLabel = claudeNativeSubagentLabel(session.labels, session.subAgentName);
   if (claudeLabel) return claudeLabel;
   // Codex children (incl. /side forks) title as "codex-native-ui-subagent:<uuid>";

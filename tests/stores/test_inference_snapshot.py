@@ -289,6 +289,20 @@ def test_explicit_child_snapshot_takes_precedence_over_parent(
     assert fetched.inference_snapshot == child_snapshot
 
 
+@pytest.mark.parametrize("source_snapshot", [None, {"revision": "source"}])
+def test_peer_uses_explicit_source_configuration_without_root_fallback(
+    store: SqlAlchemyConversationStore, source_snapshot: dict[str, Any] | None
+) -> None:
+    root = store.create_conversation(inference_snapshot=_snapshot())
+    peer = store.create_conversation(
+        parent_conversation_id=root.id,
+        labels={"omnigent.session_role": "peer"},
+        inference_snapshot=source_snapshot,
+    )
+    assert peer.inference_snapshot == source_snapshot
+    assert store.get_conversation(peer.id).inference_snapshot == source_snapshot
+
+
 def test_snapshot_metadata_and_bundled_agent_roll_back_together(
     store: SqlAlchemyConversationStore,
 ) -> None:

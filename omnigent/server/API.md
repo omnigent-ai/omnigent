@@ -597,6 +597,24 @@ This preserves the existing sessions API contract for clients that
 already uploaded or registered an agent. The response is the full
 `SessionResponse` shape with `id` set to the new conversation id.
 
+  related_to_session_id (string or null)
+    Opt-in full peer session, gated by `/v1/info.features.related_sessions`
+    (default false). Requires ownership of the source's session tree and a
+    bound source runner. The new session attaches directly to the tree root
+    and reuses the source's execution environment with fresh context. Select
+    its registered `agent_id` and optional `model_override` independently.
+    Do not combine with `parent_session_id`, `sub_agent_name`, managed placement,
+    a new project/worktree, or a different host/workspace. Public read-only
+    sharing remains inherited from the root; a reader cannot create peers.
+    The server stamps the protected `omnigent.session_role=peer` label and
+    records the source in `omnigent.created_by_session_id`.
+
+    Enable `OMNIGENT_FEATURES=related_sessions` on the server for the draft UI.
+    This adds no host, runner, or sandbox-provider handshake requirement; do
+    not pass the new server flag to an older host/runner process. Existing
+    creation requests without this field retain their behavior. The MCP
+    orchestration tools keep their existing creation and approval boundaries.
+
   initial_input (object or null)
     When `/v1/info` advertises `durable_initial_input: true`, managed creates
     can include one user `message` or SDK skill `slash_command` event. For example:
@@ -851,6 +869,26 @@ files, and the conversation row.
     `designs/SESSION_GIT_WORKTREE.md`.
 
 ### Bind Session Runner
+
+Related-session groups also support an owner-only archive operation while the
+`related_sessions` feature is enabled:
+
+```json
+{"archived": true, "archive_scope": "tree"}
+```
+
+Send it to `PATCH /v1/sessions/{root_id}`. The response's
+`archive_changed_session_ids` lists only the rows this operation changed.
+Undo sends `archived: false`, `archive_scope: "tree"`, and those IDs as
+`archive_session_ids`, preserving previously archived peers. Omitting the ID
+list restores the whole subtree. Tree archive accepts no unrelated mutations
+and retains the existing grace period before stopping affected work.
+
+`GET /v1/sessions/{id}/child_sessions?include_archived=true` includes archived
+children for the group's Archived section; the default remains false. Child
+summaries expose `archived`, `session_role` (`"peer"` or null), `host_id`, and
+`workspace`. Follow pagination to enumerate the complete roster. A peer's own
+host determines routing; its logical parent is not an execution destination.
 
 ```
 PATCH /v1/sessions/{session_id}[?include_usage=true]

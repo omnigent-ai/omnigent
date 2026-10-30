@@ -504,6 +504,8 @@ export async function createSession(
   initialItems: SessionEventInput[] = [],
   options: {
     parentSessionId?: string;
+    relatedToSessionId?: string;
+    modelOverride?: string;
     subAgentName?: string | null;
     title?: string;
   } = {},
@@ -512,12 +514,18 @@ export async function createSession(
     agent_id: string;
     initial_items: SessionEventInput[];
     parent_session_id?: string;
+    related_to_session_id?: string;
+    model_override?: string;
     sub_agent_name?: string | null;
     title?: string;
   } = { agent_id: agentId, initial_items: initialItems };
   if (options.parentSessionId !== undefined) {
     body.parent_session_id = options.parentSessionId;
   }
+  if (options.relatedToSessionId !== undefined) {
+    body.related_to_session_id = options.relatedToSessionId;
+  }
+  if (options.modelOverride) body.model_override = options.modelOverride;
   if (options.subAgentName !== undefined) {
     body.sub_agent_name = options.subAgentName;
   }

@@ -13,8 +13,10 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from fastapi import Request
 from pydantic import ValidationError
 
+from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.models.model_override import validate_model_override
 from omnigent.runtime.agent_cache import AgentCache
@@ -34,6 +36,86 @@ class ProjectCreateResolution:
 
     body: Any
     project_id: str | None = None
+
+
+async def resolve_related_session_create(
+    body: Any,
+    request: Request,
+    user_id: str | None,
+    conversation_store: ConversationStore,
+    permission_store: PermissionStore | None,
+) -> tuple[Any, Conversation | None]:
+    """Resolve a full peer's tree separately from its source execution environment."""
+    if body.related_to_session_id is None:
+        return body, None
+    from omnigent.server.feature_flags import Feature
+    from omnigent.server.session_orchestration import require_owned_session
+    from omnigent.util.session_lifecycle import is_session_closed
+
+    if not request.app.state.feature_flags.enabled(Feature.RELATED_SESSIONS):
+        raise OmnigentError("Related sessions are disabled", code=ErrorCode.FORBIDDEN)
+    # ponytail: reuse the proven environment; remote placement needs delegated authorization.
+    if (
+        body.parent_session_id is not None
+        or body.sub_agent_name is not None
+        or body.host_type != "external"
+        or body.git is not None
+        or body.workspaces is not None
+        or body.project_id is not None
+    ):
+        raise OmnigentError(
+            "Related sessions use their source environment and cannot specify "
+            "a parent, named sub-agent, sandbox, worktree or project",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if user_id is not None and permission_store is not None:
+        source = await asyncio.to_thread(
+            require_owned_session,
+            body.related_to_session_id,
+            user_id,
+            conversation_store,
+            permission_store,
+        )
+    else:
+        source = await asyncio.to_thread(
+            conversation_store.get_conversation, body.related_to_session_id
+        )
+    if source is None or source.archived or is_session_closed(source.labels, source.title):
+        raise OmnigentError("Source session is unavailable", code=ErrorCode.FORBIDDEN)
+    root = await asyncio.to_thread(
+        conversation_store.get_conversation, source.root_conversation_id
+    )
+    if (
+        root is None
+        or root.parent_conversation_id is not None
+        or root.archived
+        or is_session_closed(root.labels, root.title)
+    ):
+        raise OmnigentError("Root session is unavailable", code=ErrorCode.FORBIDDEN)
+    if source.runner_id is None:
+        raise OmnigentError(
+            "Related sessions require a source with a bound runner", code=ErrorCode.INVALID_INPUT
+        )
+    from omnigent.runner.routing import routing_host_session
+
+    placement = await asyncio.to_thread(routing_host_session, source, conversation_store)
+    host_id, workspace = source.host_id, source.workspace
+    if placement is not None and placement.runner_id == source.runner_id:
+        host_id = placement.host_id
+        workspace = source.workspace or placement.workspace
+    if (body.host_id is not None and body.host_id != host_id) or (
+        body.workspace is not None and body.workspace != workspace
+    ):
+        raise OmnigentError(
+            "Related sessions must use the source host and workspace", code=ErrorCode.INVALID_INPUT
+        )
+    return body.model_copy(
+        update={
+            "parent_session_id": root.id,
+            "host_id": host_id,
+            "workspace": workspace,
+        }
+    ), source
 
 
 async def resolve_project_session_create(

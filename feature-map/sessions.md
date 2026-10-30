@@ -9,6 +9,12 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `related-sessions`: behind `related_sessions`, create full peer sessions from
+  Agents → New session or the sidebar's Add agent menu. Main and peers share one
+  sidebar row, with independently collapsible helper lists and group-scoped side
+  tabs. Creation uses fresh context on the source's existing runner. See the
+  [draft spec](../specs/features/related-sessions.md) for unsupported placement and
+  orchestration choices.
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
@@ -183,6 +189,14 @@ the header menu), and each place is a separate entry point.
   a flat Display filter and the tooltip keeps its plain layout.
 
 ## How to get to it (user POV)
+
+With `related_sessions` enabled, open **Agents → New session** in the right
+Workspace panel, or **Add agent** in a sidebar row's overflow/right-click menu.
+Select a peer to center its conversation; use its side-panel button to chat beside
+the current conversation. Each full session has its own collapsible Subagents
+section. At mobile width, open **Conversation actions → Agents**. The original
+sidebar row's **Archive All** and **Delete All** act on the group; peer controls
+act only on that peer and its helpers.
 
 **Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
@@ -515,6 +529,28 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 Tests that stop a runner, restart the server, or read the database cannot run
 through `verify-env run`. They are marked "own environment" below; run them with
 plain `uv run pytest`, which starts a private server for the test.
+
+- **`related-sessions` (opt-in draft):** Enable `related_sessions` on the isolated
+  server only. In an owned session with an attached runner, open **Agents → New
+  session**, choose an agent/model, enter a name and optional draft, then create.
+  Repeat from that peer: both peers should appear beside Main under the original
+  sidebar row. Independently collapse Main's and each peer's Subagents, rename
+  and reorder peers, and reload. Open a peer in a side panel, send a message, then
+  switch the center conversation: its tab, transcript and composer remain scoped
+  to the peer. Repeat creation from the sidebar **Add agent** menu and check the
+  Agents drawer at mobile width. Archive one peer, then **Archive All → Undo**:
+  the previously archived peer must stay archived. **Delete All** removes the
+  group. Fresh context/current environment are the only enabled create choices.
+  Creation, ownership, routing and legacy requests have coverage in
+  `tests/server/integration/test_session_orchestration.py`; group lifecycle in
+  `tests/server/integration/test_sessions_archive.py` and
+  `tests/server/test_host_runner_ownership.py`. Component coverage is in
+  `web/src/shell/SubagentsPanel.test.tsx`, `web/src/shell/AddAgentDialog.test.tsx`,
+  `web/src/shell/Sidebar.archive.test.tsx`,
+  `web/src/hooks/useRelatedSessionLifecycle.test.tsx`,
+  `web/src/hooks/useSideChats.test.tsx` and
+  `web/src/components/chat/SideChatPane.test.tsx`. The flag defaults off; legacy
+  hosts/runners/providers require no new fields or upgrade.
 
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,

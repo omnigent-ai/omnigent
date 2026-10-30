@@ -8,10 +8,11 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import FeatureFlags
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SESSION_ROLE_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -28,6 +29,132 @@ from tests.server.integration.test_sessions_subagent_context import (
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_related_sessions_inherit_source_placement_and_root_access(
+    auth_client, auth_app, peers, db_uri, monkeypatch
+):
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(frozenset({Feature.RELATED_SESSIONS}))
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("__public__")
+    permissions.grant("__public__", source["id"], LEVEL_READ)
+    first = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "related_to_session_id": source["id"]},
+    )
+    assert first.status_code == 201, first.text
+    peer = first.json()
+    assert peer["parent_session_id"] == source["id"]
+    assert peer["labels"][SESSION_ROLE_LABEL_KEY] == "peer"
+    assert peer["runner_id"] == store.get_conversation(source["id"]).runner_id
+    # A source on another proven environment must not silently use the root's runner.
+    store.replace_runner_id(peer["id"], "peer-runner")
+    store.set_host_id(peer["id"], "a" * 32, workspace="/peer/workspace")
+
+    async def validate_workspace(**kwargs):
+        assert kwargs["host_id"] == "a" * 32
+        assert kwargs["workspace"] == "/peer/workspace"
+        return kwargs["workspace"]
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._validate_session_workspace",
+        validate_workspace,
+    )
+    second = await auth_client.post(
+        "/v1/sessions",
+        json={"agent_id": source["agent_id"], "related_to_session_id": peer["id"]},
+    )
+    assert second.status_code == 201, second.text
+    sibling = second.json()
+    assert sibling["parent_session_id"] == source["id"]
+    assert sibling["runner_id"] == "peer-runner"
+    assert sibling["host_id"] == "a" * 32
+    assert sibling["workspace"] == "/peer/workspace"
+    assert sibling["labels"][CREATED_BY_SESSION_LABEL_KEY] == peer["id"]
+    assert permissions.get("__public__", sibling["id"]) is None
+    visible = await auth_client.get(
+        f"/v1/sessions/{sibling['id']}", headers={"X-Forwarded-Email": "bob"}
+    )
+    assert visible.status_code == 200, visible.text
+    store.update_conversation(sibling["id"], archived=True)
+    listing = (
+        await auth_client.get(f"/v1/sessions/{source['id']}/child_sessions?include_archived=true")
+    ).json()
+    listed = next(row for row in listing["data"] if row["id"] == sibling["id"])
+    assert listed["session_role"] == "peer"
+    assert listed["archived"] is True
+    assert listed["host_id"] == "a" * 32
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "disabled",
+        "reader",
+        "admin",
+        "unbound",
+        "different_host",
+        "workspace",
+        "managed",
+        "parent",
+        "named",
+    ],
+)
+async def test_related_creation_rejects_before_persisting(
+    auth_client, auth_app, peers, db_uri, condition
+):
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(
+        frozenset() if condition == "disabled" else frozenset({Feature.RELATED_SESSIONS})
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    payload = {"agent_id": source["agent_id"], "related_to_session_id": source["id"]}
+    headers = {"X-Forwarded-Email": "alice"}
+    if condition in {"reader", "admin"}:
+        permissions.ensure_user("bob")
+        permissions.grant("bob", source["id"], LEVEL_READ)
+        permissions.set_admin("bob", condition == "admin")
+        headers["X-Forwarded-Email"] = "bob"
+    elif condition == "unbound":
+        other = await _create_session_as(auth_client, "", "alice")
+        payload["related_to_session_id"] = other["id"]
+    elif condition == "different_host":
+        payload["host_id"] = "b" * 32
+    elif condition == "workspace":
+        payload["workspace"] = "/different/workspace"
+    elif condition == "managed":
+        payload["host_type"] = "managed"
+    elif condition == "parent":
+        payload["parent_session_id"] = source["id"]
+    elif condition == "named":
+        payload["sub_agent_name"] = "worker"
+    before = {row.id for row in store.list_conversations().data}
+    response = await auth_client.post("/v1/sessions", json=payload, headers=headers)
+    assert response.status_code in {400, 403}, response.text
+    assert {row.id for row in store.list_conversations().data} == before
+
+
+async def test_peer_role_cannot_be_forged_or_copied_to_top_level_fork(
+    auth_client, auth_app, peers, db_uri
+):
+    source, _, _ = peers
+    auth_app.state.feature_flags = FeatureFlags(frozenset({Feature.RELATED_SESSIONS}))
+    for role in ("peer", ""):
+        labels = {SESSION_ROLE_LABEL_KEY: role}
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], "labels": labels}
+        )
+        assert response.status_code == 400, response.text
+        response = await auth_client.patch(f"/v1/sessions/{source['id']}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(source["id"], {SESSION_ROLE_LABEL_KEY: "peer"})
+    fork = await auth_client.post(f"/v1/sessions/{source['id']}/fork", json={})
+    assert fork.status_code == 201, fork.text
+    assert SESSION_ROLE_LABEL_KEY not in store.get_conversation(fork.json()["id"]).labels
 
 
 @pytest.fixture(autouse=True)

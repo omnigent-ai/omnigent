@@ -1973,6 +1973,7 @@ function AppShellImpl() {
   // With the panel setting on, sub-agent links open a rail tab beside this chat,
   // revealing the rail if another panel covers it. Ancestors still navigate.
   const parentSessionId = activeSession?.parentSessionId;
+  const relatedSessions = isFeatureEnabled(serverInfo, "related_sessions");
   const workspacePanelMounted = hasRailContent || selectedFilePath !== null;
   const openSubagentInPanel = useCallback(
     (childSessionId: string) => {
@@ -1981,10 +1982,10 @@ function AppShellImpl() {
         pendingConversation ||
         !workspacePanelMounted ||
         childSessionId === conversationId ||
-        childSessionId === rootSessionId ||
-        isCachedAncestor(queryClient, parentSessionId, childSessionId) ||
-        // The parent chain may still be loading; the Agents tree's cache shows ancestry too.
-        cachedTreeContains(queryClient, childSessionId, conversationId, MAX_TREE_DEPTH)
+        (!relatedSessions &&
+          (childSessionId === rootSessionId ||
+            isCachedAncestor(queryClient, parentSessionId, childSessionId) ||
+            cachedTreeContains(queryClient, childSessionId, conversationId, MAX_TREE_DEPTH)))
       ) {
         return false;
       }
@@ -1999,6 +2000,7 @@ function AppShellImpl() {
       pendingConversation,
       workspacePanelMounted,
       rootSessionId,
+      relatedSessions,
       parentSessionId,
       queryClient,
       revealRightPanel,
@@ -2638,7 +2640,11 @@ function AppShellImpl() {
                     settingsMode={inSettings}
                     onOpenSidebar={handleSidebarOpen}
                     isChildSession={isChildSession}
-                    subAgentName={activeSession?.subAgentName ?? null}
+                    subAgentName={
+                      activeSession?.labels?.["omnigent.session_role"] === "peer"
+                        ? activeSession.title
+                        : (activeSession?.subAgentName ?? null)
+                    }
                     conversationId={conversationId}
                     createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}

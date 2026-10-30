@@ -8,6 +8,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { AddAgentDialog } from "./AddAgentDialog";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+import { useSession } from "@/hooks/useSession";
+import { useHostModelOptions } from "@/hooks/useHosts";
+import { getSessionDraft } from "@/lib/sessionDrafts";
 import { createSession } from "@/lib/sessionsApi";
 
 const navigateMock = vi.fn();
@@ -19,6 +22,8 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
 }));
+vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/hooks/useHosts", () => ({ useHostModelOptions: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ createSession: vi.fn() }));
 
 const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
@@ -39,13 +44,19 @@ function mockAgents(agents: AvailableAgent[]) {
   } as unknown as ReturnType<typeof useAvailableAgents>);
 }
 
-function renderDialog(parentSessionId = "conv_parent") {
+function renderDialog(parentSessionId = "conv_parent", relatedSession = false) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const invalidateSpy = vi.spyOn(client, "invalidateQueries");
   const utils = render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
-        <AddAgentDialog parentSessionId={parentSessionId} open onOpenChange={vi.fn()} />
+        <AddAgentDialog
+          parentSessionId={parentSessionId}
+          rootSessionId={relatedSession ? "conv_root" : parentSessionId}
+          relatedSession={relatedSession}
+          open
+          onOpenChange={vi.fn()}
+        />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -53,6 +64,7 @@ function renderDialog(parentSessionId = "conv_parent") {
 }
 
 beforeEach(() => {
+  vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   useAvailableAgentsMock.mockReset();
   createSessionMock.mockReset();
   navigateMock.mockReset();
@@ -188,5 +200,60 @@ describe("AddAgentDialog", () => {
     );
     // A failed create must not navigate the user away from the parent.
     expect(navigateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("related session creation", () => {
+  it("uses the acted-on peer as source and stages its first message without running it", async () => {
+    vi.mocked(useSession).mockReturnValue({ session: { hostId: "host_peer" } } as ReturnType<
+      typeof useSession
+    >);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [{ id: "model-1", displayName: "Model One" }],
+    } as ReturnType<typeof useHostModelOptions>);
+    createSessionMock.mockResolvedValue({ id: "conv_new_peer" } as Awaited<
+      ReturnType<typeof createSession>
+    >);
+    const { invalidateSpy } = renderDialog("conv_peer", true);
+    fireEvent.click(screen.getByTestId("agent-card-ag_codex"));
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "model-1" } });
+    fireEvent.change(screen.getByLabelText("First message (optional draft)"), {
+      target: { value: "Review the API" },
+    });
+    expect(screen.getByRole("option", { name: "Fork context — coming soon" })).toBeDisabled();
+    expect(screen.getByRole("option", { name: "New sandbox — coming soon" })).toBeDisabled();
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+    await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_new_peer"));
+    expect(createSessionMock).toHaveBeenCalledWith("ag_codex", [], {
+      relatedToSessionId: "conv_peer",
+      title: "codex",
+      modelOverride: "model-1",
+    });
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ["conversation", "conv_root", "child_sessions"],
+    });
+    expect(useHostModelOptions).toHaveBeenCalledWith("host_peer", "codex", true, {
+      poll: false,
+    });
+    expect(getSessionDraft("conv_new_peer")?.text).toBe("Review the API");
+  });
+
+  it("uses the harness default when older hosts have no model catalog", async () => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: null, agentId: "ag_codex", harness: "codex" },
+    } as ReturnType<typeof useSession>);
+    vi.mocked(useHostModelOptions).mockReturnValue({ data: undefined } as ReturnType<
+      typeof useHostModelOptions
+    >);
+    createSessionMock.mockResolvedValue({ id: "conv_default" } as Awaited<
+      ReturnType<typeof createSession>
+    >);
+    renderDialog("conv_peer", true);
+    fireEvent.click(screen.getByTestId("add-agent-submit"));
+    await waitFor(() => expect(createSessionMock).toHaveBeenCalled());
+    expect(createSessionMock).toHaveBeenCalledWith("ag_codex", [], {
+      relatedToSessionId: "conv_peer",
+      title: "codex",
+    });
   });
 });

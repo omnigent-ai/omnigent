@@ -987,6 +987,11 @@
             "description": "Agent type recorded on the latest task, e.g. `\"researcher\"`. Mirrors the `tool` prefix in `title` and is provided alongside it because the title is a denormalized string while `agent_name` is the durable per-task value.",
             "title": "Agent Name"
           },
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
           "busy": {
             "default": false,
             "description": "`True` when the child's session loop is live. Mirrors the algorithm used by `GET /v1/sessions/{id}` to compute `status`: read the live in-memory cache first (`\"running\"`/`\"waiting\"` \u2192 busy), and fall back to the latest task's status on cache miss (`\"queued\"` / `\"in_progress\"` \u2192 busy). For NO_DBOS sessions the tasks table is not populated during active runs, so the cache consult is what keeps the rail's \"Working\" badge correct.",
@@ -1022,6 +1027,17 @@
             ],
             "description": "Status of the latest task, e.g. `\"completed\"`, `\"in_progress\"`, `\"failed\"`. `None` if no tasks exist.",
             "title": "Current Task Status"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
           },
           "id": {
             "description": "Child conversation/session identifier, e.g. `\"conv_child123\"`.",
@@ -1123,6 +1139,18 @@
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
           },
+          "session_role": {
+            "anyOf": [
+              {
+                "const": "peer",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Role"
+          },
           "task_summary": {
             "anyOf": [
               {
@@ -1163,6 +1191,17 @@
             "format": "int64",
             "title": "Updated At",
             "type": "integer"
+          },
+          "workspace": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workspace"
           }
         },
         "required": [
@@ -8460,6 +8499,20 @@
             "description": "Human-readable name of the bound agent, e.g. `\"research-agent\"`. Loaded from the agent row at snapshot-build time. `None` when the agent row cannot be found (deleted or orphaned session).",
             "title": "Agent Name"
           },
+          "archive_changed_session_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archive Changed Session Ids"
+          },
           "archived": {
             "default": false,
             "description": "Whether the session is archived. Archived sessions are hidden from the default sidebar listing and surface only behind the \"Show archived\" toggle. `False` for normal sessions. Toggled via `PATCH /v1/sessions/{id}`.",
@@ -10456,6 +10509,29 @@
             ],
             "description": "Codex-native approval mode to switch a running session to, one of `\"ask-for-approval\"`, `\"approve-for-me\"`, `\"full-access\"`, `\"read-only\"` \u2014 Codex's own `/permissions` presets (the set is codex-version-dependent, so an older build may not offer every one). Only valid for sessions stamped with the codex-native wrapper label. The runner applies it by driving Codex's `/permissions` popup and confirms the switch echoed before returning, so a failure to reach the mode surfaces as an error. The confirmed mode is stored on the read-back label only (Codex owns the durable approval state), so it is not written to `terminal_launch_args`. Omitted leaves unchanged.",
             "title": "Approval Mode"
+          },
+          "archive_scope": {
+            "default": "session",
+            "enum": [
+              "session",
+              "tree"
+            ],
+            "title": "Archive Scope",
+            "type": "string"
+          },
+          "archive_session_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Archive Session Ids"
           },
           "archived": {
             "anyOf": [
@@ -15181,6 +15257,17 @@
                 }
               ],
               "title": "Session Name"
+            }
+          },
+          {
+            "description": "Include archived children for group lifecycle controls.",
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Archived",
+              "type": "boolean"
             }
           }
         ],

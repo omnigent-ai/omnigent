@@ -151,6 +151,27 @@ describe("side-chat soft tabs", () => {
 describe("sub-agent tabs", () => {
   const subagentTab = subagentTabId("conv_child");
 
+  it("shares full-session tabs within a root while keeping real side chats session-scoped", () => {
+    writeSessionWorkspaceState("main", { openSideChats: ["side-main"] });
+    writeSessionWorkspaceState("peer", { openSideChats: ["side-peer"] });
+    const { result, rerender } = renderHook(({ id, scope }) => useSideChats(id, scope), {
+      initialProps: { id: "main", scope: "related:main" },
+    });
+    act(() => result.current.open(subagentTab));
+    rerender({ id: "peer", scope: "related:main" });
+    expect(result.current.tabs).toEqual(["side-peer", subagentTab]);
+    expect(result.current.selected).toBe(subagentTab);
+    act(() => result.current.open("side-peer-two"));
+    expect(readSessionWorkspaceState("main").openSideChats).toEqual(["side-main"]);
+    rerender({ id: "unrelated", scope: "related:unrelated" });
+    expect(result.current.tabs).toEqual([]);
+    rerender({ id: "main", scope: "related:main" });
+    expect(result.current.tabs).toEqual(["side-main", subagentTab]);
+    act(() => result.current.close(subagentTab));
+    rerender({ id: "peer", scope: "related:main" });
+    expect(result.current.tabs).toEqual(["side-peer", "side-peer-two"]);
+  });
+
   it("restore after a reload, after the side chats, with the selection", () => {
     const first = renderHook(() => useSideChats("session-a"));
     act(() => first.result.current.open(subagentTab));

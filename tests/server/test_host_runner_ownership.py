@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from omnigent.entities import Conversation
@@ -24,6 +26,9 @@ class _Rows:
         if self.raising:
             raise RuntimeError("store unavailable")
         return self.rows.get(conversation_id)
+
+    def list_conversations_by_runner_id(self, runner_id: str) -> list[Conversation]:
+        return [row for row in self.rows.values() if row.runner_id == runner_id]
 
 
 def _row(
@@ -120,3 +125,13 @@ async def test_owns_host_runner_fails_closed_when_an_ancestor_read_raises() -> N
     store = _Rows(ROOT, raising=True)
     assert await _owns_host_runner(CHILD_OWN, store) is False  # type: ignore[arg-type]
     assert store.reads == 1
+
+
+@pytest.mark.asyncio
+async def test_peer_sharing_a_siblings_runner_cannot_tear_it_down() -> None:
+    peer = replace(CHILD_OWN, labels={"omnigent.session_role": "peer"})
+    sibling = replace(peer, id="sibling")
+    assert not await _owns_host_runner(peer, _Rows(ROOT, peer, sibling))
+    assert not await _owns_host_runner(ROOT, _Rows(ROOT, replace(peer, runner_id=ROOT.runner_id)))
+    archived_sibling = replace(sibling, archived=True)
+    assert await _owns_host_runner(peer, _Rows(ROOT, peer, archived_sibling))

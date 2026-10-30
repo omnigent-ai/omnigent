@@ -103,6 +103,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    SESSION_ROLE_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -1142,7 +1143,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                             f"parent conversation {parent_conversation_id!r} does not exist"
                         )
                     root_id = parent_row.root_conversation_id
-                if inference_snapshot is None:
+                if (
+                    inference_snapshot is None
+                    and (labels or {}).get(SESSION_ROLE_LABEL_KEY) != "peer"
+                ):
                     parent_meta = self._get_meta(parent_conversation_id)
                     encoded_inference_snapshot = (
                         parent_meta.inference_snapshot if parent_meta else None
@@ -5920,6 +5924,68 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 is not None
             )
+
+    def archive_subtree(
+        self,
+        conversation_id: str,
+        archived: bool,
+        *,
+        only_ids: list[str] | None = None,
+        unpin_label: str | None = None,
+    ) -> list[str] | None:
+        """Archive a subtree in one transaction, preserving previously archived rows."""
+        now = now_epoch()
+
+        def write(session: Session) -> list[str] | None:
+            subtree = (
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+                .cte(name="archive_subtree", recursive=True)
+            )
+            subtree = subtree.union_all(
+                select(SqlConversation.id).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.parent_conversation_id == subtree.c.id,
+                )
+            )
+            query = select(SqlConversation).where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id.in_(select(subtree.c.id)),
+            )
+            if self._supports_for_update:
+                query = query.with_for_update()
+            rows = list(session.scalars(query))
+            if not rows:
+                return None
+            selected = set(only_ids) if only_ids is not None else {row.id for row in rows}
+            if not selected.issubset({row.id for row in rows}):
+                raise ValueError("Archive selection contains a session outside this group")
+            changed = []
+            for row in rows:
+                if row.id not in selected or row.archived == archived:
+                    continue
+                row.archived = archived
+                row.updated_at = now
+                changed.append(row.id)
+                if archived:
+                    _upsert_labels(session, row.id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now)
+            clear_labels = [unpin_label] if archived and unpin_label else []
+            if not archived:
+                clear_labels.append(ARCHIVED_AT_LABEL_KEY)
+            if changed and clear_labels:
+                session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(changed),
+                        SqlConversationLabel.key.in_(clear_labels),
+                    )
+                )
+            return changed
+
+        return run_write_transaction(self._conv_session_immediate, "archive_session_group", write)
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """

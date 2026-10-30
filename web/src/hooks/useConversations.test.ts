@@ -46,6 +46,8 @@ import {
 } from "./useConversations";
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
@@ -815,6 +817,11 @@ describe("useStopAndDeleteConversation cache eviction", () => {
 
   it("drops the backfill and session snapshot caches", async () => {
     const { queryClient, rendered } = seedAndDelete();
+    queryClient.setQueryData(
+      ["conversation", "root", "child_sessions"],
+      [{ id: "conv_x" }, { id: "sibling" }],
+    );
+    queryClient.setQueryData(["conversation", "conv_x", "child_sessions"], [{ id: "helper" }]);
 
     rendered.result.current.mutate({ id: "conv_x" });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
@@ -827,6 +834,10 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     // The open-chat snapshot must go too so a later visit to /c/{id}
     // can't render the deleted session from cache.
     expect(queryClient.getQueryData(["session", "conv_x"])).toBeUndefined();
+    expect(queryClient.getQueryData(["conversation", "conv_x", "child_sessions"])).toBeUndefined();
+    expect(queryClient.getQueryData(["conversation", "root", "child_sessions"])).toEqual([
+      { id: "sibling" },
+    ]);
   });
 
   it("drops a deleted pinned session from the sibling pinned cache", async () => {
@@ -2127,6 +2138,86 @@ describe("useStopSession invalidation", () => {
 });
 
 describe("useBulkArchiveConversations", () => {
+  it("archives a related group and carries exact changed IDs through bulk Undo", async () => {
+    const root = conversation({
+      id: "root",
+      archived: true,
+      archive_changed_session_ids: ["root", "peer"],
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "peer", labels: { "omnigent.session_role": "peer" } }],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse(root))
+      .mockResolvedValueOnce(mockResponse({ ...root, archived: false }));
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(
+          CapabilitiesContext.Provider,
+          { value: { ...FALLBACK_SERVER_INFO, features: { related_sessions: true } } },
+          children,
+        ),
+      );
+    const { result } = renderHook(() => useBulkArchiveConversations(), { wrapper });
+    const onArchived = vi.fn();
+    await act(() => result.current.mutateAsync({ ids: ["root"], archived: true, onArchived }));
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      archived: true,
+      archive_scope: "tree",
+    });
+    expect(onArchived.mock.calls[0][0]).toEqual([root]);
+    await undoArchiveConversations(client, onArchived.mock.calls[0][0]);
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
+      archived: false,
+      archive_scope: "tree",
+      archive_session_ids: ["root", "peer"],
+    });
+    client.clear();
+  });
+
+  it("unarchives related groups through the single-session Settings action", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "peer", archived: true, labels: { "omnigent.session_role": "peer" } }],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse(
+          conversation({
+            id: "root",
+            archived: false,
+            archive_changed_session_ids: ["root", "peer"],
+          }),
+        ),
+      );
+    const client = new QueryClient();
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(
+        QueryClientProvider,
+        { client },
+        createElement(
+          CapabilitiesContext.Provider,
+          { value: { ...FALLBACK_SERVER_INFO, features: { related_sessions: true } } },
+          children,
+        ),
+      );
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+    await act(() => result.current.mutateAsync({ id: "root", archived: false }));
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      archived: false,
+      archive_scope: "tree",
+    });
+    client.clear();
+  });
+
   function renderBulkArchiveHook() {
     const queryClient = new QueryClient({
       defaultOptions: { mutations: { retry: false } },

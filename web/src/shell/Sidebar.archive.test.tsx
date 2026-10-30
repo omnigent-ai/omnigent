@@ -21,17 +21,21 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // file exercises the archive path from a row's kebab.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import * as identity from "@/lib/identity";
+import type * as RelatedSessionLifecycle from "@/hooks/useRelatedSessionLifecycle";
 
 // Controllable archive + stop mutations, declared via vi.hoisted so the
 // vi.mock factory can reference them.
 const mocks = vi.hoisted(() => ({
   archive: { mutate: vi.fn() },
+  bulkArchive: { mutate: vi.fn() },
   stop: { mutate: vi.fn() },
+  archiveGroup: { mutate: vi.fn(), isPending: false },
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -39,11 +43,29 @@ vi.mock("@/hooks/useConversations", async () => {
   return {
     ...conversationHooksMock(),
     useArchiveConversation: () => mocks.archive,
+    useBulkArchiveConversations: () => mocks.bulkArchive,
     useStopSession: () => mocks.stop,
   };
 });
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+vi.mock("@/hooks/useRelatedSessionLifecycle", async (importOriginal) => ({
+  ...(await importOriginal<typeof RelatedSessionLifecycle>()),
+  useArchiveRelatedSessions: () => mocks.archiveGroup,
+}));
+vi.mock("./AddAgentDialog", () => ({
+  AddAgentDialog: ({
+    parentSessionId,
+    relatedSession,
+  }: {
+    parentSessionId: string;
+    relatedSession?: boolean;
+  }) => (
+    <div data-testid="add-agent-dialog">
+      {parentSessionId}:{String(relatedSession)}
+    </div>
+  ),
+}));
 
 import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
@@ -97,12 +119,71 @@ function clickArchive() {
 
 beforeEach(() => {
   mocks.archive.mutate.mockReset();
+  mocks.bulkArchive.mutate.mockReset();
   mocks.stop.mutate.mockReset();
+  mocks.archiveGroup.mutate.mockReset();
 });
 
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  vi.restoreAllMocks();
+});
+
+it("offers Add agent and All lifecycle actions for a group containing an archived peer", async () => {
+  const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation(
+    async () =>
+      new Response(
+        JSON.stringify({
+          data: [{ id: "peer", archived: true, labels: { "omnigent.session_role": "peer" } }],
+          has_more: false,
+          hosts: [],
+          order: [],
+        }),
+      ),
+  );
+  mockConversations([CONV]);
+  renderSidebar({ ...CLEANUP_SERVER, features: { related_sessions: true } });
+  expect(fetch.mock.calls.some(([url]) => String(url).includes("child_sessions"))).toBe(false);
+  fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+  await waitFor(() =>
+    expect(screen.getByTestId("archive-conversation")).toHaveTextContent("Archive All"),
+  );
+  expect(screen.getByTestId("delete-conversation")).toHaveTextContent("Delete All");
+  fireEvent.click(screen.getByTestId("archive-conversation"));
+  expect(mocks.archiveGroup.mutate).toHaveBeenCalledWith({ conversation: CONV, archived: true });
+  expect(mocks.archive.mutate).not.toHaveBeenCalled();
+  fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+  fireEvent.click(screen.getByTestId("add-agent-conversation"));
+  expect(screen.getByTestId("add-agent-dialog")).toHaveTextContent("conv_1:true");
+});
+
+it("keeps helpers on the legacy archive path and hides new actions on older servers", async () => {
+  vi.spyOn(identity, "authenticatedFetch").mockImplementation(
+    async () =>
+      new Response(
+        JSON.stringify({
+          data: [{ id: "helper", labels: {} }],
+          has_more: false,
+          hosts: [],
+          order: [],
+        }),
+      ),
+  );
+  mockConversations([CONV]);
+  const view = renderSidebar({ ...CLEANUP_SERVER, features: { related_sessions: true } });
+  fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+  await waitFor(() =>
+    expect(screen.getByTestId("archive-conversation")).not.toHaveAttribute("data-disabled"),
+  );
+  expect(screen.getByTestId("archive-conversation")).toHaveTextContent(/^Archive$/);
+  fireEvent.click(screen.getByTestId("archive-conversation"));
+  expect(mocks.archive.mutate).toHaveBeenCalled();
+  expect(mocks.archiveGroup.mutate).not.toHaveBeenCalled();
+  view.unmount();
+  renderSidebar(FALLBACK_SERVER_INFO);
+  fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+  expect(screen.queryByTestId("add-agent-conversation")).not.toBeInTheDocument();
 });
 
 describe("archive flow", () => {
@@ -187,6 +268,46 @@ describe("archive flow", () => {
 describe("archive worktree prompt", () => {
   const WORKTREE_CONV: Conversation = { ...CONV, git_branch: "feature/x" };
   const PREF_KEY = "omnigent:delete-worktrees-on-archive";
+
+  it.each([null, "true"])(
+    "keeps bulk-archived worktrees with related sessions enabled and cleanup preference %s",
+    async (preference) => {
+      if (preference) localStorage.setItem(PREF_KEY, preference);
+      mockConversations([WORKTREE_CONV]);
+      renderSidebar({ ...CLEANUP_SERVER, features: { related_sessions: true } });
+      fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+      fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+      fireEvent.click(screen.getByTestId("bulk-archive"));
+
+      expect(screen.queryByTestId("archive-worktree-dialog")).not.toBeInTheDocument();
+      expect(mocks.bulkArchive.mutate).toHaveBeenCalledWith({
+        ids: ["conv_1"],
+        archived: true,
+        deleteWorktreeIds: new Set(),
+        onArchived: expect.any(Function),
+      });
+      expect(
+        await screen.findByText("Worktrees will be kept when archiving these sessions."),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("keeps the bulk cleanup prompt when related sessions are disabled", async () => {
+    mockConversations([WORKTREE_CONV]);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    fireEvent.click(screen.getByRole("link", { name: /My Session/ }));
+    fireEvent.click(screen.getByTestId("bulk-archive"));
+
+    await screen.findByTestId("archive-worktree-dialog");
+    expect(mocks.bulkArchive.mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("archive-worktree-delete"));
+    expect(mocks.bulkArchive.mutate).toHaveBeenCalledWith({
+      ids: ["conv_1"],
+      archived: true,
+      deleteWorktreeIds: new Set(["conv_1"]),
+    });
+  });
 
   it("archives a non-worktree session without prompting", () => {
     mockConversations([CONV]);

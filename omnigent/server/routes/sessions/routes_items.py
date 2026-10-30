@@ -130,6 +130,7 @@ def register_items_routes(
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         tool: str | None = Query(default=None),
         session_name: str | None = Query(default=None),
+        include_archived: bool = Query(default=False),
     ) -> PaginatedList:
         """
         List sub-agent (child) sessions under a parent session.
@@ -164,6 +165,7 @@ def register_items_routes(
         :param session_name: When set alongside ``tool``, only
             return children whose title matches
             ``"{tool}:{session_name}"`` exactly.
+        :param include_archived: Include archived children for group lifecycle controls.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
@@ -192,6 +194,7 @@ def register_items_routes(
             order=order,
             sort_by="created_at",
             title=title_filter,
+            include_archived=include_archived,
         )
         data = await _child_session_summaries_from_conversations(
             page.data,

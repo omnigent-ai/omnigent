@@ -150,6 +150,7 @@ export function SideChatPane({
   onStart,
   readOnly: restoredReadOnly = false,
   fullSession = false,
+  interactiveSession = false,
 }: {
   childId: string;
   selectionParentId?: string;
@@ -158,6 +159,8 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
+  /** Full related sessions opt into queue/steer and supported model controls. */
+  interactiveSession?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
@@ -412,6 +415,7 @@ export function SideChatPane({
             ) : (
               <SideChatComposer
                 fullSession={fullSession}
+                interactiveSession={interactiveSession}
                 childId={childId}
                 harness={sessionHarness}
                 session={session}
@@ -441,6 +445,7 @@ export function SideChatPane({
  */
 function SideChatComposer({
   fullSession,
+  interactiveSession,
   childId,
   harness,
   session,
@@ -454,6 +459,7 @@ function SideChatComposer({
   onStart,
 }: {
   fullSession: boolean;
+  interactiveSession: boolean;
   childId: string;
   harness: string | null | undefined;
   session: Session | null | undefined;
@@ -493,7 +499,7 @@ function SideChatComposer({
     [allQueuedMessages, childId],
   );
   // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
-  const queues = !pending && !fullSession;
+  const queues = !pending && (!fullSession || interactiveSession);
   useEffect(() => {
     if (queues && queuedMessages.length > 0 && !settingsSaving) maybeFlushQueuedHead(childId);
   }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead, settingsSaving]);
@@ -782,7 +788,7 @@ function SideChatComposer({
     clearText: () => setText(""),
   });
   // Like the main composer, a draft turns Interrupt into Send.
-  const showInterrupt = !pending && busy && (fullSession || !canSend);
+  const showInterrupt = !pending && busy && ((fullSession && !interactiveSession) || !canSend);
 
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
@@ -801,7 +807,7 @@ function SideChatComposer({
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if ((busy && fullSession) || !canSend || agentId === null) return;
+    if ((busy && fullSession && !interactiveSession) || !canSend || agentId === null) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote or
     // attachment is always an ordinary message.
@@ -1018,7 +1024,7 @@ function SideChatComposer({
           ),
           trailing: (
             <>
-              {!fullSession && settingsSession?.id && (
+              {(!fullSession || interactiveSession) && settingsSession?.id && (
                 <SideChatSettings
                   key={childId}
                   session={settingsSession}

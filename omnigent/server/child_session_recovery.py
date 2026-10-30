@@ -16,7 +16,11 @@ from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
-from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
+from omnigent.stores.conversation_store import (
+    SESSION_ROLE_LABEL_KEY,
+    ConversationNotFoundError,
+    ConversationStore,
+)
 from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
@@ -163,6 +167,7 @@ async def restore_active_children(
             if (
                 row.id in tree
                 or row.host_id is not None
+                or row.labels.get(SESSION_ROLE_LABEL_KEY) == "peer"
                 or row.runner_id is None
                 or row.parent_conversation_id not in tree
                 or (
@@ -258,6 +263,7 @@ async def restore_active_children(
                 or child.runner_id != snapshot.runner_id
                 or child.parent_conversation_id != owner.id
                 or child.host_id is not None
+                or child.labels.get(SESSION_ROLE_LABEL_KEY) == "peer"
                 or is_side_chat_child(child.labels)
                 or not _restorable(child)
                 or (snapshot.id in active and not _interrupted(child))

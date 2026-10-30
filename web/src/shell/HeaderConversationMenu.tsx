@@ -68,6 +68,10 @@ import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
 import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import {
+  useArchiveRelatedSessions,
+  useRelatedSessionGroup,
+} from "@/hooks/useRelatedSessionLifecycle";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -119,9 +123,11 @@ export function HeaderConversationMenu({
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
+  const archiveRelated = useArchiveRelatedSessions();
   const archiveWorktreePrompt = useArchiveWorktreePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
+  const relatedGroup = useRelatedSessionGroup(conversation.id, menuOpen);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
@@ -200,6 +206,15 @@ export function HeaderConversationMenu({
 
   const archiveConversation = () => {
     closeMenu();
+    if (
+      relatedGroup.hasPeers ||
+      (relatedGroup.enabled && conversation.labels?.["omnigent.session_role"] === "peer")
+    ) {
+      if (relatedGroup.loading || relatedGroup.error || archiveRelated.isPending) return;
+      if (!isArchived) navigate("/", { replace: true });
+      archiveRelated.mutate({ conversation, archived: !isArchived });
+      return;
+    }
     if (isArchived) {
       // Unarchiving keeps the user on the session — no redirect home and no
       // Undo toast (mirrors the sidebar row's Unarchive).
@@ -356,6 +371,7 @@ export function HeaderConversationMenu({
       <DropdownMenuSeparator />
       <DropdownMenuItem
         data-testid="header-archive-conversation"
+        disabled={relatedGroup.loading || !!relatedGroup.error || archiveRelated.isPending}
         className={itemClass}
         onSelect={archiveConversation}
       >
@@ -365,15 +381,17 @@ export function HeaderConversationMenu({
           <ArchiveIcon className="size-3.5" />
         )}
         {isArchived ? "Unarchive" : "Archive"}
+        {relatedGroup.hasPeers ? " All" : ""}
       </DropdownMenuItem>
       <DropdownMenuItem
         data-testid="header-delete-conversation"
+        disabled={relatedGroup.loading || !!relatedGroup.error}
         className={itemClass}
         variant="destructive"
         onSelect={() => setDeleteOpen(true)}
       >
         <Trash2Icon className="size-3.5" />
-        Delete
+        Delete{relatedGroup.hasPeers ? " All" : ""}
       </DropdownMenuItem>
     </>
   );
@@ -486,10 +504,13 @@ export function HeaderConversationMenu({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogTitle>
+              {relatedGroup.hasPeers ? "Delete all sessions?" : "Delete conversation?"}
+            </DialogTitle>
             <DialogDescription>
-              <span className="font-medium break-all">{label}</span> and all of its history will be
-              removed. This cannot be undone.
+              <span className="font-medium break-all">{label}</span>
+              {relatedGroup.hasPeers ? ", its related sessions," : ""} and all of its history will
+              be removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
           {gitBranch !== null && (
@@ -531,7 +552,7 @@ export function HeaderConversationMenu({
               onClick={confirmDelete}
               disabled={deleteConversation.isPending}
             >
-              Delete
+              Delete{relatedGroup.hasPeers ? " All" : ""}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -112,7 +112,8 @@ async def test_restore_active_descendants_and_idle_ancestor(recovery_tree: Any) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "exclusion", ["closed", "archived", "stopped", "fenced", "hosted", "side_chat", "live_runner"]
+    "exclusion",
+    ["closed", "archived", "stopped", "fenced", "hosted", "side_chat", "live_runner", "peer"],
 )
 async def test_do_not_restore_excluded_children(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, exclusion: str
@@ -126,6 +127,25 @@ async def test_do_not_restore_excluded_children(
     row = child()
     if exclusion == "closed":
         store.set_labels(row.id, {"omnigent.closed": "true"})
+    elif exclusion == "peer":
+        store.set_labels(row.id, {"omnigent.session_role": "peer"})
+        from omnigent.server.routes._sessions import orchestration
+
+        assert (
+            await orchestration._heal_subagent_runner_binding_via_parent(
+                store.get_conversation(row.id), Mock(), Mock(), store
+            )
+            is None
+        )
+        helper = child(owner=row)
+        nested = child(owner=helper)
+        lookup = AsyncMock(return_value=None)
+        monkeypatch.setattr(orchestration, "_get_runner_client", lookup)
+        assert (
+            await orchestration._heal_subagent_runner_binding_via_parent(nested, None, None, store)
+            is None
+        )
+        assert [call.args[0] for call in lookup.call_args_list] == [helper.id, row.id]
     elif exclusion == "archived":
         store.update_conversation(row.id, archived=True)
     elif exclusion == "stopped":

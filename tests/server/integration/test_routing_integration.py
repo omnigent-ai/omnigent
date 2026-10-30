@@ -98,9 +98,11 @@ def _routing_decisions(conv_store: SqlAlchemyConversationStore, session_id: str)
 # ── 1. Child spawn: the router wins over ``args.model`` ─────────────
 
 
+@pytest.mark.parametrize("peer", [False, True])
 async def test_router_overrides_llm_supplied_child_model(
     client: httpx.AsyncClient,
     db_uri: str,
+    peer: bool,
 ) -> None:
     _parent, child, conv_store = await _parent_and_child(
         client,
@@ -108,6 +110,9 @@ async def test_router_overrides_llm_supplied_child_model(
         agent_name="routing-precedence",
         child_model_override=LLM_PICKED_MODEL,
     )
+    if peer:
+        conv_store.set_labels(child.id, {"omnigent.session_role": "peer"})
+        child = conv_store.get_conversation(child.id)
     caps = FakeCaps(
         routing_client=FakeRoutingClient(
             RoutingResult(model=ROUTED_MODEL, rationale="deep refactor", harness="claude_code")
@@ -129,6 +134,10 @@ async def test_router_overrides_llm_supplied_child_model(
 
     refreshed = conv_store.get_conversation(child.id)
     assert refreshed is not None
+    if peer:
+        assert refreshed.model_override == LLM_PICKED_MODEL
+        assert _routing_decisions(conv_store, child.id) == []
+        return
     # The router's pick replaced the orchestrator's ``args.model``.
     assert refreshed.model_override == ROUTED_MODEL
     decisions = _routing_decisions(conv_store, child.id)
@@ -667,10 +676,12 @@ async def test_codex_session_keeps_glm_candidates_and_applies_a_glm_pick(
 
 
 @pytest.mark.parametrize("labelled", [True, False], ids=["labelled", "sentinel-only"])
+@pytest.mark.parametrize("peer", [False, True])
 async def test_auto_session_and_its_children_keep_cross_harness_picks(
     client: httpx.AsyncClient,
     db_uri: str,
     labelled: bool,
+    peer: bool,
 ) -> None:
     """The auto sentinel alone is enough; the durable label is not required.
 
@@ -707,6 +718,7 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
         title="reviewer:auth",
         parent_conversation_id=session_id,
         agent_id=agent["id"],
+        labels={"omnigent.session_role": "peer"} if peer else None,
     )
     # Created through the store, so it misses the create route's stamp; apply the
     # value that route would have copied from the routed parent.
@@ -716,6 +728,14 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
         RoutingResult(model=GPT_MODEL, rationale="narrow change", harness="codex")
     )
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=routing_client)):
+        if peer:
+            turn = await client.post(
+                f"/v1/sessions/{child.id}/hooks/route-turn",
+                json={"harness": "claude-native", "prompt": "review"},
+            )
+            assert turn.status_code == 200, turn.text
+            assert turn.json()["action"] == "allow"
+            assert turn.json()["rationale"] == "smart routing is off for this session"
         resp = await client.post(
             f"/v1/sessions/{session_id}/hooks/route-subagent",
             json=SPAWN_PAYLOAD,
@@ -731,7 +751,9 @@ async def test_auto_session_and_its_children_keep_cross_harness_picks(
     assert resp.json()["harness"] == "codex-native"
     # The child of an auto session inherits the cross-harness allowance.
     assert child_resp.status_code == 200, child_resp.text
-    assert set(routing_client.offered[1]) == {"claude-native", "codex-native"}
+    assert set(routing_client.offered[1]) == (
+        {"claude-native"} if peer else {"claude-native", "codex-native"}
+    )
 
 
 # ── 7. Omnigent child sessions stay in the parent's family ─────────
@@ -1197,6 +1219,7 @@ async def _create_child(
     *,
     agent_name: str,
     harness: str,
+    related: bool = False,
 ) -> httpx.Response:
     """POST a child create bound to an agent running *harness*.
 
@@ -1213,21 +1236,41 @@ async def _create_child(
     )
     return await client.post(
         "/v1/sessions",
-        json={"agent_id": child_agent["id"], "parent_session_id": parent_id},
+        json={
+            "agent_id": child_agent["id"],
+            "related_to_session_id" if related else "parent_session_id": parent_id,
+        },
     )
 
 
+@pytest.mark.parametrize("related", [False, True])
 async def test_pinned_parent_cannot_create_a_child_in_another_family(
     client: httpx.AsyncClient,
+    app: Any,
+    db_uri: str,
+    related: bool,
 ) -> None:
     parent_id = await _pinned_parent(
         client, agent_name="family-gate-pinned-parent", harness="codex"
     )
+    if related:
+        from omnigent.server.feature_flags import Feature, FeatureFlags
+
+        app.state.feature_flags = FeatureFlags(frozenset({Feature.RELATED_SESSIONS}))
+        SqlAlchemyConversationStore(db_uri).set_runner_id(parent_id, "existing-runner")
     child = await _create_child(
-        client, parent_id, agent_name="family-gate-claude-child", harness="claude-sdk"
+        client,
+        parent_id,
+        agent_name="family-gate-claude-child",
+        harness="claude-sdk",
+        related=related,
     )
-    assert child.status_code == 400, child.text
-    assert "model family" in child.text
+    assert child.status_code == (201 if related else 400), child.text
+    if related:
+        assert child.json()["harness"] == "claude-sdk"
+        assert child.json()["subagent_routing_override"] is None
+    else:
+        assert "model family" in child.text
 
 
 async def test_pinned_parent_still_creates_children_in_its_own_family(

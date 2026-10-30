@@ -3,6 +3,8 @@ import { BotIcon, Maximize2Icon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { sessionQueryOptions, useSession } from "@/hooks/useSession";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { Link, useLocation } from "@/lib/routing";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
@@ -26,8 +28,13 @@ export function useSubagentTabLabels(tabIds: readonly string[]): Record<string, 
   });
   const labels: Record<string, string> = {};
   subagentTabs.forEach(({ tabId }, index) => {
+    const session = snapshots[index]?.data;
     labels[tabId] =
-      subAgentComposerLabel(snapshots[index]?.data ?? null) ?? SUBAGENT_TAB_FALLBACK_LABEL;
+      session?.labels?.["omnigent.session_role"] === "peer"
+        ? session.title || "Session"
+        : session?.parentSessionId === null
+          ? "Main"
+          : (subAgentComposerLabel(session ?? null) ?? SUBAGENT_TAB_FALLBACK_LABEL);
   });
   return labels;
 }
@@ -40,6 +47,9 @@ export function useSubagentTabLabels(tabIds: readonly string[]): Record<string, 
 export function SubagentTabPane({ sessionId, label }: { sessionId: string; label: string }) {
   const canEdit = useCanEdit(sessionId);
   const { session } = useSession(sessionId);
+  const interactiveSession =
+    isFeatureEnabled(useServerInfo(), "related_sessions") &&
+    (session?.parentSessionId === null || session?.labels?.["omnigent.session_role"] === "peer");
   const readOnlyReason = readOnlyReasonForSessionLabels(session, null);
   // The labels that decide read-only arrive with the snapshot, so don't offer a composer first.
   const readOnly = !canEdit || session === null || readOnlyReason !== null;
@@ -62,7 +72,13 @@ export function SubagentTabPane({ sessionId, label }: { sessionId: string; label
         </Link>
       </div>
       <div className="min-h-0 flex-1">
-        <SideChatPane key={sessionId} childId={sessionId} fullSession readOnly={readOnly} />
+        <SideChatPane
+          key={sessionId}
+          childId={sessionId}
+          fullSession
+          interactiveSession={interactiveSession}
+          readOnly={readOnly}
+        />
       </div>
       {readOnlyReason !== null && (
         <p

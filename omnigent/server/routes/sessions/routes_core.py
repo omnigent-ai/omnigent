@@ -82,6 +82,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -1010,7 +1011,7 @@ def register_core_routes(
                 conversation_store,
                 permission_store,
             )
-            if body.parent_session_id is not None:
+            if body.parent_session_id is not None or body.related_to_session_id is not None:
                 raise OmnigentError(
                     "Orchestration creates independent sessions", code=ErrorCode.INVALID_INPUT
                 )
@@ -1244,7 +1245,12 @@ def register_core_routes(
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
         # children follow their parent's grants instead.
-        if user_id is not None and body.parent_session_id is None and orchestration_source is None:
+        if (
+            user_id is not None
+            and body.parent_session_id is None
+            and body.related_to_session_id is None
+            and orchestration_source is None
+        ):
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -2768,6 +2774,12 @@ def register_core_routes(
         :raises OmnigentError: 400 if the runner is not
             registered; 404 if no session exists.
         """
+        if body.archive_scope == "tree":
+            return await _archive_session_tree(request, session_id, body, include_usage)
+        if body.archive_session_ids is not None:
+            raise OmnigentError(
+                "archive_session_ids requires tree scope", code=ErrorCode.INVALID_INPUT
+            )
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
         if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
@@ -2775,6 +2787,71 @@ def register_core_routes(
             async with live_change.lock:
                 return await _update_session(request, session_id, body, include_usage, live_change)
         return await _update_session(request, session_id, body, include_usage)
+
+    async def _archive_session_tree(
+        request: Request,
+        session_id: str,
+        body: UpdateSessionRequest,
+        include_usage: bool,
+    ) -> SessionResponse:
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.RELATED_SESSIONS):
+            raise OmnigentError("Related sessions are not enabled", code=ErrorCode.INVALID_INPUT)
+        if body.archived is None or body.model_fields_set - {
+            "archived",
+            "archive_scope",
+            "archive_session_ids",
+        }:
+            raise OmnigentError(
+                "Tree archive accepts only archived, archive_scope, and archive_session_ids",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if body.archived and body.archive_session_ids is not None:
+            raise OmnigentError(
+                "archive_session_ids is only valid when restoring an archive",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        try:
+            changed_ids = await asyncio.to_thread(
+                conversation_store.archive_subtree,
+                session_id,
+                body.archived,
+                only_ids=body.archive_session_ids,
+                unpin_label=pinned_label_key(user_id),
+            )
+        except (ValueError, NotImplementedError) as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if changed_ids is None:
+            raise _session_not_found()
+        for changed_id in changed_ids:
+            if body.archived:
+                _prune_session_read_state(changed_id)
+                _spawn_archive_stop(
+                    changed_id,
+                    conversation_store,
+                    runner_router,
+                    getattr(request.app.state, "host_registry", None),
+                )
+            else:
+                _cancel_pending_archive_stop(changed_id)
+        snapshot = await _get_session_snapshot(
+            conversation_store,
+            session_id,
+            LEVEL_OWNER,
+            agent_store,
+            agent_cache,
+            liveness_lookup=liveness_lookup,
+            include_items=False,
+            include_usage=include_usage,
+            runner_exit_reports=runner_exit_reports,
+            viewer_id=user_id,
+            request=request,
+        )
+        return snapshot.model_copy(update={"archive_changed_session_ids": changed_ids})
 
     async def _update_session(
         request: Request,

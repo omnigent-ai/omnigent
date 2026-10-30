@@ -1,20 +1,7 @@
-// Subagents tab content for the right-side rail. Renders the session
-// tree under the root conversation — a "main" link back to the root,
-// then its sub-agent sessions recursively (children, grandchildren,
-// …) down to ``MAX_TREE_DEPTH`` levels, each level indented one step
-// further. The user can move between any agents in the tree without
-// leaving the rail.
-//
-// The active session may itself be a descendant (the user clicked
-// into a sub-agent). The rail still renders the tree from the
-// top-level root, with the active row highlighted. AppShell resolves
-// the root id (walking the parent chain) and passes it as
-// ``rootSessionId``.
-//
-// Each row is a Link to the target conversation page so cmd/middle-
-// click opens it in a new tab, matching the sidebar's behavior.
+// Related sessions appear as peers, each with its own collapsible helper tree.
+// Older servers keep the recursive subagent view. AppShell resolves the group root.
 
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useContext, useEffect, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
 import {
   BookOpenIcon,
@@ -34,22 +21,48 @@ import {
   ListIcon,
   NetworkIcon,
   PauseIcon,
+  PanelRightOpenIcon,
+  ArrowUpIcon,
+  ArrowDownIcon,
+  PencilIcon,
+  ArchiveIcon,
+  Trash2Icon,
   PlusIcon,
   ScanSearchIcon,
   SearchIcon,
   UnplugIcon,
 } from "lucide-react";
-import { Link, useLocation } from "@/lib/routing";
+import { Link, useLocation, useNavigate } from "@/lib/routing";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
-import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import {
+  MAX_TREE_DEPTH,
+  useChildSessions,
+  childSessionsQueryKey,
+  cachedTreeContains,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
 import { cn } from "@/lib/utils";
-import { useOpenSubagentInPanel } from "./subagentPanelOpener";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { useQueryClient } from "@tanstack/react-query";
+import { useArchiveRelatedSessions } from "@/hooks/useRelatedSessionLifecycle";
+import { renameConversation, useStopAndDeleteConversation } from "@/hooks/useConversations";
+import { SubagentPanelOpenerContext, useOpenSubagentInPanel } from "./subagentPanelOpener";
 
 const SubagentsGraphView = lazy(() =>
   import("./SubagentsGraphView").then((m) => ({ default: m.SubagentsGraphView })),
@@ -61,7 +74,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { childPrimaryLabel } from "./subagentLabel";
-import { childStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
+import { childStatus, sessionStatus, type AgentActivity, type AgentStatus } from "./subagentStatus";
 import { AddAgentDialog } from "./AddAgentDialog";
 
 const CODEX_NATIVE_SUBAGENT_ROLE_LABEL = "omnigent.codex_native.agent_role";
@@ -85,11 +98,34 @@ type ViewMode = "list" | "graph";
 
 export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanelProps) {
   const { children, isLoading, error } = useChildSessions(rootSessionId);
+  const relatedSessions = isFeatureEnabled(useServerInfo(), "related_sessions");
+  const { session: sourceSession } = useSession(relatedSessions ? conversationId : null);
+  const canCreate = relatedSessions && sourceSession?.permissionLevel === 4;
   const [addOpen, setAddOpen] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("list");
-  const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>({});
+  const [collapsedRows, setCollapsedRows] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(
+      (readSessionWorkspaceState(rootSessionId).collapsedSubagentIds ?? []).map((id) => [id, true]),
+    ),
+  );
+  useEffect(() => {
+    setCollapsedRows(
+      Object.fromEntries(
+        (readSessionWorkspaceState(rootSessionId).collapsedSubagentIds ?? []).map((id) => [
+          id,
+          true,
+        ]),
+      ),
+    );
+  }, [rootSessionId]);
   const toggleCollapsedRow = (id: string) => {
-    setCollapsedRows((current) => ({ ...current, [id]: !current[id] }));
+    setCollapsedRows((current) => {
+      const next = { ...current, [id]: !current[id] };
+      writeSessionWorkspaceState(rootSessionId, {
+        collapsedSubagentIds: Object.keys(next).filter((key) => next[key]),
+      });
+      return next;
+    });
   };
 
   // Loading/error states only surface when there's no cached data to
@@ -115,10 +151,23 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
     );
   }
 
-  if (viewMode === "graph") {
-    return (
-      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+  return (
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
+      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+      <button
+        type="button"
+        data-testid="add-agent-button"
+        onClick={() => setAddOpen(true)}
+        className={
+          canCreate
+            ? "mx-2 mt-2 flex items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring"
+            : "hidden"
+        }
+      >
+        <PlusIcon className="size-3.5 shrink-0" />
+        {relatedSessions ? "New session" : "Add agent"}
+      </button>
+      {viewMode === "graph" ? (
         <Suspense
           fallback={
             <div className="flex h-full flex-1 items-center justify-center text-sm text-muted-foreground">
@@ -128,42 +177,424 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
         >
           <SubagentsGraphView conversationId={conversationId} rootSessionId={rootSessionId} />
         </Suspense>
-      </div>
-    );
-  }
+      ) : (
+        <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
+          {relatedSessions ? (
+            <RelatedSessionsList
+              rootSessionId={rootSessionId}
+              conversationId={conversationId}
+              sessions={children}
+              collapsedRows={collapsedRows}
+              onToggleCollapsed={toggleCollapsedRow}
+              canEdit={canCreate}
+            />
+          ) : (
+            <>
+              <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
+              {children.map((child, index) => (
+                <SubagentRow
+                  key={child.id}
+                  child={child}
+                  depth={1}
+                  rootGuideContinues={index < children.length - 1}
+                  conversationId={conversationId}
+                  collapsedRows={collapsedRows}
+                  onToggleCollapsed={toggleCollapsedRow}
+                />
+              ))}
+            </>
+          )}
+        </ul>
+      )}
+      {/* Mounted only while open so a closed rail issues no /v1/agents
+          fetch and carries none of the dialog's query dependencies. */}
+      {addOpen && (
+        <AddAgentDialog
+          parentSessionId={relatedSessions ? conversationId : rootSessionId}
+          rootSessionId={rootSessionId}
+          relatedSession={relatedSessions}
+          open={addOpen}
+          onOpenChange={setAddOpen}
+        />
+      )}
+    </div>
+  );
+}
 
+function RelatedSessionsList({
+  rootSessionId,
+  conversationId,
+  sessions,
+  collapsedRows,
+  onToggleCollapsed,
+  canEdit,
+}: {
+  rootSessionId: string;
+  conversationId: string;
+  sessions: ChildSessionInfo[];
+  collapsedRows: Record<string, boolean>;
+  onToggleCollapsed: (id: string) => void;
+  canEdit: boolean;
+}) {
+  const [order, setOrder] = useState(
+    () => readSessionWorkspaceState(rootSessionId).relatedSessionOrder ?? [],
+  );
+  useEffect(
+    () => setOrder(readSessionWorkspaceState(rootSessionId).relatedSessionOrder ?? []),
+    [rootSessionId],
+  );
+  const peers = sessions.filter((child) => child.labels?.["omnigent.session_role"] === "peer");
+  const rank = (id: string) => (order.includes(id) ? order.indexOf(id) : order.length);
+  peers.sort((a, b) => rank(a.id) - rank(b.id));
+  const active = peers.filter((child) => !child.archived);
+  const archived = peers.filter((child) => child.archived);
+  function move(id: string, direction: number) {
+    const ids = active.map((child) => child.id);
+    const index = ids.indexOf(id);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= ids.length) return;
+    [ids[index], ids[target]] = [ids[target], ids[index]];
+    setOrder(ids);
+    writeSessionWorkspaceState(rootSessionId, { relatedSessionOrder: ids });
+  }
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
-      <button
-        type="button"
-        data-testid="add-agent-button"
-        onClick={() => setAddOpen(true)}
-        className="hidden"
+    <>
+      <MainRow
+        rootSessionId={rootSessionId}
+        isActive={conversationId === rootSessionId}
+        fullSession
+      />
+      <HelperSection
+        sessionId={rootSessionId}
+        label="Main"
+        sessions={sessions.filter(
+          (child) => child.labels?.["omnigent.session_role"] !== "peer" && !child.archived,
+        )}
+        conversationId={conversationId}
+        collapsedRows={collapsedRows}
+        onToggleCollapsed={onToggleCollapsed}
+      />
+      {active.map((peer, index) => (
+        <PeerSessionSection
+          key={peer.id}
+          peer={peer}
+          rootSessionId={rootSessionId}
+          conversationId={conversationId}
+          collapsedRows={collapsedRows}
+          onToggleCollapsed={onToggleCollapsed}
+          canEdit={canEdit}
+          onMoveUp={index > 0 ? () => move(peer.id, -1) : undefined}
+          onMoveDown={index < active.length - 1 ? () => move(peer.id, 1) : undefined}
+        />
+      ))}
+      {archived.length > 0 && (
+        <li className="mt-3 px-2 text-xs font-medium text-muted-foreground">Archived sessions</li>
+      )}
+      {archived.map((peer) => (
+        <PeerSessionSection
+          key={peer.id}
+          peer={peer}
+          rootSessionId={rootSessionId}
+          conversationId={conversationId}
+          collapsedRows={collapsedRows}
+          onToggleCollapsed={onToggleCollapsed}
+          canEdit={canEdit}
+        />
+      ))}
+    </>
+  );
+}
+
+function PeerSessionSection({
+  peer,
+  rootSessionId,
+  conversationId,
+  collapsedRows,
+  onToggleCollapsed,
+  canEdit,
+  onMoveUp,
+  onMoveDown,
+}: {
+  peer: ChildSessionInfo;
+  rootSessionId: string;
+  conversationId: string;
+  collapsedRows: Record<string, boolean>;
+  onToggleCollapsed: (id: string) => void;
+  canEdit: boolean;
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
+}) {
+  const { children } = useChildSessions(peer.archived ? null : peer.id);
+  const archive = useArchiveRelatedSessions();
+  const removeSession = useStopAndDeleteConversation();
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const navigate = useNavigate();
+  const openInPanel = useContext(SubagentPanelOpenerContext);
+  const queryClient = useQueryClient();
+  const search = sessionNavigationSearch(useLocation().search);
+  const [renaming, setRenaming] = useState(false);
+  const [name, setName] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const label = peer.title || peer.session_name || "Session";
+  const harness = harnessAgentForChild(peer);
+  async function save(action: () => Promise<unknown>) {
+    setSaving(true);
+    setError(null);
+    try {
+      await action();
+      await queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(rootSessionId) });
+      await queryClient.invalidateQueries({ queryKey: ["session", peer.id] });
+      setRenaming(false);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not update the session.");
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <>
+      <li
+        className="group/peer mt-2 rounded-md border border-border/60"
+        data-peer-session-id={peer.id}
       >
-        <PlusIcon className="size-3.5 shrink-0" />
-        Add agent
-      </button>
-      <ul className="relative flex min-h-0 flex-1 flex-col gap-px overflow-y-auto px-2 pb-2 pt-2">
-        <MainRow rootSessionId={rootSessionId} isActive={conversationId === rootSessionId} />
-        {children.map((child, index) => (
+        <div className="flex items-start">
+          <Link
+            to={{ pathname: `/c/${peer.id}`, search }}
+            data-testid="peer-session-row"
+            className={cn(
+              "min-w-0 flex-1 rounded-md px-2.5 py-2 hover:bg-muted",
+              conversationId === peer.id && "bg-accent",
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <StatusAvatar {...childStatus(peer)} />
+              {harness && <ComposerAgentIcon agent={harness} className="size-4 shrink-0" />}
+              <span className="truncate text-sm font-semibold">{label}</span>
+            </div>
+            {peer.last_message_preview && (
+              <p className="mt-1 truncate text-xs text-muted-foreground">
+                {peer.last_message_preview}
+              </p>
+            )}
+          </Link>
+          {openInPanel && (
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="mr-1 mt-2 shrink-0"
+              aria-label={`Open ${label} in side panel`}
+              title="Open in side panel"
+              onClick={() => openInPanel(peer.id)}
+            >
+              <PanelRightOpenIcon className="size-3.5" />
+            </Button>
+          )}
+        </div>
+        {canEdit && (
+          <div className="flex items-center gap-0.5 border-t border-border/50 px-2 py-1">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`Rename ${label}`}
+              title="Rename session"
+              onClick={() => {
+                setName(label);
+                setRenaming(true);
+              }}
+            >
+              <PencilIcon className="size-3" />
+            </Button>
+            {!peer.archived && (
+              <>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Move ${label} up`}
+                  title="Move up"
+                  disabled={!onMoveUp}
+                  onClick={onMoveUp}
+                >
+                  <ArrowUpIcon className="size-3" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Move ${label} down`}
+                  title="Move down"
+                  disabled={!onMoveDown}
+                  onClick={onMoveDown}
+                >
+                  <ArrowDownIcon className="size-3" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Archive ${label}`}
+                  title="Archive session and its subagents"
+                  disabled={archive.isPending}
+                  onClick={() => {
+                    if (conversationId === peer.id) navigate(`/c/${rootSessionId}`);
+                    archive.mutate({ conversation: { id: peer.id }, archived: true });
+                  }}
+                >
+                  <ArchiveIcon className="size-3" />
+                </Button>
+              </>
+            )}
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label={`Delete ${label}`}
+              title="Delete session and its subagents"
+              onClick={() => setDeleteOpen(true)}
+            >
+              <Trash2Icon className="size-3" />
+            </Button>
+            {peer.archived && (
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={archive.isPending}
+                onClick={() => archive.mutate({ conversation: { id: peer.id }, archived: false })}
+              >
+                Unarchive
+              </Button>
+            )}
+          </div>
+        )}
+        {renaming && (
+          <form
+            className="flex gap-1 p-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void save(() => renameConversation(peer.id, name.trim()));
+            }}
+          >
+            <input
+              aria-label="Session name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              className="min-w-0 flex-1 rounded border bg-background px-2 text-sm"
+              autoFocus
+            />
+            <Button size="sm" type="submit" disabled={saving || !name.trim()}>
+              Save
+            </Button>
+            <Button size="sm" variant="ghost" type="button" onClick={() => setRenaming(false)}>
+              Cancel
+            </Button>
+          </form>
+        )}
+        {error && (
+          <p role="alert" className="px-2 pb-2 text-xs text-destructive">
+            {error}
+          </p>
+        )}
+      </li>
+      <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete {label}?</DialogTitle>
+            <DialogDescription>
+              This session, its subagents, and their history will be deleted. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              disabled={removeSession.isPending}
+              onClick={() => setDeleteOpen(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={removeSession.isPending}
+              onClick={() => {
+                if (
+                  conversationId === peer.id ||
+                  cachedTreeContains(queryClient, peer.id, conversationId, MAX_TREE_DEPTH)
+                )
+                  navigate(`/c/${rootSessionId}`);
+                removeSession.mutate(
+                  { id: peer.id, deleteBranch: false },
+                  {
+                    onSuccess: () => setDeleteOpen(false),
+                  },
+                );
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {!peer.archived && (
+        <HelperSection
+          sessionId={peer.id}
+          label={label}
+          sessions={children.filter((child) => !child.archived)}
+          conversationId={conversationId}
+          collapsedRows={collapsedRows}
+          onToggleCollapsed={onToggleCollapsed}
+        />
+      )}
+    </>
+  );
+}
+
+function HelperSection({
+  sessionId,
+  label,
+  sessions,
+  conversationId,
+  collapsedRows,
+  onToggleCollapsed,
+}: {
+  sessionId: string;
+  label: string;
+  sessions: ChildSessionInfo[];
+  conversationId: string;
+  collapsedRows: Record<string, boolean>;
+  onToggleCollapsed: (id: string) => void;
+}) {
+  const collapsed = collapsedRows[sessionId] ?? false;
+  const working = sessions.filter((child) => childStatus(child).activity === "working").length;
+  const awaiting = sessions.filter((child) => childStatus(child).activity === "awaiting").length;
+  return (
+    <>
+      <li>
+        <button
+          type="button"
+          className="flex w-full items-center gap-1 px-3 py-2 text-xs text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          aria-label={`${collapsed ? "Expand" : "Collapse"} ${label} subagents`}
+          aria-expanded={!collapsed}
+          onClick={() => onToggleCollapsed(sessionId)}
+        >
+          {collapsed ? (
+            <ChevronRightIcon className="size-3" />
+          ) : (
+            <ChevronDownIcon className="size-3" />
+          )}
+          <span>Subagents ({sessions.length})</span>
+          {working > 0 && <span className="ml-auto">{working} working</span>}
+          {awaiting > 0 && <span className="text-warning">{awaiting} needs input</span>}
+        </button>
+      </li>
+      {!collapsed &&
+        sessions.map((child, index) => (
           <SubagentRow
             key={child.id}
             child={child}
             depth={1}
-            rootGuideContinues={index < children.length - 1}
+            rootGuideContinues={index < sessions.length - 1}
             conversationId={conversationId}
             collapsedRows={collapsedRows}
-            onToggleCollapsed={toggleCollapsedRow}
+            onToggleCollapsed={onToggleCollapsed}
           />
         ))}
-      </ul>
-      {/* Mounted only while open so a closed rail issues no /v1/agents
-          fetch and carries none of the dialog's query dependencies. */}
-      {addOpen && (
-        <AddAgentDialog parentSessionId={rootSessionId} open={addOpen} onOpenChange={setAddOpen} />
-      )}
-    </div>
+    </>
   );
 }
 
@@ -396,7 +827,16 @@ function mainMessagePreview(items: SessionItem[] | undefined): string | null {
   return null;
 }
 
-function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive: boolean }) {
+function MainRow({
+  rootSessionId,
+  isActive,
+  fullSession = false,
+}: {
+  rootSessionId: string;
+  isActive: boolean;
+  fullSession?: boolean;
+}) {
+  const openInPanel = useContext(SubagentPanelOpenerContext);
   const { session } = useSession(rootSessionId);
   const search = sessionNavigationSearch(useLocation().search);
   // Same wrapper-label probe used by the sidebar (Sidebar.tsx) and
@@ -412,11 +852,25 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
   const preview = mainMessagePreview(session?.items);
   return (
     <li className="relative">
-      <span
-        aria-hidden="true"
-        style={{ left: ROOT_GUIDE_CENTER_PX }}
-        className="pointer-events-none absolute bottom-0 top-10 z-10 border-l border-dashed border-border/70"
-      />
+      {!fullSession && (
+        <span
+          aria-hidden="true"
+          style={{ left: ROOT_GUIDE_CENTER_PX }}
+          className="pointer-events-none absolute bottom-0 top-10 z-10 border-l border-dashed border-border/70"
+        />
+      )}
+      {fullSession && openInPanel && (
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          className="absolute right-1 top-2 z-10"
+          aria-label="Open Main in side panel"
+          title="Open in side panel"
+          onClick={() => openInPanel(rootSessionId)}
+        >
+          <PanelRightOpenIcon className="size-3.5" />
+        </Button>
+      )}
       <Link
         // Drop session-scoped params (``file``, ``diff``, ``comment``,
         // ``view``, ``message``) when navigating in the rail — those are tied to
@@ -437,6 +891,13 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
         <div className="flex w-full items-start gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-[2px]">
+              {fullSession && session && (
+                <StatusAvatar
+                  {...((session.pendingElicitations?.length ?? 0) > 0
+                    ? { activity: "awaiting", label: "Needs input" }
+                    : sessionStatus(session.status, session.lastTaskError))}
+                />
+              )}
               <span
                 data-testid="subagent-main-harness-icon"
                 className="flex size-8 shrink-0 items-center justify-center rounded-xl border border-border bg-background"
@@ -449,7 +910,12 @@ function MainRow({ rootSessionId, isActive }: { rootSessionId: string; isActive:
                   className="size-5"
                 />
               </span>
-              <span className="min-w-0 truncate text-base font-semibold">{label}</span>
+              <span className="min-w-0 truncate text-base font-semibold">
+                {fullSession ? "Main" : label}
+              </span>
+              {fullSession && (
+                <span className="ml-1 truncate text-xs text-muted-foreground">{label}</span>
+              )}
             </div>
             {preview && (
               <p
@@ -515,7 +981,8 @@ function SubagentRow({
   // This child's own sub-agents, rendered as the next tree level.
   // Disabled (null id) at the depth cap so the fan-out of fetches is
   // bounded; ``useChildSessions`` skips the query entirely for null.
-  const { children: grandchildren } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  const { children: descendants } = useChildSessions(depth < MAX_TREE_DEPTH ? child.id : null);
+  const grandchildren = descendants.filter((descendant) => !descendant.archived);
   const hasGrandchildren = grandchildren.length > 0;
   const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
   return (

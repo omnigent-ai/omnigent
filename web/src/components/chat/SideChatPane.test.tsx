@@ -1097,6 +1097,19 @@ describe("side-chat interrupt", () => {
     expect(screen.getByRole("button", { name: "Interrupt session" })).toBeEnabled();
   });
 
+  it("queues a full related session's message for that session while another chat is active", () => {
+    renderPane(<SideChatPane childId={childId} fullSession interactiveSession />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Review the API" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: "Review the API", conversationId: childId }),
+    ]);
+    expect(input).toHaveValue("");
+    expect(useChatStore.getState().conversationId).toBe("conv_main");
+  });
+
   it.each([
     { name: "idle", id: childId, readOnly: false, sessionStatus: "idle" as const },
     { name: "pending", id: "pending:side", readOnly: false, sessionStatus: "running" as const },

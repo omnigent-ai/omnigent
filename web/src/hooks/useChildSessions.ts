@@ -1,7 +1,9 @@
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
-import { setSessionParent } from "@/lib/sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { isTempConvId } from "@/lib/tempConversationId";
 
 /**
@@ -62,6 +64,8 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  archived?: boolean;
+  host_id?: string | null;
 }
 
 /**
@@ -82,11 +86,15 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  archived?: boolean;
+  host_id?: string | null;
 }
 
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  has_more?: boolean;
+  last_id?: string | null;
 }
 
 /**
@@ -203,17 +211,38 @@ interface UseChildSessionsResult {
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
-export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
-  );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as ChildSessionsResponse;
-  // Children run on this session's runner: record the link so their
-  // session-scoped requests key by this session's host before their own
-  // snapshot loads.
-  for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
+export async function fetchChildSessions(
+  sessionId: string,
+  includeArchived = false,
+): Promise<ChildSessionInfo[]> {
+  const rows: ChildSessionWire[] = [];
+  let after: string | undefined;
+  const cursors = new Set<string>();
+  do {
+    const params = new URLSearchParams();
+    if (after) params.set("after", after);
+    if (includeArchived) params.set("include_archived", "true");
+    const query = params.size > 0 ? `?${params}` : "";
+    // oxlint-disable-next-line no-await-in-loop -- Each page needs the previous cursor.
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions${query}`,
+    );
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    // oxlint-disable-next-line no-await-in-loop -- Read the next cursor before requesting another page.
+    const page = (await res.json()) as ChildSessionsResponse;
+    rows.push(...page.data);
+    after = page.has_more ? (page.last_id ?? undefined) : undefined;
+    if (page.has_more && (!after || cursors.has(after))) {
+      throw new Error("Invalid child-session pagination cursor");
+    }
+    if (after) cursors.add(after);
+  } while (after);
+  // Full peers have their own placement; helper children can inherit routing.
+  for (const row of rows) {
+    setSessionParent(row.id, sessionId, row.labels);
+    if ("host_id" in row) setSessionHost(row.id, sessionRoutingHostId(row.host_id, row.labels));
+  }
+  return rows.map((row) => ({
     id: row.id,
     title: row.title,
     task_summary: row.task_summary ?? null,
@@ -226,6 +255,8 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    ...(row.archived !== undefined ? { archived: row.archived } : {}),
+    ...(row.host_id !== undefined ? { host_id: row.host_id } : {}),
   }));
 }
 
@@ -249,13 +280,14 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
+  const includeArchived = isFeatureEnabled(useServerInfo(), "related_sessions");
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
     queryKey:
       sessionId === null
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
-    queryFn: () => fetchChildSessions(sessionId as string),
+    queryFn: () => fetchChildSessions(sessionId as string, includeArchived),
     enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,

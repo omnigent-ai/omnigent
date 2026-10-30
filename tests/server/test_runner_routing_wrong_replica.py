@@ -6,7 +6,11 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.server._runner_ws_tunnel import WrongReplicaWSError, make_tunnel_ws_factory
-from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SESSION_ROLE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
 
 
 class MockHostRegistry:
@@ -57,6 +61,34 @@ def test_runner_absent_code_no_host_id_returns_runner_unavailable():
     )
     code = router._runner_absent_code(None)
     assert code == ErrorCode.RUNNER_UNAVAILABLE
+
+
+@pytest.mark.parametrize("peer_host", [None, "peer_host"])
+def test_peer_and_its_helpers_never_route_through_logical_root(peer_host):
+    root = Conversation(
+        id="root", created_at=1, updated_at=1, root_conversation_id="root", host_id="root_host"
+    )
+    peer = Conversation(
+        id="peer",
+        created_at=1,
+        updated_at=1,
+        kind="sub_agent",
+        parent_conversation_id=root.id,
+        root_conversation_id=root.id,
+        labels={SESSION_ROLE_LABEL_KEY: "peer"},
+        host_id=peer_host,
+    )
+    helper = Conversation(
+        id="helper",
+        created_at=1,
+        updated_at=1,
+        kind="sub_agent",
+        parent_conversation_id=peer.id,
+        root_conversation_id=root.id,
+    )
+    store = MockConversationStore(root, peer, helper)
+    assert routing_host_id(peer, store) == peer_host
+    assert routing_host_id(helper, store) == peer_host
 
 
 def test_runner_absent_code_no_registries_returns_runner_unavailable():

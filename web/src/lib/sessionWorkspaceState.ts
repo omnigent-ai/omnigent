@@ -47,6 +47,10 @@ export interface SessionWorkspaceState {
   openSideChats?: string[];
   /** Open sub-agent tabs (`subagentTabId` values) in open order, shown after the side chats. */
   openSubagentTabs?: string[];
+  /** Collapsed helper sections, shared by the related-session group. */
+  collapsedSubagentIds?: string[];
+  /** User ordering of full related sessions in the Agents panel. */
+  relatedSessionOrder?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
   /** Split panes of the main terminal view; absent while unsplit. */
@@ -134,6 +138,10 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (Array.isArray(record.openSideChats)) state.openSideChats = uniqueIds(record.openSideChats);
   if (Array.isArray(record.openSubagentTabs))
     state.openSubagentTabs = uniqueIds(record.openSubagentTabs);
+  if (Array.isArray(record.collapsedSubagentIds))
+    state.collapsedSubagentIds = uniqueIds(record.collapsedSubagentIds);
+  if (Array.isArray(record.relatedSessionOrder))
+    state.relatedSessionOrder = uniqueIds(record.relatedSessionOrder);
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }

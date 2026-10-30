@@ -319,6 +319,7 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
+    SESSION_ROLE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
 )
@@ -6150,6 +6151,26 @@ async def _owns_host_runner(conv: Conversation, conversation_store: Conversation
     """
     if not conv.host_id or not conv.runner_id:
         return False
+    try:
+        runner_sessions = await asyncio.to_thread(
+            conversation_store.list_conversations_by_runner_id, conv.runner_id
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Cannot verify shared runner %s; leaving it up", conv.runner_id, exc_info=True
+        )
+        return False
+    # Full peers can share a sibling's runner even though their parent is Main.
+    if any(
+        row.id != conv.id
+        and not row.archived
+        and (
+            conv.labels.get(SESSION_ROLE_LABEL_KEY) == "peer"
+            or row.labels.get(SESSION_ROLE_LABEL_KEY) == "peer"
+        )
+        for row in runner_sessions
+    ):
+        return False
     visited = {conv.id}
     ancestor_id = conv.parent_conversation_id
     for _ in range(_OWNERSHIP_ANCESTOR_LOOKUP_LIMIT):
@@ -10740,7 +10761,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
-    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, CREATED_BY_SESSION_LABEL_KEY):
+    for key in (
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        CREATED_BY_SESSION_LABEL_KEY,
+        SESSION_ROLE_LABEL_KEY,
+    ):
         if key in labels:
             raise OmnigentError(
                 f"label {key!r} is server-internal and cannot be set by clients",
@@ -11383,6 +11408,10 @@ def _child_session_summary_from_conversation(
         current_task_status=current_task_status,
         busy=busy,
         labels=labels,
+        session_role="peer" if labels.get(SESSION_ROLE_LABEL_KEY) == "peer" else None,
+        archived=conv.archived,
+        host_id=conv.host_id,
+        workspace=conv.workspace,
         last_task_error=last_task_error,
         last_message_preview=last_message_preview,
         # Surface the sub-agent's parked-elicitation count from the same
