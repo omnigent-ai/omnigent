@@ -25,6 +25,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
+    claude_turn_in_progress,
     has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
@@ -339,12 +340,23 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            # The pane is still alive here: this turn's error reports the close,
-            # so the runner must not also report the pane's exit as a failure.
-            cleanup_error = self._reap_failed_turn(expected_close=True)
             message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
+            try:
+                working = await asyncio.to_thread(claude_turn_in_progress, self._bridge_dir)
+            except (OSError, ValueError):
+                working = False
+            if working:
+                # Only the input box went unseen; reaping would end the turn's work.
+                _logger.warning(
+                    "claude-native: Claude is still working its turn; leaving its pane running",
+                    extra={"session_id": self._request_session_id},
+                )
+            else:
+                # The pane is still alive here: this turn's error reports the close,
+                # so the runner must not also report the pane's exit as a failure.
+                cleanup_error = self._reap_failed_turn(expected_close=True)
+                if cleanup_error is not None:
+                    message = f"{message} Cleanup also failed: {cleanup_error}"
             yield ExecutorError(message=message, undelivered=True)
             return
         except ClaudeSignInPending as exc:

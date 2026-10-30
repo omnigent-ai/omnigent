@@ -1638,6 +1638,50 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("working", [True, False])
+async def test_run_turn_keeps_a_working_claude_on_prompt_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    working: bool,
+) -> None:
+    """
+    A readiness timeout reaps the pane only when Claude isn't working a turn.
+
+    While a turn runs, only the input box went unseen: the follow-up message is
+    reported undelivered, and reaping would end the work already under way.
+    """
+    bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "claude_turn_in_progress", lambda _dir: working)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s, expected_close=False: killed.append(bridge_dir_arg),
+    )
+
+    executor = ClaudeNativeExecutor(bridge_dir)
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == ([] if working else [bridge_dir])
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
 async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

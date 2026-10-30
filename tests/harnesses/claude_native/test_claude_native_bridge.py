@@ -47,6 +47,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _occupying_surface,
     augment_claude_args,
     claude_global_config_path,
+    claude_turn_in_progress,
     count_hook_events,
     display_cost_approval_popup,
     ensure_claude_workspace_trusted,
@@ -704,6 +705,51 @@ def test_record_hook_event_updates_transcript_state(tmp_path: Path) -> None:
 
     assert read_transcript_path(bridge_dir) == transcript_path
     assert count_hook_events(bridge_dir) == 1
+
+
+@pytest.mark.parametrize(
+    ("hooks", "in_progress"),
+    [
+        ([], False),
+        ([{"hook_event_name": "UserPromptSubmit"}], True),
+        ([{"hook_event_name": "UserPromptSubmit"}, {"hook_event_name": "Stop"}], False),
+        ([{"hook_event_name": "UserPromptSubmit"}, {"hook_event_name": "StopFailure"}], False),
+        ([{"hook_event_name": "UserPromptSubmit"}, {"hook_event_name": "SessionEnd"}], False),
+        # Auto-compaction starts a session inside the turn it continues.
+        (
+            [
+                {"hook_event_name": "UserPromptSubmit"},
+                {"hook_event_name": "SessionStart", "source": "compact"},
+            ],
+            True,
+        ),
+        # A resumed launch starts a session that has no turn yet.
+        (
+            [
+                {"hook_event_name": "UserPromptSubmit"},
+                {"hook_event_name": "SessionStart", "source": "resume"},
+            ],
+            False,
+        ),
+        # A subagent finishing does not end its parent's turn.
+        (
+            [
+                {"hook_event_name": "UserPromptSubmit"},
+                {"hook_event_name": "Stop", "agent_id": "a4892977eed616593"},
+            ],
+            True,
+        ),
+    ],
+)
+def test_claude_turn_in_progress_follows_the_parent_turn(
+    tmp_path: Path, hooks: list[dict[str, str]], in_progress: bool
+) -> None:
+    """Only the parent's turn edges decide whether Claude is working a turn."""
+    bridge_dir = tmp_path / "bridge"
+    for hook in hooks:
+        record_hook_event(bridge_dir, {"session_id": "claude-session", **hook})
+
+    assert claude_turn_in_progress(bridge_dir) is in_progress
 
 
 def test_record_hook_event_ignores_foreign_identity(tmp_path: Path) -> None:

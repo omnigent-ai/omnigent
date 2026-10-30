@@ -3770,6 +3770,44 @@ def count_hook_events(bridge_dir: Path) -> int:
         return 0
 
 
+def claude_turn_in_progress(bridge_dir: Path) -> bool:
+    """
+    Return whether Claude Code's hooks show the parent process still working a turn.
+
+    A ``UserPromptSubmit`` opens the turn and ``Stop``, ``StopFailure`` or
+    ``SessionEnd`` closes it. A ``SessionStart`` begins a new session unless
+    it is the compaction that continues the open turn. A child agent's hooks
+    don't move the parent's turn (see :func:`_from_parent_claude`).
+
+    :param bridge_dir: Bridge directory path.
+    :returns: ``True`` when the parent's last turn edge opened a turn.
+    """
+    parent_session_ids = read_seen_claude_session_ids(bridge_dir)
+    in_progress = False
+    try:
+        with (bridge_dir / _HOOKS_FILE).open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    envelope = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                if not isinstance(payload, dict) or not _from_parent_claude(
+                    payload, parent_session_ids
+                ):
+                    continue
+                event_name = payload.get("hook_event_name")
+                if event_name == "UserPromptSubmit":
+                    in_progress = True
+                elif event_name in {"Stop", "StopFailure", "SessionEnd"} or (
+                    event_name == "SessionStart" and payload.get("source") != "compact"
+                ):
+                    in_progress = False
+    except FileNotFoundError:
+        return False
+    return in_progress
+
+
 def read_hook_events_since(
     bridge_dir: Path,
     start_event_count: int,
@@ -3863,9 +3901,9 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
 
-    Only counts stop events from the parent Claude process. A foreign
-    native session, ``agent_id``, or ``subagents/`` transcript identifies
-    a child whose completion must not end the parent's turn.
+    Only counts stop events from the parent Claude process (see
+    :func:`_from_parent_claude`): a child's completion must not end the
+    parent's turn.
 
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before a
@@ -3886,24 +3924,41 @@ def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
                     continue
                 payload = envelope.get("payload") if isinstance(envelope, dict) else None
                 event_name = payload.get("hook_event_name") if isinstance(payload, dict) else None
-                if event_name in {"Stop", "StopFailure"} and isinstance(payload, dict):
-                    native_session_id = payload.get("session_id")
-                    if (
-                        parent_session_ids
-                        and isinstance(native_session_id, str)
-                        and native_session_id
-                        and native_session_id not in parent_session_ids
-                    ):
-                        continue
-                    transcript_path = payload.get("transcript_path")
-                    if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
-                        continue
-                    if payload.get("agent_id"):
-                        continue
+                if (
+                    event_name in {"Stop", "StopFailure"}
+                    and isinstance(payload, dict)
+                    and _from_parent_claude(payload, parent_session_ids)
+                ):
                     return True
     except FileNotFoundError:
         return False
     return False
+
+
+def _from_parent_claude(payload: _JsonObject, parent_session_ids: set[str]) -> bool:
+    """
+    Return whether a hook payload came from the parent Claude process.
+
+    A foreign native session, ``agent_id``, or ``subagents/`` transcript
+    identifies a child agent.
+
+    :param payload: Hook JSON object, e.g. ``{"hook_event_name": "Stop"}``.
+    :param parent_session_ids: Claude session ids the parent has used, from
+        :func:`read_seen_claude_session_ids`.
+    :returns: ``True`` unless the payload names a child agent.
+    """
+    native_session_id = payload.get("session_id")
+    if (
+        parent_session_ids
+        and isinstance(native_session_id, str)
+        and native_session_id
+        and native_session_id not in parent_session_ids
+    ):
+        return False
+    transcript_path = payload.get("transcript_path")
+    if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+        return False
+    return not payload.get("agent_id")
 
 
 # Terminal per-task ``status`` values in a ``Stop`` hook's ``background_tasks``
