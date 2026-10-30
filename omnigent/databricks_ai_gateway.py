@@ -11,6 +11,8 @@ so each harness names the coding agent and client surfaces the same way.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping
 from typing import Final, TypeVar
 from urllib.parse import urlparse
@@ -97,6 +99,87 @@ def is_databricks_ai_gateway_url(base_url: str) -> bool:
 # client surfaces as a comma-separated list, outermost first.
 CODING_AGENT_HEADER: Final[str] = "Databricks-Custom-Coding-Agent"
 CLIENT_SURFACES_HEADER: Final[str] = "Databricks-Custom-Client-Surfaces"
+REQUEST_TAGS_HEADER: Final[str] = "Databricks-Ai-Gateway-Request-Tags"
+CI_CONTEXT_ENV: Final[str] = "OMNIGENT_CI_CONTEXT"
+_HeaderValue = TypeVar("_HeaderValue")
+
+_CI_TAG_ENV: Final[dict[str, str]] = {
+    "pipeline": "OMNIGENT_CI_PIPELINE",
+    "repository": "GITHUB_REPOSITORY",
+    "workflow": "GITHUB_WORKFLOW_REF",
+    "run_id": "GITHUB_RUN_ID",
+    "run_attempt": "GITHUB_RUN_ATTEMPT",
+    "job": "GITHUB_JOB",
+    "source_session_id": "OMNIGENT_CI_SOURCE_SESSION_ID",
+    "pr_number": "OMNIGENT_CI_PR_NUMBER",
+    "reviewed_sha": "OMNIGENT_CI_REVIEWED_SHA",
+}
+
+
+def ci_request_tags(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Read opted-in CI attribution, including context inherited by child processes."""
+    env = os.environ if source is None else source
+    if context := env.get(CI_CONTEXT_ENV):
+        tags = json.loads(context)
+        if not isinstance(tags, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in tags.items()
+        ):
+            raise ValueError(f"{CI_CONTEXT_ENV} must contain a JSON string-to-string object")
+        return {key: value for key, value in tags.items() if key in _CI_TAG_ENV and value}
+    if not env.get("OMNIGENT_CI_PIPELINE"):
+        return {}
+    tags = {key: env[name] for key, name in _CI_TAG_ENV.items() if env.get(name)}
+    if workflow := tags.get("workflow"):
+        tags["workflow"] = workflow.split("@", 1)[0]
+    return tags
+
+
+def with_ci_request_tags(headers: Mapping[str, _HeaderValue]) -> dict[str, _HeaderValue | str]:
+    """Merge CI tags into a gateway header map, preserving other request tags."""
+    merged: dict[str, _HeaderValue | str] = dict(headers)
+    tags = ci_request_tags()
+    if not tags:
+        return merged
+    existing_tags: dict[str, str] = {}
+    for name in list(merged):
+        if name.lower() != REQUEST_TAGS_HEADER.lower():
+            continue
+        value = merged.pop(name)
+        decoded = json.loads(value) if isinstance(value, str) else None
+        if not isinstance(decoded, dict) or not all(
+            isinstance(key, str) and isinstance(item, str) for key, item in decoded.items()
+        ):
+            raise ValueError(f"{REQUEST_TAGS_HEADER} must contain a JSON string-to-string object")
+        existing_tags.update(decoded)
+    merged[REQUEST_TAGS_HEADER] = json.dumps({**existing_tags, **tags}, separators=(",", ":"))
+    return merged
+
+
+def gateway_request_tag_headers(base_url: str | None) -> dict[str, str]:
+    """Return CI request headers only for a Databricks AI Gateway destination."""
+    if base_url and is_databricks_ai_gateway_url(base_url):
+        return with_ci_request_tags({})
+    return {}
+
+
+def ci_gateway_base_url(base_url: str, protocol: str) -> str:
+    """Resolve a CI Databricks URL to the gateway's Anthropic or Codex surface."""
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or not _under_trusted_domain(parsed.hostname)
+    ):
+        raise ValueError("CI model usage requires an HTTPS Databricks workspace or gateway URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "CI gateway URL must not contain credentials, query parameters, or fragments"
+        )
+    if protocol not in {"anthropic", "codex/v1"}:
+        raise ValueError("Unsupported CI gateway protocol")
+    prefix = "" if DATABRICKS_AI_GATEWAY_LABEL in parsed.hostname.split(".") else "/ai-gateway"
+    return f"https://{parsed.netloc}{prefix}/{protocol}"
+
 
 # Coding-agent names, spelled the way the gateway's attribution normalizes them.
 CLAUDE_CODE_AGENT: Final[str] = "claude-code"
@@ -106,8 +189,6 @@ OPENCODE_AGENT: Final[str] = "opencode"
 
 # ug stamps ``ucode/<version> <agent>/<version>`` on the providers it writes.
 _UG_USER_AGENT_PREFIX: Final[str] = "ucode/"
-
-_HeaderValue = TypeVar("_HeaderValue")
 
 
 def gateway_attribution_headers(coding_agent: str, *, via_ug: bool = False) -> dict[str, str]:
@@ -119,7 +200,9 @@ def gateway_attribution_headers(coding_agent: str, *, via_ug: bool = False) -> d
         "Databricks-Custom-Client-Surfaces": "omnigent, ug"}``.
     """
     surfaces = "omnigent, ug" if via_ug else "omnigent"
-    return {CODING_AGENT_HEADER: coding_agent, CLIENT_SURFACES_HEADER: surfaces}
+    return with_ci_request_tags(
+        {CODING_AGENT_HEADER: coding_agent, CLIENT_SURFACES_HEADER: surfaces}
+    )
 
 
 def is_ug_route(base_url: str) -> bool:
@@ -142,7 +225,9 @@ def with_gateway_attribution(
     via_ug = (
         isinstance(user_agent, str) and user_agent.startswith(_UG_USER_AGENT_PREFIX)
     ) or is_ug_route(base_url)
-    return {**existing, **gateway_attribution_headers(coding_agent, via_ug=via_ug)}
+    attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
+    attribution.pop(REQUEST_TAGS_HEADER, None)
+    return with_ci_request_tags({**existing, **attribution})
 
 
 def with_gateway_attribution_lines(
@@ -157,5 +242,15 @@ def with_gateway_attribution_lines(
     """
     lines = [custom_headers] if custom_headers else []
     attribution = gateway_attribution_headers(coding_agent, via_ug=via_ug)
+    if REQUEST_TAGS_HEADER in attribution and custom_headers:
+        lines = []
+        tag_headers = {}
+        for line in custom_headers.splitlines():
+            name, separator, value = line.partition(":")
+            if separator and name.strip().lower() == REQUEST_TAGS_HEADER.lower():
+                tag_headers[name.strip()] = value.strip()
+            else:
+                lines.append(line)
+        attribution.update(with_ci_request_tags(tag_headers))
     lines.extend(f"{name}: {value}" for name, value in attribution.items())
     return "\n".join(lines)

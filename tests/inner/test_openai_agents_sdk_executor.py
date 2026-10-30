@@ -2166,14 +2166,24 @@ def test_get_openai_client_api_key_no_env_defaults_to_openai(monkeypatch):
     assert captured["base_url"] is None
 
 
-def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
+@pytest.mark.parametrize(
+    "base_url,tagged",
+    [
+        ("https://env-host.example.com/v1", False),
+        ("https://dbc-1.cloud.databricks.com/ai-gateway/openai/v1", True),
+    ],
+)
+def test_get_openai_client_no_profile_honors_env_vars(monkeypatch, base_url, tagged):
     """Without an explicit profile, the env-var branch still works.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    import json
+
     from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
 
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-host.example.com/v1")
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
+    monkeypatch.setenv("OPENAI_BASE_URL", base_url)
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
 
     captured: dict[str, str] = {}
@@ -2187,7 +2197,11 @@ def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
     with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
         _get_openai_async_client(profile=None)
 
-    assert captured["base_url"] == "https://env-host.example.com/v1"
+    assert captured["base_url"] == base_url
+    headers = captured["default_headers"]
+    assert bool(headers) == tagged
+    if tagged:
+        assert json.loads(headers["Databricks-Ai-Gateway-Request-Tags"])["run_id"] == "123"
     assert captured["api_key"] == "env-key"
     assert "http_client" not in captured
 

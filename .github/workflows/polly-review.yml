@@ -37,6 +37,14 @@ on:
         description: Review even if this PR commit already has a review.
         default: false
         type: boolean
+      source_session_id:
+        description: Optional originating Omnigent session for usage attribution.
+        required: false
+        type: string
+      usage_probe:
+        description: Send two bounded attribution probes instead of reviewing a PR.
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -48,6 +56,30 @@ env:
   PIP_INDEX_URL: https://pypi.org/simple
 
 jobs:
+  usage-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.usage_probe && github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      OMNIGENT_CI_PIPELINE: usage-attribution-probe
+      OMNIGENT_CI_SOURCE_SESSION_ID: ${{ inputs.source_session_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify both gateway protocols
+        env:
+          GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_REVIEW_ANTHROPIC_MODEL || vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
+        run: |
+          python3 -m dev.ci_usage probe --protocol anthropic --model "$ANTHROPIC_MODEL"
+          python3 -m dev.ci_usage probe --protocol codex/v1 --model "$OPENAI_MODEL"
+
   # Automatic runs use trusted base code and exclude forks. Manual runs require
   # write access or REVIEW_ALLOWLIST membership; forks retain the approval relay.
   # PR changes are fetched only as a diff, never executed here.
@@ -107,7 +139,7 @@ jobs:
     # !cancelled() permits skipped event-specific dependencies; each event
     # still requires its own gate or command validation to succeed.
     if: >-
-      !cancelled() && (
+      !cancelled() && !inputs.usage_probe && (
         (
           github.event_name == 'pull_request_target' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
@@ -317,15 +349,15 @@ jobs:
           # the system python; the output is valid YAML (JSON is a subset).
           python3 -c "
           import pathlib, os, json
+          from omnigent.databricks_ai_gateway import ci_gateway_base_url
           gw = os.environ['GATEWAY_BASE_URL']
-          host = gw.removesuffix('/serving-endpoints')
           cfg = {
               'providers': {
                   'databricks-gateway': {
                       'kind': 'gateway',
                       'default': ['anthropic', 'openai'],
                       'anthropic': {
-                          'base_url': gw + '/anthropic',
+                          'base_url': ci_gateway_base_url(gw, 'anthropic'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           # Fable's auto-permission classifier needs a routable Opus fallback.
                           'models': {
@@ -334,7 +366,7 @@ jobs:
                           },
                       },
                       'openai': {
-                          'base_url': host + '/ai-gateway/codex/v1',
+                          'base_url': ci_gateway_base_url(gw, 'codex/v1'),
                           'api_key_ref': 'env:LLM_API_KEY',
                           'wire_api': 'responses',
                           'models': {'default': os.environ['OMNIGENT_OPENAI_MODEL']},
@@ -796,6 +828,10 @@ jobs:
         id: polly
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          OMNIGENT_CI_PIPELINE: polly-review
+          OMNIGENT_CI_PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          OMNIGENT_CI_REVIEWED_SHA: ${{ steps.ctx.outputs.head_sha }}
+          OMNIGENT_CI_SOURCE_SESSION_ID: ${{ inputs.source_session_id }}
           OMNIGENT_POLLY_HARNESS: ${{ vars.OMNIGENT_CI_POLLY_HARNESS || 'codex' }}
           OMNIGENT_POLLY_MODEL: ${{ vars.OMNIGENT_CI_POLLY_MODEL || vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
