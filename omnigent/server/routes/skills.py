@@ -6,7 +6,7 @@ import asyncio
 import secrets
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
@@ -29,6 +29,8 @@ class SkillsResponse(BaseModel):
     """User-invocable skill metadata discovered on a host."""
 
     skills: list[SkillSummary]
+    # Sources the host could not read; non-empty means ``skills`` is incomplete.
+    warnings: list[str] = Field(default_factory=list)
 
 
 def create_skills_router(
@@ -60,7 +62,9 @@ def create_skills_router(
         Otherwise, supply ``host_id``, ``harness``, and ``path``; host ownership
         is required. Optional ``agent_id`` applies the selected agent's filter
         and bundled skills, with the same access check as session creation.
-        The two forms cannot be combined.
+        The two forms cannot be combined. ``warnings`` names sources the host
+        could not read, so an incomplete catalog is distinguishable from an
+        empty one.
         """
         user_id = require_user(request, auth_provider)
         agent_version = sub_agent_name = None
@@ -166,7 +170,7 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
-        return SkillsResponse(skills=skills)
+        return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router
 
