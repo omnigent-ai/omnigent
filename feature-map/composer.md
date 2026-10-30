@@ -591,7 +591,8 @@ Other connection providers alone do not enable the managed MCP picker.
   without a host lists only its agent's servers). In a
   claude-sdk session on a host with Claude MCP servers, expect them listed, and
   only the managed ones when the agent sets `skills: none`. Click
-  **Go to Settings** and confirm the session’s harness and host are selected.
+  **Go to Settings** and confirm the session’s harness and host are selected
+  (Claude’s page for a claude-sdk session).
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
