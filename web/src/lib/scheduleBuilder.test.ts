@@ -76,14 +76,6 @@ describe("parseRRuleToScheduleModel", () => {
     });
   });
 
-  it("opens interval rules in the custom editor", () => {
-    expect(parseRRuleToScheduleModel("FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0")).toMatchObject({
-      preset: "custom",
-      customFreq: "daily",
-      interval: 2,
-    });
-  });
-
   it.each([
     { customFreq: "hourly", interval: 3, minute: 7 },
     { customFreq: "daily", interval: 2 },
@@ -100,7 +92,11 @@ describe("parseRRuleToScheduleModel", () => {
       ] as ScheduleModel["end"][]) {
         const rule = buildRRule(model({ preset: "custom", ...overrides, end }));
         const parsed = parseRRuleToScheduleModel(rule);
-        expect(parsed).not.toBeNull();
+        expect(parsed).toMatchObject({
+          preset: "custom",
+          customFreq: overrides.customFreq,
+          interval: overrides.interval,
+        });
         expect(buildRRule(parsed!)).toBe(rule);
       }
     },

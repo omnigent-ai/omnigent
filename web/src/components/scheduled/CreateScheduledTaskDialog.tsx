@@ -48,7 +48,7 @@ import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversatio
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { sandboxOptionLabel } from "@/lib/capabilities";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { isNativeCodingAgent, nativeAgentHasCapability } from "@/lib/nativeCodingAgents";
 import { isAcpHarnessAgent, selectableSessionAgents } from "@/lib/agentGrouping";
@@ -96,6 +96,7 @@ export function CreateScheduledTaskDialog({
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts } = useHosts({ enabled: open });
   const info = useServerInfo();
+  const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
   // Gates the "new sandbox each run" option: only servers that can actually
   // serve a managed launch advertise it (same flag New Chat's sandbox option
   // gates on). "loading" → treat as disabled until /v1/info resolves.
@@ -371,8 +372,12 @@ export function CreateScheduledTaskDialog({
     savedSchedule !== null &&
     timezone === editingTask?.timezone &&
     buildRRule(schedule) === buildRRule(savedSchedule);
+  const requiresAnchoredScheduling = schedule.preset === "custom" || schedule.end?.type === "count";
+  const unsupportedByScheduler = !anchoredScheduling && requiresAnchoredScheduling;
   const scheduleInvalid =
-    scheduleUnsupported || validateSchedule(schedule, { allowPastEnd }) !== null;
+    scheduleUnsupported ||
+    unsupportedByScheduler ||
+    validateSchedule(schedule, { allowPastEnd }) !== null;
   const renderedTriggerPrompt =
     trigger !== null && triggerFieldsComplete(triggerFields)
       ? renderTriggerPrompt(trigger, triggerFields, {
@@ -633,6 +638,7 @@ export function CreateScheduledTaskDialog({
             timezone={timezone}
             onTimezoneChange={setTimezone}
             model={schedule}
+            anchoredScheduling={anchoredScheduling}
             recurrenceUnsupported={scheduleUnsupported}
             allowPastEnd={allowPastEnd}
             onChange={setSchedule}
@@ -642,6 +648,13 @@ export function CreateScheduledTaskDialog({
           {scheduleUnsupported && (
             <p className="text-sm text-destructive" role="alert">
               This schedule can&apos;t be edited in this form yet. Choose a frequency to replace it.
+            </p>
+          )}
+
+          {unsupportedByScheduler && (
+            <p className="text-sm text-destructive" role="alert">
+              This server does not support custom schedules or occurrence limits. Choose a supported
+              frequency and ending to replace this schedule.
             </p>
           )}
 

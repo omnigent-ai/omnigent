@@ -74,6 +74,7 @@ const choiceClass = "h-8 w-auto min-w-0 text-ui";
 
 export function ScheduleFields({
   model,
+  anchoredScheduling,
   onChange,
   timezone,
   onTimezoneChange,
@@ -83,6 +84,7 @@ export function ScheduleFields({
   allowPastEnd = false,
 }: {
   model: ScheduleModel;
+  anchoredScheduling: boolean;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
@@ -196,7 +198,13 @@ export function ScheduleFields({
           preventCloseAutoFocus={customOpen}
           value={selectedFrequency}
           placeholder="Choose frequency"
-          options={PRESETS}
+          options={PRESETS.filter(
+            (preset) =>
+              preset.value !== "custom" || anchoredScheduling || model.preset === "custom",
+          ).map((preset) => ({
+            ...preset,
+            disabled: preset.value === "custom" && !anchoredScheduling,
+          }))}
           onChange={changePreset}
           onOpenChange={onSelectOpenChange}
         />
@@ -207,6 +215,7 @@ export function ScheduleFields({
                 variant="outline"
                 className="h-8 min-w-0 max-w-72 justify-between px-2.5 font-normal"
                 data-testid="custom-schedule-trigger"
+                disabled={!anchoredScheduling}
               >
                 <span className="truncate">
                   {model.preset !== "custom" || recurrenceError
@@ -342,7 +351,7 @@ export function ScheduleFields({
                 </p>
               )}
               <Button
-                disabled={draftError !== null}
+                disabled={!anchoredScheduling || draftError !== null}
                 onClick={() => {
                   onChange(draft);
                   onRecurrenceSelect?.();
@@ -448,7 +457,9 @@ export function ScheduleFields({
             options={[
               { value: "never", label: "Never" },
               { value: "until", label: "On date" },
-              { value: "count", label: "After" },
+              ...(anchoredScheduling || model.end?.type === "count"
+                ? [{ value: "count", label: "After", disabled: !anchoredScheduling }]
+                : []),
             ]}
             onChange={changeEnd}
             onOpenChange={onSelectOpenChange}
@@ -467,6 +478,7 @@ export function ScheduleFields({
               <Input
                 type="number"
                 aria-label="Occurrences"
+                disabled={!anchoredScheduling}
                 min={2}
                 max={2147483647}
                 step={1}
@@ -487,6 +499,11 @@ export function ScheduleFields({
           )}
         </div>
       </div>
+      {model.end?.type === "count" && (
+        <p className="text-sm text-muted-foreground">
+          Counts scheduled occurrences since creation.
+        </p>
+      )}
       {model.preset === "hourly" && Number.isInteger(model.minute) && (
         <p className="text-sm text-muted-foreground">{hourlyHint(model.minute)}</p>
       )}
@@ -512,7 +529,7 @@ function ScheduleChoice({
 }: {
   label: string;
   value: string;
-  options: { value: string; label: string }[];
+  options: { value: string; label: string; disabled?: boolean }[];
   onChange: (value: string) => void;
   onOpenChange?: (open: boolean) => void;
   testId?: string;
@@ -542,7 +559,7 @@ function ScheduleChoice({
         }}
       >
         {options.map((option) => (
-          <SelectItem key={option.value} value={option.value}>
+          <SelectItem key={option.value} value={option.value} disabled={option.disabled}>
             {option.label}
           </SelectItem>
         ))}

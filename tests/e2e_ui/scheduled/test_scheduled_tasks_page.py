@@ -21,7 +21,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -636,13 +636,15 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str)
     page.get_by_role("button", name="Apply", exact=True).click()
     page.get_by_role("combobox", name="Schedule ends", exact=True).click()
     page.get_by_role("option", name="On date", exact=True).click()
-    page.get_by_label("End date", exact=True).fill("2030-06-10")
+    end_date = f"{datetime.now(UTC).year + 2}-06-10"
+    page.get_by_label("End date", exact=True).fill(end_date)
     page.get_by_test_id("create-scheduled-task-submit").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
     response = httpx.get(f"{live_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
     response.raise_for_status()
     assert response.json()["rrule"] == (
-        "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;UNTIL=20300610T155959Z"
+        "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;"
+        f"UNTIL={end_date.replace('-', '')}T155959Z"
     )
     assert response.json()["timezone"] == "Asia/Singapore"
 

@@ -12,7 +12,14 @@ import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
 import type React from "react";
 import userEvent from "@testing-library/user-event";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render as renderBase,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CreateScheduledTaskDialog,
@@ -180,7 +187,22 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof scheduledHooks.useUpdateScheduledTask>);
 });
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
+
+function render(ui: Parameters<typeof renderBase>[0]) {
+  return renderBase(ui, {
+    wrapper: ({ children }) => (
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: true } }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    ),
+  });
+}
 
 function renderDialog(onOpenChange: (open: boolean) => void = vi.fn()) {
   return render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
@@ -1068,14 +1090,23 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.click(screen.getByTestId("custom-schedule-trigger"));
     expect(screen.getByLabelText("Repeat every")).toHaveValue(2);
     fireEvent.keyDown(screen.getByLabelText("Repeat every"), { key: "Escape" });
+    fireEvent.click(screen.getByTestId("custom-schedule-trigger"));
+    fireEvent.keyDown(screen.getByLabelText("Month"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "July" }));
+    const updatedDays = within(screen.getByRole("group", { name: "Days of the month" }));
+    fireEvent.click(updatedDays.getByRole("button", { name: "15" }));
+    fireEvent.click(updatedDays.getByRole("button", { name: "20" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe(
-      "FREQ=YEARLY;INTERVAL=2;BYMONTH=6;BYMONTHDAY=1,15;BYHOUR=9;BYMINUTE=0;COUNT=4",
+      "FREQ=YEARLY;INTERVAL=2;BYMONTH=7;BYMONTHDAY=1,20;BYHOUR=9;BYMINUTE=0;COUNT=4",
     );
   });
 
   it("saves an inclusive end date in the selected timezone", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-01T00:00:00Z"));
     render(
       <CreateScheduledTaskDialog
         open
@@ -1867,5 +1898,80 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
     // The kept session stays, but the user may now change it.
     expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
+  });
+});
+
+describe("scheduler capabilities", () => {
+  it.each([false, undefined, "loading"] as const)(
+    "hides anchored recurrence controls when automations_v2 is %s",
+    async (enabled) => {
+      const info: React.ComponentProps<typeof CapabilitiesProvider>["info"] =
+        enabled === "loading"
+          ? "loading"
+          : {
+              ...SERVER_INFO_OFFLINE_FALLBACK,
+              features: enabled === undefined ? {} : { automations_v2: enabled },
+            };
+      render(
+        <CapabilitiesProvider info={info}>
+          <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+        </CapabilitiesProvider>,
+      );
+      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+      expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
+        "Every hour",
+        "Every day",
+        "Every weekday",
+        "Every week",
+      ]);
+      fireEvent.click(screen.getByRole("option", { name: "Every hour" }));
+      fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
+      expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
+        "Never",
+        "On date",
+      ]);
+    },
+  );
+
+  it.each([
+    [false, "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0", "custom"],
+    [undefined, "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0", "custom"],
+    [false, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3", "count"],
+    [undefined, "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=3", "count"],
+  ] as const)("protects saved rules when automations_v2 is %s: %s", async (enabled, rule, kind) => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: enabled === undefined ? {} : { automations_v2: enabled },
+        }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ rrule: rule })}
+        />
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This server does not support custom schedules or occurrence limits",
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    expect(updateMutateAsync).not.toHaveBeenCalled();
+    if (kind === "custom") {
+      expect(screen.getByTestId("custom-schedule-trigger")).toBeDisabled();
+      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Every day" }));
+    } else {
+      expect(screen.getByLabelText("Occurrences")).toHaveValue(3);
+      expect(screen.getByLabelText("Occurrences")).toBeDisabled();
+      fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: "Never" }));
+    }
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=DAILY;BYHOUR=9;BYMINUTE=0");
   });
 });

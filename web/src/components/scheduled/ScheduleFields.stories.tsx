@@ -19,6 +19,7 @@ function ScheduleExample({ initialModel }: { initialModel: ScheduleModel }) {
     <div className="w-[560px] rounded-xl border bg-card p-4">
       <ScheduleFields
         model={model}
+        anchoredScheduling
         onChange={setModel}
         timezone={timezone}
         onTimezoneChange={setTimezone}
