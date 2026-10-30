@@ -6429,7 +6429,7 @@ export function NewChatLandingScreen() {
           {sandboxSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
-              className="px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
+              className="px-2 py-0.5 mobile-app:[--composer-context-padding-block:2px] md:h-[37px] md:px-3 md:py-1.5"
               data-testid="new-chat-landing-workspace-controls"
               trailingContent={mcpRegistryPicker}
             >
@@ -6464,6 +6464,7 @@ export function NewChatLandingScreen() {
                 <PopoverContent
                   ref={sandboxRepoPopoverRef}
                   align="start"
+                  side="top"
                   className="w-96 mobile-app:max-w-[calc(100vw-1rem)] p-3"
                   onOpenAutoFocus={(event) => {
                     if (focusSandboxRepositoryIssue()) event.preventDefault();

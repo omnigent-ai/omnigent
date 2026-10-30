@@ -513,7 +513,7 @@
   width: calc(100% - 24px);
   margin-inline: 12px;
   margin-bottom: -0.5px;
-  padding: 6px 8px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
   background-color: var(--composer-header-bg);
   border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
   border-bottom: none;
