@@ -13,10 +13,17 @@ from __future__ import annotations
 import base64
 import copy
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from omnigent.entities import ConversationItem, MessageData
-from omnigent.inner.native_attachments import framework_notice_block, resize_dimensions
+from omnigent.inner.native_attachments import (
+    DELIVERY_KEY,
+    FilesystemAttachmentPolicy,
+    framework_notice_block,
+    requires_filesystem,
+    resize_dimensions,
+    uses_filesystem_delivery,
+)
 from omnigent.stores import ArtifactStore, FileStore
 
 _logger = logging.getLogger(__name__)
@@ -89,6 +96,14 @@ _EXTRA_MIME_TYPES: dict[str, str] = {
     # Dotfiles
     ".env": "text/plain",
     ".lock": "text/plain",
+}
+
+# MIME types for the compression encodings ``mimetypes.guess_type`` reports.
+_COMPRESSION_MIME_TYPES: dict[str, str] = {
+    "gzip": "application/gzip",
+    "bzip2": "application/x-bzip2",
+    "xz": "application/x-xz",
+    "compress": "application/x-compress",
 }
 
 
@@ -619,6 +634,37 @@ def attachment_text_type_for_extension(filename: str | None) -> str | None:
     return "text/plain"
 
 
+def attachment_delivery(
+    filename: str,
+    declared_type: str | None,
+    policy: FilesystemAttachmentPolicy,
+) -> Literal["inline", "filesystem"] | None:
+    """
+    Decide how an upload reaches the agent, or ``None`` when it is refused.
+
+    Listed extensions are matched by name first, so a misleading MIME cannot
+    send one inline; a default filesystem extension the policy leaves out is
+    refused for the same reason. Everything else accepted inline stays inline;
+    with ``policy.all_types``, the remaining files are delivered as files.
+
+    :param filename: The upload's filename, e.g. ``"trace.gz"``.
+    :param declared_type: The MIME the client declared, e.g. ``"application/gzip"``.
+    :param policy: The deployment's filesystem attachment policy.
+    :returns: ``"filesystem"``, ``"inline"``, or ``None``.
+    """
+    if policy.matches(filename):
+        return "filesystem"
+    if requires_filesystem(filename):
+        return None
+    content_type = _resolve_content_type(declared_type, filename)
+    if (
+        attachment_upload_limit(content_type) is not None
+        or attachment_text_type_for_extension(filename) is not None
+    ):
+        return "inline"
+    return "filesystem" if policy.all_types else None
+
+
 # ── Text-attachment extraction for input-phase policy scanning ─────────
 
 
@@ -664,8 +710,6 @@ def extract_text_attachments(
     :returns: A list of ``{"filename", "content_type", "text"}`` entries
         in order. Files requiring filesystem tools carry an empty ``text``.
     """
-    from omnigent.inner.native_attachments import requires_filesystem
-
     attachments: list[dict[str, str]] = []
     for block in content:
         # Both block types are considered: delivery follows the stored filename,
@@ -689,10 +733,11 @@ def extract_text_attachments(
         ):
             continue
         content_type = _resolve_content_type(file_meta.content_type, file_meta.filename)
-        # Checked before the text-like test: delivery follows the filename, so an
-        # archive stored under a text MIME still reaches the filesystem. It has no
-        # scannable text, but is announced by name so a policy can refuse it.
-        if requires_filesystem(file_meta.filename):
+        # Checked before the text-like test: delivery follows the upload's recorded
+        # decision, so an archive stored under a text MIME still reaches the
+        # filesystem. It has no scannable text, but is announced by name so a
+        # policy can refuse it.
+        if uses_filesystem_delivery(file_meta.filename, file_meta.source_metadata):
             attachments.append(
                 {
                     "filename": file_meta.filename or "",
@@ -901,11 +946,10 @@ def _resolve_file_id_block(
     # Types requiring filesystem tools never reach a model as bytes (a native
     # harness reads them off disk instead), so inlining one here would send
     # a payload the provider can't interpret. Fail with an actionable error.
-    from omnigent.inner.native_attachments import requires_filesystem
-
-    if requires_filesystem(file_meta.filename):
+    if uses_filesystem_delivery(file_meta.filename, file_meta.source_metadata):
         if defer_filesystem_files:
-            return dict(block), None
+            # The runner sets delivery from the stored record when it fetches the file.
+            return {k: v for k, v in block.items() if k != DELIVERY_KEY}, None
         raise ValueError(
             f"Attachment '{file_meta.filename}' requires a filesystem-capable "
             "harness (e.g. Claude Code, Codex) and cannot be used with this model."
@@ -922,8 +966,11 @@ def _resolve_file_id_block(
         if cache is not None:
             cache[file_id] = encoded
 
-    # Copy all fields except file_id.
-    resolved: dict[str, Any] = {k: v for k, v in block.items() if k != "file_id"}
+    # Copy all fields except file_id, and any delivery the client claimed:
+    # the stored record above already decided this file is inlined.
+    resolved: dict[str, Any] = {
+        k: v for k, v in block.items() if k not in ("file_id", DELIVERY_KEY)
+    }
     if file_meta.filename:
         # The stored name decides delivery; the block's own filename is
         # client-supplied and must not be able to relabel the file.
@@ -1026,7 +1073,10 @@ def _resolve_content_type(
         # video/mp2t, .rs → application/rls-services+xml).
         if suffix in _EXTRA_MIME_TYPES:
             return _EXTRA_MIME_TYPES[suffix]
-        guessed = _mt.guess_type(filename)[0]
+        guessed, encoding = _mt.guess_type(filename)
+        # ``trace.json.gz`` guesses as JSON; its bytes are the compressed stream.
+        if encoding is not None:
+            return _COMPRESSION_MIME_TYPES.get(encoding, "application/octet-stream")
         if guessed and guessed != "application/octet-stream":
             return guessed
         # Text-like extensions default to text/plain rather than

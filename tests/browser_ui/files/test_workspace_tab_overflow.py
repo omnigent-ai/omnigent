@@ -44,30 +44,22 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     toolbar = page.get_by_role("toolbar", name="Workspace tabs")
     viewport = toolbar.locator("[data-workspace-tabs-viewport]")
     expect(viewport).to_be_visible(timeout=30_000)
-    expect(toolbar.get_by_role("button", name="Scroll tabs right")).to_be_enabled()
-    expect(toolbar.get_by_role("button", name="Scroll tabs left")).to_be_disabled()
+    # Overflowing tabs scroll by wheel only; there are no arrow buttons.
+    assert viewport.evaluate("el => el.scrollWidth > el.clientWidth")
+    expect(toolbar.get_by_role("button", name="Scroll tabs right")).to_have_count(0)
+    expect(toolbar.get_by_role("button", name="Scroll tabs left")).to_have_count(0)
     assert viewport.evaluate("el => getComputedStyle(el).scrollbarWidth") == "none"
     assert viewport.evaluate("el => el.offsetHeight === el.clientHeight")
     assert (
         abs(page.get_by_role("complementary", name="Workspace").bounding_box()["width"] - width)
         < 1
     )
-    # Every navigation control stays within its slot, including narrow Electron rails.
+    # The tabs stay clear of the trailing controls, including narrow Electron rails.
     assert viewport.evaluate("""el => {
-        const slot = el.parentElement.getBoundingClientRect();
-        const next = el.parentElement.nextElementSibling.getBoundingClientRect();
+        const slot = el.getBoundingClientRect();
+        const next = el.nextElementSibling.getBoundingClientRect();
         return el.clientWidth >= 80 && slot.right <= next.left;
     }""")
-
-    toolbar.get_by_role("button", name="Scroll tabs right").click()
-    page.wait_for_function(
-        "document.querySelector('[data-workspace-tabs-viewport]').scrollLeft > 0"
-    )
-    expect(toolbar.get_by_role("button", name="Scroll tabs left")).to_be_enabled()
-    toolbar.get_by_role("button", name="Scroll tabs left").click()
-    page.wait_for_function(
-        "document.querySelector('[data-workspace-tabs-viewport]').scrollLeft === 0"
-    )
 
     viewport.hover()
     page.keyboard.down("Control")
@@ -122,18 +114,10 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     expect(toolbar.locator('[data-workspace-tab="changes"]')).to_have_attribute(
         "data-state", "active"
     )
-    # Fullscreen removes overflow arrows when all tabs fit after closing most files.
     for path in paths[1:]:
         # The picker can reveal a tab without requiring it to be initially visible.
         toolbar.get_by_role("button", name="Select panel").click()
         page.get_by_role("menuitem", name=path, exact=True).click()
         viewport.get_by_role("button", name=f"Close {path.split('/')[-1]}", exact=True).click()
-    if width == 472:
-        # A lone tab fits the full slot but not the slot minus two arrows.
-        assert viewport.evaluate(
-            "el => el.firstElementChild.clientWidth <= el.parentElement.clientWidth"
-        )
-        expect(toolbar.get_by_role("button", name="Scroll tabs right")).to_have_count(0)
-    toolbar.get_by_role("button", name="Full screen", exact=True).click()
-    expect(toolbar.get_by_role("button", name="Scroll tabs right")).to_have_count(0)
-    expect(toolbar.get_by_role("button", name="Scroll tabs left")).to_have_count(0)
+    first_close = f"Close {paths[0].split('/')[-1]}"
+    expect(viewport.get_by_role("button", name=first_close, exact=True)).to_be_in_viewport()

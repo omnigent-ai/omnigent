@@ -348,3 +348,62 @@ def test_bounded_iterator_preserves_dateutil_occurrences(rule: str, zone: str) -
     )
     midnight = start.replace(hour=0)
     assert get_next_fire_time(rule, start, tz) == rrulestr(rule, dtstart=midnight).after(start)
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "FREQ=SECONDLY;INTERVAL=3600",
+        "FREQ=MINUTELY;INTERVAL=90;BYSECOND=15",
+        "FREQ=HOURLY;INTERVAL=7;BYMINUTE=30",
+        "FREQ=DAILY;INTERVAL=3;BYHOUR=9",
+        "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,FR;WKST=SU",
+        "FREQ=MONTHLY;INTERVAL=3;BYDAY=MO;BYSETPOS=-1",
+        "FREQ=MONTHLY;INTERVAL=2",
+        "FREQ=YEARLY;INTERVAL=2",
+        "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29",
+        "FREQ=DAILY;BYHOUR=9;COUNT=500",
+        "FREQ=DAILY;BYHOUR=9;COUNT=2",
+        "FREQ=DAILY;UNTIL=20250301T000000Z",
+    ],
+)
+@pytest.mark.parametrize("zone", ["UTC", "America/Los_Angeles"])
+def test_seek_preserves_anchored_occurrences(rule: str, zone: str) -> None:
+    from dateutil.rrule import rrulestr
+
+    timezone = ZoneInfo(zone)
+    anchor = _dt(2024, 2, 29, tz=timezone)
+    # Both DST transitions and a query before the anchor.
+    for after in (
+        _dt(2024, 2, 28, tz=timezone),
+        _dt(2025, 3, 8, 23, 15, tz=timezone),
+        _dt(2025, 3, 9, 3, 15, tz=timezone),
+        _dt(2025, 11, 2, 3, 15, tz=timezone),
+    ):
+        expected = rrulestr(rule, dtstart=anchor).after(after)
+        assert get_next_fire_time(rule, after, timezone, anchor=anchor) == expected
+
+
+@pytest.mark.parametrize(
+    "rule,expected",
+    [
+        ("FREQ=MINUTELY;INTERVAL=60", _dt(2026, 10, 21, 1)),
+        ("FREQ=HOURLY", _dt(2026, 10, 21, 1)),
+        ("FREQ=DAILY", _dt(2026, 10, 22)),
+        ("FREQ=WEEKLY;INTERVAL=2;BYDAY=TU,FR;WKST=SU", _dt(2026, 10, 23)),
+        ("FREQ=MONTHLY;INTERVAL=3;BYMONTHDAY=21", _dt(2027, 1, 21)),
+    ],
+)
+def test_old_unbounded_rule_seeks_without_scanning_its_history(
+    monkeypatch: pytest.MonkeyPatch, rule: str, expected: datetime
+) -> None:
+    # A tiny budget proves the lookup doesn't walk twelve years of past occurrences.
+    monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 100)
+    assert get_next_fire_time(rule, _dt(2026, 10, 21), UTC, anchor=_dt(2014, 10, 21)) == expected
+
+
+def test_legacy_search_horizon_remains_midnight_based() -> None:
+    rule = "FREQ=YEARLY;INTERVAL=8;BYHOUR=1"
+    after = _dt(2026, 1, 1, 2)
+    assert get_next_fire_time(rule, after, UTC) is None
+    assert get_next_fire_time(rule, after, UTC, anchor=after) == _dt(2034, 1, 1, 1)

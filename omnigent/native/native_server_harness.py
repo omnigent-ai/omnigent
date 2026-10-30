@@ -214,7 +214,7 @@ class NativeServerHarness(Executor):
             return False
         try:
             return await self.transport.abort(session_id)
-        except Exception:  # noqa: BLE001 - interruption is best effort.
+        except Exception:  # interruption is best effort.
             _logger.warning("%s abort failed", self._harness_id, exc_info=True)
             return False
 
@@ -247,7 +247,7 @@ class NativeServerHarness(Executor):
                 return False
             try:
                 await self.transport.send_prompt(session_id, prompt)
-            except Exception:  # noqa: BLE001 - enqueue is best effort.
+            except Exception:  # enqueue is best effort.
                 _logger.warning("%s enqueue failed", self._harness_id, exc_info=True)
                 return False
         return True

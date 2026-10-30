@@ -40,14 +40,31 @@ function readArcaIdentity(output, serverUrl, onUnavailable = () => {}) {
     // CLI status normalizes the UI mount to the API mount and drops ?o=.
     // The selected workspace remains bound by the command's --server argument.
     const expected = new URL(target);
+    const requestedOrg = expected.searchParams.get("o");
     expected.search = "";
+    // A daemon target may carry ?o=: the requested one, or the one sign-in
+    // resolved when none was requested. Another workspace's never matches.
+    const daemonTarget = (() => {
+      const raw = arcaTarget(daemon.target);
+      if (!raw) return null;
+      const url = new URL(raw);
+      const org = url.searchParams.get("o");
+      if (org !== null && requestedOrg !== null && org !== requestedOrg) return null;
+      url.search = "";
+      return url.href;
+    })();
+    // The CLI reuses a daemon on another URL for the same workspace and names
+    // the requested target in same_workspace_as.
+    const servesTarget =
+      (daemonTarget === expected.href && arcaTarget(daemon.server_url) === expected.href) ||
+      (typeof daemon.same_workspace_as === "string" &&
+        arcaTarget(daemon.same_workspace_as) === expected.href);
     if (
       daemon.mode !== "server" ||
       daemon.process !== "online" ||
       daemon.host_status !== "online" ||
       daemon.error != null ||
-      arcaTarget(daemon.target) !== expected.href ||
-      arcaTarget(daemon.server_url) !== expected.href ||
+      !servesTarget ||
       typeof daemon.host_id !== "string" ||
       !/^[a-f0-9]{32}$/i.test(daemon.host_id)
     ) {

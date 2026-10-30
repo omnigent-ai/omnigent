@@ -50,6 +50,7 @@ of the agent YAML.
 | `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
 
 ## Executor
 
@@ -97,6 +98,10 @@ and can also drive Claude / GPT-OSS. Authenticate with an Antigravity /
 Gemini API key, or Vertex AI (`project` / `location`) — the SDK is
 Gemini-native and has no OpenAI-compatible gateway / Databricks path.
 
+For the native `omni agy` CLI, use the separate
+[native agy gateway guide](native-agy-gateways.md), which covers native Gemini
+gateways and Databricks profiles configured through `omni setup`.
+
 ```yaml
 executor:
   harness: antigravity         # aliases: agy, google-antigravity (native: antigravity-native, agy-native)
@@ -108,9 +113,10 @@ executor:
 
 ### Pi context files
 
-With `harness: pi`, Pi automatically appends context files such as `AGENTS.md`
-and `CLAUDE.md` from the workspace, its ancestors, and Pi's global agent
-directory. To disable this discovery for an agent, set `context_files: false`:
+With `harness: pi` or `pi-native`, Pi automatically appends context files such
+as `AGENTS.md` and `CLAUDE.md` from the workspace, its ancestors, and Pi's global
+agent directory. Regular `pi` also loads context from the agent bundle's root.
+To disable this discovery for an agent, set `context_files: false`:
 
 ```yaml
 name: focused-agent
@@ -138,20 +144,58 @@ The default is `true`; the value must be a YAML boolean. Explicit `prompt:` or
 `instructions:` content (including an explicitly referenced `AGENTS.md`) and
 Omnigent's runtime instructions are still sent to Pi. This option maps to Pi's
 `--no-context-files` flag. It does not disable skills, extensions, or Pi's
-separate `SYSTEM.md` discovery, and is only supported by `pi`, not `pi-native`
-or other harnesses.
+separate `SYSTEM.md` discovery. It supports `pi` and `pi-native` only.
+
+### Pi bundle resources
+
+A `harness: pi` directory bundle can ship Pi's own project-local resources, and
+sessions load them even though Pi runs in the session workspace rather than in
+the bundle:
+
+- `.pi/extensions/<name>/` directories (or top-level `.pi/extensions/*.ts` /
+  `*.js` files) are passed to Pi with `--extension`; `package.json`
+  `pi.extensions` entries must be files inside the extension directory.
+  Extensions run as code inside the Pi process, so bundle only extensions you
+  trust. Hook-style extensions (for example `before_agent_start`) take full
+  effect; tools an extension registers are loaded but not offered to the model,
+  because sessions expose only Omnigent's bridged tools to Pi.
+- `skills/<name>/SKILL.md` and `.pi/skills/<name>/SKILL.md` are passed with
+  `--skill` and follow the `skills` filter; when both roots define the same
+  name, `skills/` wins.
+- A bundle-root `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` (Pi's order) is
+  appended to the agent's instructions as an automatic context file. It is not
+  appended twice when the spec already adopted that same file as its
+  `instructions:`, and `context_files: false` disables it; an `AGENTS.md` the
+  spec already adopted as the agent's instructions is unaffected by that option.
+
+Under an `os_env` sandbox, Pi is granted read-only access to the `skills/`,
+`.pi/skills/` and `.pi/extensions/` directories it is passed, so bundled
+resources load from inside the sandbox too; the bundle root itself is not
+exposed.
 
 ### Pi system prompt
 
-With `harness: pi`, `system_prompt_mode` controls how Omnigent sends its composed
-instructions to Pi:
+With `harness: pi` or `pi-native`, `system_prompt_mode` controls how Omnigent
+sends agent instructions to Pi:
 
-- `append` (default) keeps Pi's base prompt and appends Omnigent's instructions
+- `append` (default) keeps Pi's base prompt and appends agent instructions
   using `--append-system-prompt`. The base is Pi's built-in coding prompt or a
   discovered `SYSTEM.md`.
-- `replace` sends Omnigent's instructions as the base using `--system-prompt`.
+- `replace` sends agent instructions as the base using `--system-prompt`.
   Pi's built-in coding prompt and discovered `SYSTEM.md` are omitted. An explicit
   empty `--append-system-prompt` also prevents discovery of `APPEND_SYSTEM.md`.
+
+For native Pi in append mode, authored instructions are added after the normally
+selected `APPEND_SYSTEM.md`: the trusted workspace's `.pi/APPEND_SYSTEM.md`, or
+the active Pi agent directory's file as a fallback. `--no-approve` / `-na`
+exclude the project file. If the Pi version cannot be detected, project selection
+requires an explicit `--approve` / `-a`; stored or interactive trust is not inferred.
+Explicit native `--append-system-prompt` arguments
+select append inputs themselves and disable this automatic selection, matching
+Pi's CLI behavior. `context_files: false` does not disable `APPEND_SYSTEM.md`;
+use replacement mode or explicit append arguments to exclude it.
+Regular Pi SDK sessions use explicit composed instructions rather than
+automatically loading `APPEND_SYSTEM.md`.
 
 To replace the base prompt and disable workspace context discovery:
 
@@ -179,12 +223,16 @@ executor:
 instructions: AGENTS.md
 ```
 
-Both modes preserve explicit agent instructions, per-request instructions, and
-Omnigent's appended runtime instructions. Replacement removes Pi's default tool
-summaries and coding guidelines; tool schemas and execution still work.
+Regular `pi` delivers composed agent/request/runtime instructions. Native Pi
+loads the spec's resolved authored instructions at terminal launch; replacement
+requires non-empty authored instructions, checked at spec load. Per-turn runtime
+delivery is unchanged.
+Both modes preserve explicit agent instructions. Replacement removes Pi's default
+tool summaries and coding guidelines; tool schemas and execution still work.
 `context_files` is independent and still defaults to `true`. Skills, the working
 directory footer, and extension hooks remain active; extensions can modify the
-final prompt. This setting only supports `pi`, not `pi-native` or other harnesses.
+final prompt. This setting supports `pi` and `pi-native` only. Native settings
+apply on the next terminal launch; explicit native CLI arguments remain available.
 
 ### GitHub Copilot
 
@@ -822,6 +870,39 @@ Use `os_env: inherit` to give the terminal the same sandbox as the agent, or
 alias a shared `sandbox:` block so `sys_os_*` and the terminal enforce the same
 policy. Keep `allow_sandbox_override: false` unless you intend to let the
 launcher weaken the sandbox at launch time.
+
+## Tool groups
+
+Several framework-owned tool groups register on every agent without any
+declaration. Each one has a `tool_groups` key so an agent can drop a group it
+cannot use — a headless sub-agent has no embedded browser to drive, and a
+byte-bounded provider counts every advertised tool against its limit.
+
+```yaml
+tool_groups:
+  browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  comments: false         # list_comments / update_comment
+  policies: false         # sys_add_policy / sys_policy_registry
+  agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+```
+
+Every group defaults to `true`, so omitting the block changes nothing. Values
+must be booleans and group names must match exactly; a typo fails the load
+rather than silently leaving the group registered. Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt. The block
+is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+
+`agent_discovery: false` is rejected while `spawn: true` or the
+`scheduled_tasks` group is on: `sys_session_create` and
+`sys_scheduled_task_create` take an `agent_id` the model looks up with
+`sys_agent_list` / `sys_agent_get`.
+
+The session read tools (`sys_session_list` / `sys_session_get_history` /
+`sys_session_get_info`), `sys_session_rename`, `ui_open_file`, and `sys_cancel_task`
+have no key: any agent in a multi-agent session needs the reads, and async work
+handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
+session viewers to open a workspace-relative file without switching sessions.
 
 ## Complete example
 

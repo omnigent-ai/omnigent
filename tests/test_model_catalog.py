@@ -49,6 +49,7 @@ from omnigent.models.model_metadata import (
     ModelWireAPI,
 )
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
@@ -193,6 +194,62 @@ def test_managed_claude_gateway_preserves_explicit_provider(
     )
     unusable = _worker_spec(harness, auth=ProviderAuth(name="explicit"))
     assert resolve_model_provider(unusable, harness).kind == "none"
+
+
+def test_managed_claude_gateway_beats_global_auth_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec pinning no route is labelled with the managed gateway, not global ``auth:``."""
+    _isolate_config(monkeypatch, tmp_path, "auth:\n  type: databricks\n  profile: oss\n")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+
+    provider = resolve_model_provider(_worker_spec("claude-native"), "claude-native")
+    assert provider.kind == "cli-config"
+    assert provider.base_url == "https://gateway.example/anthropic"
+    pinned = _worker_spec("claude-native", auth=DatabricksAuth(profile="explicit"))
+    assert resolve_model_provider(pinned, "claude-native").profile == "explicit"
+
+
+def test_managed_claude_gateway_keeps_ambient_key_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Managed settings only displace a global ``auth:``, not an ambient key route."""
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        lambda: [
+            DetectedProvider(
+                name="anthropic", kind="key", family="anthropic", source="$ANTHROPIC_API_KEY"
+            )
+        ],
+    )
+
+    provider = resolve_model_provider(_worker_spec("claude-native"), "claude-native")
+    assert provider.kind == "key"
 
 
 @pytest.mark.parametrize(
@@ -347,8 +404,7 @@ def _uc_service(name: str, api_types: list[str]) -> dict:
     return {"name": f"model-services/{name}", "supported_api_types": api_types}
 
 
-# Realistic serving-endpoints page (non-pi harnesses use /api/2.0/serving-endpoints
-# which returns databricks-* ids, not system.ai.* ids).
+# Realistic legacy serving-endpoints page used when UC discovery fails.
 _SERVING_ENDPOINTS_PAGE = {
     "endpoints": [
         {
@@ -563,10 +619,14 @@ def test_resolve_provider_legacy_profile(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert provider.profile == "legacy-prof"
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["databricks-claude-opus-4-8", "system.ai.claude-opus-4-8"],
+)
 def test_resolve_provider_databricks_model_prefix_uses_env_profile(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str
 ) -> None:
-    """A ``databricks-*`` spec model routes via the runner-env profile.
+    """A Databricks spec model routes via the runner-env profile.
 
     Mirrors the spawn builders' model-prefix heuristic plus the native
     launch paths' ``DATABRICKS_CONFIG_PROFILE`` fallback.
@@ -582,7 +642,7 @@ def test_resolve_provider_databricks_model_prefix_uses_env_profile(
         executor=ExecutorSpec(
             type="omnigent",
             config={"harness": "pi"},
-            model="databricks-claude-opus-4-8",
+            model=model,
         ),
     )
     provider = resolve_model_provider(spec, "pi")
@@ -758,13 +818,14 @@ def _databricks_transport(
                 "system.ai.gpt-5-4", ["mlflow/v1/chat/completions", "openai/v1/responses"]
             ),
             _uc_service("system.ai.gpt-responses-only", ["openai/v1/responses"]),
+            _uc_service("system.ai.gpt-5-6-sol", ["codex/v1/responses"]),
             _uc_service("system.ai.meta-llama-3-3-70b-instruct", ["mlflow/v1/chat/completions"]),
             _uc_service("system.ai.qwen3-embedding", ["mlflow/v1/embeddings"]),
         ]
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve serving-endpoints (non-pi) or UC model-services (pi)."""
+        """Serve the UC model-services listing and its legacy fallback."""
         requests_seen.append(request)
         if request.url.path == "/api/2.0/serving-endpoints":
             return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
@@ -811,11 +872,12 @@ def test_databricks_listing_filters_to_llm_wire_surfaces(
     # The profile's minted token authenticated the listing call.
     assert requests_seen[0].headers["authorization"] == "Bearer dapi-test"
     by_id = {m.id: m for m in listing.models}
-    # Pi uses UC model-services API → system.ai.* ids; embeddings endpoint excluded.
+    # Databricks workers use UC model-services ids; embeddings are excluded.
     assert set(by_id) == {
         "system.ai.claude-sonnet-4-6",
         "system.ai.gpt-5-4",
         "system.ai.gpt-responses-only",
+        "system.ai.gpt-5-6-sol",
         "system.ai.meta-llama-3-3-70b-instruct",
     }
     assert by_id["system.ai.claude-sonnet-4-6"].family == "claude"
@@ -830,6 +892,79 @@ def test_databricks_listing_filters_to_llm_wire_surfaces(
     assert by_id["system.ai.gpt-responses-only"].metadata.wire_apis == frozenset(
         {ModelWireAPI.OPENAI_RESPONSES}
     )
+    # The Codex Responses marker is the same wire; dropping it would hide
+    # Codex-only services such as Sol from Smart Routing.
+    assert by_id["system.ai.gpt-5-6-sol"].metadata.wire_apis == frozenset(
+        {ModelWireAPI.OPENAI_RESPONSES}
+    )
+
+
+def test_pi_filter_drops_unsupported_models_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Pi's unsupported-model filter matches regardless of the id's casing.
+
+    ``unsupported_in_pi`` takes the lowercased id; a listing spelling
+    ``gpt-oss`` with any uppercase letters must still be excluded for pi.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
+    _stub_workspace_creds(monkeypatch)
+    page = {
+        "model_services": [
+            _uc_service("system.ai.GPT-OSS-120b", ["mlflow/v1/chat/completions"]),
+            _uc_service("system.ai.claude-sonnet-4-6", ["anthropic/v1/messages"]),
+        ]
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Serve the UC model-services page."""
+        return httpx.Response(200, json=page)
+
+    listing = list_models_for_worker(
+        _worker_spec("pi"), "pi", transport=httpx.MockTransport(_handler)
+    )
+
+    assert {m.id for m in listing.models} == {"system.ai.claude-sonnet-4-6"}
+
+
+def test_custom_serving_endpoints_join_the_model_services_listing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A customer-created LLM endpoint stays listed beside the model services.
+
+    Model services cover only ``system.ai`` foundation models, so the
+    serving-endpoints listing still supplies custom endpoints; its foundation
+    entries must not duplicate the model services.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
+    _stub_workspace_creds(monkeypatch)
+    model_services = {
+        "model_services": [_uc_service("system.ai.claude-sonnet-4-6", ["anthropic/v1/messages"])]
+    }
+    serving_endpoints = {
+        "endpoints": [
+            {"name": "databricks-claude-sonnet-4-6", "task": "llm/v1/chat"},
+            {"name": "acme-claude-proxy", "task": "llm/v1/chat"},
+        ]
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Serve both workspace listings."""
+        if request.url.path == "/api/2.0/serving-endpoints":
+            return httpx.Response(200, json=serving_endpoints)
+        return httpx.Response(200, json=model_services)
+
+    listing = list_models_for_worker(
+        _worker_spec("claude-native"), "claude-native", transport=httpx.MockTransport(_handler)
+    )
+
+    assert [m.id for m in listing.models] == ["system.ai.claude-sonnet-4-6", "acme-claude-proxy"]
 
 
 def test_databricks_listing_skips_explicitly_non_ready_endpoints(
@@ -874,27 +1009,34 @@ def test_databricks_listing_skips_explicitly_non_ready_endpoints(
 @pytest.mark.parametrize(
     ("harness", "expected_ids"),
     [
-        pytest.param("claude-native", {"databricks-claude-sonnet-4-6"}, id="claude-family-only"),
-        pytest.param("codex-native", {"databricks-gpt-5-4"}, id="openai-family-only"),
+        pytest.param("claude-native", {"system.ai.claude-sonnet-4-6"}, id="claude-family-only"),
+        pytest.param(
+            "codex-native",
+            {"system.ai.gpt-5-4", "system.ai.gpt-responses-only", "system.ai.gpt-5-6-sol"},
+            id="openai-family-only",
+        ),
         # The executor-type spelling spec_harness() yields when a spec
         # declares no config harness must filter like its canonical
         # sibling — an unrecognized spelling silently disables the
         # filter and lists wrong-family models.
+        pytest.param("claude_sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-executor-type"),
+        pytest.param("claude-sdk", {"system.ai.claude-sonnet-4-6"}, id="claude-sdk-spelling"),
         pytest.param(
-            "claude_sdk", {"databricks-claude-sonnet-4-6"}, id="claude-sdk-executor-type"
+            "codex",
+            {"system.ai.gpt-5-4", "system.ai.gpt-responses-only", "system.ai.gpt-5-6-sol"},
+            id="codex-spelling",
         ),
-        pytest.param("claude-sdk", {"databricks-claude-sonnet-4-6"}, id="claude-sdk-spelling"),
-        pytest.param("codex", {"databricks-gpt-5-4"}, id="codex-spelling"),
         # openai-agents / openai-agents-sdk / agents_sdk outcomes are
         # deliberately NOT pinned here: a later change relaxes that harness to
         # multi-model (any validated id), flipping the expected set.
         pytest.param(
             "pi",
-            # Pi uses UC model-services API → system.ai.* ids (embeddings excluded).
+            # Pi keeps every chat-capable UC model service.
             {
                 "system.ai.claude-sonnet-4-6",
                 "system.ai.gpt-5-4",
                 "system.ai.gpt-responses-only",
+                "system.ai.gpt-5-6-sol",
                 "system.ai.meta-llama-3-3-70b-instruct",
             },
             id="pi-everything",
@@ -975,25 +1117,22 @@ def test_codex_worker_listing_keeps_glm_and_kimi_endpoints(
     _isolate_config(monkeypatch, tmp_path, _DATABRICKS_DEFAULT_CONFIG)
     _stub_workspace_creds(monkeypatch)
     page = {
-        "endpoints": [
-            {
-                "name": name,
-                "creator": "system",
-                "task": "llm/v1/chat",
-                "state": {"ready": "READY"},
-            }
+        "model_services": [
+            _uc_service(name, ["openai/v1/responses"])
             for name in (
-                "databricks-gpt-5-5",
-                "databricks-glm-5-2",
-                "databricks-kimi-k2-6",
-                "databricks-claude-sonnet-4-6",
-                "databricks-meta-llama-3-3-70b-instruct",
+                "system.ai.gpt-5-5",
+                "system.ai.glm-5-2",
+                "system.ai.kimi-k2-6",
+                "system.ai.claude-sonnet-4-6",
+                "system.ai.meta-llama-3-3-70b-instruct",
             )
         ]
+        # A service advertising only the Codex Responses marker is servable too.
+        + [_uc_service("system.ai.gpt-5-6-sol", ["codex/v1/responses"])]
     }
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        """Serve the serving-endpoints page for the codex worker."""
+        """Serve the Unity Catalog model-services page for the codex worker."""
         return httpx.Response(200, json=page)
 
     listing = list_models_for_worker(
@@ -1001,9 +1140,10 @@ def test_codex_worker_listing_keeps_glm_and_kimi_endpoints(
     )
 
     assert {m.id for m in listing.models} == {
-        "databricks-gpt-5-5",
-        "databricks-glm-5-2",
-        "databricks-kimi-k2-6",
+        "system.ai.gpt-5-5",
+        "system.ai.gpt-5-6-sol",
+        "system.ai.glm-5-2",
+        "system.ai.kimi-k2-6",
     }
 
 
@@ -1270,6 +1410,460 @@ def test_cli_config_listing_is_static_and_unverified(
     assert "cannot run here" not in listing.note
 
 
+_CLI_LOGIN_CLAUDE_IDS = ["claude-sonnet-5-5", "claude-opus-5-5"]
+_CLI_LOGIN_CODEX_IDS = ["gpt-6.1-sol", "gpt-6-astra"]
+_CODEX_SUBSCRIPTION_CONFIG = (
+    "providers:\n  codex:\n    kind: subscription\n    cli: codex\n    default: openai\n"
+)
+_CLI_SUBSCRIPTION_CONFIG = (
+    "providers:\n  claude:\n    kind: subscription\n    cli: claude\n    default: anthropic\n"
+    + _CODEX_SUBSCRIPTION_CONFIG.removeprefix("providers:\n")
+)
+_OPENAI_PIN = 'model_provider="openai"'
+
+
+def _isolate_native_probe_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point native launch fingerprints and the probe store at hermetic inputs.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Per-test temp dir.
+    """
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    for name in (
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "OMNIGENT_CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_AUTH_TOKEN",
+        "OMNIGENT_ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "HARNESS_CODEX_MODEL_PROVIDER",
+        "HARNESS_CODEX_GATEWAY",
+        "HARNESS_CODEX_GATEWAY_BASE_URL",
+        "HARNESS_CODEX_GATEWAY_HOST",
+        "HARNESS_CODEX_DATABRICKS_PROFILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / "claude-config").mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-config"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
+    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setattr("omnigent.onboarding.ambient.codex_config_detection", lambda: None)
+    source = tmp_path / "codex-source"
+    source.mkdir()
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+    monkeypatch.setattr(app_server, "_find_codex_cli", lambda: "/test-bin/codex")
+    monkeypatch.setattr(app_server, "_codex_login_usable", lambda: True)
+    monkeypatch.setattr(model_catalog_store, "_data_dir", lambda: tmp_path / "data")
+
+
+def _codex_fingerprint(*overrides: str) -> str:
+    """Fingerprint a native Codex launch shape with *overrides*.
+
+    :param overrides: ``-c`` config overrides, e.g. ``'model_provider="openai"'``.
+    :returns: The catalog fingerprint.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    launch = app_server.NativeCodexLaunch(
+        config_overrides=list(overrides), model=None, profile=None
+    )
+    return app_server.codex_catalog_fingerprint(launch)
+
+
+def _seed_cli_login_catalogs(*, codex_pinned: bool) -> None:
+    """Write Claude and Codex CLI-login probe catalogs.
+
+    :param codex_pinned: Whether the Codex launch pins the built-in provider.
+    """
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
+
+    catalogs = {
+        ("claude-native", claude_catalog_fingerprint(None)): [
+            {"id": "sonnet", "model": "claude-sonnet-5-5", "isDefault": True},
+            {"id": "opus", "model": "claude-opus-5-5"},
+        ],
+        ("codex-native", _codex_fingerprint(*([_OPENAI_PIN] if codex_pinned else []))): [
+            {"id": "gpt-6.1-sol", "isDefault": True},
+            {"id": "gpt-6-astra"},
+        ],
+    }
+    for (harness, fingerprint), rows in catalogs.items():
+        model_catalog_store.write_catalog(harness, fingerprint, rows)
+
+
+def _cli_login_parent() -> AgentSpec:
+    """Build a polly-shaped claude-sdk brain with SDK and native workers.
+
+    :returns: The parent :class:`AgentSpec`.
+    """
+    return AgentSpec(
+        spec_version=1,
+        name="orchestrator",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        sub_agents=[
+            AgentSpec(
+                spec_version=1,
+                name="claude_code",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+            ),
+            AgentSpec(
+                spec_version=1,
+                name="codex",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+            ),
+            AgentSpec(
+                spec_version=1,
+                name="codex_native",
+                executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider_config", "provider_kind"),
+    [(_CLI_SUBSCRIPTION_CONFIG, "subscription"), ("{}", "none")],
+    ids=["configured-subscription", "env-only-login"],
+)
+def test_cli_login_rows_replay_native_probe_catalogs(
+    provider_config: str,
+    provider_kind: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Subscription and unconfigured CLI-login workers list the probed models."""
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.runtime.workflow import _build_codex_spawn_env
+
+    _isolate_config(monkeypatch, tmp_path, provider_config)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    subscribed = provider_kind == "subscription"
+    if not subscribed:
+        # A brokered sandbox: the Claude login arrives as a token env credential.
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+    # The seeded Codex shape is the one the SDK spawn env selects.
+    spawn_pin = _build_codex_spawn_env(_worker_spec("codex")).get("HARNESS_CODEX_MODEL_PROVIDER")
+    assert spawn_pin == ("openai" if subscribed else None)
+    _seed_cli_login_catalogs(codex_pinned=subscribed)
+
+    def _no_launch_resolution(**_kwargs: object) -> None:
+        raise AssertionError("listing must not resolve (or discover) native launches")
+
+    monkeypatch.setattr(claude_native, "resolve_native_claude_config", _no_launch_resolution)
+    monkeypatch.setattr(app_server, "resolve_native_codex_launch", _no_launch_resolution)
+
+    catalog = catalog_for_spec(_cli_login_parent())
+
+    expected = {"self": _CLI_LOGIN_CLAUDE_IDS, "codex": _CLI_LOGIN_CODEX_IDS}
+    for name, model_ids in expected.items():
+        row = catalog[name]
+        assert row["source"] == "cli"
+        assert row["verified"] is True
+        assert [model["id"] for model in row["models"]] == model_ids
+        assert "cannot run here" not in str(row["note"])
+    # Native launches add routes (brokers, adopted config providers) this readout cannot see.
+    for name in ("claude_code", "codex_native"):
+        assert catalog[name]["source"] == ("static" if subscribed else "none")
+        assert catalog[name]["models"] == []
+    # The listing reads the catalog; provider resolution (and dispatch) is unchanged.
+    for harness in ("claude-sdk", "codex"):
+        assert resolve_model_provider(_worker_spec(harness), harness).kind == provider_kind
+
+
+def test_codex_subscription_reads_the_pinned_openai_launch_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A Codex subscription launch pins the built-in provider; the read must match it."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(monkeypatch, tmp_path, _CODEX_SUBSCRIPTION_CONFIG)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    spec = _worker_spec("codex")
+    native = app_server.resolve_native_codex_launch(model=None, spec=spec)
+    assert native.config_overrides == [_OPENAI_PIN]
+    model_catalog_store.write_catalog("codex-native", _codex_fingerprint(), [{"id": "gpt-wrong"}])
+    model_catalog_store.write_catalog(
+        "codex-native", app_server.codex_catalog_fingerprint(native), [{"id": "gpt-6.1-sol"}]
+    )
+
+    row = catalog_for_spec(spec)["self"]
+
+    assert [model["id"] for model in row["models"]] == ["gpt-6.1-sol"]
+
+
+def test_cli_login_store_miss_keeps_existing_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Without a cached probe, unconfigured workers stay unrunnable and logins stay empty."""
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+
+    # A token login gets the unconfigured Claude row as far as the store read.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+    unconfigured = catalog_for_spec(_cli_login_parent())
+    for name in ("self", "claude_code", "codex"):
+        assert unconfigured[name]["source"] == "none"
+        assert unconfigured[name]["models"] == []
+        assert "no model provider configured" in str(unconfigured[name]["note"])
+
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    _isolate_config(monkeypatch, tmp_path, _CLI_SUBSCRIPTION_CONFIG)
+    subscribed = catalog_for_spec(_cli_login_parent())
+    for name in ("self", "claude_code", "codex"):
+        assert (subscribed[name]["source"], subscribed[name]["models"]) == ("static", [])
+        assert "probing the harness" in str(subscribed[name]["note"])
+
+
+@pytest.mark.parametrize("harness", ["openai-agents-sdk", "antigravity"])
+def test_codex_login_catalog_is_not_replayed_for_other_harnesses(
+    harness: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only workers that launch the Codex CLI may list its login's models."""
+    _isolate_config(monkeypatch, tmp_path, _CODEX_SUBSCRIPTION_CONFIG)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    _seed_cli_login_catalogs(codex_pinned=True)
+
+    row = catalog_for_spec(_worker_spec(harness))["self"]
+
+    assert row["source"] != "cli"
+    assert row["models"] == []
+
+
+_GATEWAY_PROVIDER_CONFIG = (
+    "  gw:\n    kind: gateway\n    openai:\n"
+    "      base_url: https://gw.example/v1\n"
+    "      api_key_ref: env:OMNIGENT_TEST_GW_KEY\n"
+    "      wire_api: responses\n"
+    "      models:\n        default: gpt-gw\n"
+)
+
+
+_ENV_KEY_CODEX_TOML = (
+    'model_provider = "custom"\n\n[model_providers.custom]\n'
+    'base_url = "https://custom.example/v1"\nenv_key = "CUSTOM_CODEX_TOKEN"\n'
+)
+
+
+@pytest.mark.parametrize(
+    ("provider_config", "config_toml", "passthrough", "routing_env", "listed"),
+    [
+        pytest.param(_CODEX_SUBSCRIPTION_CONFIG, None, False, False, False, id="logged-out-sub"),
+        pytest.param("{}", None, False, False, False, id="logged-out-env-only"),
+        pytest.param("{}", 'model_provider = "ollama"\n', False, False, True, id="self-auth-toml"),
+        pytest.param("{}", _ENV_KEY_CODEX_TOML, False, False, False, id="env-key-filtered"),
+        pytest.param("{}", _ENV_KEY_CODEX_TOML, True, False, True, id="env-key-passed-through"),
+        pytest.param("{}", _ENV_KEY_CODEX_TOML, True, True, False, id="inherited-routing-env"),
+    ],
+)
+def test_codex_login_catalog_requires_a_usable_child_launch(
+    provider_config: str,
+    config_toml: str | None,
+    passthrough: bool,
+    routing_env: bool,
+    listed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex lists models while logged out, so only an authenticated, unrerouted child lists them.
+
+    Auth is judged in the child env: a host-only env_key credential is stripped
+    unless passed through.
+    """
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(monkeypatch, tmp_path, provider_config)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    monkeypatch.setattr(app_server, "_codex_login_usable", lambda: False)
+    monkeypatch.setenv("CUSTOM_CODEX_TOKEN", "token")
+    if config_toml is None:
+        _seed_cli_login_catalogs(codex_pinned=provider_config != "{}")
+    else:
+        (tmp_path / "codex-source" / "config.toml").write_text(config_toml)
+        # Seed where the native probe writes for this config.toml launch.
+        launch = app_server.resolve_native_codex_launch(model=None)
+        model_catalog_store.write_catalog(
+            "codex-native",
+            app_server.codex_catalog_fingerprint(launch),
+            [{"id": model_id} for model_id in _CLI_LOGIN_CODEX_IDS],
+        )
+    if routing_env:
+        monkeypatch.setenv("HARNESS_CODEX_MODEL_PROVIDER", "custom")
+    spec = AgentSpec(
+        spec_version=1,
+        name="worker",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex"}),
+        os_env=OSEnvSpec(
+            sandbox=OSEnvSandboxSpec(
+                type="none", env_passthrough=["CUSTOM_CODEX_TOKEN"] if passthrough else []
+            )
+        ),
+    )
+
+    row = catalog_for_spec(spec)["self"]
+
+    assert [model["id"] for model in row["models"]] == (_CLI_LOGIN_CODEX_IDS if listed else [])
+
+
+def test_unconfigured_claude_sdk_without_a_token_login_lists_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stored login would resolve as a subscription, so none here means no login."""
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    _seed_cli_login_catalogs(codex_pinned=False)
+
+    row = catalog_for_spec(_worker_spec("claude-sdk"))["self"]
+
+    assert (row["source"], row["models"]) == ("none", [])
+
+
+@pytest.mark.parametrize(
+    ("settings", "managed", "env"),
+    [
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}}, {}, {}),
+        ({"apiKeyHelper": "echo test-token"}, {}, {}),
+        ({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}, {}),
+        ({}, {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}),
+        ({}, {}, {"CLAUDE_CODE_USE_VERTEX": "1"}),
+        ({}, {}, {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}),
+    ],
+    ids=[
+        "user-gateway",
+        "api-key-helper",
+        "user-bedrock",
+        "managed-bedrock",
+        "env-vertex",
+        "env-gateway",
+    ],
+)
+def test_claude_transport_overrides_skip_login_catalog(
+    settings: dict[str, object],
+    managed: dict[str, object],
+    env: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A catalog probed under a transport override is never replayed for the login.
+
+    The override's model ids are not the login's, and the catalog key records the
+    override, so removing it later misses instead of replaying that catalog.
+    """
+    _isolate_config(monkeypatch, tmp_path, _CLI_SUBSCRIPTION_CONFIG)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    user_settings = tmp_path / "claude-config" / "settings.json"
+    managed_settings = tmp_path / "managed-settings.json"
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    user_settings.write_text(json.dumps(settings))
+    managed_settings.write_text(json.dumps(managed))
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    _seed_cli_login_catalogs(codex_pinned=True)
+
+    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
+
+    user_settings.write_text("{}")
+    managed_settings.write_text("{}")
+    for name in env:
+        monkeypatch.delenv(name)
+
+    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
+    _seed_cli_login_catalogs(codex_pinned=True)
+    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"]
+
+
+def test_native_only_binding_does_not_feed_the_sdk_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A gateway bound only to native Codex never supplies the SDK worker's catalog."""
+    from omnigent.harnesses.codex_native import app_server
+    from omnigent.models import model_catalog_store
+
+    monkeypatch.setenv("OMNIGENT_TEST_GW_KEY", "sk-test")
+    _isolate_config(
+        monkeypatch,
+        tmp_path,
+        _CODEX_SUBSCRIPTION_CONFIG
+        + _GATEWAY_PROVIDER_CONFIG
+        + "inference:\n  harnesses:\n    codex-native:\n      provider: gw\n",
+    )
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    bound = app_server.resolve_native_codex_launch(model=None, spec=_worker_spec("codex-native"))
+    model_catalog_store.write_catalog(
+        "codex-native", app_server.codex_catalog_fingerprint(bound), [{"id": "gpt-wrong-route"}]
+    )
+    _seed_cli_login_catalogs(codex_pinned=True)
+
+    sdk = _worker_spec("codex")
+    assert resolve_model_provider(sdk, "codex").kind == "subscription"
+    row = catalog_for_spec(sdk)["self"]
+    assert [model["id"] for model in row["models"]] == _CLI_LOGIN_CODEX_IDS
+
+
+def test_unconfigured_rows_require_a_cli_login_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A "none" readout that launches another provider, or fails, keeps its row."""
+    monkeypatch.setenv("OMNIGENT_TEST_GW_KEY", "sk-test")
+    # A configured but non-default provider is picked only at launch.
+    _isolate_config(monkeypatch, tmp_path, "providers:\n" + _GATEWAY_PROVIDER_CONFIG)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    _seed_cli_login_catalogs(codex_pinned=False)
+    codex = _worker_spec("codex")
+    assert resolve_model_provider(codex, "codex").kind == "none"
+    assert catalog_for_spec(codex)["self"]["models"] == []
+
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    missing = _worker_spec("codex", auth=ProviderAuth(name="missing"))
+    row = catalog_for_spec(missing)["self"]
+    assert (row["source"], row["models"]) == ("none", [])
+    assert "provider resolution failed" in str(row["note"])
+
+
+def test_cli_login_catalog_skips_ambient_claude_gateways(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Gateway catalogs share the CLI-login key; SDK subscriptions would respell their ids."""
+    from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+    from omnigent.models import model_catalog_store
+
+    _isolate_config(monkeypatch, tmp_path, _CLI_SUBSCRIPTION_CONFIG)
+    _isolate_native_probe_store(monkeypatch, tmp_path)
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    gateway_id = "databricks-claude-sonnet-4-6"
+    model_catalog_store.write_catalog(
+        "claude-native", claude_catalog_fingerprint(None), [{"id": gateway_id}]
+    )
+
+    assert resolve_model_provider(_worker_spec("claude-sdk"), "claude-sdk").kind == "subscription"
+    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
+    native = catalog_for_spec(_worker_spec("claude-native"))["self"]
+    assert [model["id"] for model in native["models"]] == [gateway_id]
+
+
 @pytest.mark.parametrize("table_key", sorted(_SMART_ROUTING_FALLBACKS))
 def test_static_model_fallbacks_document_ownership(table_key: str) -> None:
     """Every remaining static model table explains who owns it and why.
@@ -1412,9 +2006,10 @@ def test_listing_cached_within_ttl_and_refetched_after_expiry(
     """Repeat enumerations replay from the TTL cache until expiry.
 
     A fan-out turn calls the tool/gate repeatedly; without the cache
-    every call would re-hit the provider API. The fake timer proves the
-    fetch is wired THROUGH the cache (count stays 1) and that expiry
-    re-fetches (count becomes 2).
+    every call would re-hit the provider API. The fake timer proves both
+    workspace listings (model services and serving endpoints) are wired
+    THROUGH the cache (count stays 2) and that expiry re-fetches them
+    (count becomes 4).
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir.
@@ -1430,14 +2025,14 @@ def test_listing_cached_within_ttl_and_refetched_after_expiry(
 
     first = list_models_for_worker(_worker_spec("pi"), "pi", transport=transport)
     second = list_models_for_worker(_worker_spec("pi"), "pi", transport=transport)
-    # One fetch served both calls — the second replayed from the cache.
-    assert len(requests_seen) == 1
+    # One fetch per listing served both calls — the second replayed from the cache.
+    assert len(requests_seen) == 2
     assert [m.id for m in second.models] == [m.id for m in first.models]
 
     now["t"] = 301.0
     list_models_for_worker(_worker_spec("pi"), "pi", transport=transport)
-    # Past the TTL the cache entry expired and the provider was re-hit.
-    assert len(requests_seen) == 2
+    # Past the TTL both cache entries expired and the provider was re-hit.
+    assert len(requests_seen) == 4
 
 
 def test_listing_failure_reported_and_not_cached(
@@ -1458,11 +2053,14 @@ def test_listing_failure_reported_and_not_cached(
     def _flaky_handler(request: httpx.Request) -> httpx.Response:
         """Fail the first listing call, succeed afterwards."""
         calls["n"] += 1
-        if calls["n"] == 1:
+        if calls["n"] <= 2:
             return httpx.Response(503, json={"error": "temporarily unavailable"})
-        return httpx.Response(200, json=_SERVING_ENDPOINTS_PAGE)
+        return httpx.Response(
+            200,
+            json={"model_services": [_uc_service("system.ai.gpt-5-4", ["openai/v1/responses"])]},
+        )
 
-    # Use codex-native (serving-endpoints path) to test generic failure/retry logic.
+    # Use codex-native to test generic UC-listing failure/retry behavior.
     transport = httpx.MockTransport(_flaky_handler)
     failed = list_models_for_worker(
         _worker_spec("codex-native"), "codex-native", transport=transport
@@ -1477,7 +2075,7 @@ def test_listing_failure_reported_and_not_cached(
     )
     # Recovery proves the failure was NOT cached for the TTL window.
     assert recovered.source == "gateway"
-    # codex-native filters to openai-family only → 1 model from _SERVING_ENDPOINTS_PAGE
+    # codex-native filters to the one OpenAI-family UC model.
     assert len(recovered.models) == 1
 
 

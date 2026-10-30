@@ -336,10 +336,15 @@ class CodexConfigTransport:
         ``command`` + ``args`` (e.g. ``"jq -r .access_token /path/token.json"``).
         ``None`` when the table carries no ``[X.auth]`` token command (e.g. it
         authenticates via a static header or AWS SigV4 instead).
+    :param auth_refresh_interval_ms: Positive token cache lifetime from the auth
+        table; absent or invalid values disable caching.
+    :param auth_timeout_ms: Positive auth timeout, defaulting to twenty seconds.
     """
 
     base_url: str
     auth_command: str | None
+    auth_refresh_interval_ms: int = 0
+    auth_timeout_ms: int = 20_000
 
 
 def codex_config_provider_transport(
@@ -392,7 +397,16 @@ def codex_config_provider_transport(
             # shlex.join produces a single shell-safe string Pi can run as a
             # "!command" apiKey (it shell-quotes the token file path etc.).
             auth_command = shlex.join(parts)
-    return CodexConfigTransport(base_url=base_url.strip(), auth_command=auth_command)
+    refresh_interval = auth.get("refresh_interval_ms", 0) if isinstance(auth, dict) else 0
+    timeout = auth.get("timeout_ms", 20_000) if isinstance(auth, dict) else 20_000
+    return CodexConfigTransport(
+        base_url=base_url.strip(),
+        auth_command=auth_command,
+        auth_refresh_interval_ms=(
+            refresh_interval if type(refresh_interval) is int and refresh_interval > 0 else 0
+        ),
+        auth_timeout_ms=timeout if type(timeout) is int and timeout > 0 else 20_000,
+    )
 
 
 def codex_config_detection() -> DetectedProvider | None:
@@ -517,25 +531,86 @@ def claude_managed_gateway(
         credentials api.anthropic.com); ``has_credential`` is whether Claude
         Code has a usable credential to apply at launch.
     """
+    payload = read_claude_managed_settings(paths)
+    if payload is None:
+        return None, False
+    raw_env = payload.get("env")
+    env = raw_env if isinstance(raw_env, dict) else {}
+    raw_base_url = env.get("ANTHROPIC_BASE_URL")
+    base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
+    has_helper = bool(payload.get("apiKeyHelper"))
+    use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
+        "",
+        "0",
+        "false",
+    )
+    return base_url or None, has_helper or use_gateway
+
+
+def read_claude_managed_settings(
+    paths: tuple[Path, ...] | None = None,
+) -> dict[str, object] | None:
+    """Return the managed settings file Claude Code applies, parsed.
+
+    The first readable, object-shaped file decides, matching Claude Code's own
+    precedence.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The parsed settings object, or ``None`` when no file is readable.
+    """
     for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(payload, dict):
-            continue
-        raw_env = payload.get("env")
-        env = raw_env if isinstance(raw_env, dict) else {}
-        raw_base_url = env.get("ANTHROPIC_BASE_URL")
-        base_url = raw_base_url.strip() if isinstance(raw_base_url, str) else None
-        has_helper = bool(payload.get("apiKeyHelper"))
-        use_gateway = str(env.get("CLAUDE_CODE_USE_GATEWAY", "")).strip().lower() not in (
-            "",
-            "0",
-            "false",
-        )
-        return base_url or None, has_helper or use_gateway
-    return None, False
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
+    """Return Claude Code's user ``settings.json``, parsed.
+
+    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
+    relative value is relative to the CLI's working directory.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: The settings object, or ``None`` when the file is missing,
+        unreadable, or not an object.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    settings_path = Path(cwd or "") / config_dir / "settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:
+    """Return the non-Anthropic gateway Claude Code's managed settings pin, if any.
+
+    Claude Code applies managed settings over the environment omnigent passes,
+    so when this returns a URL it — not omnigent's provider config — decides
+    where native Claude inference goes.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The managed ``ANTHROPIC_BASE_URL``, or ``None`` when no credentialed
+        managed gateway is configured or it points at Anthropic itself.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if not base_url or not has_credential:
+        return None
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return None
+    return base_url
 
 
 def claude_managed_model_picker(

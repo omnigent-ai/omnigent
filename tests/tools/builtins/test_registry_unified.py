@@ -51,6 +51,7 @@ def test_builtin_names_includes_framework_owned_tools() -> None:
     assert "list_comments" in BUILTIN_NAMES
     assert "update_comment" in BUILTIN_NAMES
     assert "sys_list_models" in BUILTIN_NAMES
+    assert "ui_open_file" in BUILTIN_NAMES
 
 
 def test_instantiable_subset_excludes_framework_owned() -> None:
@@ -62,6 +63,7 @@ def test_instantiable_subset_excludes_framework_owned() -> None:
     assert "web_fetch" not in INSTANTIABLE_BUILTINS
     assert "list_comments" not in INSTANTIABLE_BUILTINS
     assert "update_comment" not in INSTANTIABLE_BUILTINS
+    assert "ui_open_file" not in INSTANTIABLE_BUILTINS
 
 
 def test_instantiable_is_subset_of_builtin_names() -> None:
@@ -83,6 +85,7 @@ def test_get_builtin_tool_returns_none_for_framework_owned() -> None:
     assert get_builtin_tool("web_fetch") is None
     assert get_builtin_tool("list_comments") is None
     assert get_builtin_tool("update_comment") is None
+    assert get_builtin_tool("ui_open_file") is None
 
 
 def test_get_builtin_tool_returns_none_for_unknown_name() -> None:
@@ -156,6 +159,7 @@ def test_builtin_names_size_matches_registry() -> None:
                 "browser_click",
                 "browser_type",
                 "browser_screenshot",
+                "ui_open_file",
             }
         )
         == BUILTIN_NAMES

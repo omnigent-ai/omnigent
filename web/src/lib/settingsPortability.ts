@@ -8,6 +8,11 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "./pickerEntryVisibility";
 import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
@@ -33,6 +38,8 @@ const EXPORTABLE_KEYS = [
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
@@ -153,6 +160,9 @@ export function applyImportedSettings(imported: ExportedSettings): number {
       // Swallow individual write failures.
     }
   }
+  // Same-tab writes fire no storage event, so the subscribable preferences
+  // have to be told; otherwise an open picker keeps the pre-import set.
+  notifyHiddenPickerAgentsChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);

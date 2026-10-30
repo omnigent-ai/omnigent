@@ -41,6 +41,8 @@ Env vars read at startup:
   ``"plan"``, ``"dontAsk"``, ``"default"``). Defaults to
   ``"auto"`` so the agent runs autonomously with background
   safety checks.
+- ``HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET``: ``claude_code`` appends
+  agent instructions to Claude Code's prompt. Unset keeps the custom prompt.
 - ``HARNESS_CLAUDE_SDK_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`) controlling the SDK's
   native OS-tool exposure. When set, the inner executor builds
@@ -110,6 +112,7 @@ _ENV_DATABRICKS_PROFILE = "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CLAUDE_SDK_CWD"
 _ENV_PERMISSION_MODE = "HARNESS_CLAUDE_SDK_PERMISSION_MODE"
+_ENV_SYSTEM_PROMPT_PRESET = "HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"
 _ENV_OS_ENV = "HARNESS_CLAUDE_SDK_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
@@ -285,6 +288,7 @@ def _build_claude_sdk_executor() -> Executor:
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),
+        system_prompt_preset=os.environ.get(_ENV_SYSTEM_PROMPT_PRESET) or None,
         gateway=gateway,
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
