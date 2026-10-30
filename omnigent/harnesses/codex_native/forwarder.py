@@ -212,6 +212,9 @@ _GOAL_STOPPED_FAILURE_OUTPUT = {
     "usageLimited": "Codex stopped the goal: usage limit reached.",
     "budgetLimited": "Codex stopped the goal: token budget reached.",
 }
+_SYSTEM_ERROR_FAILURE_OUTPUT = (
+    "Codex reported a system error on this thread. Open the terminal for details."
+)
 # Codex bounds each MCP server's spawn+handshake by its per-server
 # ``startup_timeout_sec`` (codex default 10s); the round cannot outlive
 # the slowest server's budget. The synthesis settle timer mirrors that
@@ -4424,6 +4427,14 @@ async def _maybe_handle_turn_event(
     if method == "turn/diff/updated":
         _handle_turn_diff_updated(params, forwarder_state)
         return True
+    if _is_thread_system_error_event(method, params):
+        await _handle_thread_system_error(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            forwarder_state=forwarder_state,
+        )
+        return True
     return False
 
 
@@ -4969,6 +4980,63 @@ def _is_thread_idle_status_event(method: str, params: _JsonObject) -> bool:
         return False
     status = params.get("status")
     return isinstance(status, dict) and status.get("type") == "idle"
+
+
+def _is_thread_system_error_event(method: str, params: _JsonObject) -> bool:
+    """
+    Return whether an event reports the thread in a system-error state.
+
+    Codex reports this for every ``EventMsg::Error``, including errors that do
+    not end a turn, so it can arrive while a turn keeps running.
+
+    :param method: Codex method value, e.g. ``"thread/status/changed"``.
+    :param params: Codex notification params.
+    :returns: ``True`` for a ``systemError`` ``thread/status/changed``.
+    """
+    if method != _CODEX_THREAD_STATUS_CHANGED_METHOD:
+        return False
+    status = params.get("status")
+    return isinstance(status, dict) and status.get("type") == "systemError"
+
+
+def _bridge_turn_is_active(bridge_dir: Path) -> bool:
+    """
+    Return whether the bridge records a turn that has not reached a terminal event.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``True`` while the bridge holds an active turn id.
+    """
+    state = read_bridge_state(bridge_dir)
+    return state is not None and state.active_turn_id is not None
+
+
+async def _handle_thread_system_error(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path | None,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Fail the session for a system error that no turn is reporting.
+
+    While a turn is active, its own terminal event decides the status. A
+    failure already posted for the current turn is not repeated.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory, or ``None`` for a child
+        thread, whose status is not the session's.
+    :param forwarder_state: Mutable forwarder state holding the turn's failure
+        bookkeeping.
+    :returns: None.
+    """
+    if bridge_dir is None or forwarder_state is None:
+        return
+    if forwarder_state.turn_failure_surfaced or _bridge_turn_is_active(bridge_dir):
+        return
+    forwarder_state.turn_failure_surfaced = True
+    await _post_status(client, session_id, "failed", output=_SYSTEM_ERROR_FAILURE_OUTPUT)
 
 
 def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
