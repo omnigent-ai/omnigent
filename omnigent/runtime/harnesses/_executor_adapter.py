@@ -44,6 +44,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnCancelled,
     TurnComplete,
+    TurnRetrying,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
@@ -67,6 +68,8 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    RetryErrorDetail,
+    RetryEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1216,6 +1219,17 @@ class ExecutorAdapter(HarnessApp):
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+        elif isinstance(event, TurnRetrying):
+            ctx.emit(
+                RetryEvent(
+                    type="response.retry",
+                    source="llm",
+                    attempt=event.attempt,
+                    max_attempts=event.max_attempts,
+                    delay_seconds=round(event.delay_seconds, 2),
+                    error=RetryErrorDetail(code=event.code, message=event.message),
+                )
+            )
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 

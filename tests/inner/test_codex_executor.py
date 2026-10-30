@@ -50,7 +50,9 @@ from omnigent.inner.executor import (
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
+    TurnRetrying,
 )
 from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.model_egress import FrozenModelRoute
@@ -6041,5 +6043,350 @@ def test_completed_turn_clears_certificate_evidence(turn: dict):
 
         assert not any(isinstance(event, ExecutorError) for event in events), events
         assert session._certificate_failure is None
+
+    _run(_t())
+
+
+_TMP_CODEX_HOME_STDERR_LINE = (
+    "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create "
+    'helper binaries under temporary dir "/tmp/omnigent-osenv" (codex_home: '
+    'AbsolutePathBuf("/tmp/omnigent-osenv/omnigent-codex-home"))'
+)
+
+
+def _app_server_error_event(message: str, codex_error_info: object) -> dict:
+    return {
+        "method": "error",
+        "params": {
+            "error": {
+                "message": message,
+                "codexErrorInfo": codex_error_info,
+                "additionalDetails": None,
+            },
+            "willRetry": False,
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+        },
+    }
+
+
+async def _surfaced_turn_error(event: dict):
+    from omnigent.inner.executor import MockExecutor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    session = _session_with_scripted_turn()
+    session._recent_stderr.append(_TMP_CODEX_HOME_STDERR_LINE)
+    events = await _run_turn_with_events(session, [event])
+    errors = [item for item in events if isinstance(item, ExecutorError)]
+    assert len(errors) == 1, events
+
+    executor = MockExecutor()
+    executor.enqueue_events(errors)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    context = TurnContext(
+        response_id="resp_codex_error", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(Exception) as raised:
+            await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hi"), context)
+        return adapter._build_error_detail(raised.value)
+    finally:
+        await adapter.on_shutdown()
+
+
+def _rate_limit_error_event() -> dict:
+    return _app_server_error_event(
+        "exceeded retry limit, last status: 429 Too Many Requests",
+        {"responseTooManyFailedAttempts": {"httpStatusCode": 429}},
+    )
+
+
+def test_app_server_429_surfaces_as_rate_limit():
+    """Codex giving up on a 429 is a retryable rate limit, not a generic RuntimeError."""
+    detail = _run(_surfaced_turn_error(_rate_limit_error_event()))
+
+    assert "429 Too Many Requests" in detail.message
+    assert detail.code == "rate_limit_exceeded", detail
+
+
+def test_app_server_error_omits_stderr_written_before_the_turn():
+    """A launch-time warning is not reported as part of a later turn's failure."""
+    detail = _run(_surfaced_turn_error(_rate_limit_error_event()))
+
+    assert "429 Too Many Requests" in detail.message
+    assert "PATH aliases" not in detail.message, detail.message
+
+
+def test_app_server_usage_limit_is_not_a_generic_runtime_error():
+    """An exhausted ChatGPT usage limit is neither a RuntimeError nor a retryable throttle."""
+    detail = _run(
+        _surfaced_turn_error(
+            _app_server_error_event(
+                "You've hit your usage limit. Upgrade to Pro "
+                "(https://chatgpt.com/explore/pro), visit "
+                "https://chatgpt.com/codex/settings/usage to purchase more credits "
+                "or try again at 9:41 AM.",
+                "usageLimitExceeded",
+            )
+        )
+    )
+
+    assert "hit your usage limit" in detail.message
+    assert detail.code not in {"RuntimeError", "rate_limit_exceeded"}, detail
+
+
+def _rate_limited_turn_events(turn_id: str) -> list[dict]:
+    """Codex 0.158's frames for a turn that gave up on a 429 before any output."""
+    return [
+        {
+            "method": "error",
+            "params": {
+                "error": {
+                    "message": "exceeded retry limit, last status: 429 Too Many Requests",
+                    "codexErrorInfo": {"responseTooManyFailedAttempts": {"httpStatusCode": 429}},
+                    "additionalDetails": None,
+                },
+                "willRetry": False,
+                "threadId": "thread-1",
+                "turnId": turn_id,
+            },
+        },
+        {"method": "turn/completed", "params": {"turn": {"id": turn_id, "status": "failed"}}},
+    ]
+
+
+def _agent_text_event(turn_id: str, text: str) -> dict:
+    return {
+        "method": "item/agentMessage/delta",
+        "params": {"threadId": "thread-1", "turnId": turn_id, "itemId": "msg-1", "delta": text},
+    }
+
+
+def _replied_turn_events(turn_id: str, text: str) -> list[dict]:
+    return [
+        _agent_text_event(turn_id, text),
+        {"method": "turn/completed", "params": {"turn": {"id": turn_id, "status": "completed"}}},
+    ]
+
+
+def _session_with_scripted_turns(
+    turns: list[list[dict]],
+    *,
+    provider: str | None,
+    max_retries: int = 2,
+    backoff_s: float = 0.01,
+    jitter: bool = False,
+) -> tuple[_CodexAppServerSession, list[dict]]:
+    """A session whose N-th ``turn/start`` queues ``turns[N]`` as turn ``turn-<N+1>``.
+
+    :returns: The session and the params of every ``turn/start`` it sent.
+    """
+    from omnigent.spec.types import RetryPolicy
+
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+        retry_policy=RetryPolicy(
+            max_retries=max_retries,
+            backoff_base_s=backoff_s,
+            backoff_max_s=backoff_s,
+            jitter=jitter,
+        ),
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    turn_starts: list[dict] = []
+
+    async def _request(method: str, params: dict) -> dict:
+        if method == "thread/start":
+            result: dict[str, object] = {"thread": {"id": "thread-1"}}
+            if provider is not None:
+                result["modelProvider"] = provider
+            return {"result": result}
+        if method == "turn/start":
+            turn_starts.append(params)
+            for event in turns[len(turn_starts) - 1]:
+                session._events.put_nowait(event)
+            return {"result": {"turn": {"id": f"turn-{len(turn_starts)}"}}}
+        return {"result": {}}
+
+    session._request = AsyncMock(side_effect=_request)
+    return session, turn_starts
+
+
+def test_builtin_provider_rate_limit_before_output_retries_on_the_same_thread():
+    """A ChatGPT-login 429 with no output is retried without resending the recorded prompt."""
+
+    async def _t():
+        session, turn_starts = _session_with_scripted_turns(
+            [_rate_limited_turn_events("turn-1"), _replied_turn_events("turn-2", "Recovered.")],
+            provider="openai",
+        )
+
+        events = await _run_turn_with_events(session, [])
+
+        assert not any(isinstance(event, ExecutorError) for event in events), events
+        retries = [event for event in events if isinstance(event, TurnRetrying)]
+        assert len(retries) == 1, events
+        assert (retries[0].attempt, retries[0].max_attempts) == (2, 3)
+        assert retries[0].code == "rate_limit_exceeded"
+        assert retries[0].message.startswith("Rate limited, retrying in ")
+        assert isinstance(events[-1], TurnComplete)
+        assert events[-1].response == "Recovered."
+        thread_starts = [
+            call for call in session._request.await_args_list if call.args[0] == "thread/start"
+        ]
+        assert len(thread_starts) == 1
+        assert [params["threadId"] for params in turn_starts] == ["thread-1", "thread-1"]
+        assert turn_starts[0]["input"]
+        assert turn_starts[1]["input"] == []
+
+    _run(_t())
+
+
+def test_rate_limit_backoff_jitter_stays_within_the_policy_cap():
+    """Upward jitter on a capped delay does not stretch the wait past ``backoff_max_s``."""
+
+    async def _t():
+        session, _ = _session_with_scripted_turns(
+            [_rate_limited_turn_events("turn-1"), _replied_turn_events("turn-2", "Recovered.")],
+            provider="openai",
+            jitter=True,
+        )
+        with patch("random.uniform", return_value=1.5):
+            events = await _run_turn_with_events(session, [])
+
+        retries = [event for event in events if isinstance(event, TurnRetrying)]
+        assert [event.delay_seconds for event in retries] == [0.01], events
+
+    _run(_t())
+
+
+def test_builtin_provider_rate_limit_fails_once_retries_are_exhausted():
+    """A 429 that persists through every retry still ends as a retryable rate limit."""
+
+    async def _t():
+        session, turn_starts = _session_with_scripted_turns(
+            [_rate_limited_turn_events(f"turn-{index}") for index in (1, 2, 3)],
+            provider="openai",
+            max_retries=2,
+        )
+
+        events = await _run_turn_with_events(session, [])
+
+        assert [event.attempt for event in events if isinstance(event, TurnRetrying)] == [2, 3]
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].code == "rate_limit_exceeded"
+        assert errors[0].retryable is True
+        assert "429 Too Many Requests" in errors[0].message
+        assert events[-1] is errors[0]
+        assert len(turn_starts) == 3
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("provider", [None, "omnigent_databricks"])
+def test_rate_limit_is_not_retried_for_providers_codex_retries_itself(provider: str | None):
+    """Codex applies the retry policy to configured providers, so the turn fails at once."""
+
+    async def _t():
+        session, turn_starts = _session_with_scripted_turns(
+            [_rate_limited_turn_events("turn-1")], provider=provider
+        )
+
+        events = await _run_turn_with_events(session, [])
+
+        assert not any(isinstance(event, TurnRetrying) for event in events), events
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].code == "rate_limit_exceeded"
+        assert len(turn_starts) == 1
+
+    _run(_t())
+
+
+def test_rate_limit_after_output_is_not_retried():
+    """A turn that already streamed text is not replayed after a later 429."""
+
+    async def _t():
+        session, turn_starts = _session_with_scripted_turns(
+            [[_agent_text_event("turn-1", "Partial"), *_rate_limited_turn_events("turn-1")]],
+            provider="openai",
+        )
+
+        events = await _run_turn_with_events(session, [])
+
+        assert not any(isinstance(event, TurnRetrying) for event in events), events
+        assert isinstance(events[0], TextChunk)
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].code == "rate_limit_exceeded"
+        assert len(turn_starts) == 1
+
+    _run(_t())
+
+
+def test_interrupt_during_rate_limit_backoff_cancels_the_turn():
+    """Stop during the backoff ends the turn at once instead of waiting it out."""
+
+    async def _t():
+        session, turn_starts = _session_with_scripted_turns(
+            [_rate_limited_turn_events("turn-1"), _replied_turn_events("turn-2", "late")],
+            provider="openai",
+            backoff_s=60.0,
+        )
+        events: list = []
+        async with asyncio.timeout(5):
+            async for event in session.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="Be helpful.",
+                model="gpt-5",
+                cwd=".",
+                sandbox="workspace-write",
+            ):
+                events.append(event)
+                if isinstance(event, TurnRetrying):
+                    assert await session.interrupt_turn() is True
+
+        assert [type(event) for event in events] == [TurnRetrying, TurnCancelled]
+        assert len(turn_starts) == 1
+        assert not any(
+            call.args[0] == "turn/interrupt" for call in session._request.await_args_list
+        )
+
+    _run(_t())
+
+
+def test_usage_limit_is_not_retried_and_names_the_limit():
+    """An exhausted ChatGPT usage limit is a terminal budget error, not a throttle to wait out."""
+
+    async def _t():
+        session, turn_starts = _session_with_scripted_turns(
+            [
+                [
+                    _app_server_error_event(
+                        "You've hit your usage limit. Try again at 9:41 AM.", "usageLimitExceeded"
+                    ),
+                    _completed_turn_event(),
+                ]
+            ],
+            provider="openai",
+        )
+
+        events = await _run_turn_with_events(session, [])
+
+        assert not any(isinstance(event, TurnRetrying) for event in events), events
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert len(errors) == 1, events
+        assert errors[0].code == "budget_exhausted"
+        assert errors[0].title == "Codex usage limit reached"
+        assert "hit your usage limit" in errors[0].message
+        assert len(turn_starts) == 1
 
     _run(_t())

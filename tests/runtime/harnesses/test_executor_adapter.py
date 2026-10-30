@@ -1577,6 +1577,42 @@ def test_translate_event_mcp_tool_call_request_emits_observed_with_bare_name() -
     )
 
 
+def test_turn_retrying_emits_a_retry_notice_without_marking_progress() -> None:
+    """An executor-side retry streams ``response.retry`` and leaves the turn without progress."""
+    import asyncio
+
+    from omnigent.inner.executor import TurnRetrying
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import RetryEvent
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_retrying", event_queue=event_queue, cancelled=asyncio.Event()
+    )
+
+    adapter._translate_event(
+        TurnRetrying(
+            attempt=2,
+            max_attempts=8,
+            delay_seconds=3.14159,
+            code="rate_limit_exceeded",
+            message="Rate limited, retrying in 3s",
+        ),
+        ctx,
+    )
+
+    emitted = event_queue.get_nowait()
+    assert isinstance(emitted, RetryEvent)
+    assert (emitted.source, emitted.attempt, emitted.max_attempts) == ("llm", 2, 8)
+    assert emitted.delay_seconds == 3.14
+    assert emitted.error.code == "rate_limit_exceeded"
+    assert emitted.error.message == "Rate limited, retrying in 3s"
+    assert event_queue.empty()
+    assert ctx._has_progress is False
+
+
 def test_tool_call_complete_suppressed_for_dispatched_executor() -> None:
     """A normal internally-handling executor's ``ToolCallComplete`` is
     suppressed mid-turn (its tools round-trip through dispatch_tool, which
