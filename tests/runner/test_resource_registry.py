@@ -2738,14 +2738,16 @@ async def test_claude_native_acknowledges_billing_notice_after_input_was_ready(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transfer", [False, True])
+@pytest.mark.parametrize("replace_during_tick", [False, True])
 async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     transfer: bool,
+    replace_during_tick: bool,
 ) -> None:
     import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-    callbacks, _, _, registry = await _observe_native_with_fake_poller(tmp_path, "source")
+    callbacks, _, pollers, registry = await _observe_native_with_fake_poller(tmp_path, "source")
     instance = registry.terminal_registry.get("source", "claude", "main")
     assert instance is not None
     original_bridge = tmp_path / "cli-direct-bridge"
@@ -2763,9 +2765,25 @@ async def test_claude_native_billing_acknowledgement_uses_original_launch_bridge
         assert registry.terminal_registry.get("target", "claude", "main") is instance
     on_tick = callbacks["on_tick"]
     assert callable(on_tick)
+    if replace_during_tick:
+        poller = pollers[-1]
+        original_tick = poller.tick
+
+        def replace_after_read() -> None:
+            original_tick()
+            registry.terminal_registry._by_conversation["target" if transfer else "source"][
+                ("claude", "main")
+            ] = make_test_terminal_instance("claude", "main", tmp_path / "replacement")
+
+        monkeypatch.setattr(poller, "tick", replace_after_read)
     instance._remember_pane_snapshot(_AUTO_MODE_BILLING_NOTICE_PANE)
     on_tick()
 
+    if replace_during_tick:
+        acknowledge.assert_not_called()
+        resolve_conversation_bridge.assert_not_called()
+        assert poller.ticks == 1
+        return
     acknowledge.assert_called_once_with(
         original_bridge,
         expected_socket_path=str(instance.socket_path),

@@ -1615,6 +1615,8 @@ class SessionResourceRegistry:
                 return
             if status_poller is not None:
                 status_poller.tick()
+                if not _owns_terminal():
+                    return
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE:
                 try:
                     from omnigent.harnesses.claude_native.bridge import (
