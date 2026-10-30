@@ -12,10 +12,12 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import psutil
 import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
+from omnigent.terminals.ws_common import _check_pane_dead_definitive, _tmux_session_alive
 
 _RULE = "─" * 40
 # Claude Code draws its composer glyph followed by a no-break space.
@@ -157,11 +159,17 @@ def test_repaint_request_without_a_pane_signals_nothing(tmp_path: Path) -> None:
 # handler does, and never otherwise: a differential renderer has no reason to.
 _REPAINTING_TUI = r"""
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 marker = Path(sys.argv[1])
+background_job = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(60)"],
+    stdin=subprocess.DEVNULL,
+)
+marker.with_suffix(".child-pid").write_text(str(background_job.pid))
 rule = "─" * 40
 pending = True
 
@@ -172,17 +180,22 @@ def resume(signum, frame):
 
 
 signal.signal(signal.SIGCONT, resume)
-while True:
-    if pending:
-        pending = False
-        with marker.open("a") as draws:
-            draws.write("drawn\n")
-        sys.stdout.write(
-            "\x1b[H\x1b[2Jtranscript\r\n" + rule + "\r\n❯ \r\n" + rule + "\r\n"
-            "  status line\r\n"
-        )
-        sys.stdout.flush()
-    time.sleep(0.02)
+signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
+try:
+    while True:
+        if pending:
+            pending = False
+            with marker.open("a") as draws:
+                draws.write("drawn\n")
+            sys.stdout.write(
+                "\x1b[H\x1b[2Jtranscript\r\n" + rule + "\r\n❯ \r\n" + rule + "\r\n"
+                "  status line\r\n"
+            )
+            sys.stdout.flush()
+        time.sleep(0.02)
+finally:
+    background_job.kill()
+    background_job.wait(timeout=5)
 """
 
 
@@ -193,8 +206,10 @@ def _wait_until(condition: Callable[[], bool], what: str) -> None:
         time.sleep(0.02)
 
 
-@pytest.fixture
-def overdrawn_terminal(tmp_path: Path) -> Iterator[tuple[str, Path]]:
+@pytest.fixture(params=[False, True], ids=["single-pane", "second-pane"])
+def overdrawn_terminal(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> Iterator[tuple[str, str, Path]]:
     script = tmp_path / "tui.py"
     script.write_text(_REPAINTING_TUI)
     marker = tmp_path / "draws"
@@ -204,8 +219,9 @@ def overdrawn_terminal(tmp_path: Path) -> Iterator[tuple[str, Path]]:
         # The shell stays the pane's process, so the TUI runs as its child the
         # way a launcher runs Claude Code.
         inner = f"{shlex.join([sys.executable, str(script), str(marker)])}; exit"
+        background_job: psutil.Process | None = None
         try:
-            subprocess.run(
+            created = subprocess.run(
                 [
                     *tmux,
                     "-f",
@@ -218,18 +234,42 @@ def overdrawn_terminal(tmp_path: Path) -> Iterator[tuple[str, Path]]:
                     "80",
                     "-y",
                     "24",
-                    shlex.join(["sh", "-c", inner]),
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sleep 60" if request.param else shlex.join(["sh", "-c", inner]),
                 ],
                 check=True,
                 capture_output=True,
+                text=True,
                 timeout=5,
             )
+            target = created.stdout.strip()
+            if request.param:
+                target = subprocess.run(
+                    [
+                        *tmux,
+                        "split-window",
+                        "-d",
+                        "-P",
+                        "-F",
+                        "#{pane_id}",
+                        "-t",
+                        target,
+                        shlex.join(["sh", "-c", inner]),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                ).stdout.strip()
             _wait_until(
-                lambda: bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, "main")),
+                lambda: bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, target)),
                 "test TUI never drew its input box",
             )
+            background_job = psutil.Process(int(marker.with_suffix(".child-pid").read_text()))
             pane_tty = subprocess.run(
-                [*tmux, "display-message", "-p", "-t", "main", "#{pane_tty}"],
+                [*tmux, "display-message", "-p", "-t", target, "#{pane_tty}"],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -245,25 +285,103 @@ def overdrawn_terminal(tmp_path: Path) -> Iterator[tuple[str, Path]]:
                 )
             _wait_until(
                 lambda: (
-                    not bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, "main"))
+                    not bridge._claude_prompt_rendered(bridge._capture_pane(socket_path, target))
                 ),
                 "foreign output did not reach the pane",
             )
-            yield socket_path, marker
+            yield socket_path, target, marker
         finally:
+            if background_job is not None:
+                with contextlib.suppress(psutil.Error):
+                    background_job.kill()
             with contextlib.suppress(subprocess.SubprocessError):
                 subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
 @pytest.mark.timeout(30)
+@pytest.mark.parametrize("pause_child", [False, True], ids=["running-job", "paused-job"])
 def test_real_overdrawn_composer_is_repainted_before_the_wait_gives_up(
-    overdrawn_terminal: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
+    overdrawn_terminal: tuple[str, str, Path], monkeypatch: pytest.MonkeyPatch, pause_child: bool
 ) -> None:
-    socket_path, marker = overdrawn_terminal
+    socket_path, target, marker = overdrawn_terminal
+    background_job = psutil.Process(int(marker.with_suffix(".child-pid").read_text()))
+    if pause_child:
+        background_job.suspend()
+        _wait_until(
+            lambda: background_job.status() == psutil.STATUS_STOPPED,
+            "test background job did not stop",
+        )
     monkeypatch.setattr(bridge, "_CLAUDE_REPAINT_AFTER_S", 0.3)
     monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 8.0)
 
-    bridge._wait_for_claude_prompt_ready(socket_path, "main", timeout_s=1.0)
+    bridge._wait_for_claude_prompt_ready(socket_path, target, timeout_s=1.0)
 
     assert marker.read_text().splitlines() == ["drawn", "drawn"]
+    assert background_job.is_running()
+    assert (background_job.status() == psutil.STATUS_STOPPED) is pause_child
+
+
+@pytest.mark.parametrize("overdrawn_terminal", [True], indirect=True, ids=["second-pane"])
+@pytest.mark.parametrize("target_exited", [False, True], ids=["other-exited", "target-exited"])
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.asyncio
+async def test_pane_liveness_reads_the_requested_pane(
+    overdrawn_terminal: tuple[str, str, Path], target_exited: bool
+) -> None:
+    socket_path, target, _ = overdrawn_terminal
+    tmux = ["tmux", "-S", socket_path]
+    panes = subprocess.run(
+        [*tmux, "list-panes", "-t", target, "-F", "#{pane_id}"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    ).stdout.splitlines()
+    other = next(pane for pane in panes if pane != target)
+    subprocess.run(
+        [*tmux, "set-option", "-w", "-t", target, "remain-on-exit", "on"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    exited = target if target_exited else other
+    subprocess.run(
+        [*tmux, "respawn-pane", "-k", "-t", exited, "exit 7"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    _wait_until(
+        lambda: (
+            subprocess.run(
+                [*tmux, "display-message", "-p", "-t", exited, "#{pane_dead}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            == "1"
+        ),
+        "test pane did not exit",
+    )
+
+    assert bridge._claude_pane_state(socket_path, target) == (
+        (False, True, "7") if target_exited else (True, False, None)
+    )
+    assert await _tmux_session_alive(socket_path, target) is not target_exited
+    assert await _check_pane_dead_definitive(socket_path, target) is target_exited
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.asyncio
+async def test_repaint_missing_target_does_not_signal_another_pane(
+    overdrawn_terminal: tuple[str, str, Path],
+) -> None:
+    socket_path, _, marker = overdrawn_terminal
+
+    assert bridge._request_claude_repaint(socket_path, "%999999") == 0
+    assert bridge._claude_pane_state(socket_path, "%999999").alive is False
+    assert await _tmux_session_alive(socket_path, "%999999") is False
+    assert await _check_pane_dead_definitive(socket_path, "%999999") is None
+    assert marker.read_text().splitlines() == ["drawn"]

@@ -149,6 +149,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py::test_pane_liveness_reads_the_requested_pane`
+  checks both shared WebSocket probes against real split tmux panes, including
+  an exited neighbor. This is a process check without a browser or vendor CLI.
 - **Launch failure and cancellation (plain `uv run pytest`, own tmux):**
   `tests/terminals/test_launch_failure_cleanup.py` checks a missing tmux
   executable at spawn and cancellation after a real pane starts, including

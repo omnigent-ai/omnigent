@@ -950,6 +950,11 @@ Cross-harness journeys:
   failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py` checks
+  redraw recovery in single and split tmux windows, the requested pane's exit
+  while its neighbor stays alive, a missing target, and a suspended background
+  job staying paused during redraw. It uses a scripted TUI
+  and real tmux; it does not establish browser or vendor-model compatibility.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a

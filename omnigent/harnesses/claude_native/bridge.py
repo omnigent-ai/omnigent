@@ -5859,10 +5859,9 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     dead pane's exit code comes from the same answer — a second probe at
     failure time can race the session's teardown and come back empty.
 
-    ``list-panes`` rather than ``display-message``: the latter prints an
-    empty line and still exits 0 for a target it cannot resolve, which is
-    indistinguishable from an answer of "alive". ``list-panes`` fails
-    outright, so a rejected query stays a rejected query.
+    ``display-message`` resolves the exact pane; ``list-panes`` lists its
+    whole window. The explicit missing-target marker distinguishes an
+    unresolved pane from an unanswered probe.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -5884,11 +5883,11 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
                 "tmux",
                 "-S",
                 socket_path,
-                "list-panes",
+                "display-message",
+                "-p",
                 "-t",
                 tmux_target,
-                "-F",
-                "#{pane_dead} #{pane_dead_status}",
+                "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}",
             ],
             check=False,
             capture_output=True,
@@ -5902,6 +5901,8 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
         # told us nothing about how the process finished.
         return _ClaudePaneState(False)
     fields = proc.stdout.split()
+    if fields == ["missing"]:
+        return _ClaudePaneState(False)
     if not fields:
         # tmux answered without saying anything about the pane.
         return _ClaudePaneState(None)
@@ -5925,8 +5926,8 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     from :func:`_composer_row`, and the readiness wait would reap a healthy
     pane. ``SIGCONT`` runs Claude Code's resume handler, which drops its
     cached frame and repaints everything, as after ``fg``. A running process
-    without a handler ignores it, so the whole tree under the pane gets it: a
-    launcher may run Claude Code as its child.
+    without a handler ignores it, so running processes under the pane get it:
+    a launcher may run Claude Code as its child. Suspended processes stay paused.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -5944,7 +5945,7 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     _check_injection_cancelled()
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            ["tmux", "-S", socket_path, "display-message", "-p", "-t", tmux_target, "#{pane_pid}"],
             check=False,
             capture_output=True,
             text=True,
@@ -5963,6 +5964,9 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     signalled = 0
     for process in tree:
         with contextlib.suppress(psutil.Error):
+            # SIGCONT must not resume a tool the person deliberately suspended.
+            if process.status() in {psutil.STATUS_STOPPED, psutil.STATUS_TRACING_STOP}:
+                continue
             process.send_signal(signal.SIGCONT)
             signalled += 1
     return signalled
