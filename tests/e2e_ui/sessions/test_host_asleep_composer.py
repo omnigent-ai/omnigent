@@ -376,7 +376,9 @@ def test_session_opened_mid_wake_spins_dot_through_server_stage(
 
     _expect_host_status(page, "starting", tooltip="Provisioning sandbox")
     _open_host_menu(page, "starting")
-    expect(page.get_by_role("menuitem", name="Reconnect host")).to_have_count(0)
+    # The server's stage can go stale, so Reconnect host stays available.
+    expect(page.get_by_role("menuitem", name="Reconnect host")).to_be_visible()
+    page.wait_for_timeout(_HOLD_MS)
     page.keyboard.press("Escape")
 
     # The next liveness poll (every 10s) sees the host online.

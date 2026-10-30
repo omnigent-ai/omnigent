@@ -801,7 +801,7 @@ describe("HostBadge during a sandbox launch", () => {
     expect(screen.getByTestId("composer-host-status")).toBeInTheDocument();
   });
 
-  it("spins a bound sandbox's dot through the server's wake stages until its host is online", () => {
+  it("spins a bound sandbox's dot through the server's wake stages, still reconnectable, until online", () => {
     launch("provisioning", "host_a1b2", "arclet");
     useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
     useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
@@ -812,8 +812,9 @@ describe("HostBadge during a sandbox launch", () => {
     const trigger = screen.getByTestId("composer-host-select");
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Provisioning sandbox");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
+    // A server-reported stage can go stale, so Reconnect host stays available.
     fireEvent.pointerDown(trigger, { button: 0 });
-    expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
 
     useChatStore.setState({ sandboxStatus: { stage: "connecting", error: null } });
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);

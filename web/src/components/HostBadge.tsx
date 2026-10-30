@@ -185,16 +185,15 @@ export function HostBadge({
       launch !== null && launch.stage !== "failed" && launch.stage !== "action_required";
     const launchStoppedWake =
       launch !== null && !launchInProgress && (wake.stageChanged || currentLaunch !== wake.launch);
-    const hostStarting =
-      ((starting && !!badge && !launchStoppedWake) || launchInProgress) &&
-      badge?.status !== "online";
+    const localWakeRunning = starting && !!badge && !launchStoppedWake;
+    const hostStarting = (localWakeRunning || launchInProgress) && badge?.status !== "online";
     const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
     const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
+    // Only this tab's own wake hides Reconnect: a server-reported stage can go stale.
     const reconnectable =
-      !launchStatus && !hostStarting && badge?.status === "offline" && !!onReconnect;
-    let label = badge
-      ? `Host ${badge.label}, ${hostStarting ? startingWord : STATUS_WORD[badge.status]}`
-      : "No host bound";
+      !launchStatus && !localWakeRunning && badge?.status === "offline" && !!onReconnect;
+    const statusWord = hostStarting ? startingWord : STATUS_WORD[badge?.status ?? "unknown"];
+    let label = badge ? `Host ${badge.label}, ${statusWord}` : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
     let connectionWord = CONNECTION_WORD[badge?.status ?? "unknown"];

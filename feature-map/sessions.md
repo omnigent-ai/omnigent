@@ -374,7 +374,8 @@ The host status dot in the composer chip and its menu spins while the sandbox
 starts and turns green once it is online. A toast appears only when the wake
 fails or the host isn't online 30 seconds after the server answers.
 Reloading during the wake keeps it spinning, with the stage (for example
-"Provisioning sandbox") in the chip's tooltip and in the chat.
+"Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
+stays in the menu then, in case that stage never finishes.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
