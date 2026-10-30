@@ -71,9 +71,6 @@
       "owners": [
         "dhruv0811",
         "TomeHirata"
-      ],
-      "owners_paused": [
-        "PattaraS"
       ]
     },
     {
@@ -304,10 +301,8 @@
         "omnigent/llms/"
       ],
       "owners": [
-        "dhruv0811"
-      ],
-      "owners_paused": [
-        "PattaraS"
+        "dhruv0811",
+        "TomeHirata"
       ]
     },
     {
@@ -489,9 +484,6 @@
       "owners": [
         "dhruv0811",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "PattaraS"
       ]
     },
     {
@@ -591,10 +583,8 @@
         "omnigent/onboarding/gemini_auth.py"
       ],
       "owners": [
-        "TomeHirata"
-      ],
-      "owners_paused": [
-        "PattaraS"
+        "TomeHirata",
+        "fanzeyi"
       ]
     },
     {
@@ -610,10 +600,8 @@
         "omnigent/onboarding/goose_auth.py"
       ],
       "owners": [
-        "dhruv0811"
-      ],
-      "owners_paused": [
-        "PattaraS"
+        "dhruv0811",
+        "TomeHirata"
       ]
     },
     {
@@ -665,9 +653,6 @@
       "owners": [
         "TomeHirata",
         "dhruv0811"
-      ],
-      "owners_paused": [
-        "PattaraS"
       ]
     },
     {
@@ -686,9 +671,6 @@
         "dhruv0811",
         "TomeHirata",
         "dbczumar"
-      ],
-      "owners_paused": [
-        "PattaraS"
       ]
     },
     {
@@ -738,9 +720,6 @@
       "owners": [
         "TomeHirata",
         "dhruv0811"
-      ],
-      "owners_paused": [
-        "PattaraS"
       ]
     }
   ]
