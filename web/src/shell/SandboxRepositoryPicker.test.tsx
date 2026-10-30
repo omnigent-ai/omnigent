@@ -99,6 +99,14 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.click(await screen.findByRole("combobox", { name: "Branch for org/api" }));
     await screen.findByText("Couldn't load branches. Enter a branch name to use it.");
     fireEvent.change(screen.getByTestId("sandbox-repo-branch-search"), {
+      target: { value: "feature#invalid" },
+    });
+    expect(screen.queryByRole("option", { name: "Use “feature#invalid”" })).toBeNull();
+    expect(
+      screen.getByText("Enter a valid branch name, or leave blank for the default branch."),
+    ).toBeVisible();
+    expect(onChange).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByTestId("sandbox-repo-branch-search"), {
       target: { value: "release/next" },
     });
     fireEvent.click(screen.getByRole("option", { name: "Use “release/next”" }));
@@ -108,6 +116,18 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.click(screen.getByRole("combobox", { name: "Branch for org/api" }));
     fireEvent.click(screen.getByRole("option", { name: "Default (main)" }));
     expect(onChange).toHaveBeenLastCalledWith([{ url: REPOSITORIES[0].clone_url, branch: "" }]);
+  });
+
+  it("loads only the opened repository's branches and reuses them when reopened", async () => {
+    renderPicker(REPOSITORIES.map((repo) => ({ url: repo.clone_url!, branch: "" })));
+    const branchPicker = await screen.findByRole("combobox", { name: "Branch for org/api" });
+    expect(fetchGithubBranches).not.toHaveBeenCalled();
+    fireEvent.click(branchPicker);
+    fireEvent.click(await screen.findByRole("option", { name: "dev" }));
+    expect(fetchGithubBranches).toHaveBeenCalledExactlyOnceWith("org/api");
+    fireEvent.click(branchPicker);
+    expect(screen.getByRole("option", { name: "dev" })).toBeVisible();
+    expect(fetchGithubBranches).toHaveBeenCalledOnce();
   });
 
   it("retains repository branches when switching to a provider with a smaller limit", async () => {
@@ -162,9 +182,16 @@ describe("SandboxRepositoryPicker", () => {
     fireEvent.change(input, { target: { value: "https://git.example.com/org/repo" } });
     fireEvent.keyDown(input, { key: "Enter" });
     expect(onPendingUrlChange).toHaveBeenLastCalledWith("");
-    fireEvent.change(within(screen.getByTestId("sandbox-repo-row")).getByRole("textbox"), {
+    const branchInput = within(screen.getByTestId("sandbox-repo-row")).getByRole("textbox");
+    fireEvent.change(branchInput, { target: { value: "my branch" } });
+    expect(branchInput).toHaveAttribute("aria-invalid", "true");
+    expect(branchInput).toHaveAccessibleDescription(
+      "Enter a valid branch name, or leave blank for the default branch.",
+    );
+    fireEvent.change(branchInput, {
       target: { value: "release" },
     });
+    expect(branchInput).not.toHaveAttribute("aria-invalid");
     expect(onChange).toHaveBeenLastCalledWith([
       { url: "https://git.example.com/org/repo", branch: "release" },
     ]);

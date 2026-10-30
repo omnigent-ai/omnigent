@@ -13,7 +13,13 @@ import {
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
-import { deriveRepoName, isValidSandboxRepoUrl } from "@/lib/sandboxRepositories";
+import {
+  deriveRepoName,
+  isValidSandboxBranch,
+  isValidSandboxRepoUrl,
+} from "@/lib/sandboxRepositories";
+
+const INVALID_BRANCH_MESSAGE = "Enter a valid branch name, or leave blank for the default branch.";
 
 const COMBOBOX_TRIGGER_CLASS =
   "flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors hover:border-ring/60 focus-visible:border-ring";
@@ -93,19 +99,23 @@ function SandboxRepoBranchSelect({
   onChange,
   enabled,
   testIdPrefix,
+  descriptionId,
+  invalid,
 }: {
   repo: GithubRepo;
   value: string;
   onChange: (branch: string) => void;
   enabled: boolean;
   testIdPrefix: string;
+  descriptionId?: string;
+  invalid: boolean;
 }): ReactNode {
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const { data, isPending, isError } = useQuery({
     queryKey: ["github-branches", repo.full_name],
     queryFn: () => fetchGithubBranches(repo.full_name),
-    enabled,
+    enabled: enabled && open,
     staleTime: 5 * 60_000,
   });
   const branches = data?.connected ? data.branches : [];
@@ -113,8 +123,12 @@ function SandboxRepoBranchSelect({
   const options = branches.filter((branch) => branch !== repo.default_branch);
   if (value !== "" && !options.includes(value)) options.unshift(value);
   const customBranch = search.trim();
+  const invalidSearch = !isValidSandboxBranch(search);
   const showCustomBranch =
-    customBranch !== "" && customBranch !== repo.default_branch && !options.includes(customBranch);
+    customBranch !== "" &&
+    !invalidSearch &&
+    customBranch !== repo.default_branch &&
+    !options.includes(customBranch);
   const chooseBranch = (branch: string): void => {
     onChange(branch);
     setOpen(false);
@@ -133,6 +147,8 @@ function SandboxRepoBranchSelect({
           role="combobox"
           aria-expanded={open}
           aria-label={`Branch for ${repo.full_name}`}
+          aria-describedby={descriptionId}
+          aria-invalid={invalid || undefined}
           className={COMBOBOX_TRIGGER_CLASS}
           data-testid={`${testIdPrefix}-branch-select`}
           title={value || defaultLabel}
@@ -150,6 +166,9 @@ function SandboxRepoBranchSelect({
             onValueChange={setSearch}
             data-testid={`${testIdPrefix}-branch-search`}
           />
+          {invalidSearch && (
+            <p className="px-3 py-2 text-xs text-destructive">{INVALID_BRANCH_MESSAGE}</p>
+          )}
           {isError && (
             <p className="px-3 py-2 text-xs text-muted-foreground">
               Couldn't load branches. Enter a branch name to use it.
@@ -193,7 +212,8 @@ function SandboxRepoBranchSelect({
 
 interface SandboxRepositoryPickerProps {
   selections: LastSandboxRepo[];
-  onChange: (selections: LastSandboxRepo[]) => void;
+  onChange: (selections: LastSandboxRepo[], editedBranchUrl?: string) => void;
+  branchNotes?: Readonly<Record<string, string>>;
   maxRepos: number;
   enabled?: boolean;
   testIdPrefix?: string;
@@ -205,6 +225,7 @@ interface SandboxRepositoryPickerProps {
 export function SandboxRepositoryPicker({
   selections,
   onChange,
+  branchNotes,
   maxRepos,
   enabled = true,
   testIdPrefix = "new-chat-landing-repo",
@@ -247,6 +268,7 @@ export function SandboxRepositoryPicker({
   const setBranch = (index: number, branch: string): void => {
     onChange(
       selections.map((selection, row) => (row === index ? { ...selection, branch } : selection)),
+      selections[index]?.url,
     );
   };
   return (
@@ -263,47 +285,60 @@ export function SandboxRepositoryPicker({
           (item) => repoIdentity(repoCloneUrl(item)) === repoIdentity(selection.url),
         );
         const name = repo?.full_name ?? deriveRepoName(selection.url) ?? selection.url;
+        const invalidBranch = !isValidSandboxBranch(selection.branch);
+        const note = invalidBranch ? INVALID_BRANCH_MESSAGE : branchNotes?.[selection.url];
+        const descriptionId = note ? `${testIdPrefix}-branch-note-${index}` : undefined;
         return (
-          <div
-            key={selection.url}
-            className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1.5 py-1 sm:flex sm:gap-2 sm:py-0"
-            data-testid={`${testIdPrefix}-row`}
-          >
-            <span
-              className="col-start-1 row-start-1 min-w-0 flex-1 truncate text-sm"
-              title={selection.url}
-            >
-              {name}
-            </span>
-            <div className="col-span-2 row-start-2 min-w-0 sm:w-40 sm:max-w-[55%] sm:shrink-0">
-              {repo ? (
-                <SandboxRepoBranchSelect
-                  repo={repo}
-                  value={selection.branch}
-                  onChange={(branch) => setBranch(index, branch)}
-                  enabled={githubEnabled}
-                  testIdPrefix={testIdPrefix}
-                />
-              ) : (
-                <input
-                  type="text"
-                  value={selection.branch}
-                  onChange={(event) => setBranch(index, event.target.value)}
-                  placeholder="Default branch"
-                  aria-label={`Branch for ${name}`}
-                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
-                />
-              )}
+          <div key={selection.url} className="min-w-0" data-testid={`${testIdPrefix}-row`}>
+            <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1.5 py-1 sm:flex sm:gap-2 sm:py-0">
+              <span
+                className="col-start-1 row-start-1 min-w-0 flex-1 truncate text-sm"
+                title={selection.url}
+              >
+                {name}
+              </span>
+              <div className="col-span-2 row-start-2 min-w-0 sm:w-40 sm:max-w-[55%] sm:shrink-0">
+                {repo ? (
+                  <SandboxRepoBranchSelect
+                    repo={repo}
+                    value={selection.branch}
+                    onChange={(branch) => setBranch(index, branch)}
+                    enabled={githubEnabled}
+                    testIdPrefix={testIdPrefix}
+                    descriptionId={descriptionId}
+                    invalid={invalidBranch}
+                  />
+                ) : (
+                  <input
+                    type="text"
+                    value={selection.branch}
+                    onChange={(event) => setBranch(index, event.target.value)}
+                    placeholder="Default branch"
+                    aria-label={`Branch for ${name}`}
+                    aria-describedby={descriptionId}
+                    aria-invalid={invalidBranch || undefined}
+                    className="w-full rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors focus-visible:border-ring"
+                  />
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => onChange(selections.filter((_, row) => row !== index))}
+                aria-label={`Remove ${name}`}
+                className="col-start-2 row-start-1 shrink-0 justify-self-end rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
+                data-testid={`${testIdPrefix}-remove`}
+              >
+                <XIcon className="size-3.5" />
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => onChange(selections.filter((_, row) => row !== index))}
-              aria-label={`Remove ${name}`}
-              className="col-start-2 row-start-1 shrink-0 justify-self-end rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
-              data-testid={`${testIdPrefix}-remove`}
-            >
-              <XIcon className="size-3.5" />
-            </button>
+            {note && (
+              <p
+                id={descriptionId}
+                className={`mt-1 text-xs break-words ${invalidBranch ? "text-destructive" : "text-muted-foreground"}`}
+              >
+                {note}
+              </p>
+            )}
           </div>
         );
       })}

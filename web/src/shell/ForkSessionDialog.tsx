@@ -43,7 +43,7 @@ import {
   workspaceRecoveryDisabledReason,
 } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
@@ -96,6 +96,7 @@ import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import {
   MAX_SANDBOX_REPOS,
   composeSandboxWorkspaces,
+  isValidSandboxBranch,
   isValidSandboxRepoUrl,
   splitSandboxWorkspace,
 } from "@/lib/sandboxRepositories";
@@ -877,6 +878,9 @@ function SupportedForkSessionForm({
   // Provider the sandbox pick launches on; null for a server that names none.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
   const [sandboxRepos, setSandboxRepos] = useState<LastSandboxRepo[]>([]);
+  const [sandboxBranchNotes, setSandboxBranchNotes] = useState<Record<string, string>>({});
+  const [sandboxBranchesChecked, setSandboxBranchesChecked] = useState(false);
+  const editedSandboxReposRef = useRef(new Set<string>());
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
   // Whether the "connect another host" CLI hint is expanded (only shown when
   // at least one host is online; otherwise the instructions render directly).
@@ -1104,12 +1108,77 @@ function SupportedForkSessionForm({
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
   const sourceSandboxRepo = sourceSession?.labels?.[SANDBOX_REPO_LABEL_KEY] ?? null;
+  const sandboxBranchesPending =
+    sandboxSelected && Boolean(sourceSandboxRepo) && !sandboxBranchesChecked;
   // Seed once so removing all inherited repositories stays an explicit choice.
   useEffect(() => {
     if (!sandboxSelected || sandboxRepoSeededRef.current || sourceSandboxRepo === null) return;
     sandboxRepoSeededRef.current = true;
     setSandboxRepos(sourceSandboxRepo.split(/\s+/).filter(Boolean).map(splitSandboxWorkspace));
   }, [sandboxSelected, sourceSandboxRepo]);
+
+  useEffect(() => {
+    if (
+      !visible ||
+      !sandboxSelected ||
+      busy ||
+      sourceSandboxRepo === null ||
+      sandboxBranchesChecked
+    )
+      return;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort();
+      setSandboxBranchesChecked(true);
+    }, 8_000);
+    const originals = sourceSandboxRepo.split(/\s+/).filter(Boolean).map(splitSandboxWorkspace);
+    void fetchSessionRepositoryBranches(sourceSessionId, controller.signal)
+      .then(({ repositories }) => {
+        if (controller.signal.aborted) return;
+        const currentBranches = new Map(repositories.map((repo) => [repo.url, repo]));
+        setSandboxRepos((current) =>
+          current.map((repo) => {
+            const live = currentBranches.get(repo.url);
+            return !editedSandboxReposRef.current.has(repo.url) &&
+              live?.pushed &&
+              live.branch &&
+              isValidSandboxBranch(live.branch)
+              ? { ...repo, branch: live.branch }
+              : repo;
+          }),
+        );
+        setSandboxBranchNotes(
+          Object.fromEntries(
+            originals.flatMap((repo) => {
+              const live = currentBranches.get(repo.url);
+              if (
+                editedSandboxReposRef.current.has(repo.url) ||
+                live?.pushed !== false ||
+                !live.branch
+              ) {
+                return [];
+              }
+              return [
+                [
+                  repo.url,
+                  `“${live.branch}” isn’t pushed. Using ${repo.branch || "the default branch"}.`,
+                ],
+              ];
+            }),
+          ),
+        );
+      })
+      // An offline source or older server leaves the original branches selected.
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(timeout);
+        if (!controller.signal.aborted) setSandboxBranchesChecked(true);
+      });
+    return () => {
+      controller.abort();
+      clearTimeout(timeout);
+    };
+  }, [visible, sandboxSelected, busy, sourceSandboxRepo, sourceSessionId, sandboxBranchesChecked]);
 
   // Resolve a typed "~/…" path to its absolute form against the host's home,
   // so it's directly submittable without opening the tree browser (the server
@@ -1167,11 +1236,17 @@ function SupportedForkSessionForm({
             : "Enter a repository URL like https://github.com/org/repo.",
         };
       }
-      return sandboxRepos.every((repo) => isValidSandboxRepoUrl(repo.url))
+      if (sandboxRepos.some((repo) => !isValidSandboxRepoUrl(repo.url))) {
+        return {
+          field: "sandboxRepo",
+          message: "Enter a repository URL like https://github.com/org/repo.",
+        };
+      }
+      return sandboxRepos.every((repo) => isValidSandboxBranch(repo.branch))
         ? null
         : {
             field: "sandboxRepo",
-            message: "Enter a repository URL like https://github.com/org/repo.",
+            message: "Enter a valid branch name or leave it blank for the default branch.",
           };
     }
     if (!isCodingSource) return null;
@@ -1195,7 +1270,7 @@ function SupportedForkSessionForm({
     }
     return null;
   })();
-  const canSubmit = submitBlocker === null;
+  const canSubmit = submitBlocker === null && !sandboxBranchesPending;
   const fieldError = (field: ForkField) =>
     showErrors && submitBlocker?.field === field ? submitBlocker.message : null;
   useEffect(() => {
@@ -1296,6 +1371,7 @@ function SupportedForkSessionForm({
   }
 
   async function handleFork(): Promise<void> {
+    if (sandboxBranchesPending) return;
     if (submitBlocker !== null) {
       // Point at what's missing rather than ignoring the click.
       setShowErrors(true);
@@ -1769,17 +1845,38 @@ function SupportedForkSessionForm({
               <h3 id="fork-session-repositories-label" className="text-sm font-medium">
                 {maxSandboxRepos > 1 ? "Repositories" : "Repository"}
               </h3>
-              <span className="text-xs text-muted-foreground">{sandboxRepos.length} selected</span>
+              <span className="text-xs text-muted-foreground">
+                {sandboxBranchesPending
+                  ? "Checking current branches…"
+                  : `${sandboxRepos.length} selected`}
+              </span>
             </div>
             <p className="text-sm text-muted-foreground" data-testid="fork-session-sandbox-hint">
               Choose what to clone into the new sandbox. Changes here only apply to the fork.
             </p>
             <SandboxRepositoryPicker
               selections={sandboxRepos}
-              onChange={(repos) => {
+              onChange={(repos, editedBranchUrl) => {
                 sandboxRepoSeededRef.current = true;
+                if (editedBranchUrl) editedSandboxReposRef.current.add(editedBranchUrl);
+                for (const repo of [...sandboxRepos, ...repos]) {
+                  if (
+                    !sandboxRepos.some((previous) => previous.url === repo.url) ||
+                    !repos.some((next) => next.url === repo.url)
+                  ) {
+                    editedSandboxReposRef.current.add(repo.url);
+                  }
+                }
+                setSandboxBranchNotes((notes) =>
+                  Object.fromEntries(
+                    Object.entries(notes).filter(
+                      ([url]) => !editedSandboxReposRef.current.has(url),
+                    ),
+                  ),
+                );
                 setSandboxRepos(repos);
               }}
+              branchNotes={sandboxBranchNotes}
               maxRepos={maxSandboxRepos}
               enabled={visible}
               testIdPrefix="fork-session-sandbox-repo"
@@ -1927,6 +2024,7 @@ function SupportedForkSessionForm({
           data-testid="fork-session-submit"
           onClick={handleFork}
           loading={busy}
+          disabled={sandboxBranchesPending}
           // Greyed but clickable: a blocked click points at the missing field.
           aria-disabled={!canSubmit || undefined}
           className="aria-disabled:opacity-50"

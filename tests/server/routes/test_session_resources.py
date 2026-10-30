@@ -3232,6 +3232,112 @@ async def test_files_route_not_captured_as_resource_id(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("multiple", [False, True])
+async def test_repository_branches_use_stored_launch_targets(
+    app: FastAPI, client: httpx.AsyncClient, multiple: bool
+) -> None:
+    from omnigent.server.managed_hosts import managed_repo_labels
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    conversation = app.state.test_conversation_store.get_conversation(session_id)
+    urls = (
+        ["https://github.com/one/api", "https://github.com/two/api"]
+        if multiple
+        else ["https://github.com/one/api"]
+    )
+    conversation.labels = managed_repo_labels([f"{url}#main" for url in urls])
+    conversation.workspace = "/sandbox/workspace"
+    original_labels = dict(conversation.labels)
+    payload = {"repositories": [{"url": url, "branch": "feature", "pushed": True} for url in urls]}
+    runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{session_id}/resources/repository-branches"
+
+    response = await client.get(
+        path, params={"repositories": '[{"url":"file:///secret","path":"../../secret"}]'}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == payload
+    assert runner.calls == [("GET", path)]
+    assert json.loads(runner.get_params[0]["repositories"]) == [
+        {"url": url, "path": name if multiple else ""}
+        for url, name in zip(urls, ["one__api", "two__api"], strict=False)
+    ]
+    assert conversation.labels == original_labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host_available", [False, True])
+async def test_repository_branches_fall_back_without_waking_source(
+    app: FastAPI, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, host_available: bool
+) -> None:
+    from omnigent.server.managed_hosts import managed_repo_labels
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    url = "https://github.com/one/api"
+    conversation = app.state.test_conversation_store.get_conversation(session_id)
+    conversation.labels = managed_repo_labels([f"{url}#main"])
+    conversation.workspace = "/sandbox/workspace"
+    conversation.host_id = "source-host"
+    monkeypatch.setattr(app.state.test_host_registry, "get", lambda _host_id: object())
+    wake = Mock(side_effect=AssertionError("Branch suggestions must not wake the source"))
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    async def read(**kwargs):
+        assert kwargs["op"] == "repository_branches"
+        assert kwargs["workspace"] == conversation.workspace
+        assert kwargs["params"] == {"repositories": [{"url": url, "path": ""}]}
+        if not host_available:
+            raise _host_filesystem.HostFsUnavailableError("offline")
+        return {"repositories": [{"url": url, "branch": "feature", "pushed": False}]}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read)
+    response = await client.get(f"/v1/sessions/{session_id}/resources/repository-branches")
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "repositories": [
+            {
+                "url": url,
+                "branch": "feature" if host_available else None,
+                "pushed": False if host_available else None,
+            }
+        ]
+    }
+    wake.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("granted", [False, True])
+async def test_repository_branches_require_session_read_access(
+    runner_globals_reset: None, granted: bool
+) -> None:
+    del runner_globals_reset
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    permissions = _StubPermissionStore()
+    if granted:
+        permissions.add_grant("alice@example.com", session_id, LEVEL_READ)
+    app = _sessions_app(
+        _ConversationStore(),
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        response = await client.get(
+            f"/v1/sessions/{session_id}/resources/repository-branches",
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    assert response.status_code == (200 if granted else 404)
+    if granted:
+        assert response.json() == {"repositories": []}
+
+
+@pytest.mark.asyncio
 async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
     """GET /resources/github proxies to the runner and returns its payload.
 

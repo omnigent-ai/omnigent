@@ -24,6 +24,25 @@ export function isValidSandboxRepoUrl(url: string): boolean {
   return /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
 }
 
+/** Validate the trimmed branch sent to the server; blank selects the repository default. */
+export function isValidSandboxBranch(branch: string): boolean {
+  const value = branch.trim();
+  if (value === "") return true;
+  return (
+    !/^[0-9a-f]{40}$/.test(value) &&
+    !Array.from(value).some(
+      (character) =>
+        character.charCodeAt(0) < 0x20 || /\s/.test(character) || "~^:?*[\\#".includes(character),
+    ) &&
+    !value.startsWith("-") &&
+    !value.startsWith("/") &&
+    !value.endsWith("/") &&
+    !value.endsWith(".") &&
+    !value.includes("..") &&
+    !value.includes("@{")
+  );
+}
+
 /**
  * Compose the managed session's ``workspace`` string from the split
  * repository inputs.

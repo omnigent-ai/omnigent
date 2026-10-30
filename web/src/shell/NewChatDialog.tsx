@@ -120,6 +120,7 @@ import {
   MAX_SANDBOX_REPOS,
   composeSandboxWorkspaces,
   deriveRepoName,
+  isValidSandboxBranch,
   isValidSandboxRepoUrl,
 } from "@/lib/sandboxRepositories";
 
@@ -2394,6 +2395,8 @@ export function NewChatLandingScreen() {
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
   const [pendingRepoUrl, setPendingRepoUrl] = useState("");
+  const [sandboxRepoPopoverOpen, setSandboxRepoPopoverOpen] = useState(false);
+  const sandboxRepoPopoverRef = useRef<HTMLDivElement>(null);
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
@@ -4719,8 +4722,12 @@ export function NewChatLandingScreen() {
   // Keep provider changes and unfinished URL edits from silently dropping repositories.
   const sandboxRepoOverCap = sandboxRepoSelections.length > maxSandboxRepos;
   const sandboxRepoPending = pendingRepoUrl.trim() !== "";
+  const sandboxBranchesValid = sandboxRepoSelections.every((repo) =>
+    isValidSandboxBranch(repo.branch),
+  );
   const sandboxRepoValid =
     sandboxRepoSelections.every((repo) => isValidSandboxRepoUrl(repo.url)) &&
+    sandboxBranchesValid &&
     !sandboxRepoOverCap &&
     !sandboxRepoPending;
 
@@ -5049,17 +5056,19 @@ export function NewChatLandingScreen() {
                 } — remove the extras`
               : sandboxSelected && sandboxRepoPending
                 ? "Add the repository or clear its URL before starting"
-                : sandboxSelected && !sandboxRepoValid
-                  ? "Please enter a valid repository URL"
-                  : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-                    ? "Selected host is unavailable. Reconnect it or choose another host."
-                    : !sandboxSelected && (!selectedHostId || !workspaceValid)
-                      ? "Please choose a host and working directory"
-                      : configuredAgentUnavailable && selectedAgent == null
-                        ? "This project's configured agent is unavailable — pick an agent to continue"
-                        : message.trim().length === 0 && files.length === 0
-                          ? "Enter a message to get started"
-                          : null;
+                : sandboxSelected && !sandboxBranchesValid
+                  ? "Please enter a valid repository branch"
+                  : sandboxSelected && !sandboxRepoValid
+                    ? "Please enter a valid repository URL"
+                    : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+                      ? "Selected host is unavailable. Reconnect it or choose another host."
+                      : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                        ? "Please choose a host and working directory"
+                        : configuredAgentUnavailable && selectedAgent == null
+                          ? "This project's configured agent is unavailable — pick an agent to continue"
+                          : message.trim().length === 0 && files.length === 0
+                            ? "Enter a message to get started"
+                            : null;
   useLayoutEffect(() => {
     if (submitDisabledReason !== null) return;
     setSubmitTooltipState("closed");
@@ -5069,6 +5078,24 @@ export function NewChatLandingScreen() {
         ?.focus();
     }
   }, [submitDisabledReason]);
+
+  function focusSandboxRepositoryIssue(): boolean {
+    const field = sandboxRepoPopoverRef.current?.querySelector<HTMLElement>(
+      sandboxRepoPending ? "#new-chat-landing-repo-input" : '[aria-invalid="true"]',
+    );
+    field?.focus();
+    return field !== undefined && field !== null;
+  }
+
+  function handleBlockedSubmit(): void {
+    if (sandboxSelected && !sandboxRepoValid) {
+      setSubmitTooltipState("closed");
+      setSandboxRepoPopoverOpen(true);
+      focusSandboxRepositoryIssue();
+    } else if (submitDisabledReason !== null) {
+      setSubmitTooltipState("pinned");
+    }
+  }
 
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
@@ -5387,7 +5414,7 @@ export function NewChatLandingScreen() {
     // and form-submit paths that call this directly can't create a session with
     // a blank message, host, agent, or workspace.
     if (!canSubmit) {
-      if (submitDisabledReason !== null) setSubmitTooltipState("pinned");
+      handleBlockedSubmit();
       return;
     }
     if (createAttemptRef.current !== null) return;
@@ -6231,7 +6258,7 @@ export function NewChatLandingScreen() {
               before the sandbox exists, so the workspace is specified as
               a git repository URL (+ optional branch) the server clones
               at create time. Blank = empty server-created workspace. */}
-              <Popover>
+              <Popover open={sandboxRepoPopoverOpen} onOpenChange={setSandboxRepoPopoverOpen}>
                 <PopoverTrigger asChild>
                   <button
                     type="button"
@@ -6254,7 +6281,22 @@ export function NewChatLandingScreen() {
                     <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </PopoverTrigger>
-                <PopoverContent align="start" className="w-96 p-3">
+                <PopoverContent
+                  ref={sandboxRepoPopoverRef}
+                  align="start"
+                  className="w-96 p-3"
+                  onOpenAutoFocus={(event) => {
+                    if (focusSandboxRepositoryIssue()) event.preventDefault();
+                  }}
+                  onPointerDownOutside={(event) => {
+                    if (
+                      !sandboxRepoValid &&
+                      submitTooltipTriggerRef.current?.contains(event.target as Node)
+                    ) {
+                      event.preventDefault();
+                    }
+                  }}
+                >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <span className="text-sm font-medium text-foreground">
@@ -7129,7 +7171,7 @@ export function NewChatLandingScreen() {
                             onPointerDown={(event) => {
                               if (submitDisabledReason === null) return;
                               event.preventDefault();
-                              setSubmitTooltipState("pinned");
+                              handleBlockedSubmit();
                             }}
                             onKeyDown={(event) => {
                               if (
@@ -7137,7 +7179,7 @@ export function NewChatLandingScreen() {
                                 (event.key === "Enter" || event.key === " ")
                               ) {
                                 event.preventDefault();
-                                setSubmitTooltipState("pinned");
+                                handleBlockedSubmit();
                               }
                             }}
                             onBlur={() => setSubmitTooltipState("closed")}

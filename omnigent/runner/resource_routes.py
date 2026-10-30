@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import mimetypes
 import os
@@ -1373,6 +1374,28 @@ def register_resource_routes(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/sessions/{session_id}/resources/repository-branches")
+    async def get_repository_branches(session_id: str, repositories: str) -> JSONResponse:
+        """Inspect server-provided repository targets in the existing workspace."""
+        from omnigent.workspace_fs import WorkspaceReaderError, read_repository_branches
+
+        root = await _github_workspace_root(session_id)
+        try:
+            targets = json.loads(repositories)
+            if not isinstance(targets, list) or any(
+                not isinstance(target, dict)
+                or not isinstance(target.get("url"), str)
+                or not isinstance(target.get("path"), str)
+                for target in targets
+            ):
+                raise ValueError("Invalid repository targets")
+            result = await run_slow_io(read_repository_branches, Path(root), targets)
+        except WorkspaceReaderError as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid repository targets") from exc
+        return JSONResponse(content=result)
 
     @app.get("/v1/sessions/{session_id}/resources/github")
     async def read_github_info(

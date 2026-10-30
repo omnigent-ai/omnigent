@@ -348,6 +348,40 @@ async def client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "targets,status",
+    [
+        ([{"url": "https://github.com/org/repo", "path": ""}], 200),
+        ([{"url": "https://github.com/org/repo", "path": "../outside"}], 400),
+        ([{"url": "https://github.com/org/repo", "path": ""}] * 11, 400),
+        ([{"path": ""}], 400),
+    ],
+)
+async def test_repository_branches_runner_contract(
+    tmp_path: Path, targets: object, status: int
+) -> None:
+    app = create_runner_app(
+        runner_workspace=tmp_path,
+        per_session_workspace=False,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/repository-branches",
+            params={"repositories": json.dumps(targets)},
+        )
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {
+            "repositories": [
+                {"url": "https://github.com/org/repo", "branch": None, "pushed": None}
+            ]
+        }
+
+
+@pytest.mark.asyncio
 async def test_session_resources_new_session_lists_default_only(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

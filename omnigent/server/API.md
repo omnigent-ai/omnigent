@@ -1324,6 +1324,24 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### Read Fork Repository Branch Suggestions
+
+`GET /v1/sessions/{session_id}/resources/repository-branches` requires session
+read access and returns the managed repositories in their original launch order:
+
+```json
+{"repositories": [{"url": "https://github.com/org/repo", "branch": "feature", "pushed": true}]}
+```
+
+Repository URLs and checkout paths come from server-owned launch metadata; this
+endpoint accepts no paths or URLs. It inspects the existing workspace through
+the runner or connected host without waking a sandbox, fetching, or changing Git
+state. `pushed` means the current branch exists at its original clone URL, not
+that all local commits or working-tree changes are pushed. It is `false` only
+when the remote confirms the branch is absent. Detached HEADs, an unavailable
+workspace, or a failed remote check produce `null` values so clients can retain
+the original selection. Non-managed sessions return an empty repository list.
+
 ### Stream Session
 
 ```

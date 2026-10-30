@@ -1174,6 +1174,24 @@ export async function getSession(sessionId: string): Promise<Session> {
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
 }
 
+export interface SessionRepositoryBranch {
+  url: string;
+  branch: string | null;
+  /** Whether this branch exists on the clone remote; null when it cannot be checked. */
+  pushed: boolean | null;
+}
+
+export async function fetchSessionRepositoryBranches(
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<{ repositories: SessionRepositoryBranch[] }> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/resources/repository-branches`,
+    { signal },
+  );
+  return readJsonOrThrow(res);
+}
+
 /**
  * Snapshot a session without committed items, liveness, or subtree usage.
  *

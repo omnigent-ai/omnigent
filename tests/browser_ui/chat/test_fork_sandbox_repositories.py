@@ -82,6 +82,23 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
         {"sessions": {chat.session_id: {"runner_online": True, "host_online": True}}},
     )
     contract.json(
+        f"/v1/sessions/{chat.session_id}/resources/repository-branches",
+        {
+            "repositories": [
+                {
+                    "url": "https://github.com/acme/delivery-api.git",
+                    "branch": "feature/checkout",
+                    "pushed": True,
+                },
+                {
+                    "url": "https://github.com/acme/customer-web.git",
+                    "branch": "wip/customer-checkout",
+                    "pushed": False,
+                },
+            ]
+        },
+    )
+    contract.json(
         "/v1/connections/github/repos",
         {
             "connected": True,
@@ -100,7 +117,7 @@ def _sandbox_source(chat: ChatSessionContract) -> list[dict[str, Any]]:
     for name in ("delivery-api", "customer-web", "shared-contracts"):
         contract.json(
             f"/v1/connections/github/repos/acme/{name}/branches",
-            {"connected": True, "branches": ["main", "feature/checkout"]},
+            {"connected": True, "branches": ["main", "feature/checkout", "release/stable"]},
         )
     requests: list[dict[str, Any]] = []
 
@@ -140,7 +157,7 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
     chat_session_contract: ChatSessionContract,
     entry: str,
 ) -> None:
-    """Each fork entry exposes inherited repos and sends the edited selections."""
+    """Each fork entry prefills available branches and sends edited selections."""
     chat = chat_session_contract
     page.set_viewport_size(
         {"width": 390, "height": 844}
@@ -152,9 +169,19 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
     _open_fork(page, chat.session_id, entry)
     dialog = page.get_by_test_id("fork-session-dialog")
     expect(dialog.get_by_test_id("fork-session-sandbox-repo-row")).to_have_count(2)
+    expect(dialog.get_by_role("combobox", name="Branch for acme/delivery-api")).to_have_text(
+        "feature/checkout"
+    )
+    expect(dialog.get_by_role("combobox", name="Branch for acme/customer-web")).to_have_text(
+        "main"
+    )
+    branch_note = dialog.get_by_text("“wip/customer-checkout” isn’t pushed. Using main.")
+    expect(branch_note).to_be_visible()
     dialog.get_by_role("combobox", name="Branch for acme/delivery-api").click()
-    page.get_by_role("option", name="feature/checkout", exact=True).click()
+    page.get_by_role("option", name="release/stable", exact=True).click()
+    expect(branch_note).to_be_visible()
     dialog.get_by_role("button", name="Remove acme/customer-web").click()
+    expect(branch_note).to_have_count(0)
     dialog.get_by_role("combobox", name="GitHub repository").click()
     page.get_by_placeholder("Search repositories…").fill("shared")
     page.get_by_role("option", name="acme/shared-contracts").click()
@@ -167,7 +194,7 @@ def test_sandbox_fork_edits_multiple_repositories_and_branches(
     expect(page).to_have_url(f"{chat.base_url}/c/{_FORK_ID}")
     assert len(requests) == 1
     assert requests[0]["workspaces"] == [
-        "https://github.com/acme/delivery-api.git#feature/checkout",
+        "https://github.com/acme/delivery-api.git#release/stable",
         "https://github.com/acme/shared-contracts.git#release/checkout",
     ]
     assert requests[0]["sandbox_provider"] == "agent_sandbox"

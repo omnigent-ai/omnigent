@@ -87,6 +87,9 @@ the header menu), and each place is a separate entry point.
   remove repositories, and choose each branch independently. Providers that
   support multiple repositories allow several; switching to a single-repository
   provider keeps the selection visible and asks you to remove the extras.
+  Each repository starts on its current branch if pushed, otherwise its original
+  launch branch. A quiet note explains an unpushed branch's fallback; unavailable
+  source workspaces retain their original selections.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
 - `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
@@ -606,10 +609,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/browser_ui/chat/test_fork_sandbox_repositories.py::test_sandbox_fork_edits_multiple_repositories_and_branches`
   runs without a repro instance using `uv run pytest <test>
 --browser-ui-skip-build --video=on --output=<evidence-directory>`.
-  Each entry edits an inherited multi-repository selection, removes one repo,
-  searches for another, chooses independent branches, and checks the fork request
-  and navigation. The built SPA uses mocked sandbox and GitHub responses; this
-  proves browser behavior and the submitted payload, not sandbox provisioning.
+  Each entry checks current-branch prefilling and the unpushed-branch fallback,
+  edits an inherited multi-repository selection, removes one repo, searches for
+  another, chooses independent branches, and checks the fork request and
+  navigation. The built SPA uses mocked sandbox and GitHub responses; this proves
+  browser behavior and the submitted payload, not sandbox provisioning.
 - **`workspace-recovery`, desktop and mobile conversation, Canvas, and side-chat cards:**
   `tests/browser_ui/chat/test_workspace_missing_recovery.py::test_continue_missing_workspace_in_another_directory`
   runs without a repro instance using `uv run pytest <test>

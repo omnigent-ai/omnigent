@@ -3005,6 +3005,25 @@ class SessionPullRequest(SessionPullRequestSummary):
     last_seen_at: float
 
 
+class SessionRepositoryBranch(BaseModel):
+    """Current branch and remote availability for one managed repository.
+
+    ``pushed`` is true when the branch exists at the original clone URL,
+    false when confirmed absent, and null when availability is unknown.
+    It does not indicate whether local commits or working-tree changes are pushed.
+    """
+
+    url: str
+    branch: str | None = None
+    pushed: bool | None = None
+
+
+class SessionRepositoryBranchList(BaseModel):
+    """Managed repositories in their original launch order."""
+
+    repositories: list[SessionRepositoryBranch]
+
+
 class SessionPullRequestList(BaseModel):
     """
     A page of a session's linked pull requests in display order, keyed by URL.

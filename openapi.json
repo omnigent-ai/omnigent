@@ -8037,6 +8037,59 @@
         "title": "SessionReasoningEffortEvent",
         "type": "object"
       },
+      "SessionRepositoryBranch": {
+        "description": "Current branch and remote availability for one managed repository.\n\n`pushed` is true when the branch exists at the original clone URL,\nfalse when confirmed absent, and null when availability is unknown.\nIt does not indicate whether local commits or working-tree changes are pushed.",
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "pushed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pushed"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "SessionRepositoryBranch",
+        "type": "object"
+      },
+      "SessionRepositoryBranchList": {
+        "description": "Managed repositories in their original launch order.",
+        "properties": {
+          "repositories": {
+            "items": {
+              "$ref": "#/components/schemas/SessionRepositoryBranch"
+            },
+            "title": "Repositories",
+            "type": "array"
+          }
+        },
+        "required": [
+          "repositories"
+        ],
+        "title": "SessionRepositoryBranchList",
+        "type": "object"
+      },
       "SessionResourceCreatedEvent": {
         "description": "A session resource was created.\n\nEmitted when a terminal is launched, a file is uploaded, or\nany other resource is materialized under a session. Wire shape\nis FLAT: `{\"type\": \"session.resource.created\", \"resource\": <SessionResourceObject-like dict>}`.",
         "properties": {
@@ -18337,6 +18390,49 @@
           }
         },
         "summary": "Update Session Github Reviewers",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/repository-branches": {
+      "get": {
+        "description": "Suggest fork branches without waking or modifying the source sandbox.",
+        "operationId": "get_session_repository_branches_v1_sessions__session_id__resources_repository_branches_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRepositoryBranchList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Repository Branches",
         "tags": [
           "session_resources"
         ]
