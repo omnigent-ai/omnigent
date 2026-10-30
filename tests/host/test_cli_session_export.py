@@ -270,3 +270,26 @@ def test_session_export_pagination(tmp_path: Path) -> None:
     assert len(entries) == 2
     assert [r["id"] for r in entries] == ["msg_1", "msg_2"]
     assert [r["seq"] for r in entries] == [1, 2]
+
+
+@respx.mock
+def test_session_export_refuses_a_page_without_a_cursor(tmp_path: Path) -> None:
+    """A page that claims more results but gives no cursor stops the export, leaving no file."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json={**_ITEMS_PAGE, "has_more": True, "last_id": None})
+    )
+
+    out_file = tmp_path / "stuck.jsonl"
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(
+            cli,
+            ["session", "export", "--id", "conv_abc123", "--output", str(out_file)],
+        )
+
+    assert result.exit_code != 0
+    assert "without a cursor" in result.output
+    assert list(tmp_path.iterdir()) == []

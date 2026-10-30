@@ -1455,13 +1455,18 @@ export async function fetchSessionItemsPage(
  *
  * An older server has no `/export` route, and its 404 looks exactly like a
  * missing session's (the SPA fallback answers unknown `/v1` paths with the
- * same error envelope). So on a 404 the session itself is fetched: if that
- * succeeds the route is missing and the legacy export is built client-side;
- * if not, the original "not found" is the real answer.
+ * same error envelope), or it serves the SPA shell as HTML. So on a 404 or a
+ * non-NDJSON body the session itself is fetched: if that succeeds the route is
+ * missing and the legacy export is built client-side; if not, its error is
+ * the real answer.
  */
 export async function exportSessionTranscript(sessionId: string): Promise<string> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/export`);
-  if (res.status === 404) {
+  if (res.ok && (res.headers.get("content-type") ?? "").includes("ndjson")) {
+    return await res.text();
+  }
+  // A 200 that is not NDJSON is an older server's SPA shell for the unknown path.
+  if (res.ok || res.status === 404) {
     const metaRes = await authenticatedFetch(sessionMetaUrl(sessionId));
     if (metaRes.ok) {
       return exportSessionTranscriptLegacy(
@@ -1469,10 +1474,9 @@ export async function exportSessionTranscript(sessionId: string): Promise<string
         (await metaRes.json()) as Record<string, unknown>,
       );
     }
-    throw await apiErrorFromResponse(res);
+    throw await apiErrorFromResponse(res.ok ? metaRes : res);
   }
-  if (!res.ok) throw await apiErrorFromResponse(res);
-  return await res.text();
+  throw await apiErrorFromResponse(res);
 }
 
 function sessionMetaUrl(sessionId: string): string {
@@ -1486,7 +1490,7 @@ function sessionMetaUrl(sessionId: string): string {
  * per committed item. `omnigent session import` still reads this shape.
  *
  * @deprecated Compatibility shim for servers older than the `/export` route
- * (added in 0.20.0). Remove in 0.22.0, when those servers are out of support.
+ * (added in 0.21.0). Remove in 0.23.0, when those servers are out of support.
  */
 async function exportSessionTranscriptLegacy(
   sessionId: string,

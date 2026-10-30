@@ -7629,6 +7629,11 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
                 if not page.get("has_more"):
                     break
                 after = page.get("last_id")
+                if not after:
+                    raise click.ClickException(
+                        f"Server reported more items for {session_id} without a cursor; "
+                        "refusing to write a transcript that ends early."
+                    )
 
         # Write beside the target and rename, so a failure while paging never
         # leaves a partial file that reads as a complete transcript.
@@ -7693,7 +7698,12 @@ def _read_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, ob
         can read, or an item does not validate.
     """
     from omnigent.entities.conversation import parse_item_data
-    from omnigent.export import TranscriptSchemaError, item_from_entry, read_transcript
+    from omnigent.export import (
+        SETTING_KEYS,
+        TranscriptSchemaError,
+        item_from_entry,
+        read_transcript,
+    )
 
     with src_path.open("r", encoding="utf-8") as fh:
         first = next((line for line in fh if line.strip()), "")
@@ -7719,7 +7729,10 @@ def _read_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, ob
 
     initial_items: list[dict[str, object]] = []
     for entry in transcript.entries:
-        payload = item_from_entry(entry)
+        try:
+            payload = item_from_entry(entry)
+        except TranscriptSchemaError as exc:
+            raise click.ClickException(f"{src_path}: {exc}") from exc
         try:
             parse_item_data(str(payload["type"]), payload["data"])
         except (TypeError, ValueError) as exc:
@@ -7730,12 +7743,13 @@ def _read_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, ob
 
     header = transcript.header
     meta: _JsonObject = {
+        # Only known settings, and first, so a stray key cannot override the header.
+        **{key: value for key, value in header.settings.items() if key in SETTING_KEYS},
         "id": header.session,
         "title": header.title,
         "agent_id": header.agent_id,
         "harness": header.harness,
         "workspace": header.workspace,
-        **header.settings,
     }
     return meta, initial_items
 
@@ -7878,6 +7892,9 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     )
 
     def _create(agent_id: str, client: httpx.Client) -> httpx.Response:
+        # The native fallback already runs the exported harness, and the server
+        # refuses a harness_override on a native agent.
+        skipped = {"harness_override"} if agent_id != exported_agent_id else set()
         body: dict[str, object] = {
             "agent_id": agent_id,
             "initial_items": initial_items,
@@ -7893,7 +7910,7 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         # export's so the two cannot drift apart.
         for key in ("workspace", *SETTING_KEYS):
             value = meta.get(key)
-            if value is not None:
+            if value is not None and key not in skipped:
                 body[key] = value
         return client.post("/v1/sessions", json=body)
 

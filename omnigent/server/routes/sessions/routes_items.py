@@ -50,10 +50,10 @@ from omnigent.server.routes._sessions.common import (
 from omnigent.server.routes._sessions.helpers import (
     _attachment_disposition,
     _resolve_harness,
-    _resolve_llm_model,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
+    _resolve_session_agent_identity,
 )
 from omnigent.server.schemas import (
     ChildSessionList,
@@ -119,8 +119,9 @@ def register_items_routes(
         Builds the same ``omnigent.transcript/1`` file as ``omnigent session
         export`` (see ``docs/session-export.md``) server-side, paging the
         items so a long session never has to fit in memory at once. The
-        header's ``title`` and ``model`` are resolved the way the session
-        snapshot (``GET /v1/sessions/{id}``) resolves them.
+        header's ``title``, ``agent`` and ``model`` are resolved the way the
+        session snapshot (``GET /v1/sessions/{id}``) resolves them, and items
+        appended after the export starts are left out.
 
         :param request: Inbound HTTP request; carries the caller identity
             used to authorize READ on the session.
@@ -143,20 +144,32 @@ def register_items_routes(
 
         def _header() -> TranscriptHeader:
             """Resolve the agent-derived header fields the way the snapshot does."""
-            agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+            from omnigent.runtime import get_agent_cache
+
+            cache = agent_cache or get_agent_cache()
+            identity = _resolve_session_agent_identity(
+                conv, agent_store=agent_store, agent_cache=cache
+            )
             return header_from_conversation(
                 conv,
-                agent_name=agent.name if agent is not None else None,
-                harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache),
+                agent_name=identity.agent_name,
+                harness=_resolve_harness(conv, agent_store=agent_store, agent_cache=cache),
                 # The harness's own report supersedes the spec-derived model.
-                llm_model=concrete_reported_model(conv.reported_model)
-                or _resolve_llm_model(conv, agent_store=agent_store, agent_cache=agent_cache),
+                llm_model=concrete_reported_model(conv.reported_model) or identity.llm_model,
             )
 
+        # The file is the session as of ``exported``: stop at the item that was
+        # newest then, so a turn still running cannot extend the download.
+        newest = await asyncio.to_thread(
+            conversation_store.list_items, session_id, limit=1, order="desc"
+        )
+        stop_after_id = newest.data[0].id if newest.data else None
         header = await asyncio.to_thread(_header)
 
         async def _lines() -> AsyncIterator[str]:
             yield header.to_line() + "\n"
+            if stop_after_id is None:
+                return
             numbering = EntryNumbering()
             after: str | None = None
             while True:
@@ -169,6 +182,8 @@ def register_items_routes(
                 )
                 for item in page.data:
                     yield numbering.entry(item.to_api_dict()).to_line() + "\n"
+                    if item.id == stop_after_id:
+                        return
                 if not page.has_more:
                     break
                 if page.last_id is None:

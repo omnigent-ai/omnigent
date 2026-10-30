@@ -180,7 +180,12 @@ def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
     src = tmp_path / "s.jsonl"
     _write_export(
         src,
-        meta={"id": "conv_old", "agent_id": "ag_missing", "harness": "claude-native"},
+        meta={
+            "id": "conv_old",
+            "agent_id": "ag_missing",
+            "harness": "claude-native",
+            "harness_override": "claude-native",
+        },
         items=[
             {
                 "id": "msg_1",
@@ -195,12 +200,14 @@ def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
 
     seen_agent_ids: list[str] = []
     seen_labels: list[object] = []
+    seen_harness_overrides: list[object] = []
 
     def _responder(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         agent_id = body["agent_id"]
         seen_agent_ids.append(agent_id)
         seen_labels.append(body.get("labels"))
+        seen_harness_overrides.append(body.get("harness_override"))
         if agent_id == "ag_missing":
             return httpx.Response(404, json={"error": {"message": "Agent not found"}})
         return httpx.Response(200, json={"id": "conv_new"})
@@ -217,6 +224,8 @@ def test_session_import_falls_back_to_native_agent(tmp_path: Path) -> None:
     assert seen_agent_ids == ["ag_missing", fallback_id]
     # The retry keeps the import labels.
     assert seen_labels == [_import_labels("claude")] * 2
+    # The native agent already runs that harness and refuses an override.
+    assert seen_harness_overrides == ["claude-native", None]
 
 
 _USER_ITEM = {
@@ -318,13 +327,15 @@ def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
             "session": "conv_old",
             "title": "orig",
             "agent_id": "ag_abc",
-            "harness": "claude-native",
+            "harness": "codex",
             "workspace": "/work/churn",
             "settings": {
                 "reasoning_effort": "high",
-                "harness_override": "claude-native",
-                "subagent_routing_override": "same-harness",
-                "cost_control_mode_override": "strict",
+                "harness_override": "codex",
+                "subagent_routing_override": "on",
+                "cost_control_mode_override": "off",
+                # Not a setting: must not override the header's own title.
+                "title": "smuggled",
             },
         },
         entries=[
@@ -375,9 +386,9 @@ def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
     assert body["workspace"] == "/work/churn"
     # Every exported setting reaches the create request, not an allowlist of them.
     assert body["reasoning_effort"] == "high"
-    assert body["harness_override"] == "claude-native"
-    assert body["subagent_routing_override"] == "same-harness"
-    assert body["cost_control_mode_override"] == "strict"
+    assert body["harness_override"] == "codex"
+    assert body["subagent_routing_override"] == "on"
+    assert body["cost_control_mode_override"] == "off"
     assert [item["type"] for item in body["initial_items"]] == [
         "message",
         "function_call",

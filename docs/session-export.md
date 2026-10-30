@@ -61,9 +61,11 @@ small and does not grow a case per harness:
 | `compaction` | `text` (the summary the model continued from), `covers_through`, `model`, `token_count` | compaction items |
 | `note` | `note_type` (the producer's event type), `text` when there is a one-line reading | routing decisions, resource events, slash commands, and any item type this version does not know |
 
-The table is enforced on read: a line whose fields do not belong to its `kind`
-(a `tool_call` with `covers_through`, a `message` with `call_id`) is refused
-with the same error as an unknown schema.
+The table is enforced on read: a line carrying a known field that does not
+belong to its `kind` (a `tool_call` with `covers_through`, a `message` with
+`call_id`) is refused with the same error as an unknown schema. Fields this
+version does not know are ignored rather than refused, so a reader still opens
+a file from a writer that added one.
 
 Two fields appear on every entry for the benefit of `session import`, and
 readers may ignore both. `origin_type` names the Omnigent item type the entry
@@ -74,10 +76,15 @@ restores fields the summary leaves out: a message's `user_authored` flag, an
 error's `title` / `cause` / `remediation`, a compaction's `compacted_messages`,
 a reasoning item's `encrypted_content`.
 
+`raw` is authoritative: an import rebuilds the item from `raw` alone. So the
+readable fields cannot hide what gets imported, import refuses an entry whose
+`raw` would rebuild as a different `kind` or `role` than the entry says.
+
 Nothing is stored twice. A readable field only ever holds a *reading* of the
 payload (joined text, a parsed tool input, a one-line note), never a copy of a
 `raw` value: message and reasoning content blocks appear in `raw` alone, and a
-`content` field is accepted only on a hand-written entry that has no `raw`. The
+`content` field is used only on a hand-written entry that has no `raw` (beside
+`raw` it is ignored). The
 size cost of `raw` is therefore one copy of each item plus the short readings,
 not two copies of the content.
 
@@ -112,15 +119,19 @@ replaced item id) and carries the summary it continued from.
 - The stream has no trailer. A download that stopped early (a lost connection,
   a store error mid-page) is still a valid file; check that the last `seq`
   matches the item count you expect before trusting it as complete.
-- `omnigent session import` can rebuild only item types the importing server
-  knows. A `note` for a type this version does not know is kept in the file
-  but refused on import.
+- The file is the session as of `exported`: items appended while the export
+  runs (a turn still in progress) are left out.
+- `omnigent session import` can rebuild only item types the CLI running the
+  import knows, since it validates every item before sending it. A `note` for
+  a type that version does not know is kept in the file but refused on import.
 
 ## Reading it back
 
 `omnigent session import -i FILE` recreates the session on the target server as
 a new history-only session: the header's agent id is tried first, then the
-built-in agent for the header's harness; `settings` are reapplied. Each item is
+built-in agent for the header's harness; `settings` are reapplied, except
+`harness_override` when the built-in agent is used, since that agent already
+runs the header's harness. Each item is
 rebuilt from `raw`, so the imported session carries every field the exporting
 server stored. Per-turn grouping is seeded afresh (`turn` is informational),
 and item authorship is re-attributed to the importing user. Items get new ids,

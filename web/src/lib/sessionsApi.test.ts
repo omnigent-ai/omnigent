@@ -1592,6 +1592,7 @@ describe("exportSessionTranscript", () => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
+      headers: new Headers({ "content-type": "application/x-ndjson" }),
       text: async () => body,
     } as unknown as Response);
 
@@ -1667,6 +1668,33 @@ describe("exportSessionTranscript", () => {
       { record_type: "item", id: "it_1", type: "message", role: "user" },
       { record_type: "item", id: "it_2", type: "message", role: "assistant" },
     ]);
+  });
+
+  it("falls back when an older server answers /export with the web UI's HTML", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      text: async () => "<!doctype html>",
+    } as unknown as Response);
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "sess_1" }));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ data: [], has_more: false }));
+
+    const transcript = await exportSessionTranscript("sess_1");
+
+    expect(JSON.parse(transcript.trimEnd())).toEqual({ record_type: "session_meta", id: "sess_1" });
+  });
+
+  it("surfaces a non-404 export error without probing the session", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "internal_error", message: "boom" } },
+        { ok: false, status: 500, statusText: "Internal Server Error" },
+      ),
+    );
+
+    await expect(exportSessionTranscript("sess_1")).rejects.toMatchObject({ status: 500 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -18729,7 +18729,7 @@
     },
     "/v1/sessions/{session_id}/export": {
       "get": {
-        "description": "Stream the session as a portable, versioned transcript.\n\nBuilds the same `omnigent.transcript/1` file as `omnigent session export` (see `docs/session-export.md`) server-side, paging the\nitems so a long session never has to fit in memory at once. The\nheader's `title` and `model` are resolved the way the session\nsnapshot (`GET /v1/sessions/{id}`) resolves them.\n\n**Returns:** An `application/x-ndjson` download named `<session_id>.jsonl`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when no such session exists or the caller has no READ access to it (the two are not distinguished).",
+        "description": "Stream the session as a portable, versioned transcript.\n\nBuilds the same `omnigent.transcript/1` file as `omnigent session export` (see `docs/session-export.md`) server-side, paging the\nitems so a long session never has to fit in memory at once. The\nheader's `title`, `agent` and `model` are resolved the way the\nsession snapshot (`GET /v1/sessions/{id}`) resolves them, and items\nappended after the export starts are left out.\n\n**Returns:** An `application/x-ndjson` download named `<session_id>.jsonl`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when no such session exists or the caller has no READ access to it (the two are not distinguished).",
         "operationId": "export_session_transcript_v1_sessions__session_id__export_get",
         "parameters": [
           {

@@ -14,7 +14,8 @@ import httpx
 import pytest
 
 from omnigent.export import TRANSCRIPT_SCHEMA, item_from_entry, read_transcript
-from omnigent.server.routes.sessions.routes_items import _EXPORT_PAGE_SIZE
+from omnigent.server.routes.sessions import routes_items
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -89,6 +90,9 @@ async def test_export_streams_a_versioned_transcript(client: httpx.AsyncClient) 
     assert header.title == "Churn analysis"
     assert header.agent == "export-agent"
     assert header.exported is not None
+    # The header resolves the agent the way the session snapshot (and so the CLI) does.
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert (header.agent, header.model) == (snapshot["agent_name"], snapshot["llm_model"])
 
     kinds = [e.kind for e in transcript.entries]
     assert kinds == ["message", "reasoning", "tool_call", "tool_result", "message"]
@@ -122,34 +126,72 @@ async def test_export_entries_rebuild_the_stored_items(client: httpx.AsyncClient
     assert rebuilt[0]["data"]["user_authored"] is True
 
 
-async def test_export_numbers_across_item_pages(client: httpx.AsyncClient) -> None:
+async def test_export_numbers_across_item_pages(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``seq`` and ``turn`` keep counting past the route's page size."""
-    agent = await create_test_agent(client, name="export-paging-agent")
-    count = _EXPORT_PAGE_SIZE + 7
-    resp = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": agent["id"],
-            "host_type": "external",
-            "initial_items": [
-                {
-                    "type": "message",
-                    "data": {"role": "user", "content": [{"type": "input_text", "text": f"m{i}"}]},
-                }
-                for i in range(count)
-            ],
-        },
-    )
-    assert resp.status_code == 201, resp.text
-    session_id = resp.json()["id"]
+    monkeypatch.setattr(routes_items, "_EXPORT_PAGE_SIZE", 2)
+    session_id = await _seed_session(client)
 
     resp = await client.get(f"/v1/sessions/{session_id}/export")
 
     transcript = read_transcript(resp.text.splitlines(keepends=True))
+    count = len(_INITIAL_ITEMS)
     assert [e.seq for e in transcript.entries] == list(range(1, count + 1))
-    # Each user message is a request of its own, so it opens a turn.
-    assert [e.turn for e in transcript.entries] == list(range(1, count + 1))
-    assert [e.text for e in transcript.entries][-1] == f"m{count - 1}"
+    # One user message opens the only turn; everything after stays in it.
+    assert [e.turn for e in transcript.entries] == [1] * count
+    assert transcript.entries[-1].text == "West churns most."
+
+
+async def test_export_stops_at_the_item_newest_when_it_started(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An item that lands after the export starts is not in the file."""
+    session_id = await _seed_session(client)
+    list_items = SqlAlchemyConversationStore.list_items
+
+    def _last_item_arrives_after_the_probe(
+        self: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
+    ) -> Any:
+        if kwargs.get("order") == "desc" and kwargs.get("limit") == 1:
+            newest = list_items(self, conversation_id, limit=1, order="desc")
+            kwargs["after"] = newest.data[0].id
+        return list_items(self, conversation_id, **kwargs)
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "list_items", _last_item_arrives_after_the_probe
+    )
+
+    resp = await client.get(f"/v1/sessions/{session_id}/export")
+
+    transcript = read_transcript(resp.text.splitlines(keepends=True))
+    assert [e.kind for e in transcript.entries] == [
+        "message",
+        "reasoning",
+        "tool_call",
+        "tool_result",
+    ]
+
+
+async def test_export_fails_the_download_when_a_later_page_fails(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store error after the header was sent aborts the stream instead of ending it cleanly."""
+    monkeypatch.setattr(routes_items, "_EXPORT_PAGE_SIZE", 2)
+    session_id = await _seed_session(client)
+    list_items = SqlAlchemyConversationStore.list_items
+
+    def _fail_after_the_first_page(
+        self: SqlAlchemyConversationStore, conversation_id: str, **kwargs: Any
+    ) -> Any:
+        if kwargs.get("after") is not None:
+            raise RuntimeError("store unavailable")
+        return list_items(self, conversation_id, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "list_items", _fail_after_the_first_page)
+
+    with pytest.raises(RuntimeError, match="store unavailable"):
+        await client.get(f"/v1/sessions/{session_id}/export")
 
 
 async def test_export_unknown_session_is_404(client: httpx.AsyncClient) -> None:

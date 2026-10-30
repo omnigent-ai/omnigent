@@ -409,8 +409,7 @@ def entry_from_item(item: Mapping[str, Any], *, turn: int, seq: int) -> Transcri
             tool_output=payload.get("output"),
         )
     if item_type == "reasoning":
-        content = payload.get("content")
-        readable = isinstance(content, list) and len(content) > 0
+        readable = _blocks_text(payload.get("content")) is not None
         sealed_reason: str | None = None
         if not readable:
             sealed_reason = (
@@ -630,10 +629,13 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
     :param entry: One parsed transcript entry.
     :returns: A create payload in the ``SessionEventInput`` shape, with
         ``data`` keyed by the entity field names (``agent``, not ``model``).
+    :raises TranscriptSchemaError: If ``raw`` describes a different kind or
+        role than the entry's readable fields.
     """
     origin = entry.origin_type
     data: dict[str, Any]
     if entry.raw is not None and origin:
+        _require_raw_matches_entry(entry, origin, entry.raw)
         data = dict(entry.raw)
         if "model" in data and agent_serializes_as_model(origin):
             data["agent"] = data.pop("model")
@@ -708,6 +710,28 @@ def item_from_entry(entry: TranscriptEntry) -> dict[str, Any]:
     # A note without ``raw`` has only its one-line reading left.
     note_type = entry.note_type or origin or "note"
     return {"type": note_type, "data": {"text": entry.text} if entry.text else {}}
+
+
+def _require_raw_matches_entry(entry: TranscriptEntry, origin: str, raw: dict[str, Any]) -> None:
+    """Refuse an entry whose ``raw`` payload would import as a different kind or role.
+
+    ``raw`` is what gets imported, so the readable ``kind`` and ``role`` must
+    describe it; otherwise an edited line could read as one thing and
+    rebuild as another.
+
+    :raises TranscriptSchemaError: If ``raw`` maps to another kind or role.
+    """
+    try:
+        expected = entry_from_item({**raw, "type": origin}, turn=entry.turn, seq=entry.seq)
+    except ValueError as exc:
+        raise TranscriptSchemaError(
+            f"entry {entry.seq}: raw is not a valid {origin!r} payload ({exc})"
+        ) from exc
+    if (expected.kind, expected.role) != (entry.kind, entry.role):
+        raise TranscriptSchemaError(
+            f"entry {entry.seq}: raw {origin!r} payload is a {expected.role} "
+            f"{expected.kind}, but the entry reads as a {entry.role} {entry.kind}"
+        )
 
 
 def agent_serializes_as_model(item_type: str) -> bool:
