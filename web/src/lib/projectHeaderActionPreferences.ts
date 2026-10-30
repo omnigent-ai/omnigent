@@ -29,6 +29,12 @@ export function writeShowProjectHeaderActionsOnTouch(value: boolean): void {
   window.dispatchEvent(new Event(PREFERENCE_CHANGED_EVENT));
 }
 
+/** Tell subscribers the stored value changed underneath them, e.g. after a settings import. */
+export function notifyShowProjectHeaderActionsOnTouchChanged(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(PREFERENCE_CHANGED_EVENT));
+}
+
 function refreshSnapshot(): void {
   snapshot = readShowProjectHeaderActionsOnTouch();
 }
