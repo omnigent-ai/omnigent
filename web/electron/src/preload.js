@@ -14,7 +14,7 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer, webFrame } = require("electron");
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
@@ -170,6 +170,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /**
+   * Subscribe to the find bar opening (Cmd/Ctrl+F or Edit > Find…), so the
+   * page can render content it would otherwise virtualize away. Returns an
+   * unsubscribe function.
+   * @param {() => void} callback
+   * @returns {() => void}
+   */
+  onFindOpened: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("omnigent:find-opened", listener);
+    return () => ipcRenderer.removeListener("omnigent:find-opened", listener);
+  },
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -191,6 +203,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory: (defaultPath) => ipcRenderer.invoke("omnigent:choose-directory", defaultPath),
+  /**
+   * This machine's path for a File dropped from the OS file manager. Resolves
+   * "" when it has none or the page isn't the pinned server.
+   */
+  getPathForFile: (file) =>
+    ipcRenderer.invoke("omnigent:dropped-file-path", webUtils.getPathForFile(file)),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
@@ -216,6 +236,17 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  // Windows' built-in ssh can't share one connection, so it gets this later.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Connect a machine the user reaches over SSH to the window's server as
+         * a host. Consent and ssh prompts happen in a shell-owned window.
+         * Resolves `{ ok, error?, canceled?, identity? }`.
+         */
+        connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
@@ -397,7 +428,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Whether a view already exists for a conversation — lets a re-mounting pane
    * re-attach it without waiting for a fresh create event.
    * @param {string} conversationId
-   * @returns {Promise<{ exists: boolean }>}
+   * @returns {Promise<{ exists: boolean, url?: string, pendingUrl?: string, title?: string, canGoBack?: boolean, canGoForward?: boolean }>}
    */
   browserHasView: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-has-view", { conversationId }),
@@ -474,9 +505,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       scope: args?.scope,
     }),
   /**
-   * Subscribe to the real url of a view as it navigates (redirects, links,
-   * back/forward) so the URL bar stays honest. Returns an unsubscribe.
-   * @param {(payload: { conversationId: string, url: string }) => void} callback
+   * Subscribe to URL and title changes, including background views, so the
+   * address bar and tab labels stay current. Returns an unsubscribe.
+   * @param {(payload: { conversationId: string, url: string, title?: string }) => void} callback
    * @returns {() => void}
    */
   onBrowserUrlChanged: (callback) => {

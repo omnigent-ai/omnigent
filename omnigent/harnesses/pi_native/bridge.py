@@ -64,6 +64,7 @@ _INBOX_DIR = "inbox"
 # Written by the extension once ``session_start`` has armed the inbox poller.
 _INPUT_READY_FILE = "input_ready"
 _SESSIONS_DIR = "sessions"
+_ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 
 def bridge_root() -> Path:
@@ -103,16 +104,45 @@ def prepare_bridge_dir(session_id: str) -> Path:
 
 def prune_orphaned_bridge_dirs() -> int:
     """
-    Remove pi-native bridge dirs whose owner process is provably dead.
+    Remove Pi bridges inactive for seven days whose owner is provably dead.
 
-    Delegates to the shared sweep against this harness's bridge root; the
-    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
-    at startup to reclaim dirs leaked by a prior runner that died without
-    running the explicit delete path.
+    Runner death is a normal resume boundary. Keep the native session JSONL
+    through restarts so Pi retains provider usage and compaction history.
+    Explicit session deletion still removes the bridge immediately.
 
     :returns: The number of orphaned bridge dirs removed.
     """
-    return native_bridge_common.prune_orphaned_dirs(bridge_root())
+    return native_bridge_common.prune_orphaned_dirs(
+        bridge_root(), should_prune=_pi_orphan_retention_expired
+    )
+
+
+def _pi_orphan_retention_expired(bridge_dir: Path) -> bool:
+    """Keep recent bridge preparations or native session writes; retain on I/O errors."""
+    cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
+    try:
+        marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
+        try:
+            if marker.stat().st_mtime > cutoff:
+                return False
+        except FileNotFoundError:
+            # An unmarked directory may be unrelated state under this root.
+            if not ((bridge_dir / _CONFIG_FILE).exists() or (bridge_dir / _SESSIONS_DIR).exists()):
+                return False
+            if bridge_dir.stat().st_mtime > cutoff or any(
+                child.lstat().st_mtime > cutoff for child in bridge_dir.iterdir()
+            ):
+                return False
+        sessions = bridge_dir / _SESSIONS_DIR
+        try:
+            session_files = list(sessions.iterdir())
+        except FileNotFoundError:
+            return True
+        return all(
+            entry.stat().st_mtime <= cutoff for entry in session_files if entry.suffix == ".jsonl"
+        )
+    except OSError:
+        return False
 
 
 def clear_inbox(bridge_dir: Path) -> None:
@@ -284,7 +314,9 @@ def enqueue_thinking_level_change(bridge_dir: Path, level: str) -> str:
     return change_id
 
 
-def enqueue_model_change(bridge_dir: Path, model: str) -> str:
+def enqueue_model_change(
+    bridge_dir: Path, model: str, *, thinking_level: str | None = None
+) -> str:
     """
     Queue a UI-originated model switch for the resident Pi extension.
 
@@ -298,6 +330,7 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
     :param bridge_dir: Native Pi bridge directory.
     :param model: Model id to switch to, e.g.
         ``"databricks-claude-sonnet-4-6"``.
+    :param thinking_level: Explicit session effort to apply after the model switch.
     :returns: Opaque model-change id.
     """
     model_change_id = f"model_change_{uuid.uuid4().hex}"
@@ -307,6 +340,8 @@ def enqueue_model_change(bridge_dir: Path, model: str) -> str:
         "model": model,
         "created_at": time.time(),
     }
+    if thinking_level is not None:
+        payload["thinkingLevel"] = thinking_level
     _enqueue_payload(bridge_dir, model_change_id, payload)
     return model_change_id
 
@@ -343,7 +378,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
-    usage_baseline: dict[str, int] | None = None,
+    usage_baseline: dict[str, int | float] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -361,7 +396,7 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
-    :param usage_baseline: Server-recorded own-session cumulative tokens,
+    :param usage_baseline: Server-recorded own-session cumulative usage,
         excluding child sessions; ``None`` retains local-only restoration.
     :returns: ``(extension_path, config_path)``.
     """

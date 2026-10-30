@@ -140,20 +140,23 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
             frame.agent_version,
             frame.sub_agent_name,
         ) == (conv.id, conv.workspace, agent.id, str(agent.version), "child")
+        warning = "Codex plugin skills unavailable: `codex plugin list` exited 1"
         conn.pending_skills[frame.request_id].set_result(
             HostSkillsResultFrame(
                 frame.request_id,
                 "ok",
                 skills=[{"name": "child-review", "description": "Review"}],
                 session_id=conv.id if acknowledged else None,
+                warnings=[warning],
             )
         )
         response = await task
     assert response.status_code == (200 if acknowledged else 502)
     if acknowledged:
-        assert response.json()["skills"] == [
-            {"name": "child-review", "description": "Review", "display_name": None}
-        ]
+        assert response.json() == {
+            "skills": [{"name": "child-review", "description": "Review", "display_name": None}],
+            "warnings": [warning],
+        }
     else:
         assert "update the host" in response.json()["detail"]
     assert not conn.pending_skills
@@ -279,6 +282,7 @@ async def test_presession_catalog_matches_filtered_invocations(
         for s in expected
     ]
     assert "hidden" not in {s["name"] for s in response.json()["skills"]}
+    assert response.json()["warnings"] == []
 
 
 async def test_presession_discovery_rejects_private_agent(

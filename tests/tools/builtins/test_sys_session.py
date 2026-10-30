@@ -1438,6 +1438,8 @@ def test_session_list_schema_exposes_bounded_pagination() -> None:
     assert "default" not in properties["limit"]
     assert properties["limit"]["maximum"] == 100
     assert properties["cursor"]["type"] == "string"
+    # Trigger-template managers pass it to find workers they archived.
+    assert properties["include_archived"]["type"] == "boolean"
 
 
 def test_close_unknown_conversation_id_returns_not_found(

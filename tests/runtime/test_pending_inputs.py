@@ -151,6 +151,35 @@ def test_cancelled_lifecycle_is_drained_as_interrupted_not_missing() -> None:
     assert interrupted.reason_code == "response_cancelled"
 
 
+@pytest.mark.parametrize("mismatch", [None, "session", "pending", "attempt", "stable", "missing"])
+def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
+    mismatch: str | None,
+) -> None:
+    first = pending_inputs.record("conv", [_text_block("first")])
+    second = pending_inputs.record("conv", [_text_block("second")])
+    identity = pending_inputs.delivery_attributes_for("conv", first)
+    attempt = str(identity["delivery_attempt_id"])
+
+    matched = pending_inputs.mark_lifecycle(
+        "other" if mismatch == "session" else "conv",
+        "a" * 32 if mismatch == "stable" else None,
+        pending_id=second if mismatch == "pending" else first,
+        delivery_attempt_id=(
+            "b" * 32 if mismatch == "attempt" else None if mismatch == "missing" else attempt
+        ),
+        stage="native_turn_completed",
+    )
+
+    assert matched == (first if mismatch is None else None)
+    assert pending_inputs.delivery_attributes_for("conv", first)["last_delivery_stage"] == (
+        "native_turn_completed" if mismatch is None else "server_queued"
+    )
+    assert (
+        pending_inputs.delivery_attributes_for("conv", second)["last_delivery_stage"]
+        == "server_queued"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """
@@ -768,6 +797,33 @@ def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -
     assert pending_inputs.snapshot_for("conv_a") == []
 
 
+@pytest.mark.parametrize("hold", [False, True])
+@pytest.mark.parametrize("uncertain", [False, True])
+def test_restoring_a_removed_entry_preserves_its_missing_record_disposition(
+    hold: bool, uncertain: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An eviction or non-held drain must not turn an ambiguous receipt into a loss."""
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    first = pending_inputs.record("conv_a", [_text_block("first")])
+    if uncertain:
+        pending_inputs.mark_uncertain("conv_a")
+    drained = pending_inputs.resolve_oldest("conv_a", hold=hold)
+    assert drained is not None
+    if hold:
+        now[0] += pending_inputs._TTL_S + 1
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+    pending_inputs.restore("conv_a", drained)
+    later = pending_inputs.record("conv_a", [_text_block("later")])
+    matched = pending_inputs.resolve_matching_text("conv_a", "later")
+
+    assert matched.matched is not None and matched.matched.pending_id == later
+    assert [entry.pending_id for entry in matched.uncertain] == ([first] if uncertain else [])
+    assert [entry.pending_id for entry in matched.skipped] == ([] if uncertain else [first])
+    assert pending_inputs.snapshot_for("conv_a") == []
+
+
 def test_pending_ids_lists_queued_unheld_entries_in_queue_order() -> None:
     """The interrupt route reads the queue before it forwards the Stop."""
     first = pending_inputs.record("conv_a", [_text_block("first")])
@@ -1054,3 +1110,33 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
 
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_queued_slash_prompt_recorded_after_a_plain_follow_up_is_not_lost() -> None:
+    """
+    A "/"-led prompt queued before a plain one can be recorded after it.
+
+    Claude folds the plain prompt in at the next tool call but holds the
+    "/"-led one until the turn ends, so the older entry is not known lost.
+    """
+    pending_inputs.record("conv", [_text_block("/probe-cmd")], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("plain follow-up")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "plain follow-up")
+
+    assert match.matched is not None
+    assert match.skipped == []
+    [uncertain] = match.uncertain
+    assert uncertain.content == [_text_block("/probe-cmd")]
+
+
+def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost() -> None:
+    """A plain older entry jumped over is still reported as lost."""
+    pending_inputs.record("conv", [_text_block("first plain")], stable_id="a" * 32)
+    pending_inputs.record("conv", [_text_block("second plain")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "second plain")
+
+    [skipped] = match.skipped
+    assert skipped.content == [_text_block("first plain")]
+    assert match.uncertain == []
