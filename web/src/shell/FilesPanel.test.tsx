@@ -22,7 +22,7 @@ const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.r
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
-import { FilesPanel } from "./FilesPanel";
+import { FilesPanel, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
@@ -1732,6 +1732,59 @@ describe("FilesPanel browse location", () => {
     });
 
     expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_loc_other", expect.anything(), "");
+  });
+
+  it("browses a folder revealed from chat, live and on its next mount", () => {
+    vi.useFakeTimers();
+    const first = renderPanel({
+      conversationId: "conv_reveal",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: CONFINED,
+    });
+    const search = screen.getByRole("searchbox", { name: "Search all files" });
+    fireEvent.change(search, { target: { value: "touch" } });
+    act(() => vi.advanceTimersByTime(300));
+    expect(useSearchMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      "touch",
+      "",
+      "",
+      { enabled: true },
+      "",
+    );
+
+    act(() => revealFolderInFilesPanel("conv_reveal", "/home/user/proj/experimental/data"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      expect.anything(),
+      "experimental/data",
+    );
+    expect(search).toHaveValue("");
+    expect(useSearchMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      "",
+      "",
+      "",
+      { enabled: false },
+      "experimental/data",
+    );
+    act(() => revealFolderInFilesPanel("conv_reveal_other", "/home/user/proj/docs"));
+    expect(useAllFilesMock).toHaveBeenLastCalledWith(
+      "conv_reveal",
+      expect.anything(),
+      "experimental/data",
+    );
+
+    first.unmount();
+    revealFolderInFilesPanel("conv_reveal", "/home/user/proj/docs");
+    renderPanel({
+      conversationId: "conv_reveal",
+      files: [],
+      workingDir: "/home/user/proj",
+      reachable: CONFINED,
+    });
+    expect(useAllFilesMock).toHaveBeenLastCalledWith("conv_reveal", expect.anything(), "docs");
   });
 
   it("surfaces a refused location instead of an empty tree", () => {
