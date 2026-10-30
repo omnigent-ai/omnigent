@@ -81,7 +81,9 @@ async def test_close_with_no_process_is_a_noop() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
-async def test_ci_provider_settings_reach_qwen_spawn(tmp_path, monkeypatch, context) -> None:
+async def test_ci_provider_settings_reach_qwen_spawn(
+    tmp_path, monkeypatch, caplog, context
+) -> None:
     """The supported settings file carries headers through the actual ACP env boundary."""
     from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
     from omnigent.harnesses.qwen_native.credentials import with_qwen_ci_request_tags
@@ -90,6 +92,11 @@ async def test_ci_provider_settings_reach_qwen_spawn(tmp_path, monkeypatch, cont
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     if context is not None:
         monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
     gateway = "https://test.cloud.databricks.com/ai-gateway/mlflow/v1"
     original = {
         "theme": "Default",
@@ -109,6 +116,7 @@ async def test_ci_provider_settings_reach_qwen_spawn(tmp_path, monkeypatch, cont
                 },
                 {"id": "external", "baseUrl": "https://example.com/v1"},
                 {"id": "legacy", "baseUrl": "https://test.cloud.databricks.com/serving-endpoints"},
+                {"id": "unused", "baseUrl": "https://[invalid"},
             ],
         },
     }
@@ -133,6 +141,7 @@ async def test_ci_provider_settings_reach_qwen_spawn(tmp_path, monkeypatch, cont
     if context and context != "invalid":
         expected.update(json.loads(context))
     assert json.loads(headers[REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
     assert (
         original["modelProviders"]["openai"][0]["generationConfig"]["customHeaders"][
             REQUEST_TAGS_HEADER

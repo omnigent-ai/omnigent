@@ -32,7 +32,12 @@ from omnigent.inner.goose_executor import GooseExecutor
 @pytest.mark.parametrize(
     "base_path", ["ai-gateway/codex/v1/responses", "serving-endpoints/responses"]
 )
-def test_ci_custom_provider_reaches_goose_spawn(tmp_path, monkeypatch, context, base_path) -> None:
+@pytest.mark.parametrize(
+    "base_url", ["https://test.cloud.databricks.com/ai-gateway/codex/v1", "https://[invalid"]
+)
+def test_ci_custom_provider_reaches_goose_spawn(
+    tmp_path, monkeypatch, caplog, context, base_path, base_url
+) -> None:
     """Custom-provider JSON preserves comma-bearing tag values and the Responses path."""
     from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
     from omnigent.harnesses.goose_native.credentials import with_goose_ci_request_tags
@@ -41,12 +46,21 @@ def test_ci_custom_provider_reaches_goose_spawn(tmp_path, monkeypatch, context, 
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     if context is not None:
         monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.harnesses.goose_native.credentials.urlsplit",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
     original = {
         "name": "custom_ci",
         "engine": "openai",
         "display_name": "CI",
         "api_key_env": "OPENAI_API_KEY",
-        "base_url": "https://test.cloud.databricks.com/ai-gateway/codex/v1",
+        "base_url": base_url,
         "base_path": base_path,
         "models": [{"name": "test-model", "context_limit": 200000}],
         "requires_auth": True,
@@ -73,9 +87,17 @@ def test_ci_custom_provider_reaches_goose_spawn(tmp_path, monkeypatch, context, 
     }
     assert configured["headers"]["X-Existing"] == "kept"
     expected = {"team": "ci"}
-    if context and context != "invalid" and base_path.startswith("ai-gateway/"):
+    if (
+        context
+        and context != "invalid"
+        and base_path.startswith("ai-gateway/")
+        and base_url != "https://[invalid"
+    ):
         expected.update(json.loads(context))
     assert json.loads(configured["headers"][REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed Goose provider URL" in caplog.text) == (
+        context not in (None, "invalid") and base_url == "https://[invalid"
+    )
     assert original["headers"][REQUEST_TAGS_HEADER] == '{"team":"ci"}'
 
 

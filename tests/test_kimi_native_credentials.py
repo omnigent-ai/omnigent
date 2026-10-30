@@ -144,7 +144,7 @@ def test_build_session_home_without_user_home_writes_hooks_only(
 
 
 @pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
-def test_ci_headers_survive_kimi_private_home(tmp_path, monkeypatch, context) -> None:
+def test_ci_headers_survive_kimi_private_home(tmp_path, monkeypatch, caplog, context) -> None:
     """Native config copying preserves CI headers and leaves non-gateway providers alone."""
     from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
 
@@ -152,6 +152,11 @@ def test_ci_headers_survive_kimi_private_home(tmp_path, monkeypatch, context) ->
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     if context is not None:
         monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
     user_home = _fake_user_home(tmp_path, monkeypatch)
     original = """default_model = "test"
 [providers.databricks]
@@ -164,6 +169,8 @@ Databricks-Ai-Gateway-Request-Tags = '{"team":"ci"}'
 [providers.external]
 type = "openai_responses"
 base_url = "https://example.com/v1"
+[providers.unused]
+base_url = "https://[invalid"
 [models.test]
 provider = "databricks"
 model = "test-model"
@@ -183,6 +190,8 @@ max_context_size = 200000
         expected.update(json.loads(context))
     assert json.loads(provider["custom_headers"][REQUEST_TAGS_HEADER]) == expected
     assert configured["providers"]["external"] == tomllib.loads(original)["providers"]["external"]
+    assert configured["providers"]["unused"] == tomllib.loads(original)["providers"]["unused"]
+    assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
     assert configured["models"] == tomllib.loads(original)["models"]
     assert len(configured["hooks"]) == 2
     assert (session_home / "oauth").is_symlink()
@@ -201,8 +210,22 @@ base_url = "https://example.com/v1"
         """[providers.legacy]
 base_url = "https://test.cloud.databricks.com/serving-endpoints"
 """,
+        """[providers.databricks]
+base_url = "https://test.cloud.databricks.com/ai-gateway/codex/v1"
+[models.unused]
+provider = "databricks"
+base_url = "https://[invalid"
+""",
     ],
 )
-def test_kimi_does_not_tag_invalid_legacy_or_mixed_route_config(monkeypatch, config) -> None:
-    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"repro-agent"}')
+@pytest.mark.parametrize("opted_in", [False, True])
+def test_kimi_does_not_tag_invalid_legacy_or_mixed_route_config(
+    monkeypatch, caplog, config, opted_in
+) -> None:
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if opted_in:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"repro-agent"}')
     assert with_kimi_ci_request_tags(config) == config
+    if "https://[invalid" in config:
+        assert ("malformed provider URL" in caplog.text) == opted_in

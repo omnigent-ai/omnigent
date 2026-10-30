@@ -71,7 +71,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify both gateway protocols
+      - name: Verify gateway protocols
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}

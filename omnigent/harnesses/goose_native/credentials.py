@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import copy
+import logging
 from urllib.parse import urlsplit, urlunsplit
 
-from omnigent.databricks_ai_gateway import gateway_request_tag_headers, with_ci_request_tags
+from omnigent.databricks_ai_gateway import (
+    ci_request_tags,
+    gateway_request_tag_headers,
+    with_ci_request_tags,
+)
 
 
 def with_goose_ci_request_tags(provider: dict[str, object]) -> dict[str, object]:
@@ -16,12 +21,18 @@ def with_goose_ci_request_tags(provider: dict[str, object]) -> dict[str, object]
     OPENAI_CUSTOM_HEADERS cannot carry tag JSON: Goose splits it on commas.
     """
     result = copy.deepcopy(provider)
+    if not ci_request_tags():
+        return result
     base_url = result.get("base_url")
     if not isinstance(base_url, str):
         return result
     base_path = result.get("base_path")
     if isinstance(base_path, str):
-        parsed = urlsplit(base_url)
+        try:
+            parsed = urlsplit(base_url)
+        except ValueError:
+            logging.getLogger(__name__).warning("Skipping CI tags: malformed Goose provider URL")
+            return result
         base_url = urlunsplit(parsed._replace(path="/" + base_path.lstrip("/")))
     if not gateway_request_tag_headers(base_url):
         return result

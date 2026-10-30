@@ -13,6 +13,7 @@ from omnigent.databricks_ai_gateway import (
     ci_request_tags,
     gateway_attribution_headers,
     gateway_request_tag_headers,
+    is_databricks_ai_gateway_url,
     with_gateway_attribution,
     with_gateway_attribution_lines,
 )
@@ -90,6 +91,32 @@ def test_oversized_pipeline_is_ignored_or_rejected_at_ci_boundary() -> None:
     assert ci_request_tags(source) == {}
     with pytest.raises(ValueError, match="Invalid CI request tags"):
         ci_request_tags(source, strict=True)
+
+
+@pytest.mark.parametrize("opted_in", [False, True])
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://[invalid",
+        "https://user:secret@workspace.cloud.databricks.com\N{FULLWIDTH SOLIDUS}bad",
+    ],
+)
+def test_optional_headers_do_not_validate_malformed_urls(monkeypatch, caplog, opted_in, base_url):
+    # The legacy predicate and explicit CI route validator still reject malformed URLs.
+    with pytest.raises(ValueError):
+        is_databricks_ai_gateway_url(base_url)
+    with pytest.raises(ValueError):
+        ci_gateway_base_url(base_url, "anthropic")
+    if opted_in:
+        monkeypatch.setenv("OMNIGENT_CI_PIPELINE", "polly-review")
+    else:
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+    assert gateway_request_tag_headers(base_url) == {}
+    assert ("Skipping CI tags: malformed provider URL" in caplog.text) == opted_in
+    assert "secret" not in caplog.text
 
 
 @pytest.mark.parametrize(

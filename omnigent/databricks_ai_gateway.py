@@ -190,9 +190,14 @@ def with_ci_request_tags(headers: Mapping[str, _HeaderValue]) -> dict[str, _Head
 
 
 def gateway_request_tag_headers(base_url: str | None) -> dict[str, str]:
-    """Return CI request headers only for a Databricks AI Gateway destination."""
-    if base_url and is_databricks_ai_gateway_url(base_url):
-        return with_ci_request_tags({})
+    """Add optional CI headers without validating unrelated provider configuration."""
+    if not ci_request_tags():
+        return {}
+    try:
+        if base_url and is_databricks_ai_gateway_url(base_url):
+            return with_ci_request_tags({})
+    except ValueError:
+        _logger.warning("Skipping CI tags: malformed provider URL")
     return {}
 
 

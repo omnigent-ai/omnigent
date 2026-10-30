@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import copy
 
-from omnigent.databricks_ai_gateway import gateway_request_tag_headers, with_ci_request_tags
+from omnigent.databricks_ai_gateway import (
+    ci_request_tags,
+    gateway_request_tag_headers,
+    with_ci_request_tags,
+)
 
 
 def with_hermes_ci_request_tags(config: dict[str, object]) -> dict[str, object]:
     """Preserve provider routing and add tags only to Databricks gateway entries."""
     result = copy.deepcopy(config)
+    if not ci_request_tags():
+        return result
     providers = result.get("providers", {})
     entries = list(providers.values()) if isinstance(providers, dict) else []
     legacy_entries = result.get("custom_providers", [])

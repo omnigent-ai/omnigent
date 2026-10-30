@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import copy
 
-from omnigent.databricks_ai_gateway import gateway_request_tag_headers, with_ci_request_tags
+from omnigent.databricks_ai_gateway import (
+    ci_request_tags,
+    gateway_request_tag_headers,
+    with_ci_request_tags,
+)
 
 
 def with_qwen_ci_request_tags(settings: dict[str, object]) -> dict[str, object]:
@@ -16,6 +20,8 @@ def with_qwen_ci_request_tags(settings: dict[str, object]) -> dict[str, object]:
     a user's settings: Qwen replaces, rather than merges, modelProviders.
     """
     result = copy.deepcopy(settings)
+    if not ci_request_tags():
+        return result
     providers = result.get("modelProviders", {})
     if not isinstance(providers, dict):
         return result

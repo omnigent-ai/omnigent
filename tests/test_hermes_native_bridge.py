@@ -398,7 +398,7 @@ def test_write_policy_hook_config_merges_user_model(tmp_path, monkeypatch) -> No
 @pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
 @pytest.mark.parametrize("legacy", [False, True])
 def test_ci_provider_headers_survive_hermes_policy_config(
-    tmp_path, monkeypatch, context, legacy
+    tmp_path, monkeypatch, caplog, context, legacy
 ) -> None:
     """Native and headless policy setup share the provider-scoped header boundary."""
     from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
@@ -408,6 +408,11 @@ def test_ci_provider_headers_survive_hermes_policy_config(
     monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     if context is not None:
         monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
     gateway = {
         "name": "databricks",
         "base_url" if legacy else "api": "https://test.cloud.databricks.com/ai-gateway/codex/v1",
@@ -416,10 +421,13 @@ def test_ci_provider_headers_survive_hermes_policy_config(
         "extra_headers": {"X-Existing": "kept", REQUEST_TAGS_HEADER: '{"team":"ci"}'},
     }
     external = {"name": "external", "base_url": "https://example.com/v1"}
+    malformed = {"name": "unused", "base_url": "https://[invalid"}
     key = "custom_providers" if legacy else "providers"
     original = {
         "model": {"default": "test-model", "provider": "custom:databricks"},
-        key: [gateway, external] if legacy else {"databricks": gateway, "external": external},
+        key: [gateway, external, malformed]
+        if legacy
+        else {"databricks": gateway, "external": external, "unused": malformed},
     }
     user_home = tmp_path / ".hermes"
     user_home.mkdir()
@@ -432,6 +440,7 @@ def test_ci_provider_headers_survive_hermes_policy_config(
     providers = configured[key]
     provider = providers[0] if legacy else providers["databricks"]
     assert (providers[1] if legacy else providers["external"]) == external
+    assert (providers[2] if legacy else providers["unused"]) == malformed
     assert configured["model"] == original["model"]
     assert provider["transport"] == "codex_responses"
     assert provider["key_env"] == "OPENAI_API_KEY"
@@ -442,6 +451,7 @@ def test_ci_provider_headers_survive_hermes_policy_config(
     if context and context != "invalid":
         expected.update(json.loads(context))
     assert json.loads(headers[REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed provider URL" in caplog.text) == (context not in (None, "invalid"))
     assert gateway["extra_headers"][REQUEST_TAGS_HEADER] == '{"team":"ci"}'
 
 
