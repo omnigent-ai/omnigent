@@ -5256,7 +5256,7 @@ def test_inject_user_message_raises_when_prompt_never_renders(
         del kwargs
         # Read-only queries (pane capture, liveness probe) are not
         # keystrokes — only writes must be absent on this path.
-        if "capture-pane" in cmd or "list-panes" in cmd:
+        if "capture-pane" in cmd or "display-message" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         send_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -11070,18 +11070,15 @@ def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     short. The probe gets the shared tmux budget, not a bespoke 1s a
     starved server outlasts.
 
-    An answer carrying no usable flag is inconclusive too. This is why the
-    probe runs ``list-panes`` and not ``display-message``: the latter
-    prints an empty line and still exits 0 for a target it cannot
-    resolve, so "tmux told us nothing" would read as "the pane is dead"
-    and end a healthy slow boot at the base budget.
+    An answer carrying no usable flag is inconclusive too. The conditional
+    format reports an unresolved target explicitly, even though tmux exits 0.
     """
     responses: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
         assert kwargs["timeout"] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
-        assert "list-panes" in cmd
-        assert "#{pane_dead} #{pane_dead_status}" in cmd
+        assert "display-message" in cmd
+        assert "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}" in cmd
         outcome = responses["outcome"]
         if isinstance(outcome, Exception):
             raise outcome
@@ -11100,6 +11097,7 @@ def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     assert state(returncode=0, stdout="1 \n") == (False, True, None)
     # A rejected query ends the wait without claiming the process exited.
     assert state(returncode=1, stdout="") == (False, False, None)
+    assert state(returncode=0, stdout="missing\n") == (False, False, None)
     # Answered, but said nothing about the pane.
     assert state(returncode=0, stdout="\n") == (None, False, None)
     assert state(returncode=0, stdout="what\n") == (None, False, None)
