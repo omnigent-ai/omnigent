@@ -9,7 +9,8 @@
 // Requested diffs can start while the changed-files list is loading. Known
 // unchanged files and unavailable workspaces keep the query disabled.
 
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
@@ -77,6 +78,19 @@ export function useFileDiff(
 ) {
   const serveable = useWorkspaceServeable(conversationId);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const queryClient = useQueryClient();
+  const previousUpdate = useRef(changedFiles.dataUpdatedAt);
+  useEffect(() => {
+    const refreshed =
+      previousUpdate.current > 0 && previousUpdate.current !== changedFiles.dataUpdatedAt;
+    previousUpdate.current = changedFiles.dataUpdatedAt;
+    if (refreshed && changedFiles.isSuccess && path) {
+      void queryClient.invalidateQueries({
+        queryKey: ["file-diff", conversationId, path],
+        exact: true,
+      });
+    }
+  }, [changedFiles.dataUpdatedAt, changedFiles.isSuccess, conversationId, path, queryClient]);
   const environment = useWorkspaceEnvironment(conversationId);
   const isInChangedFiles = changedFiles.data?.data.some((f) => f.path === path) ?? false;
 
