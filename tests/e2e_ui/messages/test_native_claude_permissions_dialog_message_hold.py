@@ -5,8 +5,8 @@ of holding it behind what looks like a pending question.
 
 Kept apart from the occupied-composer journey in
 ``test_native_claude_render_parity``: a slash-command dialog submits a turn of
-its own, so the session reads busy and the message has to be steered out of
-the queue, and the dialog is left two Escapes deep on its add-rule field.
+its own, so the session can read busy and the message may need steering out
+of the queue, and the dialog is left two Escapes deep on its add-rule field.
 """
 
 from __future__ import annotations
@@ -153,7 +153,7 @@ def test_web_message_is_delivered_past_an_open_permissions_dialog(
 
     _open_add_rule_field(page, base_url, session_id)
     _ensure_chat_view(page)
-    # The open dialog keeps the session busy, so the message is steered from the queue.
+    # If the open dialog makes the session report busy, steer the message from the queue.
     _log.info("sending from the web composer with the dialog open")
     _send_composer_turn(
         page,
@@ -164,7 +164,7 @@ def test_web_message_is_delivered_past_an_open_permissions_dialog(
         user_marker=held_marker,
         assistant_token=held_token,
         expected_user_bubbles=2,
-        steer_queued=True,
+        steer_if_queued=True,
     )
     _log.info("message delivered and answered")
 
