@@ -287,6 +287,13 @@ Providers declare their feature set via a `capabilities` property returning
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
 
+## Provider-owned sandbox profiles
+
+Providers can offer per-user sandbox choices by implementing `list_profiles` and
+`select_profile` on their launcher. They own configuration and authorization;
+Omnigent shows approved metadata and saves an immutable revision reference.
+See [the provider contract and rollout guide](provider_profiles.md).
+
 ## Network policy for harness bridge servers
 
 Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox

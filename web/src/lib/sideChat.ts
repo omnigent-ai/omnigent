@@ -12,6 +12,13 @@
 /** Prefix that opens a side chat. The trailing space keeps `/sidebar` out. */
 export const SIDE_CHAT_COMMAND_PREFIX = "/side ";
 
+export const SIDE_CHAT_SETTINGS_MUTATION = "side-chat-settings";
+
+/** Shared by the picker and every send/queue gate for the same child. */
+export function sideChatSettingsMutationKey(sessionId: string) {
+  return [SIDE_CHAT_SETTINGS_MUTATION, sessionId] as const;
+}
+
 /** A fresh id for a side-chat rail tab whose fork isn't created yet. */
 export function newPendingSideChatId(): string {
   return `pending:${crypto.randomUUID()}`;
@@ -55,4 +62,10 @@ export function usesNativeSideChatFork(harness: string | null | undefined): bool
 export function isSideChatCommand(text: string): boolean {
   if (!text.startsWith(SIDE_CHAT_COMMAND_PREFIX)) return false;
   return text.slice(SIDE_CHAT_COMMAND_PREFIX.length).trim().length > 0;
+}
+
+/** Optional model and effort picks for a side chat’s first turn. */
+export interface SideChatModelSettings {
+  modelOverride?: string;
+  reasoningEffort?: string | null;
 }
