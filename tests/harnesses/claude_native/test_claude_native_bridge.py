@@ -11885,20 +11885,26 @@ def test_a_draft_the_clearing_budget_cannot_empty_is_refused_not_submitted(
     """
     Running out of clearing rounds refuses the injection instead of pasting.
 
-    A pane with room for one row of the box shows one line of a four-line
-    draft per round and never its closing rule, so after the budget a line
-    is still in the box and no capture can prove otherwise. Pasting anyway
-    would submit that leftover line with the message or command.
+    A pane with room for one row of the box shows one line of the draft per
+    round and never its closing rule, so after the budget (the rounds before
+    and after the repaint) a line is still in the box and no capture can
+    prove otherwise. Pasting anyway would submit that leftover line with the
+    message or command.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer("ONE\nTWO\nTHREE\nFOUR", cursor=0, visible_rows=1)
+    lines = [
+        f"LINE {idx}" for idx in range(2 * claude_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS + 1)
+    ]
+    composer = _EditableComposer("\n".join(lines), cursor=0, visible_rows=1)
     composer.install(monkeypatch)
 
     with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"):
         inject(bridge_dir)
 
     assert composer.submitted == []
-    assert "FOUR" in composer.text, "The leftover line should still be the person's to deal with."
+    assert lines[-1] in composer.text, (
+        "The leftover line should still be the person's to deal with."
+    )
 
 
 @pytest.mark.parametrize(
@@ -11919,7 +11925,8 @@ def test_a_draft_the_clearing_budget_cannot_empty_is_refused_not_submitted(
 )
 @pytest.mark.parametrize(
     "unavailable_clear_captures",
-    [1, claude_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS + 1],
+    # Failing every capture of the clearing rounds and of the rounds after the repaint.
+    [1, 2 * (claude_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS + 1)],
     ids=["one-failed-capture", "persistent-failed-captures"],
 )
 def test_unavailable_composer_capture_never_submits_the_leftover_draft(
@@ -12113,7 +12120,7 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
         else:
             inject_user_message(bridge_dir, content="hello from the web")
 
-    if scenario in {"unresponsive", "scrollback"}:
+    if scenario == "unresponsive":
         with pytest.raises(
             claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
         ):
@@ -12125,7 +12132,13 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
         assert [text.strip() for text in composer.submitted] == [
             "/effort high" if slash else "hello from the web"
         ]
-    assert sum(args[-1] == "C-l" for args in operations) == (scenario != "scrollback")
+    clearing = next(index for index, args in enumerate(operations) if args[-1] == "Space")
+    # A visible notice is redrawn before any clearing key; a box clearing can't
+    # settle is redrawn once more before refusing.
+    assert sum(args[-1] == "C-l" for args in operations[:clearing]) == (scenario != "scrollback")
+    assert sum(args[-1] == "C-l" for args in operations[clearing:]) == (
+        scenario in {"unresponsive", "scrollback"}
+    )
 
 
 # Another process's output printed from the input row's cursor onward: it
@@ -12152,6 +12165,9 @@ ific earlier point.
 @pytest.mark.parametrize("draft", ["", _STALE_MULTILINE_DRAFT], ids=["empty", "hidden-draft"])
 @pytest.mark.parametrize("printed", list(_PRINTED_OVER_BOX_PANES))
 @pytest.mark.parametrize("repaint_shows_box", [True, False], ids=["repainted", "still-covered"])
+# ``keystroke``: the SIGCONT reaches only the pane's relay, as when a launcher
+# runs Claude Code in a worker outside the pane's process tree.
+@pytest.mark.parametrize("repainted_by", ["signal", "keystroke"])
 def test_output_printed_over_the_input_box_is_repainted_before_refusing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -12159,20 +12175,33 @@ def test_output_printed_over_the_input_box_is_repainted_before_refusing(
     draft: str,
     printed: str,
     repaint_shows_box: bool,
+    repainted_by: str,
 ) -> None:
     """Output another process printed over the box is repainted, not refused as a draft."""
     composer = _EditableComposer(draft, cursor=len(draft))
     composer.install(monkeypatch)
     covered = True
     repaints: list[str] = []
+    redraw_keys: list[str] = []
 
     def repaint(socket_path: str, tmux_target: str) -> int:
         nonlocal covered
         repaints.append(tmux_target)
-        covered = not repaint_shows_box
+        if repainted_by == "signal":
+            covered = not repaint_shows_box
         return 1
 
+    def run_tmux(socket_path: str, *args: str) -> None:
+        nonlocal covered
+        if args[0] == "send-keys" and args[-1] == "C-l":
+            redraw_keys.append(args[-2])
+            if repainted_by == "keystroke":
+                covered = not repaint_shows_box
+            return
+        composer._run_tmux(socket_path, *args)
+
     monkeypatch.setattr(claude_native_bridge, "_request_claude_repaint", repaint)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
@@ -12200,6 +12229,7 @@ def test_output_printed_over_the_input_box_is_repainted_before_refusing(
             inject()
         assert composer.submitted == []
     assert len(repaints) == 1
+    assert len(redraw_keys) == 1
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
@@ -12235,14 +12265,17 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     )
     resized = False
     redrawn = False
+    redraw_requests = 0
     recovery_keys: list[str] = []
 
     def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
-        nonlocal resized, redrawn
+        nonlocal resized, redrawn, redraw_requests
         if args[0] == "resize-window":
             resized = args[args.index("-y") + 1] == "24"
         elif args[0] == "send-keys" and args[-1] == "C-l":
-            redrawn = True
+            redraw_requests += 1
+            # A clipped box redraws unchanged; only the resize gives it room.
+            redrawn = redrawn or recovery == "notice-redraw"
         elif resized or redrawn:
             assert args[0] == "send-keys" and args[-1] == "Escape"
             recovery_keys.append(args[-1])
@@ -12280,6 +12313,8 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     assert composer.submitted == []
     assert not resized
     assert redrawn == (recovery == "notice-redraw")
+    # The notice's redraw, or the redraw a clipped box gets before it is refused.
+    assert redraw_requests == 1
     if pane != _REVERSE_SEARCH_PANE:
         assert recovery_keys == []
 

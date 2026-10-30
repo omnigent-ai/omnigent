@@ -5968,6 +5968,24 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     return signalled
 
 
+def _redraw_claude_screen(socket_path: str, tmux_target: str) -> None:
+    """
+    Ask Claude Code to redraw its whole screen with its Ctrl+L redraw key.
+
+    The draft stays in the input box. A keystroke travels the terminal path
+    typed input takes, so it reaches Claude Code under any launcher, even one
+    that runs Claude Code in a worker outside the pane's process tree and
+    only relays its terminal to the pane, where
+    :func:`_request_claude_repaint`'s ``SIGCONT`` never arrives. Send it only
+    while the input box is on screen, where Claude Code reads Ctrl+L as its
+    chat redraw key.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    """
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-l")
+
+
 def claude_pane_ready(bridge_dir: Path) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
@@ -6281,7 +6299,7 @@ def _restore_occupied_input(
             and any("[idle-compact]" in row for row in box.rows)
         ):
             _logger.info("claude-native: redrawing an idle-compaction notice over the input box")
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-l")
+            _redraw_claude_screen(socket_path, tmux_target)
             notice_redrawn = True
             time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
             continue
@@ -6582,11 +6600,13 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     capture is likewise retried without sending clearing keys, then refused
     if no readable box appears within the budget.
 
-    Before refusing, Claude Code is asked to repaint once
-    (:func:`_request_claude_repaint`) and the rounds start over. Output
-    another process printed over the box, such as a launcher's log line, is
-    not part of the draft, so no key deletes it; after the repaint the
-    capture shows the real input box.
+    Before refusing, Claude Code is asked to repaint once and the rounds
+    start over. Output another process printed over the box, such as a
+    launcher's log line, is not part of the draft, so no key deletes it;
+    after the repaint the capture shows the real input box. The request is
+    the Ctrl+L redraw key (:func:`_redraw_claude_screen`) as well as the
+    ``SIGCONT`` of :func:`_request_claude_repaint`: a launcher may run Claude
+    Code outside the pane's process tree, where only the keystroke reaches it.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -6605,7 +6625,9 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
         # Blank rows after the glyph row hold nothing a paste could join.
         settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
-            if not repainted and _request_claude_repaint(socket_path, tmux_target):
+            if not repainted:
+                _redraw_claude_screen(socket_path, tmux_target)
+                _request_claude_repaint(socket_path, tmux_target)
                 repainted, round_no = True, 0
                 delivery_diagnostics.record_details(composer_repaint_requested=True)
                 time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
