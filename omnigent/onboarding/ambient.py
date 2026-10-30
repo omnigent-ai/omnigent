@@ -555,6 +555,29 @@ def read_claude_managed_settings(
     return None
 
 
+def read_claude_user_settings(cwd: str | None = None) -> dict[str, object] | None:
+    """Return Claude Code's user ``settings.json``, parsed.
+
+    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
+    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
+    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
+    relative value is relative to the CLI's working directory.
+
+    :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
+        ``None`` means this process's working directory.
+    :returns: The settings object, or ``None`` when the file is missing,
+        unreadable, or not an object.
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    config_dir = Path(configured) if configured else Path.home() / ".claude"
+    settings_path = Path(cwd or "") / config_dir / "settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:
     """Return the non-Anthropic gateway Claude Code's managed settings pin, if any.
 

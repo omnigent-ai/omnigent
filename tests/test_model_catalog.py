@@ -1607,12 +1607,15 @@ def test_cli_login_store_miss_keeps_existing_rows(
     _isolate_config(monkeypatch, tmp_path, "{}")
     _isolate_native_probe_store(monkeypatch, tmp_path)
 
+    # A token login gets the unconfigured Claude row as far as the store read.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
     unconfigured = catalog_for_spec(_cli_login_parent())
     for name in ("self", "claude_code", "codex"):
         assert unconfigured[name]["source"] == "none"
         assert unconfigured[name]["models"] == []
         assert "no model provider configured" in str(unconfigured[name]["note"])
 
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
     _isolate_config(monkeypatch, tmp_path, _CLI_SUBSCRIPTION_CONFIG)
     subscribed = catalog_for_spec(_cli_login_parent())
     for name in ("self", "claude_code", "codex"):
@@ -1677,16 +1680,25 @@ def test_codex_login_catalog_requires_a_usable_child_launch(
     """
     from omnigent.harnesses.codex_native import app_server
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.models import model_catalog_store
 
     _isolate_config(monkeypatch, tmp_path, provider_config)
     _isolate_native_probe_store(monkeypatch, tmp_path)
     monkeypatch.setattr(app_server, "_codex_login_usable", lambda: False)
     monkeypatch.setenv("CUSTOM_CODEX_TOKEN", "token")
-    if config_toml is not None:
+    if config_toml is None:
+        _seed_cli_login_catalogs(codex_pinned=provider_config != "{}")
+    else:
         (tmp_path / "codex-source" / "config.toml").write_text(config_toml)
+        # Seed where the native probe writes for this config.toml launch.
+        launch = app_server.resolve_native_codex_launch(model=None)
+        model_catalog_store.write_catalog(
+            "codex-native",
+            app_server.codex_catalog_fingerprint(launch),
+            [{"id": model_id} for model_id in _CLI_LOGIN_CODEX_IDS],
+        )
     if routing_env:
         monkeypatch.setenv("HARNESS_CODEX_MODEL_PROVIDER", "custom")
-    _seed_cli_login_catalogs(codex_pinned=provider_config != "{}")
     spec = AgentSpec(
         spec_version=1,
         name="worker",
@@ -1724,8 +1736,16 @@ def test_unconfigured_claude_sdk_without_a_token_login_lists_nothing(
         ({"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}, {}),
         ({}, {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}}, {}),
         ({}, {}, {"CLAUDE_CODE_USE_VERTEX": "1"}),
+        ({}, {}, {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}),
     ],
-    ids=["user-gateway", "api-key-helper", "user-bedrock", "managed-bedrock", "env-vertex"],
+    ids=[
+        "user-gateway",
+        "api-key-helper",
+        "user-bedrock",
+        "managed-bedrock",
+        "env-vertex",
+        "env-gateway",
+    ],
 )
 def test_claude_transport_overrides_skip_login_catalog(
     settings: dict[str, object],
@@ -1734,24 +1754,34 @@ def test_claude_transport_overrides_skip_login_catalog(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Settings that move Claude off its login share the catalog key but not its ids."""
+    """A catalog probed under a transport override is never replayed for the login.
+
+    The override's model ids are not the login's, and the catalog key records the
+    override, so removing it later misses instead of replaying that catalog.
+    """
     _isolate_config(monkeypatch, tmp_path, _CLI_SUBSCRIPTION_CONFIG)
     _isolate_native_probe_store(monkeypatch, tmp_path)
-    _seed_cli_login_catalogs(codex_pinned=True)
-    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"]
-
-    (tmp_path / "claude-config" / "settings.json").write_text(json.dumps(settings))
+    user_settings = tmp_path / "claude-config" / "settings.json"
     managed_settings = tmp_path / "managed-settings.json"
-    managed_settings.write_text(json.dumps(managed))
     monkeypatch.setattr(
         "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
     )
+    user_settings.write_text(json.dumps(settings))
+    managed_settings.write_text(json.dumps(managed))
     for name, value in env.items():
         monkeypatch.setenv(name, value)
-    # Reseed so an override that also changes the launch key is still read.
     _seed_cli_login_catalogs(codex_pinned=True)
 
     assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
+
+    user_settings.write_text("{}")
+    managed_settings.write_text("{}")
+    for name in env:
+        monkeypatch.delenv(name)
+
+    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
+    _seed_cli_login_catalogs(codex_pinned=True)
+    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"]
 
 
 def test_native_only_binding_does_not_feed_the_sdk_worker(
@@ -1832,14 +1862,6 @@ def test_cli_login_catalog_skips_ambient_claude_gateways(
     assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
     native = catalog_for_spec(_worker_spec("claude-native"))["self"]
     assert [model["id"] for model in native["models"]] == [gateway_id]
-
-    monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
-    _isolate_config(monkeypatch, tmp_path, "{}")
-    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://gateway.example/anthropic")
-    model_catalog_store.write_catalog(
-        "claude-native", claude_catalog_fingerprint(None), [{"id": "claude-wrong-route"}]
-    )
-    assert catalog_for_spec(_worker_spec("claude-sdk"))["self"]["models"] == []
 
 
 @pytest.mark.parametrize("table_key", sorted(_SMART_ROUTING_FALLBACKS))

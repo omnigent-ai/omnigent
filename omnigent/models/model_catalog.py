@@ -38,7 +38,6 @@ import re
 import subprocess
 import threading
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, cast
 from urllib.parse import urlsplit
 
@@ -1549,14 +1548,18 @@ def _cli_login_probe_listing(
             if launch_entry is not None:
                 return None
         if cli == "claude":
-            from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+            from omnigent.harnesses.claude_native.main import (
+                claude_ambient_transport,
+                claude_catalog_fingerprint,
+            )
             from omnigent.onboarding.harness_readiness import _claude_token_env_configured
 
             # Detection turns a stored login into a subscription, so an
             # unconfigured child can only run on a token env credential.
             if provider.kind == NONE_KIND and not _claude_token_env_configured():
                 return None
-            if _claude_transport_overridden():
+            # Such routes share the CLI-login catalog key but not its model ids.
+            if claude_ambient_transport().leaves_login():
                 return None
             return _probe_catalog_listing(
                 "claude-native", claude_catalog_fingerprint(None), "Claude Code"
@@ -1567,60 +1570,6 @@ def _cli_login_probe_listing(
             "CLI-login probe catalog lookup failed for harness %r", harness, exc_info=True
         )
         return None
-
-
-def _claude_transport_overridden() -> bool:
-    """Whether Claude Code would leave its login for another transport or gateway.
-
-    Such routes share the CLI-login catalog key but not its model ids, which a
-    subscription dispatch would respell. Project settings depend on the session
-    workspace and are not visible here.
-
-    :returns: ``True`` when managed, user, or process settings select a gateway,
-        an ``apiKeyHelper``, or a cloud transport.
-    """
-    from omnigent.harnesses.claude_native.main import (
-        _managed_settings_paths,
-        managed_claude_gateway_signal,
-    )
-    from omnigent.onboarding.ambient import read_claude_managed_settings
-
-    managed_settings = read_claude_managed_settings(_managed_settings_paths()) or {}
-    managed_env = managed_settings.get("env")
-    managed_env = managed_env if isinstance(managed_env, dict) else {}
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
-    settings_path = Path(config_dir) if config_dir else Path.home() / ".claude"
-    try:
-        user_settings = json.loads((settings_path / "settings.json").read_text())
-    except (OSError, ValueError):
-        user_settings = {}
-    if not isinstance(user_settings, dict):
-        user_settings = {}
-    user_env = user_settings.get("env")
-    user_env = user_env if isinstance(user_env, dict) else {}
-    if user_settings.get("apiKeyHelper"):
-        return True
-    for env in (managed_env, user_env, os.environ):
-        if any(
-            str(env.get(name, "")).strip().lower() in ("1", "true", "yes")
-            for name in (
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-            )
-        ):
-            return True
-    for base_url in (
-        managed_claude_gateway_signal()[0],
-        os.environ.get("ANTHROPIC_BASE_URL"),
-        user_env.get("ANTHROPIC_BASE_URL"),
-    ):
-        if not base_url:
-            continue
-        host = (urlsplit(str(base_url)).hostname or "").lower()
-        if host != "anthropic.com" and not host.endswith(".anthropic.com"):
-            return True
-    return False
 
 
 # Inherited spawn-env overrides that reroute the SDK Codex child.
@@ -1647,6 +1596,7 @@ def _codex_login_probe_listing(
         return None
     from omnigent.harnesses.codex_native.app_server import (
         NativeCodexLaunch,
+        _ambient_builtin_codex_provider,
         _codex_home_config_source_from_env,
         _codex_login_usable,
         codex_catalog_fingerprint,
@@ -1671,11 +1621,14 @@ def _codex_login_probe_listing(
     )
     if auth != "provider-ready" and not (auth == "codex-login" and _codex_login_usable()):
         return None
-    launch = NativeCodexLaunch(
-        config_overrides=['model_provider="openai"'] if pinned else [],
-        model=None,
-        profile=None,
-    )
+    if pinned:
+        overrides = ['model_provider="openai"']
+    else:
+        # The native probe pins the built-in provider config.toml selects; the child
+        # runs that same provider from config.toml, so read the pinned catalog.
+        builtin = _ambient_builtin_codex_provider(None)
+        overrides = [f"model_provider={json.dumps(builtin)}"] if builtin else []
+    launch = NativeCodexLaunch(config_overrides=overrides, model=None, profile=None)
     return _probe_catalog_listing("codex-native", codex_catalog_fingerprint(launch), "Codex")
 
 
