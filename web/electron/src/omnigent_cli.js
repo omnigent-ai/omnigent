@@ -152,14 +152,20 @@ let cachedHostId = null;
  */
 function localHostId() {
   if (cachedHostId) return cachedHostId;
+  cachedHostId = readLocalHostId();
+  return cachedHostId;
+}
+
+/** Read the current machine identity without retaining a stale config value. */
+function readLocalHostId() {
   try {
     const parsed = yaml.load(fs.readFileSync(path.join(localConfigDir(), "config.yaml"), "utf8"));
     const id = parsed && typeof parsed === "object" ? parsed.host?.host_id : null;
-    if (typeof id === "string" && id) cachedHostId = id.replace(/^host_/, "");
+    if (typeof id === "string" && id) return id.replace(/^host_/, "") || null;
   } catch {
     // No config yet, or unparseable.
   }
-  return cachedHostId;
+  return null;
 }
 
 /**
@@ -1080,23 +1086,13 @@ async function probeServerAuth(serverUrl, { timeoutMs = 10000 } = {}) {
  * }>}
  */
 async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000 } = {}) {
-  const match = readDaemonRecords().find((r) => matchesServer(r, serverUrl)) || null;
+  const match = liveDaemonRecordFor(serverUrl);
   if (!match) {
     return {
       connected: false,
       process: "offline",
       hostStatus: null,
       pid: null,
-      error: null,
-      verified: true,
-    };
-  }
-  if (!isPidAlive(match.pid)) {
-    return {
-      connected: false,
-      process: "offline",
-      hostStatus: null,
-      pid: match.pid,
       error: null,
       verified: true,
     };
@@ -1156,6 +1152,20 @@ async function getHostConnectionFast(serverUrl, { probe = true, timeoutMs = 2000
   };
 }
 
+/** Find a live daemon enrolled with this server, including loopback URL aliases. */
+function liveDaemonRecordFor(serverUrl) {
+  return (
+    readDaemonRecords().find(
+      (record) =>
+        isPidAlive(record.pid) &&
+        (matchesServer(record, serverUrl) ||
+          [record.server_url, record.target, record.resolved_server_url].some((field) =>
+            sameLoopbackServer(field, serverUrl),
+          )),
+    ) ?? null
+  );
+}
+
 module.exports = {
   INSTALL_COMMAND,
   DEFAULT_TIMEOUT_MS,
@@ -1163,6 +1173,8 @@ module.exports = {
   isLoopbackServer,
   sameLoopbackServer,
   localHostId,
+  readLocalHostId,
+  liveDaemonRecordFor,
   parseLocalServerPidfile,
   isPidAlive,
   readLocalServerPidfile,

@@ -28,6 +28,8 @@ const {
   getHostConnectionFast,
   probeServerAuth,
   localHostId,
+  readLocalHostId,
+  liveDaemonRecordFor,
 } = require("../src/omnigent_cli");
 
 describe("cliCommandParts", () => {
@@ -498,6 +500,61 @@ describe("probeServerAuth — /v1/me auth gate", () => {
 
     assert.deepEqual(res, { authed: false, reachable: false });
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("liveDaemonRecordFor", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("skips a dead matching record before a live record", async () => {
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    const records = [dead, process.pid].map((pid) => ({
+      pid,
+      target: "https://server.example",
+      mode: "server",
+      host_id: "local",
+    }));
+    mock.method(fs, "readdirSync", () => ["dead.json", "live.json"]);
+    mock.method(fs, "readFileSync", (filename) =>
+      JSON.stringify(records[filename.endsWith("dead.json") ? 0 : 1]),
+    );
+    assert.equal(liveDaemonRecordFor("https://server.example").pid, process.pid);
+    assert.equal(
+      (await getHostConnectionFast("https://server.example", { probe: false })).connected,
+      true,
+    );
+    assert.equal(liveDaemonRecordFor("https://different.example"), null);
+  });
+
+  for (const field of ["target", "server_url", "resolved_server_url"]) {
+    it(`matches loopback aliases in ${field}`, () => {
+      const record = {
+        pid: process.pid,
+        target: "local",
+        mode: "local",
+        [field]: "http://127.0.0.1:6767",
+      };
+      mock.method(fs, "readdirSync", () => ["live.json"]);
+      mock.method(fs, "readFileSync", () => JSON.stringify(record));
+      assert.equal(liveDaemonRecordFor("http://localhost:6767").pid, process.pid);
+      assert.equal(liveDaemonRecordFor("http://localhost:6768"), null);
+    });
+  }
+});
+
+describe("readLocalHostId", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("follows config rewrites and normalizes the legacy prefix", () => {
+    let config = "host:\n  host_id: host_first\n";
+    mock.method(fs, "readFileSync", () => config);
+    assert.equal(readLocalHostId(), "first");
+    config = "host:\n  host_id: second\n";
+    assert.equal(readLocalHostId(), "second");
+    config = "{}";
+    assert.equal(readLocalHostId(), null);
+    config = "[bad yaml";
+    assert.equal(readLocalHostId(), null);
   });
 });
 
