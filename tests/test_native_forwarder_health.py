@@ -11,6 +11,8 @@ and ``tests/runtime/harnesses/test_scaffold.py``.
 
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -128,28 +130,43 @@ def test_note_post_success_stamps_last_post_at(monkeypatch: pytest.MonkeyPatch) 
 async def test_post_success_stamps_the_bound_forwarder_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A forwarder task's posts, including those from tasks it spawns for
-    sub-agent mirrors, stamp the session it bound; unbound posts stamp none."""
-    import asyncio
-
+    """A forwarder's posts, including those from tasks it spawned before a
+    ``/clear`` rotation, stamp the session it currently owns; unbound posts
+    stamp none, and a stopped forwarder releases its activity."""
     clock = _FakeClock(start=500.0)
     monkeypatch.setattr(health, "time", clock)
     health.clear()
+    rotated = asyncio.Event()
 
-    async def forwarder(session_id: str) -> None:
-        health.bind_forwarder_session(session_id)
-        # A child mirror's post runs in a task the forwarder spawned.
-        await asyncio.create_task(asyncio.to_thread(health.note_post_success))
+    async def child_mirror() -> None:
+        await rotated.wait()
+        await asyncio.to_thread(health.note_post_success)
+
+    async def forwarder() -> None:
+        health.bind_forwarder_session("conv_old")
+        child_task = asyncio.create_task(child_mirror())
+        health.note_post_success()
+        health.rebind_forwarder_session("conv_new")
+        assert not health.session_posted_within("conv_old", 120.0)
+        assert health.session_posted_within("conv_new", 120.0)
+        clock.now = 600.0
+        rotated.set()
+        await child_task
+
+    async def stopped_forwarder() -> None:
+        health.bind_forwarder_session("conv_done")
+        health.note_post_success()
+        health.release_forwarder_session()
 
     try:
-        await asyncio.create_task(forwarder("conv_parent"))
+        await asyncio.create_task(forwarder())
+        clock.now = 700.0
+        assert health.session_posted_within("conv_new", 120.0)
         health.note_post_success()
-        assert health.session_posted_within("conv_parent", 120.0)
-        assert not health.session_posted_within("conv_other", 120.0)
-        clock.now = 620.0
-        assert not health.session_posted_within("conv_parent", 120.0)
-        health.clear()
-        clock.now = 500.0
-        assert not health.session_posted_within("conv_parent", 120.0)
+        clock.now = 721.0
+        assert not health.session_posted_within("conv_new", 120.0)
+        assert not health.session_posted_within("conv_old", 120.0)
+        await asyncio.create_task(stopped_forwarder())
+        assert not health.session_posted_within("conv_done", 120.0)
     finally:
         health.clear()

@@ -74,7 +74,13 @@ from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
 from omnigent.native._native_forwarder_health import (
+    rebind_forwarder_session as rebind_native_forwarder_session,
+)
+from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
+)
+from omnigent.native._native_forwarder_health import (
+    release_forwarder_session as release_native_forwarder_session,
 )
 from omnigent.native._native_post_delivery import (
     RepostResult,
@@ -2424,6 +2430,7 @@ async def supervise_forwarder(
                     )
                     if rotated:
                         forwarder_state.note_parent_rotation(target.session_id)
+                        rebind_native_forwarder_session(target.session_id)
                         subscribe_task.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await subscribe_task
@@ -2503,6 +2510,7 @@ async def supervise_forwarder(
                     await close()
                 except BaseException as exc:  # noqa: BLE001 - finish all closers, even on cancellation.
                     cleanup_errors.append(exc)
+            release_native_forwarder_session()
             for error in cleanup_errors[1 if stream_error is None else 0 :]:
                 _logger.warning(
                     "Codex forwarder cleanup failed",

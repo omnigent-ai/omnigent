@@ -15,6 +15,7 @@ from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
+from omnigent.native import _native_forwarder_health
 from tests.harnesses.codex_native.session._support import (
     _agent_message_event,
     _elicitation_tracker,
@@ -390,9 +391,11 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     notification. That gap marker is intentionally permissive while the
     parent thread is current, but it must not survive a parent ``/clear``
     rotation and make stale child approvals actionable in the new session.
+    The forwarder's pane activity moves to the new session with the pane.
 
     :param tmp_path: Pytest temporary directory.
     """
+    _native_forwarder_health.clear()
     _write_forwarder_bridge(
         tmp_path, session_id="conv_old", thread_id="thread_old", active_turn_id=None
     )
@@ -420,11 +423,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
             unparented_child_started,
             _thread_started_event("thread_new"),
             _started_event("turn_new"),
+            _agent_message_event("turn_new", "item_new", "after clear", thread_id="thread_new"),
             stale_child_approval,
         ]
     )
     session_events: list[_CapturedSessionEvent] = []
     hook_posts: list[dict[str, Any]] = []
+    activity_seen_by_new_session: list[dict[str, bool]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         """
@@ -463,6 +468,13 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
             assert isinstance(body, dict)
             session_id = request.url.path.split("/")[3]
             session_events.append(_CapturedSessionEvent(session_id=session_id, body=body))
+            if session_id == "conv_new":
+                activity_seen_by_new_session.append(
+                    {
+                        candidate: _native_forwarder_health.session_posted_within(candidate, 120.0)
+                        for candidate in ("conv_old", "conv_new")
+                    }
+                )
             return httpx.Response(202, json={"queued": False})
         return httpx.Response(
             500,
@@ -502,3 +514,5 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
     ]
     assert hook_posts == []
     assert fake_client.responses == []
+    assert activity_seen_by_new_session[-1] == {"conv_old": False, "conv_new": True}
+    assert not _native_forwarder_health.session_posted_within("conv_new", 120.0)

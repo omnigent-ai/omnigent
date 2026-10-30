@@ -36,10 +36,20 @@ _state: dict[str, tuple[float, str] | None] = {"last_post_failure": None}
 # counts as activity; once posts stop, the idle window bounds the hold.
 _last_post_at: dict[str, float | None] = {"value": None}
 
+
+class _ForwarderOwner:
+    """Mutable holder so tasks spawned before a ``/clear`` rotation follow it."""
+
+    __slots__ = ("session_id",)
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+
+
 # Session whose forwarder task is posting. A codex forwarder also posts for its
 # sub-agent mirrors, so a parent pane with streaming children reads as active.
-_forwarder_session: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "native_forwarder_session", default=None
+_forwarder_owner: contextvars.ContextVar[_ForwarderOwner | None] = contextvars.ContextVar(
+    "native_forwarder_owner", default=None
 )
 _last_post_at_by_session: dict[str, float] = {}
 
@@ -95,9 +105,9 @@ def note_post_success() -> None:
     _state["last_post_failure"] = None
     now = time.monotonic()
     _last_post_at["value"] = now
-    session_id = _forwarder_session.get()
-    if session_id is not None:
-        _last_post_at_by_session[session_id] = now
+    owner = _forwarder_owner.get()
+    if owner is not None:
+        _last_post_at_by_session[owner.session_id] = now
 
 
 def bind_forwarder_session(session_id: str) -> None:
@@ -110,7 +120,37 @@ def bind_forwarder_session(session_id: str) -> None:
     :param session_id: Session that owns the forwarder, e.g. ``"conv_abc123"``.
     :returns: None.
     """
-    _forwarder_session.set(session_id)
+    _forwarder_owner.set(_ForwarderOwner(session_id))
+
+
+def rebind_forwarder_session(session_id: str) -> None:
+    """
+    Move the bound forwarder's activity to *session_id* after a rotation.
+
+    Tasks the forwarder already spawned share the binding, so their later
+    posts also count toward *session_id*. No-op outside a bound forwarder.
+
+    :param session_id: Session that now owns the pane, e.g. ``"conv_new"``.
+    :returns: None.
+    """
+    owner = _forwarder_owner.get()
+    if owner is None:
+        return
+    posted_at = _last_post_at_by_session.pop(owner.session_id, None)
+    owner.session_id = session_id
+    if posted_at is not None:
+        _last_post_at_by_session[session_id] = posted_at
+
+
+def release_forwarder_session() -> None:
+    """
+    Forget the bound forwarder's activity once the forwarder stops.
+
+    :returns: None.
+    """
+    owner = _forwarder_owner.get()
+    if owner is not None:
+        _last_post_at_by_session.pop(owner.session_id, None)
 
 
 def session_posted_within(session_id: str, within_s: float) -> bool:
