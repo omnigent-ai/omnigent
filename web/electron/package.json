@@ -67,6 +67,7 @@
       "workspace-picker/**/*",
       "setup/**/*",
       "arca-connect/**/*",
+      "ssh-connect/**/*",
       "server-selector-v2/**/*",
       "find/**/*",
       "return-banner/**/*",

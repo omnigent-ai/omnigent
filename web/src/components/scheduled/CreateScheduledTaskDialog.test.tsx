@@ -10,6 +10,7 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
+import type React from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -37,6 +38,20 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
 }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
+// The project field (and the shared ProjectPicker inside it) lists projects
+// from this hook.
+const PROJECTS = [
+  { id: "proj_1", name: "Triage", icon: null },
+  { id: "proj_2", name: "Reports", icon: null },
+];
+const projectsQuery = vi.hoisted(() => ({
+  current: { data: undefined as unknown, isPending: false, isSuccess: false, isError: false },
+}));
+const resolveOrCreateProjectId = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useConversations", () => ({
+  useProjects: () => projectsQuery.current,
+  useResolveOrCreateProjectId: () => resolveOrCreateProjectId,
+}));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
   WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
@@ -144,8 +159,10 @@ const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
+  projectsQuery.current = { data: PROJECTS, isPending: false, isSuccess: true, isError: false };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
+  resolveOrCreateProjectId.mockReset();
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -193,9 +210,12 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    sessionMode: "new",
+    sessionId: null,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -514,7 +534,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
   it("offers a sandbox option in the host picker when enabled; choosing it enters sandbox mode", () => {
     renderWithSandboxes();
     expect(
-      screen.getByText("Leave unset to run on your connected host when the automation fires."),
+      screen.getByText("Runs on this host. A run fails while the host is offline."),
     ).toBeInTheDocument();
     openHostSelect();
     fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
@@ -548,7 +568,7 @@ describe("CreateScheduledTaskDialog sandbox mode", () => {
 });
 
 describe("CreateScheduledTaskDialog submit", () => {
-  it("submits required fields with the built RRULE and omits host/workspace when unset", async () => {
+  it("submits required fields with the built RRULE on the first online host", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
@@ -567,8 +587,8 @@ describe("CreateScheduledTaskDialog submit", () => {
       agentId: "ag_claude_native",
       // Default schedule model is daily at 09:00.
       rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      hostId: "host_1",
     });
-    expect(arg).not.toHaveProperty("hostId");
     expect(arg).not.toHaveProperty("workspace");
     // Timezone has no visible control but is still inferred + sent: a non-empty
     // IANA-ish string (whatever the test env's local zone resolves to).
@@ -630,6 +650,66 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(screen.getByTestId("schedule-frequency-control")).toHaveClass("w-full");
     expect(screen.getByTestId("schedule-time-control")).toHaveClass("w-full");
     expect(screen.getByTestId("schedule-preset-trigger")).toHaveClass("w-full");
+  });
+
+  it("waits for a host pick when no host is online", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [{ host_id: "host_1", name: "laptop", owner: "me", status: "offline" }],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+
+    // There is no unpinned choice, so a new task needs a host or a sandbox.
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Pick a host");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    expect(screen.queryByRole("option", { name: /fire time/i })).toBeNull();
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+
+    await waitFor(() => expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled());
+  });
+
+  it("keeps the saved workspace in view and in the update when the host changes", async () => {
+    vi.mocked(hostsHook.useHosts).mockReturnValue({
+      data: [
+        { host_id: "host_1", name: "laptop", owner: "me", status: "online" },
+        { host_id: "host_2", name: "desktop", owner: "me", status: "online" },
+      ],
+    } as unknown as ReturnType<typeof hostsHook.useHosts>);
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ hostId: "host_1", workspace: "/home/me/repo" })}
+      />,
+    );
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /desktop/ }));
+
+    // Omitting the workspace would keep the saved one, so the form keeps showing it.
+    expect(screen.getByTestId("task-workspace-browse")).toHaveTextContent("/home/me/repo");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      hostId: "host_2",
+      workspace: "/home/me/repo",
+    });
+  });
+
+  it("keeps an older unpinned task unpinned until a host is picked", async () => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+
+    expect(screen.getByTestId("task-host-trigger")).toHaveTextContent("Most recently active host");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("hostId");
   });
 
   it("lays out Host full-width like the other top-level fields", () => {
@@ -937,6 +1017,220 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
   });
 });
 
+describe("CreateScheduledTaskDialog project", () => {
+  function renderWithProjects(
+    ui: React.ReactElement = <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />,
+  ) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}
+      >
+        {ui}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("hides the project field when the server does not accept task projects", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-project-field")).not.toBeInTheDocument();
+  });
+
+  function fillRequired() {
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+  }
+
+  function openProjectMenu() {
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+  }
+
+  async function submitCreate() {
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    return mutateAsync.mock.calls[0][0];
+  }
+
+  it("sends no project when none is picked", async () => {
+    renderWithProjects();
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    const arg = await submitCreate();
+    expect(arg).not.toHaveProperty("projectId");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("files runs into an existing project picked from the menu", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Triage" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+  });
+
+  it("blocks a second save while a typed project is being created", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    let finishCreate: (id: string) => void = () => undefined;
+    resolveOrCreateProjectId.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    await waitFor(() => expect(submit).toBeDisabled());
+    fireEvent.click(submit);
+    finishCreate("proj_new");
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(resolveOrCreateProjectId).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the picked project when it is renamed before saving", async () => {
+    const view = renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Triage" }));
+    // Another tab renames the project; the list refresh drops the old name.
+    projectsQuery.current = {
+      data: [{ id: "proj_1", name: "Bugs", icon: null }, PROJECTS[1]],
+      isPending: false,
+      isSuccess: true,
+      isError: false,
+    };
+    view.rerender(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    // The trigger follows the picked project's new name.
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Bugs");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("keeps the dialog open and retryable when creating its project fails", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    resolveOrCreateProjectId.mockRejectedValueOnce(new Error("500 Internal Server Error"));
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("create-error")).toHaveTextContent(
+      "500 Internal Server Error",
+    );
+    expect(mutateAsync).not.toHaveBeenCalled();
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ projectId: "proj_new" });
+  });
+
+  it("creates a project from a typed name", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_new");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_new" });
+    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Nightly reports");
+  });
+
+  function renderEditingFiledTask() {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_1" })}
+      />,
+    );
+  }
+
+  it("keeps an edited task's project when it is not changed", async () => {
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("projectId");
+  });
+
+  it("shows a deleted saved project as no project and clears it on save", async () => {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_deleted" })}
+      />,
+    );
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    openProjectMenu();
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Search or create project"), { key: "Escape" });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+
+  it("moves an edited task to another existing project", async () => {
+    renderEditingFiledTask();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reports" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Reports");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: "proj_2" });
+  });
+
+  it("shows a loading label, not a deleted one, while projects load", async () => {
+    projectsQuery.current = { data: undefined, isPending: true, isSuccess: false, isError: false };
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Loading…");
+    openProjectMenu();
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+  });
+
+  it("can unfile a task whose project list fails to load", async () => {
+    projectsQuery.current = { data: undefined, isPending: false, isSuccess: false, isError: true };
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Project unavailable");
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+
+  it("unfiles an edited task's runs when its project is removed", async () => {
+    renderEditingFiledTask();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from Triage" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+});
+
 describe("nested dropdowns do not dismiss the Dialog (isInsidePopper guard)", () => {
   // The guard's decision is pure DOM: is the interaction target inside a Radix
   // popper / Select portal? Unit-test that directly — jsdom can't faithfully
@@ -1047,5 +1341,290 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
     expect(shouldGuardDialogDismiss(plain, { selectOpen: false, msSinceSelectClose: 500 })).toBe(
       false,
     );
+  });
+});
+
+describe("CreateScheduledTaskDialog session mode", () => {
+  function renderWithSessionModes(editingTask?: ScheduledTasksApiModule.ScheduledTask) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={editingTask} />
+      </CapabilitiesProvider>,
+    );
+  }
+
+  function chooseContinue() {
+    const trigger = screen.getByTestId("task-session-mode-trigger");
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("task-session-mode-continue"));
+  }
+
+  it("hides the Session control on a server that does not accept session modes", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-session-mode-field")).toBeNull();
+  });
+
+  it("sends sessionMode only when continue is chosen on create", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    chooseContinue();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ sessionMode: "continue" });
+  });
+
+  it("leaves sessionMode out of a create that keeps a new session per run", async () => {
+    renderWithSessionModes();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("sessionMode");
+  });
+
+  it("says a sandbox automation that continues a session keeps one sandbox", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          scheduled_task_session_modes: true,
+          managed_sandboxes_enabled: true,
+        }}
+      >
+        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />
+      </CapabilitiesProvider>,
+    );
+    chooseContinue();
+    const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    expect(
+      screen.getByText(
+        "Keeps one sandbox for every run, including a session started after a reset. Shutdown follows the server’s sandbox configuration.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("clears the continued session when asked to start a new one on the next run", async () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue", sessionId: "conv_1" }));
+    fireEvent.click(screen.getByTestId("task-start-new-session"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.sessionId).toBeNull();
+    expect(input).not.toHaveProperty("sessionMode");
+  });
+
+  it("offers no new-session option before the first run creates a session", () => {
+    renderWithSessionModes(scheduledTask({ sessionMode: "continue" }));
+    expect(screen.queryByTestId("task-start-new-session")).toBeNull();
+  });
+});
+
+describe("CreateScheduledTaskDialog trigger template", () => {
+  function renderTrigger(
+    source: "jira" | "slack" | "github",
+    extraInfo: Partial<typeof SERVER_INFO_OFFLINE_FALLBACK> = {},
+    sessionLink = "https://omni.example.com/c/CONVERSATION_ID",
+  ) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true, ...extraInfo }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          initialTrigger={source}
+          sessionLink={sessionLink}
+        />
+      </CapabilitiesProvider>,
+    );
+  }
+
+  /** Open a builder Select the Radix-in-jsdom way and pick an option. */
+  function pick(triggerTestId: string, optionTestId: string) {
+    const trigger = screen.getByTestId(triggerTestId);
+    fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId(optionTestId));
+  }
+
+  function type(testId: string, value: string) {
+    fireEvent.change(screen.getByTestId(testId), { target: { value } });
+  }
+
+  function fillJira() {
+    type("task-trigger-scope", "ES");
+    type("task-trigger-instructions", "Triage it.");
+  }
+
+  async function submittedPrompt(): Promise<string> {
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    return mutateAsync.mock.calls[0][0].prompt;
+  }
+
+  it("replaces the prompt with a trigger builder, runs hourly and locks one kept session", () => {
+    renderTrigger("jira");
+
+    expect(screen.getByTestId("task-name-input")).toHaveValue("Jira tickets");
+    expect(screen.queryByTestId("task-prompt-input")).toBeNull();
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Ticket created");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("in project");
+    expect(screen.getByTestId("schedule-preset-trigger")).toHaveTextContent("Hourly");
+    expect(screen.getByTestId("task-session-mode-trigger")).toBeDisabled();
+    expect(screen.getByTestId("task-session-mode-trigger")).toHaveTextContent(
+      "Continue in the same session",
+    );
+    expect(screen.getByTestId("task-trigger-fields")).toHaveTextContent(
+      "Each run starts a session for each of these tickets created since the previous run that meets every condition by then. To allow for slow search indexing, the window starts 5 minutes early, so one created just before the previous run can still count. Older tickets don't, even if they change or start matching later.",
+    );
+    // The form says the source is untrusted and that link-back writes there.
+    const note = screen.getByTestId("task-trigger-untrusted-note");
+    expect(note).toHaveTextContent("Anyone who can write in what you watch can try to steer");
+    expect(note).toHaveTextContent("Link-back posts to Jira with your account.");
+    expect(note).toHaveTextContent(
+      'Anything posted with your account ends with "Sent with Omnigent".',
+    );
+    // Runs can only search where the agent has the service's tools.
+    expect(screen.getByTestId("task-trigger-tools-note")).toHaveTextContent(
+      "This only works if the agent has a Jira MCP server where this task runs. Without one, each run stops and says so in its reply.",
+    );
+    pick("task-trigger-then", "task-trigger-then-none");
+    expect(note).not.toHaveTextContent("Link-back posts");
+    expect(note).toHaveTextContent("Sent with Omnigent");
+  });
+
+  it("keeps submit disabled until the scope, every condition and the instructions are filled", () => {
+    renderTrigger("jira");
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(submit).toBeDisabled();
+    expect(screen.queryByTestId("task-trigger-preview")).toBeNull();
+
+    type("task-trigger-scope", ",");
+    type("task-trigger-instructions", "Triage it.");
+    expect(submit).toBeDisabled();
+    fillJira();
+    expect(submit).toBeEnabled();
+    expect(screen.getByTestId("task-trigger-preview")).toHaveTextContent('project = "ES"');
+
+    // A new row starts empty and blocks saving until it's filled in or removed.
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("task-trigger-empty-condition")).toHaveTextContent(
+      "Fill in or remove each condition.",
+    );
+    type("task-trigger-condition-0-value", "omnigent");
+    expect(submit).toBeEnabled();
+    fireEvent.click(screen.getByTestId("task-trigger-condition-0-remove"));
+    expect(screen.queryByTestId("task-trigger-condition-0")).toBeNull();
+    expect(submit).toBeEnabled();
+
+    // Over-long instructions would crowd the item out of a worker's first message.
+    type("task-trigger-instructions", "x".repeat(2001));
+    expect(submit).toBeDisabled();
+    expect(screen.getByTestId("task-trigger-too-long")).toHaveTextContent(
+      "Keep instructions to 2,000 characters or fewer",
+    );
+  });
+
+  it("compiles the builder rows into the saved hourly continue-mode task", async () => {
+    // A host-transformed link isn't a prefix, so it must reach the prompt as given.
+    renderTrigger("jira", {}, "https://host.example.com/embed#/c/CONVERSATION_ID?o=42");
+    fillJira();
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    type("task-trigger-condition-0-value", "omnigent");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-1-field", "task-trigger-condition-1-field-issuetype");
+    pick("task-trigger-condition-1-operator", "task-trigger-condition-1-operator-is_not");
+    type("task-trigger-condition-1-value", "Epic");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-2-field", "task-trigger-condition-2-field-jql");
+    // A raw JQL row has one operator, shown as a fixed word.
+    expect(screen.queryByTestId("task-trigger-condition-2-operator")).toBeNull();
+    expect(screen.getByTestId("task-trigger-condition-2")).toHaveTextContent("matches");
+    type("task-trigger-condition-2-value", 'summary ~ "crash"');
+
+    const prompt = await submittedPrompt();
+    const arg = mutateAsync.mock.calls[0][0];
+    expect(arg).toMatchObject({ name: "Jira tickets", sessionMode: "continue" });
+    expect(arg.rrule).toMatch(/^FREQ=HOURLY/);
+    expect(prompt).toContain(
+      '(project = "ES" AND labels = "omnigent" AND issuetype != "Epic" AND (summary ~ "crash")) AND created >= <that time> ORDER BY created ASC',
+    );
+    expect(prompt).toContain('placement "same_host"');
+    expect(prompt).toContain(
+      'Comment "Omnigent session: https://host.example.com/embed#/c/CONVERSATION_ID?o=42" on each ticket',
+    );
+    expect(prompt).toContain("Instructions for each session:\nTriage it.\n");
+  });
+
+  it("hides the value box for an assignee row that is unassigned", async () => {
+    renderTrigger("jira");
+    fillJira();
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-assignee");
+    pick("task-trigger-condition-0-operator", "task-trigger-condition-0-operator-empty");
+    expect(screen.getByTestId("task-trigger-condition-0-operator")).toHaveTextContent(
+      "is unassigned",
+    );
+    // Nothing to fill in, so the row neither shows a value box nor blocks saving.
+    expect(screen.queryByTestId("task-trigger-condition-0-value")).toBeNull();
+    expect(screen.queryByTestId("task-trigger-empty-condition")).toBeNull();
+
+    expect(await submittedPrompt()).toContain('(project = "ES" AND assignee is EMPTY)');
+  });
+
+  it("starts each worker in its own sandbox when the automation runs in a sandbox", async () => {
+    renderTrigger("jira", { managed_sandboxes_enabled: true });
+    fillJira();
+    const host = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(host, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(host);
+    fireEvent.click(screen.getByTestId("task-host-sandbox-option"));
+
+    const prompt = await submittedPrompt();
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ executionTarget: "managed_sandbox" });
+    expect(prompt).toContain('placement "managed"');
+  });
+
+  it("leaves the link-back step out when then only starts the session", async () => {
+    renderTrigger("slack");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Message posted");
+    type("task-trigger-scope", "#eng-support");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    type("task-trigger-condition-0-value", "error");
+    type("task-trigger-instructions", "Reproduce it.");
+    pick("task-trigger-then", "task-trigger-then-none");
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain(
+      'Watch: new Slack messages in #eng-support whose text contains "error"',
+    );
+    expect(prompt).not.toContain("Omnigent session:");
+  });
+
+  it("hands the rendered prompt to the plain Prompt field on Edit as prompt", () => {
+    renderTrigger("github");
+    expect(screen.getByTestId("task-trigger-event")).toHaveTextContent("Issue opened");
+    pick("task-trigger-event", "task-trigger-event-pr");
+    type("task-trigger-scope", "acme/app");
+    type("task-trigger-instructions", "Fix it.");
+    fireEvent.click(screen.getByTestId("task-trigger-edit-as-prompt"));
+
+    expect(screen.queryByTestId("task-trigger-fields")).toBeNull();
+    const prompt = screen.getByTestId("task-prompt-input") as HTMLTextAreaElement;
+    expect(prompt.value).toContain("repo:acme/app is:pr created:>=<that time>");
+    // The kept session stays, but the user may now change it.
+    expect(screen.getByTestId("task-session-mode-trigger")).toBeEnabled();
   });
 });
