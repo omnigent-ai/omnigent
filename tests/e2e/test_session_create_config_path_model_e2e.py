@@ -38,8 +38,8 @@ def _spec(name: str, model: str, mock: str) -> dict[str, object]:
 # Older servers reject a multipart model_override, and older runners drop the
 # model and refuse the effort.
 pytestmark = [
-    pytest.mark.min_server_version("0.20.0"),
-    pytest.mark.min_runner_version("0.20.0"),
+    pytest.mark.min_server_version("0.21.0"),
+    pytest.mark.min_runner_version("0.21.0"),
 ]
 
 
