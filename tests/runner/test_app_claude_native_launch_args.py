@@ -688,6 +688,7 @@ def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
 
     assert _augmented(bridge_dir, auto_harness=False) == baseline
     assert "--append-system-prompt" not in baseline
+    assert "--append-system-prompt-file" not in baseline
     assert "--allowedTools" not in baseline
 
 

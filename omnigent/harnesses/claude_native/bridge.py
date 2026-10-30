@@ -545,6 +545,13 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_INVOCATION_MCP_CONFIG_FILE = "claude-mcp-config.json"
+_APPEND_SYSTEM_PROMPT_FILE = "claude-append-system-prompt.md"
+_APPEND_SYSTEM_PROMPT_FILE_FLAG = "--append-system-prompt-file"
+# Inline instructions keep Claude's ``/fork`` available; launches whose args
+# would pass this size move them to a file, leaving room under tmux's 16KB
+# command cap for the wrapper, environment and tmux options.
+_INLINE_LAUNCH_ARGS_BUDGET_BYTES = 8 * 1024
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -2835,8 +2842,8 @@ def augment_claude_args(
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+        (author-supplied, not framework-composed) appended to Claude Code's
+        system prompt; see :func:`_with_append_system_prompt`.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2868,16 +2875,18 @@ def augment_claude_args(
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
+    # A file, not inline JSON: the whole command must fit in one tmux
+    # ``new-session`` call, which tmux rejects above its 16KB command cap.
+    mcp_config_path = bridge_dir / _INVOCATION_MCP_CONFIG_FILE
+    _write_json_file(mcp_config_path, mcp_config)
     args.extend(
         [
             "--mcp-config",
-            json.dumps(mcp_config, separators=(",", ":")),
+            str(mcp_config_path),
             "--settings",
             str(settings_path),
         ]
     )
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -2891,9 +2900,117 @@ def augment_claude_args(
     if workspace is not None:
         roots = (workspace, bundle_dir) if bundle_dir is not None else (workspace,)
         args.extend(claude_agents_skill_args(bridge_dir, roots, skills_filter))
+    args = _with_append_system_prompt(args, bridge_dir, append_system_prompt, workspace)
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
+
+
+def _with_append_system_prompt(
+    args: list[str],
+    bridge_dir: Path,
+    append_system_prompt: str | None,
+    workspace: Path | None,
+) -> list[str]:
+    """
+    Return ``args`` with the agent's instructions appended.
+
+    Claude Code refuses ``/fork`` in a session started with
+    ``--append-system-prompt-file``, so instructions stay inline unless the
+    inline launch would exceed :data:`_INLINE_LAUNCH_ARGS_BUDGET_BYTES`; then
+    they go through an owner-only file so the launch still fits in tmux.
+    Claude Code rejects an inline prompt next to a prompt file, so the user's
+    own prompt flag decides the form: an inline one keeps the instructions
+    inline, and a prompt file gets a bridge copy that also holds them.
+
+    :param args: Claude args assembled so far, including the user's own,
+        e.g. ``["--resume", "abc", "--settings", "/bridge/claude-settings.json"]``.
+    :param bridge_dir: Bridge directory that holds the prompt file.
+    :param append_system_prompt: Raw ``AgentSpec.instructions``, or
+        ``None`` when the agent has none.
+    :param workspace: Directory a relative user prompt-file path resolves
+        against; ``None`` uses the current directory.
+    :returns: The launch args with the instructions applied.
+    """
+    prompt_path = bridge_dir / _APPEND_SYSTEM_PROMPT_FILE
+    # A previous launch's instructions must not outlive this launch's args.
+    prompt_path.unlink(missing_ok=True)
+    if not append_system_prompt:
+        return args
+    user_file_index = _last_append_system_prompt_file_index(args)
+    if user_file_index is not None:
+        return _merge_into_user_prompt_file(
+            args, user_file_index, prompt_path, append_system_prompt, workspace
+        )
+    inline_args = [*args, "--append-system-prompt", append_system_prompt]
+    user_sets_inline_prompt = any(
+        arg.partition("=")[0] == "--append-system-prompt" for arg in args
+    )
+    if (
+        user_sets_inline_prompt
+        or len(shlex.join(inline_args).encode()) <= _INLINE_LAUNCH_ARGS_BUDGET_BYTES
+    ):
+        return inline_args
+    _write_private_text_file(prompt_path, append_system_prompt)
+    return [*args, _APPEND_SYSTEM_PROMPT_FILE_FLAG, str(prompt_path)]
+
+
+def _last_append_system_prompt_file_index(args: Sequence[str]) -> int | None:
+    """
+    Return the index of the last ``--append-system-prompt-file`` value in ``args``.
+
+    :param args: Claude args, e.g. ``["--append-system-prompt-file", "p.md"]``
+        or ``["--append-system-prompt-file=p.md"]``.
+    :returns: Index of the arg holding the path, or ``None`` when absent.
+    """
+    found: int | None = None
+    for index, arg in enumerate(args):
+        if arg.startswith(f"{_APPEND_SYSTEM_PROMPT_FILE_FLAG}="):
+            found = index
+        elif arg == _APPEND_SYSTEM_PROMPT_FILE_FLAG and index + 1 < len(args):
+            found = index + 1
+    return found
+
+
+def _merge_into_user_prompt_file(
+    args: list[str],
+    value_index: int,
+    prompt_path: Path,
+    append_system_prompt: str,
+    workspace: Path | None,
+) -> list[str]:
+    """
+    Point the user's prompt-file arg at a bridge copy that also holds the instructions.
+
+    :param args: Claude args containing the user's prompt-file flag.
+    :param value_index: Index of the arg holding the user's path, from
+        :func:`_last_append_system_prompt_file_index`.
+    :param prompt_path: Bridge prompt file to write.
+    :param append_system_prompt: Raw ``AgentSpec.instructions``.
+    :param workspace: Directory a relative user path resolves against.
+    :returns: ``args`` with the user's path replaced, or unchanged when the
+        user's file cannot be read.
+    """
+    arg = args[value_index]
+    is_joined = arg.startswith(f"{_APPEND_SYSTEM_PROMPT_FILE_FLAG}=")
+    user_path = Path(arg.partition("=")[2] if is_joined else arg).expanduser()
+    if not user_path.is_absolute():
+        user_path = (workspace or Path.cwd()) / user_path
+    try:
+        user_prompt = user_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _logger.warning(
+            "Agent instructions not applied: cannot read --append-system-prompt-file %s: %s",
+            user_path,
+            exc,
+        )
+        return args
+    _write_private_text_file(prompt_path, f"{user_prompt.rstrip()}\n\n{append_system_prompt}")
+    merged = list(args)
+    merged[value_index] = (
+        f"{_APPEND_SYSTEM_PROMPT_FILE_FLAG}={prompt_path}" if is_joined else str(prompt_path)
+    )
+    return merged
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
@@ -10790,6 +10907,17 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
+    _write_private_text_file(path, json.dumps(payload, separators=(",", ":")))
+
+
+def _write_private_text_file(path: Path, text: str) -> None:
+    """
+    Atomically write a text file with owner-only permissions.
+
+    :param path: File path inside a bridge directory.
+    :param text: File contents.
+    :returns: None.
+    """
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
     try:
@@ -10802,7 +10930,7 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
             delete=False,
         ) as handle:
             tmp_path = Path(handle.name)
-            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)
