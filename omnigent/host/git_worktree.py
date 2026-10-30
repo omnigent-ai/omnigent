@@ -512,6 +512,10 @@ def _discard_created_branch(repo_root: str, branch_name: str, created_commit: st
         if deleted.returncode != 0:
             detail = deleted.stderr.strip() or f"exit {deleted.returncode}"
             _logger.warning("Keeping branch %s: %s", branch_name, detail)
+            return
+        # Like ``git branch -D``, drop the upstream ``git branch`` recorded, so a
+        # retry from another start point does not inherit it.
+        _run_git(["config", "--remove-section", f"branch.{branch_name}"], cwd=repo_root)
     except WorktreeError:
         _logger.warning(
             "Could not roll back branch %s after a failed worktree add", branch_name, exc_info=True

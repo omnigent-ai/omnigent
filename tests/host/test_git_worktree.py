@@ -806,6 +806,34 @@ def test_create_worktree_failed_add_rolls_back_branch(
     assert _current_branch(Path(created.worktree_path)) == "feature/slow"
 
 
+def test_failed_add_rollback_drops_branch_tracking(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry from a local start point does not inherit the rolled-back branch's upstream."""
+    _git(git_repo, "remote", "add", "origin", str(git_repo))
+    _git(git_repo, "fetch", "-q", "origin")
+    _git(git_repo, "config", "branch.autoSetupMerge", "true")
+    real_run = git_worktree_module._run_git
+    tracked_before_rollback: list[str] = []
+
+    def fail_add(args: list[str], *, cwd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["worktree", "add"] and not tracked_before_rollback:
+            upstream = real_run(["config", "branch.feature/track.merge"], cwd=cwd).stdout
+            tracked_before_rollback.append(upstream.strip())
+            return subprocess.CompletedProcess(args, 128, "", "fatal: disk full")
+        return real_run(args, cwd=cwd, **kwargs)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", fail_add)
+    with pytest.raises(WorktreeError, match="disk full"):
+        create_worktree(
+            repo_path=str(git_repo), branch_name="feature/track", base_branch="origin/main"
+        )
+    assert tracked_before_rollback == ["refs/heads/main"]
+    assert not _branch_exists(git_repo, "feature/track")
+    created = create_worktree(repo_path=str(git_repo), branch_name="feature/track")
+    assert _rev_parse(Path(created.worktree_path), "@{upstream}") == ""
+
+
 def test_create_worktree_add_start_failure_rolls_back_branch(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
