@@ -236,6 +236,11 @@ def test_private_manager_launch_send_read_and_sharing(
                     json={"user_id": "__public__", "level": 1},
                 )
                 assert shared.status_code == 200, shared.text
+                shared = client.put(
+                    f"/v1/sessions/{manager}/permissions",
+                    json={"user_id": "__public__", "level": 1},
+                )
+                assert shared.status_code == 200, shared.text
                 configure("WORKER_TASK", [{"text": "WORKER_RESULT"}])
                 configure(
                     "MANAGER_SEND",
@@ -386,7 +391,7 @@ def test_private_manager_launch_send_read_and_sharing(
 
                 shared = client.put(
                     f"/v1/sessions/{manager}/permissions",
-                    json={"user_id": "__public__", "level": 1},
+                    json={"user_id": "viewer@example.test", "level": 2},
                 )
                 assert shared.status_code == 200, shared.text
                 configure(
@@ -401,13 +406,29 @@ def test_private_manager_launch_send_read_and_sharing(
                                 )
                             ]
                         },
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_create",
+                                    {"agent_id": agent, "placement": "same_host"},
+                                    "blocked-create",
+                                )
+                            ]
+                        },
                         {"text": "MANAGER_BLOCKED"},
                     ],
                 )
                 send(manager, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK")
                 wait_text(manager, "MANAGER_BLOCKED")
                 assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
-                assert "Shared sessions cannot" in json.dumps(get_mock_requests(mock))
+                for call_id in ("blocked", "blocked-create"):
+                    assert "edit sharing" in json.dumps(tool_results(call_id))
+                assert {
+                    row["id"]
+                    for row in client.get("/v1/sessions", params={"visibility": "mine"}).json()[
+                        "data"
+                    ]
+                } == before_managed
 
                 configure(
                     "SCHEDULED_MANAGER_TASK",
@@ -511,4 +532,29 @@ def test_private_manager_launch_send_read_and_sharing(
                 assert "SIDE_CHAT_MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 # Native tool results reach the model without entering the UI transcript.
                 side_chat_results = tool_results("side-chat-message")
-                assert "Shared sessions cannot" in json.dumps(side_chat_results)
+                assert "edit sharing" in json.dumps(side_chat_results)
+
+                shared = client.put(
+                    f"/v1/sessions/{manager}/permissions",
+                    json={"user_id": "viewer@example.test", "level": 1},
+                )
+                assert shared.status_code == 200, shared.text
+                configure("RECOVERED_TASK", [{"text": "RECOVERED_RESULT"}])
+                configure(
+                    "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK_RECOVER",
+                    [
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_message",
+                                    {"session_id": worker, "message": "RECOVERED_TASK"},
+                                    "recovered-send",
+                                )
+                            ]
+                        },
+                        {"text": "MANAGER_RECOVERED"},
+                    ],
+                )
+                send(manager, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK_RECOVER")
+                wait_text(manager, "MANAGER_RECOVERED")
+                wait_text(worker, "RECOVERED_RESULT")

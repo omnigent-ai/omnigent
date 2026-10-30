@@ -1,14 +1,14 @@
 # Session orchestration
 
-An agent in a private session can send work to another session owned by the
-same user, then read its status/history. It can also create private top-level
+An agent in a private or read-only shared session can send work to another
+session owned by the same user, then read its status/history. It can also create private top-level
 workers on its host or a new managed sandbox. This is enabled by default, with
 `-session_orchestration` in `OMNIGENT_FEATURES` as a server kill switch.
 
 ## Sub-features
 
-- `message`: private sender, same owner and workspace; shared destinations are
-  allowed and their readers see the message. Normal queue/steering applies.
+- `message`: sender without edit sharing, same owner and workspace; shared
+  destinations are allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
@@ -25,16 +25,18 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
-- `sharing`: sharing the sender blocks subsequent sends and independent creates.
-  Side chats and their children also inherit restrictions from the source chain.
-  Accepted work, including tasks saved while a worker starts, continues. Making
-  the sender private restores eligibility.
+- `sharing`: read-only sharing permits subsequent sends and independent creates.
+  Any explicit EDIT-or-higher grant to another user (including public write)
+  blocks both operations, even for the owner. Child-local grants and the entire
+  parent/side-chat source chain are checked. Accepted work continues. Removing
+  or downgrading the last editor restores eligibility, including retained work;
+  there is no per-message requester tracking.
 - `scheduled`: scheduled runs, their forks and children use the new sends and
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
-- `refusal`: disabled flag, another owner, shared sender or wrong runner binding
+- `refusal`: disabled flag, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
   acknowledgements are uncertain and must not auto-retry. After uncertain
@@ -81,17 +83,19 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   tests/e2e/test_private_session_orchestration.py --reruns 0` uses real local
   host, server, SDK and Codex processes with a scripted model. It submits chat
   requests over HTTP and checks send, history reads, same-host creation, and
-  sharing refusal. It also checks that unconfigured managed creation gives a clear
-  refusal without creating a session. Codex and tmux are required for the native row.
+  read-only sharing, edit-sharing refusal and recovery after a downgrade. It also
+  checks that unconfigured managed creation refuses without creating a session. Codex and tmux are required for the native row.
   Both harnesses also exercise a server restart with the explicit kill switch:
   existing runners remain opted in, but their subsequent peer sends and independent
   creates are refused without writes; session-info reads still work.
   It also fires an owner-created schedule through the real server/host and checks
-  that the resulting worker cannot message a peer or create an independent worker.
+  that the resulting private worker can message a peer and create an independent worker.
 - Component integration: `uv run --no-sync pytest
   tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   authenticated routes, ownership stores, refusal matrix and managed request /
-  durable startup contract with simulated provisioning. It covers default provider
+  durable startup contract with simulated provisioning. It checks legacy permission
+  adapters through app construction: private senders still work, but read-only
+  shared senders remain refused. It covers default provider
   selection for OSS and embedding configurations. Runner tests cover an absent
   orchestration route without falling back to ordinary creation.
   Two ASGI replicas sharing a database verify host routing for root, child and
@@ -105,8 +109,10 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   and its children.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
-  read it. Share the manager and repeat: the tool must report refusal and the
-  destination must contain no new task. API runs do not prove these UI actions.
+  read it. Give a viewer read-only access to the manager and repeat: messaging
+  and independent creation must work. Upgrade to edit access: both must be refused
+  even for the owner, and the destination must contain no new task. Downgrade to
+  read-only: delegation resumes. API runs do not prove these UI actions.
   Append `-session_orchestration` to the isolated server's feature settings and
   restart it, then repeat from a private manager: expect a disabled error, no new
   task and no independent worker. Read history/info to confirm reads still work.
@@ -141,18 +147,18 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
-- A shared receiver can continue working but cannot message back while shared.
-- Privacy checks govern these tools. They do not confine arbitrary code holding
+- A shared receiver can continue working; edit sharing blocks its outgoing delegation.
+- Sharing checks govern these tools. They do not confine arbitrary code holding
   owner credentials or sanitize shared content the manager reads.
 - The source token authenticates its runner, not an exact session within that
   runner. Runners are trusted for every session they host: another private owned
   session on the same runner can be named as the source. Stable-ID runner pools
   using allow-listed tunnel tokens are unsupported;
   this gate requires token-derived runner IDs and refuses other bindings.
-- Side chats must be private and have a private, owned, available source chain
+- Side chats need an owned, available source chain without edit sharing
   to send work or create independent workers. Nested side chats and their children
   inherit this restriction. Missing or cyclic source chains are refused. Ordinary
-  reads and incoming work remain available; making the source private restores
+  reads and incoming work remain available; removing the source's last editor restores
   eligibility without erasing copied history.
 - Peer messages carry only task text and owner attribution. They do not forward
   per-event model/tool overrides or a caller-supplied delivery ID.
@@ -181,7 +187,14 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or
   per-owner settings page is needed.
-  V1 treats eligible private agents as delegates across the owner's sessions.
+  V1 treats eligible agents without edit sharing as delegates across the owner's sessions.
   Unlike sharing, messaging does not grant another user access, but untrusted
   content can still influence an agent to steer other owned sessions. Enabling
   the flag accepts that broader trust; hiding a tool is not authorization.
+
+- SQL permission stores support read-only sharing using existing grants and the
+  per-session index; no migration or new index is required. Large reader lists
+  can make the grant check more expensive. Custom stores retain private-only
+  behavior until they implement a complete writer check. Implicit administrator
+  access does not count as an explicit sharing grant. Managed deployment needs
+  its own adapter support and live verification.

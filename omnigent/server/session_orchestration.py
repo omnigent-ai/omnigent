@@ -1,4 +1,4 @@
-"""Owner-authorized orchestration from private sessions using existing delivery."""
+"""Owner-authorized orchestration from sessions without edit sharing."""
 
 from fastapi import Request
 
@@ -28,7 +28,7 @@ def require_owned_session(
     conversations: ConversationStore,
     permissions: PermissionStore,
     *,
-    private: bool = False,
+    no_edit_sharing: bool = False,
 ) -> Conversation:
     """Resolve actual ownership and inherited sharing, without administrator bypass."""
     session_id = normalize_uuid(identifier)
@@ -40,23 +40,22 @@ def require_owned_session(
         if is_session_closed(current.labels, current.title):
             break
         seen.add(current.id)
+        if no_edit_sharing and permissions.has_other_write_grants(current.id, user_id):
+            raise OmnigentError(
+                "Sessions with edit sharing cannot send messages or launch independent sessions. "
+                "Read-only sharing requires a permission store that supports it.",
+                code=ErrorCode.FORBIDDEN,
+            )
         if current.parent_conversation_id is not None:
             current = conversations.get_conversation(current.parent_conversation_id)
             continue
         grant = permissions.get(user_id, current.id)
         if grant is None or grant.level != LEVEL_OWNER:
             break
-        if private:
-            # Child access comes from the root, including public/read-only grants.
-            grants, cursor = permissions.list_for_session(current.id, limit=2)
-            if cursor is not None or any(g.user_id != user_id for g in grants):
-                raise OmnigentError(
-                    "Shared sessions cannot send messages or launch independent sessions",
-                    code=ErrorCode.FORBIDDEN,
-                )
-            if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
-                # Side chats keep their own grants but inherit source restrictions.
-                source_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+        if no_edit_sharing:
+            source_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+            if source_id or current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+                # The protected source link survives clearing the display marker.
                 current = conversations.get_conversation(source_id) if source_id else None
                 continue
         assert session is not None
@@ -72,7 +71,7 @@ def require_orchestration_source(
     *,
     target_id: str | None = None,
 ) -> Conversation:
-    """Check the bound runner, private sender and optional same-owner destination."""
+    """Check the bound runner, sender sharing and optional same-owner destination."""
     if not request.app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION):
         raise OmnigentError("Session orchestration is disabled", code=ErrorCode.FORBIDDEN)
     if not user_id or permissions is None:
@@ -82,7 +81,7 @@ def require_orchestration_source(
         user_id,
         conversations,
         permissions,
-        private=True,
+        no_edit_sharing=True,
     )
     token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
     if not token or not source.runner_id or token_bound_runner_id(token) != source.runner_id:
