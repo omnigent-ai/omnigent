@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -51,6 +51,7 @@ class _LaunchHarness:
     resets: list[dict[str, Any]]
     probe: AsyncMock
     response_status: dict[str, int]
+    workspace_models: Mock
 
     async def launch(self) -> SessionResourceView:
         """Run the production launch path, including snapshot and catalog reads."""
@@ -103,6 +104,18 @@ async def codex_launch_harness(
     monkeypatch.setattr(
         "omnigent.harnesses.codex_native.process_registry.reap_codex_native_processes_for_state_dir",
         lambda _path: None,
+    )
+    databrickscfg = tmp_path / "databrickscfg"
+    databrickscfg.write_text("[session-provider]\nhost = https://workspace.example.com\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(databrickscfg))
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        lambda _profile: SimpleNamespace(token="workspace-token"),
+    )
+    workspace_models = Mock(return_value=())
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+        workspace_models,
     )
 
     def resolve_launch(
@@ -218,6 +231,7 @@ async def codex_launch_harness(
             resets=resets,
             probe=probe,
             response_status=response_status,
+            workspace_models=workspace_models,
         )
     await runner_native._cancel_auto_forwarder_task(_SESSION_ID)
     runner_native._AUTO_CODEX_APP_SERVERS.pop(_SESSION_ID, None)
@@ -245,6 +259,30 @@ async def test_equivalent_gateway_pick_launches_without_reset(
     assert harness.app_server.env["OMNIGENT_CLIENT_SURFACE"] == "desktop"
     assert harness.resets == []
     harness.probe.assert_not_awaited()
+    harness.workspace_models.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pick_served_by_the_profile_workspace_launches_without_reset(
+    codex_launch_harness: _LaunchHarness,
+) -> None:
+    """The profile's workspace listing outranks a Codex list that omits a served pick."""
+    harness = codex_launch_harness
+    pick = "gpt-6.1-sol"
+    harness.snapshot["model_override"] = pick
+    harness.seed_catalog(
+        [{"id": "system.ai.gpt-5-6-sol", "model": "system.ai.gpt-5-6-sol", "isDefault": True}]
+    )
+    harness.workspace_models.return_value = ("system.ai.gpt-5-6-sol", "system.ai.gpt-6-1-sol")
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == pick
+    assert harness.resets == []
+    assert harness.snapshot["model_override"] == pick
+    harness.workspace_models.assert_called_once_with(
+        "https://workspace.example.com", "workspace-token"
+    )
 
 
 @pytest.mark.asyncio

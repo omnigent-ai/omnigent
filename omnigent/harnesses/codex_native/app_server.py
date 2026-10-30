@@ -3699,10 +3699,7 @@ def _resolve_databricks_codex_model(
     :returns: The model id to pin on the codex launch.
     """
     from omnigent.models import model_catalog_store
-    from omnigent.models.databricks_model_discovery import (
-        discover_databricks_codex_models,
-        select_servable_model,
-    )
+    from omnigent.models.databricks_model_discovery import select_servable_model
 
     if requested:
         profile_host = _read_databrickscfg_host(profile)
@@ -3716,6 +3713,39 @@ def _resolve_databricks_codex_model(
                 model = next((row.get("model") for row in rows if row.get("id") == slug), None)
                 if isinstance(model, str) and model.strip():
                     return model.strip()
+
+    servable = _databricks_servable_codex_models(host, profile)
+    if requested:
+        return select_servable_model(requested, servable) or requested
+    if servable:
+        return servable[0]
+    return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+
+
+def databricks_profile_serves_codex_model(profile: str, model: str) -> bool:
+    """
+    Report whether a Databricks profile's workspace serves *model* to Codex.
+
+    Uses the same listing a profile launch resolves its model from, so a
+    ``True`` answer means the launch will pin that workspace's served id.
+
+    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+    :param model: Model id in any spelling, e.g. ``"gpt-6.1-sol"``.
+    :returns: ``True`` when the workspace lists the model on the codex route;
+        ``False`` when it does not, or no listing could be read.
+    """
+    from omnigent.models.databricks_model_discovery import select_servable_model
+
+    host = _databricks_gateway_host(profile)
+    if not host:
+        return False
+    servable = _databricks_servable_codex_models(host.rstrip("/"), profile)
+    return select_servable_model(model, servable) is not None
+
+
+def _databricks_servable_codex_models(host: str, profile: str) -> tuple[str, ...]:
+    """List codex-servable ids live, then from ucode's cached copy; empty when neither reads."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
     servable: tuple[str, ...] = ()
     try:
@@ -3750,12 +3780,7 @@ def _resolve_databricks_codex_model(
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
-
-    if requested:
-        return select_servable_model(requested, servable) or requested
-    if servable:
-        return servable[0]
-    return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
+    return servable
 
 
 def build_codex_native_server(
