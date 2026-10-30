@@ -68,6 +68,9 @@ RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _RUNNER_RECOVERY_SLOW_SEC = 30.0
 # WebSocket close codes a runner sends on purpose: 1000 normal, 1001 going away.
 _CLEAN_CLOSE_CODES = frozenset({1000, 1001})
+# How long teardown waits for the receive loop to read a peer close that a
+# failed send reached first.
+_PEER_CLOSE_READ_GRACE_S = 1.0
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -748,6 +751,17 @@ def create_runner_tunnel_router(
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
         finally:
+            if (
+                receive_task is not None
+                and not receive_task.done()
+                and session is not None
+                and session.close_code is None
+                and _send_side_disconnected(owned, receive_task)
+                and not _current_task_cancelling()
+            ):
+                # A send can fail on a peer close the receive loop has not read
+                # yet; let it read that close so its reason (idle shutdown) survives.
+                await asyncio.wait({receive_task}, timeout=_PEER_CLOSE_READ_GRACE_S)
             ended_at = time.time()
             for task in owned:
                 task.cancel()
@@ -776,6 +790,25 @@ def create_runner_tunnel_router(
                         _logger.exception("on_runner_disconnect callback failed for %s", runner_id)
 
     return router
+
+
+def _send_side_disconnected(
+    owned: list[asyncio.Task[None]], receive_task: asyncio.Task[None]
+) -> bool:
+    """Return whether a helper other than the receive loop ended on a disconnect."""
+    return any(
+        task is not receive_task
+        and task.done()
+        and not task.cancelled()
+        and isinstance(task.exception(), WebSocketDisconnect)
+        for task in owned
+    )
+
+
+def _current_task_cancelling() -> bool:
+    """Return whether the running task has a pending cancellation request."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 async def _run_connect_hook(

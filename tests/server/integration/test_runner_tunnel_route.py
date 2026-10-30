@@ -2692,6 +2692,67 @@ async def _peer_close_racing_a_send(close_reason: str, connection_id: str) -> li
     return reasons
 
 
+async def test_send_failing_before_the_peer_close_is_read_keeps_its_reason() -> None:
+    """A send that hits the runner's closed socket before the receive loop reads the
+    close must not cancel that read and drop the idle-shutdown reason."""
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+
+    registry = TunnelRegistry()
+    reasons: list[str | None] = []
+
+    async def on_disconnect(_runner_id: str, connection: RunnerSession) -> None:
+        reasons.append(connection.peer_close_reason)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_disconnect=on_disconnect),
+        prefix="/v1",
+    )
+    peer_closing = False
+    send_failed = asyncio.Event()
+
+    async def uvicorn_like(scope, receive, send):  # type: ignore[no-untyped-def]
+        async def lagging_receive():  # type: ignore[no-untyped-def]
+            message = await receive()
+            if message["type"] == "websocket.disconnect":
+                # The protocol saw the close; the app reads it after the failed send.
+                await send_failed.wait()
+                await asyncio.sleep(0.05)
+            return message
+
+        async def closing_send(message):  # type: ignore[no-untyped-def]
+            if peer_closing and message["type"] == "websocket.send":
+                send_failed.set()
+                # uvicorn's ClientDisconnected, which Starlette turns into a 1006.
+                raise OSError("client disconnected")
+            await send(message)
+
+        await app(scope, lagging_receive, closing_send)
+
+    communicator = ApplicationCommunicator(uvicorn_like, _websocket_scope(_TUNNEL_PATH))
+    try:
+        await communicator.send_input({"type": "websocket.connect"})
+        accepted = await communicator.receive_output(timeout=budget(1.0))
+        assert accepted["type"] == "websocket.accept"
+        await _send_hello(communicator, registry, connection_id="conn-send-first")
+        session = registry.get(_RUNNER_ID)
+        assert session is not None
+        peer_closing = True
+        await communicator.send_input(
+            {
+                "type": "websocket.disconnect",
+                "code": 1000,
+                "reason": RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
+            }
+        )
+        await registry.send_text(session, encode_frame(PingFrame(ts=0)))
+        await asyncio.wait_for(communicator.future, timeout=budget(2.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+    assert reasons == [RUNNER_IDLE_SHUTDOWN_CLOSE_REASON]
+
+
 async def test_peer_close_racing_a_send_keeps_the_peer_close_reason(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
