@@ -1234,13 +1234,19 @@ class TerminalHost:
             import time as _time
 
             buf = event.app.current_buffer
-            if buf.text:
+            picker = self._question_picker
+            if buf is self._answer_buffer and picker is not None:
+                if buf.text != picker.prefill:
+                    # Back to the question's own text: a fixed default is
+                    # never wiped from view while Enter would still send it.
+                    self._start_answer(picker)
+                    self._exit_confirm_deadline = None
+                    return
+            elif buf.text:
                 # Clear the input field; cancel any pending exit hint.
-                # Drop paste registrations too so ``#N`` restarts at 1
-                # (they belong to the chat line, not an answer).
+                # Drop paste registrations too so ``#N`` restarts at 1.
                 buf.reset()
-                if buf is not self._answer_buffer:
-                    self._pasted_blocks = []
+                self._pasted_blocks = []
                 self._exit_confirm_deadline = None
                 return
             now = _time.monotonic()
@@ -1377,6 +1383,8 @@ class TerminalHost:
                         marker=self._marker,
                     )
                     n = min(_prompt_input_max_rows(), n)
+                    if self._question_picker is not None:
+                        n = 1  # the draft waits on one row; the selector needs the room
                     # When the completion popup is visible, request
                     # extra rows so the renderer claims enough
                     # terminal space for the menu to render below
@@ -3682,6 +3690,7 @@ class TerminalHost:
         self._question_picker = picker
         self._start_answer(picker)
         self._focus(self._answer_window)
+        self._show_long_question(picker)
         self._invalidate_prompt()
         try:
             return await picker.future
@@ -3701,12 +3710,29 @@ class TerminalHost:
         """Render the open question selector; empty when none is open."""
         if self._question_picker is None:
             return FormattedText([])
-        return FormattedText(self._question_picker.render(self._picker_width()))
+        return FormattedText(
+            self._question_picker.render(self._picker_width(), self._picker_rows())
+        )
 
     def _question_picker_line_count(self) -> int:
         if self._question_picker is None:
             return 0
-        return self._question_picker.line_count(self._picker_width())
+        return self._question_picker.line_count(self._picker_width(), self._picker_rows())
+
+    def _picker_rows(self) -> int:
+        """Rows the selector may use: the screen less the input, toolbar and answer line."""
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = _term_height()
+        answer_rows = self._answer_line_count() if self._answer_line_shown() else 0
+        # One row for the waiting chat draft, plus a safety margin.
+        return rows - 1 - _PROMPT_INPUT_RESERVED_UI_ROWS - answer_rows - 1
+
+    def _show_long_question(self, picker: QuestionPicker) -> None:
+        """Print the current question in full above the selector when it can't fit there."""
+        if picker.question_overflows(self._picker_width()):
+            self.output(Text(f" ? {picker.current.question}"))
 
     def _picker_width(self) -> int:
         try:
@@ -3726,6 +3752,7 @@ class TerminalHost:
             return
         if picker.answer(self._answer_buffer.text) and not picker.future.done():
             self._start_answer(picker)  # the next question
+            self._show_long_question(picker)
         self._invalidate_prompt()
 
     def _accept_answer(self, buffer: Buffer) -> bool:

@@ -24,6 +24,12 @@ from omnigent_ui_sdk.terminal import QuestionSpec
 from rich.text import Text
 
 QUESTIONS: list[list[QuestionSpec]] = [
+    # Far taller than the terminal when wrapped: the selector must still fit.
+    [
+        QuestionSpec(
+            key="Long?", question="Long " + "你好世界" * 600, options=(("yes", ""), ("no", ""))
+        )
+    ],
     [
         QuestionSpec(
             key="Env?",

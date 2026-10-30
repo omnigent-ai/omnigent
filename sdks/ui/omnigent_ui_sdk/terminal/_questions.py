@@ -21,6 +21,8 @@ Answers = dict[str, str | list[str]]
 CUSTOM_ROW_LABEL = "Type something"
 # Option rows shown at once; longer lists scroll with the highlight.
 _MAX_VISIBLE_ROWS = 8
+# Question rows in the selector; a longer question is shown in full above it.
+_MAX_QUESTION_ROWS = 3
 
 
 @dataclass(frozen=True)
@@ -154,38 +156,54 @@ class QuestionPicker:
             return typed or None
         return question.options[self.row][0]
 
-    def render(self, width: int) -> list[tuple[str, str]]:
+    def render(self, width: int, max_rows: int | None = None) -> list[tuple[str, str]]:
         """Selector lines as prompt-toolkit ``(style, text)`` fragments, one per line.
 
         :param width: Terminal columns; long lines are wrapped or truncated.
+        :param max_rows: Rows available, e.g. ``12``. The question and the
+            option list shrink to fit (at least one row each), and the
+            options scroll with the highlight; ``None`` uses the default caps.
         """
         question = self.current
+        rows_left = (max_rows if max_rows is not None else 1 << 16) - 2  # title, hint
+        visible = min(self.row_count(), _MAX_VISIBLE_ROWS, max(1, rows_left - 1))
+        question_rows = max(1, min(_MAX_QUESTION_ROWS, rows_left - visible))
         lines: list[tuple[str, str]] = []
         title = f" ? question {self.index + 1} of {len(self.questions)}"
         if question.header:
             title += f" · {_one_line(question.header)}"
         lines.append(("class:prompt-marker", title))
-        for text_line in _wrap(question.question, max(width - 4, 2)):
+        wrap_width = max(width - 4, 2)
+        wrapped = _wrap(question.question, wrap_width)
+        if len(wrapped) > question_rows:
+            wrapped = wrapped[:question_rows]
+            wrapped[-1] = _truncate(f"{wrapped[-1]} …", wrap_width)
+        for text_line in wrapped:
             lines.append(("", f"   {text_line}"))
-        lines.extend(self._option_lines(width))
+        lines.extend(self._option_lines(visible))
         lines.append(("class:model-name", f" {self._hint()}"))
         return [(style, _truncate(text, width) + "\n") for style, text in lines]
 
-    def line_count(self, width: int) -> int:
+    def line_count(self, width: int, max_rows: int | None = None) -> int:
         """Number of terminal lines :meth:`render` produces."""
-        return len(self.render(width))
+        return len(self.render(width, max_rows))
 
-    def _option_lines(self, width: int) -> list[tuple[str, str]]:
+    def question_overflows(self, width: int) -> bool:
+        """Whether the current question is too long for the selector at *width*."""
+        return len(_wrap(self.current.question, max(width - 4, 2))) > _MAX_QUESTION_ROWS
+
+    def _option_lines(self, visible: int) -> list[tuple[str, str]]:
         question = self.current
         count = self.row_count()
         if not count:
             return []
+        self._scroll = min(self._scroll, max(0, count - visible))  # fill a grown window
         if self.row < self._scroll:
             self._scroll = self.row
-        elif self.row >= self._scroll + _MAX_VISIBLE_ROWS:
-            self._scroll = self.row - _MAX_VISIBLE_ROWS + 1
+        elif self.row >= self._scroll + visible:
+            self._scroll = self.row - visible + 1
         lines: list[tuple[str, str]] = []
-        for row in range(self._scroll, min(count, self._scroll + _MAX_VISIBLE_ROWS)):
+        for row in range(self._scroll, min(count, self._scroll + visible)):
             selected = row == self.row
             marker = "▸" if selected else " "
             if row < len(question.options):

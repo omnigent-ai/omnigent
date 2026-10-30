@@ -1,11 +1,12 @@
 """
 PTY test: the inline question selector answers with real keystrokes.
 
-The driver (``_question_selector_driver.py``) asks seven questions through
+The driver (``_question_selector_driver.py``) asks eight questions through
 :meth:`TerminalHost.ask_questions` and prints each result. This test drives
 them the way a person would: arrows and Enter for a single choice, Space to
 check multi-select options, typing for a custom answer, editing a prefilled
-answer, and Esc to dismiss. Answers must never be submitted as chat or saved
+answer, a question too long for the screen, and Esc to dismiss. Answers must
+never be submitted as chat or saved
 to the input history: Alt+# does nothing to them, and undo in the chat line
 never brings one back.
 """
@@ -66,12 +67,19 @@ def test_selector_answers_with_real_keystrokes(
             lambda shown: text in shown, timeout=_RENDER_TIMEOUT, what=repr(text)
         )
 
+    # A question far taller than the terminal (printed in full above): the
+    # selector still fits, with its choices on screen.
+    shown = wait("▸ 1. yes")
+    assert "Window too small" not in shown
+    child.send("\r")
+    wait('ANSWER 1 {"Long?": "yes"}')
+
     wait("question 1 of 1 · Environment")
     wait("▸ 1. dev — Development")
     child.send(_DOWN)
     wait("▸ 2. staging")
     child.send("\r")
-    wait('ANSWER 1 {"Env?": "staging"}')
+    wait('ANSWER 2 {"Env?": "staging"}')
 
     wait("Which regions?")
     child.send(" ")  # check us-east
@@ -80,22 +88,22 @@ def test_selector_answers_with_real_keystrokes(
     child.send(" ")  # check ap-south
     wait("[x] 3. ap-south")
     child.send("\r")
-    wait('ANSWER 2 {"regions": ["us-east", "ap-south"]}')
+    wait('ANSWER 3 {"regions": ["us-east", "ap-south"]}')
 
     wait("Which name?")
     child.send("qa")  # typing highlights "Type something"
     wait("▸ 3. Type something")
     child.send("\r")
-    wait('ANSWER 3 {"Name?": "qa"}')
+    wait('ANSWER 4 {"Name?": "qa"}')
 
     wait("Release notes?")
     wait("draft notes")  # the prefill is in the answer line, editable
     child.send(" v2\r")
-    wait('ANSWER 4 {"0": "draft notes v2"}')
+    wait('ANSWER 5 {"0": "draft notes v2"}')
 
     wait("Dismiss me")
     child.send(_ESC)
-    wait("ANSWER 5 null")
+    wait("ANSWER 6 null")
 
     # Alt+# (accept as a comment) neither edits nor sends the answer.
     wait("Comment me")
@@ -103,14 +111,14 @@ def test_selector_answers_with_real_keystrokes(
     wait("▸ 2. Type something")
     child.send(_ALT_HASH)
     child.send("\r")
-    wait('ANSWER 6 {"Comment?": "synthetic-answer"}')
+    wait('ANSWER 7 {"Comment?": "synthetic-answer"}')
 
     # Undo in the chat line can't bring back a dismissed answer.
     wait("Discard me")
     child.send("synthetic-discarded-answer")
     wait("▸ 2. Type something")
     child.send(_ESC)
-    wait("ANSWER 7 null")
+    wait("ANSWER 8 null")
     child.send(_UNDO)
     child.send("\r")
     child.send("probe\r")

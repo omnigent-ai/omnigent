@@ -279,27 +279,9 @@ async def test_unusable_questions_decline_without_any_prompt(questions: Any) -> 
 # ── One request at a time, never a settled one ────────────────
 
 
-async def test_concurrent_prompts_are_asked_one_at_a_time() -> None:
-    adapter, host, _, client, _ = _adapter()
-    first = asyncio.create_task(adapter._handle_elicitation("conv_abc", _question_event()))
-    second = asyncio.create_task(
-        adapter._handle_elicitation("conv_abc", _question_event("elicit_second"))
-    )
-    await _until(lambda: host.selector_open, "the first question never opened")
-    for _ in range(50):
-        await asyncio.sleep(0)
-    assert len(host.asked) == 1, "the second question opened over the first"
-    host.answer({"Env?": "dev"})
-    await _until(lambda: first.done() and host.selector_open, "the second never opened")
-    host.answer({"Env?": "prod"})
-    await second
-
-    assert [args[1] for args in _posted(client)] == ["elicit_q", "elicit_second"]
-
-
 async def test_prompt_kinds_take_the_terminal_one_at_a_time() -> None:
-    # A question, a y/a/n approval and a schema form queued together open in
-    # turn, each only once the previous one is answered.
+    # A question, a y/a/n approval, a schema form and a second question queued
+    # together open in turn, each only once the previous one is answered.
     adapter, host, fis, client, approval_hook = _adapter()
     _gate_approvals_on_the_user(adapter, approval_hook)
     approvals = adapter._approval_state
@@ -308,9 +290,13 @@ async def test_prompt_kinds_take_the_terminal_one_at_a_time() -> None:
     await _until(lambda: host.selector_open, "the question never opened")
     approval = asyncio.create_task(adapter._handle_elicitation("conv_abc", _approval_event()))
     schema_form = asyncio.create_task(adapter._handle_elicitation("conv_abc", form))
+    second = asyncio.create_task(
+        adapter._handle_elicitation("conv_abc", _question_event("elicit_second"))
+    )
     for _ in range(50):
         await asyncio.sleep(0)
     assert not approvals.pending and not fis.pending, "a prompt opened over the selector"
+    assert len(host.asked) == 1, "the second question opened over the first"
 
     host.answer({"Env?": "dev"})
     await _until(lambda: approvals.pending, "the approval never opened")
@@ -320,11 +306,21 @@ async def test_prompt_kinds_take_the_terminal_one_at_a_time() -> None:
     await _until(lambda: approvals.pending, "the form's approval never opened")
     approvals.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
     await _until(lambda: fis.pending, "the form's field never opened")
+    assert not host.selector_open
     fis.resolve("Ada")
+    await _until(lambda: host.selector_open, "the second question never opened")
+    host.answer({"Env?": "prod"})
     await question
     await schema_form
+    await second
 
-    assert [args[1] for args in _posted(client)] == ["elicit_q", "elicit_approve", "elicit_form"]
+    assert [args[1] for args in _posted(client)] == [
+        "elicit_q",
+        "elicit_approve",
+        "elicit_form",
+        "elicit_second",
+    ]
+    assert _posted(client)[-1][2] == {"action": "accept", "content": {"Env?": "prod"}}
 
 
 async def test_a_pre_approved_request_does_not_wait_for_an_open_question() -> None:
@@ -582,13 +578,14 @@ async def test_a_release_elsewhere_does_not_swallow_the_next_verdict() -> None:
 
 
 async def test_approval_settled_elsewhere_posts_no_verdict() -> None:
-    adapter, _, _, client, approval_hook = _adapter()
+    # Another client's verdict releases the waiting y/a/n card, and the
+    # terminal posts nothing of its own.
+    adapter, _, fis, client, approval_hook = _adapter()
+    _gate_approvals_on_the_user(adapter, approval_hook)
+    approval = asyncio.create_task(adapter._handle_elicitation("conv_abc", _approval_event()))
+    await _until(lambda: adapter._approval_state.pending, "the approval never opened")
+    _resolved_elsewhere(adapter, fis, "elicit_approve")
+    await _until(lambda: approval.done(), "the settled approval kept waiting")
 
-    async def _settled_elsewhere(ctx: Any) -> bool:
-        adapter.note_elicitation_resolved(ctx.elicitation_id)  # as run_repl does
-        return False
-
-    approval_hook.side_effect = _settled_elsewhere
-    await adapter._handle_elicitation("conv_abc", _approval_event())
-
+    assert not adapter._approval_state.pending
     client.sessions.resolve_elicitation.assert_not_awaited()

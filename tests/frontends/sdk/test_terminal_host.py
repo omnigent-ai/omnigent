@@ -1850,22 +1850,48 @@ async def test_question_picker_scrolls_long_lists_and_truncates_wide_lines() -> 
     assert "▸ 12. opt11" in shown and "1. opt0" not in shown
     wide = QuestionPicker([_env_question(options=(("界" * 80, ""),))])
     assert all(get_cwidth(text.rstrip("\n")) <= 40 for _, text in wide.render(40))
-    # Question text wraps by terminal cells and keeps every character.
+    # Question text wraps by terminal cells without dropping a character...
+    from omnigent_ui_sdk.terminal._questions import _wrap
+
     cjk = "你好世界" * 20
     half = "你好世界" * 10  # 40 characters, but 80 cells
     for question_text in (cjk, f"Deploy {cjk} now?", f"{half} {half}"):
-        asked = QuestionPicker([_env_question(question=question_text)])
-        rendered = asked.render(80)
-        assert all(get_cwidth(text.rstrip("\n")) <= 80 for _, text in rendered)
-        wrapped = [text.strip() for style, text in rendered if style == ""]
+        wrapped = _wrap(question_text, 76)
+        assert all(get_cwidth(line) <= 76 for line in wrapped)
         assert "".join(wrapped).replace(" ", "") == question_text.replace(" ", "")
-    # Agent text with newlines stays one row per option, so the height holds.
-    multiline = QuestionPicker(
-        [_env_question(header="Env\nironment", options=(("dev\nbox", "a\nb"), ("prod", "")))]
+    # ...and the selector shows up to three rows of it, ending in "…" when cut
+    # (the host prints a longer question in full above the selector).
+    fits = QuestionPicker([_env_question(question=cjk)])
+    assert not fits.question_overflows(80)
+    assert "".join(t.strip() for s, t in fits.render(80) if s == "") == cjk
+    long_question = QuestionPicker([_env_question(question=f"Deploy {cjk} now?")])
+    assert long_question.question_overflows(80)
+    shown = [t.rstrip("\n") for s, t in long_question.render(80) if s == ""]
+    assert len(shown) == 3 and shown[-1].endswith("…")
+    assert all(get_cwidth(line) <= 80 for line in shown)
+
+
+@pytest.mark.asyncio
+async def test_question_picker_fits_the_rows_it_is_given() -> None:
+    from omnigent_ui_sdk.terminal._questions import QuestionPicker
+
+    picker = QuestionPicker(
+        [
+            _env_question(
+                question="Pick one " * 40,
+                options=tuple((f"opt{i}", "") for i in range(12)),
+            )
+        ]
     )
-    rendered = multiline.render(80)
-    assert all(text.count("\n") == 1 for _, text in rendered)
-    assert "1. dev box — a b" in _picker_text(multiline)
+    for max_rows in (4, 6, 10):
+        for _ in range(12):  # every highlight position, scrolling as it goes
+            rendered = picker.render(80, max_rows)
+            assert len(rendered) <= max_rows
+            assert any(text.startswith(" ▸ ") for _, text in rendered), "highlight scrolled away"
+            picker.move(1)
+    # A taller window shows a full page of options again, whatever the scroll.
+    option_rows = [t for _, t in picker.render(80, 30) if re.match(r" [▸ ] \d+\. opt", t)]
+    assert len(option_rows) == 8
 
 
 async def _press(host: TerminalHost, raw: str = "", *presses: Any) -> None:
@@ -2043,6 +2069,68 @@ async def test_alt_hash_neither_edits_nor_accepts_an_answer() -> None:
     assert host._answer_buffer.text == "teal"
     await _press(host, "\r")
     assert await asking == {"Env?": "teal"}
+
+
+@pytest.mark.asyncio
+async def test_a_long_question_is_printed_in_full_and_the_selector_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    printed: list[str] = []
+    monkeypatch.setattr(sys.stdout, "write", lambda data: printed.append(data) or len(data))
+    monkeypatch.setattr(sys.stdout, "flush", lambda: None)
+    host = TerminalHost(model_name="test")
+    words = [f"step{i}" for i in range(400)]
+    asking = await _open(host, _env_question(question=" ".join(words)))
+
+    shown = re.sub(r"\x1b\[[0-9;]*m", "", "".join(printed)).split()
+    assert [word for word in shown if word.startswith("step")] == words
+    assert host._question_picker_line_count() <= host._picker_rows()
+    host.dismiss_questions()
+    await asking
+
+
+@pytest.mark.asyncio
+async def test_the_chat_draft_shrinks_to_one_row_while_a_question_is_open() -> None:
+    # A tall draft would otherwise push the selector off the screen.
+    from prompt_toolkit.layout.controls import BufferControl
+
+    host = TerminalHost(model_name="test")
+    chat = host._prompt.default_buffer
+    chat.text = "\n".join(f"line {i}" for i in range(30))
+    chat_window = next(
+        window
+        for window in host._prompt.app.layout.find_all_windows()
+        if isinstance(window.content, BufferControl) and window.content.buffer is chat
+    )
+    assert chat_window.height().preferred > 1
+    asking = await _open(host, _env_question())
+    assert chat_window.height().preferred == 1
+    host.dismiss_questions()
+    await asking
+    assert chat_window.height().preferred > 1
+
+
+@pytest.mark.parametrize(
+    ("question", "typed", "after_ctrl_c"),
+    [
+        (_env_question(), "teal", ""),
+        (_env_question(options=(), text_default="draft"), " edits", "draft"),
+        # Ctrl+C never wipes a fixed default that Enter would still send.
+        (_env_question(options=(), allow_custom=False, text_default="fixed"), "x", "fixed"),
+    ],
+    ids=["typed", "editor", "fixed-default"],
+)
+@pytest.mark.asyncio
+async def test_ctrl_c_returns_an_answer_to_its_question_text(
+    question: Any, typed: str, after_ctrl_c: str
+) -> None:
+    host = TerminalHost(model_name="test")
+    asking = await _open(host, question)
+    await _press(host, typed + "\x03")
+    assert host._answer_buffer.text == after_ctrl_c
+    assert host._question_picker is not None, "Ctrl+C closed the question"
+    host.dismiss_questions()
+    await asking
 
 
 @pytest.mark.asyncio
