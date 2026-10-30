@@ -1181,8 +1181,17 @@ The link names a server by **host** (with port if non-default) and carries no
 uses (`http` for loopback, `https` for a remote host), so a deep link and a
 pasted URL can never disagree. The Databricks workspace mount (`/omnigent`)
 is **not** in the link; it is server-determined and discovered the same way a
-pasted workspace URL is. v1 accepts only `/c/<session_id>`; other paths are
-ignored.
+pasted workspace URL is. v1 accepts `/c/<session_id>` and the server-home root
+`/`; other paths are ignored. `omnigent start --open-in-desktop` emits these
+links only for URLs without mount paths, query parameters, or fragments; other
+URLs stay in the browser. The CLI adds a one-time `desktop_ack=port:nonce` query
+parameter and listens on IPv4 loopback for up to five seconds. Before navigation
+or consent, the desktop POSTs to `/desktop-open/<nonce>` on that port and proceeds
+only on HTTP 204. An old app or failed dispatch cannot acknowledge, so the CLI
+opens the original browser URL. A late desktop request is discarded when the
+listener has expired. Acknowledgment accepts responsibility for the request; it
+does not claim sign-in or page loading completed, and cancelling desktop consent
+does not open a browser. Ordinary links without the parameter work as before.
 
 **Window handling** (the careful part):
 
