@@ -3752,9 +3752,9 @@ def test_runner_host_lookup_is_bounded(
 
 @pytest.mark.parametrize("row_count", [10_000, 10_001])
 def test_runner_host_lookup_fails_closed_at_safety_budget(conversation_store, row_count):
-    from sqlalchemy import insert
+    from sqlalchemy import func, insert, select
 
-    from omnigent.db.db_models import SqlConversationMetadata
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
 
     host_id = "a" * 32
     with conversation_store._session_immediate("seed_runner_lookup_budget") as session:
@@ -3775,6 +3775,34 @@ def test_runner_host_lookup_fails_closed_at_safety_budget(conversation_store, ro
     else:
         with pytest.raises(ValueError, match="safety limit"):
             conversation_store.get_runner_host_ids("runner-target")
+
+    writes = []
+
+    def capture(_conn, cursor, statement, _params, _context, _executemany):
+        if statement.lstrip().upper().startswith("UPDATE omnigent_conversation_metadata".upper()):
+            writes.append(cursor.rowcount)
+
+    event.listen(conversation_store._engine, "after_cursor_execute", capture)
+    try:
+        if row_count == 10_000:
+            conversation_store.touch_profile_runner_liveness("runner-target", now=123)
+        else:
+            with pytest.raises(ValueError, match="safety limit"):
+                conversation_store.touch_profile_runner_liveness("runner-target", now=123)
+    finally:
+        event.remove(conversation_store._engine, "after_cursor_execute", capture)
+    assert writes == ([10_000] if row_count == 10_000 else [])
+    with conversation_store._session("check_bounded_admission_liveness") as session:
+        stamped = session.scalar(
+            select(func.count())
+            .select_from(SqlConversationMetadata)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.runner_id == "runner-target",
+                SqlConversationMetadata.runner_last_seen == 123,
+            )
+        )
+    assert stamped == (10_000 if row_count == 10_000 else 0)
 
 
 def test_runner_host_lookup_retains_snapshot_during_rotation(conversation_store):

@@ -215,7 +215,9 @@ Runner-only adoption reads host IDs through the existing runner index in one
 statement snapshot, so concurrent rotation cannot hide a host between pages.
 This read has a separate safety budget of 10,000 currently attached sessions
 (10,001 rows detect overflow). Conflicting hosts or overflow fail closed; launch
-a new runner on overflow. Ordinary runners with 201 or more attached sessions
+a new runner on overflow. The reconnect liveness write uses the same budget,
+locks the selected bindings and rejects overflow before updating any rows.
+Ordinary runners with 201 or more attached sessions
 remain usable within that budget in mixed deployments.
 Rotation and rollback still bound their
 source lookup to 201 rows and leave the binding intact if no source is found.

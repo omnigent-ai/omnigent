@@ -4394,6 +4394,37 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise ValueError("Runner host lookup exceeds the safety limit; launch a new runner")
         return host_ids
 
+    def touch_profile_runner_liveness(self, runner_id: str, now: int) -> None:
+        def write(session: Session) -> None:
+            ids = list(
+                session.scalars(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.runner_id == runner_id,
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .limit(_RUNNER_HOST_LOOKUP_LIMIT + 1)
+                    .with_for_update()
+                )
+            )
+            if len(ids) > _RUNNER_HOST_LOOKUP_LIMIT:
+                raise ValueError(
+                    "Runner host lookup exceeds the safety limit; launch a new runner"
+                )
+            if ids:
+                # Row locks retain each runner binding until its liveness stamp commits.
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(ids),
+                    )
+                    .values(runner_last_seen=now)
+                )
+
+        run_write_transaction(self._session_immediate, "admit_profile_runner", write)
+
     @staticmethod
     def _runner_binding_candidates(session: Session, runner_id: str | None) -> list[Any]:
         # Apply residual host/source checks in Python after this indexed, bounded read.

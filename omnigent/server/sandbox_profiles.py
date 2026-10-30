@@ -252,7 +252,7 @@ class SandboxProfileCatalog:
         from omnigent.db.utils import now_epoch
 
         conversations = self._store.conversations
-        conversations.touch_runner_liveness([runner_id], now_epoch())
+        conversations.touch_profile_runner_liveness(runner_id, now_epoch())
         return bool(conversations.get_runner_host_ids(runner_id))
 
     def reassign_runner(

@@ -150,7 +150,7 @@ def test_runner_admission_skips_deployments_without_profiles(admission_app, monk
     catalog = app.state.sandbox_profiles
     monkeypatch.setattr(catalog, "managed_providers", list)
     touch = Mock(side_effect=AssertionError("Ordinary deployment must not change reconnects"))
-    monkeypatch.setattr(conversations, "touch_runner_liveness", touch)
+    monkeypatch.setattr(conversations, "touch_profile_runner_liveness", touch)
     assert catalog.admit_runner_connection("unbound-ordinary-runner")
     touch.assert_not_called()
 

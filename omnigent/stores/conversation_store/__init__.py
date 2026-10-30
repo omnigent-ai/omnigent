@@ -1829,6 +1829,10 @@ class ConversationStore(ABC):
         """Find up to two hosts in one bounded snapshot of the existing runner index."""
         raise NotImplementedError
 
+    def touch_profile_runner_liveness(self, runner_id: str, now: int) -> None:
+        """Fence profile reconnects with a bounded write; reject overflow before stamping."""
+        raise NotImplementedError
+
     def reassign_runner_with_host(
         self,
         conversation_id: str,
