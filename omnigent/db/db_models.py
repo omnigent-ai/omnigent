@@ -1756,6 +1756,8 @@ class SqlSkillSource(OmnigentBase):
     :param url: Clone URL, e.g. ``"https://github.com/acme/skills.git"``.
     :param ref: Branch or tag to fetch; ``"HEAD"`` (git's name for the
         remote's default branch) when none was chosen, so the identity is unique.
+    :param path: Directory inside the repository the catalog is indexed from,
+        POSIX form; ``""`` for the repository root.
     :param name: Label shown in the UI.
     :param created_by: User who added the source, or ``None`` in single-user mode.
     :param created_at: Unix epoch seconds at row creation.
@@ -1765,9 +1767,10 @@ class SqlSkillSource(OmnigentBase):
     __table_args__ = (
         # Keyset pagination over (created_at, id); ends in the primary key.
         Index("ix_skill_sources_order", "workspace_id", "created_at", "id"),
-        # One row per repository and ref: replicas seeding the same source at
-        # startup collide here instead of leaving a duplicate.
-        Index("ux_skill_sources_identity", "workspace_id", "url", "ref", unique=True),
+        # One row per repository, ref and path: replicas seeding the same source
+        # at startup collide here instead of leaving a duplicate. The three
+        # columns total 710 characters, within MySQL's 3072-byte key at utf8mb4.
+        Index("ux_skill_sources_identity", "workspace_id", "url", "ref", "path", unique=True),
     )
 
     workspace_id: Mapped[int] = mapped_column(
@@ -1778,11 +1781,12 @@ class SqlSkillSource(OmnigentBase):
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
     url: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
     ref: Mapped[str] = mapped_column(BoundedString(255, exact=True), nullable=False)
+    path: Mapped[str] = mapped_column(BoundedString(200, exact=True), nullable=False)
     name: Mapped[str] = mapped_column(BoundedString(256), nullable=False)
     created_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
-    @validates("url", "ref", "name", "created_by")
+    @validates("url", "ref", "path", "name", "created_by")
     def _within_declared_length(self, key: str, value: str | None) -> str | None:
         return _within_declared_length(self, key, value)
 
@@ -1828,8 +1832,10 @@ class SqlInstalledSkill(OmnigentBase):
         unique on every engine; ``owner_user_id`` stays the plain, nullable id.
     :param owner_user_id: The installing user for a user-scoped row, else ``None``.
     :param bundle_location: Artifact-store key of the skill tarball.
-    :param bundle_bytes: Size of that tarball, so a principal's delivery budget
-        is a bounded sum rather than a read of every artifact.
+    :param bundle_bytes: Bytes of the skill's files once unpacked, so a
+        principal's delivery budget, sized to what a runner unpacks, is a
+        bounded sum rather than a read of every artifact.
+    :param bundle_entries: Files and directories in the tarball, for the same budget.
     :param enabled: Whether sessions receive the skill.
     :param user_invocable: Whether the skill's own ``SKILL.md`` offers it to the
         user (``user-invocable: false`` marks an internal orchestration skill).
@@ -1874,6 +1880,7 @@ class SqlInstalledSkill(OmnigentBase):
     owner_user_id: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
     bundle_location: Mapped[str] = mapped_column(BoundedString(512), nullable=False)
     bundle_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    bundle_entries: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
     user_invocable: Mapped[bool] = mapped_column(Boolean, nullable=False)
     installed_by: Mapped[str | None] = mapped_column(BoundedString(128), nullable=True)
@@ -1911,6 +1918,7 @@ class SqlSkillPrincipal(OmnigentBase):
     :param principal: ``"org"``, ``"local"`` or ``"user:<owner_user_id>"``.
     :param installed_count: Rows the principal holds in ``installed_skills``.
     :param enabled_bytes: Sum of ``bundle_bytes`` over its enabled rows.
+    :param enabled_entries: Sum of ``bundle_entries`` over its enabled rows.
     :param created_at: Unix epoch seconds at row creation.
     """
 
@@ -1924,6 +1932,7 @@ class SqlSkillPrincipal(OmnigentBase):
     principal: Mapped[str] = mapped_column(BoundedString(133, exact=True), primary_key=True)
     installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    enabled_entries: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     @validates("principal")

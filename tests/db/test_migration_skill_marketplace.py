@@ -20,7 +20,7 @@ TABLES = {"skill_sources", "installed_skills", "skill_principals"}
 INDEXES: dict[str, dict[str, list[str]]] = {
     "skill_sources": {
         "ix_skill_sources_order": ["workspace_id", "created_at", "id"],
-        "ux_skill_sources_identity": ["workspace_id", "url", "ref"],
+        "ux_skill_sources_identity": ["workspace_id", "url", "ref", "path"],
     },
     "installed_skills": {
         "ux_installed_skills_identity": ["workspace_id", "principal", "name"],
@@ -87,6 +87,7 @@ def _assert_lifecycle(engine: sa.Engine, config: object) -> None:
             "principal",
             "owner_user_id",
             "bundle_bytes",
+            "bundle_entries",
             "scope",
             "enabled",
             "user_invocable",
@@ -96,11 +97,13 @@ def _assert_lifecycle(engine: sa.Engine, config: object) -> None:
         assert columns["owner_user_id"]["nullable"] is True
         sources = {c["name"]: c for c in inspector.get_columns("skill_sources")}
         assert sources["ref"]["nullable"] is False
+        assert sources["path"]["nullable"] is False
         assert [c["name"] for c in inspector.get_columns("skill_principals")] == [
             "workspace_id",
             "principal",
             "installed_count",
             "enabled_bytes",
+            "enabled_entries",
             "created_at",
         ]
 
@@ -149,6 +152,7 @@ def test_a_bulk_write_cannot_slip_past_a_declared_length(db_uri: str) -> None:
             "id": uuid.uuid4().hex,
             "url": "https://github.com/" + "a" * 20_000,
             "ref": "HEAD",
+            "path": "",
             "name": "x",
             "created_by": None,
             "created_at": 0,
@@ -169,13 +173,18 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
                 id=uuid.uuid4().hex,
                 url="https://github.com/" + "a" * 20_000,
                 ref="HEAD",
+                path="",
                 name="x",
                 created_by=None,
                 created_at=0,
             )
         with pytest.raises(ValueError, match="principal is longer than 133"):
             SqlSkillPrincipal(
-                principal="user:" + "u" * 129, installed_count=0, enabled_bytes=0, created_at=0
+                principal="user:" + "u" * 129,
+                installed_count=0,
+                enabled_bytes=0,
+                enabled_entries=0,
+                created_at=0,
             )
         row = SqlInstalledSkill(
             id=uuid.uuid4().hex,
@@ -191,6 +200,7 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
             owner_user_id="alice",
             bundle_location="skills/review.tar.gz",
             bundle_bytes=1,
+            bundle_entries=1,
             enabled=True,
             user_invocable=True,
             installed_by="alice",
@@ -203,9 +213,15 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
         session.rollback()
 
 
-def _source(url: str, ref: str) -> SqlSkillSource:
+def _source(url: str, ref: str, path: str = "") -> SqlSkillSource:
     return SqlSkillSource(
-        id=uuid.uuid4().hex, url=url, ref=ref, name="Acme", created_by=None, created_at=0
+        id=uuid.uuid4().hex,
+        url=url,
+        ref=ref,
+        path=path,
+        name="Acme",
+        created_by=None,
+        created_at=0,
     )
 
 
@@ -224,6 +240,7 @@ def _installed(name: str, principal: str, *, scope: int = 2) -> SqlInstalledSkil
         owner_user_id=None if principal == "org" else principal.removeprefix("user:"),
         bundle_location=f"skills/{name}.tar.gz",
         bundle_bytes=1,
+        bundle_entries=1,
         enabled=True,
         user_invocable=True,
         installed_by=None,
@@ -232,8 +249,8 @@ def _installed(name: str, principal: str, *, scope: int = 2) -> SqlInstalledSkil
 
 
 def test_identities_are_unique_on_the_engine(db_uri: str) -> None:
-    # An exact duplicate of (url, ref) or (principal, name) is refused by the index,
-    # while rows that differ only in case, ref or principal coexist: git refs,
+    # An exact duplicate of (url, ref, path) or (principal, name) is refused by the
+    # index, while rows that differ only in case, ref, path or principal coexist: git refs,
     # repository paths and skill names are case-sensitive, so the identity
     # columns compare byte for byte on every engine (utf8mb4_bin on MySQL).
     engine = get_or_create_engine(db_uri)
@@ -244,6 +261,10 @@ def test_identities_are_unique_on_the_engine(db_uri: str) -> None:
                 _source(url, "main"),
                 _source(url, "Main"),
                 _source(url, "HEAD"),
+                _source(url, "main", "team-a"),
+                _source(url, "main", "Team-A"),
+                # The longest identity still fits MySQL's index key.
+                _source("https://github.com/" + "a" * 236, "r" * 255, "p" * 200),
                 _source("https://github.com/acme/Skills.git", "main"),
             ]
         )

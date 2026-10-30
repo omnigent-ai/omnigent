@@ -4,10 +4,10 @@ Revision ID: zb1c2d3e4f5a
 Revises: d0a1f879a01d
 Create Date: 2026-10-28 00:00:00.000000
 
-Creates ``skill_sources`` (repositories the marketplace browses),
+Creates ``skill_sources`` (repositories, or a directory in one, the marketplace browses),
 ``installed_skills`` (skills fetched from a repository and stored as tarballs
 in the artifact store) and ``skill_principals`` (one lock row per principal
-that installs, carrying its row count and enabled bytes, so a quota is
+that installs, carrying its row count and enabled bytes and entries, so a quota is
 checked and written under one lock without scanning its rows). All are
 workspace-partitioned like the other application tables, carry no database
 foreign keys (schema Rule R032), and declare no SQL defaults: the
@@ -51,6 +51,8 @@ def _skill_sources_columns() -> list[sa.Column]:
         sa.Column("url", _exact_string(255), nullable=False),
         # "HEAD", git's name for the remote's default branch, when none was chosen.
         sa.Column("ref", _exact_string(255), nullable=False),
+        # Directory the catalog is indexed from; "" for the repository root.
+        sa.Column("path", _exact_string(200), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         sa.Column("created_by", sa.String(128), nullable=True),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
@@ -74,7 +76,9 @@ def _installed_skills_columns() -> list[sa.Column]:
         sa.Column("principal", _exact_string(133), nullable=False),
         sa.Column("owner_user_id", sa.String(128), nullable=True),
         sa.Column("bundle_location", sa.String(512), nullable=False),
+        # Unpacked bytes and entries, counted against what a runner unpacks.
         sa.Column("bundle_bytes", sa.Integer(), nullable=False),
+        sa.Column("bundle_entries", sa.Integer(), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False),
         # From the skill's own SKILL.md: false keeps it out of the user's menu
         # while it is still delivered to the agent.
@@ -92,6 +96,7 @@ def _skill_principals_columns() -> list[sa.Column]:
         # Maintained under the row's lock: a quota check reads these, never the rows.
         sa.Column("installed_count", sa.Integer(), nullable=False),
         sa.Column("enabled_bytes", sa.BigInteger(), nullable=False),
+        sa.Column("enabled_entries", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.BigInteger(), nullable=False),
     ]
 
@@ -105,7 +110,7 @@ _TABLES = [
         (),
         [
             ("ix_skill_sources_order", ["workspace_id", "created_at", "id"], False),
-            ("ux_skill_sources_identity", ["workspace_id", "url", "ref"], True),
+            ("ux_skill_sources_identity", ["workspace_id", "url", "ref", "path"], True),
         ],
     ),
     (
