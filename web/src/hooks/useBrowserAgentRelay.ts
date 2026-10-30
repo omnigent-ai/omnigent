@@ -14,6 +14,7 @@ import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
   navigationHostOptions,
+  SESSION_HOST_PROTOCOL,
   supportsBrowser,
   type BrowserHostOptions,
 } from "@/lib/nativeBridge";
@@ -37,19 +38,25 @@ interface BrowserDesktopBridge {
       rememberedArcaHostId?: string;
       sourceIsArcaHost?: boolean;
     },
-  ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
+  ) => Promise<{ ok: boolean; created?: boolean; hostIsThisMachine?: boolean; error?: string }>;
+  browserHasView?: (
+    conversationId: string,
+  ) => Promise<{ exists: boolean; hostIsThisMachine?: boolean }>;
   browserScreenshot?: (
     conversationId: string,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
   /** @deprecated Compatibility with pre-typed desktops until v0.21. */
   browserExecute?: (
     conversationId: string,
     script: string,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
   browserPerformAction?: (
     conversationId: string,
     action: "snapshot" | "click" | "type",
     args?: Record<string, unknown>,
+    opts?: BrowserHostOptions,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
 }
 
@@ -87,13 +94,19 @@ async function performAction(
   conversationId: string,
   action: "snapshot" | "click" | "type",
   args?: Record<string, unknown>,
+  opts?: BrowserHostOptions,
 ) {
   if (desktop.browserPerformAction) {
-    return desktop.browserPerformAction(conversationId, action, args);
+    return opts
+      ? desktop.browserPerformAction(conversationId, action, args, opts)
+      : desktop.browserPerformAction(conversationId, action, args);
   }
   // Pre-typed desktops retain their existing executor until the v0.21 transition.
   if (desktop.browserExecute) {
-    return desktop.browserExecute(conversationId, buildBrowserActionScript(action, args));
+    const script = buildBrowserActionScript(action, args);
+    return opts
+      ? desktop.browserExecute(conversationId, script, opts)
+      : desktop.browserExecute(conversationId, script);
   }
   return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
@@ -110,6 +123,8 @@ async function dispatch(
   sourceHostId: string | null,
   rememberedArcaHostId: string | null,
   sourceIsArcaHost: boolean,
+  privilegedViews: Set<string>,
+  readHostOptions?: BrowserHostOptions,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -129,6 +144,8 @@ async function dispatch(
           ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
+        if (r.hostIsThisMachine) privilegedViews.add(conversationId);
+        else privilegedViews.delete(conversationId);
         if (
           isLoopbackPreview(url) &&
           sourceHostId &&
@@ -144,12 +161,20 @@ async function dispatch(
         if (!desktop.browserScreenshot) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
         }
-        const r = await desktop.browserScreenshot(conversationId);
+        const r = readHostOptions
+          ? await desktop.browserScreenshot(conversationId, readHostOptions)
+          : await desktop.browserScreenshot(conversationId);
         if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
         return { ok: true, data_url: r.dataUrl };
       }
       case "snapshot": {
-        const r = await performAction(desktop, conversationId, "snapshot");
+        const r = await performAction(
+          desktop,
+          conversationId,
+          "snapshot",
+          undefined,
+          readHostOptions,
+        );
         if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
@@ -159,12 +184,12 @@ async function dispatch(
         }
       }
       case "click": {
-        const r = await performAction(desktop, conversationId, "click", args);
+        const r = await performAction(desktop, conversationId, "click", args, readHostOptions);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         return { ok: true };
       }
       case "type": {
-        const r = await performAction(desktop, conversationId, "type", args);
+        const r = await performAction(desktop, conversationId, "type", args, readHostOptions);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
         return { ok: true };
       }
@@ -240,6 +265,7 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
     if (!supportsBrowser()) return;
 
     let cancelled = false;
+    const privilegedViews = new Set<string>();
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
@@ -247,10 +273,24 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
+      const isRead = ["screenshot", "snapshot", "click", "type"].includes(evt.action);
+      if (isRead && desktop.browserHasView) {
+        try {
+          const view = await desktop.browserHasView(sourceConversationId);
+          if (view.hostIsThisMachine) privilegedViews.add(sourceConversationId);
+        } catch {
+          // A failed probe must not let a formerly local view use stale host data.
+          privilegedViews.add(sourceConversationId);
+        }
+      }
+      const fresh = isRead && privilegedViews.has(sourceConversationId);
       const sourceHostId =
-        evt.action === "navigate"
-          ? await fetchSessionHostId(sourceConversationId, { queryClient })
+        evt.action === "navigate" || fresh
+          ? await fetchSessionHostId(sourceConversationId, { queryClient, fresh })
           : null;
+      const readHostOptions = fresh
+        ? { sessionHostProtocol: SESSION_HOST_PROTOCOL, sourceHostId }
+        : undefined;
       const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
       const sourceIsArcaHost =
         evt.action === "navigate" && sourceHostId !== null
@@ -271,6 +311,8 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             sourceHostId,
             rememberedArcaHostId,
             sourceIsArcaHost,
+            privilegedViews,
+            readHostOptions,
           );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };

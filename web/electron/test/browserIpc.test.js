@@ -535,6 +535,7 @@ it("restores URL, title and history state for the requested browser tab only", (
   });
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
+    hostIsThisMachine: false,
     url: "https://example.com/restored",
     title: "Restored page",
     canGoBack: true,
@@ -1505,7 +1506,80 @@ describe("browser IPC sessions on this machine", () => {
         {},
         { conversationId: "conv", url, opts },
       );
-    return { ipcMain, registry, navigate };
+    return { ipcMain, registry, navigate, webContents };
+  }
+
+  for (const transport of ["screenshot", "snapshot", "click", "type", "legacy"]) {
+    for (const scenario of [
+      {
+        name: "same host",
+        opts: { sessionHostProtocol: 1, sourceHostId: "local" },
+        allowed: true,
+        blank: false,
+      },
+      {
+        name: "different host",
+        opts: { sessionHostProtocol: 1, sourceHostId: "remote" },
+        allowed: false,
+        blank: true,
+      },
+      {
+        name: "unknown host",
+        opts: { sessionHostProtocol: 1, sourceHostId: null },
+        allowed: false,
+        blank: false,
+      },
+      { name: "no marker", opts: { sourceHostId: "local" }, allowed: false, blank: false },
+    ]) {
+      it(`${transport}: ${scenario.name} ${scenario.allowed ? "can" : "cannot"} read a privileged view`, async () => {
+        const { navigate, ipcMain, registry, webContents } = localNavigation();
+        await navigate("http://127.0.0.1:5173");
+        const entry = registry.get("conv");
+        const loads = [];
+        let reads = 0;
+        webContents.loadURL = async (url) => {
+          loads.push(url);
+        };
+        webContents.capturePage = async () => {
+          reads++;
+          return { toPNG: () => Buffer.from("fixture") };
+        };
+        webContents.executeJavaScript = async () => {
+          reads++;
+          return "{}";
+        };
+        const channel =
+          transport === "screenshot"
+            ? "omnigent:browser-screenshot"
+            : transport === "legacy"
+              ? "omnigent:browser-execute"
+              : "omnigent:browser-perform-action";
+        const result = await ipcMain.invoke(
+          channel,
+          {},
+          {
+            conversationId: "conv",
+            opts: scenario.opts,
+            action: transport === "screenshot" || transport === "legacy" ? undefined : transport,
+            params:
+              transport === "click"
+                ? { ref: 1 }
+                : transport === "type"
+                  ? { ref: 1, text: "hello" }
+                  : undefined,
+            js:
+              transport === "legacy"
+                ? require("./fixtures/browserActions-v0.18.json").requests[0].script
+                : undefined,
+          },
+        );
+        assert.equal(result.ok, scenario.allowed);
+        assert.equal(reads, scenario.allowed ? 1 : 0);
+        assert.equal(registry.get("conv"), entry, "a denial keeps the view");
+        assert.deepEqual(loads, scenario.blank ? ["about:blank"] : []);
+        assert.equal(entry.agentContext?.hostIsThisMachine === true, !scenario.blank);
+      });
+    }
   }
 
   for (const url of ["http://localhost:5173", "http://127.0.0.1:5173", "http://[::1]:5173"]) {

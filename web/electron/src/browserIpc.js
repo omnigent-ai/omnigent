@@ -13,6 +13,8 @@ const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
+const SESSION_HOST_PROTOCOL = 1;
+
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
@@ -387,6 +389,38 @@ function registerBrowserIpc({
     }
   };
 
+  async function withAgentView(event, args) {
+    const gated = gateRegistry(event);
+    if (gated.error) return gated;
+    const entry = gated.registry.get(args?.conversationId);
+    if (!entry) return { error: "No browser view" };
+    const context = entry.agentContext;
+    if (context?.hostIsThisMachine === true) {
+      const opts = args?.opts;
+      if (
+        opts?.sessionHostProtocol !== SESSION_HOST_PROTOCOL ||
+        typeof opts.sourceHostId !== "string" ||
+        !opts.sourceHostId
+      ) {
+        return { error: "Current session host is required to read this browser view" };
+      }
+      if (opts.sourceHostId !== context.sourceHostId) {
+        try {
+          await entry.view.webContents.loadURL("about:blank");
+          // Keep reads gated until the old document has finished unloading.
+          if (entry.agentContext === context) {
+            entry.agentContext = null;
+            entry.lastRequestedUrl = "about:blank";
+          }
+        } catch {
+          // Retain the privilege gate if the view could not be cleared.
+        }
+        return { error: "Session host changed; the previous browser page is no longer available" };
+      }
+    }
+    return { entry };
+  }
+
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
@@ -519,11 +553,9 @@ function registerBrowserIpc({
 
   // Capture the conversation's view as a base64 PNG.
   ipcMain.handle("omnigent:browser-screenshot", async (event, args) => {
-    const g = gateRegistry(event);
+    const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const { entry } = g;
     try {
       const image = await entry.view.webContents.capturePage();
       const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
@@ -535,11 +567,9 @@ function registerBrowserIpc({
 
   // Both transports converge on main-owned scripts and the same sender gate.
   async function performBrowserAction(event, args, legacy = false) {
-    const g = gateRegistry(event);
+    const g = await withAgentView(event, args);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
-    const entry = g.registry.get(conversationId);
-    if (!entry) return { ok: false, error: "No browser view" };
+    const { entry } = g;
     try {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
       const js = buildBrowserActionScript(action, params);
@@ -574,6 +604,7 @@ function registerBrowserIpc({
         : undefined;
     return {
       exists: true,
+      hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
       url,
       title: webContents.getTitle(),
       ...(pendingUrl ? { pendingUrl } : {}),

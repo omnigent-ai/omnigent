@@ -780,3 +780,80 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 });
+
+describe("useBrowserAgentRelay — privileged reads", () => {
+  beforeEach(() => authenticatedFetch.mockResolvedValue(WON));
+
+  it.each(["screenshot", "snapshot", "click", "type"])(
+    "fetches a fresh host for %s after a privileged navigation",
+    async (action) => {
+      const bridge = installBridge({
+        browserOpenOrNavigate: vi.fn().mockResolvedValue({ ok: true, hostIsThisMachine: true }),
+        browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "{}" }),
+      });
+      const client = new QueryClient();
+      client.setQueryData(["session", CONV], {
+        id: CONV,
+        hostId: "local-host",
+        parentSessionId: null,
+      });
+      renderRelay(CONV, client);
+      emitBrowserActionRequest(
+        actionEvent("navigate", { url: "http://127.0.0.1:5173" }, "nav"),
+        CONV,
+      );
+      await vi.waitFor(() => expect(postedResult().result).toHaveProperty("ok", true));
+      expect(getSessionSlim).not.toHaveBeenCalled();
+      getSessionSlim.mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
+      emitBrowserActionRequest(actionEvent(action, { ref: "e1", text: "hello" }, "read"), CONV);
+      const opts = { sessionHostProtocol: 1, sourceHostId: "remote-host" };
+      await vi.waitFor(() => {
+        if (action === "screenshot")
+          expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, opts);
+        else
+          expect(bridge.browserPerformAction).toHaveBeenCalledWith(
+            CONV,
+            action,
+            action === "snapshot" ? undefined : { ref: "e1", text: "hello" },
+            opts,
+          );
+      });
+      expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
+    },
+  );
+
+  it("a second window with stale cached metadata sends the current host for an existing local view", async () => {
+    const browserHasView = vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: true });
+    const bridge = installBridge({ browserHasView });
+    const firstClient = new QueryClient();
+    firstClient.setQueryData(["session", CONV], {
+      id: CONV,
+      hostId: "local-host",
+      parentSessionId: null,
+    });
+    const firstWindow = renderRelay(CONV, firstClient);
+    firstWindow.unmount();
+    const secondClient = new QueryClient();
+    secondClient.setQueryData(["session", CONV], firstClient.getQueryData(["session", CONV]));
+    getSessionSlim.mockResolvedValue({ id: CONV, hostId: "remote-host", parentSessionId: null });
+    await runAction(actionEvent("screenshot"), { client: secondClient });
+    expect(browserHasView).toHaveBeenCalledWith(CONV);
+    expect(getSessionSlim).toHaveBeenCalledExactlyOnceWith(CONV);
+    expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
+      sessionHostProtocol: 1,
+      sourceHostId: "remote-host",
+    });
+  });
+
+  it("sends an explicit unknown host when fresh resolution fails", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, hostIsThisMachine: true }),
+    });
+    getSessionSlim.mockRejectedValue(new Error("session unavailable"));
+    await runAction(actionEvent("screenshot"));
+    expect(bridge.browserScreenshot).toHaveBeenCalledWith(CONV, {
+      sessionHostProtocol: 1,
+      sourceHostId: null,
+    });
+  });
+});
