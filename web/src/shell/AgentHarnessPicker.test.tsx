@@ -222,9 +222,9 @@ describe("AgentHarnessPicker Agents group header", () => {
         if (!native || entry.mine) {
           await userEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
         }
-        const row = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
-        expect(row).toHaveTextContent(`Orion (${expectedSource})`);
-        await userEvent.click(row);
+        const agentRow = await screen.findByTestId(`new-chat-landing-agent-${entry.id}`);
+        expect(agentRow).toHaveTextContent(`Orion (${expectedSource})`);
+        await userEvent.click(agentRow);
       }
       await selectEntry(server, "server");
       await selectEntry(owned, "yours");
