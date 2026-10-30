@@ -738,6 +738,44 @@ async def test_held_message_is_sent_after_a_failed_bridge_lookup(
 
 
 @pytest.mark.asyncio
+async def test_held_message_is_sent_when_the_queue_drain_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A lookup that fails in the queue drain, after the waiter's own lookup worked, retries."""
+    app, harness, _server = _build_app([_REFUSED, _DELIVERED])
+    sid = uuid.uuid4().hex
+    lookups_after_release = 0
+
+    async def flaky_bridge_id(**_: Any) -> str:
+        nonlocal lookups_after_release
+        hold = app.state.sign_in_holds.get(sid)
+        if hold is not None and not hold.waiting:
+            lookups_after_release += 1
+            # The waiter resolves the bridge first; the drain's own lookup is the second.
+            if lookups_after_release == 2:
+                raise httpx.ConnectError("synthetic labels lookup failure")
+        return "label-owned-bridge"
+
+    monkeypatch.setattr(runner_app, "_claude_native_bridge_id_for_session", flaky_bridge_id)
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+        async with _runner_client(app) as client:
+            await _create_session(client, sid)
+            await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+            await _until(lambda: sid in app.state.sign_in_holds)
+            app.state.sign_in_holds[sid].waiting = False
+            await _until(
+                lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns
+            )
+
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
+    assert lookups_after_release >= 3
+    assert any(
+        "Failed to check the Claude prompt before sending" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "resend", [_DELIVERED, _FAILED_OTHERWISE], ids=["delivered", "failed-otherwise"]
 )

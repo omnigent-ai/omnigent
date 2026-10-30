@@ -4734,7 +4734,20 @@ def create_runner_app(
             if _sign_in_hold_waiting(session_id):
                 _start_claude_prompt_waiter(session_id)
                 return
-            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            try:
+                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            except (httpx.HTTPError, RuntimeError, OSError):
+                # Nothing else resumes this queue, so a failed lookup hands it to the
+                # waiter, which retries until the bridge resolves.
+                _logger.warning(
+                    "Failed to check the Claude prompt before sending queued input for %s; "
+                    "retrying",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                _start_claude_prompt_waiter(session_id)
+                return
             # Stop/delete can clear the queue while the pane inspection is in flight.
             buf = _session_message_buffers.get(session_id)
             if not buf:
