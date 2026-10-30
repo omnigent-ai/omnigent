@@ -110,6 +110,41 @@ configuration, recreate the service instead:
 docker compose up -d --force-recreate omnigent
 ```
 
+## Trimming the packaged built-in agents
+
+`OMNIGENT_SEEDED_AGENTS` is a comma-separated allowlist naming which packaged
+built-ins the deployment keeps — the native CLI harnesses (`claude-native-ui`,
+`codex-native-ui`, …), the builtin ACP rows, `polly` and `debby`. Leave it
+unset to keep them all (the default). Set it to keep only what you name:
+
+```dotenv
+# Keep Claude Code, drop everything else packaged:
+OMNIGENT_SEEDED_AGENTS=claude-native-ui
+
+# Keep nothing packaged — the picker offers only your own agents:
+OMNIGENT_SEEDED_AGENTS=
+```
+
+Names are the agent's slug, not its display label (`claude-native-ui`, not
+"Claude Code"). `docker-compose.yaml` forwards the variable from `.env`
+without a default, so leaving it out of `.env` keeps it unset (keep all)
+rather than empty (keep none). Use `docker compose logs omnigent | grep
+Suppressing` to see what a given value trimmed.
+
+Agents from `OMNIGENT_BUILTIN_AGENT_DIRS` are never filtered — pairing an
+empty allowlist with your own specs is the supported way to run a picker that
+offers only your agents.
+
+Trimming hides, it never deletes. A packaged agent already seeded by an
+earlier boot keeps its database row, so sessions bound to it keep working and
+their history is untouched; only the new-session picker omits it. The native
+CLI harness rows are always seeded, even when trimmed, because transcript
+imports bind to them. Adding a name back to the allowlist brings it straight
+back on the next restart.
+
+Trimming is not access control: a hidden agent can still be read and launched
+by its id through the API.
+
 Built-ins are keyed by name. If an extra's file stem or directory name matches
 an existing built-in, startup refreshes that stable row with the extra bundle;
 it does not create a second agent. Use a distinct name unless that override is
@@ -282,7 +317,10 @@ When migrating from a custom integration that inferred public-client mode from
 an absent secret, explicitly add `OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none`.
 If your trusted enterprise directory omits `email_verified`, the existing
 `OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1` remains a separate operator choice;
-these compatibility options never enable it automatically.
+these compatibility options never enable it automatically. Likewise, if CLI or
+device sign-in fails with "IdP did not confirm re-authentication" because the
+IdP omits `auth_time` (for example, Cloudflare Access), opt out with
+`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
 
 To verify a deployment, restart with the settings above, sign in from a private
 browser window, then run `omnigent login <server-url>` and finish the browser
@@ -402,6 +440,7 @@ trusts whatever value reaches it.
 | `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
 | `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
+| `OMNIGENT_SEEDED_AGENTS` | unset (keep all) | Comma-separated allowlist of packaged built-in agent names to keep. Empty value keeps none. Never filters `OMNIGENT_BUILTIN_AGENT_DIRS` agents. See [Trimming the packaged built-in agents](#trimming-the-packaged-built-in-agents). |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
