@@ -37,6 +37,7 @@ const { createUpdateOverlay } = require("./update_overlay");
 const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
+const { registerFolderChooser } = require("./folderChooser");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -85,10 +86,13 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const arcaOnboarding = require("./arca_onboarding");
 const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
 const { createArcaAutoConnect } = require("./arca_autoconnect");
+const sshConnect = require("./ssh_connect");
+const { createSshConnectFlow } = require("./ssh_connect_window");
 const { registerSessionExpiryReload } = require("./session-expiry");
 const { ensureDatabricksSession } = require("./databricks-session");
 const {
@@ -368,6 +372,26 @@ const arcaConnectFlow = createArcaConnectFlow({
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 
+/** Shell-owned flow for connecting a remote machine over SSH (ssh_connect.js). */
+const sshConnectFlow = createSshConnectFlow({
+  BrowserWindow,
+  ipcMain,
+  pagePath: path.join(__dirname, "..", "ssh-connect", "index.html"),
+  preloadPath: path.join(__dirname, "ssh_connect_preload.js"),
+  startConnect: (serverUrl, destination, hooks) =>
+    sshConnect.startSshConnect(serverUrl, destination, {
+      hooks,
+      openExternal: (url) => shell.openExternal(url),
+      readInstallScript: () => {
+        const script = cliInstall.resolveInstallScript();
+        return script ? fs.readFileSync(script, "utf8") : null;
+      },
+      log: (message) => console.log(`[omnigent] ${message}`),
+    }),
+  commandLines: (serverUrl, destination) => sshConnect.describeCommands(serverUrl, destination),
+  log: (message) => console.log(`[omnigent] ${message}`),
+});
+
 /** How long a negative arca-binary probe is trusted before re-checking PATH. */
 const ARCA_PATH_RETRY_MS = 60 * 1000;
 let cachedArcaPath = { path: null, checkedAt: 0 };
@@ -452,15 +476,15 @@ const arcaPreviewDeclinedUntil = new Map();
  * succeeded.
  */
 const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
-const onboardingArcaLogins = new Map();
+const onboardingArcaSetups = new Map();
 
 /**
  * Onboarding's Arca connect, run through the auto-connect state machine so
  * the window's own launch-time connect joins it instead of racing a second
  * `arca ssh`. Picking Arca opts into auto-connect; overlapping attempts share
  * the opt-in, and the last to finish keeps it only if any of them succeeded.
- * Like any auto-connect, a started run finishes in the background even if
- * setup closes; nothing starts once it has.
+ * Browser sign-in is canceled when the last setup window closes; a started
+ * noninteractive connection may finish in the background.
  *
  * @param {string} serverUrl
  * @param {(line: string) => void} log
@@ -484,65 +508,62 @@ async function connectOnboardingArca(serverUrl, log, sender) {
     if (isClosed()) {
       result = { ok: false, canceled: true };
     } else {
-      const current = arcaAutoConnect.getStatus(serverUrl);
-      // Joining a run already in flight streams nothing, so only a new run shows its command.
-      if (current.command && (current.state === "idle" || current.state === "failed")) {
-        log(`$ ${current.command}`);
-      }
-      let status =
-        current.state === "failed"
-          ? await arcaAutoConnect.retry(serverUrl, log)
-          : await arcaAutoConnect.ensure(serverUrl, log);
-      if (status.state === "failed" && status.errorKind === "omni-auth" && !isClosed()) {
-        // The setup page's Install click authorizes sign-in; passive auto-connect never does.
-        log(`$ arca ${arca.buildLoginArgs(serverUrl).join(" ")}`);
-        log("Signing in on Arca. If a browser window opens, finish signing in there.");
-        const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
-        let login = onboardingArcaLogins.get(target);
-        if (!login) {
-          login = { ...arca.startArcaLogin(serverUrl), waiters: 0 };
-          onboardingArcaLogins.set(target, login);
-          login.promise = login.promise.finally(() => {
-            if (onboardingArcaLogins.get(target) === login) onboardingArcaLogins.delete(target);
-          });
-        }
-        login.waiters += 1;
-        let onClosed;
-        const closed = new Promise((resolve) => {
-          onClosed = () => resolve({ ok: false, canceled: true });
-          sender.once("destroyed", onClosed);
+      // The setup page's Install click authorizes browser sign-in before host startup.
+      log(`$ arca ${arcaOnboarding.buildSetupArgs(serverUrl).join(" ")}`);
+      log("If sign-in is needed, a browser opens on your laptop. Finish signing in to continue.");
+      const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
+      let setup = onboardingArcaSetups.get(target);
+      if (!setup) {
+        setup = { ...arcaOnboarding.startArcaSetup(serverUrl), waiters: 0 };
+        onboardingArcaSetups.set(target, setup);
+        setup.promise = setup.promise.finally(() => {
+          if (onboardingArcaSetups.get(target) === setup) onboardingArcaSetups.delete(target);
         });
-        let auth;
-        try {
-          auth = await Promise.race([login.promise, closed]);
-        } finally {
-          sender.removeListener("destroyed", onClosed);
-          login.waiters -= 1;
-          // A closed setup window must not cancel another window's sign-in.
-          if (login.waiters === 0 && onboardingArcaLogins.get(target) === login) {
-            onboardingArcaLogins.delete(target);
-            login.cancel();
-          }
-        }
-        if (isClosed()) {
-          result = { ok: false, canceled: true };
-        } else if (auth.ok) {
-          log("Signed in. Connecting Arca…");
-          status = await arcaAutoConnect.retry(serverUrl, log);
-        } else {
-          result = auth;
+      }
+      setup.waiters += 1;
+      let onClosed;
+      const closed = new Promise((resolve) => {
+        onClosed = () => resolve({ ok: false, canceled: true });
+        sender.once("destroyed", onClosed);
+      });
+      let prepared;
+      try {
+        prepared = await Promise.race([setup.promise, closed]);
+      } finally {
+        sender.removeListener("destroyed", onClosed);
+        setup.waiters -= 1;
+        // A closed setup window must not cancel another window's sign-in.
+        if (setup.waiters === 0 && onboardingArcaSetups.get(target) === setup) {
+          onboardingArcaSetups.delete(target);
+          setup.cancel();
         }
       }
-      result ??=
-        status.state === "online"
-          ? { ok: true, alreadyRunning: status.alreadyRunning === true }
-          : {
-              ok: false,
-              error:
-                status.state === "unavailable"
-                  ? "The arca CLI was not found on this machine."
-                  : (status.error ?? "Couldn't connect Arca."),
-            };
+      if (isClosed()) {
+        result = { ok: false, canceled: true };
+      } else if (!prepared.ok) {
+        result = prepared;
+      } else {
+        log("Sign-in ready. Connecting Arca…");
+        const current = arcaAutoConnect.getStatus(serverUrl);
+        // Joining a run already in flight streams nothing, so only a new run shows its command.
+        if (current.command && (current.state === "idle" || current.state === "failed")) {
+          log(`$ ${current.command}`);
+        }
+        const status =
+          current.state === "failed"
+            ? await arcaAutoConnect.retry(serverUrl, log)
+            : await arcaAutoConnect.ensure(serverUrl, log);
+        result =
+          status.state === "online"
+            ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+            : {
+                ok: false,
+                error:
+                  status.state === "unavailable"
+                    ? "The arca CLI was not found on this machine."
+                    : (status.error ?? "Couldn't connect Arca."),
+              };
+      }
     }
   } catch (error) {
     result = { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -4663,6 +4684,13 @@ function registerIpc() {
     localHostId: () => omnigentCli.localHostId(),
   });
 
+  registerFolderChooser({
+    ipcMain,
+    dialog,
+    windowFor: (event) => BrowserWindow.fromWebContents(event.sender) ?? undefined,
+    isPinnedOriginSender,
+  });
+
   // SPA → this machine's identity: is the CLI installed, and its host id. Both
   // come from local config (no `omnigent host status` subprocess), so this is
   // instant — it lets the new-session picker tag/connect "this machine" without
@@ -4848,6 +4876,31 @@ function registerIpc() {
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
     };
+  });
+
+  // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
+  // and revalidates the destination before the shell-owned console asks consent.
+  ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("ssh-connect is only available to a connected server page");
+    }
+    if (process.platform === "win32") {
+      return { ok: false, error: "Connecting over SSH isn't available on Windows yet." };
+    }
+    const serverUrl = senderServerUrl(event);
+    if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
+    // Where Run on Arca is offered, it replaces this path. Re-checked here: the
+    // server's own page decides what it shows.
+    if (databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(serverUrl)) {
+      return { ok: false, error: "Connecting over SSH is off here. Use Run on Arca instead." };
+    }
+    let target;
+    try {
+      target = sshConnect.validateDestination(destination);
+    } catch (error) {
+      return { ok: false, error: error.message };
+    }
+    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
   });
 
   // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
