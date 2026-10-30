@@ -89,6 +89,7 @@ def _spawn_host_daemon(tmp_path: Path, base_url: str) -> tuple[subprocess.Popen[
     env = {
         **os.environ,
         "HOME": str(tmp_path),
+        "OMNIGENT_CONFIG_HOME": str(omni_dir),
         "OMNIGENT_RUNNER_ZYGOTE": "0",
         "PYTHONPATH": os.pathsep.join([str(_REPO_ROOT), os.environ.get("PYTHONPATH", "")]).rstrip(
             os.pathsep
