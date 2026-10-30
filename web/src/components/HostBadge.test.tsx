@@ -754,6 +754,7 @@ describe("HostBadge during a sandbox launch", () => {
   it.each([
     ["provisioning", "Provisioning sandbox", "starting"],
     ["connecting", "Starting agent", "starting"],
+    ["action_required", "Provisioning sandbox", null],
     ["failed", "Sandbox launch failed", null],
   ] as const)("shows a %s sandbox instead of a missing host", (stage, status, dot) => {
     launch(stage, null);
@@ -810,10 +811,37 @@ describe("HostBadge during a sandbox launch", () => {
     expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
 
     useChatStore.setState({ sandboxStatus: { stage: "connecting", error: null } });
+    rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
+    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, Starting agent");
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "starting");
+
     useSessionHostOnlineMock.mockReturnValue(true);
     rerender(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
     expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, online");
     expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "online");
+  });
+
+  it("keeps an offline sandbox reconnectable while its launch waits on the user", () => {
+    launch("action_required", "host_a1b2", "arclet");
+    useHostsMock.mockReturnValue({ data: [host({ sandbox_provider: "arclet" })] });
+    useSessionMock.mockReturnValue({ session: { hostId: "host_a1b2", hostResumable: true } });
+    useSessionHostOnlineMock.mockReturnValue(false);
+    render(<HostBadge sessionId="conv_1" appearance="composer" onReconnect={vi.fn()} />);
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger).toHaveAccessibleName("Host Arclet Sandbox, offline");
+    expect(screen.getByTestId("composer-host-status")).toHaveAttribute("data-status", "offline");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Reconnect host" })).toBeInTheDocument();
+  });
+
+  it("doesn't spin a dot for a wake when no host is bound", () => {
+    useSessionMock.mockReturnValue({ session: { hostId: null } });
+    render(<HostBadge sessionId="conv_1" appearance="composer" starting />);
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName("No host bound");
+    expect(screen.getByTestId("composer-host-status")).not.toHaveAttribute(
+      "data-status",
+      "starting",
+    );
   });
 
   it("shows a resolved host rather than an earlier failed launch", () => {

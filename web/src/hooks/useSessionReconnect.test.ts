@@ -46,10 +46,12 @@ function hostRow(hostId: string, status: Host["status"]): Host {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 beforeEach(() => {
@@ -502,21 +504,39 @@ describe("useSessionReconnect", () => {
     },
   );
 
-  it("stops showing a woken sandbox as starting if liveness never reports it online", async () => {
+  it("says so when a woken sandbox never reads online within the grace period", async () => {
     vi.useFakeTimers();
     try {
-      vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
-      const { result } = renderHook(() =>
-        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      const { result, rerender } = renderHook(
+        (props: { hostOnline: boolean | null | undefined }) =>
+          useSessionReconnect({ ...asleepSandbox, hostOnline: props.hostOnline }),
+        { initialProps: { hostOnline: false as boolean | null | undefined } },
       );
+      let reconnect!: Promise<void>;
       await act(async () => {
-        await result.current.reconnect();
+        reconnect = result.current.reconnect();
+      });
+      // The grace period starts when the server answers, not at the click.
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS));
+      expect(result.current.sandboxStarting).toBe(true);
+      expect(toast.error).not.toHaveBeenCalled();
+      await act(async () => {
+        pending.resolve({ queued: false, recovered: true });
+        await reconnect;
       });
       expect(result.current.sandboxStarting).toBe(true);
       act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS - 1));
+      // Liveness settling to another not-online value must not extend the deadline.
+      rerender({ hostOnline: null });
       expect(result.current.sandboxStarting).toBe(true);
+      expect(toast.error).not.toHaveBeenCalled();
       act(() => vi.advanceTimersByTime(1));
       expect(result.current.sandboxStarting).toBe(false);
+      expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+        "The sandbox didn't come online. Try Reconnect host again.",
+      );
     } finally {
       vi.useRealTimers();
     }
@@ -546,26 +566,30 @@ describe("useSessionReconnect", () => {
     expect(toast.loading).not.toHaveBeenCalled();
   });
 
-  it("ignores a sandbox wake's result after navigating to another session", async () => {
-    const pending = deferred<PostEventResponse>();
-    vi.mocked(retrySession).mockReturnValue(pending.promise);
-    const { result, rerender } = renderHook(useSessionReconnect, { initialProps: asleepSandbox });
-    let reconnect!: Promise<void>;
-    await act(async () => {
-      reconnect = result.current.reconnect();
-    });
-    expect(result.current.sandboxStarting).toBe(true);
-    rerender({ ...asleepSandbox, sessionId: "other-session", hostId: "other-host" });
-    expect(result.current.sandboxStarting).toBe(false);
+  it.each(["resolves", "rejects"] as const)(
+    "ignores a sandbox wake that %s after navigating to another session",
+    async (outcome) => {
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      const { result, rerender } = renderHook(useSessionReconnect, { initialProps: asleepSandbox });
+      let reconnect!: Promise<void>;
+      await act(async () => {
+        reconnect = result.current.reconnect();
+      });
+      expect(result.current.sandboxStarting).toBe(true);
+      rerender({ ...asleepSandbox, sessionId: "other-session", hostId: "other-host" });
+      expect(result.current.sandboxStarting).toBe(false);
 
-    await act(async () => {
-      pending.resolve({ queued: false, recovered: true });
-      await reconnect;
-    });
-    expect(result.current.sandboxStarting).toBe(false);
-    expect(refreshRunnerHealth).not.toHaveBeenCalled();
-    expect(toast.error).not.toHaveBeenCalled();
-  });
+      await act(async () => {
+        if (outcome === "resolves") pending.resolve({ queued: false, recovered: true });
+        else pending.reject(new Error("managed host wake timed out"));
+        await reconnect;
+      });
+      expect(result.current.sandboxStarting).toBe(false);
+      expect(refreshRunnerHealth).not.toHaveBeenCalled();
+      expect(toast.error).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     { label: "browser", desktop: false, hostId: "this-mac", isOwner: true },

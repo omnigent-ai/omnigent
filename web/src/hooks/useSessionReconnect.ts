@@ -124,14 +124,17 @@ export function useSessionReconnect({
 
   // Liveness polls lag the wake, so stay "starting" until the host reads online.
   useEffect(() => {
-    if (sandboxWake !== "awaiting_online") return;
-    if (hostOnline === true) {
-      setSandboxWake(null);
-      return;
-    }
-    const timer = setTimeout(() => setSandboxWake(null), SANDBOX_WAKE_ONLINE_GRACE_MS);
-    return () => clearTimeout(timer);
+    if (sandboxWake === "awaiting_online" && hostOnline === true) setSandboxWake(null);
   }, [sandboxWake, hostOnline]);
+
+  useEffect(() => {
+    if (sandboxWake !== "awaiting_online") return;
+    const timer = setTimeout(() => {
+      setSandboxWake(null);
+      toast.error("The sandbox didn't come online. Try Reconnect host again.");
+    }, SANDBOX_WAKE_ONLINE_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, [sandboxWake]);
 
   // The server resumes the sandbox and starts the agent, as it does for a
   // message, so this works in the browser and for anyone who can send one.

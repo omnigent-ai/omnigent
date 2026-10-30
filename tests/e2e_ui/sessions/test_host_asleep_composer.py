@@ -35,6 +35,7 @@ the host is online; there is no toast unless the wake fails.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from urllib.parse import urlparse
@@ -56,8 +57,8 @@ _FAKE_HOST = {
 # Unix seconds well before now so the session is outside the startup grace
 # (STARTING_GRACE_S) — see useSessionLiveness row 2.
 _OLD_CREATED_AT = 1_700_000_000
-# Keeps each status visible long enough to read in a recording.
-_HOLD_MS = 1_500
+# Keeps each status visible long enough to read, only when recording.
+_HOLD_MS = 1_500 if os.environ.get("OMNIGENT_E2E_RECORD_DIR") else 0
 
 
 def _force_host_asleep(
@@ -225,7 +226,10 @@ def _open_host_menu(page: Page, status: str) -> None:
     :param page: Page showing the session composer.
     :param status: Expected ``data-status`` for both dots.
     """
+    # A trigger click during the previous menu's close animation is dropped.
+    expect(page.get_by_role("menu")).to_have_count(0, timeout=5_000)
     page.get_by_test_id("composer-host-select").click()
+    expect(page.get_by_role("menu")).to_be_visible(timeout=5_000)
     menu_dot = page.get_by_test_id("composer-host-menu-status")
     expect(menu_dot).to_have_attribute("data-status", status, timeout=5_000)
     chip_class = page.get_by_test_id("composer-host-status").get_attribute("class")

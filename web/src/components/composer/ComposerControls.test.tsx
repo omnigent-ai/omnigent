@@ -43,7 +43,11 @@ describe("shared composer controls", () => {
     ["online", ["bg-success"], ["border-[1.5px]", "animate-spin"]],
     ["offline", ["border-[1.5px]"], ["bg-success", "animate-spin", "bg-destructive"]],
     ["unknown", ["border-[1.5px]"], ["bg-success", "animate-spin"]],
-    ["starting", ["border-[1.5px]", "border-t-transparent", "animate-spin"], ["bg-success"]],
+    [
+      "starting",
+      ["border-[1.5px]", "border-t-transparent", "animate-spin", "motion-reduce:animate-none"],
+      ["bg-success"],
+    ],
   ] as const)("draws a %s host status dot", (status, present, absent) => {
     render(<HostStatusDot status={status} testId="dot" />);
     const dot = screen.getByTestId("dot");

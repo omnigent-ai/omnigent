@@ -166,9 +166,10 @@ export function HostBadge({
     // A launching sandbox has no host record yet: show the launch, not a missing host.
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
     // A wake, or a launch or resume the server reports by stage, spins the status
-    // dot until the host itself is online.
-    const launchInProgress = launch !== null && launch.stage !== "failed";
-    const hostStarting = (starting || launchInProgress) && badge?.status !== "online";
+    // dot until the host itself is online. A launch waiting on the user isn't progress.
+    const launchInProgress =
+      launch !== null && launch.stage !== "failed" && launch.stage !== "action_required";
+    const hostStarting = ((starting && !!badge) || launchInProgress) && badge?.status !== "online";
     const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
     const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
     const reconnectable =
@@ -178,11 +179,9 @@ export function HostBadge({
       : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
-    const connectionWord = hostStarting
-      ? startingWord
-      : asleep
-        ? "Asleep — wakes on next message"
-        : CONNECTION_WORD[badge?.status ?? "unknown"];
+    let connectionWord = CONNECTION_WORD[badge?.status ?? "unknown"];
+    if (hostStarting) connectionWord = startingWord;
+    else if (asleep) connectionWord = "Asleep — wakes on next message";
     let tooltipRows = badge
       ? [
           { label: "Host", value: badge.label },
