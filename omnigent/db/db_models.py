@@ -671,6 +671,11 @@ class SqlConversationMetadata(OmnigentBase):
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Whether the agent's work outlives its ended turn, e.g. a background shell;
+    # NULL = never written.
+    background_work_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Why a running session's agent is parked on a terminal prompt; NULL = not parked.
+    blocked_on: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
     # (Rule R032). NULL = unfiled. Coexists with the implicit ``omni_project``
     # label via the store's dual-read until labels are consolidated.
@@ -686,6 +691,11 @@ class SqlConversationMetadata(OmnigentBase):
             "host_id IS NULL OR workspace IS NOT NULL",
             name="ck_conversation_metadata_workspace_required_for_host",
         ),
+        # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "blocked_on IS NULL OR length(CAST(blocked_on AS BLOB)) <= 512",
+            name="ck_conversation_metadata_blocked_on_bytes",
+        ).ddl_if(dialect="sqlite"),
         # Supports list_conversations_by_runner_id and get_runner_ids.
         Index("ix_conversation_metadata_runner_id", "workspace_id", "runner_id", "id"),
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
