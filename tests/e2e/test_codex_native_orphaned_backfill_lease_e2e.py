@@ -42,6 +42,7 @@ Runs with only the ``codex`` CLI installed (no login, no LLM key)::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import socket
 import sqlite3
 import time
@@ -87,9 +88,7 @@ def _mark_running_lease(codex_home: Path, *, age_seconds: int) -> None:
         )
 
 
-async def _launch_until_ready_or_error(
-    *, codex_home: Path, bridge_dir: Path
-) -> tuple[str, float]:
+async def _launch_until_ready_or_error(*, codex_home: Path, bridge_dir: Path) -> tuple[str, float]:
     """Run the real codex-native launch path once against ``codex_home``.
 
     :returns: ``("ready", elapsed)`` when the app-server becomes ready, or
@@ -112,10 +111,9 @@ async def _launch_until_ready_or_error(
     except RuntimeError as exc:
         return str(exc), time.monotonic() - started
     finally:
-        try:
+        # Teardown must not mask the launch outcome.
+        with contextlib.suppress(Exception):
             await server.close()
-        except Exception:  # noqa: BLE001 - teardown must not mask the outcome
-            pass
     return "ready", time.monotonic() - started
 
 
