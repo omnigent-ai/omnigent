@@ -2546,7 +2546,7 @@ function ComposerImpl(
         : undefined
       : nativeMcpHarness;
   const hostMcpHarness = hostMcpKey !== undefined && isBrandHarness(hostMcpKey) ? hostMcpKey : null;
-  const { data: sessionAgent } = useSessionAgent(composerSessionId);
+  const { data: sessionAgent, isError: sessionAgentFailed } = useSessionAgent(composerSessionId);
   // A claude-sdk session run without setting sources (`skills: none`) loads only managed
   // servers; until the session's agent arrives, list only those.
   const hostUserServersLoaded =
@@ -2580,7 +2580,9 @@ function ComposerImpl(
           ? "Loading MCP servers…"
           : hostMcpQuery.isError
             ? "Couldn’t load MCP servers from this session’s host."
-            : undefined;
+            : sessionHarness === "claude-sdk" && sessionAgent === undefined && sessionAgentFailed
+              ? "Couldn’t load this session’s agent, so only managed MCP servers are shown."
+              : undefined;
   const mcpSettingsHarness = nativeMcpHarness
     ? sessionHarness
     : hostMcpHarness && INVENTORY_HARNESS_IDS[hostMcpHarness];
