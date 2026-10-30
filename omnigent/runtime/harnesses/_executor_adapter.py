@@ -25,6 +25,7 @@ from fastapi import Response
 
 from omnigent.debug_logging import phase_scope
 from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -244,7 +245,9 @@ class ExecutorAdapter(HarnessApp):
         """
         executor = self._ensure_executor()
         messages = _translate_input_to_messages(
-            request.input, include_tool_history=executor.replays_tool_history()
+            request.input,
+            include_tool_history=executor.replays_tool_history(),
+            preserve_content_blocks=executor.preserves_message_content_blocks(),
         )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
@@ -356,6 +359,7 @@ class ExecutorAdapter(HarnessApp):
                 phase_scope(ErrorPhase.TURN),
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
+                native_shell_authorization(request.authorized_native_shell_command),
             ):
                 log_input_event(
                     _logger, "native_input_execution_started", session_id=turn_session_id
@@ -730,24 +734,34 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            text = _extract_user_text(injection.input)
-            if not text:
+            content = (
+                _normalize_message_content(injection.input, preserve_content_blocks=True)
+                if executor.preserves_message_content_blocks()
+                else _extract_user_text(injection.input)
+            )
+            if not content:
                 _logger.warning(
-                    "skipping in-band injection with no text payload: %r",
+                    "skipping in-band injection with no supported payload: %r",
                     injection.input,
                 )
                 continue
             if ctx.cancelled.is_set():
                 return
             try:
-                with input_delivery_scope(
-                    injection.model_dump(include=set(INPUT_FIELDS)), response_id=ctx.response_id
+                with (
+                    input_delivery_scope(
+                        injection.model_dump(include=set(INPUT_FIELDS)),
+                        response_id=ctx.response_id,
+                    ),
+                    native_shell_authorization(injection.authorized_native_shell_command),
                 ):
                     log_input_event(
                         _logger, "native_input_steering_started", session_id=ctx.session_id
                     )
                     try:
-                        accepted = await executor.enqueue_session_message(self._session_key, text)
+                        accepted = await executor.enqueue_session_message(
+                            self._session_key, content
+                        )
                         outcome = "executor_accepted" if accepted else "executor_refused"
                     except InjectionDeliveryAmbiguous:
                         # The harness may already hold the message; resending could duplicate it.
@@ -1557,6 +1571,7 @@ def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
     *,
     include_tool_history: bool = False,
+    preserve_content_blocks: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1568,12 +1583,16 @@ def _translate_input_to_messages(
         return [{"role": "user", "content": input_value}]
 
     history_messages = _extract_role_keyed_messages(
-        input_value, include_tool_history=include_tool_history
+        input_value,
+        include_tool_history=include_tool_history,
+        preserve_content_blocks=preserve_content_blocks,
     )
     if history_messages:
         return history_messages
 
-    content = _normalize_message_content(input_value)
+    content = _normalize_message_content(
+        input_value, preserve_content_blocks=preserve_content_blocks
+    )
     return [{"role": "user", "content": content}]
 
 
@@ -1581,6 +1600,7 @@ def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
     *,
     include_tool_history: bool,
+    preserve_content_blocks: bool,
 ) -> list[Message]:
     """Extract role-keyed messages from an Omnigent input list.
 
@@ -1612,7 +1632,9 @@ def _extract_role_keyed_messages(
         if item_type != "message" or "role" not in item:
             continue
         role = item["role"]
-        content = _normalize_message_content(item.get("content"))
+        content = _normalize_message_content(
+            item.get("content"), preserve_content_blocks=preserve_content_blocks
+        )
         if not content:
             continue
         messages.append({"role": role, "content": content})
@@ -1668,14 +1690,18 @@ _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file"
 
 def _normalize_message_content(
     content: Any,
+    *,
+    preserve_content_blocks: bool = False,
 ) -> str | list[dict[str, Any]]:
-    """Normalize message content: plain string for text-only; full block list for multimodal."""
+    """Keep blocks for opted-in executors and attachments; otherwise join plain text."""
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return ""
+    if preserve_content_blocks:
+        return content
 
     has_multimodal = any(
         isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES

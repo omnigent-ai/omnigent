@@ -1026,7 +1026,7 @@ function FileExistenceProbe({
 }) {
   const result = useWorkspaceFileExists(id, path, trusted);
   useEffect(() => {
-    onResult(result);
+    onResult({ exists: result.exists, settled: result.settled });
   }, [result, onResult]);
   return null;
 }
@@ -1180,6 +1180,27 @@ describe("useWorkspaceFileExists", () => {
     expect(results.length).toBeGreaterThan(0);
     expect(results).not.toContain(true);
     expect(results.at(-1)).toBe(false);
+  });
+
+  it("reports a listed folder as a directory, not as a verified-absent file", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          dirEntry("experimental/data/mobile-touch-targets", "directory"),
+          dirEntry("experimental/data/notes.md"),
+        ],
+        has_more: false,
+      }),
+    );
+    const { result } = renderHook(
+      () => useWorkspaceFileExists("conv_1", "experimental/data/mobile-touch-targets", true),
+      { wrapper: Wrap },
+    );
+
+    await waitFor(() => expect(result.current.settled).toBe(true));
+    expect(result.current).toEqual({ exists: false, isDirectory: true, settled: true });
+    expect(fetchMock.mock.calls[0][0]).toContain("/filesystem/experimental/data?");
   });
 
   it("reports false (and 404-tolerant) when the parent directory is missing", async () => {
