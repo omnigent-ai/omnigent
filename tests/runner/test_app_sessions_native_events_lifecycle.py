@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import sys
@@ -5661,3 +5662,86 @@ async def test_events_codex_side_chat_message_failure_is_structured(
     if detail is not None:
         assert response.json()["detail"] == detail
     assert fake_client.closed
+
+
+@pytest.mark.asyncio
+async def test_events_stop_session_during_delivery_cancels_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Stop while Claude's terminal is still booting ends the turn cancelled, not failed.
+
+    The kill makes the waiting delivery fail with a terminal-exit error; that
+    error is the stop's own effect, so the turn must not be published as failed.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _BlockingHarnessClient, _sse
+
+    session_id = "5d1c3e9a0b7f4e21a6c8d2f0e4b9a7c1"
+    pane_killed = asyncio.Event()
+    harness = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_stop"}}),
+            _sse(
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "id": "resp_stop",
+                        "error": {
+                            "code": "RuntimeError",
+                            "message": "The Claude Code terminal is no longer running.",
+                        },
+                    },
+                }
+            ),
+        ],
+        pane_killed,
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "kill_session",
+        lambda bridge_dir, *, timeout_s: pane_killed.set(),
+    )
+    spec = _harness_spec("claude-native")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "ag_stop"}
+        )
+        assert create.status_code == 201, create.text
+        queue = _session_event_queues_ref.get(session_id)
+        sent = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stop",
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert sent.status_code == 202, sent.text
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5)
+        turn = app.state.active_turns[session_id]
+        _drain_session_event_queue(queue)
+
+        stop = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+        )
+        assert stop.status_code == 204, stop.text
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(turn, timeout=5)
+        events = _drain_session_event_queue(queue)
+
+    statuses = [e.get("status") for e in events if e.get("type") == "session.status"]
+    assert "failed" not in statuses, events
+    assert "idle" in statuses
+    assert session_id not in app.state.interrupted_sessions
