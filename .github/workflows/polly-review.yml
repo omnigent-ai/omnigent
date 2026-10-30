@@ -71,7 +71,7 @@ jobs:
         github.event.comment.author_association == 'COLLABORATOR' ||
         contains(fromJSON(vars.REVIEW_ALLOWLIST || '[]'), github.event.comment.user.login)
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions: {}
     outputs:
@@ -121,9 +121,13 @@ jobs:
         ) ||
         github.event_name == 'workflow_dispatch'
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
+      - name: Set review deadline
+        # Reserve time for process cleanup and diagnostics before the job expires.
+        run: echo "POLLY_REVIEW_DEADLINE=$(( $(date +%s) + 27 * 60 ))" >> "$GITHUB_ENV"
+
       - name: Acknowledge /review command
         if: github.event_name == 'issue_comment'
         env:
@@ -236,7 +240,7 @@ jobs:
       - name: Set up uv
         if: steps.creds.outputs.available == 'true'
         # This workflow checks out main, which may predate the action on its PR branch.
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: true
 
@@ -261,13 +265,13 @@ jobs:
 
       - name: Install Claude Code CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: claude
 
       - name: Install Codex CLI
         if: steps.creds.outputs.available == 'true'
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@c76912dd5f9cfe9e2e11572eae45ad657243232f
         with:
           harness: codex
 
@@ -799,18 +803,31 @@ jobs:
 
           prompt=$(cat /tmp/review_prompt.txt)
           review_started=$(date +%s)
+          review_timeout=$(( POLLY_REVIEW_DEADLINE - review_started ))
+          if [ "$review_timeout" -le 0 ]; then
+            echo "::error::Polly review time budget was exhausted during setup."
+            exit 124
+          fi
 
           # Run Polly headlessly with -p; it starts a local server, sends
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
-          uv run omnigent run examples/polly/ \
+          review_status=0
+          timeout --signal=INT --kill-after=30s "$review_timeout" uv run omnigent run examples/polly/ \
             --harness "$OMNIGENT_POLLY_HARNESS" --model "$OMNIGENT_POLLY_MODEL" \
             -p "$prompt" \
             --no-session \
             2>polly-stderr.log \
             | tee /tmp/polly_output.txt \
-            || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
+            || review_status=$?
           echo "::notice::Polly review generation took $(( $(date +%s) - review_started )) seconds."
+          if [ "$review_status" -eq 124 ] || [ "$review_status" -eq 137 ]; then
+            echo "::error::Polly review timed out or was killed; no review was published. See the diagnostics artifact." | tee -a polly-stderr.log
+            exit "$review_status"
+          elif [ "$review_status" -ne 0 ]; then
+            echo "::warning::Polly review exited non-zero"
+            cat polly-stderr.log
+          fi
 
           # Keep raw stdout for failures, including secret-scan and posting errors.
           # Write publishable content separately using a review marker or heading.
