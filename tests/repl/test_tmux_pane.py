@@ -496,7 +496,7 @@ def test_resolve_argv_falls_back_to_python_m_when_which_misses(
     monkeypatch.setattr(shutil, "which", lambda name: None)
     monkeypatch.setattr("sys.executable", "/path/to/python")
     argv = _resolve_omnigent_argv()
-    assert argv == ["/path/to/python", "-m", "omnigent.cli"], (
+    assert argv == ["/path/to/python", "-P", "-m", "omnigent.cli"], (
         f"python-m fallback regressed; got {argv!r}. The fallback is "
         f"the only path that works in environments where the omnigent "
         f"binary isn't directly findable, so silent breakage here means "
@@ -625,6 +625,7 @@ def test_register_pane_strips_existing_python_m_prefix_idempotently(
     stored_argv = json.loads(launch_call[6])
     assert stored_argv == [
         "/p/python",
+        "-P",
         "-m",
         "omnigent.cli",
         "run",
@@ -701,6 +702,7 @@ def test_register_pane_repairs_already_doubled_prefix(
     stored_argv = json.loads(launch_call[6])
     assert stored_argv == [
         "/p/python",
+        "-P",
         "-m",
         "omnigent.cli",
         "run",

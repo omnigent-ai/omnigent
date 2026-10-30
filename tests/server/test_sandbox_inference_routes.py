@@ -21,7 +21,11 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.models import model_catalog
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    NoReachableModels,
+)
 from omnigent.server.routes import sandbox_inference as sandbox_inference_routes
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_core, routes_events
@@ -280,6 +284,41 @@ async def test_gateway_preview_needs_no_host_or_inference_binding(env: _Env, row
     assert response.headers["cache-control"] == "private, no-store"
     target.default_model_options.assert_awaited_once_with("codex-native", None)
     assert env.persisted() == before
+    env.launch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_error"),
+    [
+        (("No models are available for Codex.",), {"error": "No models are available for Codex."}),
+        ((), {}),
+        (("first", "second"), {}),
+        (("x" * 400,), {"error": "x" * 300}),
+    ],
+    ids=["with-reason", "without-reason", "non-message-args", "long-reason"],
+)
+async def test_provider_certain_no_model_is_reachable_reports_unsupported(
+    env: _Env, reason, expected_error
+):
+    from omnigent.server.inference_catalog import SandboxInferenceService
+
+    target = env.app.state.sandbox_config.default
+    target.host_config = None
+    target.default_model_options = AsyncMock(side_effect=NoReachableModels(*reason))
+    env.app.state.inference_catalog = SandboxInferenceService(env.app.state)
+    response = await env.client.get(
+        "/v1/sandbox-providers/agent_sandbox/harnesses/codex-native/model-options"
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "configured": False,
+        "models": [],
+        "configuration_revision": None,
+        "provider_label": "AI Gateway",
+        "default_model": None,
+        "status": "unsupported",
+        **expected_error,
+    }
     env.launch.assert_not_called()
 
 
@@ -753,7 +792,7 @@ async def test_rejected_native_switch_restores_saved_model(
     )
 
     assert response.status_code == 503, response.text
-    assert "previous selection has been restored" in response.text
+    assert "Please check the current selection and try again" in response.text
     runner_post.assert_awaited_once()
     assert runner_post.call_args.args == (f"/v1/sessions/{session_id}/events",)
     assert runner_post.call_args.kwargs["json"] == {

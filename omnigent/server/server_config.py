@@ -36,14 +36,17 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePath
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 from PIL import Image, ImageSequence, UnidentifiedImageError
 
 from omnigent.server.admin_list import resolve_data_dir
+
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +272,79 @@ def filesystem_attachment_denied_extensions() -> frozenset[str]:
         value = entry.strip().lower()
         denied.add(value if value.startswith(".") else f".{value}")
     return frozenset(denied)
+
+
+def parse_filesystem_attachment_policy(raw: object) -> FilesystemAttachmentPolicy:
+    """Build the filesystem attachment policy from a configured value.
+
+    ``None`` keeps the default extensions. A list replaces them, with or
+    without leading dots (``[".gz", "har"]``), and ``[]`` delivers nothing as
+    a file. ``"*"``, alone or as a list entry, adds the default extensions and
+    every other file that can't be inlined. An unusable value keeps the
+    defaults, so a typo cannot turn off attachments that worked before.
+
+    :param raw: The configured value, e.g. ``"*"`` or ``[".zip", ".gz"]``.
+    :returns: The policy the upload route applies.
+    """
+    from omnigent.inner.native_attachments import (
+        DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS,
+        DEFAULT_FILESYSTEM_ATTACHMENT_POLICY,
+        FilesystemAttachmentPolicy,
+    )
+
+    if raw is None:
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list):
+        logger.warning(
+            "filesystem_attachment_allowed_extensions=%r is not a list, using the defaults",
+            raw,
+        )
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    extensions: set[str] = set()
+    all_types = False
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.strip():
+            logger.warning(
+                "filesystem_attachment_allowed_extensions entry %r is not a "
+                "non-empty string, skipping",
+                entry,
+            )
+            continue
+        value = entry.strip().lower()
+        if value == "*":
+            all_types = True
+            continue
+        extension = value if value.startswith(".") else f".{value}"
+        if PurePath(f"file{extension}").suffix != extension:
+            # Files match on their last extension only, so ".tar.gz" would match nothing.
+            logger.warning(
+                "filesystem_attachment_allowed_extensions entry %r is not a single "
+                "extension such as '.gz', skipping",
+                entry,
+            )
+            continue
+        extensions.add(extension)
+    if entries and not extensions and not all_types:
+        logger.warning(
+            "filesystem_attachment_allowed_extensions=%r has no usable entry, using the defaults",
+            raw,
+        )
+        return DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+    if all_types:
+        extensions |= DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
+    return FilesystemAttachmentPolicy(extensions=frozenset(extensions), all_types=all_types)
+
+
+def filesystem_attachment_policy() -> FilesystemAttachmentPolicy:
+    """Which uploads this deployment delivers through native filesystem tools.
+
+    Config key ``filesystem_attachment_allowed_extensions``; see
+    :func:`parse_filesystem_attachment_policy` for the accepted values.
+    """
+    return parse_filesystem_attachment_policy(
+        load_server_config().get("filesystem_attachment_allowed_extensions")
+    )
 
 
 def _branding_section(config: Mapping[str, Any]) -> Mapping[str, Any]:

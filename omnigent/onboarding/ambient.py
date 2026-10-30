@@ -336,10 +336,15 @@ class CodexConfigTransport:
         ``command`` + ``args`` (e.g. ``"jq -r .access_token /path/token.json"``).
         ``None`` when the table carries no ``[X.auth]`` token command (e.g. it
         authenticates via a static header or AWS SigV4 instead).
+    :param auth_refresh_interval_ms: Positive token cache lifetime from the auth
+        table; absent or invalid values disable caching.
+    :param auth_timeout_ms: Positive auth timeout, defaulting to twenty seconds.
     """
 
     base_url: str
     auth_command: str | None
+    auth_refresh_interval_ms: int = 0
+    auth_timeout_ms: int = 20_000
 
 
 def codex_config_provider_transport(
@@ -392,7 +397,16 @@ def codex_config_provider_transport(
             # shlex.join produces a single shell-safe string Pi can run as a
             # "!command" apiKey (it shell-quotes the token file path etc.).
             auth_command = shlex.join(parts)
-    return CodexConfigTransport(base_url=base_url.strip(), auth_command=auth_command)
+    refresh_interval = auth.get("refresh_interval_ms", 0) if isinstance(auth, dict) else 0
+    timeout = auth.get("timeout_ms", 20_000) if isinstance(auth, dict) else 20_000
+    return CodexConfigTransport(
+        base_url=base_url.strip(),
+        auth_command=auth_command,
+        auth_refresh_interval_ms=(
+            refresh_interval if type(refresh_interval) is int and refresh_interval > 0 else 0
+        ),
+        auth_timeout_ms=timeout if type(timeout) is int and timeout > 0 else 20_000,
+    )
 
 
 def codex_config_detection() -> DetectedProvider | None:
@@ -536,6 +550,27 @@ def claude_managed_gateway(
         )
         return base_url or None, has_helper or use_gateway
     return None, False
+
+
+def claude_managed_gateway_routes(paths: tuple[Path, ...] | None = None) -> str | None:
+    """Return the non-Anthropic gateway Claude Code's managed settings pin, if any.
+
+    Claude Code applies managed settings over the environment omnigent passes,
+    so when this returns a URL it — not omnigent's provider config — decides
+    where native Claude inference goes.
+
+    :param paths: Settings files to read; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The managed ``ANTHROPIC_BASE_URL``, or ``None`` when no credentialed
+        managed gateway is configured or it points at Anthropic itself.
+    """
+    base_url, has_credential = claude_managed_gateway(paths)
+    if not base_url or not has_credential:
+        return None
+    host = (urlsplit(base_url).hostname or "").lower()
+    if host == "anthropic.com" or host.endswith(".anthropic.com"):
+        return None
+    return base_url
 
 
 def claude_managed_model_picker(

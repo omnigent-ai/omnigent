@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -39,6 +40,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -167,18 +169,6 @@ def _health_ok(port: int) -> bool:
     except httpx.HTTPError:
         return False
     return resp.status_code == 200
-
-
-def _find_free_port() -> int:
-    """Find a free loopback TCP port.
-
-    :returns: An available port number on ``127.0.0.1``.
-    """
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 def _wait_for_pidfile_server(
@@ -431,6 +421,42 @@ def procs() -> Iterator[_Procs]:
         registry.teardown()
 
 
+def test_orphan_stop_preserves_server_in_another_runtime(procs: _Procs, tmp_path: Path) -> None:
+    if shutil.which("lsof") is None:
+        pytest.skip("lsof is required to resolve the real server listener")
+    home = tmp_path / "home"
+    home.mkdir()
+    owner_env = {**_isolated_env(home), "OMNIGENT_DATA_DIR": str(home / "runtime-a")}
+    port = find_free_port()
+    log = tmp_path / "server.log"
+    server = procs.spawn(["server", "--port", str(port)], env=owner_env, cwd=home, log=log)
+    _wait_for_health(port, server, log)
+    # Target only this test's listener; exercise the real CLI's orphan sweep.
+    stop_command = [
+        sys.executable,
+        "-c",
+        "from functools import partial; import sys; from omnigent import cli; "
+        "from omnigent.host.local_server import stop_untracked_local_server; "
+        "cli.stop_untracked_local_server = partial(stop_untracked_local_server, "
+        "port=int(sys.argv[1])); cli.cli(args=['server', 'stop'])",
+        str(port),
+    ]
+    other_env = {**owner_env, "OMNIGENT_DATA_DIR": str(home / "runtime-b")}
+    other_stop = subprocess.run(
+        stop_command, env=other_env, cwd=home, capture_output=True, text=True, timeout=30
+    )
+    assert other_stop.returncode == 0, other_stop.stderr
+    assert server.poll() is None and _health_ok(port), (
+        f"Stopping runtime B terminated runtime A's server: {other_stop.stdout}"
+    )
+    owner_stop = subprocess.run(
+        stop_command, env=owner_env, cwd=home, capture_output=True, text=True, timeout=30
+    )
+    assert owner_stop.returncode == 0, owner_stop.stderr
+    assert server.wait(timeout=15) in (0, -signal.SIGTERM)
+    assert not _health_ok(port)
+
+
 def test_connect_reuses_foreground_server_without_killing_it(
     procs: _Procs,
     tmp_path: Path,
@@ -534,10 +560,10 @@ def test_explicit_port_servers_run_side_by_side(
     env = _isolated_env(home)
     # Two distinct free ports: the probe socket closes immediately, so the OS
     # could hand out the same ephemeral port twice — loop until they differ.
-    port_a = _find_free_port()
-    port_b = _find_free_port()
+    port_a = find_free_port()
+    port_b = find_free_port()
     while port_b == port_a:
-        port_b = _find_free_port()
+        port_b = find_free_port()
 
     srv_a = procs.spawn(
         ["server", "--port", str(port_a)], env=env, cwd=home, log=tmp_path / "a.log"

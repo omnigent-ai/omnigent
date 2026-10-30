@@ -7,9 +7,13 @@ import type { ReactNode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import {
   readTerminalClipboardPreference,
@@ -50,7 +54,12 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("next-themes", () => ({
-  useTheme: () => ({ theme: mocks.theme, systemTheme: "light", setTheme: mocks.setTheme }),
+  useTheme: () => ({
+    theme: mocks.theme,
+    systemTheme: "light",
+    resolvedTheme: mocks.theme === "dark" ? "dark" : "light",
+    setTheme: mocks.setTheme,
+  }),
 }));
 vi.mock("@/lib/embedded", () => ({ useIsEmbedded: () => mocks.isEmbedded }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
@@ -215,13 +224,21 @@ function LocationProbe() {
 }
 
 function renderPage(path = "/settings") {
+  // The Appearance section lists the agent catalog (picker visibility), so the
+  // page needs a query client like it has in the real app. Retries off so a
+  // failed fetch surfaces as an empty list instead of hanging the test.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <TooltipProvider>
-      <MemoryRouter initialEntries={[path]}>
-        <SettingsPage />
-        <LocationProbe />
-      </MemoryRouter>
-    </TooltipProvider>,
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <MemoryRouter initialEntries={[path]}>
+          <SettingsPage />
+          <LocationProbe />
+        </MemoryRouter>
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -330,6 +347,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
+    localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
@@ -366,6 +384,31 @@ describe("SettingsPage", () => {
 
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
+
+  it("opens sub-agents full screen by default and persists the panel setting", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("open-subagents-in-panel-toggle");
+    expect(screen.getByTestId("settings-group-sessions")).toContainElement(toggle);
+    expect(toggle).toHaveAccessibleName("Open sub-agents in the Workspace panel");
+    expect(toggle).not.toBeChecked();
+
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBe("on");
+
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY)).toBeNull();
+
+    // A save that storage refuses leaves the switch showing what is stored.
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    const toastError = vi.spyOn(toast, "error").mockImplementation(() => "");
+    fireEvent.click(toggle);
+    expect(toggle).not.toBeChecked();
+    expect(toastError).toHaveBeenCalledTimes(1);
   });
 
   it("asks before terminal copying by default and explains the scope", () => {
@@ -480,8 +523,9 @@ describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     const heading = screen.getByRole("heading", { name: "Appearance" });
-    expect(heading).toHaveClass("settings-page-title");
-    expect(heading.closest("section")?.parentElement).toHaveClass("px-4", "md:px-8");
+    expect(heading).toHaveClass("settings-page-title", "font-medium");
+    expect(heading).not.toHaveClass("font-semibold");
+    expect(heading.closest("section")?.parentElement).toHaveClass("max-w-4xl", "px-4", "md:px-8");
     expect(screen.getByRole("button", { name: "About Interface font size" })).toHaveClass(
       "md:hidden",
     );
@@ -505,8 +549,12 @@ describe("SettingsPage", () => {
         "bg-card",
       );
     }
+    expect(screen.getByTestId("color-theme-editor")).toHaveClass("bg-transparent");
+    expect(screen.getByTestId("color-theme-editor")).not.toHaveClass("bg-card");
     // System is selected (theme = "system").
     expect(screen.getByTestId("theme-system")).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByTestId("transcript-view-default-chat")).toHaveClass("border");
+    expect(screen.getByTestId("transcript-view-default-chat")).not.toHaveClass("border-2");
     fireEvent.click(screen.getByTestId("theme-dark"));
     expect(mocks.setTheme).toHaveBeenCalledWith("dark");
   });
@@ -629,10 +677,15 @@ describe("SettingsPage", () => {
       "aria-checked",
       "true",
     );
+    expect(
+      screen.getByRole("img", {
+        name: "Sidebar preview: Agents, Files, Changes, Pull Requests pinned.",
+      }),
+    ).toBeInTheDocument();
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
   });
 
-  it("seeds the default Workspace tab from storage", () => {
+  it("seeds the preferred Workspace tab and restores it when repinned", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     renderPage("/settings/appearance");
 
@@ -640,10 +693,73 @@ describe("SettingsPage", () => {
       "aria-checked",
       "true",
     );
+    expect(
+      screen.getByRole("img", {
+        name: "Sidebar preview: Changes, Files, Pull Requests, Agents pinned.",
+      }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
       "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("changes");
+    fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("lets every workspace page be unpinned, remembers the choice, and selects a pinned default", () => {
+    writeSessionWorkspaceState("file", {
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    writeSessionWorkspaceState("browser", {
+      rightRailTab: "browser",
+      openBrowsers: ["one"],
+      selectedBrowserId: "one",
+    });
+    const page = renderPage("/settings/appearance");
+    for (const label of ["Files", "Changes", "Pull Requests", "Agents"]) {
+      const toggle = screen.getByRole("button", { name: `Pin ${label}` });
+      expect(toggle).toHaveAttribute("aria-pressed", "true");
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute("aria-pressed", "false");
+      expect(screen.queryByRole("radio", { name: label })).toBeNull();
+    }
+    expect(screen.queryByRole("radiogroup", { name: "Default Workspace tab" })).toBeNull();
+    expect(
+      screen.getByRole("img", { name: "Sidebar preview: all pages in the + menu." }),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBe("[]");
+
+    page.unmount();
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("button", { name: "Pin Files" })).toHaveAttribute(
+      "aria-pressed",
       "false",
     );
+    fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(
+      screen.getByRole("img", { name: "Sidebar preview: Changes pinned." }),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
+    expect(readSessionWorkspaceState("file")).toEqual({
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    expect(readSessionWorkspaceState("browser")).toEqual({
+      rightRailTab: "browser",
+      openBrowsers: ["one"],
+      selectedBrowserId: "one",
+    });
   });
 
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
@@ -670,7 +786,7 @@ describe("SettingsPage", () => {
 
     fireEvent.click(screen.getByTestId("custom-theme-accent-trigger"));
     const accent = screen.getByTestId("custom-theme-accent-input") as HTMLInputElement;
-    expect(accent.value).toBe("#1F883D");
+    expect(accent.value).toBe("#0969DA");
     fireEvent.change(accent, { target: { value: "#2563eb" } });
 
     expect(select.value).toBe("custom");
@@ -679,10 +795,60 @@ describe("SettingsPage", () => {
     expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
       basePalette: "github",
       accent: "#2563eb",
-      darkAccent: "#2563eb",
+      darkAccent: "#58a6ff",
     });
     expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
       "#2563eb",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-light-sidebar-active")).toBe(
+      "rgba(37, 99, 235, 0.12)",
+    );
+    expect(
+      document.documentElement.style.getPropertyValue("--custom-light-sidebar-active-foreground"),
+    ).toBe("#2563eb");
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-primary")).toBe(
+      "#58a6ff",
+    );
+  });
+
+  it("edits only dark custom colors while dark mode is active", () => {
+    mocks.theme = "dark";
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("color-theme-select"), {
+      target: { value: "github" },
+    });
+
+    fireEvent.click(screen.getByTestId("custom-theme-accent-trigger"));
+    const accent = screen.getByTestId("custom-theme-accent-input") as HTMLInputElement;
+    expect(accent.value).toBe("#58A6FF");
+    fireEvent.change(accent, { target: { value: "#f59e0b" } });
+
+    fireEvent.click(screen.getByTestId("custom-theme-tint-trigger"));
+    const tint = screen.getByTestId("custom-theme-tint-input") as HTMLInputElement;
+    expect(tint.value).toBe("#0D1117");
+    fireEvent.change(tint, { target: { value: "#160e24" } });
+
+    expect(JSON.parse(localStorage.getItem("omnigent:custom-theme") ?? "null")).toMatchObject({
+      basePalette: "github",
+      accent: "#0969da",
+      darkAccent: "#f59e0b",
+      tint: "#f6f8fa",
+      darkTint: "#160e24",
+    });
+    expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
+      "#0969da",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-primary")).toBe(
+      "#f59e0b",
+    );
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-sidebar-active")).toBe(
+      "rgba(245, 158, 11, 0.12)",
+    );
+    expect(
+      document.documentElement.style.getPropertyValue("--custom-dark-sidebar-active-foreground"),
+    ).toBe("#f59e0b");
+    expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe(
+      "#160e24",
     );
   });
 
@@ -698,10 +864,10 @@ describe("SettingsPage", () => {
 
     expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
     expect(document.documentElement.style.getPropertyValue("--custom-light-primary")).toBe(
-      "#1f883d",
+      "#0969da",
     );
     expect(document.documentElement.style.getPropertyValue("--custom-dark-primary")).toBe(
-      "#238636",
+      "#58a6ff",
     );
     expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe(
       "#0d1117",
@@ -845,7 +1011,9 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
+    fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -857,6 +1025,7 @@ describe("SettingsPage", () => {
       target: { value: "Fira Code" },
     });
     fireEvent.click(screen.getByTestId("heavier-code-text-toggle"));
+    localStorage.setItem("omnigent:hidden-picker-agents", '["polly"]');
 
     // Sanity: the non-default choices were persisted.
     expect(localStorage.getItem("omnigent:terminal-theme")).toBe("dark");
@@ -867,6 +1036,11 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
+    expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBe("true");
+    expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
 
     // Open the confirmation dialog and confirm the reset.
     fireEvent.click(screen.getByTestId("reset-appearance-button"));
@@ -905,10 +1079,21 @@ describe("SettingsPage", () => {
       "true",
     );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
+    expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBeNull();
+    expect(screen.getByRole("button", { name: "Pin Changes" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
       "aria-checked",
       "false",
     );
+    expect(screen.getByTestId("fold-assistant-narration-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
   it("lets you clear and retype the font size without clamping mid-edit", () => {

@@ -281,6 +281,18 @@ class Conversation:
 # ── Conversation item data types ───────────────────────
 
 
+class StartupInputOptions(BaseModel):
+    """Request options retained only while a startup input awaits delivery."""
+
+    model_override: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    background_titles_enabled: bool = False
+
+
+# Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
+_MAX_MESSAGE_PHASE_LENGTH = 64
+
+
 class MessageData(BaseModel):
     """
     Data for a message item (user or assistant).
@@ -305,6 +317,10 @@ class MessageData(BaseModel):
     :param user_authored: Confirmed or conservatively preserved user input;
         prevents legacy content cleanup from hiding literal agent markup.
     :param subagent_return_id: Native task id of an explicitly completed child.
+    :param phase: Assistant-only harness label for the message, e.g. Codex
+        ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
+        Stored as given so clients can act on values added later; ``None``
+        when unset, not a string, or longer than 64 characters.
     """
 
     role: Literal["user", "assistant"]
@@ -316,12 +332,24 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @field_validator("content")
     @classmethod
     def reject_framework_blocks(cls, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reject_authored_framework_notices(content)
         return content
+
+    @field_validator("phase", mode="before")
+    @classmethod
+    def drop_malformed_phase(cls, phase: object) -> str | None:
+        """Read a malformed phase as unlabelled rather than rejecting the message."""
+        if isinstance(phase, str) and 0 < len(phase) <= _MAX_MESSAGE_PHASE_LENGTH:
+            return phase
+        return None
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:
@@ -331,10 +359,12 @@ class MessageData(BaseModel):
 
         :returns: The validated instance.
         :raises ValueError: If an assistant message is missing
-            ``agent``.
+            ``agent`` or a user message carries ``phase``.
         """
         if self.role == "assistant" and self.agent is None:
             raise ValueError("assistant messages require 'agent'")
+        if self.role == "user" and self.phase is not None:
+            raise ValueError("user messages cannot carry 'phase'")
         return self
 
 
@@ -753,6 +783,9 @@ class SlashCommandData(BaseModel):
     name: str
     arguments: str
     output: str | None = None
+    startup_options: StartupInputOptions | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 ItemData = (
@@ -862,6 +895,8 @@ class NewConversationItem(BaseModel):
     # know whether a timed-out POST committed). Same 32-hex shape the store
     # mints itself; ``None`` keeps the store-assigned random id.
     stable_id: str | None = None
+    status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
+    replaces_pending_id: str | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def check_type_matches_data(self) -> NewConversationItem:
@@ -937,12 +972,16 @@ class ConversationItem(BaseModel):
 
         :returns: Flat dict, e.g. for an assistant message::
 
-            {"id": "msg_abc", "response_id": "resp_xyz",
-             "type": "message", "status": "completed",
-             "created_at": 1753900000,
-             "role": "assistant",
-             "content": [{"type": "output_text", "text": "hi"}],
-             "model": "databricks-gpt-5-4"}
+            {
+                "id": "msg_abc",
+                "response_id": "resp_xyz",
+                "type": "message",
+                "status": "completed",
+                "created_at": 1753900000,
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}],
+                "model": "databricks-gpt-5-4",
+            }
         """
         return {
             "id": self.id,

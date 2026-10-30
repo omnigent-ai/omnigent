@@ -1,9 +1,10 @@
 """
 Integration tests for the Origin CSRF guard on the multipart session POSTs.
 
-Two POST routes accept ``multipart/form-data``: ``POST /v1/sessions`` (the
-bundled-create path) and ``POST /v1/sessions/{id}/resources/files`` (file
-upload). ``multipart/form-data`` is CORS-safelisted, so the JSON
+Three POST routes accept ``multipart/form-data``: ``POST /v1/sessions`` (the
+bundled-create path), ``POST /v1/sessions/{id}/resources/files`` (file
+upload), and ``POST /v1/sessions/{id}/resources/github/attachments`` (PR
+description media). ``multipart/form-data`` is CORS-safelisted, so the JSON
 Content-Type guard cannot stop a cross-site upload — a malicious page can
 ``fetch`` a ``FormData`` body to either route with no preflight. The
 ``require_trusted_origin`` dependency closes that gap: a present ``Origin``
@@ -183,3 +184,24 @@ async def test_upload_file_allows_trusted_origin(
     body = resp.json()
     assert body["name"] == "hello.txt"
     assert body["metadata"]["filename"] == "hello.txt"
+
+
+# ── upload_session_github_attachment (multipart PR media upload) ──
+
+
+async def test_pr_attachment_upload_rejects_cross_origin(client: httpx.AsyncClient) -> None:
+    """
+    A cross-site ``Origin`` on the PR attachment upload returns 403.
+
+    The upload goes to GitHub as the PR's account, so without the guard a
+    hostile page could push files there through a signed-in editor's browser.
+    """
+    session_id = await _create_session(client)
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/resources/github/attachments",
+        data={"pr_url": "https://github.com/acme/widgets/pull/17"},
+        files={"file": ("shot.png", b"\x89PNG\r\n\x1a\n", "image/png")},
+        headers={"Origin": _EVIL_ORIGIN},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "origin" in resp.text.lower()

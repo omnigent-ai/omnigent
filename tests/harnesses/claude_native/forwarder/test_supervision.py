@@ -195,7 +195,9 @@ async def test_forwarder_logs_a_repeating_loop_failure_once_until_it_recovers(
         request = await _get_recorded_item_request(server)
         # The streak ends once the delivering poll finishes.
         async with asyncio.timeout(5.0):
-            while "recovered after" not in caplog.text:
+            # Match the loop's own line: the item POST can also log a
+            # "forward sync recovered after" line first.
+            while "forwarder loop recovered after" not in caplog.text:
                 await asyncio.sleep(0.01)
     finally:
         task.cancel()
