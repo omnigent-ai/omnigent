@@ -625,6 +625,7 @@ export function CreateScheduledTaskDialog({
             timezone={timezone}
             onTimezoneChange={setTimezone}
             model={schedule}
+            recurrenceUnsupported={scheduleUnsupported}
             onChange={setSchedule}
             onRecurrenceSelect={() => setScheduleUnsupported(false)}
             onSelectOpenChange={handleSelectOpenChange}

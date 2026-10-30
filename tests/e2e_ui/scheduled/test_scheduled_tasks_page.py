@@ -192,39 +192,7 @@ def _row_by_name(page: Page, name: str):
 
 
 def _pick_minute(page: Page, minute: int) -> None:
-    """Open the time picker and click a minute cell.
-
-    The time input opens the picker on focus, so by the time a caller reaches the
-    clock button the picker is already open and being dismissed by whatever the
-    caller clicked last. Radix keeps the popover mounted through its exit
-    animation, and toggling the clock mid-exit re-opens it only to have Radix
-    dismiss it again immediately — leaving the minute cells alive just until the
-    animation ends, long enough for a visibility check to pass and the click
-    after it to miss. Waiting for the exit to finish means the toggle acts on a
-    genuinely closed picker, so no re-open-and-retry is needed.
-
-    Selecting a minute does not close the popover, and an open floating-ui
-    popover keeps recomputing its position — leaving the dialog's submit button
-    perpetually "not stable" for Playwright. So dismiss the picker (by clicking a
-    field inside the dialog, an interaction-outside — Escape would bubble to the
-    Radix Dialog and close it) and wait for it to unmount, letting the layout
-    settle before the caller submits.
-
-    Every dismiss click on the name input uses force=True: while the picker
-    popover is open the Radix Dialog owns pointer hit-testing over the modal, so
-    a normal actionability-gated click resolves to the ``dialog-overlay`` at the
-    input's coordinates ("overlay intercepts pointer events") and blocks the full
-    30s under load. A forced click still dispatches a real pointerdown on the
-    input, which Radix registers as the interaction-outside that closes the
-    popover — the same reason the open click below is forced.
-
-    :param page: Playwright page with the create/edit task dialog open.
-    :param minute: Minute of the hour to select (0-59).
-    """
-    name_input = page.get_by_test_id("task-name-input")
-    # The popover content element: it carries data-state (open/closed) and
-    # unmounts only after the exit animation finishes, so its count/state are
-    # the reliable signals for both waits below.
+    """Pick a minute and close the popover before the caller submits."""
     popover_content = page.locator('[data-slot="popover-content"]').filter(
         has=page.get_by_test_id("schedule-time-picker")
     )
@@ -232,8 +200,7 @@ def _pick_minute(page: Page, minute: int) -> None:
     page.get_by_test_id("schedule-time-picker-trigger").click()
     expect(popover_content).to_have_attribute("data-state", "open")
     page.get_by_test_id(f"schedule-minute-{minute:02d}").click()
-    # Dismiss the picker so its floating position stops churning the layout.
-    name_input.click(force=True)
+    page.keyboard.press("Escape")
     expect(popover_content).to_have_count(0)
 
 
@@ -430,10 +397,9 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.press("ControlOrMeta+A")
     time_input.press_sequentially("9:37")
     assert time_input.input_value() == "9:37"
-    # force=True: focusing the time input opened the picker popover, so a normal
-    # click here can resolve to the dialog overlay (see _pick_minute's note). A
-    # forced click still blurs the input and closes the picker.
-    page.get_by_test_id("task-name-input").click(force=True)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.get_by_test_id("task-name-input").click()
     expect(time_input).to_have_value("09:37 AM")
     # Pick a minute the typed input did NOT already produce, so this proves the
     # picker applied the click rather than re-reading the value typing had set.
@@ -477,9 +443,9 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     time_input.press("ControlOrMeta+A")
     time_input.press_sequentially("10:37")
     assert time_input.input_value() == "10:37"
-    # force=True: the time input's focus reopened the picker popover, so blur it
-    # with a forced click that can't be swallowed by the dialog overlay.
-    page.get_by_test_id("task-name-input").click(force=True)
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.get_by_test_id("task-name-input").click()
     expect(time_input).to_have_value("10:37 AM")
     submit.click()
 
@@ -597,6 +563,15 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str)
     page.get_by_test_id("task-name-input").fill(name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
     _pick_select_option(page, "schedule-preset-trigger", "Custom schedule")
+    page.get_by_label("Repeat every", exact=True).fill("2")
+    page.get_by_test_id("schedule-time").click()
+    page.get_by_test_id("schedule-hour-10").click()
+    page.get_by_test_id("schedule-time").click()
+    page.keyboard.press("Escape")
+    expect(page.get_by_test_id("schedule-time-picker")).to_have_count(0)
+    page.keyboard.press("Escape")
+    expect(page.get_by_label("Repeat every", exact=True)).to_be_hidden()
+    page.get_by_test_id("custom-schedule-trigger").click()
     page.get_by_label("Repeat every", exact=True).fill("2")
     page.get_by_test_id("schedule-time").fill("invalid")
     page.keyboard.press("Escape")

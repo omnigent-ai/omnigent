@@ -358,10 +358,3 @@ export function parseTimeOfDayInput(input: string): { hour: number; minute: numb
   if (rawHour < 0 || rawHour > 23) return null;
   return { hour: rawHour, minute };
 }
-
-export function parseMinuteOfHourInput(input: string): number | null {
-  const value = input.trim().replace(/^:/, "");
-  if (!/^\d{1,2}$/.test(value)) return null;
-  const minute = Number(value);
-  return Number.isInteger(minute) && minute >= 0 && minute <= 59 ? minute : null;
-}

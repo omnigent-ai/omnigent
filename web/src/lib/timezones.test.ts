@@ -19,6 +19,7 @@ describe("schedule timezones", () => {
     ["0002-06-10", "UTC", "0002-06-10T23:59:59.000Z"],
     ["0020-06-10", "UTC", "0020-06-10T23:59:59.000Z"],
     ["9999-12-31", "Pacific/Kiritimati", "9999-12-31T09:59:59.000Z"],
+    ["9999-12-31", "America/New_York", "+010000-01-01T04:59:59.000Z"],
   ])("ends %s in %s at %s", (day, timezone, expected) => {
     const date = endOfDayInTimezone(day, timezone)!;
     expect(date.toISOString()).toBe(expected);

@@ -8,7 +8,6 @@ import { useScheduleEscape } from "./useScheduleEscape";
 import {
   DEFAULT_SCHEDULE_MODEL,
   parseTimeOfDayInput,
-  validateSchedule,
   type ScheduleModel,
 } from "@/lib/scheduleBuilder";
 
@@ -26,7 +25,13 @@ export function ScheduleTimePicker({
   onChange: (next: ScheduleModel) => void;
   onSelectOpenChange?: (open: boolean) => void;
 }) {
-  const error = validateSchedule(model);
+  const invalidTime =
+    !Number.isInteger(model.hour) ||
+    model.hour < 0 ||
+    model.hour > 23 ||
+    !Number.isInteger(model.minute) ||
+    model.minute < 0 ||
+    model.minute > 59;
   const inputRef = useRef<HTMLInputElement | null>(null);
   const hourColumnRef = useRef<HTMLDivElement | null>(null);
   const minuteColumnRef = useRef<HTMLDivElement | null>(null);
@@ -52,14 +57,11 @@ export function ScheduleTimePicker({
   }, [pickerParts.hour12, pickerParts.minute, timePickerOpen]);
 
   useEffect(() => {
+    if (!timePickerOpen) return;
     const handleWheel = (event: WheelEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
-      const columns = [
-        hourColumnRef.current ?? document.querySelector('[data-testid="schedule-hour-column"]'),
-        minuteColumnRef.current ?? document.querySelector('[data-testid="schedule-minute-column"]'),
-        periodColumnRef.current ?? document.querySelector('[data-testid="schedule-period-column"]'),
-      ];
+      const columns = [hourColumnRef.current, minuteColumnRef.current, periodColumnRef.current];
       const column = columns.find((col) => col?.contains(target));
       if (!column) return;
       if (column.scrollHeight > column.clientHeight) {
@@ -73,7 +75,7 @@ export function ScheduleTimePicker({
     return () => {
       window.removeEventListener("wheel", handleWheel, true);
     };
-  }, []);
+  }, [timePickerOpen]);
 
   function handleTimeTextChange(value: string) {
     setTimeText(value);
@@ -91,6 +93,7 @@ export function ScheduleTimePicker({
   }
 
   function handleTimePickerOpenChange(next: boolean) {
+    if (next === timePickerOpen) return;
     setTimePickerOpen(next);
     onSelectOpenChange?.(next);
   }
@@ -126,7 +129,7 @@ export function ScheduleTimePicker({
             data-testid="schedule-time"
             placeholder="5:00 PM"
             className="h-8 w-32 pr-8 text-ui"
-            aria-invalid={error ? true : undefined}
+            aria-invalid={invalidTime ? true : undefined}
             onFocus={() => handleTimePickerOpenChange(true)}
             onChange={(e) => handleTimeTextChange(e.target.value)}
             onBlur={canonicalizeTimeText}
@@ -146,6 +149,9 @@ export function ScheduleTimePicker({
         align="start"
         className="w-64 rounded-sm p-1.5"
         onOpenAutoFocus={(event) => event.preventDefault()}
+        onInteractOutside={(event) => {
+          if (event.target === inputRef.current) event.preventDefault();
+        }}
       >
         <div className="grid grid-cols-3 gap-1" data-testid="schedule-time-picker">
           <div

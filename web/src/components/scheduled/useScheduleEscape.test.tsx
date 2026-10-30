@@ -62,3 +62,16 @@ it("defers to a nested picker and ignores other keys", () => {
   expect(outer).toHaveBeenCalledOnce();
   expect(inner).toHaveBeenCalledOnce();
 });
+
+it("ignores Escape already handled by an earlier listener", () => {
+  const prevent = (event: KeyboardEvent) => event.preventDefault();
+  window.addEventListener("keydown", prevent, true);
+  const dismiss = vi.fn(() => true);
+  try {
+    renderHook(() => useScheduleEscape(true, dismiss));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(dismiss).not.toHaveBeenCalled();
+  } finally {
+    window.removeEventListener("keydown", prevent, true);
+  }
+});

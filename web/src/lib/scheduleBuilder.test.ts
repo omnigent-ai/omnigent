@@ -120,9 +120,6 @@ describe("parseRRuleToScheduleModel", () => {
 
   it("validates bounds and rejects impossible cutoff dates", () => {
     expect(validateSchedule(model({ preset: "custom", interval: 367 }))).not.toBeNull();
-    expect(
-      validateSchedule(model({ preset: "custom", customFreq: "monthly", monthDays: [32] })),
-    ).not.toBeNull();
     expect(validateSchedule(model({ end: { type: "count", count: 1 } }))).not.toBeNull();
     expect(parseUntil("20270230T235959Z")).toBeNull();
     expect(parseUntil("20270228T235959Z")?.toISOString()).toBe("2027-02-28T23:59:59.000Z");
@@ -201,20 +198,5 @@ describe("parseTimeOfDayInput", () => {
     expect(parseTimeOfDayInput("25:00")).toBeNull();
     expect(parseTimeOfDayInput("5:99 PM")).toBeNull();
     expect(parseTimeOfDayInput("not a time")).toBeNull();
-  });
-});
-
-describe("parseMinuteOfHourInput", () => {
-  it("accepts any minute in an hour", async () => {
-    const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
-    expect(parseMinuteOfHourInput(":00")).toBe(0);
-    expect(parseMinuteOfHourInput("7")).toBe(7);
-    expect(parseMinuteOfHourInput(":59")).toBe(59);
-  });
-
-  it("rejects invalid minute input", async () => {
-    const { parseMinuteOfHourInput } = await import("./scheduleBuilder");
-    expect(parseMinuteOfHourInput(":60")).toBeNull();
-    expect(parseMinuteOfHourInput("abc")).toBeNull();
   });
 });

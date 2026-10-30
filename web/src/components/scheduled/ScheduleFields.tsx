@@ -79,6 +79,7 @@ export function ScheduleFields({
   onTimezoneChange,
   onSelectOpenChange,
   onRecurrenceSelect,
+  recurrenceUnsupported = false,
 }: {
   model: ScheduleModel;
   onChange: (next: ScheduleModel) => void;
@@ -86,6 +87,7 @@ export function ScheduleFields({
   onTimezoneChange: (timezone: string) => void;
   onSelectOpenChange?: (open: boolean) => void;
   onRecurrenceSelect?: () => void;
+  recurrenceUnsupported?: boolean;
 }) {
   const [customOpen, setCustomOpen] = useState(false);
   const [draft, setDraft] = useState(model);
@@ -103,7 +105,21 @@ export function ScheduleFields({
     return true;
   });
   const zones = useMemo(() => commonTimezones(timezone), [timezone]);
-  const error = validateSchedule(model);
+  const [dateInput, setDateInput] = useState<{
+    value: string;
+    until: string;
+    timezone: string;
+    error: string | null;
+  } | null>(null);
+  const activeDateInput =
+    model.end?.type === "until" &&
+    dateInput?.until === model.end.until &&
+    dateInput.timezone === timezone
+      ? dateInput
+      : null;
+  const error = activeDateInput?.error ?? validateSchedule(model);
+  const recurrence = { ...model, end: undefined };
+  const recurrenceError = validateSchedule(recurrence);
   const draftError = validateSchedule({ ...draft, end: undefined });
   const until = model.end?.type === "until" ? parseUntil(model.end.until) : null;
 
@@ -130,16 +146,33 @@ export function ScheduleFields({
   }
 
   function changeEnd(value: string) {
+    setDateInput(null);
     let end: ScheduleModel["end"];
     if (value === "count") end = { type: "count", count: 2 };
     if (value === "until") end = { type: "until", until: "" };
     onChange({ ...model, end });
   }
 
+  function changeEndDate(value: string, zone: string) {
+    const cutoff = endOfDayInTimezone(value, zone);
+    const serialized = cutoff ? formatUntil(cutoff) : "";
+    const representable = parseUntil(serialized) !== null;
+    const nextUntil = representable ? serialized : "";
+    setDateInput({
+      value,
+      until: nextUntil,
+      timezone: zone,
+      error:
+        value && !representable
+          ? "This end date is unavailable in this timezone. Choose another date."
+          : null,
+    });
+    onChange({ ...model, end: { type: "until", until: nextUntil } });
+  }
+
   function changeTimezone(next: string) {
-    if (until) {
-      const cutoff = endOfDayInTimezone(dateInTimezone(until, timezone), next);
-      if (cutoff) onChange({ ...model, end: { type: "until", until: formatUntil(cutoff) } });
+    if (model.end?.type === "until") {
+      changeEndDate(activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : ""), next);
     }
     onTimezoneChange(next);
     setTimezoneOpen(false);
@@ -155,7 +188,8 @@ export function ScheduleFields({
           className="min-w-36"
           testId="schedule-preset-trigger"
           preventCloseAutoFocus={customOpen}
-          value={model.preset}
+          value={recurrenceUnsupported ? "" : model.preset}
+          placeholder="Choose frequency"
           options={PRESETS}
           onChange={changePreset}
           onOpenChange={onSelectOpenChange}
@@ -169,7 +203,7 @@ export function ScheduleFields({
                 data-testid="custom-schedule-trigger"
               >
                 <span className="truncate">
-                  {error ? "Select schedule…" : describeSchedule(buildRRule(model))}
+                  {recurrenceError ? "Select schedule…" : describeSchedule(buildRRule(recurrence))}
                 </span>
                 <ChevronDownIcon className="size-3.5 shrink-0" />
               </Button>
@@ -424,14 +458,8 @@ export function ScheduleFields({
               type="date"
               aria-label="End date"
               className="w-auto"
-              value={until ? dateInTimezone(until, timezone) : ""}
-              onChange={(event) => {
-                const date = endOfDayInTimezone(event.target.value, timezone);
-                onChange({
-                  ...model,
-                  end: { type: "until", until: date ? formatUntil(date) : "" },
-                });
-              }}
+              value={activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : "")}
+              onChange={(event) => changeEndDate(event.target.value, timezone)}
             />
           )}
           {model.end?.type === "count" && (
@@ -483,6 +511,7 @@ function ScheduleChoice({
   onOpenChange,
   testId,
   preventCloseAutoFocus,
+  placeholder,
   className,
 }: {
   label: string;
@@ -492,6 +521,7 @@ function ScheduleChoice({
   onOpenChange?: (open: boolean) => void;
   testId?: string;
   preventCloseAutoFocus?: boolean;
+  placeholder?: string;
   className?: string;
 }) {
   const [open, setOpen] = useState(false);
@@ -506,7 +536,7 @@ function ScheduleChoice({
   return (
     <Select open={open} value={value} onValueChange={onChange} onOpenChange={changeOpen}>
       <SelectTrigger aria-label={label} data-testid={testId} className={cn(choiceClass, className)}>
-        <SelectValue />
+        <SelectValue placeholder={placeholder} />
       </SelectTrigger>
       <SelectContent
         position="popper"
