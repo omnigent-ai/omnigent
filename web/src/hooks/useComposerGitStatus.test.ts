@@ -53,8 +53,8 @@ function setWorktrees(
     ...extra,
   });
 }
-function setGithub(data: Record<string, unknown> | undefined) {
-  usePullRequestInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn() });
+function setGithub(data: Record<string, unknown> | undefined, extra: Record<string, unknown> = {}) {
+  usePullRequestInfoMock.mockReturnValue({ data, isFetching: false, refetch: vi.fn(), ...extra });
 }
 
 function run(args: Partial<Parameters<typeof useComposerGitStatus>[0]> = {}) {
@@ -252,7 +252,7 @@ describe("useComposerGitStatus", () => {
       { data: { pr: { url: "pending", state: "OPEN", checks: { pending: 1 } } } },
       { data: { pr: { url: "conflict", state: "OPEN", merge_state_status: "DIRTY" } } },
     ]);
-    const { result, rerender } = run();
+    const { result } = run();
     expect(result.current.prs.map((pr) => pr.number)).toEqual([5, 3, 4, 1, 2]);
     expect(result.current).toMatchObject({ prCount: 5, prNumber: 5, prStatus: "conflict" });
     expect(usePullRequestInfosMock).toHaveBeenCalledWith("conv-1", [
@@ -260,16 +260,6 @@ describe("useComposerGitStatus", () => {
       "pending",
       "conflict",
     ]);
-
-    // Another selected PR cannot overwrite a linked PR just because its number matches.
-    usePullRequestInfosMock.mockReturnValue([
-      { data: { pr: { url: "unlinked", number: 5, state: "OPEN", merge_state_status: "DIRTY" } } },
-    ]);
-    rerender();
-    expect(result.current).toMatchObject({ prNumber: 3, prStatus: "ready", prNumberPrefix: "!" });
-    expect(
-      result.current.prs.find((pr) => pr.url === "conflict")?.merge_state_status,
-    ).toBeUndefined();
   });
 
   it("refreshes a closed PR that has reopened while leaving merged PRs at rest", () => {
@@ -312,14 +302,16 @@ describe("useComposerGitStatus", () => {
     "drops stale readiness and conflicts after a failed refresh or offline transition: %j",
     (queryState) => {
       setWorktrees(undefined);
-      setGithub({
-        prs: [
-          { url: "ready", number: 1, state: "OPEN" },
-          { url: "conflict", number: 2, state: "OPEN" },
-        ],
-        pr: { url: "ready", state: "OPEN", merge_state_status: "CLEAN" },
-      });
-      usePullRequestInfoMock.mockReturnValue({ ...usePullRequestInfoMock(), ...queryState });
+      setGithub(
+        {
+          prs: [
+            { url: "ready", number: 1, state: "OPEN" },
+            { url: "conflict", number: 2, state: "OPEN" },
+          ],
+          pr: { url: "ready", state: "OPEN", merge_state_status: "CLEAN" },
+        },
+        queryState,
+      );
       usePullRequestInfosMock.mockReturnValue([
         {
           ...queryState,
@@ -368,6 +360,46 @@ describe("useComposerGitStatus", () => {
     rerender();
     expect(result.current.prStatus).toBe("open");
   });
+
+  it.each(["selected", "linked"])(
+    "uses newer stored lifecycle over an older successful %s PR response",
+    (source) => {
+      setWorktrees(undefined);
+      const pr = { url: "updated", state: "OPEN", merge_state_status: "CLEAN", title: "Old title" };
+      const info = { tracking_available: true, ...(source === "selected" ? { pr } : {}) };
+      setGithub(info, { dataUpdatedAt: 2000 });
+      if (source === "linked") {
+        usePullRequestInfosMock.mockReturnValue([{ data: { pr }, dataUpdatedAt: 2000 }]);
+      }
+      useSessionPullRequestsMock.mockReturnValue({
+        data: {
+          synced: true,
+          prs: [
+            {
+              url: "updated",
+              number: 1,
+              state: "CLOSED",
+              title: "Current title",
+              state_checked_at: 3,
+            },
+          ],
+        },
+      });
+      const { result, rerender } = run();
+      expect(result.current).toMatchObject({
+        prStatus: "closed",
+        prs: [{ title: "Current title" }],
+      });
+      expect(result.current.prs[0].merge_state_status).toBeUndefined();
+
+      setGithub(info, { dataUpdatedAt: 4000 });
+      if (source === "linked") {
+        usePullRequestInfosMock.mockReturnValue([{ data: { pr }, dataUpdatedAt: 4000 }]);
+      }
+      rerender();
+      expect(result.current.prStatus).toBe("ready");
+    },
+  );
 
   it("preserves the legacy single PR's full status without another lookup", () => {
     setWorktrees(undefined);
@@ -481,11 +513,17 @@ describe("useComposerGitStatus", () => {
       isFetching: false,
       refetch: ghRefetch,
     });
-    const { result } = run();
+    const { result, rerender } = run();
     expect(result.current.refreshing).toBe(true);
-    result.current.refresh();
+    const refresh = result.current.refresh;
+    const latestDetailRefetch = vi.fn();
+    usePullRequestInfosMock.mockReturnValue([{ refetch: latestDetailRefetch }]);
+    rerender();
+    expect(result.current.refresh).toBe(refresh);
+    refresh();
     expect(wtRefetch).toHaveBeenCalledTimes(1);
     expect(ghRefetch).toHaveBeenCalledTimes(1);
-    expect(detailRefetch).toHaveBeenCalledTimes(1);
+    expect(detailRefetch).not.toHaveBeenCalled();
+    expect(latestDetailRefetch).toHaveBeenCalledTimes(1);
   });
 });

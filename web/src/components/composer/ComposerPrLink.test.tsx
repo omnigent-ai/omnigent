@@ -150,8 +150,11 @@ describe("ComposerPrLink", () => {
     const link = screen.getByTestId("composer-pr-link");
     expect(link).toHaveAttribute("data-pr-status", "conflict");
     expect(link).toHaveAccessibleName("2 PRs");
+    expect(link).not.toHaveAttribute("aria-describedby");
     fireEvent.focus(link);
     const preview = await screen.findByTestId("composer-pr-preview");
+    expect(link).toHaveAttribute("aria-describedby", preview.id);
+    expect(link).toHaveAccessibleDescription(/Merge conflicts.*Merged.*Previously merged work/);
     expect(preview.querySelectorAll("li[data-pr-status]")).toHaveLength(2);
     expect(preview.querySelector("li")).toHaveAttribute("data-pr-status", "conflict");
     expect(screen.getByText("Merged")).toBeVisible();

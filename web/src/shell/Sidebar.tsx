@@ -280,7 +280,11 @@ import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
 import DevinColor from "@lobehub/icons/es/Devin/components/Color";
 import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
-import { getPullRequestStatus, pullRequestStatusPresentation } from "@/lib/pullRequestStatus";
+import {
+  getPullRequestStatus,
+  pullRequestStatusPresentation,
+  type PullRequestStatusSummary,
+} from "@/lib/pullRequestStatus";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import {
@@ -4563,7 +4567,8 @@ function SessionTooltipDetail({
 function SessionTooltipDetails({ conversation }: { conversation: Conversation }) {
   const viewerId = useContext(ViewerIdContext);
   // Only a workspace-bound session has a checkout to read GitHub state from.
-  const { data: github } = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
+  const githubInfo = usePullRequestInfo(conversation.workspace ? conversation.id : undefined);
+  const github = githubInfo.data;
   // `owner` is null when permissions are off; there's no creator to name then.
   const owner = conversation.owner ?? null;
   const createdBy = owner !== null && isOwnedByViewer(conversation, viewerId) ? "You" : owner;
@@ -4578,12 +4583,19 @@ function SessionTooltipDetails({ conversation }: { conversation: Conversation })
   const association =
     github?.prs?.find((p) => p.url === github.selected_pr_url) ?? github?.prs?.[0] ?? null;
   const prNumber = pr?.number ?? association?.number ?? stored?.number ?? null;
-  const fromStored = !pr && !association && !!stored?.state;
-  const statusSource = pr ?? (fromStored ? stored : null);
+  const storedIsNewer =
+    !!pr &&
+    !!stored &&
+    stored.url === pr.url &&
+    !!stored.state &&
+    (stored.state_checked_at ?? 0) * 1000 > (githubInfo.dataUpdatedAt ?? 0);
+  const fromStored = storedIsNewer || (!pr && !association && !!stored?.state);
+  let statusSource: PullRequestStatusSummary | null = fromStored ? stored : pr;
+  if (pr && !fromStored && (githubInfo.isError || githubInfo.isEnabled === false)) {
+    statusSource = { state: pr.state, is_draft: pr.is_draft };
+  }
   const prStatus = statusSource
-    ? pullRequestStatusPresentation(
-        getPullRequestStatus({ state: statusSource.state, is_draft: statusSource.is_draft }),
-      )
+    ? pullRequestStatusPresentation(getPullRequestStatus(statusSource))
     : null;
   // The stored state may be old while the host is offline; say how old.
   const asOf = fromStored ? stateAsOf(stored?.state_checked_at) : null;

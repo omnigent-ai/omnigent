@@ -99,11 +99,12 @@ export function getPullRequestStatus(
   if (state === "MERGED") return "merged";
   if (state === "CLOSED") return "closed";
   if (state !== "OPEN" || !pr) return "unknown";
-  if (pr.is_draft) return "draft";
 
   const mergeState = pr.merge_state_status?.toUpperCase();
   if (mergeState === "DIRTY") return "conflict";
   if (pr.checks && pr.checks.failing > 0) return "failed";
+  // Drafts still surface repairs, but running or passing checks do not make them ready.
+  if (pr.is_draft) return "draft";
   if (pr.checks && pr.checks.pending > 0) return "pending";
   // Passing checks alone do not establish that required reviews or merge rules passed.
   if (mergeState === "CLEAN" && !pr.checks?.partial && pr.checks_supported !== false)

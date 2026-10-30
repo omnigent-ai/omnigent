@@ -54,6 +54,21 @@ describe("getPullRequestStatus", () => {
 });
 
 describe("sortPullRequestsByStatus", () => {
+  it("prioritizes repairs on drafts while keeping ordinary drafts below ready PRs", () => {
+    const prs: (PullRequestStatusSummary & { id: string })[] = [
+      { id: "ready", state: "OPEN", merge_state_status: "CLEAN" },
+      { id: "running-draft", state: "OPEN", is_draft: true, checks: { failing: 0, pending: 1 } },
+      { id: "failed-draft", state: "OPEN", is_draft: true, checks: { failing: 1, pending: 1 } },
+      { id: "conflicted-draft", state: "OPEN", is_draft: true, merge_state_status: "DIRTY" },
+    ];
+    expect(sortPullRequestsByStatus(prs).map((pr) => [pr.id, getPullRequestStatus(pr)])).toEqual([
+      ["conflicted-draft", "conflict"],
+      ["failed-draft", "failed"],
+      ["ready", "ready"],
+      ["running-draft", "draft"],
+    ]);
+  });
+
   it("puts conflicts, failing checks, and merge-ready PRs before inactive PRs without mutating the list", () => {
     const prs: (PullRequestStatusSummary & { id: string })[] = [
       { id: "merged", state: "MERGED" },

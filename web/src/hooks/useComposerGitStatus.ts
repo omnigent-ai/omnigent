@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useRef } from "react";
 
 import {
   type PullRequest,
@@ -113,6 +113,39 @@ function linkedPullRequests(
   ];
 }
 
+interface PullRequestStatusSource {
+  pr: PullRequest;
+  updatedAt: number;
+  live: boolean;
+}
+
+function enrichPullRequest(
+  association: PullRequestAssociation,
+  source: PullRequestStatusSource | undefined,
+): ComposerPullRequest {
+  if (!source) return association;
+  if (association.state_checked_at && source.updatedAt < association.state_checked_at * 1000) {
+    return association;
+  }
+  const { pr } = source;
+  const terminal = ["MERGED", "CLOSED"].includes(pr.state?.toUpperCase());
+  // An offline or failed refresh retains terminal lifecycle, not stale merge readiness.
+  if (!source.live && !terminal) return association;
+  const lifecycle = {
+    ...association,
+    title: pr.title,
+    state: pr.state,
+    is_draft: pr.is_draft,
+  };
+  if (!source.live) return lifecycle;
+  return {
+    ...lifecycle,
+    checks: pr.checks,
+    checks_supported: pr.checks_supported,
+    merge_state_status: pr.merge_state_status,
+  };
+}
+
 export function useComposerGitStatus({
   sessionId,
   hostId,
@@ -125,7 +158,7 @@ export function useComposerGitStatus({
   creationBranch?: string | null;
 }): ComposerGitStatus {
   const worktrees = useSessionWorktrees(sessionId, hostId, workspace);
-  const github = usePullRequestInfo(sessionId ?? undefined, { poll: "list" });
+  const github = usePullRequestInfo(sessionId ?? undefined, { poll: "linked" });
   const stored = useSessionPullRequests(sessionId ?? undefined, github.data);
   const info = github.data;
   const result = worktrees.data;
@@ -135,9 +168,7 @@ export function useComposerGitStatus({
     .filter((pr) => pr.url && pr.url !== info?.pr?.url && pr.state?.toUpperCase() !== "MERGED")
     .map((pr) => pr.url);
   const details = usePullRequestInfos(sessionId ?? undefined, detailUrls);
-  const liveByUrl = new Map<string, PullRequest>();
-  const cachedByUrl = new Map<string, { pr: PullRequest; updatedAt: number }>();
-  // An offline or failed refresh keeps lifecycle information, not stale merge readiness.
+  const statusSources = new Map<string, PullRequestStatusSource>();
   const sources = [
     { query: github, url: info?.pr?.url },
     ...details.map((query, index) => ({ query, url: detailUrls[index] })),
@@ -145,37 +176,17 @@ export function useComposerGitStatus({
   for (const { query, url } of sources) {
     const pr = query.data?.pr;
     if (pr && pr.url === url) {
-      cachedByUrl.set(pr.url, { pr, updatedAt: query.dataUpdatedAt });
-      if (!query.isError && query.isEnabled !== false) liveByUrl.set(pr.url, pr);
+      statusSources.set(pr.url, {
+        pr,
+        updatedAt: query.dataUpdatedAt,
+        live: !query.isError && query.isEnabled !== false,
+      });
     }
   }
   const prs = sortPullRequestsByStatus(
-    associations.map((association): ComposerPullRequest => {
-      const live = liveByUrl.get(association.url);
-      const cached = cachedByUrl.get(association.url);
-      const cachedTerminal =
-        cached &&
-        ["MERGED", "CLOSED"].includes(cached.pr.state?.toUpperCase()) &&
-        (!association.state_checked_at || cached.updatedAt >= association.state_checked_at * 1000);
-      return live
-        ? {
-            ...association,
-            title: live.title,
-            state: live.state,
-            is_draft: live.is_draft,
-            checks: live.checks,
-            checks_supported: live.checks_supported,
-            merge_state_status: live.merge_state_status,
-          }
-        : cachedTerminal
-          ? {
-              ...association,
-              title: cached.pr.title,
-              state: cached.pr.state,
-              is_draft: cached.pr.is_draft,
-            }
-          : association;
-    }),
+    associations.map((association) =>
+      enrichPullRequest(association, statusSources.get(association.url)),
+    ),
   );
 
   let branchState: ComposerBranchState;
@@ -222,11 +233,13 @@ export function useComposerGitStatus({
 
   const worktreeRefetch = worktrees.refetch;
   const githubRefetch = github.refetch;
+  const detailQueriesRef = useRef(details);
+  detailQueriesRef.current = details;
   const refresh = useCallback(() => {
     void worktreeRefetch();
     void githubRefetch();
-    for (const detail of details) void detail.refetch();
-  }, [worktreeRefetch, githubRefetch, details]);
+    for (const detail of detailQueriesRef.current) void detail.refetch();
+  }, [worktreeRefetch, githubRefetch]);
 
   return {
     branch,

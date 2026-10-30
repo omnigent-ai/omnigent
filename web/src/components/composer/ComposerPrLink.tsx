@@ -1,4 +1,5 @@
 import { GitPullRequestIcon, Loader2Icon } from "lucide-react";
+import { useId, useState } from "react";
 import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
@@ -45,6 +46,8 @@ export function ComposerPrLink({
   className?: string;
 }) {
   const isCoarsePointer = useIsCoarsePointer();
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const previewId = useId();
   // Status belongs to a known PR; lookup and setup errors remain in the GitHub tab.
   if (prCount <= 0 || !onOpen) return null;
 
@@ -70,10 +73,15 @@ export function ComposerPrLink({
       </span>
     );
   }
-  const label =
-    prCount > 1 ? `${prCount} PRs` : prNumber == null ? "1 PR" : `${prNumberPrefix}${prNumber}`;
+  const singleLabel = prNumber == null ? "1 PR" : `${prNumberPrefix}${prNumber}`;
+  const label = prCount > 1 ? `${prCount} PRs` : singleLabel;
   const status = prStatus ?? "unknown";
   const presentation = pullRequestStatusPresentation(status);
+  const showPreview = prs.length > 0 && !isCoarsePointer;
+  const openHint =
+    prCount > 1
+      ? "View these PRs in the Pull Requests tab"
+      : "View this PR in the Pull Requests tab";
 
   const trigger = (
     <button
@@ -83,13 +91,8 @@ export function ComposerPrLink({
       onClick={() => onOpen()}
       aria-label={label}
       aria-description={prStatus ? presentation.label : undefined}
-      title={
-        prs.length > 0
-          ? undefined
-          : prCount > 1
-            ? "View these PRs in the Pull Requests tab"
-            : "View this PR in the Pull Requests tab"
-      }
+      aria-describedby={showPreview && previewOpen ? previewId : undefined}
+      title={showPreview ? undefined : openHint}
       className={cn(
         "group flex min-w-0 items-center gap-1 rounded text-sm transition-colors hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
         presentation.className,
@@ -103,7 +106,7 @@ export function ComposerPrLink({
       <span
         data-workspace-collapse-label=""
         className="truncate tabular-nums underline-offset-2 group-hover:underline group-focus-visible:underline"
-        title={prs.length > 0 ? undefined : label}
+        title={showPreview ? undefined : label}
       >
         {label}
       </span>
@@ -111,13 +114,14 @@ export function ComposerPrLink({
   );
 
   // HoverCard prevents touchstart; touch devices need the button's native tap.
-  if (prs.length === 0 || isCoarsePointer) return trigger;
+  if (!showPreview) return trigger;
 
   return (
-    <HoverCard openDelay={200} closeDelay={150}>
+    <HoverCard open={previewOpen} onOpenChange={setPreviewOpen} openDelay={200} closeDelay={150}>
       <HoverCardTrigger asChild>{trigger}</HoverCardTrigger>
       <HoverCardContent
         data-testid="composer-pr-preview"
+        id={previewId}
         role="tooltip"
         side="top"
         align="start"

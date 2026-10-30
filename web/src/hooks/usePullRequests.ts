@@ -485,7 +485,7 @@ function usePullRequestQueryContext(rawConversationId: string | undefined) {
 
 function pullRequestInfoQueryOptions(
   { conversationId, enabled, retry }: ReturnType<typeof usePullRequestQueryContext>,
-  options?: { poll?: boolean | "list"; prUrl?: string },
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
   return queryOptions({
     queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
@@ -495,12 +495,14 @@ function pullRequestInfoQueryOptions(
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
     refetchInterval: options?.poll
-      ? (query) =>
-          options.poll === "list"
-            ? computePullRequestPollInterval(query.state.data, true)
-            : query.state.data?.tracking_available
-              ? 10_000
-              : computePullRequestPollInterval(query.state.data)
+      ? (query) => {
+          const info = query.state.data;
+          if (options.poll === "linked" && !info?.pr && !info?.prs?.length) return false;
+          if (options.poll === "list" || options.poll === "linked") {
+            return computePullRequestPollInterval(info, true);
+          }
+          return info?.tracking_available ? 10_000 : computePullRequestPollInterval(info);
+        }
       : false,
     refetchIntervalInBackground: false,
   });
@@ -522,13 +524,15 @@ function pullRequestInfoQueryOptions(
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
+ *   - Composer: `{ poll: "linked" }` uses the list cadence once a PR is known,
+ *     leaving discovery without a PR to turn-end refreshes.
  *
  * Disabled when the runner is known offline. Retries the runner-offline case
  * with capped backoff so a cold-booting runner resolves before any error UI.
  */
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
-  options?: { poll?: boolean | "list"; prUrl?: string },
+  options?: { poll?: boolean | "list" | "linked"; prUrl?: string },
 ) {
   const context = usePullRequestQueryContext(rawConversationId);
   // A turn end refreshes the default query and every linked PR's cached info.
