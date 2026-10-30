@@ -31,6 +31,15 @@ describe("buildRRule — Hourly minute-of-hour", () => {
 });
 
 describe("parseRRuleToScheduleModel", () => {
+  it("preserves ended rules and normalizes equivalent day sets when parsing", () => {
+    const parsed = parseRRuleToScheduleModel(
+      "FREQ=WEEKLY;BYDAY=FR,MO,MO;BYHOUR=9;BYMINUTE=0;UNTIL=20200101T235959Z",
+    );
+    expect(parsed).not.toBeNull();
+    expect(buildRRule(parsed!)).toBe(
+      "FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=9;BYMINUTE=0;UNTIL=20200101T235959Z",
+    );
+  });
   it("round-trips daily rules into the visible schedule controls", () => {
     expect(parseRRuleToScheduleModel("FREQ=DAILY;BYHOUR=14;BYMINUTE=30")).toMatchObject({
       preset: "daily",
@@ -132,6 +141,50 @@ describe("parseRRuleToScheduleModel", () => {
       preset: "hourly",
       minute: 7,
     });
+  });
+});
+
+describe("visual schedule validation", () => {
+  it.each([
+    { customFreq: "yearly", month: 2, monthDays: [30, 31] },
+    { customFreq: "yearly", month: 4, monthDays: [31] },
+    { customFreq: "monthly", monthDays: Array.from({ length: 25 }, (_, index) => index + 1) },
+    { customFreq: "yearly", interval: 9 },
+    { customFreq: "monthly", interval: 97 },
+    { customFreq: "yearly", interval: 5, month: 2, monthDays: [29] },
+  ] as Partial<ScheduleModel>[])("rejects backend-incompatible recurrence %j", (overrides) => {
+    expect(validateSchedule(model({ preset: "custom", ...overrides }))).not.toBeNull();
+  });
+
+  it.each([
+    { customFreq: "yearly", month: 2, monthDays: [29, 30] },
+    { customFreq: "yearly", interval: 4, month: 2, monthDays: [29] },
+    { customFreq: "yearly", interval: 8, hour: 0, month: 1, monthDays: [1] },
+    { customFreq: "monthly", interval: 96, hour: 0, monthDays: [1] },
+    { customFreq: "monthly", interval: 95, monthDays: [31] },
+    { customFreq: "yearly", interval: 366, monthDays: [1, 15] },
+    { customFreq: "monthly", interval: 366, monthDays: [1, 15] },
+    { customFreq: "hourly", interval: 366 },
+  ] as Partial<ScheduleModel>[])("retains supported recurrence %j", (overrides) => {
+    expect(validateSchedule(model({ preset: "custom", ...overrides }))).toBeNull();
+  });
+
+  it("distinguishes invalid day numbers from an empty selection", () => {
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "monthly", monthDays: [32] })),
+    ).toBe("Days of the month must be whole numbers from 1 to 31.");
+    expect(
+      validateSchedule(model({ preset: "custom", customFreq: "monthly", monthDays: [] })),
+    ).toBe("Pick at least one day of the month.");
+  });
+
+  it("requires a future cutoff for submission without preventing parsing ended tasks", () => {
+    const schedule = model({ end: { type: "until", until: "20300610T235959Z" } });
+    expect(validateSchedule(schedule, { now: new Date("2030-06-11T00:00:00Z") })).toBe(
+      "Choose an end date in the future.",
+    );
+    expect(validateSchedule(schedule, { now: new Date("2030-06-10T23:59:59Z") })).not.toBeNull();
+    expect(validateSchedule(schedule, { now: new Date("2030-06-10T23:59:58Z") })).toBeNull();
   });
 });
 

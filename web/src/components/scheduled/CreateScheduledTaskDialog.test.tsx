@@ -884,6 +884,27 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(mutateAsync.mock.calls[0][0].rrule).toBe("FREQ=HOURLY;BYMINUTE=7");
   });
 
+  it.each(["Every hour", "Custom schedule"])(
+    "recovers an invalid typed time when changing to hourly through %s",
+    async (preset) => {
+      renderDialog();
+      fireEvent.change(screen.getByTestId("schedule-time"), { target: { value: "invalid" } });
+      fireEvent.keyDown(screen.getByLabelText("Frequency"), { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name: preset }));
+      if (preset === "Custom schedule") {
+        fireEvent.keyDown(screen.getByLabelText("Repeat unit"), { key: "Enter" });
+        fireEvent.click(await screen.findByRole("option", { name: "Hours" }));
+      }
+      expect(screen.getByLabelText("Minute of the hour")).toHaveTextContent("00");
+      expect(screen.queryByText(/NaN/)).not.toBeInTheDocument();
+      if (preset === "Custom schedule") {
+        expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
+      } else {
+        expect(screen.getByText("Runs at the start of every hour.")).toBeInTheDocument();
+      }
+    },
+  );
+
   it("offers recurring presets and a visual custom schedule", async () => {
     renderDialog();
     fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });

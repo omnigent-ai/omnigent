@@ -4,6 +4,30 @@ import { useScheduleEscape } from "./useScheduleEscape";
 
 afterEach(cleanup);
 
+it("uses the latest callback without changing listener order on rerender", () => {
+  const order: string[] = [];
+  const first = () => {
+    order.push("old");
+    return false;
+  };
+  const second = () => {
+    order.push("new");
+    return false;
+  };
+  const { rerender } = renderHook(({ dismiss }) => useScheduleEscape(true, dismiss), {
+    initialProps: { dismiss: first },
+  });
+  const later = () => order.push("later");
+  window.addEventListener("keydown", later, true);
+  try {
+    rerender({ dismiss: second });
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(order).toEqual(["new", "later"]);
+  } finally {
+    window.removeEventListener("keydown", later, true);
+  }
+});
+
 it("closes the active picker without sending Escape to the parent dialog", () => {
   const dismiss = vi.fn(() => true);
   const parent = vi.fn();

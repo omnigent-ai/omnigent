@@ -638,12 +638,7 @@ export function CreateScheduledTaskDialog({
           )}
 
           <div className={projectsSupported ? "grid gap-3 sm:grid-cols-2 sm:gap-6" : "grid gap-3"}>
-            {/* Host / execution target. When the server offers managed sandboxes,
-              a "New Sandbox" entry sits in the same picker (mirroring the New Chat
-              composer): choosing it provisions a FRESH sandbox per fire, or one
-              kept sandbox for a continue task (execution_target=managed_sandbox,
-              hostless), instead of a connected host. Otherwise the picker is the
-              connected-host pin. */}
+            {/* Pin a connected host, or provision a sandbox per run (kept for continuing sessions). */}
             <div className="flex min-w-0 flex-col gap-1.5" data-testid="task-host-field">
               <Label htmlFor="task-host">Host</Label>
               <Select

@@ -1,4 +1,5 @@
 // Visual recurrence model shared by the automation form and RRULE serialization.
+import { RRule } from "rrule";
 
 /** The frequency dropdown's top-level options. */
 export type SchedulePreset = "hourly" | "daily" | "weekdays" | "weekly" | "custom";
@@ -139,7 +140,7 @@ export function parseRRuleToScheduleModel(rrule: string): ScheduleModel | null {
     if (!parseUntil(until)) return null;
     model.end = { type: "until", until };
   }
-  return validateSchedule(model) === null ? model : null;
+  return validateSchedule(model, { allowPastEnd: true }) === null ? model : null;
 }
 
 /** Parse a UTC RRULE cutoff without allowing Date to normalize invalid dates. */
@@ -231,13 +232,11 @@ function parseWeekdaysPart(value: string | undefined): WeekdayCode[] | null {
   return normalizeWeekdays(codes);
 }
 
-/**
- * Validate the schedule model against the form's constraints. Returns a
- * human-readable error string when invalid (shown inline + gates submit), or
- * `null` when the model is OK. Mirrors the server's rejection reasons so a bad
- * schedule fails fast in the form rather than as a 400.
- */
-export function validateSchedule(model: ScheduleModel): string | null {
+/** Validate visual form constraints; the server remains authoritative for saved rules. */
+export function validateSchedule(
+  model: ScheduleModel,
+  { allowPastEnd = false, now = new Date() }: { allowPastEnd?: boolean; now?: Date } = {},
+): string | null {
   if (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59) {
     return model.preset === "hourly" ? "Enter a valid minute from 0 to 59." : "Enter a valid time.";
   }
@@ -259,12 +258,11 @@ export function validateSchedule(model: ScheduleModel): string | null {
     if (model.customFreq === "weekly" && model.weekdays.length === 0) {
       return "Pick at least one day of the week.";
     }
-    if (
-      (model.customFreq === "monthly" || model.customFreq === "yearly") &&
-      (model.monthDays.length === 0 ||
-        model.monthDays.some((day) => !Number.isInteger(day) || day < 1 || day > 31))
-    ) {
-      return "Pick at least one day of the month.";
+    if (model.customFreq === "monthly" || model.customFreq === "yearly") {
+      if (model.monthDays.length === 0) return "Pick at least one day of the month.";
+      if (model.monthDays.some((day) => !Number.isInteger(day) || day < 1 || day > 31))
+        return "Days of the month must be whole numbers from 1 to 31.";
+      if (new Set(model.monthDays).size > 24) return "Pick at most 24 days of the month.";
     }
   }
   if (
@@ -278,8 +276,30 @@ export function validateSchedule(model: ScheduleModel): string | null {
     (!Number.isInteger(model.end.count) || model.end.count < 2 || model.end.count > 2147483647)
   )
     return "Enter at least 2 occurrences (at most 2,147,483,647).";
-  if (model.end?.type === "until" && !parseUntil(model.end.until))
-    return "Choose a valid end date.";
+  if (model.end?.type === "until") {
+    const until = parseUntil(model.end.until);
+    if (!until) return "Choose a valid end date.";
+    if (!allowPastEnd && until <= now) return "Choose an end date in the future.";
+  }
+  if (model.preset === "custom" && model.customFreq === "yearly") {
+    const daysInMonth = new Date(Date.UTC(2016, model.month, 0)).getUTCDate();
+    if (!model.monthDays.some((day) => day <= daysInMonth))
+      return "Pick a day that exists in the selected month.";
+  }
+  if (
+    model.preset === "custom" &&
+    (model.customFreq === "monthly" || model.customFreq === "yearly")
+  ) {
+    // Match the server's fixed validation window without excluding multiple dates in one period.
+    const occurrences = new RRule({
+      ...RRule.parseString(buildRecurringRule(model)),
+      dtstart: new Date(Date.UTC(2016, 0, 1)),
+      until: new Date(Date.UTC(2024, 0, 1)),
+      count: 2,
+    }).all();
+    if (occurrences.length < 2)
+      return "Choose a recurrence that runs at least twice within eight years.";
+  }
   return null;
 }
 

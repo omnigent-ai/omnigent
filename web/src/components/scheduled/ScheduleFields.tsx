@@ -113,13 +113,10 @@ export function ScheduleFields({
 
   function changePreset(value: string) {
     const next = { ...model, preset: value as SchedulePreset };
+    if (value === "hourly" && !Number.isInteger(next.minute)) next.minute = 0;
     if (value === "custom") {
-      next.customFreq =
-        model.preset === "weekdays"
-          ? "weekly"
-          : model.preset === "custom"
-            ? model.customFreq
-            : model.preset;
+      if (model.preset === "weekdays") next.customFreq = "weekly";
+      else if (model.preset !== "custom") next.customFreq = model.preset;
       if (model.preset === "weekdays") next.weekdays = ["MO", "TU", "WE", "TH", "FR"];
       if (model.preset !== "custom") next.interval = 1;
       setDraft(next);
@@ -127,6 +124,13 @@ export function ScheduleFields({
       onSelectOpenChange?.(true);
     }
     onChange(next);
+  }
+
+  function changeEnd(value: string) {
+    let end: ScheduleModel["end"];
+    if (value === "count") end = { type: "count", count: 2 };
+    if (value === "until") end = { type: "until", until: "" };
+    onChange({ ...model, end });
   }
 
   function changeTimezone(next: string) {
@@ -204,7 +208,11 @@ export function ScheduleFields({
                     testId="custom-freq-trigger"
                     value={draft.customFreq}
                     options={FREQUENCIES}
-                    onChange={(value) => setDraft({ ...draft, customFreq: value as CustomFreq })}
+                    onChange={(value) => {
+                      const next = { ...draft, customFreq: value as CustomFreq };
+                      if (value === "hourly" && !Number.isInteger(next.minute)) next.minute = 0;
+                      setDraft(next);
+                    }}
                     onOpenChange={handleNestedOpenChange}
                   />
                 </div>
@@ -404,17 +412,7 @@ export function ScheduleFields({
               { value: "until", label: "On date" },
               { value: "count", label: "After" },
             ]}
-            onChange={(value) =>
-              onChange({
-                ...model,
-                end:
-                  value === "never"
-                    ? undefined
-                    : value === "count"
-                      ? { type: "count", count: 2 }
-                      : { type: "until", until: "" },
-              })
-            }
+            onChange={changeEnd}
             onOpenChange={onSelectOpenChange}
           />
           {model.end?.type === "until" && (
@@ -457,7 +455,7 @@ export function ScheduleFields({
           )}
         </div>
       </div>
-      {model.preset === "hourly" && (
+      {model.preset === "hourly" && Number.isInteger(model.minute) && (
         <p className="text-sm text-muted-foreground">
           {model.minute === 0
             ? "Runs at the start of every hour."
