@@ -3736,7 +3736,16 @@ def databricks_profile_serves_codex_model(profile: str, model: str) -> bool:
     """
     from omnigent.models.databricks_model_discovery import select_servable_model
 
-    host = _databricks_gateway_host(profile)
+    try:
+        host = _databricks_gateway_host(profile)
+    except Exception as exc:  # an unresolvable profile cannot confirm the pick
+        _logger.warning(
+            "native-codex: could not resolve the workspace host for profile %r (%s)",
+            profile,
+            exc,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
+        )
+        return False
     if not host:
         return False
     servable = _databricks_servable_codex_models(host.rstrip("/"), profile)

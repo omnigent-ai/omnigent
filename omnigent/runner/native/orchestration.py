@@ -5272,7 +5272,7 @@ async def _auto_create_codex_terminal(
                     _codex_catalog_was_stale = False
                     reachable = codex_reachable_model_slug(pick, fresh_rows)
             if reachable is None and _codex_launch.profile is not None:
-                # Codex's list can lag the workspace; its gateway listing decides.
+                # Codex's list can lag the workspace, so the profile's workspace listing decides.
                 profile = _codex_launch.profile
                 if await asyncio.to_thread(databricks_profile_serves_codex_model, profile, pick):
                     reachable = pick

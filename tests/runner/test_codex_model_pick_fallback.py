@@ -320,6 +320,30 @@ async def test_profile_workspace_listing_decides_a_pick_codex_omits(
 
 
 @pytest.mark.asyncio
+async def test_unresolvable_profile_host_falls_back_instead_of_failing_launch(
+    codex_launch_harness: _LaunchHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace probe that cannot resolve the profile's host treats the pick as unserved."""
+    harness = codex_launch_harness
+    pick = "gpt-6.1-sol"
+    harness.snapshot["model_override"] = pick
+    harness.seed_catalog(
+        [{"id": "system.ai.gpt-5-6-sol", "model": "system.ai.gpt-5-6-sol", "isDefault": True}]
+    )
+    monkeypatch.setattr(
+        codex_app,
+        "_databricks_gateway_host",
+        Mock(side_effect=ConnectionError("token endpoint unreachable")),
+    )
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+    assert harness.resets == [{"expected_model_override": pick}]
+    harness.workspace_models.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_codex_policy_hook_token_refresh_keeps_runner_responsive(
     codex_launch_harness: _LaunchHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -576,6 +600,7 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
 
     monkeypatch.setattr(codex_app, "resolve_native_codex_launch", resolve_launch)
     harness.seed_catalog([{"id": _PROVIDER_DEFAULT, "isDefault": True}])
+    harness.workspace_models.return_value = (f"system.ai.{pick}",)
 
     await harness.launch()
 
@@ -583,6 +608,7 @@ async def test_generic_provider_fallback_rebuilds_model_config_overrides(
     assert f'model="{_PROVIDER_DEFAULT}"' in harness.builds[0]["extra_config_overrides"]
     assert all(pick not in override for override in harness.builds[0]["extra_config_overrides"])
     assert harness.resets == [{"expected_model_override": pick}]
+    harness.workspace_models.assert_not_called()
 
 
 @pytest.mark.asyncio
