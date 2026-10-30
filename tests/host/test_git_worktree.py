@@ -1028,6 +1028,22 @@ def test_create_worktree_slow_checkout_beyond_budget_times_out(git_repo: Path) -
         create_worktree(repo_path=str(git_repo), branch_name="feature/slow", timeout_s=1.0)
 
 
+def test_failed_worktree_checkout_releases_branch_for_retry(git_repo: Path) -> None:
+    """A checkout failure inside ``worktree add`` leaves the branch name free to retry."""
+    _commit_slow_smudge_file(git_repo, delay_s=0)
+    _git(git_repo, "config", "filter.slow.smudge", "false")
+
+    with pytest.raises(WorktreeError, match="git worktree add failed"):
+        create_worktree(repo_path=str(git_repo), branch_name="worktree-retry")
+    assert len(list_worktrees(repo_path=str(git_repo))) == 1
+    assert _branch_exists(git_repo, "worktree-retry") is False
+
+    _git(git_repo, "config", "filter.slow.smudge", "cat")
+    created = create_worktree(repo_path=str(git_repo), branch_name="worktree-retry")
+    assert created.branch == "worktree-retry"
+    assert Path(created.worktree_path, "slow.bin").read_text() == "payload\n"
+
+
 @dataclass
 class _TimedGit:
     """Real git under a fake clock that advances by a set time per command.
