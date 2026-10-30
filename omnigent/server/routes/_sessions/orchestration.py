@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -368,6 +369,8 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    flush_held_bare_failure,
+    hold_bare_failure,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.server.schemas import (
@@ -9338,7 +9341,8 @@ async def _relay_runner_stream_once(
                                     )
                                 else:
                                     continue
-                            _publish_status(
+                            publish_relayed_status = functools.partial(
+                                _publish_status,
                                 session_id,
                                 status,
                                 status_error,
@@ -9369,6 +9373,12 @@ async def _relay_runner_stream_once(
                                     else None
                                 ),
                             )
+                            # An older runner sends Claude's error state bare, ahead of
+                            # the hook that posts its cause.
+                            if status == "failed" and status_error is None:
+                                hold_bare_failure(session_id, publish_relayed_status)
+                            else:
+                                publish_relayed_status()
                         if status == "running":
                             text_acc.clear()
                             # A new turn invalidates any deny marker a prior
@@ -9908,6 +9918,8 @@ async def _relay_runner_stream_once(
         # mid-turn, or a rebind cancellation) can't strand it forever.
         # Normal turn-ends already clear via record_publish.
         inflight_text.discard(session_id)
+        # A held causeless failure waits for its cause only while this runner streams.
+        flush_held_bare_failure(session_id)
         # The intentional-stop marker is consumed by the disconnect handler
         # above on the expected path; discard it here too so a relay that
         # exits some other way (clean [DONE], rebind cancellation) can't
