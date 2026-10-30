@@ -91,6 +91,7 @@
     "maintainer-approval-rerun-run.yml",
     "maintainer-approval-rerun.yml",
     "maintainer-approval.yml",
+    "merge-ready-sweep.yml",
     "merge-ready.yml",
     "needs-info-expiry.yml",
     "nightly-failure-monitor.yml",

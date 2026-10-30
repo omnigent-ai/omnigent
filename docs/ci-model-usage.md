@@ -7,10 +7,14 @@ without assigning a separate service principal to every workflow.
 
 ## Workflow coverage
 
-[The maintained inventory](../.github/model-usage.json) classifies all 93 workflow
-definitions: 13 model consumers, five mock test lanes, and 75 workflows without
+[The maintained inventory](../.github/model-usage.json) classifies all 94 workflow
+definitions: 13 model consumers, five mock test lanes, and 76 workflows without
 model calls. Tests require new workflow files to be classified and check that
 shared actions and reusable workflows keep their caller's pipeline identity.
+
+`merge-ready-sweep` reads GitHub status metadata and dispatches `merge-ready` for
+expiry or reevaluation. Both workflows perform deterministic GitHub checks
+without model calls.
 
 | Pipeline | Model calls |
 |---|---|
