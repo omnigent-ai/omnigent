@@ -392,6 +392,7 @@ def create_host_tunnel_router(
                 allow_host_id_reown=allow_host_id_reown,
                 configured_harnesses=frame.configured_harnesses,
                 managed_token=managed_token,
+                ssh_target=frame.ssh_target,
             )
             host_persisted = True
             if persisted_host.account_generation is not None:

@@ -21,6 +21,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
+  EditorLink,
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
@@ -127,6 +128,11 @@ interface SessionResponseWire {
    * Absent/`false` for non-managed/non-resumable hosts.
    */
   host_resumable?: boolean;
+  /**
+   * Server-built ways to open the workspace in a desktop code editor, default
+   * first. Absent/null unless the server enables them for this viewer.
+   */
+  editor_links?: EditorLink[] | null;
   /**
    * Whether the session is archived. The snapshot is the only carrier for a
    * session opened directly by URL — the default list request excludes
@@ -330,6 +336,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostId: wire.host_id ?? null,
     hostOnline: wire.host_online ?? undefined,
     hostResumable: wire.host_resumable ?? false,
+    editorLinks: wire.editor_links ?? undefined,
     archived: wire.archived ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,

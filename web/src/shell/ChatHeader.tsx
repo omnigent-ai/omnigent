@@ -46,6 +46,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+import { OpenInEditorButton } from "./OpenInEditorButton";
 import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
@@ -634,6 +635,11 @@ export function ChatHeader({
             conversationId={conversationId}
             permissionLevel={permissionLevel}
           />
+        )}
+        {/* Open the workspace in Cursor / VS Code — self-gates to null unless
+            the server offers links this client can use. Desktop widths only. */}
+        {!pending && conversationId && !isMobile && (
+          <OpenInEditorButton sessionId={conversationId} />
         )}
         {/* Chat/Terminal switcher for terminal-first sessions — self-gates to
             null otherwise. Renders on every shell, iOS included. */}
