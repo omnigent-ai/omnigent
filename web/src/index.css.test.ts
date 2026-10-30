@@ -390,6 +390,44 @@ describe("index.css native tablet layout", () => {
   );
 });
 
+const nativeScrollFadeContracts = [
+  {
+    platform: "iOS/iPadOS",
+    selector: "[data-ios-native] .chat-scroll-fade",
+    transparentStop: "transparent calc(48px + var(--omnigent-inset-top))",
+    opaqueStop: "black calc(80px + var(--omnigent-inset-top))",
+  },
+  {
+    platform: "Android",
+    selector: "[data-android-native] .chat-scroll-fade",
+    transparentStop: "transparent var(--fade-start)",
+    opaqueStop: "black calc(var(--fade-start) + 32px)",
+  },
+  {
+    platform: "native Settings",
+    selector: ":is([data-ios-native], [data-android-native]) .settings-page-scroll",
+    transparentStop: "transparent var(--status-bar-cut)",
+    opaqueStop: "black var(--status-bar-cut)",
+  },
+] as const;
+
+describe("index.css native status-bar scroll fades", () => {
+  it.each(nativeScrollFadeContracts)(
+    "keeps the %s top fade inset-aware at every viewport width",
+    ({ selector, transparentStop, opaqueStop }) => {
+      const rule = cssBlocks.find(([block]) => selectorOf(block).replace(/\s+/g, " ") === selector);
+      expect(rule, `missing native scroll fade for ${selector}`).toBeDefined();
+      expect(rule![0]).toContain(transparentStop);
+      expect(rule![0]).toContain(opaqueStop);
+
+      const before = cssSource.slice(0, rule!.index!);
+      const opens = (before.match(/\{/g) ?? []).length;
+      const closes = (before.match(/\}/g) ?? []).length;
+      expect(opens - closes, `${selector} must not sit inside a width media query`).toBe(0);
+    },
+  );
+});
+
 /* The unified native-panel rule: one ungated :is() list covering the
  * Workspace rail, the conversations sidebar, and every push panel / rail-tab
  * drawer. The assertions below apply it verbatim — media-stripping a gated
