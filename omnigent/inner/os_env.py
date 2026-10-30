@@ -335,6 +335,8 @@ class OSEnvironment(ABC):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -1000,6 +1002,8 @@ class CallerProcessOSEnvironment(OSEnvironment):
         offset: int = 1,
         limit: int | None = None,
         max_bytes: int | None = None,
+        *,
+        regular_only: bool = False,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -1013,6 +1017,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "offset": offset,
                 "limit": limit,
                 "max_bytes": max_bytes,
+                "regular_only": regular_only,
             },
         )
         return cast(OpResult, result)
@@ -1252,6 +1257,20 @@ def _handle_helper_request(
         offset = offset_raw if isinstance(offset_raw, int) else 1
         max_bytes_raw = request.get("max_bytes")
         max_bytes = max_bytes_raw if isinstance(max_bytes_raw, int) else None
+        if request.get("regular_only"):
+            if not max_bytes or max_bytes < 0 or not hasattr(os, "O_NONBLOCK"):
+                return {"error": "A bounded regular-file read is unavailable"}
+            try:
+                descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                with os.fdopen(descriptor, "rb") as source:
+                    if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                        return {"error": "Original content requires a regular file"}
+                    content = source.read(max_bytes + 1)
+                if len(content) > max_bytes or b"\0" in content:
+                    return {"error": "Original content exceeds the text read limit"}
+                return {"content": content.decode("utf-8"), "encoding": "utf-8"}
+            except (OSError, UnicodeError) as exc:
+                return {"error": str(exc)}
         return _read_impl(
             path,
             offset,

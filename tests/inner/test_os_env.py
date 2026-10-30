@@ -244,6 +244,33 @@ def test_read_impl_binary_truncated_at_cap(tmp_path: Path) -> None:
     assert result["truncated"] is True
 
 
+@pytest.mark.parametrize("kind", ["text", "binary", "large", "fifo", "outside"])
+def test_regular_original_read_is_bounded(tmp_path: Path, kind: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    path = workspace / "file"
+    if kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO requires POSIX")
+        os.mkfifo(path)
+    elif kind == "outside":
+        outside = tmp_path / "outside"
+        outside.write_text("private")
+        path.symlink_to(outside)
+    else:
+        path.write_bytes({"text": b"hello\n", "binary": b"\x00\xff", "large": b"x" * 20}[kind])
+    result = _handle_helper_request(
+        request={"op": "read", "path": "file", "max_bytes": 10, "regular_only": True},
+        cwd=workspace,
+        shell_path="/bin/sh",
+        sandbox=_inactive_policy(),
+    )
+    if kind == "text":
+        assert result["content"] == "hello\n"
+    else:
+        assert "error" in result
+
+
 def _make_large_binary(path: Path, size: int) -> None:
     """Write a sparse file with a binary prefix and a logical size of *size*.
 

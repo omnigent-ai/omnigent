@@ -344,6 +344,21 @@ def test_get_baseline_returns_none_when_no_snapshot(tmp_path: Path) -> None:
     assert result is None, f"Expected None (no snapshot, no git), got {result!r}."
 
 
+@pytest.mark.parametrize("operation,original", [("created", ""), ("modified", None)])
+def test_first_observation_preserves_known_or_unknown_original(
+    tmp_path: Path, operation: str, original: str | None
+) -> None:
+    registry = AgentEditFilesystemRegistry(tmp_path)
+    assert registry.needs_snapshot("file.txt")
+    registry.record_change("file.txt", operation, "session")
+    registry.seed_snapshot("file.txt", "intermediate", session_id="session")
+    registry.record_change("file.txt", "modified", "session")
+    assert not registry.needs_snapshot("file.txt")
+    assert registry.get_baseline("file.txt") == original
+    registry.unregister_conversation("session")
+    assert registry.needs_snapshot("file.txt")
+
+
 def test_get_baseline_returns_snapshot_for_non_git_workspace(tmp_path: Path) -> None:
     """``get_baseline`` returns the snapshot seeded via ``seed_snapshot`` in a non-git workspace.
 
