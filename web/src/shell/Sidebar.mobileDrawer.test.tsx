@@ -268,9 +268,9 @@ describe("mobile sidebar drawer swipe to close", () => {
     vi.unstubAllGlobals();
   });
 
-  function renderDrawer() {
+  function renderDrawer(props: { route?: string; dragProgress?: number } = {}) {
     const onClose = vi.fn();
-    const { setOpen } = renderSidebar({ onClose });
+    const { setOpen } = renderSidebar({ onClose, ...props });
     const drawer = screen.getByRole("complementary", { name: "Conversations" });
     drawer.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
     return { onClose, drawer, setOpen };
@@ -329,15 +329,44 @@ describe("mobile sidebar drawer swipe to close", () => {
     expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
   });
 
-  it("ignores the swipe in the desktop layout", () => {
-    stubMobileLayout(false);
-    const { onClose, drawer } = renderDrawer();
+  it("clears a drag cut off by the drawer closing, so reopening shows no stale offset", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer, setOpen } = renderDrawer();
 
     touch(drawer, "touchstart", 300, 0);
-    touch(drawer, "touchmove", 100, 60);
-    touch(drawer, "touchend", 0, 120);
+    touch(drawer, "touchmove", 250, 80);
+    touch(drawer, "touchmove", 200, 160);
+    expect(drawer.style.transform).toBe("translateX(-25%)");
+
+    setOpen(false);
+    expect(drawer).toHaveAttribute("data-collapsed", "true");
+    expect(drawer.style.transform).toBe("");
+
+    touch(drawer, "touchmove", 100, 200);
+    touch(drawer, "touchend", 0, 240);
+    setOpen(true);
 
     expect(drawer.style.transform).toBe("");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the desktop layout", { mobile: false }, ""],
+    ["Settings", { mobile: true, route: "/settings" }, ""],
+    // The native edge swipe owns the drawer while its progress is live.
+    ["a native edge swipe", { mobile: true, dragProgress: 0.5 }, "translateX(-50%)"],
+  ])("ignores the swipe during %s", (_label, { mobile, ...props }, transform) => {
+    stubMobileLayout(mobile);
+    const { onClose, drawer } = renderDrawer(props);
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 250, 80);
+    touch(drawer, "touchmove", 100, 160);
+    expect(drawer.style.transform).toBe(transform);
+    touch(drawer, "touchend", 0, 400);
+
+    expect(drawer.style.transform).toBe(transform);
     expect(onClose).not.toHaveBeenCalled();
   });
 });

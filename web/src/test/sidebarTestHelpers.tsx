@@ -8,7 +8,12 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { Sidebar } from "@/shell/Sidebar";
 
 export function renderSidebar(
-  props: { open?: boolean; onClose?: () => void; route?: string } = {},
+  props: {
+    open?: boolean;
+    onClose?: () => void;
+    route?: string;
+    dragProgress?: number | null;
+  } = {},
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onClose = props.onClose ?? vi.fn();
@@ -17,7 +22,7 @@ export function renderSidebar(
       <SidebarDataProvider>
         <TooltipProvider>
           <MemoryRouter initialEntries={[props.route ?? "/"]}>
-            <Sidebar open={open} onClose={onClose} />
+            <Sidebar open={open} onClose={onClose} dragProgress={props.dragProgress} />
           </MemoryRouter>
         </TooltipProvider>
       </SidebarDataProvider>

@@ -125,6 +125,50 @@ describe("useSidebarSwipeToClose", () => {
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
   });
 
+  // Each pair sits either side of one cutoff; the moves before it stay slow,
+  // short, or early enough that no other rule decides the release.
+  it.each([
+    ["past a third of the width", { dx: -100, steps: 5, stepMs: 80 }, true],
+    ["just short of a third", { dx: -98, steps: 5, stepMs: 80 }, false],
+  ])("closes by distance only %s", (_label, gesture, close) => {
+    const { getByTestId, onSettle } = setup();
+
+    swipe(getByTestId("row"), gesture);
+
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(close);
+  });
+
+  it.each([
+    ["at 0.62 px/ms", 31, 100, true],
+    ["below 0.6 px/ms", 29, 100, false],
+    ["lifted 100 ms after the last move", 31, 190, true],
+    ["lifted 101 ms after the last move", 31, 191, false],
+  ])("treats a short drag as a flick only %s", (_label, lastMovePx, liftAt, close) => {
+    const { getByTestId, onSettle } = setup();
+    const row = getByTestId("row");
+
+    touch(row, "touchstart", 200, 100, 0);
+    touch(row, "touchmove", 180, 100, 40);
+    touch(row, "touchmove", 180 - lastMovePx, 100, 90);
+    touch(row, "touchend", 0, 0, liftAt);
+
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(close);
+  });
+
+  it.each([
+    [HOLD_MS - 1, true],
+    [HOLD_MS, false],
+  ])("claims a drag whose first decisive move comes at %i ms: %s", (moveAt, claimed) => {
+    const { getByTestId, onDragProgress } = setup();
+    const row = getByTestId("row");
+
+    touch(row, "touchstart", 200, 100, 0);
+    const move = touch(row, "touchmove", 180, 100, moveAt);
+
+    expect(onDragProgress).toHaveBeenCalledTimes(claimed ? 1 : 0);
+    expect(move.defaultPrevented).toBe(claimed);
+  });
+
   it("starts from the scrim over the exposed chat strip", () => {
     const { getByTestId, onSettle } = setup();
 
