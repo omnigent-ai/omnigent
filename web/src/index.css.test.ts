@@ -613,3 +613,16 @@ describe("index.css native conversation breadcrumb", () => {
     );
   });
 });
+
+describe("index.css touch input font size", () => {
+  it("pins editable text to 16px on touch devices so iOS Safari never auto-zooms", () => {
+    // Mobile --text-ui is 14px; iOS Safari zooms on focus below 16px.
+    const rule = cssSource.match(
+      /@media \(pointer: coarse\) \{\s*:is\(([^)]*)\)\s*\{\s*font-size:\s*16px/,
+    );
+    expect(rule).not.toBeNull();
+    for (const sel of ["input", "textarea", '[data-testid="composer-highlight-overlay"]']) {
+      expect(rule?.[1]).toContain(sel);
+    }
+  });
+});

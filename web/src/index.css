@@ -477,6 +477,21 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
 }
 
+/* iOS Safari auto-zooms when focusing a field under 16px, pushing the header
+   (hamburger menu) off-screen. Pin editable text to 16px on touch devices; the
+   composer's highlight overlay mirrors the textarea so it must match. */
+@media (pointer: coarse) {
+  :is(
+    input,
+    textarea,
+    select,
+    [contenteditable="true"],
+    [data-testid="composer-highlight-overlay"]
+  ) {
+    font-size: 16px;
+  }
+}
+
 /* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
  * to be opaque — the rules above set `background` as a shorthand, which resets
  * background-color and would otherwise let the conversation show through the
