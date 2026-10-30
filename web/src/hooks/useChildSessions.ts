@@ -280,7 +280,9 @@ export function useChildSessions(
   conversationId: string | null,
   pollMs?: number | null,
 ): UseChildSessionsResult {
-  const includeArchived = isFeatureEnabled(useServerInfo(), "related_sessions");
+  const serverInfo = useServerInfo();
+  const capabilitiesReady = serverInfo !== "loading";
+  const includeArchived = isFeatureEnabled(serverInfo, "related_sessions");
   const sessionId = isTempConvId(conversationId) ? null : conversationId;
   const { data, isLoading, error } = useQuery({
     queryKey:
@@ -288,7 +290,8 @@ export function useChildSessions(
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
     queryFn: () => fetchChildSessions(sessionId as string, includeArchived),
-    enabled: sessionId !== null,
+    // Both roster consumers share this key, so the first fetch must know its archive scope.
+    enabled: sessionId !== null && capabilitiesReady,
     staleTime: 60_000,
     retry: false,
     refetchOnMount: false,
@@ -296,7 +299,7 @@ export function useChildSessions(
   });
   return {
     children: data ?? [],
-    isLoading,
+    isLoading: sessionId !== null && (!capabilitiesReady || isLoading),
     error: (error as Error | null) ?? null,
   };
 }

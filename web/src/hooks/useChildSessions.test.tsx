@@ -4,8 +4,16 @@ import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getSessionHost, setSessionHost } from "@/lib/sessionHost";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { useRelatedSessionGroup } from "./useRelatedSessionLifecycle";
 import { authenticatedFetch } from "@/lib/identity";
-import { fetchChildSessions, useChildSessions, useDescendantSession } from "./useChildSessions";
+import {
+  childSessionsQueryKey,
+  fetchChildSessions,
+  useChildSessions,
+  useDescendantSession,
+} from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -16,7 +24,7 @@ function wrapper({ children }: PropsWithChildren) {
     <QueryClientProvider
       client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
     >
-      {children}
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>{children}</CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
@@ -26,6 +34,44 @@ beforeEach(() => {
 });
 
 describe("useChildSessions", () => {
+  it("waits for capabilities so the shared roster includes archived peers on reload", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let info: ServerInfo | "loading" = "loading";
+    const archivedPeer = {
+      id: "archived-peer",
+      archived: true,
+      labels: { "omnigent.session_role": "peer" },
+    };
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ object: "list", data: [archivedPeer] })),
+    );
+    const { result, rerender } = renderHook(
+      () => ({
+        roster: useChildSessions("root"),
+        group: useRelatedSessionGroup("root"),
+      }),
+      {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={client}>
+            <CapabilitiesProvider info={info}>{children}</CapabilitiesProvider>
+          </QueryClientProvider>
+        ),
+      },
+    );
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+    expect(result.current.roster.isLoading).toBe(true);
+    expect(client.getQueryData(childSessionsQueryKey("root"))).toBeUndefined();
+    info = { ...FALLBACK_SERVER_INFO, features: { related_sessions: true } };
+    rerender();
+    await waitFor(() => expect(result.current.group.hasPeers).toBe(true));
+    expect(result.current.roster.children).toMatchObject([archivedPeer]);
+    expect(authenticatedFetch).toHaveBeenCalledExactlyOnceWith(
+      "/v1/sessions/root/child_sessions?include_archived=true",
+    );
+    expect(client.getQueryData(childSessionsQueryKey("root"))).toMatchObject([archivedPeer]);
+    client.clear();
+  });
+
   it("does not fetch child sessions for a provisional conversation", () => {
     const { result } = renderHook(() => useChildSessions("temp:pending-create"), { wrapper });
 
