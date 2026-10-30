@@ -1,6 +1,6 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New automation" manual-create action,
+ * tasks, a search + Active/Paused filter, a "New automation" menu,
  * and a static Suggestions section below (prompt suggestions plus the
  * Jira/Slack/GitHub trigger templates).
  *
@@ -12,10 +12,25 @@
  */
 
 import { useMemo, useState } from "react";
-import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
+import {
+  ArrowLeftIcon,
+  ChevronDownIcon,
+  ClockIcon,
+  LayoutGridIcon,
+  Loader2Icon,
+  PencilIcon,
+  SearchIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
@@ -31,7 +46,7 @@ import {
 } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
-import { useRebasePath } from "@/lib/routing";
+import { Link, useRebasePath } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
   useDeleteScheduledTask,
@@ -52,7 +67,7 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "paused", label: "Paused" },
 ];
 
-export function TasksPage() {
+export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }) {
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
@@ -182,6 +197,42 @@ export function TasksPage() {
 
   const hasAnyTasks = (tasks ?? []).length > 0;
 
+  const createDialog = (
+    <CreateScheduledTaskDialog
+      open={manualOpen}
+      onOpenChange={handleManualOpenChange}
+      initialName={prefill?.name}
+      initialPrompt={prefill?.prompt}
+      initialTrigger={trigger}
+      sessionLink={sessionLink}
+      editingTask={editingTask}
+    />
+  );
+
+  if (templatesOnly) {
+    return (
+      <PageScroll contentClassName="px-4 md:px-6">
+        <Button asChild variant="ghost" size="sm" className="mb-4">
+          <Link to="/tasks" componentId="tasks.templates.back">
+            <ArrowLeftIcon className="size-4" />
+            Back to automations
+          </Link>
+        </Button>
+        <h1 className="text-2xl font-semibold">Automation templates</h1>
+        <p className="mt-1 text-ui text-muted-foreground">
+          Choose a template to customize your automation.
+        </p>
+        <SuggestionsSection
+          onPick={openFromSuggestion}
+          onPickTrigger={triggersSupported ? openFromTrigger : null}
+          showHeading={false}
+          className="mt-6 border-t-0 pt-0"
+        />
+        {createDialog}
+      </PageScroll>
+    );
+  }
+
   return (
     <PageScroll contentClassName="px-4 md:px-6">
       <div className="mb-6 flex items-start justify-between gap-4">
@@ -191,14 +242,26 @@ export function TasksPage() {
             Run agent sessions on a recurring schedule.
           </p>
         </div>
-        <Button
-          data-testid="new-task-button"
-          className="shrink-0"
-          onClick={openManual}
-          componentId="tasks.new"
-        >
-          New automation
-        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button data-testid="new-task-button" className="shrink-0" componentId="tasks.new">
+              New automation
+              <ChevronDownIcon className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onSelect={openManual} data-testid="new-task-manual">
+              <PencilIcon className="size-4" />
+              Create manually
+            </DropdownMenuItem>
+            <DropdownMenuItem asChild>
+              <Link to="/tasks/templates" componentId="tasks.templates">
+                <LayoutGridIcon className="size-4" />
+                Create from template
+              </Link>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
       {/* Search + filter tabs. No "Mark all as read" control: there is no unread
@@ -302,15 +365,7 @@ export function TasksPage() {
         />
       )}
 
-      <CreateScheduledTaskDialog
-        open={manualOpen}
-        onOpenChange={handleManualOpenChange}
-        initialName={prefill?.name}
-        initialPrompt={prefill?.prompt}
-        initialTrigger={trigger}
-        sessionLink={sessionLink}
-        editingTask={editingTask}
-      />
+      {createDialog}
     </PageScroll>
   );
 }
@@ -375,21 +430,6 @@ function SuggestionsSection({
       {showHeading && <h2 className="mb-3 text-ui text-muted-foreground">Suggestions</h2>}
       {/* Compact chips that wrap onto multiple lines. */}
       <div className="flex flex-wrap gap-2">
-        {SCHEDULED_TASK_SUGGESTIONS.map((s) => {
-          const Icon = s.icon;
-          return (
-            <button
-              key={s.id}
-              type="button"
-              onClick={() => onPick(s)}
-              data-testid={`suggestion-${s.id}`}
-              className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-ui font-normal transition-colors hover:bg-muted hover:text-foreground"
-            >
-              <Icon className={cn("size-4 shrink-0", s.iconClassName)} />
-              <span className="truncate">{s.title}</span>
-            </button>
-          );
-        })}
         {onPickTrigger !== null &&
           TRIGGER_SOURCES.map((source) => {
             const t = TRIGGER_TEMPLATES[source];
@@ -407,6 +447,21 @@ function SuggestionsSection({
               </button>
             );
           })}
+        {SCHEDULED_TASK_SUGGESTIONS.map((s) => {
+          const Icon = s.icon;
+          return (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => onPick(s)}
+              data-testid={`suggestion-${s.id}`}
+              className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-1.5 text-ui font-normal transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <Icon className={cn("size-4 shrink-0", s.iconClassName)} />
+              <span className="truncate">{s.title}</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );

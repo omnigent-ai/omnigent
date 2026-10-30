@@ -318,6 +318,7 @@ def test_scheduled_task_create_edit_modal_and_time_picker(
     page.goto(f"{live_server}/tasks")
 
     page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(typed_name)
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
@@ -470,6 +471,7 @@ def _open_create_dialog(page: Page) -> None:
     :param page: Playwright page already navigated to ``/tasks``.
     """
     page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create manually", exact=True).click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     agent_trigger = page.get_by_test_id("task-agent-picker").get_by_test_id(
         "new-chat-landing-agent-select"
@@ -824,6 +826,11 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     """The Jira trigger chip saves an hourly continue task with the rendered prompt."""
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     page.goto(f"{live_server}/tasks")
+    page.get_by_test_id("new-task-button").click()
+    page.get_by_role("menuitem", name="Create from template", exact=True).click()
+    expect(page).to_have_url(f"{live_server}/tasks/templates")
+    page.reload()
+    expect(page.get_by_role("heading", name="Automation templates")).to_be_visible()
     page.get_by_test_id("suggestion-trigger-jira").click()
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(name)
@@ -833,6 +840,8 @@ def test_scheduled_task_trigger_template_creates_hourly_manager_task(
     page.get_by_test_id("task-trigger-instructions").fill("Triage the ticket.")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
+    expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
+    page.get_by_role("link", name="Back to automations").click()
     expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
     created = next(t for t in tasks if t["name"] == name)

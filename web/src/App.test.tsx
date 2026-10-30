@@ -105,6 +105,8 @@ describe("chunk load recovery", () => {
 
   it.each([
     { path: "/tasks", basename: undefined, needsSetup: false },
+    { path: "/tasks/templates", basename: undefined, needsSetup: false },
+    { path: "/mount/tasks/templates", basename: "/mount", needsSetup: false },
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("recovers from a failed page at $path", async ({ path, basename, needsSetup }) => {
