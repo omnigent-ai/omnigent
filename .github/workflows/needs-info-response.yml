@@ -14,6 +14,11 @@ concurrency:
 
 jobs:
   retriage:
+    # A called workflow cannot exceed this grant; it mirrors priority onto PRs.
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     if: >-
       !endsWith(github.event.sender.login, '[bot]') &&
       !github.event.issue.pull_request &&

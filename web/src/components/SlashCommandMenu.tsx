@@ -37,6 +37,7 @@ export const BUILTIN_SLASH_COMMANDS: Record<string, string> = {
 };
 
 const DEFAULT_BUILTIN_NAMES = new Set(Object.keys(BUILTIN_SLASH_COMMANDS));
+const NO_SKILLS_WARNINGS: readonly string[] = [];
 // First token must read as a command name (`/cross-review`,
 // `/dev-productivity:simplify`) — letters/digits then word chars, `:`, `-`.
 // The leading `/` is the only slash allowed IN THE NAME, so file paths like
@@ -204,6 +205,8 @@ interface SlashCommandMenuProps {
   labels?: Readonly<Record<string, string>>;
   /** Absent for menus without asynchronous skill discovery. */
   skillsStatus?: SkillsStatus | null;
+  /** Sources discovery could not read, shown with the catalog they leave incomplete. */
+  skillsWarnings?: readonly string[];
   /** Context-specific guidance when discovery cannot run yet. */
   skillsUnavailableMessage?: string;
   onRetrySkills?: () => void;
@@ -411,6 +414,19 @@ interface MenuRow {
   isBuiltin: boolean;
 }
 
+function RetrySkillsButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      className="underline hover:text-foreground"
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onClick}
+    >
+      Retry
+    </button>
+  );
+}
+
 /** A row inside a section list ("Commands" or "Skills"). */
 function MenuRowButton({
   row,
@@ -480,6 +496,7 @@ export function SlashCommandMenu({
   builtinNames = DEFAULT_BUILTIN_NAMES,
   labels,
   skillsStatus,
+  skillsWarnings = NO_SKILLS_WARNINGS,
   skillsUnavailableMessage = "Skills unavailable while disconnected.",
   onRetrySkills,
   showMcpServers = false,
@@ -536,7 +553,7 @@ export function SlashCommandMenu({
   return (
     <div
       data-testid="slash-command-menu"
-      className="absolute bottom-full left-0 z-10 mb-2 w-[28rem] max-w-[calc(100vw-24px)] overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      className="menu-surface absolute right-0 bottom-full left-0 z-30 mb-2 w-full overflow-hidden rounded-[16px] border border-border bg-popover p-2 shadow-menu"
     >
       <div ref={listRef} className="max-h-[22rem] overflow-y-auto">
         {builtinRows.length > 0 && sectionHeader("Commands")}
@@ -560,17 +577,7 @@ export function SlashCommandMenu({
         )}
         {skillsStatus === "error" && (
           <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            Couldn’t load skills.{" "}
-            {onRetrySkills && (
-              <button
-                type="button"
-                className="underline hover:text-foreground"
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={onRetrySkills}
-              >
-                Retry
-              </button>
-            )}
+            Couldn’t load skills. {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
           </div>
         )}
         {skillsStatus === "unavailable" && (
@@ -578,11 +585,24 @@ export function SlashCommandMenu({
             {skillsUnavailableMessage}
           </div>
         )}
-        {skillsStatus === "ready" && skillRows.length === 0 && (
+        {/* An incomplete catalog explains itself; "No skills available" is only claimed when complete. */}
+        {skillsStatus === "ready" && skillsWarnings.length > 0 && (
           <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
-            {query ? "No matching skills" : "No skills available"}
+            {skillsWarnings.map((warning) => (
+              <span key={warning} className="block break-words">
+                {warning}
+              </span>
+            ))}
+            {onRetrySkills && <RetrySkillsButton onClick={onRetrySkills} />}
           </div>
         )}
+        {skillsStatus === "ready" &&
+          skillRows.length === 0 &&
+          (query !== "" || skillsWarnings.length === 0) && (
+            <div role="status" className="px-1.5 py-1 text-ui text-muted-foreground">
+              {query ? "No matching skills" : "No skills available"}
+            </div>
+          )}
         {skillRows.map((row) => (
           <MenuRowButton
             key={row.name}
