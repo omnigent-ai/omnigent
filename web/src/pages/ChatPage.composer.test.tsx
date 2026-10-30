@@ -5375,33 +5375,47 @@ describe("Composer reply quotes", () => {
     expect(useChatStore.getState().restoredSendDraft).toBeNull();
   });
 
-  it("adds a message recovered on load after the draft the reload kept, sending neither", async () => {
-    setSessionDraft("conv_test", { text: "also check the docs", files: [] });
-    const props = composerProps();
-    render(<Composer {...props} />);
-    expect(textarea()).toHaveValue("also check the docs");
+  it.each<[string, StoredReplyDraft | undefined, string]>([
+    ["a message", undefined, "also check the docs\n\nrun the linter next"],
+    [
+      "a reply",
+      {
+        version: 1,
+        quotes: [{ before: "", text: "the failing test" }],
+        text: "run the linter next",
+      },
+      "also check the docs\n\n> the failing test\n\nrun the linter next",
+    ],
+  ])(
+    "adds %s recovered on load after the draft the reload kept, sending neither",
+    async (_, replyDraft, joined) => {
+      setSessionDraft("conv_test", { text: "also check the docs", files: [] });
+      const props = composerProps();
+      render(<Composer {...props} />);
+      expect(textarea()).toHaveValue("also check the docs");
 
-    act(() =>
-      useChatStore.setState({
-        failedSendDraft: {
-          conversationId: "conv_test",
-          text: "run the linter next",
-          files: [],
-          stableId: "stable_queued",
-          serverRefused: false,
-          recovered: true,
-        },
-      }),
-    );
+      act(() =>
+        useChatStore.setState({
+          failedSendDraft: {
+            conversationId: "conv_test",
+            text: replyDraft ? serializeReplyDraft(replyDraft) : "run the linter next",
+            files: [],
+            stableId: "stable_queued",
+            ...(replyDraft ? { replyDraft } : {}),
+            serverRefused: false,
+            recovered: true,
+          },
+        }),
+      );
 
-    const joined = "also check the docs\n\nrun the linter next";
-    expect(textarea()).toHaveValue(joined);
-    expect(props.onSend).not.toHaveBeenCalled();
-    // The joined text is a new message, kept for another reload.
-    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
-    expect(useChatStore.getState().restoredSendDraft).toBeNull();
-    await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe(joined));
-  });
+      expect(screen.queryAllByTestId("composer-reply-quote")).toHaveLength(replyDraft ? 1 : 0);
+      expect(props.onSend).not.toHaveBeenCalled();
+      // The joined text is a new message, kept for another reload.
+      expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+      expect(useChatStore.getState().restoredSendDraft).toBeNull();
+      await waitFor(() => expect(getSessionDraft("conv_test")?.text).toBe(joined));
+    },
+  );
 
   it("drops a failed-send draft whose message already committed under its stable id", () => {
     const stableId = "e".repeat(32);
