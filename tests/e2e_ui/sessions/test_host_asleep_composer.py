@@ -334,7 +334,9 @@ def test_failed_wake_restores_dot_and_reports_error(
     wake.fulfill(
         status=502,
         content_type="application/json",
-        body=json.dumps({"detail": "Arclet sandbox didn't start."}),
+        body=json.dumps(
+            {"error": {"code": "runner_unavailable", "message": "Arclet sandbox didn't start."}}
+        ),
     )
     expect(
         page.get_by_text("Couldn't reconnect the sandbox: Arclet sandbox didn't start.")

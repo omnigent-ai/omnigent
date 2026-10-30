@@ -84,6 +84,11 @@ const CONNECTION_WORD: Record<HostBadgeStatus, string> = {
   unknown: "Unknown",
 };
 
+/** Identifies a reported launch stage by value; snapshots rebuild the object. */
+function launchKey(launch: SandboxStatus | null): string {
+  return launch ? JSON.stringify([launch.stage, launch.error, launch.details]) : "";
+}
+
 /** Composer status for a sandbox that is still launching, or failed to launch. */
 function launchStatusWord(launch: SandboxStatus): string {
   if (launch.stage === "failed") return "Sandbox launch failed";
@@ -122,6 +127,12 @@ export function HostBadge({
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
   // The open session's sandbox launch, which its chat progress banners also show.
   const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
+  // The launch stage seen when a wake began. A failed or waiting stage left over
+  // from before the wake mustn't stop its spinner; one reported since then does.
+  const wakeStartRef = useRef({ starting: false, launch: "" });
+  if (starting !== wakeStartRef.current.starting) {
+    wakeStartRef.current = { starting, launch: starting ? launchKey(launch) : "" };
+  }
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -169,7 +180,11 @@ export function HostBadge({
     // dot until the host itself is online. A launch waiting on the user isn't progress.
     const launchInProgress =
       launch !== null && launch.stage !== "failed" && launch.stage !== "action_required";
-    const hostStarting = ((starting && !!badge) || launchInProgress) && badge?.status !== "online";
+    const launchStoppedWake =
+      launch !== null && !launchInProgress && launchKey(launch) !== wakeStartRef.current.launch;
+    const hostStarting =
+      ((starting && !!badge && !launchStoppedWake) || launchInProgress) &&
+      badge?.status !== "online";
     const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
     const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
     const reconnectable =

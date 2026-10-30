@@ -372,7 +372,7 @@ asleep, **Reconnect host** in the composer's host menu has the server wake the
 sandbox and start the agent without sending a message, in the browser too.
 The host status dot in the composer chip and its menu spins while the sandbox
 starts and turns green once it is online. A toast appears only when the wake
-fails or the host isn't online 20 seconds after the server answers.
+fails or the host isn't online 30 seconds after the server answers.
 Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat.
 

@@ -114,56 +114,60 @@ describe("useRunnerHealth", () => {
     });
   });
 
-  it("refreshes host liveness immediately on desktop status changes", async () => {
-    let notify!: () => void;
-    const unsubscribe = vi.fn();
-    vi.spyOn(nativeBridge, "onHostStatusChanged").mockImplementation((callback) => {
-      notify = callback;
-      return unsubscribe;
-    });
-    fetchMock.mockResolvedValueOnce(
-      mockHealth({ conv_a: { runner_online: false, host_online: false } }),
-    );
-    const sessions = [input("conv_a")];
-    const { result, unmount } = renderHook(() => useRunnerHealth(sessions));
-    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(false));
-
-    let finishHealth!: (response: Response) => void;
-    fetchMock.mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        finishHealth = resolve;
+  it.each([
+    {
+      trigger: "a desktop status change",
+      listen: () => {
+        let notify!: () => void;
+        const unsubscribe = vi.fn();
+        vi.spyOn(nativeBridge, "onHostStatusChanged").mockImplementation((callback) => {
+          notify = callback;
+          return unsubscribe;
+        });
+        return {
+          fire: () => notify(),
+          expectStopped: () => expect(unsubscribe).toHaveBeenCalledOnce(),
+        };
+      },
+    },
+    {
+      trigger: "an app refresh request",
+      listen: () => ({
+        fire: refreshRunnerHealth,
+        expectStopped: () => {
+          refreshRunnerHealth();
+          expect(fetchMock).toHaveBeenCalledTimes(2);
+        },
       }),
-    );
-    act(() => notify());
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(result.current.get("conv_a")?.host_online).toBe(false);
-    await act(async () => {
-      finishHealth(mockHealth({ conv_a: { runner_online: false, host_online: true } }));
-    });
-    expect(result.current.get("conv_a")?.host_online).toBe(true);
-    unmount();
-    expect(unsubscribe).toHaveBeenCalledOnce();
-  });
+    },
+  ])(
+    "re-polls host liveness immediately on $trigger, and stops after unmount",
+    async ({ listen }) => {
+      const { fire, expectStopped } = listen();
+      fetchMock.mockResolvedValueOnce(
+        mockHealth({ conv_a: { runner_online: false, host_online: false } }),
+      );
+      const sessions = [input("conv_a")];
+      const { result, unmount } = renderHook(() => useRunnerHealth(sessions));
+      await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(false));
 
-  it("re-polls immediately when the app asks for a refresh, and stops after unmount", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockHealth({ conv_a: { runner_online: false, host_online: false } }),
-    );
-    const sessions = [input("conv_a")];
-    const { result, unmount } = renderHook(() => useRunnerHealth(sessions));
-    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(false));
-
-    fetchMock.mockResolvedValueOnce(
-      mockHealth({ conv_a: { runner_online: true, host_online: true } }),
-    );
-    act(() => refreshRunnerHealth());
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    await waitFor(() => expect(result.current.get("conv_a")?.host_online).toBe(true));
-
-    unmount();
-    refreshRunnerHealth();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
+      let finishHealth!: (response: Response) => void;
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          finishHealth = resolve;
+        }),
+      );
+      act(() => fire());
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.current.get("conv_a")?.host_online).toBe(false);
+      await act(async () => {
+        finishHealth(mockHealth({ conv_a: { runner_online: false, host_online: true } }));
+      });
+      expect(result.current.get("conv_a")?.host_online).toBe(true);
+      unmount();
+      expectStopped();
+    },
+  );
 
   it("ignores a stale poll that finishes after a desktop-triggered refresh", async () => {
     let notify!: () => void;

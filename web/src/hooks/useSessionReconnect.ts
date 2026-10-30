@@ -13,8 +13,8 @@ import {
 } from "@/lib/nativeBridge";
 import { retrySession } from "@/lib/sessionsApi";
 
-/** How long a woken sandbox may wait for liveness to report its host online. */
-export const SANDBOX_WAKE_ONLINE_GRACE_MS = 20_000;
+/** How long a woken sandbox may wait to read online; spans three 10s health polls. */
+export const SANDBOX_WAKE_ONLINE_GRACE_MS = 30_000;
 
 /**
  * Reconnect this desktop's host directly; use the dialog for fallback and retry.
