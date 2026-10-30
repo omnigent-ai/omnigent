@@ -1354,8 +1354,13 @@ def register_resource_routes(
             content={
                 "object": "session.environment.filesystem.file_diff",
                 "path": relative_path,
-                "before": before,
+                "before": None if record.get("status") == "created" and before == "" else before,
                 "after": after,
+                **(
+                    {"baseline_state": "unknown"}
+                    if before is None and record.get("status") != "created"
+                    else {}
+                ),
             },
         )
 

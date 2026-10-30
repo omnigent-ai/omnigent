@@ -1806,6 +1806,13 @@ function FileViewerBody({
               <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
               </div>
+            ) : diffQuery.data.baseline_state === "unknown" ? (
+              <div
+                role="status"
+                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
+              >
+                Original content unavailable
+              </div>
             ) : (
               // Keep viewer state on resize without computing the CSS-hidden copy's diff.
               isActiveViewport && (

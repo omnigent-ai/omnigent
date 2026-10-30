@@ -3,7 +3,7 @@
 //
 // Returns `before` (content at first observed modification) and `after`
 // (current content) as strings — either may be null:
-//   before=null → new file (no pre-session snapshot available)
+//   before=null → new file, or unavailable original when baseline_state is unknown
 //   after=null  → deleted file
 //
 // Requested diffs can start while the changed-files list is loading. Known
@@ -25,8 +25,9 @@ const DEFAULT_ENVIRONMENT_ID = "default";
 export interface FileDiffResponse {
   object: "session.environment.filesystem.file_diff";
   path: string;
-  /** File content at the time of the first modification, or null for new files. */
+  /** Original content, or null for new files and unavailable originals. */
   before: string | null;
+  baseline_state?: "unknown";
   /** Current file content, or null for deleted files. */
   after: string | null;
 }

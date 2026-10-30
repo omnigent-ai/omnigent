@@ -876,6 +876,31 @@ describe("FileViewer URL sync — diff param", () => {
     }
   });
 
+  it.each([
+    { baseline_state: "unknown", after: "current" },
+    { baseline_state: "unknown", after: null },
+    { baseline_state: undefined, after: "new file" },
+  ] as const)("handles a missing original with $baseline_state and $after", async (payload) => {
+    vi.mocked(useFileDiff).mockReturnValue({
+      data: { before: null, ...payload },
+    } as ReturnType<typeof useFileDiff>);
+    try {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      renderViewer({ open: true, path: "file1.py", initialSearch: "diff=1" });
+      if (payload.baseline_state === "unknown") {
+        expect(screen.getByText("Original content unavailable")).toBeInTheDocument();
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      } else {
+        expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+        expect(screen.queryByText("Original content unavailable")).toBeNull();
+      }
+    } finally {
+      vi.mocked(useFileDiff).mockReturnValue({
+        data: { before: "old", after: "new" },
+      } as ReturnType<typeof useFileDiff>);
+    }
+  });
+
   it("surfaces the server's reason instead of hanging on the loading state when the diff fetch fails", () => {
     // On error, useFileDiff's `data` stays undefined — which would otherwise
     // read as still-loading forever. The diff view must show the failure
