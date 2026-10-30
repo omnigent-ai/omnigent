@@ -71,6 +71,11 @@ def test_private_manager_launch_send_read_and_sharing(
                     ),
                 )
 
+                def assert_send_surface():
+                    schemas = json.dumps([r.get("tools", []) for r in get_mock_requests(mock)])
+                    assert '"sys_session_send"' in schemas
+                    assert "sys_session_message" not in schemas
+
                 def configure(marker, responses):
                     configure_mock_llm(
                         mock,
@@ -175,8 +180,8 @@ def test_private_manager_launch_send_read_and_sharing(
                             {
                                 "tool_calls": [
                                     tool(
-                                        "sys_session_message",
-                                        {"session_id": worker, "message": "BEFORE_SWITCH_TASK"},
+                                        "sys_session_send",
+                                        {"session_id": worker, "args": "BEFORE_SWITCH_TASK"},
                                         "before-switch",
                                     )
                                 ]
@@ -186,6 +191,7 @@ def test_private_manager_launch_send_read_and_sharing(
                     )
                     send(manager, "MANAGER_BEFORE_SWITCH")
                     wait_text(manager, "BEFORE_SWITCH_SENT")
+                    assert_send_surface()
                     wait_text(worker, "BEFORE_SWITCH_RESULT")
                     manager_runner = client.get(f"/v1/sessions/{manager}").json()["runner_id"]
                     stack.restart_server(env={"OMNIGENT_FEATURES": "-session_orchestration"})
@@ -254,6 +260,7 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
                 send(manager, "MANAGER_SEND")
                 wait_text(manager, "MANAGER_SENT")
+                assert_send_surface()
                 assert "reply_mode" in json.dumps(tool_results("send"))
                 assert "poll" in json.dumps(tool_results("send"))
                 wait_text(worker, "WORKER_RESULT")

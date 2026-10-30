@@ -9,8 +9,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 
 - `message`: private sender, same owner and workspace; shared destinations are
   allowed and their readers see the message. Use `sys_session_send(session_id, args)`;
-  normal queue/steering applies. `sys_session_message(session_id, message)` remains
-  compatible with its original peer semantics, including when addressing children.
+  normal queue/steering applies. This is the single session-send tool; parentage
+  selects child tracking or peer delivery automatically.
 - `read-results`: peer sends return `reply_mode: "poll"`; the manager reads
   history/status and replies are not forwarded. Direct-child sends keep their
   tracked task handles, inbox results and completion wake notices.
@@ -87,7 +87,7 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   Both harnesses also exercise a server restart with the explicit kill switch:
   existing runners remain opted in, but their subsequent peer sends and independent
   creates are refused without writes; session-info reads still work.
-  The pre-restart send uses the compatibility tool `sys_session_message`.
+  Both harnesses check the model receives only the unified send tool.
   It also fires an owner-created schedule through the real server/host and checks
   that the resulting worker can message a peer and create an independent worker.
 - Component integration: `uv run --no-sync pytest
@@ -188,9 +188,12 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   `created_by_session_id` records origin; it does not select child semantics.
   Policies keyed to `sys_session_send` (such as dispatch-purpose requirements
   and per-turn dispatch limits) also apply to its peer sends.
-  A custom policy matching only `sys_session_message` does not cover
-  `sys_session_send`. To restrict peer messaging across both interfaces, match
-  both tool names; the server's ownership and privacy checks apply to both.
+- Version 0.21 removes `sys_session_message` (released opt-in in 0.20) without
+  a tool alias. Update prompts, integrations and tool-name policies to
+  `sys_session_send`, changing the text argument from `message` to `args`.
+  Restart or resume runners to refresh their tool schemas. The server's
+  `session_message` event remains supported for older runners and peer delivery.
+  Direct-child sends now use tracked completion; there is no untracked child mode.
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or

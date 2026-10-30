@@ -383,7 +383,6 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_history",
         "sys_session_get_info",
         "sys_session_rename",
-        "sys_session_message",
         "sys_session_send",
         "ui_open_file",
         "sys_agent_list",
@@ -407,10 +406,6 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "conversation_id" in tools_by_name["sys_session_get_history"]["parameters"]["properties"]
     )
     assert "path" in tools_by_name["sys_os_read"]["parameters"]["properties"]
-    assert tools_by_name["sys_session_message"]["parameters"]["required"] == [
-        "session_id",
-        "message",
-    ]
     assert set(tools_by_name["sys_session_send"]["parameters"]["properties"]) == {
         "session_id",
         "args",

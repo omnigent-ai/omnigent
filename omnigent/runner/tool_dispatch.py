@@ -85,7 +85,6 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
-from omnigent.tools.builtins.session_message import SysSessionMessageTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -478,8 +477,7 @@ _BROWSER_TIMEOUT_ERROR = (
 # unconditionally for policy enforcement (independent of the spec's
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
-    {SysSessionMessageTool.name()}
-    | _COMMENT_TOOLS
+    _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
     | _UI_TOOLS
@@ -605,7 +603,6 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
-            SysSessionMessageTool,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -878,8 +875,7 @@ def _bounded_discovery_result(
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
-    {SysSessionMessageTool.name()}
-    | _OS_ENV_TOOLS
+    _OS_ENV_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
     | _TERMINAL_TOOLS
@@ -3170,7 +3166,7 @@ async def _send_to_existing_session(
     Send to a direct child with tracked completion, or to a gated peer.
 
     Parentage selects delivery semantics, not peer authorization. Non-children
-    go through the same server gate as ``sys_session_message`` and never receive
+    go through the server orchestration gate and never receive
     an ordinary child message or register work in the caller's inbox.
 
     The child's ``(agent, title)`` identity, carried by the handle, the
@@ -7018,10 +7014,6 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
-        elif tool_name == SysSessionMessageTool.name():
-            from omnigent.runner.session_message import execute_message_tool
-
-            output = await execute_message_tool(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,

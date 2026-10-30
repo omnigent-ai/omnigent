@@ -8,18 +8,36 @@ import httpx
 import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.session_message import execute_message_tool
 from omnigent.runner.tool_dispatch import build_native_relay_tool_schemas, execute_tool
 from omnigent.spec.types import AgentSpec
 
 
-@pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
-def test_native_message_schema(spec):
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec", [AgentSpec(spec_version=1), AgentSpec(spec_version=1, spawn=True), None]
+)
+async def test_native_message_schema(spec):
     schemas = build_native_relay_tool_schemas(spec)
-    schema = next(s for s in schemas if s["name"] == "sys_session_message")
-    assert schema["parameters"]["required"] == ["session_id", "message"]
+    assert "sys_session_message" not in {s["name"] for s in schemas}
     send = next(s for s in schemas if s["name"] == "sys_session_send")
     assert set(send["parameters"]["properties"]) == {"session_id", "args"}
     assert "reply_mode='poll'" in send["description"]
+
+    def unexpected(request):
+        pytest.fail("Removed tool must not send requests")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = await execute_tool(
+            tool_name="sys_session_message",
+            arguments=json.dumps({"session_id": uuid4().hex, "message": "Work"}),
+            server_client=client,
+            conversation_id=uuid4().hex,
+            agent_spec=spec,
+        )
+    assert "error" in result.lower(), result
 
 
 @pytest.mark.asyncio
@@ -117,8 +135,7 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
     "failure", ["timeout", "non_json", "null", "list", "empty", "non_bool", 408, 429, 503]
 )
 @pytest.mark.parametrize("after_routing", [False, True])
-@pytest.mark.parametrize("tool_name", ["sys_session_send", "sys_session_message"])
-async def test_message_timeout_is_not_retried(failure, after_routing, tool_name):
+async def test_message_timeout_is_not_retried(failure, after_routing):
     requests = []
 
     def timeout(request):
@@ -141,13 +158,8 @@ async def test_message_timeout_is_not_retried(failure, after_routing, tool_name)
         transport=httpx.MockTransport(timeout), base_url="http://server"
     ) as client:
         result = await execute_tool(
-            tool_name=tool_name,
-            arguments=json.dumps(
-                {
-                    "session_id": uuid4().hex,
-                    "args" if tool_name == "sys_session_send" else "message": "Work",
-                }
-            ),
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": uuid4().hex, "args": "Work"}),
             server_client=client,
             conversation_id="manager",
         )
@@ -325,11 +337,8 @@ async def test_message_routing_lookup_and_keyless_delivery(outcome):
         transport=httpx.MockTransport(respond), base_url="http://server"
     ) as client:
         result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_message",
-                arguments=json.dumps({"session_id": uuid4().hex, "message": "Start"}),
-                server_client=client,
-                conversation_id=uuid4().hex,
+            await execute_message_tool(
+                {"session_id": uuid4().hex, "message": "Start"}, client, uuid4().hex
             )
         )
     assert len(lookups) == (16 if outcome == "hop_limit" else 1)
@@ -366,11 +375,8 @@ async def test_message_destination_is_a_uuid(spelling):
         transport=httpx.MockTransport(respond), base_url="http://server"
     ) as client:
         result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_message",
-                arguments=json.dumps({"session_id": supplied, "message": "Work"}),
-                server_client=client,
-                conversation_id="manager",
+            await execute_message_tool(
+                {"session_id": supplied, "message": "Work"}, client, "manager"
             )
         )
     if spelling in ("hex", "dashed", "legacy"):

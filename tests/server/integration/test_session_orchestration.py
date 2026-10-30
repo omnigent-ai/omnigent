@@ -50,25 +50,17 @@ async def peers(auth_client, auth_app, db_uri, monkeypatch):
     return source, target, captured
 
 
-async def _send(
-    client, source, target, message="Please inspect the PR", tool_name="sys_session_send"
-):
+async def _send(client, source, target, message="Please inspect the PR"):
     return json.loads(
         await execute_tool(
-            tool_name=tool_name,
-            arguments=json.dumps(
-                {
-                    "session_id": target["id"],
-                    "args" if tool_name == "sys_session_send" else "message": message,
-                }
-            ),
+            tool_name="sys_session_send",
+            arguments=json.dumps({"session_id": target["id"], "args": message}),
             server_client=client,
             conversation_id=source["id"],
         )
     )
 
 
-@pytest.mark.parametrize("tool_name", ["sys_session_send", "sys_session_message"])
 @pytest.mark.parametrize("policy_denied", [False, True])
 @pytest.mark.parametrize(
     "orchestration_environment",
@@ -76,7 +68,7 @@ async def _send(
     indirect=True,
 )
 async def test_private_sender_can_message_shared_receiver(
-    auth_client, peers, db_uri, monkeypatch, policy_denied, orchestration_environment, tool_name
+    auth_client, peers, db_uri, monkeypatch, policy_denied, orchestration_environment
 ):
     from omnigent.server.routes.sessions import routes_events
 
@@ -90,7 +82,7 @@ async def test_private_sender_can_message_shared_receiver(
             return {"verdict": "deny", "reason": "Task needs approval"}
 
         monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
-    result = await _send(auth_client, source, target, tool_name=tool_name)
+    result = await _send(auth_client, source, target)
     if orchestration_environment == "-session_orchestration":
         assert "Session orchestration is disabled" in result["detail"]
         assert not captured.get("posts")
@@ -101,8 +93,7 @@ async def test_private_sender_can_message_shared_receiver(
         assert not captured.get("posts")
         return
     assert result.get("queued") is True, result
-    if tool_name == "sys_session_send":
-        assert result["reply_mode"] == "poll"
+    assert result["reply_mode"] == "poll"
     assert "Please inspect the PR" in json.dumps(captured)
     items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
     assert f"[Message from session {source['id']}]" in items.text

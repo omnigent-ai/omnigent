@@ -445,8 +445,7 @@ class ToolManager:
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
 
-        Send by ID and its peer-only compatibility tool ``sys_session_message``
-        are always advertised. Direct-child sends retain tracked completion;
+        Send by ID is always advertised. Direct-child sends retain tracked completion;
         other sends use the deployment flag and server ownership/privacy checks.
         Close remains child-only; create supports gated independent placements.
         Sharing retains its separate opt-in.
@@ -454,9 +453,6 @@ class ToolManager:
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
         """
-        from omnigent.tools.builtins.session_message import SysSessionMessageTool
-
-        self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
         sub_specs = (
             {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
             if self._spec.tools.agents or self._spec.spawn
