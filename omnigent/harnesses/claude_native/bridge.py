@@ -6564,6 +6564,12 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     capture is likewise retried without sending clearing keys, then refused
     if no readable box appears within the budget.
 
+    Before refusing, Claude Code is asked to repaint once
+    (:func:`_request_claude_repaint`) and the rounds start over. Output
+    another process printed over the box, such as a launcher's log line, is
+    not part of the draft, so no key deletes it; after the repaint the
+    capture shows the real input box.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
@@ -6573,12 +6579,19 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
+    repainted = False
+    round_no = 0
+    while True:
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
         settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            if not repainted and _request_claude_repaint(socket_path, tmux_target):
+                repainted, round_no = True, 0
+                delivery_diagnostics.record_details(composer_repaint_requested=True)
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
             delivery_diagnostics.record_composer_not_cleared(
                 pane=pane,
                 rows=None if box is None else box.rows,
@@ -6593,6 +6606,7 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
             _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
+        round_no += 1
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
