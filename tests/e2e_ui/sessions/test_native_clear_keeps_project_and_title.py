@@ -2,7 +2,8 @@
 
 On claude-native and codex-native sessions, ``/clear`` from the web composer
 continues in a replacement session and the SPA follows it. That replacement
-should stay filed under the same project and keep the session's name.
+should stay filed under the same project, keep the session's name and answer
+the next message.
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ def test_native_clear_keeps_project_and_title(
     session_fixture: str,
     mock_model: str,
 ) -> None:
-    """``/clear`` continues in a session filed in the same project with the same name."""
+    """``/clear`` continues in a usable session filed in the same project with the same name."""
     base_url, session_id = request.getfixturevalue(session_fixture)
     uniq = uuid.uuid4().hex[:6]
     project_name = f"E2E Clear Project {uniq}"
@@ -155,6 +156,13 @@ def test_native_clear_keeps_project_and_title(
             f"observed {observed}, expected {expected}; original session now has "
             f"project_id={original.get('project_id')!r} title={original.get('title')!r}"
         )
+
+        _ensure_chat_view(page)
+        _send(page, f"Reply with the single word {reply}")
+        expect(page.locator(_ASSISTANT).filter(has_text=reply)).to_have_count(
+            1, timeout=_TURN_TIMEOUT_MS
+        )
+        expect(page).to_have_url(re.compile(rf"/c/{new_session_id}"))
     finally:
         if new_session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
