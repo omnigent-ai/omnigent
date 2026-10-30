@@ -5356,17 +5356,25 @@ class TestCodexAppServerSessionHomeStaging(unittest.TestCase):
         self.assertTrue(any("restricted reads" in line for line in logs.output), logs.output)
 
 
-def test_run_turn_cli_config_passes_no_model_to_thread_create():
-    """On the cli-config path (model_provider_override set), model=None is passed
-    to thread/create so the codex binary uses its own configured model rather than
-    forwarding an unresolvable alias (e.g. gpt-5.6) to the Databricks UC API."""
+@pytest.mark.parametrize(
+    ("model", "model_provider_override"),
+    [("gpt-5.6", "Databricks"), (None, "openai")],
+    ids=["cli_config_alias", "subscription_without_model"],
+)
+def test_run_turn_cli_config_passes_no_model_to_thread_create(
+    model: str | None, model_provider_override: str
+):
+    """A pinned provider passes model=None to thread/start when the model is
+    the codex config's to choose: a cli-config provider never receives an alias it
+    cannot resolve (e.g. gpt-5.6), and a subscription without a selected model keeps
+    the config.toml default."""
 
     async def _t():
         fake_session = _FakeAppSession([[TurnComplete(response="done")]])
         executor = CodexExecutor(
             codex_path="/bin/echo",
-            model="gpt-5.6",
-            model_provider_override="Databricks",
+            model=model,
+            model_provider_override=model_provider_override,
             app_session_factory=lambda **kwargs: fake_session,
         )
         async for _ in executor.run_turn(

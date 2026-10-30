@@ -20,6 +20,7 @@ subprocess spawn, no real CLI.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -35,6 +36,7 @@ import pytest
 import yaml as _yaml
 
 from omnigent.errors import OmnigentError
+from omnigent.inner.executor import ExecutorConfig, TurnComplete
 from omnigent.onboarding import ambient, harness_install
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
@@ -1703,6 +1705,58 @@ def test_codex_subscription_default_pins_builtin_openai(config_home: Path) -> No
     assert env["HARNESS_CODEX_MODEL_PROVIDER"] == "openai"
     # Subscription still emits no gateway transport (the CLI login is auth).
     assert "HARNESS_CODEX_GATEWAY" not in env
+
+
+@pytest.mark.parametrize(
+    ("turn_config", "expected_effort"),
+    [
+        (None, None),
+        (ExecutorConfig(model="gpt-6-luna", extra={"reasoning_effort": "high"}), "high"),
+    ],
+    ids=["spec_model", "dispatch_model_and_effort"],
+)
+def test_codex_subscription_thread_start_uses_selected_model(
+    config_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    turn_config: ExecutorConfig | None,
+    expected_effort: str | None,
+) -> None:
+    """A codex subscription session starts its Codex thread on the selected model."""
+    from omnigent.inner import codex_harness
+
+    _write_config(
+        config_home,
+        {"providers": {"codex-sub": {"kind": "subscription", "cli": "codex", "default": True}}},
+    )
+    env = _build_codex_spawn_env(_make_spec(harness="codex", model="gpt-6-luna"), workdir=None)
+    thread_starts: list[dict[str, object]] = []
+
+    class _RecordingAppSession:
+        async def run_turn(self, **kwargs: object):
+            thread_starts.append(kwargs)
+            yield TurnComplete(response="done")
+
+        async def close(self) -> None:
+            return None
+
+    with monkeypatch.context() as env_patch:
+        for name in tuple(os.environ):
+            env_patch.delenv(name)
+        for name, value in {**env, "OMNIGENT_CODEX_PATH": "/bin/true"}.items():
+            env_patch.setenv(name, value)
+        executor = codex_harness._build_codex_executor()
+    executor._app_session_factory = lambda **kwargs: _RecordingAppSession()
+
+    async def _drive() -> None:
+        async for _ in executor.run_turn(
+            [{"role": "user", "content": "hi", "session_id": "s1"}], [], "", config=turn_config
+        ):
+            pass
+
+    asyncio.run(_drive())
+
+    assert thread_starts[0]["reasoning_effort"] == expected_effort
+    assert thread_starts[0]["model"] == "gpt-6-luna"
 
 
 def test_openai_agents_cli_config_default_fails_loud(config_home: Path) -> None:
