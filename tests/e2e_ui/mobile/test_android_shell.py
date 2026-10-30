@@ -25,7 +25,11 @@ the injected OS inset reach the layout's shared vars.
 
 from __future__ import annotations
 
+import io
+
 import httpx
+import pytest
+from PIL import Image
 from playwright.sync_api import Page, ViewportSize, expect
 
 # A phone-sized viewport: the Android shell is a mobile surface, and the narrow
@@ -136,104 +140,147 @@ def test_no_android_tag_or_fold_in_plain_browser(
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
 
 
-def test_android_unfolded_chat_scroll_fade_tracks_status_bar(
+# A solid marker block prepended to scrolled content, so a status-bar band
+# screenshot shows whether any content paints there.
+_PREPEND_MARKER = """
+([container, height]) => {
+  const marker = document.createElement("div");
+  marker.dataset.statusBarMarker = "true";
+  marker.style.cssText = `height:${height}px;flex:none;background:rgb(255,0,0)`;
+  container.prepend(marker);
+}
+"""
+
+
+def _marker_rows(page: Page, top: int, bottom: int) -> list[int]:
+    """Return the viewport rows in ``[top, bottom)`` where the red marker paints."""
+    viewport = page.viewport_size
+    assert viewport is not None
+    band = Image.open(
+        io.BytesIO(
+            page.screenshot(
+                clip={"x": 0, "y": top, "width": viewport["width"], "height": bottom - top}
+            )
+        )
+    ).convert("RGB")
+    # Through a mask ramp or the header glass the marker blends but stays red-dominant.
+    return sorted(
+        {
+            top + row * (bottom - top) // band.height
+            for row in range(band.height)
+            for column in range(band.width)
+            if (pixel := band.getpixel((column, row)))[0] - max(pixel[1], pixel[2]) > 60
+        }
+    )
+
+
+def test_android_unfolded_chat_keeps_content_out_of_status_bar(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A scrolled chat on an unfolded Android screen fades below its status bar.
+    """An unfolded Android chat paints no content in the status bar or top fade.
 
-    The Pixel Fold inner display crosses the 48rem breakpoint. Seed a long
-    assistant turn so the real transcript can scroll, then check the native
-    fade starts below the OS inset and server-switcher pill.
+    The Pixel Fold inner display crosses the 48rem breakpoint. At rest the first
+    transcript content must start below the fade; scrolled, nothing may show in
+    the status-bar band.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
     """
     base_url, session_id = seeded_session
+    status_bar_height = 48
+    # Status bar + server-switcher footprint (8px + 25px) + the 32px fade ramp.
+    fade_end = status_bar_height + 33 + 32
 
     page.set_viewport_size(_UNFOLDED_VIEWPORT)
     page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
-
-    response = httpx.post(
+    httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={
             "type": "external_assistant_message",
             "data": {
                 "agent": "hello_world",
                 "response_id": "android_statusbar_scroll",
-                "text": "\n\n".join(f"Older transcript line {index}" for index in range(80)),
+                "text": "Short transcript",
             },
         },
         timeout=10.0,
-    )
-    response.raise_for_status()
+    ).raise_for_status()
     page.goto(f"{base_url}/c/{session_id}")
 
     expect(page.locator(".app-shell")).to_have_attribute("data-android-native", "true")
-    assistant_bubble = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
-    expect(assistant_bubble).to_be_visible()
-
+    expect(page.locator('[data-testid="message-bubble"][data-role="assistant"]')).to_be_visible()
     page.evaluate(
-        "() => document.documentElement.style"
-        ".setProperty('--omnigent-android-safe-area-top', '48px')"
+        "height => document.documentElement.style"
+        ".setProperty('--omnigent-android-safe-area-top', `${height}px`)",
+        status_bar_height,
     )
-    transcript = page.locator(".chat-scroll-fade")
-    scroll_top = transcript.evaluate(
+
+    content = page.locator(".chat-conversation-content")
+    page.evaluate(_PREPEND_MARKER, [content.element_handle(), 40])
+    assert _marker_rows(page, 0, fade_end) == [], "at-rest transcript starts inside the top fade"
+
+    page.locator("[data-status-bar-marker]").evaluate(
+        "marker => { marker.style.height = '3000px'; }"
+    )
+    scroll_top = content.evaluate(
         "element => {"
-        "const scroller = [element, ...element.querySelectorAll('*')].find(candidate => {"
-        "const overflowY = getComputedStyle(candidate).overflowY;"
-        "return (overflowY === 'auto' || overflowY === 'scroll') && "
-        "candidate.scrollHeight > candidate.clientHeight + 1;"
-        "});"
-        "if (!scroller) return 0;"
-        "scroller.scrollTop = Math.min(240, scroller.scrollHeight - scroller.clientHeight);"
+        "let scroller = element.parentElement;"
+        "while (scroller && scroller.scrollHeight <= scroller.clientHeight + 1) {"
+        "scroller = scroller.parentElement; }"
+        "scroller.scrollTop = 1000;"
         "return scroller.scrollTop;"
         "}"
     )
-    assert scroll_top > 0, "the long transcript did not scroll"
-
-    mask_image = transcript.evaluate("element => getComputedStyle(element).maskImage")
-    assert "81px" in mask_image and "113px" in mask_image, (
-        "the unfolded Android chat fade must follow the 48px status inset and "
-        f"33px switcher footprint; got {mask_image}"
-    )
+    assert scroll_top > 0, "the transcript did not scroll"
+    marker_rows = _marker_rows(page, 0, status_bar_height)
+    assert marker_rows == [], f"scrolled transcript paints in the status bar at rows {marker_rows}"
 
 
-def test_android_scrolled_settings_page_masks_status_bar(
+@pytest.mark.parametrize(
+    "viewport", [_MOBILE_VIEWPORT, _UNFOLDED_VIEWPORT], ids=["phone", "unfolded"]
+)
+def test_android_scrolled_settings_page_keeps_status_bar_blank(
     page: Page,
     live_server: str,
+    viewport: ViewportSize,
 ) -> None:
-    """Settings content stays hidden in the status bar while scrolling.
+    """Scrolled Settings content never paints in the status bar; the title stays intact.
 
-    Follow the phone-width Android journey into Settings / Appearance, scroll the
-    settings page, and verify its mask cuts off at the offset header's top edge.
+    Follow the Android journey into Settings / Appearance at phone and unfolded
+    widths, scroll the page under the status bar, and check the band pixels.
 
     :param page: Playwright page fixture (fresh context per test).
     :param live_server: Base URL of the shared test server.
+    :param viewport: Phone or unfolded-foldable viewport.
     """
-    page.set_viewport_size(_MOBILE_VIEWPORT)
+    status_bar_height = 40
+    page.set_viewport_size(viewport)
     page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
     page.goto(f"{live_server}/settings/appearance")
 
     expect(page.locator(".app-shell")).to_have_attribute("data-android-native", "true")
-    expect(page.get_by_role("heading", name="Appearance", exact=True)).to_be_visible()
+    title = page.get_by_role("heading", name="Appearance", exact=True)
+    expect(title).to_be_visible()
     page.evaluate(
-        "() => document.documentElement.style"
-        ".setProperty('--omnigent-android-safe-area-top', '40px')"
+        "height => document.documentElement.style"
+        ".setProperty('--omnigent-android-safe-area-top', `${height}px`)",
+        status_bar_height,
     )
 
     settings_page = page.locator(".settings-page-scroll")
-    expect(settings_page).to_be_visible()
+    page.evaluate(_PREPEND_MARKER, [settings_page.locator(":scope > div").element_handle(), 3000])
     scroll_top = settings_page.evaluate(
-        "element => { element.scrollTop = element.scrollHeight; return element.scrollTop; }"
+        "element => { element.scrollTop = 1000; return element.scrollTop; }"
     )
-    assert scroll_top > 0, "Settings / Appearance did not have scrollable content"
+    assert scroll_top > 0, "Settings / Appearance did not scroll"
+    marker_rows = _marker_rows(page, 0, status_bar_height)
+    assert marker_rows == [], f"scrolled Settings paints in the status bar at rows {marker_rows}"
 
-    mask_image = settings_page.evaluate("element => getComputedStyle(element).maskImage")
-    assert mask_image.count("32px") == 2, (
-        "the settings mask must hide the 40px status inset down to the header "
-        f"top 8px above it; got {mask_image}"
-    )
+    # Any status-bar mask must leave the title exactly as it renders unmasked.
+    masked_title = title.screenshot()
+    settings_page.evaluate("element => { element.style.maskImage = 'none'; }")
+    assert title.screenshot() == masked_title, "the status-bar mask hides the Settings title"
 
 
 # Bridge stub that also CAPTURES the notification-activation callback the SPA
