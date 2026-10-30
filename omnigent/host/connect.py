@@ -1505,7 +1505,7 @@ class HostProcess:
                 self._reap_orphans_once(child_pids)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # a reaper must never die on a stray error
+            except Exception:
                 _logger.debug("orphan reaper sweep failed", exc_info=True)
 
     def _reap_orphans_once(self, child_pids: Iterable[int] | None = None) -> int:
@@ -2414,7 +2414,7 @@ class HostProcess:
         )
         try:
             await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
-        except Exception:  # detached cleanup must be observed
+        except Exception:
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
                 proc.pid,
@@ -2482,7 +2482,7 @@ class HostProcess:
                     runner_id,
                     session_id,
                 )
-            except Exception:  # must never die unobserved
+            except Exception:
                 _logger.warning(
                     "Failed to stop superseded runner %s for session %s; "
                     "the process may linger until it exits on its own",
@@ -2657,11 +2657,23 @@ class HostProcess:
             handle.proc.returncode == RUNNER_AUTH_REJECTED_EXIT_CODE and had_connected is not True
         )
         if auth_rejected:
-            error = (
-                "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
-                f"on this host, then retry. Details: {error}"
+            from omnigent.runner.transports.ws_tunnel.serve import (
+                RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
             )
+
+            if RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX in error:
+                # The runner sent no credential, so the server did not reject this host.
+                error = (
+                    "The runner had no credential to send, so it could not connect. Check this "
+                    f"host's sign-in with `{cli_invocation()} login {self._login_hint_url()}`, "
+                    f"then retry. Details: {error}"
+                )
+            else:
+                error = (
+                    "The server rejected this host's credentials, so the runner could not "
+                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{self._login_hint_url()}` on this host, then retry. Details: {error}"
+                )
         _logger.warning(
             "Runner %s died unexpectedly: %s",
             runner_id,
@@ -2747,7 +2759,7 @@ class HostProcess:
             try:
                 await self._send_text(ws, encode_host_frame(report))
                 return
-            except Exception:  # any send failure parks the report
+            except Exception:
                 _logger.debug(
                     "Could not send runner_exited for %s; queueing for reconnect",
                     runner_id,
@@ -3973,7 +3985,7 @@ class HostProcess:
 
         try:
             rows = await codex_launch_catalog()
-        except Exception:  # no catalog, never a crash
+        except Exception:
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4000,7 +4012,7 @@ class HostProcess:
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
             rows = await claude_launch_catalog(config)
-        except Exception:  # no catalog, never a crash
+        except Exception:
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4049,7 +4061,7 @@ class HostProcess:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
-            except Exception:  # no catalog, never a crash
+            except Exception:
                 _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4079,7 +4091,7 @@ class HostProcess:
                     status="failed",
                     error=str(exc),
                 )
-            except Exception:  # no catalog, never a crash
+            except Exception:
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,

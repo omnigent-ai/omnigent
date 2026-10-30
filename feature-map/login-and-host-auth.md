@@ -33,7 +33,9 @@ be able to write resources without a separate Omnigent account.
 - `expired-credential`: an expired or revoked Databricks credential leads to a
   re-authentication prompt. When a newly launched runner explicitly reports a
   pending host sign-in, its first message waits on that same runner until the
-  sign-in finishes or its bounded wait expires. A runner the server refuses on
+  sign-in finishes or its bounded wait expires. A temporarily missing runner
+  credential uses the same pending status for up to two minutes, including
+  scheduled and managed launches. A runner the server refuses on
   credentials before it connects is reported with a sign-in-again instruction
   naming `omnigent login`, not as a runner crash.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.
@@ -167,8 +169,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 - **Pending host sign-in:**
   `tests/server/integration/test_session_host_launch.py::test_host_session_message_waits_for_bound_runner_before_relaunch`
   checks that the original message is forwarded once after the sign-in wait,
-  without replacing the runner. The `sign_in_pending` parameter covers the
-  explicit pending state; ordinary startup retains its shorter grace.
+  without replacing the runner. The `sign_in_pending` and `missing_credential`
+  parameters cover interactive sign-in and temporary credential loss; ordinary
+  startup retains its shorter grace. The runner's
+  `tests/runner/transports/ws_tunnel/test_serve.py` retry-window scenarios use
+  a simulated clock to cover recovery after 30 seconds, expiry, HTTP 401/403,
+  backoff and cleanup. Scheduled dispatch and managed launch/wake scenarios in
+  `tests/server/scheduled/test_fire.py` and
+  `tests/server/integration/test_host_session_binding.py` cover the other launches.
   `tests/server/routes/test_runner_connect_wait.py::test_explicit_sign_in_wait_is_bounded_and_owned`
   covers cancellation, stop, replacement, process exit and expiry. The isolated
   header-mode environment has no interactive credential source, so it cannot

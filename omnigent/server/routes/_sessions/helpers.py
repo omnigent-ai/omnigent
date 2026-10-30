@@ -6738,6 +6738,10 @@ async def _wait_for_managed_runner_tunnel(
     runner_id: str,
     tunnel_registry: TunnelRegistry,
     tracker: ManagedLaunchTracker,
+    *,
+    host_conn: HostConnection,
+    host_registry: HostRegistry,
+    conversation_store: ConversationStore,
 ) -> bool:
     """
     Wait for a launched managed runner to connect, failing the launch on timeout.
@@ -6751,9 +6755,17 @@ async def _wait_for_managed_runner_tunnel(
     """
     from omnigent.server.routes import sessions as _facade
 
-    runner = await tunnel_registry.wait_for_runner(
-        runner_id,
+    runner = await _facade._wait_for_host_bound_runner(
+        session_id,
+        runner_id=runner_id,
+        wait_for_connection=lambda budget_s: tunnel_registry.wait_for_runner(
+            runner_id, timeout_s=budget_s
+        ),
         timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+        runner_exit_reports=None,
+        host_conn=host_conn,
+        host_registry=host_registry,
+        conversation_store=conversation_store,
     )
     if runner is not None:
         return True

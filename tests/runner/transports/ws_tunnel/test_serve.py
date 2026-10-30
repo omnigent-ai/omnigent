@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, TypedDict, Unpack
 
@@ -27,7 +28,10 @@ from websockets.http11 import Response
 
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
+    RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    runner_sign_in_is_pending,
+    sign_in_pending_marker_path,
 )
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
@@ -49,6 +53,12 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _websocket_http_status,
     serve_tunnel,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_credential_window_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep older no-credential scenarios on their immediate-exit budget."""
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 0.0)
 
 
 @dataclass
@@ -503,6 +513,178 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
     assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
     assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["connected", "rejected", "cancelled", "shutdown"])
+async def test_serve_tunnel_rides_out_a_transient_missing_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    """Credential recovery past normal startup grace preserves a bounded pending launch."""
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    runner_id = "runner_transient_credential"
+    upgrades: list[str | None] = []
+    pending: list[bool] = []
+    shutdown = asyncio.Event()
+
+    def _mint() -> str | None:
+        return None if sum(sleeps) < 45 else "tok-recovered"
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        pending.append(runner_sign_in_is_pending(marker, runner_id))
+        if sum(sleeps) >= 30 and outcome == "shutdown":
+            shutdown.set()
+        if auth_token is None or outcome == "rejected":
+            raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+        kwargs["on_connected"]()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+    monkeypatch.setattr("omnigent.runner.identity.time", serve_module.time)
+    advance_clock = serve_module.asyncio.sleep
+
+    async def _sleep(delay: float) -> None:
+        await advance_clock(delay)
+        if outcome == "cancelled" and sum(sleeps) >= 30:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        serve_module, "asyncio", SimpleNamespace(**{**vars(serve_module.asyncio), "sleep": _sleep})
+    )
+
+    task = serve_tunnel(
+        _noop_app,
+        server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+        runner_id=runner_id,
+        runner_version="0.1.0",
+        auth_token_factory=_mint,
+        shutdown_event=shutdown,
+    )
+    if outcome == "shutdown":
+        await task
+    elif outcome == "rejected":
+        with pytest.raises(
+            serve_module.RunnerTunnelAuthRejectedError,
+            match=serve_module.RUNNER_TUNNEL_REJECTION_PREFIX,
+        ):
+            await task
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert pending[0] is False
+    if outcome != "rejected":
+        assert all(pending[1:-1])
+    if outcome in {"connected", "rejected"}:
+        assert upgrades[-1] == "tok-recovered"
+        if outcome == "connected":
+            assert pending[-1] is False
+            assert 30 < sum(sleeps) < 120
+        else:
+            # A refused token is retried for the whole window before the runner exits.
+            assert 120 <= sum(sleeps) < 150
+    else:
+        assert pending[-1] is True
+    assert marker.exists() is (outcome == "connected")
+    assert not sign_in_pending_marker_path(marker).exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("http_status", [401, 403])
+@pytest.mark.parametrize(
+    "make_factory",
+    [lambda: lambda: None, _NoBearerMintDeclineFactory],
+    ids=["no-token", "no-bearer-mint-decline"],
+)
+async def test_serve_tunnel_no_credential_exits_only_after_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    make_factory: Callable[[], Any],
+    http_status: int,
+) -> None:
+    """A missing credential backs off without renewing its startup deadline."""
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    deadlines: list[float] = []
+    attempts = 0
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        assert auth_token is None
+        nonlocal attempts
+        attempts += 1
+        pending_marker = sign_in_pending_marker_path(marker)
+        if attempts > 1:
+            assert pending_marker.exists(), "the host cannot see the credential recovery wait"
+            deadlines.append(json.loads(pending_marker.read_text())["deadline"])
+        raise InvalidStatus(Response(http_status, "auth required", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_persistent_no_credential",
+            runner_version="0.1.0",
+            auth_token_factory=make_factory(),
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert sum(sleeps) >= serve_module._NO_CREDENTIAL_FATAL_WINDOW_S
+    assert attempts > serve_module._HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+    assert sleeps[:6] == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
+    assert max(sleeps) == serve_module._MAX_RECONNECT_DELAY_S
+    assert len(set(deadlines)) == 1
+    assert not sign_in_pending_marker_path(marker).exists()
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_rejected_token_exits_only_after_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A never-connected runner whose token is refused re-mints until the window elapses."""
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(tmp_path / "runner.connected"))
+    tokens_used: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        tokens_used.append(auth_token)
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_rejected_token_window",
+            runner_version="0.1.0",
+            auth_token_factory=lambda: "tok-refused",
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_REJECTION_PREFIX)
+    assert sum(sleeps) >= serve_module._NO_CREDENTIAL_FATAL_WINDOW_S
+    assert len(tokens_used) > serve_module._HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+    assert sleeps[:6] == [0.5, 1.0, 2.0, 4.0, 8.0, 10.0]
 
 
 class _SignInFactory:

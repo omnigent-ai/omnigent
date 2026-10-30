@@ -1684,7 +1684,7 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         from omnigent.server.routes._host_launch import resolve_host_launch
         from omnigent.server.routes.sessions import (
             _launch_runner_on_host,
-            _wait_for_runner_client,
+            _wait_for_host_bound_runner_client,
         )
 
         if deps.host_registry is None or deps.host_store is None:
@@ -1717,12 +1717,16 @@ def _make_connected_host_dispatch(deps: FireDeps) -> LaunchDispatch:
         if attempt.error is not None:
             raise RuntimeError(f"host launch failed: {attempt.error}")
 
-        runner_client = await _wait_for_runner_client(
+        runner_client = await _wait_for_host_bound_runner_client(
             conv.id,
             deps.runner_router,
             deps.tunnel_registry,
             runner_id=attempt.runner_id,
             timeout_s=_RUNNER_CONNECT_TIMEOUT_S,
+            runner_exit_reports=getattr(deps.app_state, "runner_exit_reports", None),
+            host_conn=target.conn,
+            host_registry=deps.host_registry,
+            conversation_store=deps.conversation_store,
         )
         if runner_client is None:
             raise RuntimeError("runner did not connect before timeout")
