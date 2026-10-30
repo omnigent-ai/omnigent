@@ -221,6 +221,17 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   | Legacy runner → updated server | Peer sends/top-level creates refuse without requester metadata; ordinary child work retains unknown origin. |
   | Updated runner → older/mixed server replicas | Requester-specific mutation routes refuse when unsupported; no ordinary-route fallback. Released-version pair checks do not prove a mixed-replica deployment. |
 
+- Native Claude mod contract probe: the opt-in developer plugin in
+  [the probe guide](../dev/claude_requester_probe/README.md) observes typed input,
+  turn/tool identifiers and MCP metadata. Run
+  `tests/e2e/test_claude_mod_requester_probe.py` only in its isolated Linux
+  environment; `tests/dev/test_claude_requester_probe.py` covers handler/analyzer
+  contracts without Claude. This is diagnostic evidence, not owner delegation
+  support. No production entry point installs the plugin, and the blocked row
+  above remains unchanged. The probe also observes transcript row IDs and tests
+  `/clear` followed by fresh work. Its [remaining contract](../dev/claude_requester_probe/REQUESTER_CONTRACT.md)
+  separates supported row/tool identity from the missing input-consumption proof.
+
 - Component compatibility checks: `tests/runtime/harnesses/test_executor_adapter_requester.py`
   exercises retained callbacks with the real SDK parser/dispatcher. The Claude
   scenarios verify retained SDK callback binding and that lost metadata stays
