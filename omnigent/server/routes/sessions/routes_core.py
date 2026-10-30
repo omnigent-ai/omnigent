@@ -1387,6 +1387,7 @@ def register_core_routes(
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
+            require_codex_plan_launch_support,
             validate_create_harness_readiness,
         )
 
@@ -1399,6 +1400,12 @@ def register_core_routes(
             conversation_store=conversation_store,
             host_store=getattr(request.app.state, "host_store", None),
             parent=parent_conv,
+        )
+        require_codex_plan_launch_support(
+            harness=spec_harness(spec),
+            host_id=parsed_metadata.host_id,
+            labels=parsed_metadata.labels,
+            host_registry=getattr(request.app.state, "host_registry", None),
         )
         with creation_stage("create_persistence_ms"):
             result = await asyncio.to_thread(
