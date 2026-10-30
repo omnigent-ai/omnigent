@@ -356,6 +356,7 @@ from omnigent.server.routes._sessions.helpers import (
     _HostLaunchAttempt as _HostLaunchAttempt,
     _NativeTerminalEnsureOutcome as _NativeTerminalEnsureOutcome,
     _RunnerForwardResult as _RunnerForwardResult,
+    _RunnerStopReceipt as _RunnerStopReceipt,
     _SessionEventDispatchResult as _SessionEventDispatchResult,
     _add_model_usage_delta as _add_model_usage_delta,
     _agent_carries_cursor_fork_history as _agent_carries_cursor_fork_history,

@@ -214,6 +214,31 @@ async def test_control_cancels_question_waiter_and_queued_input(
 
 
 @pytest.mark.asyncio
+async def test_stop_names_the_held_web_messages_it_discarded(
+    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool]
+) -> None:
+    """Stop session tells the server which held web messages Claude never received."""
+    app, harness = _build_app()
+    sid = uuid.uuid4().hex
+    held_ids = [f"pending_{uuid.uuid4().hex}" for _ in range(2)]
+    monkeypatch.setattr(claude_native_bridge, "kill_session", lambda *_a, **_k: None)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        for pending_id in held_ids:
+            queued = await client.post(
+                f"/v1/sessions/{sid}/events", json={**_message("held"), "pending_id": pending_id}
+            )
+            assert queued.json()["status"] == "buffered"
+        # Input without a pending id (not from the web composer) has nothing to settle.
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("not from the web"))
+        response = await client.post(f"/v1/sessions/{sid}/events", json={"type": "stop_session"})
+        assert response.status_code == 200
+        assert response.json() == {"discarded_pending_ids": held_ids}
+        assert sid not in app.state.session_message_buffers
+        assert harness.posted_bodies == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("action", "control", "error"),
     [
@@ -249,13 +274,19 @@ async def test_failed_terminal_control_still_cancels_queued_work(
         await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
         if has_active_turn:
             app.state.active_turns[sid] = None
-        queued = await client.post(f"/v1/sessions/{sid}/events", json=_message("cancel this"))
+        pending_id = f"pending_{uuid.uuid4().hex}"
+        queued = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={**_message("cancel this"), "pending_id": pending_id},
+        )
         assert queued.status_code == 202
         assert queued.json()["status"] == "buffered"
         waiter = app.state.claude_prompt_waiters.get(sid)
         response = await client.post(f"/v1/sessions/{sid}/events", json={"type": action})
         assert response.status_code == 503
         assert response.json()["error"] == error
+        reported = [pending_id] if action == "stop_session" else None
+        assert response.json().get("discarded_pending_ids") == reported
         assert control_calls == [(False, False)]
         assert (sid in app.state.active_turns) == has_active_turn
         if waiter is not None:

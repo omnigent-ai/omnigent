@@ -239,6 +239,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_filesystem_attachment_harness,
     _resolve_harness,
     _response_agent_name_from_store,
+    _RunnerStopFailedError,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
@@ -277,6 +278,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _recover_side_chat_runner_via_source,
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
+    _settle_native_inputs_discarded_by_stop,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -1881,16 +1883,33 @@ def register_events_routes(
             # non-2xx / unreachable runner (503) rather than swallowing
             # it, letting the web UI show the stop didn't land instead
             # of closing the dialog as if it succeeded.
+            # Read before the forward so a message sent after Stop stays live.
+            queued_pending_ids = pending_inputs.pending_ids(session_id)
             try:
-                stop_delivered = await _stop_session_via_runner(session_id, runner_router)
-            except Exception:
+                stop_receipt = await _stop_session_via_runner(session_id, runner_router)
+            except Exception as exc:
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                if isinstance(exc, _RunnerStopFailedError):
+                    await _settle_native_inputs_discarded_by_stop(
+                        conversation_store,
+                        session_id,
+                        conv,
+                        exc.discarded_pending_ids,
+                        stop_landed=False,
+                    )
                 raise
-            if not stop_delivered:
+            stop_delivered = stop_receipt is not None
+            if stop_receipt is None:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
                 _interrupt_fenced_sessions.discard(session_id)
+            else:
+                # Like interrupt: a later mirror must not report this input as never recorded.
+                pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+                await _settle_native_inputs_discarded_by_stop(
+                    conversation_store, session_id, conv, stop_receipt.discarded_pending_ids
+                )
             if (
                 stop_delivered
                 and not conv.host_id
@@ -1948,7 +1967,7 @@ def register_events_routes(
                         )
             if not stop_delivered:
                 # False-success backstop. The stop reached NO live runner
-                # (``_stop_session_via_runner`` returned False, so there was
+                # (``_stop_session_via_runner`` returned None, so there was
                 # no tunnel to deliver to). That path treats "no runner bound"
                 # as a no-op success — correct for an already-idle session,
                 # but WRONG for an orphaned one whose persisted status is

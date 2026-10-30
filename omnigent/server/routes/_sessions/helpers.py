@@ -89,6 +89,7 @@ from omnigent.native.failure_telemetry import (
     failure_log_attributes,
     normalize_failure_context,
 )
+from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -7475,7 +7476,45 @@ async def _forward_session_change_to_runner_impl(
     return _RunnerForwardResult(status_code=resp.status_code, body=resp.text)
 
 
-async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
+@dataclass(frozen=True)
+class _RunnerStopReceipt:
+    """
+    A ``stop_session`` the runner acknowledged.
+
+    :param discarded_pending_ids: Queued web messages the runner dropped
+        undelivered, oldest first; empty from runners that do not report them.
+    """
+
+    discarded_pending_ids: tuple[str, ...] = ()
+
+
+class _RunnerStopFailedError(OmnigentError):
+    """A failed ``stop_session``, naming the queued messages the runner still discarded."""
+
+    def __init__(self, message: str, *, discarded_pending_ids: tuple[str, ...]) -> None:
+        super().__init__(message, code=ErrorCode.RUNNER_UNAVAILABLE)
+        self.discarded_pending_ids = discarded_pending_ids
+
+
+def _discarded_pending_ids(resp: httpx.Response) -> tuple[str, ...]:
+    """Read the pending ids a runner reports discarding when it stops a session."""
+    if not resp.content:
+        return ()
+    try:
+        body = resp.json()
+    except ValueError:
+        return ()
+    raw_ids = body.get("discarded_pending_ids") if isinstance(body, dict) else None
+    if not isinstance(raw_ids, list):
+        return ()
+    return tuple(
+        raw_id
+        for raw_id in raw_ids
+        if isinstance(raw_id, str) and "pending_id" in input_attributes({"pending_id": raw_id})
+    )
+
+
+async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> _RunnerStopReceipt | None:
     """Call-time proxy so a facade patch of this symbol is honored here."""
     from omnigent.server.routes import sessions as _facade
 
@@ -7485,7 +7524,7 @@ async def _stop_session_via_runner(*args: Any, **kwargs: Any) -> bool:
 async def _stop_session_via_runner_impl(
     session_id: str,
     runner_router: Any,
-) -> bool:
+) -> _RunnerStopReceipt | None:
     """
     Forward a ``stop_session`` request to the bound runner, surfacing
     failures to the caller instead of swallowing them.
@@ -7505,7 +7544,7 @@ async def _stop_session_via_runner_impl(
     global runner client (in-process / test setups). When neither
     resolves to a client there is no live runner bound — the session is
     not running on any runner, so the stop is a no-op success and this
-    returns ``False`` without raising (the caller uses that to discard
+    returns ``None`` without raising (the caller uses that to discard
     the turn fence it installed, since no runner means nothing else
     would ever lift it).
 
@@ -7513,8 +7552,8 @@ async def _stop_session_via_runner_impl(
         ``"conv_abc123"``.
     :param runner_router: The session's ``RunnerRouter`` (may be
         ``None`` in tests / in-process setups).
-    :returns: ``True`` if the stop was delivered to a runner (2xx),
-        ``False`` if no runner client resolved (nothing forwarded).
+    :returns: The runner's receipt if the stop was delivered (2xx),
+        ``None`` if no runner client resolved (nothing forwarded).
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` (HTTP 503) if the
         runner could not be reached or reported a non-2xx — e.g. the
         claude-native tmux pane is wedged and ``kill_session`` failed.
@@ -7527,7 +7566,7 @@ async def _stop_session_via_runner_impl(
     if runner_client is None:
         runner_client = cast("httpx.AsyncClient | None", get_runner_client())
     if runner_client is None:
-        return False
+        return None
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
@@ -7541,12 +7580,12 @@ async def _stop_session_via_runner_impl(
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
     if resp.status_code >= 400:
-        raise OmnigentError(
+        raise _RunnerStopFailedError(
             f"Runner failed to stop session {session_id!r} "
             f"(status {resp.status_code}): {resp.text}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+            discarded_pending_ids=_discarded_pending_ids(resp),
         )
-    return True
+    return _RunnerStopReceipt(discarded_pending_ids=_discarded_pending_ids(resp))
 
 
 @dataclass
@@ -12297,6 +12336,8 @@ __all__ = [
     "_HostLaunchAttempt",
     "_NativeTerminalEnsureOutcome",
     "_RunnerForwardResult",
+    "_RunnerStopFailedError",
+    "_RunnerStopReceipt",
     "_SessionEventDispatchResult",
     "_add_model_usage_delta",
     "_agent_carries_cursor_fork_history",

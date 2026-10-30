@@ -1608,7 +1608,9 @@ async def test_stop_session_requires_confirmed_host_runner_exit(
     if runner_status == "offline":
         await comm.send_input({"type": "websocket.disconnect", "code": 1001})
         await comm.wait(timeout=budget(5.0))
-    monkeypatch.setattr(sessions, "_stop_session_via_runner", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        sessions, "_stop_session_via_runner", AsyncMock(return_value=sessions._RunnerStopReceipt())
+    )
     host_stop = AsyncMock(return_value=False)
     status_query = AsyncMock(return_value=runner_status)
     monkeypatch.setattr(routes_events, "_stop_host_runner_intentionally", host_stop)

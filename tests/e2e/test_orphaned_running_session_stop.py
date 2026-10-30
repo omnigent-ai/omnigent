@@ -18,7 +18,7 @@ pokes, no hand-written session rows):
 2. **``stop-session`` falsely succeeds.** ``omnigent host stop-session`` POSTs
    a ``stop_session`` event to ``POST /v1/sessions/{id}/events``. On the
    replacement server no runner client resolves
-   (``_stop_session_via_runner`` returns a no-op ``False``) and there is no
+   (``_stop_session_via_runner`` returns a no-op ``None``) and there is no
    live host tunnel, yet the route still returns ``2xx``. The CLI prints
    "Stopped session" while the row stays ``running`` — a destructive action
    reported as success that did nothing.
