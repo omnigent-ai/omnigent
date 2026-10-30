@@ -75,6 +75,16 @@ function useInvalidate() {
   };
 }
 
+/** Also refresh composer discovery: installed skills appear in its slash menu. */
+function useInvalidateDelivered() {
+  const client = useQueryClient();
+  const invalidate = useInvalidate();
+  return () => {
+    invalidate();
+    void client.invalidateQueries({ queryKey: ["skills"] });
+  };
+}
+
 export function useAddSkillSource() {
   const invalidate = useInvalidate();
   return useMutation({
@@ -96,7 +106,7 @@ export function usePreviewCatalog() {
 }
 
 export function useInstallSkills() {
-  const invalidate = useInvalidate();
+  const invalidate = useInvalidateDelivered();
   return useMutation({
     mutationFn: (input: {
       source: string;
@@ -109,7 +119,7 @@ export function useInstallSkills() {
 }
 
 export function useUpdateInstalledSkill() {
-  const invalidate = useInvalidate();
+  const invalidate = useInvalidateDelivered();
   return useMutation({
     mutationFn: (id: string) => updateInstalledSkill(id),
     onSuccess: invalidate,
@@ -117,7 +127,7 @@ export function useUpdateInstalledSkill() {
 }
 
 export function useSetInstalledSkillEnabled() {
-  const invalidate = useInvalidate();
+  const invalidate = useInvalidateDelivered();
   return useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
       setInstalledSkillEnabled(id, enabled),
@@ -126,7 +136,7 @@ export function useSetInstalledSkillEnabled() {
 }
 
 export function useDeleteInstalledSkill() {
-  const invalidate = useInvalidate();
+  const invalidate = useInvalidateDelivered();
   return useMutation({
     mutationFn: (id: string) => deleteInstalledSkill(id),
     onSuccess: invalidate,
