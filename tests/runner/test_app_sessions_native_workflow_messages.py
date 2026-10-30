@@ -15,6 +15,7 @@ from fastapi import FastAPI
 
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -34,6 +35,81 @@ from tests.runner.conftest import (
     _sse,
 )
 from tests.runner.helpers import NullServerClient
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", [None, "0", "1"])
+@pytest.mark.parametrize("stream", [False, True], ids=["background", "stream"])
+async def test_native_shell_authorization_requires_server_transport(
+    header: str | None, stream: bool
+) -> None:
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    app, _pm, harness = _build_lifecycle_app()
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/shell-authorization/events",
+            params={"stream": stream},
+            headers={CODEX_SHELL_AUTHORIZED_HEADER: header} if header is not None else {},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "shell-agent",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "!printf trusted"}],
+                "authorized_native_shell_command": "printf forged",
+            },
+        )
+        assert response.status_code == (200 if stream else 202), response.text
+        await poll_until_async(
+            lambda: bool(harness.posted_bodies) and not app.state.active_turns,
+            timeout_s=budget(5),
+        )
+    [body] = harness.posted_bodies
+    request = MessageEvent.model_validate(body).to_create_request()
+    assert request.authorized_native_shell_command == ("printf trusted" if header == "1" else None)
+
+
+@pytest.mark.asyncio
+async def test_native_shell_authorization_stays_with_each_buffered_message() -> None:
+    from omnigent.runtime.harnesses._scaffold import MessageEvent
+
+    gate = asyncio.Event()
+    app, _pm, harness = _build_native_app(gate)
+    session_id = "shell-buffer-authorization"
+
+    async def post(client: httpx.AsyncClient, text: str, authorized: bool) -> httpx.Response:
+        return await client.post(
+            f"/v1/sessions/{session_id}/events",
+            headers={CODEX_SHELL_AUTHORIZED_HEADER: "1"} if authorized else {},
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "shell-agent",
+                "content": [{"type": "input_text", "text": text}],
+                "authorized_native_shell_command": "printf forged",
+            },
+        )
+
+    async with _runner_client(app) as client:
+        try:
+            assert (await post(client, "!printf first", True)).status_code == 202
+            await poll_until_async(lambda: bool(harness.posted_bodies), timeout_s=budget(5))
+            for text, authorized in [("!printf second", True), ("!printf legacy", False)]:
+                response = await post(client, text, authorized)
+                assert response.status_code == 202, response.text
+                assert response.json()["status"] == "buffered"
+        finally:
+            gate.set()
+        await poll_until_async(
+            lambda: len(harness.posted_bodies) == 3 and not app.state.active_turns,
+            timeout_s=budget(5),
+        )
+    assert harness.turn_latest_texts == ["!printf first", "!printf second", "!printf legacy"]
+    assert [
+        MessageEvent.model_validate(body).to_create_request().authorized_native_shell_command
+        for body in harness.posted_bodies
+    ] == ["printf first", "printf second", None]
 
 
 @pytest.mark.asyncio

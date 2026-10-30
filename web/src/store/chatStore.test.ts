@@ -15934,6 +15934,9 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     // Every stream is recycled by the ingress at ~5 minutes, so streams opened
     // together drop together. Without a stagger, a tab holding N conversations
     // fires N reconnects — each with a snapshot + items fetch — in one burst.
+    // Mid-range jitter: a random draw under 1 ms would land inside the first tick.
+    const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
+    onTestFinished(() => random.mockRestore());
     seedSession("conv_fg", []);
     seedSession("conv_bg", []);
     const opens: string[] = [];
