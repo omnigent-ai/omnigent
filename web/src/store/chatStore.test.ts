@@ -20904,6 +20904,7 @@ describe("a send cut off by a reload", () => {
       files: [],
       stableId: "stable_reload",
       serverRefused: false,
+      recovered: true,
     });
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
@@ -20981,6 +20982,7 @@ describe("a send cut off by a reload", () => {
       files: [],
       stableId: "stable_queued",
       serverRefused: false,
+      recovered: true,
     });
     expect(peekQueuedSends("conv_reload")).toEqual([]);
   });
@@ -21022,6 +21024,7 @@ describe("a send cut off by a reload", () => {
       text: restored,
       files: [],
       serverRefused: false,
+      recovered: true,
     });
     expect(peekUnsentSend("conv_reload")).toBeNull();
     // Queued again while the agent works, the joined text is kept whole.

@@ -913,6 +913,11 @@ export interface ConversationState {
      * settles it (see `committedItemProvesDelivery`).
      */
     unsettled?: boolean;
+    /**
+     * Recovered from this tab's records when the session loaded. No other copy
+     * is left, so the composer adds it after newer input instead of dropping it.
+     */
+    recovered?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -7320,17 +7325,27 @@ export function restoredSendDraftUnchanged(
   );
 }
 
-/** Consume a session's failed send once, retaining retry identity only when restored. */
-export function takeFailedSendDraft(conversationId: string, hasDraft: boolean) {
+/**
+ * Consume a session's failed send once, retaining retry identity only when restored.
+ * `appendsRecovered`: the composer adds a recovered send after its newer input.
+ */
+export function takeFailedSendDraft(
+  conversationId: string,
+  hasDraft: boolean,
+  appendsRecovered = false,
+) {
   const state = setterForState(conversationId);
   const failed = state?.failedSendDraft;
   if (!state || !failed || failed.conversationId !== conversationId) return null;
   const delivered = committedItemProvesDelivery(state.blocks, failed);
-  const restore = !hasDraft && !delivered;
+  // Added after newer input, the text goes out as a new message.
+  const appended = hasDraft && appendsRecovered && failed.recovered === true;
+  const restore = (!hasDraft || appended) && !delivered;
+  const tracked = restore && !appended;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
-  if (!delivered) patch.pendingRetryStableId = restore ? (failed.stableId ?? null) : null;
+  if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
-  if (restore && failed.stableId)
+  if (tracked && failed.stableId)
     patch.restoredSendDraft = {
       conversationId,
       stableId: failed.stableId,
@@ -7496,6 +7511,7 @@ function unsentSendToRestore(
       ? { stableId: first.stableId, ...(first.replyDraft ? { replyDraft: first.replyDraft } : {}) }
       : {}),
     serverRefused: false,
+    recovered: true,
   };
 }
 
