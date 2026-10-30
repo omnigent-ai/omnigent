@@ -610,7 +610,8 @@ policy must be configured to allow it; the pane does not rewrite those headers.
 The browser runs on the user's machine (a native `WebContentsView`); the agent —
 which may run on a different host — drives it purely by messages: an action
 request fans out over the session stream, the renderer claims and executes it
-against its local Chromium, and the result is posted back.
+against its local Chromium, and the result is posted back. Every renderer navigation,
+including the address bar, chat links, and agent actions, enforces this policy.
 
 **Pieces:**
 
@@ -622,14 +623,14 @@ against its local Chromium, and the result is posted back.
   `nodeIntegration:false, contextIsolation:true, sandbox:true`.
   Page-initiated `window.open` / `target=_blank` never spawns a window: an
   http(s) target navigates the same view in place (still allowlist-checked on
-  an agent-locked view), and right-click offers "Open Link in Browser" /
+  a policy-enforced view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
-- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
+- `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
   any literal form, except exact loopback hosts for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
-  policy to every HTTP(S) and WebSocket request of an agent-locked view through
+  policy to every HTTP(S) and WebSocket request of a policy-enforced view through
   `webRequest`, including frames, `<object>`/`<embed>`, scripts, styles, images,
   media, and fetch/XHR. Worker network requests use the owning view's policy;
   requests without a registered view use the most restrictive owner in the

@@ -445,7 +445,8 @@ function registerBrowserIpc({
       }
       return registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
-        // Renderer flags do not establish user intent.
+        // Renderer flags cannot prove user intent; enforce policy for every
+        // renderer navigation, including the URL bar.
         agent: true,
         agentContext,
       });
