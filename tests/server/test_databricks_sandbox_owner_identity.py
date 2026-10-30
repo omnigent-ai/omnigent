@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -97,7 +98,7 @@ async def test_owner_resolver_refreshes_a_token_that_would_lapse_before_the_next
     assert await asyncio.to_thread(resolve, "carol") is None
 
 
-def _app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:
+def _app(db_uri: str, tmp_path: Path, *, manages_profiles: bool = False, **kwargs: Any) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     sandbox = parse_sandbox_config(
         {
@@ -105,6 +106,10 @@ def _app(db_uri: str, tmp_path: Path, **kwargs: Any) -> FastAPI:
             "server_url": "https://srv.example",
             "databricks": {"workspace_host": _WS},
         }
+    )
+    assert sandbox is not None
+    sandbox = replace(
+        sandbox, configs=(replace(sandbox.default, manages_profiles=manages_profiles),)
     )
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -143,6 +148,7 @@ async def test_create_app_binds_owner_launchers_to_databricks_connect(
     app = _app(
         db_uri,
         tmp_path,
+        manages_profiles=profiles_enabled,
         databricks_config=DatabricksConfig(
             client_id="cid", client_secret="secret", redirect_uri=f"{_WS}/cb", scopes="all-apis"
         ),
