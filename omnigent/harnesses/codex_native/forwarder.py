@@ -4005,7 +4005,7 @@ async def _auto_continue_after_output_limit(
                 "input": [{"type": "text", "text": _OUTPUT_LIMIT_CONTINUE_TEXT}],
             },
         )
-    except Exception:  # noqa: BLE001 - the stop is surfaced as the original error.
+    except Exception:  # The stop is surfaced as the original error.
         _logger.warning("Codex output-limit continuation failed to start", exc_info=True)
         return False
     result = response.get("result")
