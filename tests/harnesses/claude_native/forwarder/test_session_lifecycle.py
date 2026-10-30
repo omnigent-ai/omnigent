@@ -25,9 +25,13 @@ from tests.harnesses.claude_native.forwarder._support import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "project_available", [True, False], ids=["project-available", "project-not-found"]
+)
 async def test_clear_hook_rotates_active_session_without_reprocessing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    project_available: bool,
 ) -> None:
     """
     Claude ``/clear`` creates a fresh Omnigent session and consumes the hook.
@@ -36,7 +40,9 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     session with the old title and project, bind the same runner,
     transfer the terminal, rewrite the active bridge session, clear the
     old runner binding, and keep the hook cursor past the clear record
-    so the next poll does not fork again from the same hook line.
+    so the next poll does not fork again from the same hook line. A
+    project the server reports as not found (deleted, or owned by another
+    user) gets one unfiled retry and the same transaction.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
     bridge_dir = prepare_bridge_dir(
@@ -79,7 +85,9 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
                 },
             )
         if request.method == "POST" and request.url.path == "/v1/sessions":
-            return httpx.Response(201, json={"id": "conv_new"})
+            if project_available or "project_id" not in body:
+                return httpx.Response(201, json={"id": "conv_new"})
+            return httpx.Response(404, json={"error": {"message": "Project not found"}})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_new":
             assert body == {"runner_id": "runner_one"}
             return httpx.Response(200, json={"id": "conv_new"})
@@ -128,23 +136,18 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
     assert read_active_session_id(bridge_dir) == "conv_new"
     assert not (bridge_dir / "transcript_forwarder.json").exists()
     assert (bridge_dir / "hook_forwarder.json").exists()
+    unfiled_body = {
+        "agent_id": "ag_claude",
+        "labels": {"omnigent.ui": "terminal", BRIDGE_ID_LABEL_KEY: "bridge_shared"},
+        "title": "Fix login flow",
+    }
+    filed_body = {**unfiled_body, "project_id": "proj_alpha", "workspace": None, "git": None}
+    creates = [("POST", "/v1/sessions", filed_body)]
+    if not project_available:
+        creates.append(("POST", "/v1/sessions", unfiled_body))
     assert calls == [
         ("GET", "/v1/sessions/conv_old", None),
-        (
-            "POST",
-            "/v1/sessions",
-            {
-                "agent_id": "ag_claude",
-                "labels": {
-                    "omnigent.ui": "terminal",
-                    BRIDGE_ID_LABEL_KEY: "bridge_shared",
-                },
-                "title": "Fix login flow",
-                "project_id": "proj_alpha",
-                "workspace": None,
-                "git": None,
-            },
-        ),
+        *creates,
         ("PATCH", "/v1/sessions/conv_new", {"runner_id": "runner_one"}),
         (
             "POST",
@@ -156,83 +159,6 @@ async def test_clear_hook_rotates_active_session_without_reprocessing(
             "/v1/sessions/conv_old",
             {"runner_id": "", "labels": {BRIDGE_ID_LABEL_KEY: "conv_old-cleared"}},
         ),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_clear_rotation_creates_unfiled_replacement_when_project_is_unavailable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A project the rotation cannot file into still yields a titled continuation.
-
-    The server answers 404 for a deleted project or one owned by another
-    user, which must not leave ``/clear`` without a replacement session.
-    """
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
-    bridge_dir = prepare_bridge_dir(
-        "conv_old",
-        bridge_id="bridge_shared",
-        workspace=tmp_path,
-    )
-    record_hook_event(bridge_dir, {"hook_event_name": "SessionStart", "source": "clear"})
-    create_bodies: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        """
-        Mock rotation endpoints whose project-filed create is rejected.
-
-        :param request: Incoming request.
-        :returns: Canned Omnigent response.
-        """
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_old":
-            return httpx.Response(
-                200,
-                json={
-                    "id": "conv_old",
-                    "agent_id": "ag_claude",
-                    "runner_id": "runner_one",
-                    "labels": {BRIDGE_ID_LABEL_KEY: "bridge_shared"},
-                    "title": "Fix login flow",
-                    "project_id": "proj_foreign",
-                },
-            )
-        if request.method == "POST" and request.url.path == "/v1/sessions":
-            body = json.loads(request.content)
-            create_bodies.append(body)
-            if "project_id" in body:
-                return httpx.Response(404, json={"error": {"message": "Project not found"}})
-            return httpx.Response(201, json={"id": "conv_new"})
-        return httpx.Response(200, json={"id": "ok"})
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
-        hook_state = await forwarder._ensure_hook_state(
-            bridge_dir,
-            start_at_end=False,
-            session_id="conv_old",
-        )
-        rotated_to = await forwarder._maybe_rotate_session_on_clear(
-            client=client,
-            session_id="conv_old",
-            bridge_dir=bridge_dir,
-            state=hook_state,
-        )
-
-    assert rotated_to == "conv_new"
-    assert read_active_session_id(bridge_dir) == "conv_new"
-    labels = {BRIDGE_ID_LABEL_KEY: "bridge_shared"}
-    assert create_bodies == [
-        {
-            "agent_id": "ag_claude",
-            "labels": labels,
-            "title": "Fix login flow",
-            "project_id": "proj_foreign",
-            "workspace": None,
-            "git": None,
-        },
-        {"agent_id": "ag_claude", "labels": labels, "title": "Fix login flow"},
     ]
 
 
