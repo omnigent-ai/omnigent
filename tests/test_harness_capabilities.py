@@ -276,8 +276,7 @@ def test_optional_bench_capabilities_default_to_unknown() -> None:
     assert capability.shell_tool_name is None
     assert capability.shell_tool_prompt is None
     assert capability.instruction_delivery is InstructionDelivery.UNKNOWN
-    # Pause axes default to the conservative claim for an SDK harness: an
-    # interrupt ends the run and the vendor thread does not survive it.
+    # An SDK harness's Pause ends the run and drops the vendor thread.
     assert capability.pause is PauseSemantics.ENDS_RUN
     assert capability.resume_after_pause is PauseResume.NEW_TURN
     assert capability.as_dict() == {

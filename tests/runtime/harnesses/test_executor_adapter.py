@@ -4039,14 +4039,10 @@ async def test_interrupt_with_neither_turn_nor_executor_still_404s() -> None:
     )
 
 
-async def test_interrupt_response_outlasts_no_slow_inner_teardown(
+async def test_slow_inner_report_does_not_hold_the_interrupt_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A slow reap must not hold the Pause response past the runner's POST budget.
-
-    The runner bounds its interrupt POST at 4.0s; the reap behind a confirmed stop can
-    take seconds and must finish in the background rather than hold the response.
-    """
+    """A report that outlasts the slice answers 204 and keeps running, tracked."""
     from omnigent.runtime.harnesses import _executor_adapter
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
@@ -4064,3 +4060,59 @@ async def test_interrupt_response_outlasts_no_slow_inner_teardown(
     assert adapter._bg_tasks, "the unfinished teardown must stay tracked, not be cancelled"
     await asyncio.gather(*adapter._bg_tasks)
     assert executor.interrupted == ["conv_slow"]
+
+
+async def test_second_pause_answers_within_one_slice_after_a_slow_earlier_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An earlier reap that ends just before the slice runs out leaves the next report
+    only what is left of the same slice, so the answer stays inside the runner's POST."""
+    from omnigent.runtime.harnesses import _executor_adapter
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    slice_seconds = 0.3
+    monkeypatch.setattr(_executor_adapter, "_INTERRUPT_EVENT_SLICE_S", slice_seconds)
+    executor = _InterruptRecordingExecutor(teardown_delay=0.25)
+    adapter = ExecutorAdapter(lambda: executor, session_key="conv_stacked")
+    adapter._executor = executor
+    first = await adapter._handle_interrupt_event()
+    assert first.status_code == 204
+    executor._delay = 0.25
+    executor._teardown_delay = 0.0
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    second = await adapter._handle_interrupt_event()
+    elapsed = loop.time() - started
+
+    assert second.status_code == 204, second.status_code
+    assert elapsed < slice_seconds + 0.1, (
+        f"the second Pause took {elapsed:.2f}s; the reap wait and the report must share "
+        f"one {slice_seconds}s slice"
+    )
+    await asyncio.gather(*adapter._bg_tasks)
+    assert executor.interrupted == ["conv_stacked", "conv_stacked"]
+
+
+async def test_unconfirmed_inner_stop_behind_a_cancelled_turn_is_a_204_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With a harness turn to cancel, an unconfirmed inner stop still answers 204,
+    since the turn itself is torn down, and is logged rather than hidden."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    executor = _InterruptRecordingExecutor(outcome=InterruptOutcome.UNCONFIRMED)
+    adapter = ExecutorAdapter(lambda: executor, session_key="conv_turn_unconfirmed")
+    adapter._executor = executor
+    ctx = TurnContext(
+        response_id="resp_unconfirmed", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    adapter._in_flight["resp_unconfirmed"] = ctx
+
+    with caplog.at_level("WARNING", logger="omnigent.runtime.harnesses._executor_adapter"):
+        response = await adapter._handle_interrupt_event()
+
+    assert response.status_code == 204, response.status_code
+    assert ctx.cancelled.is_set()
+    assert "did not confirm its stop" in caplog.text, caplog.text

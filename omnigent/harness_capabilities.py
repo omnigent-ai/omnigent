@@ -156,11 +156,8 @@ class HarnessCapabilities:
     :param interrupt: Whether a running turn can be cancelled mid-stream. This
         is a *declared* claim; the harness bench's interrupt probe verifies it
         live and flags drift when a harness does not honor it.
-    :param pause: What Pause does to the vendor agent — ``ends-run`` for every
-        harness that honors an interrupt today. When *interrupt* is ``False``
-        this is normalized to ``unsupported`` silently: a declared value is
-        not an error, because the dataclass default cannot tell a declaration
-        from an omission.
+    :param pause: Pause behaviour; normalized to ``unsupported`` when
+        *interrupt* is ``False``.
     :param resume_after_pause: What the turn after a Pause continues —
         ``same-thread`` when the vendor keeps its own conversation across the
         interrupt, ``new-turn`` when the vendor session is dropped and rebuilt

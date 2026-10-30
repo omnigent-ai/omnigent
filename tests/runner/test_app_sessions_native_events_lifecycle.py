@@ -6124,15 +6124,19 @@ class _RejectingHarnessClient(_ScriptedHarnessClient):
     404 models an older scaffold with neither a turn nor an inner session.
     """
 
-    status_code = 409
+    def __init__(self, status_code: int) -> None:
+        """Answer every interrupt POST with *status_code*."""
+        super().__init__([])
+        self.status_code = status_code
 
     async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
         """Record the body and reject it the way the harness scaffold would."""
         del url, timeout
         self.patched_events.append(json)
+        rejected_status = self.status_code
 
         class _Response:
-            status_code = _RejectingHarnessClient.status_code
+            status_code = rejected_status
             headers: dict[str, str] = {}
             content = b""
 
@@ -6165,7 +6169,6 @@ async def test_interrupt_rejected_by_the_harness_is_not_reported_as_delivered(
     refusal, and does not claim the session was idle.
     """
     conv_id = f"conv_{uuid.uuid4().hex}"
-    _RejectingHarnessClient.status_code = harness_status
 
     spec = AgentSpec(
         spec_version=1,
@@ -6178,7 +6181,7 @@ async def test_interrupt_rejected_by_the_harness_is_not_reported_as_delivered(
         del agent_id, session_id
         return spec
 
-    harness_client = _RejectingHarnessClient([])
+    harness_client = _RejectingHarnessClient(harness_status)
     pm = _FakeProcessManager(harness_client)
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]

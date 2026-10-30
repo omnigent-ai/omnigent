@@ -117,7 +117,7 @@ class _FakeAppSession:
     async def await_turn_stopped(self, turn_id, *, timeout):
         del timeout
         self.awaited_stop_for = turn_id
-        return self.confirms_stop
+        return self.confirms_stop or self.already_stopped
 
 
 class _FakePipe:
@@ -1621,6 +1621,7 @@ class TestCodexExecutor(unittest.TestCase):
 
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            fake_session.confirms_stop = False
 
             async def _boom(turn_id=None):
                 del turn_id
@@ -1739,6 +1740,19 @@ class TestCodexExecutor(unittest.TestCase):
             )
             self.assertTrue(session.turn_stopped("turn-1"))
             self.assertTrue(await session.await_turn_stopped("turn-1", timeout=0.1))
+
+            # The previous turn's markers never confirm the next turn, even
+            # after a retrying failure of the new one.
+            session._note_native_activity(
+                {"method": "turn/started", "params": {"turn": {"id": "turn-2"}}}
+            )
+            session._note_native_activity(
+                {
+                    "method": "turn/failed",
+                    "params": {"willRetry": True, "turn": {"id": "turn-2"}},
+                }
+            )
+            self.assertFalse(session.turn_stopped("turn-2"))
 
         _run(_t())
 

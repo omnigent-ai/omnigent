@@ -5242,10 +5242,7 @@ class CodexExecutor(Executor):
         reported before the session is closed: the close can take seconds and
         must not hide an unconfirmed stop behind a caller's budget.
 
-        The session is always dropped so the next turn replays full history; a
-        resumed thread would skip the runner's "[System: interrupted]" marker
-        (see claude_sdk_executor.interrupt_session and Codex's
-        ``resume_after_pause`` capability).
+        Always drops the session; see Codex's ``resume_after_pause`` capability.
 
         :param session_key: The Omnigent session id to interrupt.
         :returns: The outcome, with the session close as ``teardown`` whenever
@@ -5275,12 +5272,11 @@ class CodexExecutor(Executor):
                     session_key,
                     exc,
                 )
-                # The turn may have ended on its own while the request failed.
-                confirmed = app_session.turn_stopped(turn_id)
-            else:
-                confirmed = await app_session.await_turn_stopped(
-                    turn_id, timeout=_INTERRUPT_CONFIRM_SECONDS
-                )
+            # Watch for the stop even after a failed request: it may have landed
+            # with only its response lost, or the turn may end on its own.
+            confirmed = await app_session.await_turn_stopped(
+                turn_id, timeout=_INTERRUPT_CONFIRM_SECONDS
+            )
             if not confirmed:
                 logger.warning(
                     "Codex did not confirm turn %s stopped within %.1fs for "

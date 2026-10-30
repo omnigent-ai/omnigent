@@ -639,10 +639,8 @@ class ExecutorAdapter(HarnessApp):
     async def _handle_interrupt_event(self) -> Response:
         """Cancel the turn and interrupt the inner executor session.
 
-        Extends the base handler to also interrupt the inner session, so the in-flight
-        generation stops even when the run loop is blocked awaiting the first token. The
-        base 404 is absorbed when an executor exists: the inner agent can outlive the
-        harness turn, and the executor is then the only thing left to stop.
+        The base 404 is absorbed when an executor exists: the inner agent can outlive
+        the harness turn, and the executor is then the only thing left to stop.
 
         :returns: 204 when a harness turn was cancelled or the inner session stopped (or
             is still being reaped past the response budget).
@@ -675,13 +673,10 @@ class ExecutorAdapter(HarnessApp):
         return response
 
     async def _interrupt_inner_session(self) -> _InnerStop:
-        """Interrupt the inner session without holding the Pause response past its budget.
+        """Interrupt the inner session, answering within :data:`_INTERRUPT_EVENT_SLICE_S`.
 
-        The executor's report carries the outcome apart from its reap, so the answer
-        arrives as soon as the stop is confirmed or refused; the reap keeps running as a
-        tracked task and :meth:`run_turn` waits for it before the executor serves again.
-        A Pause that lands while an earlier reap is still running waits for that reap
-        (within the same budget) instead of interrupting the executor a second time.
+        The outcome is answered within the slice; the reap continues as a tracked task.
+        An earlier reap still running is waited for inside the same slice.
 
         :returns: The inner outcome, ``PENDING`` when nothing is known within
             :data:`_INTERRUPT_EVENT_SLICE_S`, ``FAILED`` when the executor raised, or
@@ -690,14 +685,17 @@ class ExecutorAdapter(HarnessApp):
         executor = self._executor
         if executor is None:
             return _InnerStop.ABSENT
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _INTERRUPT_EVENT_SLICE_S
         if not await self._wait_pending_inner_interrupts(_INTERRUPT_EVENT_SLICE_S):
             return _InnerStop.PENDING
         task = asyncio.ensure_future(self._report_inner_interrupt(executor))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
         try:
+            # One deadline covers the earlier reap and this report together.
             outcome = await asyncio.wait_for(
-                asyncio.shield(task), timeout=_INTERRUPT_EVENT_SLICE_S
+                asyncio.shield(task), timeout=max(0.0, deadline - loop.time())
             )
         except TimeoutError:
             _logger.warning(
@@ -1232,12 +1230,8 @@ class ExecutorAdapter(HarnessApp):
         return self._executor
 
     async def _await_pending_inner_interrupt(self) -> None:
-        """Let every Pause teardown that outran its response slice finish before the next turn.
-
-        Otherwise the executor could start generating again while a previous session is
-        still being interrupted and reaped underneath it. The wait is bounded so a reap
-        that never finishes cannot wedge the session; the next turn then starts over it.
-        """
+        """Wait (bounded) for Pause reaps still running, so the next turn does not start
+        on top of a session being torn down."""
         if not await self._wait_pending_inner_interrupts(_INTERRUPT_SLICE_S):
             _logger.warning(
                 "inner session %s teardown still running after %.1fs; "

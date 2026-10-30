@@ -43,6 +43,13 @@ but keep the cached session id, so the next turn resumes the same vendor thread.
 A client should treat `same-thread` as "the thread survives a Pause that
 lands", not as a guarantee against a vendor that is already broken.
 
+`resume_after_pause` is not the `resume` capability. `resume` says whether a
+session can reattach to its vendor thread after the harness process restarts;
+`resume_after_pause` covers the next turn in the same live process. So
+`open-responses` (which keeps the last completed turn's `previous_response_id`)
+and `openai-agents` (which rolls its in-memory session back to before the
+interrupted turn) are `resume: cold-only` yet `resume_after_pause: same-thread`.
+
 **`cancel`** — always `true`. Cancel is a framework floor, not a per-vendor
 feature: Omnigent's own turn teardown records the cancellation and its cause
 even when the vendor ignores the interrupt.
@@ -66,7 +73,11 @@ For Codex, `turn/interrupt` returning only proves the app server received the
 ask, so `CodexExecutor.interrupt_session` then waits for the turn to be seen
 ending — off the reader task's own markers, which keep arriving even when
 nothing is consuming `run_turn`. A turn the reader already saw end gets no
-interrupt at all.
+interrupt at all. `antigravity-native` and the generic ACP harnesses cannot
+observe the stop, but they do tell a live conversation whose cancel could not
+be delivered (agy's connect-RPC port is missing or `CancelCascadeSteps` failed;
+the `session/cancel` send failed) apart from one with nothing running, and
+report the former as unconfirmed rather than idle.
 
 What the caller sees:
 
@@ -87,7 +98,8 @@ What the caller sees:
 - The inner agent reports its outcome before it reaps the session, so the
   response does not wait for the process reap. The reap keeps running in the
   background, a second Pause in that window waits for it instead of
-  interrupting again, and the next turn waits (bounded) for it to finish.
+  interrupting again (within the same response budget), and the next turn
+  waits (bounded) for it to finish.
 - `session.interrupted` is published once the runner has accepted the
   interrupt, so it follows the forward rather than preceding it.
 - Harnesses older than this contract answer 404 when they have no turn; the
