@@ -10,23 +10,29 @@ button. The browser or desktop shell may ask permission to open the editor's
 protocol link. Local file links are offered only when the desktop app can
 identify the session's host as its own machine. Mobile shells hide the controls.
 
-The UI infers standard SSH aliases from the existing host list: provider
+Remote controls require the host to be online. The UI infers standard SSH
+aliases from the existing host list: provider
 `databricks-arca` uses `arca.ssh`, and provider `arclet` uses
 `arclet_<host.name>.ssh`. Arclet names follow Arclet's existing validation:
 1–64 ASCII letters, digits, underscores, or hyphens; a letter or digit first;
 and no `arclet_` or `arclet-` prefix. The alias must exist in your local SSH
 configuration; Arca Companion creates these aliases for Arclets.
-User-connected hosts with no sandbox provider also use `arca.ssh` when their
-name matches Isaac's standard `<username>'s arca` format, such as
-`alex.dev's arca`. The username must start with an ASCII letter or digit and
-contain only ASCII letters, digits, dots, underscores, or hyphens. Explicit
-sandbox providers take precedence over this naming fallback.
+For user-connected hosts without a sandbox provider, the UI reads
+`/etc/metric_proxy/labels/default` through the existing authenticated session
+file API. A unique `arca_type arca` label selects `arca.ssh`. For
+`arca_type arclet`, it reads `/opt/arclet/arclet-name` and uses the validated
+canonical name for `arclet_<name>.ssh`. Display names, including IP-based
+hostnames and custom names, do not determine the machine type. Other types,
+including `isaac-arca`, are not treated as personal Arcas.
+Discovery is cached per session and host for five minutes and shared by the
+folder and file controls. Clicking Open performs no metadata request.
 Remote links currently support POSIX paths, including Arca and Arclet workspaces.
 
-Other remote providers, custom aliases, missing host rows, and invalid Arclet
-names hide the remote controls. Inference uses persisted host rows, so a
-recognized offline host can retain the action; connecting still requires that
-host to be reachable over SSH. Host-list updates refresh the inferred alias.
+Other remote providers, custom aliases, missing or offline host rows, invalid
+Arclet names, and unreadable or malformed metadata hide the remote controls.
+The existing file API's session permissions and filesystem reach still apply;
+the UI does not bypass them. Cached discovery cannot keep an offline host's
+controls visible. Host-list updates refresh availability and provider aliases.
 No new host protocol, server API, or database migration is required. The browser
 cannot check whether an editor or SSH alias is installed locally.
 

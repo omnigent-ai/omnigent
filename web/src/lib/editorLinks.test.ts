@@ -4,6 +4,7 @@ import {
   inferHostSshTarget,
   launchEditorLink,
   normalizeSshTarget,
+  parseArcaTypeLabel,
 } from "./editorLinks";
 
 afterEach(() => {
@@ -42,8 +43,6 @@ it("keeps remote folder links distinct from file links", () => {
 
 it.each([
   [{ name: "my-arca", sandbox_provider: "databricks-arca" }, "arca.ssh"],
-  [{ name: "alex.dev's arca", sandbox_provider: null }, "arca.ssh"],
-  [{ name: "alex-dev_2's arca" }, "arca.ssh"],
   [{ name: "conversant-crane", sandbox_provider: "arclet" }, "arclet_conversant-crane.ssh"],
   [
     { name: "omnigent-arclet-session", sandbox_provider: "arclet" },
@@ -58,6 +57,9 @@ it.each([
   undefined,
   null,
   { name: "remote", sandbox_provider: null },
+  { name: "ip-10-92-23-179", sandbox_provider: null },
+  { name: "alex.dev's arca", sandbox_provider: null },
+  { name: "alex-dev_2's arca" },
   { name: "alex.dev's laptop", sandbox_provider: null },
   { name: "'s arca", sandbox_provider: null },
   { name: " alex.dev's arca", sandbox_provider: null },
@@ -82,6 +84,22 @@ it.each([
   { name: "x".repeat(65), sandbox_provider: "arclet" },
 ])("does not infer an SSH target from %j", (host) => {
   expect(inferHostSshTarget(host)).toBeNull();
+});
+
+it.each([
+  ["arca_type arca\n", "arca"],
+  ["owner alex\n\t arca_type\tarclet \r\nregion test\n", "arclet"],
+  ["", null],
+  ["owner arca\n", null],
+  ["arca_type isaac-arca\n", null],
+  ["arca_type other\n", null],
+  ["arca_type\n", null],
+  ["arca_type arca extra\n", null],
+  ["arca_type arca\narca_type arca\n", null],
+  ["arca_type arca\narca_type arclet\n", null],
+  ["arca_type arca\narca_type\n", null],
+] as const)("reads only a unique supported Arca type from %j", (labels, expected) => {
+  expect(parseArcaTypeLabel(labels)).toBe(expected);
 });
 
 it.each(["relative/file", "/file\0", "/file\n", ""])("rejects invalid path %j", (path) => {

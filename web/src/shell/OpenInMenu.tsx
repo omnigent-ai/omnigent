@@ -13,6 +13,7 @@ import {
 import { useHostSshTarget } from "@/hooks/useHostSshTarget";
 import { CODE_EDITORS, editorLink, launchEditorLink } from "@/lib/editorLinks";
 import { isAndroidShell, isIOSShell, supportsFileReveal } from "@/lib/nativeBridge";
+import { useFileViewerConversationId } from "./FileViewerContext";
 import {
   revealInFileManager,
   revealLabel,
@@ -61,8 +62,12 @@ interface OpenInAction {
 export function useOpenInActions(path: string | null, directory = false): OpenInAction[] {
   const localTarget = useLocalFileTarget(path);
   const target = useHostFileTarget(path);
+  const conversationId = useFileViewerConversationId();
   const mobile = isAndroidShell() || isIOSShell();
-  const sshTarget = useHostSshTarget(!mobile && !localTarget ? (target?.hostId ?? null) : null);
+  const sshTarget = useHostSshTarget(
+    !mobile && !localTarget ? (target?.hostId ?? null) : null,
+    conversationId,
+  );
   const preferred = useSyncExternalStore(subscribeToAppPreference, readPreferredApp, () => "");
   if (mobile || !target || (!localTarget && !sshTarget)) return [];
   const actions: OpenInAction[] = [];

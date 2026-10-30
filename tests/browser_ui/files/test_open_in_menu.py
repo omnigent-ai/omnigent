@@ -24,7 +24,8 @@ seeded_session = seeded_session_fixture
         (360, "local", "laptop", None, None, True, True),
         (950, "local", "laptop", None, None, True, True),
         (950, "arca", "my-arca", "databricks-arca", "arca.ssh", True, True),
-        (950, "personal-arca", "alex.dev's arca", None, "arca.ssh", False, True),
+        (950, "personal-arca", "ip-10-92-23-179", None, "arca.ssh", False, True),
+        (950, "personal-arclet", "custom name", None, "arclet_conversant-crane.ssh", False, True),
         (
             360,
             "arclet",
@@ -81,6 +82,28 @@ def test_open_folder_and_file_in_app(
         },
     )
     session.contract.json(f"/v1/hosts/{host_id}/worktrees", {"data": []})
+    session.contract.json(
+        f"/v1/sessions/{sid}/resources/environments/default/filesystem/etc/metric_proxy/labels/default?base=host",
+        {"detail": "File not found"},
+        status=404,
+    )
+    if sandbox_provider is None and ssh_host is not None:
+        machine_type = "arca" if ssh_host == "arca.ssh" else "arclet"
+        metadata_files = {"etc/metric_proxy/labels/default": f"arca_type {machine_type}\n"}
+        if machine_type == "arclet":
+            metadata_files["opt/arclet/arclet-name"] = "conversant-crane\n"
+        for metadata_path, content in metadata_files.items():
+            session.contract.json(
+                f"/v1/sessions/{sid}/resources/environments/default/filesystem/{metadata_path}?base=host",
+                {
+                    "object": "session.environment.filesystem.file_content",
+                    "path": f"/{metadata_path}",
+                    "content_type": "text/plain",
+                    "encoding": "utf-8",
+                    "content": content,
+                    "bytes": len(content),
+                },
+            )
     session.contract.json(
         "/v1/hosts",
         {
