@@ -1159,6 +1159,8 @@ class CreateResponseRequest(BaseModel):
     pending_id: str | None = None
     delivery_attempt_id: str | None = None
     input_enqueued_at_ms: int | None = None
+    # Runner-validated authorization for one delivery, separate from user content/history.
+    authorized_native_shell_command: str | None = None
     conversation: ConversationRef | None = None
     # Reasoning config, e.g. {"effort": "low"|"medium"|"high"}
     reasoning: dict[str, str] | None = None
