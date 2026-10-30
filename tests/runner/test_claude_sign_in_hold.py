@@ -798,8 +798,13 @@ async def test_interrupt_or_stop_before_the_refused_stream_ends_is_never_undone(
     assert sid not in app.state.sign_in_holds
     assert not app.state.session_message_buffers.get(sid)
     assert not server.notices("databricks_sign_in_pending")
+    failures = [e for e in _published(app, sid) if e.get("type") == "response.failed"]
+    if action == "stop_session":
+        # Stopping the session ends the turn as cancelled, with no failure card.
+        assert failures == []
+        return
     # The refusal is reported as it was before messages were held.
-    (failed,) = [e for e in _published(app, sid) if e.get("type") == "response.failed"]
+    (failed,) = failures
     assert failed["error"]["code"] == "databricks_sign_in_pending"
 
 
