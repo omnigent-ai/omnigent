@@ -3728,7 +3728,8 @@ async def _settle_native_inputs_discarded_by_stop(
     prompt or a running turn) when the session is stopped, even if stopping
     then fails. No transcript mirror will ever settle them, so a later mirror
     would otherwise skip them and blame the harness for never recording them.
-    A failed append returns the entries to the queue; the stop itself stands.
+    A failed append returns the entries to the queue unsaved without changing
+    the stop's outcome; after a failed stop they may still be reported as never recorded.
 
     :param conversation_store: Store to append the messages and notices to.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -3772,7 +3773,7 @@ async def _settle_native_inputs_discarded_by_stop(
     ]
     try:
         persisted = await asyncio.to_thread(conversation_store.append, session_id, items)
-    except Exception:  # noqa: BLE001 — the stop landed; an unsaved notice must not undo it
+    except Exception:  # noqa: BLE001 — an unsaved notice must not change the stop's outcome
         _logger.exception(
             "Could not persist the messages discarded by stopping session=%s",
             session_id,

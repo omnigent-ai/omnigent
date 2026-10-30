@@ -11245,7 +11245,7 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
     """
     Stop session keeps the held messages Claude never received, each with a notice.
 
-    The runner names what it dropped from behind Claude's open prompt: that
+    The runner names what it dropped from behind Claude's open prompt: each
     message is saved with a neutral notice and its bubble is cleared. A queued
     message it does not name may have reached Claude and drains quietly, and
     one sent after Stop is still delivered normally.
@@ -11256,9 +11256,12 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
         session_id,
         published,
     ):
-        held = _queue_web_message(session_id, "held message")
+        held = [
+            _queue_web_message(session_id, "held message one"),
+            _queue_web_message(session_id, "held message two"),
+        ]
         _queue_web_message(session_id, "message that reached Claude")
-        stop_reply = {"discarded_pending_ids": [held, "not-a-pending-id"]}
+        stop_reply = {"discarded_pending_ids": [*held, "not-a-pending-id"]}
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(lambda _request: httpx.Response(200, json=stop_reply)),
             base_url="http://runner",
@@ -11270,21 +11273,37 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
         assert response.status_code < 300, response.text
 
         items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-        notices = [item for item in items if item["type"] == "error"]
-        assert [item["code"] for item in notices] == ["native_input_discarded_by_stop"]
-        notice = notices[0]
-        assert notice["level"] == "info"
-        assert notice["title"] == "Message not sent because the session was stopped"
-        assert "waiting for Claude," in notice["message"]
-        assert _consumed_pending_ids(published) == [held]
+        assert [
+            item["code"] if item["type"] == "error" else item["content"][0]["text"]
+            for item in items
+            if item["type"] == "error" or (item["type"] == "message" and item["role"] == "user")
+        ] == [
+            "held message one",
+            "native_input_discarded_by_stop",
+            "held message two",
+            "native_input_discarded_by_stop",
+        ]
+        for notice in (item for item in items if item["type"] == "error"):
+            assert notice["level"] == "info"
+            assert notice["title"] == "Message not sent because the session was stopped"
+            assert "waiting for Claude," in notice["message"]
+        consumed = [
+            (event["data"]["item_id"], event["data"]["cleared_pending_id"])
+            for _sid, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        user_item_ids = [
+            item["id"] for item in items if item["type"] == "message" and item["role"] == "user"
+        ]
+        assert consumed == list(zip(user_item_ids, held, strict=True))
 
         after_stop = _queue_web_message(session_id, "sent after stop")
         await _mirror_user_message(client, session_id, "sent after stop", "claude:after-stop:0")
 
         user_texts, error_codes = await _persisted_user_texts_and_error_codes(client, session_id)
-        assert user_texts == ["held message", "sent after stop"]
-        assert error_codes == ["native_input_discarded_by_stop"]
-        assert _consumed_pending_ids(published) == [held, after_stop]
+        assert user_texts == ["held message one", "held message two", "sent after stop"]
+        assert error_codes == ["native_input_discarded_by_stop"] * 2
+        assert _consumed_pending_ids(published) == [*held, after_stop]
         assert pending_inputs.pending_ids(session_id) == []
 
 
