@@ -58,6 +58,7 @@ export interface Branding {
 
 /** Release features understood by this frontend build. */
 export type FeatureKey =
+  | "codex_plan_at_launch"
   | "usage_page"
   | "harness_install"
   | "canvas"
