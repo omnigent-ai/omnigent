@@ -758,25 +758,25 @@ async def test_held_message_is_sent_after_a_failed_bridge_lookup(
 
 
 @pytest.mark.asyncio
-async def test_held_message_is_sent_when_the_queue_drain_lookup_fails(
+async def test_held_message_is_sent_when_the_queue_drains_prompt_check_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A lookup that fails in the queue drain, after the waiter's own lookup worked, retries."""
+    """A pane check that fails in the queue drain, after the waiter's own check worked, retries."""
     app, harness, _server = _build_app([_REFUSED, _DELIVERED])
     sid = uuid.uuid4().hex
-    lookups_after_release = 0
+    checks_after_release = 0
 
-    async def flaky_bridge_id(**_: Any) -> str:
-        nonlocal lookups_after_release
+    def flaky_pending_prompt(_bridge_dir: Path) -> bool:
+        nonlocal checks_after_release
         hold = app.state.sign_in_holds.get(sid)
         if hold is not None and not hold.waiting:
-            lookups_after_release += 1
-            # The waiter resolves the bridge first; the drain's own lookup is the second.
-            if lookups_after_release == 2:
-                raise httpx.ConnectError("synthetic labels lookup failure")
-        return "label-owned-bridge"
+            checks_after_release += 1
+            # The waiter checks the pane first; the drain's own check is the second.
+            if checks_after_release == 2:
+                raise OSError("synthetic tmux capture failure")
+        return False
 
-    monkeypatch.setattr(runner_app, "_claude_native_bridge_id_for_session", flaky_bridge_id)
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", flaky_pending_prompt)
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
         async with _runner_client(app) as client:
             await _create_session(client, sid)
@@ -788,7 +788,7 @@ async def test_held_message_is_sent_when_the_queue_drain_lookup_fails(
             )
 
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
-    assert lookups_after_release >= 3
+    assert checks_after_release >= 3
     assert any(
         "Failed to check the Claude prompt before sending" in r.getMessage()
         for r in caplog.records

@@ -4737,8 +4737,8 @@ def create_runner_app(
             try:
                 pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
             except (httpx.HTTPError, RuntimeError, OSError):
-                # Nothing else resumes this queue, so a failed lookup hands it to the
-                # waiter, which retries until the bridge resolves.
+                # Nothing else resumes this queue, so a failed pane check hands it to the
+                # waiter, which retries until the check succeeds.
                 _logger.warning(
                     "Failed to check the Claude prompt before sending queued input for %s; "
                     "retrying",
