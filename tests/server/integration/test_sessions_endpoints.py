@@ -11288,6 +11288,42 @@ async def test_stop_keeps_each_message_the_runner_discarded_with_a_notice(
         assert pending_inputs.pending_ids(session_id) == []
 
 
+async def test_failed_stop_still_keeps_the_message_the_runner_discarded(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Stop the runner could not finish still keeps what it discarded; the rest stays live."""
+    from omnigent.runtime import pending_inputs
+
+    async with _codex_native_session(client, monkeypatch, wrapper="claude-code-native-ui") as (
+        session_id,
+        published,
+    ):
+        held = _queue_web_message(session_id, "held message")
+        still_queued = _queue_web_message(session_id, "message the turn may still deliver")
+        stop_reply = {"error": "claude_native_stop_failed", "discarded_pending_ids": [held]}
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(503, json=stop_reply)),
+            base_url="http://runner",
+        ) as runner:
+            _route_to_runner(monkeypatch, runner)
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session", "data": {}}
+            )
+        assert response.status_code == 503, response.text
+
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        notices = [item for item in items if item["type"] == "error"]
+        assert [(item["code"], item["title"]) for item in notices] == [
+            ("native_input_discarded_by_stop", "Message discarded by Stop session")
+        ]
+        assert "could not be stopped" in notices[0]["message"]
+        assert _consumed_pending_ids(published) == [held]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            still_queued
+        ]
+
+
 async def test_unsaved_stop_notice_returns_the_discarded_message_to_the_queue() -> None:
     """A failed append keeps the discarded message queued, still marked interrupted."""
     from omnigent.runtime import pending_inputs

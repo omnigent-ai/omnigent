@@ -239,6 +239,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_filesystem_attachment_harness,
     _resolve_harness,
     _response_agent_name_from_store,
+    _RunnerStopFailedError,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
@@ -1886,10 +1887,18 @@ def register_events_routes(
             queued_pending_ids = pending_inputs.pending_ids(session_id)
             try:
                 stop_receipt = await _stop_session_via_runner(session_id, runner_router)
-            except Exception:
+            except Exception as exc:
                 # Stop didn't land: the turn keeps running, so lift the
                 # fence or its remaining output is dropped forever.
                 _interrupt_fenced_sessions.discard(session_id)
+                if isinstance(exc, _RunnerStopFailedError):
+                    await _settle_native_inputs_discarded_by_stop(
+                        conversation_store,
+                        session_id,
+                        conv,
+                        exc.discarded_pending_ids,
+                        stop_landed=False,
+                    )
                 raise
             stop_delivered = stop_receipt is not None
             if stop_receipt is None:

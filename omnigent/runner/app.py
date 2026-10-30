@@ -334,31 +334,38 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 _server_version: str | None = None
 
 
-def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
-    """Mark a refused Codex settings response as not kept by this runner."""
+def _json_object_body(response: Response) -> dict[str, Any]:
+    """Return *response*'s JSON object body, or ``{}`` when it has none."""
     try:
         content = json.loads(bytes(response.body))
     except ValueError:
-        content = None
-    if not isinstance(content, dict):
-        content = {}
+        return {}
+    return content if isinstance(content, dict) else {}
+
+
+def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
+    """Mark a refused Codex settings response as not kept by this runner."""
     return JSONResponse(
-        status_code=response.status_code, content={**content, "rollback_on_refusal": True}
+        status_code=response.status_code,
+        content={**_json_object_body(response), "rollback_on_refusal": True},
     )
 
 
 def _stop_acknowledgement(response: Response, discarded_pending_ids: list[str]) -> Response:
     """
-    Name the queued web messages a successful ``stop_session`` discarded.
+    Name the queued web messages a ``stop_session`` discarded.
 
-    :param response: The stop's own reply, e.g. a bare ``204``.
+    :param response: The stop's own reply, e.g. a bare ``204`` or a ``503``.
     :param discarded_pending_ids: Pending ids dropped undelivered, oldest first.
-    :returns: *response* unchanged when nothing was discarded or the stop
-        failed, else a ``200`` listing the ids for the server to settle.
+    :returns: *response* unchanged when nothing was discarded; else a ``200``
+        listing the ids, or a failed stop's reply with the ids added.
     """
-    if not discarded_pending_ids or response.status_code >= 300:
+    if not discarded_pending_ids:
         return response
-    return JSONResponse(status_code=200, content={"discarded_pending_ids": discarded_pending_ids})
+    return JSONResponse(
+        status_code=200 if response.status_code < 300 else response.status_code,
+        content={**_json_object_body(response), "discarded_pending_ids": discarded_pending_ids},
+    )
 
 
 def _invalid_effort_response(effort: object) -> JSONResponse | None:

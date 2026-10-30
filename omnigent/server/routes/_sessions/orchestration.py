@@ -3718,21 +3718,25 @@ async def _settle_native_inputs_discarded_by_stop(
     session_id: str,
     conv: Conversation,
     pending_ids: Sequence[str],
+    *,
+    stop_landed: bool = True,
 ) -> None:
     """
     Keep the queued web messages a stopped runner discarded, each with a notice.
 
     The runner drops messages it was still holding (behind an open native
-    prompt or a running turn) when the session is stopped. No transcript
-    mirror will ever settle them, so a later mirror would otherwise skip them
-    and blame the harness for never recording them. A failed append returns
-    the entries to the queue; the stop itself stands.
+    prompt or a running turn) when the session is stopped, even if stopping
+    then fails. No transcript mirror will ever settle them, so a later mirror
+    would otherwise skip them and blame the harness for never recording them.
+    A failed append returns the entries to the queue; the stop itself stands.
 
     :param conversation_store: Store to append the messages and notices to.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row, used to name the harness in the notice.
     :param pending_ids: Pending ids the runner reported discarding, oldest
         first, e.g. ``["pending_a1b2..."]``.
+    :param stop_landed: ``False`` when the runner reported the stop failed,
+        so the notice does not claim the session was stopped.
     """
     discarded = [
         entry
@@ -3743,15 +3747,21 @@ async def _settle_native_inputs_discarded_by_stop(
         return
     native_agent = _native_coding_agent_for_session(conv)
     display_name = native_agent.display_name if native_agent is not None else "the agent"
+    if stop_landed:
+        title = "Message not sent because the session was stopped"
+        explanation = f"The session was stopped while this message was waiting for {display_name}"
+    else:
+        title = "Message discarded by Stop session"
+        explanation = (
+            f"Stop session discarded this message while it was waiting for {display_name}, "
+            "although the session could not be stopped"
+        )
     notice = ErrorData(
         source="execution",
         code="native_input_discarded_by_stop",
         level="info",
-        title="Message not sent because the session was stopped",
-        message=(
-            f"The session was stopped while this message was waiting for {display_name}, "
-            "so it was never delivered. Send it again if you still need it."
-        ),
+        title=title,
+        message=f"{explanation}, so it was never delivered. Send it again if you still need it.",
     )
     items = [
         item

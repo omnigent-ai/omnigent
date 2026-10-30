@@ -274,9 +274,10 @@ async def test_failed_terminal_control_still_cancels_queued_work(
         await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
         if has_active_turn:
             app.state.active_turns[sid] = None
+        pending_id = f"pending_{uuid.uuid4().hex}"
         queued = await client.post(
             f"/v1/sessions/{sid}/events",
-            json={**_message("cancel this"), "pending_id": f"pending_{uuid.uuid4().hex}"},
+            json={**_message("cancel this"), "pending_id": pending_id},
         )
         assert queued.status_code == 202
         assert queued.json()["status"] == "buffered"
@@ -284,6 +285,8 @@ async def test_failed_terminal_control_still_cancels_queued_work(
         response = await client.post(f"/v1/sessions/{sid}/events", json={"type": action})
         assert response.status_code == 503
         assert response.json()["error"] == error
+        reported = [pending_id] if action == "stop_session" else None
+        assert response.json().get("discarded_pending_ids") == reported
         assert control_calls == [(False, False)]
         assert (sid in app.state.active_turns) == has_active_turn
         if waiter is not None:

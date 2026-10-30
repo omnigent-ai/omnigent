@@ -7488,6 +7488,14 @@ class _RunnerStopReceipt:
     discarded_pending_ids: tuple[str, ...] = ()
 
 
+class _RunnerStopFailedError(OmnigentError):
+    """A failed ``stop_session``, naming the queued messages the runner still discarded."""
+
+    def __init__(self, message: str, *, discarded_pending_ids: tuple[str, ...]) -> None:
+        super().__init__(message, code=ErrorCode.RUNNER_UNAVAILABLE)
+        self.discarded_pending_ids = discarded_pending_ids
+
+
 def _discarded_pending_ids(resp: httpx.Response) -> tuple[str, ...]:
     """Read the pending ids a runner reports discarding when it stops a session."""
     if not resp.content:
@@ -7572,10 +7580,10 @@ async def _stop_session_via_runner_impl(
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
     if resp.status_code >= 400:
-        raise OmnigentError(
+        raise _RunnerStopFailedError(
             f"Runner failed to stop session {session_id!r} "
             f"(status {resp.status_code}): {resp.text}",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
+            discarded_pending_ids=_discarded_pending_ids(resp),
         )
     return _RunnerStopReceipt(discarded_pending_ids=_discarded_pending_ids(resp))
 
@@ -12328,6 +12336,7 @@ __all__ = [
     "_HostLaunchAttempt",
     "_NativeTerminalEnsureOutcome",
     "_RunnerForwardResult",
+    "_RunnerStopFailedError",
     "_RunnerStopReceipt",
     "_SessionEventDispatchResult",
     "_add_model_usage_delta",
