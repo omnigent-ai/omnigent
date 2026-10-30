@@ -6,8 +6,10 @@ import asyncio
 import json
 import os
 import subprocess
+import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +41,8 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -2694,6 +2698,78 @@ async def test_failed_snapshot_does_not_pin_workspace_cache_to_none(
         f"Only the startup entry means the failed first snapshot pinned this "
         f"session's workspace to None forever."
     )
+
+
+@pytest.mark.asyncio
+async def test_slow_changed_files_listing_leaves_the_default_executor_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``git status`` stuck in the changes listing holds no default-executor worker.
+
+    A listing the browser abandons keeps its git call running; on the default
+    executor, enough of them starve every other offload, message delivery included.
+    """
+    import omnigent.runtime.filesystem_registry as filesystem_registry_mod
+
+    conv = "conv_slow_changes"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    release_git = threading.Event()
+    listing_threads: list[str] = []
+
+    class _SlowGitRegistry:
+        """Stands in for a git status that takes minutes on a large tree."""
+
+        def __init__(self, watch_path: Path | None) -> None:
+            self.watch_path = watch_path
+
+        def start(self) -> None:
+            return None
+
+        def list_changed_files(self, session_id: str, *, limit: int = 10_000) -> list[Any]:
+            del session_id, limit
+            listing_threads.append(threading.current_thread().name)
+            release_git.wait(budget(10))
+            return []
+
+    monkeypatch.setattr(
+        filesystem_registry_mod,
+        "create_filesystem_registry",
+        lambda *, watch_path=None: _SlowGitRegistry(watch_path),
+    )
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(
+                200, json={"id": conv, "agent_id": None, "workspace": str(workspace)}
+            )
+        return httpx.Response(200, json={})
+
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=2))
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    )
+    app = create_runner_app(runner_workspace=workspace, server_client=server_client)
+    path = f"/v1/sessions/{conv}/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            # As many stuck listings as the default executor has workers.
+            listings = [asyncio.create_task(client.get(path)) for _ in range(2)]
+            await poll_until_async(lambda: len(listing_threads) == 2, timeout_s=budget(5))
+
+            quick = asyncio.to_thread(lambda: "done")
+            assert await asyncio.wait_for(quick, timeout=budget(2)) == "done"
+            assert all(name.startswith("runner-slow-io_") for name in listing_threads)
+
+            release_git.set()
+            responses = await asyncio.gather(*listings)
+    finally:
+        release_git.set()
+        await server_client.aclose()
+
+    assert [response.status_code for response in responses] == [200, 200]
 
 
 @pytest.mark.asyncio

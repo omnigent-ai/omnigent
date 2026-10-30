@@ -195,9 +195,8 @@ function goForward(wc) {
 }
 
 /**
- * Wire nav listeners onto a new view so the URL bar live-tracks the real url
- * (redirects, in-page links, agent nav). Fires `browser-url-changed` +
- * `browser-nav-state` to the owning renderer. Attached once at create time.
+ * Track URL, title and history changes for the owning renderer, including
+ * detached views. Attached once at create time.
  *
  * @param {object} params
  * @param {string} params.conversationId
@@ -205,8 +204,11 @@ function goForward(wc) {
  * @param {(channel: string, payload: unknown) => void} params.send  window-scoped sender
  */
 function attachNavListeners({ conversationId, webContents, send }) {
+  const emitPageMetadata = (url, title = webContents.getTitle()) => {
+    send("browser-url-changed", { conversationId, url, title });
+  };
   const emitUrl = (url) => {
-    send("browser-url-changed", { conversationId, url });
+    emitPageMetadata(url);
     const { canGoBack, canGoForward } = readNavState(webContents);
     send("browser-nav-state", { conversationId, canGoBack, canGoForward });
   };
@@ -216,6 +218,10 @@ function attachNavListeners({ conversationId, webContents, send }) {
   webContents.on("did-navigate-in-page", (_e, url, isMainFrame) => {
     if (isMainFrame) emitUrl(url);
   });
+  webContents.on("page-title-updated", (_e, title) => {
+    emitPageMetadata(webContents.getURL(), title);
+  });
+  webContents.on("did-finish-load", () => emitPageMetadata(webContents.getURL()));
 }
 
 // ── Design mode (point-and-prompt) ─────────────────────────────────────────
@@ -558,10 +564,20 @@ function registerBrowserIpc({
     const { conversationId } = args ?? {};
     const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
     if (!entry) return { exists: false };
+    const webContents = entry.view.webContents;
+    const url = webContents.getURL();
+    // A new view has no committed URL while its first navigation is loading.
+    const pendingUrl =
+      (url === "" || url === "about:blank") &&
+      (webContents.isLoadingMainFrame?.() ?? webContents.isLoading?.() ?? false)
+        ? entry.lastRequestedUrl
+        : undefined;
     return {
       exists: true,
-      url: entry.view.webContents.getURL(),
-      ...readNavState(entry.view.webContents),
+      url,
+      title: webContents.getTitle(),
+      ...(pendingUrl ? { pendingUrl } : {}),
+      ...readNavState(webContents),
     };
   });
 

@@ -60,6 +60,8 @@ async def test_forward_side_chat_turn_redirects_to_parent_with_thread_id() -> No
     conv = SimpleNamespace(
         parent_conversation_id="conv_parent",
         kind="sub_agent",
+        model_override=None,
+        reasoning_effort=None,
         labels={_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY: "thread_side"},
     )
     body = SimpleNamespace(data={"content": [{"type": "input_text", "text": "and why?"}]})
@@ -73,6 +75,8 @@ async def test_forward_side_chat_turn_redirects_to_parent_with_thread_id() -> No
     assert "conv_parent" in url and url.endswith("/events")  # forwarded to the PARENT
     assert payload["codex_side_thread_id"] == "thread_side"  # tagged with the child thread
     assert payload["content"] == [{"type": "input_text", "text": "and why?"}]
+    assert "model_override" not in payload
+    assert "reasoning_effort" not in payload
 
 
 @pytest.mark.asyncio
@@ -128,6 +132,8 @@ async def test_forward_side_chat_turn_translates_runner_errors(
     conv = SimpleNamespace(
         parent_conversation_id="conv_parent",
         kind="sub_agent",
+        model_override=None,
+        reasoning_effort=None,
         labels={_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY: "thread_side"},
     )
     body = SimpleNamespace(data={"content": [{"type": "input_text", "text": "hi"}]})
