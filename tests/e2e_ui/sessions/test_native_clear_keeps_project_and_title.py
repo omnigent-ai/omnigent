@@ -146,7 +146,6 @@ def test_native_clear_keeps_project_and_title(
         while observed != expected and time.monotonic() < deadline:
             page.wait_for_timeout(1_000)
             observed = _observe(page, base_url, new_session_id, project_name)
-        page.wait_for_timeout(3_000)
 
         original = _session(base_url, session_id)
         assert observed == expected, (
