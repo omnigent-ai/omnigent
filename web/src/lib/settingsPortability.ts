@@ -9,7 +9,10 @@
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
-import { SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY } from "./projectHeaderActionPreferences";
+import {
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
+  notifyShowProjectHeaderActionsOnTouchChanged,
+} from "./projectHeaderActionPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   notifyHiddenPickerAgentsChanged,
@@ -165,14 +168,12 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   // Same-tab writes fire no storage event, so the subscribable preferences
   // have to be told; otherwise an open picker keeps the pre-import set.
   notifyHiddenPickerAgentsChanged();
+  notifyShowProjectHeaderActionsOnTouchChanged();
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);
   if (previousDefault !== readDefaultWorkspaceTab()) {
     resetSessionWorkspaceTabSelections();
   }
-  // Imports overwrite storage in this tab, so broadcast the clear to subscribers
-  // that normally refresh only on writes or browser storage events.
-  window.dispatchEvent(new StorageEvent("storage", { key: null }));
   return count;
 }
