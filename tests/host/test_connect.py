@@ -8070,6 +8070,55 @@ async def test_handle_model_options_claude_sdk_rides_the_probe_when_endpoints_li
     _cleanup_host(host)
 
 
+async def test_handle_model_options_claude_sdk_serves_the_replayed_store_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A store-backed CLI-login listing serves the stored catalog's own rows.
+
+    Those rows keep the probe's display names and aliases; the listing's wire
+    ids stay routable, and the native launch config is never re-resolved.
+    """
+    from omnigent.harnesses.claude_native import main as claude_native
+    from omnigent.models.model_catalog import ModelEntry, ModelListing
+
+    def _fake_listing(spec: object, harness: str) -> ModelListing:
+        assert harness == "claude-sdk"
+        return ModelListing(
+            source="cli",
+            verified=True,
+            models=(ModelEntry(id="claude-sonnet-5", family="claude"),),
+            note="test catalog",
+        )
+
+    def _stored_rows(claude_config: object) -> list[dict[str, object]] | None:
+        assert claude_config is None
+        return [{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}]
+
+    monkeypatch.setattr("omnigent.models.model_catalog.list_models_for_worker", _fake_listing)
+    monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", _stored_rows)
+    monkeypatch.setattr(
+        "omnigent.host.connect._model_configuration_source_for_harness", lambda harness: None
+    )
+    host = _make_host_process()
+
+    async def _unexpected_probe() -> None:
+        raise AssertionError("a store-backed listing must not re-resolve the native config")
+
+    monkeypatch.setattr(host, "_probed_claude_model_options", _unexpected_probe)
+
+    result = await host._handle_model_options(
+        HostModelOptionsFrame(request_id="req_sdk_store", harness="claude-sdk"),
+    )
+
+    assert result == HostModelOptionsResultFrame(
+        request_id="req_sdk_store",
+        status="ok",
+        models=[{"id": "sonnet", "model": "claude-sonnet-5", "displayName": "Sonnet 5"}],
+        routable_models=["claude-sonnet-5"],
+    )
+    _cleanup_host(host)
+
+
 async def test_model_options_frame_replies_off_the_receive_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
