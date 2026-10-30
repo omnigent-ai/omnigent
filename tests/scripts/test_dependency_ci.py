@@ -14,6 +14,13 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.scripts.test_merge_ready_compute_gate import (
+    _parse_github_output,
+)
+from tests.scripts.test_merge_ready_compute_gate import (
+    _run as _run_compute_gate,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".github/scripts/ci"
 OMNIDEV = "dev/omnidev/Cargo.lock"
@@ -1096,6 +1103,7 @@ def test_merge_gate_expires_original_workflow_after_24_hours(tmp_path, created_a
     output = (tmp_path / "gate-output").read_text()
     assert (process.returncode == 0) == fresh, process.stdout + process.stderr
     assert f"freshness_failed={str(not fresh).lower()}" in output
+    assert "api_failed=false" in output
     if fresh:
         assert "expires_at=2026-10-19T12:00:01Z" in output
     else:
@@ -1159,6 +1167,21 @@ def test_merge_gate_emits_freshness_failure_when_api_read_fails(tmp_path, endpoi
     assert "freshness_failed=true" in output
     assert "GitHub API request failed; retry Merge Ready" in output
     assert "expires_at=\n" in output
+
+    outputs = _parse_github_output(output)
+    gate = _run_compute_gate(
+        tmp_path,
+        eval_outcome="failure",
+        failed=outputs["failed"],
+        freshness_failed=outputs["freshness_failed"],
+        api_failed=outputs.get("api_failed", "false"),
+        expires_at=outputs["expires_at"],
+        dependency_required="false",
+    )
+    assert gate["state"] == "failure"
+    assert gate["post_status"] == "true"
+    assert gate["short_desc"] == "GitHub API request failed; retry Merge Ready"
+    assert "update branch" not in gate["short_desc"]
 
 
 def test_merge_gate_does_not_expire_dco_or_intentionally_skipped_checks(tmp_path):

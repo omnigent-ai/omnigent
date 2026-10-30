@@ -401,6 +401,7 @@ jobs:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
           FRESHNESS_FAILED: ${{ steps.eval.outputs.freshness_failed }}
+          API_FAILED: ${{ steps.eval.outputs.api_failed }}
           EXPIRES_AT: ${{ steps.eval.outputs.expires_at }}
           DEPENDENCY_EVAL: ${{ steps.dependency.outcome }}
           DEPENDENCY_REQUIRED: ${{ steps.labels.outputs.dependency_required }}

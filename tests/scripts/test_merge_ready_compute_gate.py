@@ -20,6 +20,7 @@ def _run(
     dependency_required: str = "true",
     post_red: str = "false",
     freshness_failed: str = "false",
+    api_failed: str = "false",
     expires_at: str = "",
 ) -> dict[str, str]:
     """Run compute-gate.sh with the given env and parse its GITHUB_OUTPUT.
@@ -39,6 +40,7 @@ def _run(
             "DEPENDENCY_REQUIRED": dependency_required,
             "POST_RED": post_red,
             "FRESHNESS_FAILED": freshness_failed,
+            "API_FAILED": api_failed,
             "EXPIRES_AT": expires_at,
             "GITHUB_OUTPUT": str(out_file),
         }

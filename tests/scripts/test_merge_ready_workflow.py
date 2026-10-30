@@ -310,6 +310,14 @@ def test_merge_requests_survive_replacement_of_a_pending_evaluator() -> None:
         step for step in steps if step["name"] == "Post Merge Ready status on PR head SHA"
     )
     enable = next(step for step in steps if step["name"] == "Enable requested auto-merge")
+    gate = _step("evaluate", "gate")
+    assert gate["env"]["EVAL"] == "${{ steps.eval.outcome }}"
+    for name in ("FAILED", "FRESHNESS_FAILED", "API_FAILED", "EXPIRES_AT"):
+        assert gate["env"][name] == "${{ steps.eval.outputs." + name.lower() + " }}"
+    assert publish["env"]["SHA"] == "${{ steps.ctx.outputs.sha }}"
+    assert publish["env"]["STATE"] == "${{ steps.gate.outputs.state }}"
+    assert publish["env"]["DESC"] == "${{ steps.gate.outputs.short_desc }}"
+    assert "steps.gate.outputs.post_status == 'true'" in publish["if"]
     assert steps.index(publish) < steps.index(enable)
     assert not publish.get("continue-on-error", False)
     assert "always()" not in enable["if"]
@@ -349,7 +357,26 @@ def test_required_lint_lane_runs_sweep_tests_and_shell_validation() -> None:
     for step in (sweep, syntax):
         assert "if" not in step
         assert not step.get("continue-on-error", False)
-    assert not (ROOT / ".github/workflows/merge-ready-test.yml").exists()
+
+
+def test_sweep_schedule_and_manual_dry_run_policy() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/merge-ready-sweep.yml").read_text())
+    triggers = workflow.get("on", workflow.get(True))
+    assert triggers["schedule"] == [{"cron": "7,22,37,52 * * * *"}]
+    dry_run = triggers["workflow_dispatch"]["inputs"]["dry_run"]
+    assert dry_run["type"] == "boolean"
+    assert dry_run["default"] is True
+    step = next(
+        step
+        for step in workflow["jobs"]["sweep"]["steps"]
+        if step["name"] == "Reevaluate expired green statuses"
+    )
+    assert "if" not in step
+    assert step["env"]["DRY_RUN"] == "${{ inputs.dry_run }}"
+    assert (
+        'dryRun: context.eventName !== "schedule" && process.env.DRY_RUN !== "false"'
+        in step["with"]["script"]
+    )
 
 
 Reply = tuple[list[str], str, int, str | None]

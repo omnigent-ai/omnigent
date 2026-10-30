@@ -453,6 +453,12 @@ writers queue without replacing pending evaluations (up to 100 pending jobs
 per head; GitHub cancels additional arrivals). Normal gate evaluations also
 enforce expiry, and only a full evaluation can restore green.
 
+GitHub's normal merge button, native auto-merge, and the separate Dependabot
+auto-merge workflow rely on the published `Merge Ready` status. They can merge
+after the recorded deadline until reevaluation revokes green; they do not
+independently enforce the timestamp. Before asking GitHub to merge a green
+gate, the `Merge Ready` workflow itself checks the timestamp again.
+
 A `/merge` command from a user with write access records the request with the
 `automerge` label and posts an acknowledgement. Every subsequent gate evaluation
 can act on that request after checking CI freshness, so overlapping CI events

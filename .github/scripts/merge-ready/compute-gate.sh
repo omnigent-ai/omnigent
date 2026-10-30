@@ -16,12 +16,13 @@
 #   failure  | failure  | a required check is red
 #
 # Env in: EVAL, FAILED, DEPENDENCY_EVAL, DEPENDENCY_REQUIRED, POST_RED,
-#         FRESHNESS_FAILED, EXPIRES_AT
+#         FRESHNESS_FAILED, API_FAILED, EXPIRES_AT
 # Out:    state, short_desc, long_desc, post_status on $GITHUB_OUTPUT
 
 set -euo pipefail
 
 FRESHNESS_FAILED=${FRESHNESS_FAILED:-false}
+API_FAILED=${API_FAILED:-false}
 EXPIRES_AT=${EXPIRES_AT:-}
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 if [[ -n "$EXPIRES_AT" && ( "$EXPIRES_AT" < "$NOW" || "$EXPIRES_AT" == "$NOW" ) ]]; then
@@ -43,7 +44,9 @@ else
   STATE=failure
   SHORT="Required checks not all green"
   LONG=$':hourglass: gate not green yet. Required checks not satisfied:\n\n'"$FAILED"$'\nThe merge will fire once these turn green.'
-  if [[ "$FRESHNESS_FAILED" == "true" ]]; then
+  if [[ "$API_FAILED" == "true" ]]; then
+    SHORT="GitHub API request failed; retry Merge Ready"
+  elif [[ "$FRESHNESS_FAILED" == "true" ]]; then
     SHORT="CI freshness not satisfied (24h); update branch and run fresh CI"
   fi
 fi

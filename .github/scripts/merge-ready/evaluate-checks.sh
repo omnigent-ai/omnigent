@@ -25,10 +25,9 @@
 # PR) from blocking the gate; trusting a *skipped* run keeps fork/draft
 # PRs — whose entire e2e workflow is gated off — from wedging it.
 #
-# DCO is not a CI snapshot and does not expire. A rerun keeps its original
-# workflow created_at, so rerunning an old snapshot cannot renew freshness.
-# Out: failed=<markdown bullets>, freshness_failed=<bool>, expires_at=<UTC ISO8601>
-#      on $GITHUB_OUTPUT. expires_at is the earliest successful CI deadline.
+# DCO never expires; reruns keep the original workflow created_at.
+# Out: failed, freshness_failed, api_failed, expires_at on $GITHUB_OUTPUT.
+# expires_at is the earliest successful CI deadline (UTC ISO8601).
 # A check can still read as running for a while after its workflow run
 # completes. When only such checks keep the gate red, re-read them a few
 # times first: nothing else re-evaluates the gate once CI is done.
@@ -204,11 +203,13 @@ evaluate_once() {
   done
 }
 
+API_FAILED=false
 attempt=1
 while true; do
   if ! fetch_state; then
     FAIL=1
     FRESHNESS_FAILED=true
+    API_FAILED=true
     EXPIRES_AT_EPOCH=""
     FAILED_LINES="- CI freshness could not be verified (GitHub API request failed; retry Merge Ready)."$'\n'
     break
@@ -225,6 +226,7 @@ done
 
 {
   echo "freshness_failed=$FRESHNESS_FAILED"
+  echo "api_failed=$API_FAILED"
   if [[ -n "$EXPIRES_AT_EPOCH" ]]; then
     echo "expires_at=$(jq -nr --argjson deadline "$EXPIRES_AT_EPOCH" '$deadline | todateiso8601')"
   else
