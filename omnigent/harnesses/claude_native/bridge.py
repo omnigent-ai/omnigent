@@ -5926,8 +5926,8 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     from :func:`_composer_row`, and the readiness wait would reap a healthy
     pane. ``SIGCONT`` runs Claude Code's resume handler, which drops its
     cached frame and repaints everything, as after ``fg``. A running process
-    without a handler ignores it, so the whole tree under the pane gets it: a
-    launcher may run Claude Code as its child.
+    without a handler ignores it, so running processes under the pane get it:
+    a launcher may run Claude Code as its child. Suspended processes stay paused.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -5964,6 +5964,9 @@ def _request_claude_repaint(socket_path: str, tmux_target: str) -> int:
     signalled = 0
     for process in tree:
         with contextlib.suppress(psutil.Error):
+            # SIGCONT must not resume a tool the person deliberately suspended.
+            if process.status() in {psutil.STATUS_STOPPED, psutil.STATUS_TRACING_STOP}:
+                continue
             process.send_signal(signal.SIGCONT)
             signalled += 1
     return signalled
