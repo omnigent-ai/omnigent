@@ -58,7 +58,6 @@ async def prepare_profile(
         and (
             getattr(body, "parent_session_id", None) is not None
             or getattr(body, "side_chat", False)
-            or (body.host_type != "managed" and "host_type" not in body.model_fields_set)
         )
         else None
     )

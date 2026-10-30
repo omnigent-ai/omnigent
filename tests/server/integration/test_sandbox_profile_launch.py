@@ -239,6 +239,56 @@ async def test_rejected_selection_does_not_persist_or_allocate(
     assert env.recording.allocations == []
 
 
+@pytest.mark.parametrize("caller,outage", [(_OWNER, True), (_OTHER_USER, False)])
+async def test_implicit_fork_can_launch_locally_without_provider_access(
+    env, monkeypatch, caller, outage
+):
+    source_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    env.client.headers["X-Forwarded-Email"] = caller
+    env.recording.selections.clear()
+    if outage:
+        env.recording.selection_error = RuntimeError("private provider failure")
+    else:
+        assert caller not in env.recording.allowed_users
+    response = await env.client.post(f"/v1/sessions/{source_id}/fork", json={})
+    assert response.status_code == 201, response.text
+    fork_id = response.json()["id"]
+    assert env.catalog.get_session_snapshot(fork_id) is None
+
+    host_id = uuid.uuid4().hex
+    env.hosts.upsert_on_connect(host_id, "local-host", caller)
+    registry = env.app.state.profile_test_hosts
+    registry.register(
+        host_id=host_id,
+        ws=AsyncMock(),
+        owner=caller,
+        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="local-host"),
+    )
+
+    async def valid_workspace(**kwargs):
+        return kwargs["workspace"]
+
+    def successful_launch(conn, frame):
+        [future] = conn.pending_launches.values()
+        future.set_result({"status": "started"})
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._workspace_validation.validate_workspace", valid_workspace
+    )
+    monkeypatch.setattr(registry, "send_text", successful_launch)
+    response = await env.client.post(
+        f"/v1/hosts/{host_id}/runners",
+        json={"session_id": fork_id, "workspace": "/workspace"},
+    )
+    assert response.status_code == 200, response.text
+    fork = env.conversations.get_conversation(fork_id)
+    assert fork.host_id == host_id and fork.runner_id is not None
+    assert env.catalog.get_session_snapshot(fork_id) is None
+    assert env.catalog.get_session_snapshot(source_id) == env.profile
+    assert env.recording.selections == []
+    assert len(env.recording.allocations) == 1
+
+
 @pytest.mark.parametrize("accepted_profile", [False, True])
 @pytest.mark.parametrize(
     "failure", ["workspace", "rejection", "send", "timeout", "database", "commit"]
@@ -815,6 +865,7 @@ class TestProviderManagedProfiles:
         assert response.status_code == 201, response.text
         target_id = response.json()["id"]
         target_profile = env.catalog.get_session_snapshot(target_id)
+        assert target_profile is None
         if revoked:
             env.recording.allowed_users.clear()
         notify.reset_mock()

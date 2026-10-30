@@ -179,7 +179,7 @@ and separate search keys keep older responses from replacing newer results.
 | New session, including attachments | Explicit authorized ID/revision; reject before allocating if unavailable. |
 | Fresh managed fork / branch clone | Default to the source profile for the same provider, resolve the currently offered revision and show an update notice if changed. User can search and choose another. Revoked/missing source blocks until a valid choice is made. |
 | Fork to an ordinary provider or local host | Do not copy the source profile. |
-| Native `/clear` / implicit `/fork` | Reauthorize the saved reference and bind the replacement to the trusted runner/host before detaching the source. |
+| Native `/clear` / implicit `/fork` | Create an unprofiled replacement. Binding to a managed runner reauthorizes and adopts its host's reference before detaching the source; local forks stay unprofiled. |
 | Side chat | Keep the source's profile and runner; reject unrelated runner adoption. |
 | Existing host reuse | Authorize the controller's actual assignment, check ownership and profile compatibility, then accept it for the session. |
 | Restart / wake | Reauthorize the exact saved revision. Never upgrade an existing session to the current catalog revision. |

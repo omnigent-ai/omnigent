@@ -81,7 +81,25 @@ def test_durable_assignment_survives_catalog_update_and_restart(tmp_path, monkey
     assert json.loads(state.read_text()) == {}
 
 
-@pytest.mark.parametrize("failure", ["denied", "changed", "gone", "secret", "large", "redirect"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "denied",
+        "changed",
+        "gone",
+        "secret",
+        "large",
+        "redirect",
+        "timeout",
+        "connect",
+        "invalid-json",
+        "invalid-shape",
+        "invalid-profile",
+        "missing-profiles",
+        "invalid-assignment",
+        "invalid-selection",
+    ],
+)
 def test_adapter_bounds_and_sanitizes_responses(monkeypatch, failure):
     monkeypatch.setenv("SANDBOX_CONTROLLER_TOKEN", "service-secret")
     original = httpx.Client
@@ -89,6 +107,18 @@ def test_adapter_bounds_and_sanitizes_responses(monkeypatch, failure):
     def dispatch(request):
         assert request.headers["X-Sandbox-User"] == "alice"
         assert request.headers["X-Sandbox-Workspace"] == "0"
+        if failure in ("timeout", "connect"):
+            error = httpx.ReadTimeout if failure == "timeout" else httpx.ConnectError
+            raise error("private-provider-secret", request=request)
+        invalid_payloads = {
+            "invalid-shape": ["private-provider-secret"],
+            "invalid-profile": {"profiles": [{"name": "private-provider-secret"}]},
+            "missing-profiles": {"private": "private-provider-secret"},
+            "invalid-assignment": {"sandbox_profile": {"name": "private-provider-secret"}},
+            "invalid-selection": {"profile": {"name": "private-provider-secret"}},
+        }
+        if failure in invalid_payloads:
+            return httpx.Response(200, json=invalid_payloads[failure])
         status = {
             "denied": 403,
             "changed": 409,
@@ -96,6 +126,7 @@ def test_adapter_bounds_and_sanitizes_responses(monkeypatch, failure):
             "secret": 500,
             "large": 200,
             "redirect": 302,
+            "invalid-json": 200,
         }[failure]
         return httpx.Response(
             status,
@@ -115,7 +146,19 @@ def test_adapter_bounds_and_sanitizes_responses(monkeypatch, failure):
         "gone": SandboxGoneError,
     }.get(failure, SandboxConfigError)
     with pytest.raises(error) as caught:
-        launcher.list_profiles(SandboxProfileContext(user_id="alice", workspace_id=0))
+        context = SandboxProfileContext(user_id="alice", workspace_id=0)
+        if failure == "invalid-selection":
+            from omnigent.onboarding.sandboxes.profiles import ProviderSandboxProfile
+
+            launcher.select_profile(
+                context, ProviderSandboxProfile(id="build", name="Build", revision="r1")
+            )
+        else:
+            launcher.list_profiles(
+                replace(context, sandbox_id="sandbox")
+                if failure == "invalid-assignment"
+                else context
+            )
     assert "private-provider-secret" not in str(caught.value)
 
 

@@ -23,6 +23,13 @@ from omnigent.onboarding.sandboxes.types import SandboxConfigError
 _logger = logging.getLogger(__name__)
 
 
+def _parse_profile(value: Any) -> ProviderSandboxProfile:
+    try:
+        return ProviderSandboxProfile.model_validate(value)
+    except ValueError:
+        raise SandboxConfigError("Controller returned an invalid sandbox profile") from None
+
+
 class ControllerConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -75,38 +82,48 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
                     "X-Sandbox-Workspace": str(context.workspace_id),
                 }
             )
-        # A streamed read bounds memory even when a controller sends an oversized body.
-        with (
-            httpx.Client(timeout=self.config.timeout_s, follow_redirects=False) as client,
-            client.stream(
-                method, self.config.url.rstrip("/") + path, headers=headers, json=body
-            ) as response,
-        ):
-            if response.status_code == 403:
-                raise SandboxProfileAccessDenied("Controller denied sandbox access")
-            if response.status_code == 409:
-                raise SandboxProfileChanged("Controller rejected the saved revision")
-            if response.status_code == 404:
-                raise SandboxGoneError("The controller resource no longer exists")
-            if not response.is_success:
-                raise SandboxConfigError("Controller request failed")
-            payload = bytearray()
-            for chunk in response.iter_bytes():
-                payload.extend(chunk)
-                if len(payload) > 1024 * 1024:
-                    raise SandboxConfigError("Controller response exceeds 1 MiB")
-            if not payload:
-                return {}
-            return TypeAdapter(dict[str, Any]).validate_json(payload)
+        try:
+            # A streamed read bounds memory even when a controller sends an oversized body.
+            with (
+                httpx.Client(timeout=self.config.timeout_s, follow_redirects=False) as client,
+                client.stream(
+                    method, self.config.url.rstrip("/") + path, headers=headers, json=body
+                ) as response,
+            ):
+                if response.status_code == 403:
+                    raise SandboxProfileAccessDenied("Controller denied sandbox access")
+                if response.status_code == 409:
+                    raise SandboxProfileChanged("Controller rejected the saved revision")
+                if response.status_code == 404:
+                    raise SandboxGoneError("The controller resource no longer exists")
+                if not response.is_success:
+                    raise SandboxConfigError("Controller request failed")
+                payload = bytearray()
+                for chunk in response.iter_bytes():
+                    payload.extend(chunk)
+                    if len(payload) > 1024 * 1024:
+                        raise SandboxConfigError("Controller response exceeds 1 MiB")
+                if not payload:
+                    return {}
+                return TypeAdapter(dict[str, Any]).validate_json(payload)
+        except (httpx.HTTPError, ValueError):
+            raise SandboxConfigError(
+                "Controller request failed or returned invalid data"
+            ) from None
 
     def list_profiles(self, context: SandboxProfileContext) -> list[ProviderSandboxProfile]:
         if context.sandbox_id is not None:
             record = self._request(
                 "GET", f"/sandboxes/{quote(context.sandbox_id, safe='')}", context=context
             )
-            return [ProviderSandboxProfile.model_validate(record["sandbox_profile"])]
+            return [_parse_profile(record.get("sandbox_profile"))]
         result = self._request("GET", "/profiles", context=context)
-        profiles = TypeAdapter(list[ProviderSandboxProfile]).validate_python(result["profiles"])
+        try:
+            profiles = TypeAdapter(list[ProviderSandboxProfile]).validate_python(
+                result.get("profiles")
+            )
+        except ValueError:
+            raise SandboxConfigError("Controller returned an invalid profile catalog") from None
         if len(profiles) > 1000:
             raise SandboxConfigError("Controller catalog exceeds 1000 profiles")
         return profiles
@@ -123,7 +140,7 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
                 f"?revision={quote(profile.revision, safe='')}",
                 context=context,
             )
-            accepted = ProviderSandboxProfile.model_validate(record["profile"])
+            accepted = _parse_profile(record.get("profile"))
         if (accepted.id, accepted.revision) != (profile.id, profile.revision):
             raise SandboxProfileChanged("Controller returned a different profile revision")
         self._context, self._profile = context, accepted
@@ -148,12 +165,7 @@ class ControllerSandboxLauncher(SandboxHostLauncher):
         if not isinstance(sandbox_id, str) or not sandbox_id:
             raise SandboxConfigError("Controller returned no sandbox id")
         try:
-            try:
-                profile = ProviderSandboxProfile.model_validate(result["sandbox_profile"])
-            except (KeyError, ValueError):
-                raise SandboxConfigError(
-                    "Controller returned an invalid sandbox profile"
-                ) from None
+            profile = _parse_profile(result.get("sandbox_profile"))
             assert self._profile is not None
             if (profile.id, profile.revision) != (self._profile.id, self._profile.revision):
                 raise SandboxProfileChanged("Controller allocated a different profile revision")
