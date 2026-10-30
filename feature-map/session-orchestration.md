@@ -179,6 +179,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   still turns all orchestration off.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
+  The names also preserve different native approval scopes; see
+  [why the messaging tools remain separate](../docs/session-messaging-tool-boundary.md).
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or
