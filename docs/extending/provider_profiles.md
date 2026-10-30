@@ -196,7 +196,7 @@ profile. Retry after an error or select an ordinary connected host to continue.
 | Last session deleted | Its labels are deleted; capable controllers retain the sandbox assignment. |
 | Host deletion | Existing host metadata marks deletion; surviving sessions can bind an authorized replacement. |
 | Failed allocation / runner startup | Roll back the attempted host/runner binding and clean up fresh infrastructure. Retain a preaccepted selection for retry. |
-| Programmatic managed create | `sys_session_create(placement="managed")` accepts `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`, with the same authorization as the composer. |
+| Programmatic managed create | `sys_session_create(placement="managed")` accepts `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`, with the same authorization as the composer. Explicit profile selections require the existing `/v1/info` response to advertise `features.sandbox_profiles: true`; otherwise no create request is sent. Provider-only launches retain their existing behavior. |
 | Scheduled fresh sandbox | Creating/updating a task rejects a default provider requiring profiles before saving. Use a connected host or an ordinary default provider. Already-saved unsupported tasks fail closed at launch. |
 
 Omnigent stores the accepted provider/ID/revision, public display snapshot and
