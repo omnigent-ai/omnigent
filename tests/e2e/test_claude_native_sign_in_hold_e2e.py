@@ -13,6 +13,7 @@ import contextlib
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,13 +27,17 @@ import httpx
 import pytest
 
 from tests._helpers.native_session import create_native_session
+from tests._helpers.session import send_user_text
 from tests.e2e.test_claude_native_delivery_timeout_e2e import _FAKE_CLAUDE_TUI
 from tests.e2e.test_native_terminal_start_error_log_correlation_e2e import (
     _bind_session,
     _native_stack,
 )
 
-pytestmark = pytest.mark.timeout(240)
+pytestmark = [
+    pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required"),
+    pytest.mark.timeout(240),
+]
 
 _T = TypeVar("_T")
 
@@ -72,16 +77,6 @@ def _errors(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _notices(items: list[dict[str, Any]], code: str) -> list[dict[str, Any]]:
     return [error for error in _errors(items) if error.get("code") == code]
-
-
-def _send(client: httpx.Client, base_url: str, session_id: str, text: str) -> None:
-    client.post(
-        f"{base_url}/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-        },
-    ).raise_for_status()
 
 
 def _pane(advert: dict[str, str]) -> str:
@@ -126,12 +121,14 @@ def test_message_waits_for_launcher_sign_in_then_is_sent(
     ):
         monkeypatch.setenv("TMPDIR", native_tmp)
         stack = resources.enter_context(_native_stack(tmp_path, _launcher_script(tui, signed_in)))
-        client = resources.enter_context(httpx.Client(trust_env=False, timeout=120))
+        client = resources.enter_context(
+            httpx.Client(base_url=stack.base_url, trust_env=False, timeout=120)
+        )
         session_id = create_native_session(client, stack.base_url, harness="claude")["session_id"]
         _bind_session(stack, session_id)
         # As in production, the first message starts Claude's pane, so it meets the
         # launcher's sign-in before Claude Code is up.
-        _send(client, stack.base_url, session_id, first)
+        send_user_text(client, session_id=session_id, text=first)
         adverts = _wait(
             lambda: list(Path(native_tmp).rglob("tmux.json")),
             timeout=20,
@@ -158,7 +155,7 @@ def test_message_waits_for_launcher_sign_in_then_is_sent(
         snapshot = client.get(f"{stack.base_url}/v1/sessions/{session_id}").json()
         assert snapshot.get("status") != "failed", snapshot
         # A message sent during the wait queues behind the held one.
-        _send(client, stack.base_url, session_id, second)
+        send_user_text(client, session_id=session_id, text=second)
         time.sleep(3)  # custom-lint: disable=sleep-then-assert -- nothing may reach Claude
         pane = _pane(advert)
         assert first not in pane and second not in pane, pane

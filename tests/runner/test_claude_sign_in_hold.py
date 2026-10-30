@@ -33,6 +33,16 @@ _HELD_SIGN_IN_STEP = (
     "Open the sign-in link and sign in. Claude Code continues on its own once the "
     "sign-in completes."
 )
+# The bridge's step when another session's sign-in holds the launcher's lock.
+_ANOTHER_SESSION_SIGN_IN_STEP = (
+    "Finish the sign-in that another session opened, in your browser or in "
+    "that session's terminal. Claude Code continues on its own once it "
+    "completes; then send your message again."
+)
+_HELD_ANOTHER_SESSION_SIGN_IN_STEP = (
+    "Finish the sign-in that another session opened, in your browser or in "
+    "that session's terminal. Claude Code continues on its own once it completes."
+)
 _SIGN_IN_SCREEN = (
     "If the browser does not open automatically, please open the following URL:\n\n"
     "\thttps://example.okta.test/oauth2/v1/authorize?client_id=0oa1&state=T4IU\n\n"
@@ -439,7 +449,17 @@ async def test_refusal_without_undelivered_evidence_fails_as_before() -> None:
     assert not app.state.session_message_buffers.get(sid)
 
 
-def test_hold_notice_keeps_the_sign_in_step_without_asking_for_a_resend() -> None:
+@pytest.mark.parametrize(
+    ("remediation", "held_remediation"),
+    [
+        (_SIGN_IN_STEP, _HELD_SIGN_IN_STEP),
+        (_ANOTHER_SESSION_SIGN_IN_STEP, _HELD_ANOTHER_SESSION_SIGN_IN_STEP),
+    ],
+    ids=["own-prompt", "another-session-lock"],
+)
+def test_hold_notice_keeps_the_sign_in_step_without_asking_for_a_resend(
+    remediation: str, held_remediation: str
+) -> None:
     """The neutral notice points at the sign-in link; the held message is sent on its own."""
     server = _RecordingServerClient()
     watch = sign_in_watch.build_sign_in_watch(
@@ -451,11 +471,8 @@ def test_hold_notice_keeps_the_sign_in_step_without_asking_for_a_resend() -> Non
         resource_registry=None,  # type: ignore[arg-type]
         server_client=server,  # type: ignore[arg-type]
     )
-    asyncio.run(
-        watch.post_sign_in_hold_notice(
-            "conv_1", json.loads(_sign_in_refusal().split("data: ", 1)[1])["error"]
-        )
-    )
+    error = json.loads(_sign_in_refusal().split("data: ", 1)[1])["error"]
+    asyncio.run(watch.post_sign_in_hold_notice("conv_1", {**error, "remediation": remediation}))
     (notice,) = server.notices("databricks_sign_in_pending")
     assert notice == {
         "source": "harness",
@@ -465,7 +482,7 @@ def test_hold_notice_keeps_the_sign_in_step_without_asking_for_a_resend() -> Non
             "Claude Code is waiting for a sign-in in this session's terminal. "
             "You don't need to send your message again."
         ),
-        "remediation": _HELD_SIGN_IN_STEP,
+        "remediation": held_remediation,
         "level": "info",
     }
     # The refusal itself still asks for a resend; only the held notice drops it.
@@ -806,6 +823,34 @@ async def test_resend_that_is_not_refused_ends_the_wait_even_with_messages_still
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first", "second"]
     assert app.state.sign_in_holds[sid].holds == 1
     assert len(server.notices("databricks_sign_in_pending")) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "control"),
+    [("interrupt", "inject_interrupt"), ("stop_session", "kill_session")],
+)
+async def test_interrupt_or_stop_during_the_hold_drops_the_held_message(
+    action: str, control: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A control sent while the message waits on the sign-in keeps it from ever being sent."""
+    monkeypatch.setattr(claude_native_bridge, control, lambda *_a, **_k: None)
+    app, harness, _server = _build_app([_REFUSED, _DELIVERED])
+    sid = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: sid in app.state.sign_in_holds)
+        hold = app.state.sign_in_holds[sid]
+        response = await client.post(f"/v1/sessions/{sid}/events", json={"type": action})
+        assert response.status_code == 204
+        # The sign-in completes after the control.
+        hold.waiting = False
+        await asyncio.sleep(0.1)  # custom-lint: disable=sleep-then-assert -- no send in window
+
+    assert len(harness.posted_bodies) == 1
+    assert sid not in app.state.sign_in_holds
+    assert not app.state.session_message_buffers.get(sid)
 
 
 @pytest.mark.asyncio
