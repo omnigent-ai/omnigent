@@ -119,7 +119,9 @@ export function MobilePanelDrawer({
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <MobilePanelHeaderContext.Provider value={headerTargets}>
           {(open || keepMounted) && (
-            <RenderErrorBoundary name={title}>{children}</RenderErrorBoundary>
+            <RenderErrorBoundary name={title} resetKey={open ? "open" : "closed"}>
+              {children}
+            </RenderErrorBoundary>
           )}
         </MobilePanelHeaderContext.Provider>
       </div>

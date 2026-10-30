@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { Link, Outlet, MemoryRouter } from "react-router-dom";
+import { Link, Outlet, MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -76,15 +76,17 @@ import App from "./App";
 const chunkError = vi.hoisted(
   () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
 );
-const pageFault = vi.hoisted(() => ({ error: null as Error | null }));
+const pageFault = vi.hoisted(() => ({ error: undefined as Error | null | undefined }));
 vi.mock("@/pages/TasksPage", () => ({
   TasksPage: () => {
-    throw pageFault.error ?? chunkError;
+    if (pageFault.error !== null) throw pageFault.error ?? chunkError;
+    return <p>Tasks recovered</p>;
   },
 }));
 vi.mock("@/pages/SetupPage", () => ({
   SetupPage: () => {
-    throw pageFault.error ?? chunkError;
+    if (pageFault.error !== null) throw pageFault.error ?? chunkError;
+    return <p>Setup recovered</p>;
   },
 }));
 
@@ -148,7 +150,7 @@ describe("ordinary page render failures", () => {
 
   afterEach(() => {
     cleanup();
-    pageFault.error = null;
+    pageFault.error = undefined;
     window.removeEventListener("error", suppressExpectedError);
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -171,7 +173,47 @@ describe("ordinary page render failures", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("Unable to display this page.");
     expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
     expect(reload).not.toHaveBeenCalled();
+
+    pageFault.error = null;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(
+      await screen.findByText(needsSetup ? "Setup recovered" : "Tasks recovered"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reload).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { path: "/tasks", basename: undefined },
+    { path: "/mount/tasks", basename: "/mount" },
+  ])(
+    "resets an ordinary page failure when the pathname changes at $path",
+    async ({ path, basename }) => {
+      function HostNavigation() {
+        const navigate = useNavigate();
+        return (
+          <button type="button" onClick={() => navigate(`${basename ?? ""}/c/healthy`)}>
+            Navigate
+          </button>
+        );
+      }
+      render(
+        <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+          <MemoryRouter initialEntries={[path]}>
+            <HostNavigation />
+            <App basename={basename} />
+          </MemoryRouter>
+        </CapabilitiesProvider>,
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent("Unable to display this page.");
+
+      fireEvent.click(screen.getByRole("button", { name: "Navigate" }));
+
+      expect(await screen.findByText("chat page")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(reload).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function renderUsageRoute(enabled: boolean) {

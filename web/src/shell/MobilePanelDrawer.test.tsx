@@ -183,42 +183,46 @@ describe("MobilePanelDrawer", () => {
       vi.spyOn(console, "error").mockImplementation(() => {});
     });
 
-    it("keeps the title and Close usable and recovers when the drawer reopens", () => {
-      let broken = true;
-      function Panel() {
-        if (broken) throw drawerError;
-        return <p>Drawer recovered</p>;
-      }
-      function Drawer() {
-        const [open, setOpen] = useState(true);
-        return (
-          <>
-            <button type="button" onClick={() => setOpen(true)}>
-              Open drawer
-            </button>
-            <MobilePanelDrawer
-              open={open}
-              title="Shells"
-              onClose={() => setOpen(false)}
-              testId="drawer"
-            >
-              <Panel />
-            </MobilePanelDrawer>
-          </>
-        );
-      }
-      render(<Drawer />);
-      expect(screen.getByRole("alert")).toHaveTextContent("Unable to display Shells.");
-      expect(screen.getByRole("heading", { name: "Shells" })).toBeInTheDocument();
+    it.each([false, true])(
+      "keeps the title and Close usable and recovers when the drawer reopens (keepMounted=%s)",
+      (keepMounted) => {
+        let broken = true;
+        function Panel() {
+          if (broken) throw drawerError;
+          return <p>Drawer recovered</p>;
+        }
+        function Drawer() {
+          const [open, setOpen] = useState(true);
+          return (
+            <>
+              <button type="button" onClick={() => setOpen(true)}>
+                Open drawer
+              </button>
+              <MobilePanelDrawer
+                open={open}
+                title="Shells"
+                onClose={() => setOpen(false)}
+                testId="drawer"
+                keepMounted={keepMounted}
+              >
+                <Panel />
+              </MobilePanelDrawer>
+            </>
+          );
+        }
+        render(<Drawer />);
+        expect(screen.getByRole("alert")).toHaveTextContent("Unable to display Shells.");
+        expect(screen.getByRole("heading", { name: "Shells" })).toBeInTheDocument();
 
-      fireEvent.click(screen.getByRole("button", { name: "Close" }));
-      expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "closed");
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        fireEvent.click(screen.getByRole("button", { name: "Close" }));
+        expect(screen.getByTestId("drawer")).toHaveAttribute("data-state", "closed");
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
-      broken = false;
-      fireEvent.click(screen.getByRole("button", { name: "Open drawer" }));
-      expect(screen.getByText("Drawer recovered")).toBeInTheDocument();
-    });
+        broken = false;
+        fireEvent.click(screen.getByRole("button", { name: "Open drawer" }));
+        expect(screen.getByText("Drawer recovered")).toBeInTheDocument();
+      },
+    );
 
     it("contains failures portaled into the header and restores them on retry", () => {
       let broken = true;
