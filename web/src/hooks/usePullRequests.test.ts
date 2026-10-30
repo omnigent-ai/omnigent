@@ -295,6 +295,16 @@ describe("computePullRequestPollInterval", () => {
     ...over,
   });
 
+  it("refreshes list rows slowly and rests closed or merged rows", () => {
+    expect(computePullRequestPollInterval(undefined, true)).toBe(30_000);
+    expect(computePullRequestPollInterval(ready(), true)).toBe(30_000);
+    for (const state of ["CLOSED", "MERGED"]) {
+      expect(computePullRequestPollInterval(ready({ pr: { ...ready().pr!, state } }), true)).toBe(
+        false,
+      );
+    }
+  });
+
   it("polls setup/availability states the user fixes outside the app", () => {
     // No info yet (initial error / transient failure with no cache).
     expect(computePullRequestPollInterval(undefined)).toBe(5_000);

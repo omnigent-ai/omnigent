@@ -18,39 +18,79 @@ implements them separately, so a fix for one harness does not reach the others.
   repair conflicting defaults, and keep the connection across tool turns.
 - `needs-auth`: a harness without usable credentials is shown as needing
   sign-in, with a repair hint, instead of failing after launch. A harness the
-  host has not configured can be hidden from the picker.
+  host has not configured can be hidden from the picker. When harness repair is
+  enabled, Settings → Harnesses shows the missing credential as an actionable
+  card; its Reconfigure control and full-card click replace a separate banner action.
+- `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
+  action opens the shared Reconfigure flow in place for native agents on
+  connected user hosts when a fix is available. Missing binaries install before
+  authentication; success refreshes readiness without leaving the composer. SDK
+  agents and managed-host agents keep the setup checklist. With the flag off,
+  New Chat shows the CLI setup guidance.
+- `account-management`: Settings harness cards show the non-secret account label
+  reported by the connected host (email, plan, organization, or provider names).
+  An expired Codex account offers **Sign in again**. Codex sign-in opens a
+  device-code modal with an HTTPS sign-in link, one-time code and copy actions,
+  expiration countdown, Cancel, and Try again; a `login_busy` response resumes
+  polling the active login. Configured Codex and Claude subscriptions offer
+  **Switch account** behind a confirmation; Claude includes an optional email
+  hint that is copied into the `--email` command. The server owns the
+  `/v1/hosts/{host}/harnesses/{harness}/login` start/status/cancel routes and
+  `/logout`, plus `/v1/hosts/{host}/harnesses/accounts/refresh`. Hosts never
+  probe accounts on their own: an enabled server requests one probe after
+  connection, and Settings requests one when Harnesses opens or its selected
+  host changes. The server reuses a successful result for 60 seconds. Account
+  metadata and these routes are available only while harness repair is enabled
+  and the connected host advertises support; older hosts receive no probe, and
+  older servers or flag-off servers never cause a new host to spawn one.
+- `isaac-credential-detection`: harness setup offers Isaac when host-side
+  Databricks detection finds a matching credential, and fails open for older
+  hosts or servers that cannot report detection results.
+- `picker-entry-visibility`: the user hides individual harnesses and agents from
+  every agent picker (new chat, automation, project default) in Settings →
+  Appearance, per device. Independent of the readiness filter above, which only
+  drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
   composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness.
+- `devin-questions`: Devin's native question picker appears in Chat and Inbox;
+  selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `pi-rebuilt-tool-names`: Pi forks and cold resumes keep matching tool names
-  when rebuilding tool results, as required by Gemini.
+  when rebuilding tool results, as required by Gemini. Results stay after their
+  calls, ahead of messages sent while a tool ran. Unmatched outputs become
+  labeled recovery text so missing calls do not block continuation.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the
-  row. Absolute paths open workspace-relative under the session root and
-  host-absolute outside it; they stay plain text until the root is known.
-  Shell commands and multi-file patches have no file link. A shell row reads
-  `$ command` and expands to a terminal panel with the command, its output
-  and exit status.
+  row. Absolute paths show and open workspace-relative under the session root
+  and host-absolute outside it; they stay plain text until the root is known.
+  Other tool rows follow [Tool calls in chat](./tool-calls.md).
+  Shell commands and multi-file patches have no file link. A shell row shows
+  the command (a script's first line and "+N lines") and expands to a
+  terminal panel with the command, its output and exit status, in the
+  Settings terminal theme.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
-- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
-  stay in that thread, and closing it leaves the parent usable.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
+  including those sent while it works, stay in that thread, and closing it
+  leaves the parent usable.
+- `codex-plan-mode`: Codex starts in, or switches to, its own Plan mode from the
+  composer's Plan row; see `plan-mode` in [composer.md](./composer.md).
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
-  them, including delayed spawns; an unresolved spawn does not keep an idle
-  runner re-reading unchanged conversations.
+  them, including forked slash commands and delayed spawns; an unresolved
+  spawn does not keep an idle runner re-reading unchanged conversations.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
@@ -61,6 +101,8 @@ implements them separately, so a fix for one harness does not reach the others.
   Env wrappers are split into these fields, without a duplicate raw invocation.
   Sessions can add to or override these host defaults. Project config can
   choose the default harness, but commands and arguments come only from user config.
+  Codex's `harness.codex-native.app_server` (`command` plus `args`) is a separate,
+  config-file-only wrapper for its session app-servers; unset runs Codex directly.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
@@ -101,14 +143,35 @@ Chat session as well as the local terminal.
 from Chat or type it into the native Pi terminal. Follow a completed tool call
 with a question about its result; verify the routed model and retained history.
 
+**Pi model and effort changes:** in an existing session, select Medium, switch
+to a non-reasoning model, then to a reasoning model from another family. Send
+immediately from Chat and repeat from Terminal. Verify the target request uses
+Medium and retains earlier conversation text. Repeat with a later effort change
+while the model switch is pending; the latest choice must win. With no explicit
+session effort, Pi keeps its native defaults. Component coverage:
+`tests/runner/test_app_sessions_native_events_lifecycle.py::test_events_model_change_on_pi_native_enqueues_bridge_model_change`
+and
+`tests/harnesses/pi_native/test_pi_native_extension.py::test_input_waits_for_inbox_model_change_to_settle`.
+Real-provider history compatibility requires a separate live check.
+
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Picker visibility:** open Settings → Appearance → **Show in agent pickers**.
+The row summarizes what is shown ("Showing 15 of 17. Hidden: …"). Press
+**Edit**, filter the checklist and uncheck an entry, or press **Show all** to
+restore them. The entry drops from the New Chat, New automation and
+project-default pickers. This is the user's own per-device choice, unlike "Hide
+unconfigured harnesses" next to it, which only drops rows that cannot launch on
+the selected host.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
 child to delegate again to check nested ownership; completed children remain
-visible while the runner idles.
+visible while the runner idles. Also invoke an installed skill configured with
+`context: fork`, such as `/code-review`, from Chat or the native terminal.
+The skill's agent and any helpers it delegates should appear in the same tree.
 
 **Native Gemini setup:** run `omni setup` → Antigravity → Configure native agy
 API key / gateway. If existing providers conflict, choose the Gemini default
@@ -117,6 +180,11 @@ before entering the harness menu. Then start a new CLI or web session.
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
 the advertised session and saved-rule choices.
+
+**Devin questions:** start Devin from the CLI or the new-session picker and ask
+it to use `ask_user_question` with selectable options. Answer in Chat or open Inbox
+to answer there. Reload while a choice is pending, submit it, and confirm Devin
+continues with the answer and the session no longer needs a response.
 
 **Approval links:** open a pending permission's standalone approval link.
 Claude directory requests show the exact directories in Chat, Inbox, and the
@@ -140,6 +208,20 @@ Probes run only on expansion.
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown for a newly connected or requested host → See more. The modal auto-opens
 only when the server enables the `import_review` release feature.
+
+**Harness credential repair:** Settings → Harnesses → a needs-auth harness →
+Settings. Activate either the credential card or its Reconfigure affordance;
+both open the same repair flow.
+
+**Harness account sign-in and switching:** Settings → Harnesses → Codex or
+Claude. Use **Sign in again** on an expired Codex card, or open the configured
+harness and choose **Switch account**. For Codex, open or copy the HTTPS device
+link, copy the one-time code, and wait for the countdown/poller to finish; use
+Cancel to stop the host login or Try again after a terminal error. If another
+Codex login is already active, the dialog resumes its status instead of starting
+a second one. For Claude, confirm the sign-out and optionally enter the target
+email; the dialog presents the supported login command with a shell-quoted
+`--email` hint. Older hosts and servers fall back to the copyable CLI command.
 
 **Idle reap:** finish a turn, then leave the session alone past the idle window:
 a web session with its Terminal view open but untouched or its tabs closed, a
@@ -213,6 +295,7 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 starts the real CLI/server/runner/Pi with scripted routing and model replies.
 It covers composer API and session-owned TUI input, verifies the actual served
 model, then checks the follow-up request retains the tool result and first answer.
+Each composer/TUI prompt must appear exactly once in persisted user history.
 Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
@@ -340,7 +423,8 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
   model context, distinct native threads on one runner, transcript isolation,
-  follow-ups, and a working parent after side-chat closure.
+  follow-ups that switch model and effort on the same thread, and a working
+  parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
@@ -357,9 +441,44 @@ Cross-harness journeys:
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
 - **`needs-auth`:**
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx` covers the
+  flag-gated credential warning card, its Reconfigure affordance, and full-card click.
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`model-and-effort`, Claude runtime selection (own environment):**
+  `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
+  uses real Claude catalog discovery, tmux, statusLine and the runner event
+  endpoint. With the per-session options cache still cold, repeated `opus` and
+  `opus[1m]` selections retain the exact launch-pinned generation and context.
+  It then switches to a managed GLM picker ID and back, opens Claude's model
+  picker, and confirms another switch reclaims that surface successfully.
+  Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
+  Requires Claude Code and tmux; use a clean container if machine-managed
+  settings override the fixture's picker. It makes no model calls and does not
+  verify browser rendering or live gateway servability.
+- **`model-and-effort`, Claude browser selection and refusal (nightly):**
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
+  proves alias picks through the gear, model pill and Ctrl+Shift+M using
+  the real browser, server, owned isolated host, runner and CLI. Subsequent
+  mock requests preserve the wire model's generation; native status and
+  `requestedModel` retain `[1m]`, with a correlated `context-1m` request beta.
+  Chat and the transcript each contain the reply once.
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
+  pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
+  a newer same-value model write and its effort while the applied model stays
+  unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
+  These cases do not cover live providers or a post-refusal retry.
+- **`picker-entry-visibility`:**
+  `web/src/shell/AgentHarnessPicker.test.tsx` covers the picker rows a hidden
+  entry drops and when the picker points at Settings,
+  `web/src/pages/settings/PickerVisibilitySetting.test.tsx` the Settings
+  summary, checklist, **Show all** and a failed catalog load,
+  `web/src/lib/pickerEntryVisibility.test.ts`
+  the stored set, `web/src/lib/settingsPortability.test.ts` export and import,
+  `web/src/hooks/useAvailableAgents.test.tsx` (`useAgentCatalog`) the Settings
+  list's agents, and `web/src/lib/agentGrouping.test.ts` that Settings and the
+  picker group an entry the same way.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
@@ -370,6 +489,18 @@ Cross-harness journeys:
   Literal fallback requires an allowlist; decoding without one is unchanged.
   Browser acceptance is separate: select each row in the new-session composer,
   launch, and confirm Pi reports the model that row represents.
+- **`model-and-effort`, Pi thinking compatibility (own environment):**
+  With the CI-pinned Pi on PATH, run
+  `uv run --no-sync pytest tests/e2e/omnigent/test_pi_thinking_compatibility_e2e.py --reruns 0 -q`.
+  Real SDK CLI and native provider-launch/print paths send requests to the shared
+  mock provider: Opus 5.5 clamps off to adaptive/low, Sonnet honors high, and
+  Haiku retains off and uses budget-based thinking at high. An inference-bound
+  Opus `[1m]` ID stays intact while receiving the same clamp. Catalog, dated,
+  regional and vendor variants use `tests/test_pi_model_compatibility.py`.
+  Known budget models override native Pi's existing adaptive default; unlisted
+  models keep that default. Run `tests/e2e/test_pi_native_model_scope_e2e.py`
+  for real TUI picker and effort/tool-turn regression checks with a mock provider.
+  These prove process behavior, not browser controls or live serving compatibility.
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -535,21 +666,78 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi compaction → restart → continuation → fork (own environment):**
+  `tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_compacted_restart_then_fork`
+  runs parallel file reads and two actual Pi compactions through the API, then
+  replaces the native Pi process. Separate cases keep the runner, abruptly
+  replace the runner while its idle native pane is still alive, or remove native
+  history before relaunch. Preserved files retain their checkpoint. Missing-file
+  reconstruction and forks restore the shared compaction snapshot: Pi's summary,
+  retained tool-call/result pairs and subsequent turns, stored text-only, like
+  live forwarding, in the item shapes other harnesses replay. The parent
+  transcript stays unchanged; resume keeps its native identity and forks mint
+  one.
+  Incomplete or unsupported snapshots use a meaningful summary and preserve turns
+  after its recorded boundary, including turns before the checkpoint itself.
+  If that boundary is unavailable, or only a compaction notice is available
+  (such as an opaque Codex or Claude hook checkpoint), keep the full history.
+  A scripted provider enforces the same 16,384 serialized-message-byte limit from
+  the first request. Continuation, reconstruction and fork must fit it without
+  resurrecting summarized reads or duplicating retained tools/replies.
+  Artifacts include full provider payloads, server transcripts, native JSONL and
+  genuine tmux text captures. This tests a bounded synthetic capacity limit,
+  not vendor token limits or model recall. The retention setting is deliberately
+  small; large production histories remain unvalidated. Older sessions compacted
+  before checkpoint persistence have no server snapshot until another compaction;
+  losing their native files still requires full-transcript reconstruction.
+  There is no startup backfill. Live gateways, browser controls, sandboxing,
+  automatic-compaction triggering and active-turn loss are not covered here.
+- **`resume`, Pi user setup (own environment):**
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
+  and process resume through the server/host/runner. User skills/extensions and
+  relative settings must survive relocation of the agent root, including a
+  relative custom root. Existing context/prompt opt-outs remain independent.
+  This is not Claude marketplace or Managed deployment coverage.
+- **`auth-recovery`, Pi token commands (component/process boundaries):**
+  With a positive configured auth refresh interval, warm and renew tokens in the
+  session workspace, even when the runner starts elsewhere. Relative token files
+  must keep working after renewal. Discard caches created in another directory
+  or before directory tracking was added.
+  `tests/runner/test_app_pi_native_model.py::test_auto_create_pi_terminal_threads_spec_model_into_models_json`
+  drives startup and renewal with real helpers and a stubbed terminal launcher;
+  `tests/harnesses/pi_native/test_pi_native_auth_refresh.py` covers cache rejection,
+  failed refreshes and cleanup. These checks do not establish browser, sandbox
+  or live-gateway acceptance.
+- **`resume`, Pi cost reporting (component boundaries):**
+  `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
+  dollars, duplicate callbacks, local/server restart baselines and missing pricing.
+  `tests/server/routes/test_sessions_usage_loading.py` checks the real HTTP
+  snapshot-to-runner handoff, excluding child-session cost. An incomplete or
+  older reporter keeps server pricing; its last display subtotal is not a complete
+  cost baseline. Check the session cost before and after a resumed turn; provider
+  pricing must be available to compare dollars. These tests do not prove live billing.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`approvals`, Pi extension dialogs:**
   `tests/e2e/test_pi_extension_ui_round_trip.py::test_real_pi_dialog_answers_and_continues`
   runs real SDK and native Pi through an isolated server/runner with a scripted
-  provider, sandbox disabled: four dialog answers, decline, later-turn history
-  and native cancellation/card cleanup after the reconnect grace period.
+  provider, sandbox disabled: all four dialog types, confirmation decline,
+  literal editor text, editor rejection and later-turn history. Pending cards
+  and the API sidebar count must clear after answers and native cancellation
+  (after the reconnect grace period).
   `tests/e2e_ui/approvals/test_pi_extension_ui.py` checks confirmation layout
-  and multiline editor submission through Chat using injected hooks; select
-  and input matrices stay in component tests. Older servers use native TUI
+  and editable prefill, exact multiline submission and sidebar badge cleanup
+  through Chat using injected hooks. Empty/whitespace editor answers and
+  select/input matrices stay in component tests. Older servers use native TUI
   dialogs on 404/405; supported servers deliver dialogs through the web only.
   Read-only callers cannot publish cards. Native timeouts are capped at the
   server limit, and cancelled waits stop re-parking (server/JS regressions).
-  Known gaps: stale sidebar “Needs response” after native cancellation,
-  Inbox/mobile, active SDK interruption, sandbox and Managed acceptance.
+  For a manual check, edit the prefill, cancel a subsequent editor, and send a
+  follow-up. Keep the service running while checking that the card and sidebar
+  “Needs response” badge settle.
+  Known gaps: native cancellation → browser sidebar settlement, select/input
+  cancellation through real Pi, active SDK interruption, Inbox/standalone
+  approvals, mobile, sandbox and Managed acceptance.
   These scenarios own their isolated environments:
 
   ```sh
@@ -557,6 +745,17 @@ Cross-harness journeys:
   uv run --no-sync pytest tests/e2e_ui/approvals/test_pi_extension_ui.py --ui-skip-build --video=on --screenshot=on --reruns 0 -q
   pnpm --filter web test src/components/blocks/ApprovalCard.test.tsx
   ```
+
+- **`devin-questions`:**
+  `tests/e2e_ui/approvals/test_ask_user_question.py::test_devin_question_hook_round_trip_survives_reload`
+  runs the real native hook subprocess with a recorded question shape through
+  the server and browser. Chat and Inbox each restore a pending question after
+  reload, submit the answer in Devin's native input shape, and clear the pending
+  count and sidebar badge. This uses no Devin CLI or live model; a live native
+  session must additionally confirm that the tool consumes the answer and
+  continues. Custom and multiple selections belong in the hook's component
+  coverage. Standalone approval links do not expose the question form; mobile
+  and Managed question journeys remain unverified.
 
 - **`resume`, Claude and Pi provider selection after a runner restart:**
   `tests/e2e/test_native_resume_provider_e2e.py::test_connected_native_resume_routes_to_configured_provider`
@@ -619,6 +818,33 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`chat-render`, `steer`, Codex shell commands from the web composer:**
+  A standalone `!command` runs in the session's shell. Its pending bubble settles
+  and its output appears below it; attachments, multiple content blocks and `!!`
+  text remain model input. On shared servers, direct Codex shell messages require
+  owner access (`LEVEL_OWNER`), including API and automated messages. Codex runs
+  these commands as the host process user, outside its thread sandbox and
+  model-tool approval path. Collaborators with edit access can still send model
+  prompts. Each shell delivery carries trusted owner authorization from the
+  server, bound to the exact command at runner ingress. An older server cannot
+  authorize direct shell execution: the runner reports an undelivered upgrade
+  error and preserves the native session.
+  `tests/e2e_ui/messages/test_native_codex_shell_input.py::test_web_shell_input_runs_in_codex_shell_not_as_prompt`
+  covers both a first message and an existing session, including rendered output.
+  Run it through the repro environment with `--ui-skip-build --video=on` after
+  building the SPA. It requires real Codex and tmux with the mock model provider.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_web_prompt_during_standalone_shell_gets_model_reply`
+  (own environment; real server, runner, Codex and tmux, local mock model) checks
+  that a prompt sent during the command receives an answer after it finishes,
+  and that an unresolved submission with no running command allows the next
+  question through without resubmitting the shell command.
+  `tests/e2e/test_codex_native_shell_followup_e2e.py::test_editor_bang_input_cannot_execute_through_an_older_server`
+  covers editor rejection and ordinary-prompt recovery with current peers or an
+  older server selected by `OMNIGENT_COMPAT_SERVER_PYTHON`.
+  Manually, send `!echo hi`, expand its output and check for `hi`. Then send
+  `!sleep 5` followed immediately by a question; the question must receive an
+  answer. Upload a text file containing `!echo file-content` with an empty
+  composer and verify that it reaches the model without running a shell command.
 - **`codex-plugin-skills`:** use the
   [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
   real CLI catalog regression and recorded browser journey across both
@@ -744,8 +970,11 @@ Cross-harness journeys:
   transcripts, then registration under the right parent when the spawn arrives.
   The same module covers cache invalidation on append and same-size rewrites,
   eviction, deleted files, transient read failures, and existing Task/fork and
-  restart behavior. These use real transcript files and forwarder code with a
-  mocked HTTP peer; they do not measure runner CPU or prove browser rendering.
+  restart behavior. The `slash_command` variant of
+  `test_subagent_watcher_preserves_nested_parent_graph_across_restart`
+  checks a forked skill without a tool-call ID and its nested helpers.
+  These use real transcript files and forwarder code with a mocked HTTP peer;
+  they do not measure runner CPU or prove browser rendering.
 - **`subagent-discovery`, Claude (manual runner performance):** use an isolated
   server/runner from this checkout, with real Claude Code and tmux and a scripted
   model endpoint. Follow the native prerequisites above; do not use a developer
@@ -779,16 +1008,53 @@ Cross-harness journeys:
   derived skill/MCP plugin listing still works; a 502 shows an inventory error.
   Codex and Cursor keep their existing derived listings.
 
+**Pi persisted history:** for `chat-render` and `tool-history`, complete a
+prompt and tool turn, then reload Chat: each persisted item appears once.
+Stall a history POST and confirm policy ALLOW/DENY still runs. A result must
+wait for its call to be accepted. Retries retain item IDs; repeated tool/message
+callbacks coalesce, while a repeated input callback is a separate prompt.
+For a Pi child, stall final-answer delivery: idle may update, but the parent
+must receive no completion until the answer is saved. Exhaust delivery and
+expect a failed result instead of an old answer. A later prompt must not extend
+the previous history wait; an obsolete outcome must not retry into a newer loop.
+If a follow-up is queued before delivery finishes, the parent must wait for
+that continued work and receive its final answer.
+Interrupt a running tool and expect cancellation. Compaction must leave the
+runner idle without completing the parent's task. Queue bounds, retry budgets and shutdown
+limits live in `createHistoryQueue`; delivery is memory-only. Older servers
+may omit the status-only observation and lack `source_id` deduplication.
+`tests/harnesses/pi_native/test_pi_native_extension.py` covers extension behavior;
+`tests/server/routes/test_subagent_status.py` covers status-only forwarding;
+`tests/server/routes/test_native_failure_output.py` covers result selection;
+`tests/runner/test_native_subagent_turn_outcome_delivery.py` covers runner idle
+and confirmed outcomes;
+`tests/server/integration/test_sessions_external_item_idempotency.py` covers
+persistence deduplication. These checks do not establish desktop rendering parity.
+
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
-and orphan results. The existing
+and duplicate results, results stored after a message sent during their call,
+missing calls, and calls, including interrupted or malformed ones, that reuse an earlier call's id. Unmatched outputs retain their content as labeled, untrusted
+tool data without inventing a call; matched results retain their names and pairing. The existing
 `tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
-checks real server/runner serialization with a stub Pi process. For a real
-Google-provider check, fork a session containing tool calls onto native Pi
-with Gemini, then send a follow-up; repeat a cold resume after removing its
-local session file. Expect preserved results and a reply without the empty
-`function_response.name` error. Orphan results and thought signatures remain
-separate compatibility gaps; these automated checks do not prove live Gemini.
+checks real server/runner serialization with a stub Pi process.
+`tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent`
+uses real Pi with scripted providers: an Anthropic tool turn forks onto Anthropic
+or OpenAI Responses with an unmatched stored output. The Responses case also
+stops Pi, removes its isolated local history file and cold-resumes. Both retain
+parallel results and recovery text, and the follow-up succeeds.
+`tests/e2e/test_pi_native_fork_parallel_tool_results_e2e.py::test_pi_native_cold_resume_keeps_result_before_message_sent_during_tool`
+steers a message into a running real Pi `bash` call, then cold-resumes; the provider
+receives the real result before that message instead of a synthetic missing result.
+
+For a manual check, fork an affected session onto a Responses model and send a
+follow-up; expect retained output without an orphan-call HTTP 400. Reload Chat
+and confirm the reply appears once; ask another question and confirm the copied
+tool values reach the model without executing the tools again. Repeat after
+stopping the isolated test terminal and removing its local session file. Existing
+local files are reused unchanged. For Gemini, fork tool-containing history and
+send a follow-up; expect no empty `function_response.name` error. These automated
+checks do not prove live providers, browser rendering or thought-signature parity.
 
 ## Gotchas
 

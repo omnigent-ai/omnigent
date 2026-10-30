@@ -106,17 +106,35 @@ def test_crash():
     assert not any(r["type"] == "finish" for r in records)
 
 
-def test_parallel_pytest_is_rejected_before_touching_output(
+def test_parallel_workers_each_record_the_tests_they_ran(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _configure(pytester, monkeypatch)
-    pytester.makepyfile("def test_pass(): pass")
-    result = pytester.runpytest_subprocess(
-        "-q", "-p", "xdist.plugin", "-n2", f"--ui-timing-output={path}"
+    path.parent.mkdir(parents=True)
+    for stale in (path, path.with_name("timings-gw7.jsonl")):
+        stale.write_text("stale records from an earlier run\n")
+    pytester.makepyfile(
+        test_alpha="def test_one(): pass\ndef test_two(): pass\n",
+        test_beta="import pytest\ndef test_three(): pass\ndef test_four(): pytest.skip('x')\n",
     )
-    assert result.ret == pytest.ExitCode.USAGE_ERROR
-    result.stderr.fnmatch_lines(["*--ui-timing-output requires serial pytest within each shard*"])
+    result = pytester.runpytest_subprocess(
+        "-q", "-p", "xdist.plugin", "-n2", "--dist=loadfile", f"--ui-timing-output={path}"
+    )
+    result.assert_outcomes(passed=3, skipped=1)
     assert not path.exists()
+    files = sorted(path.parent.glob("timings-gw*.jsonl"))
+    assert [file.name for file in files] == ["timings-gw0.jsonl", "timings-gw1.jsonl"]
+    expected = [f"test_alpha.py::test_{name}" for name in ("one", "two")]
+    expected += [f"test_beta.py::test_{name}" for name in ("three", "four")]
+    ran = []
+    for file in files:
+        records = [json.loads(line) for line in file.read_text().splitlines()]
+        assert records[0]["type"] == "plan"
+        assert records[0]["worker"] == file.stem.removeprefix("timings-")
+        assert sorted(records[0]["nodeids"]) == sorted(expected)
+        assert records[-1] == {"type": "finish", "exitstatus": 0}
+        ran += [r["nodeid"] for r in records if r.get("when") == "call"]
+    assert sorted(ran) == sorted(expected)
 
 
 def test_new_run_replaces_previous_timing_file(
@@ -125,9 +143,15 @@ def test_new_run_replaces_previous_timing_file(
     path = _configure(pytester, monkeypatch)
     path.parent.mkdir(parents=True)
     path.write_text("stale records from an earlier run\n")
+    stale_worker = path.with_name("timings-gw0.jsonl")
+    stale_worker.write_text("stale records from an earlier parallel run\n")
+    lookalike = path.with_name("timings-gw-notes.jsonl")
+    lookalike.write_text("not a worker file\n")
     pytester.makepyfile("def test_pass(): pass")
     result = pytester.runpytest_subprocess("-q", f"--ui-timing-output={path}")
     result.assert_outcomes(passed=1)
+    assert not stale_worker.exists()
+    assert lookalike.read_text() == "not a worker file\n"
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [r["type"] for r in records] == ["plan", "phase", "phase", "phase", "finish"]
     assert records[-1] == {"type": "finish", "exitstatus": 0}

@@ -1,6 +1,6 @@
 // Shared auto-save orchestration for the file-viewer editors (TipTap markdown +
 // Monaco code). Owns everything that was identical between the two: the write
-// mutation, the single-flight save with a mid-turn conflict check, the
+// mutation, the single-flight save with a pre-write conflict check, the
 // save-after-teardown guard, and the debounce/flush wiring (on edit, on unmount,
 // on reconnect). Each editor keeps its own *content access* — getContent
 // / isEditorDirty / baselineRef — because that's intrinsically tied to the
@@ -11,13 +11,17 @@ import type { RefObject } from "react";
 import { useWriteFileContent } from "@/hooks/useWriteFileContent";
 import { fetchFileContent } from "@/hooks/useFileContent";
 import { useWorkspaceServeable } from "@/hooks/useWorkspaceChangedFiles";
-import { useChatStore } from "@/store/chatStore";
 import { useAutoSave } from "./useAutoSave";
+import type { FinishServerCheck } from "./useMarkdownEditorSync";
 
 // Debounce between the last edit and an auto-save — long enough to coalesce a
 // burst of typing, short enough to keep the dirty window brief. Shared so both
 // editor surfaces behave identically.
 const AUTOSAVE_DELAY_MS = 1000;
+
+// A stalled pre-write conflict check gives up after this long, and the save
+// proceeds as if the check had failed.
+export const CONFLICT_CHECK_TIMEOUT_MS = 10_000;
 
 interface UseEditorAutoSaveOptions {
   conversationId: string;
@@ -31,7 +35,7 @@ interface UseEditorAutoSaveOptions {
   /** True while an unresolved external-edit conflict suppresses auto-save. */
   hasExternalUpdate: boolean;
   markSaved: (content: string) => void;
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
   dismissExternalUpdate: () => void;
   // ── Editor-specific content access ──
   /**
@@ -71,7 +75,7 @@ export function useEditorAutoSave({
   setDirty,
   hasExternalUpdate,
   markSaved,
-  reconcileServerContent,
+  beginServerCheck,
   dismissExternalUpdate,
   baselineRef,
   getContent,
@@ -83,16 +87,6 @@ export function useEditorAutoSave({
   // A reachable host lets the save endpoint reconnect a sleeping runner.
   // Only buffer edits when neither the runner nor its host is reachable.
   const saveDisabled = useWorkspaceServeable(conversationId) === false;
-
-  // The only concurrent writer is the agent during its turn, so the pre-write
-  // conflict check runs only while the session is active — when idle we write
-  // directly (no extra GET, zero added latency).
-  const focusedId = useChatStore((s) => s.conversationId);
-  const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const sessionActive =
-    conversationId === focusedId && (sessionStatus === "running" || sessionStatus === "waiting");
-  const sessionActiveRef = useRef(sessionActive);
-  sessionActiveRef.current = sessionActive;
 
   // False once this editor instance unmounts (path switch / key remount / panel
   // close). A save in flight can resolve after teardown: the network write still
@@ -108,6 +102,8 @@ export function useEditorAutoSave({
     };
   }, []);
 
+  // handleSave restarts itself when its conflict check went stale.
+  const handleSaveRef = useRef<(value: string) => Promise<void>>(async () => {});
   const handleSave = useCallback(
     async (value: string) => {
       if (value === baselineRef.current) {
@@ -116,23 +112,34 @@ export function useEditorAutoSave({
       }
       writeFileRef.current.reset();
       try {
-        // Pre-write conflict check: mid-turn the file query isn't refetched, so
-        // GET the live file first; if it changed under us, raise the conflict
-        // and skip the write instead of clobbering the agent's edit.
-        if (sessionActiveRef.current) {
-          try {
-            const fresh = await fetchFileContent(conversationId, path);
-            // Torn down during the GET → don't touch the outer sync hook (it now
-            // tracks a different file); fall through and let the write land.
-            if (
-              mountedRef.current &&
-              fresh.encoding === "utf-8" &&
-              reconcileServerContent(fresh.content)
-            ) {
-              return;
-            }
-          } catch {
-            // Best-effort: a failed conflict-check GET must not block saving.
+        // GET the live file first: if another writer changed it since the last
+        // refresh, raise the conflict instead of clobbering their edit. A write
+        // landing between this GET and the PUT can still be lost (last writer wins).
+        const finishCheck = beginServerCheck();
+        const checkTimeout = new AbortController();
+        const timer = window.setTimeout(() => checkTimeout.abort(), CONFLICT_CHECK_TIMEOUT_MS);
+        let serverContent: string | null = null;
+        try {
+          const fresh = await fetchFileContent(conversationId, path, checkTimeout.signal);
+          if (fresh.encoding === "utf-8") serverContent = fresh.content;
+        } catch {
+          // Best-effort: a failed or timed-out conflict-check GET must not block saving.
+        } finally {
+          window.clearTimeout(timer);
+        }
+        // Torn down during the GET → don't touch the outer sync hook (it now
+        // tracks a different file); fall through and let the write land.
+        if (mountedRef.current) {
+          const outcome = finishCheck(serverContent);
+          if (outcome === "conflict") return;
+          // A refresh landed during the GET, so its response and `value` may be
+          // older than what's shown: start over from the current buffer.
+          if (outcome === "stale") return handleSaveRef.current(getContent());
+          // Clean again after the GET (undone, or a refresh applied newer server
+          // content): writing the captured value would overwrite what's shown.
+          if (!isEditorDirty()) {
+            setDirty(false);
+            return;
           }
         }
         await writeFileRef.current.mutateAsync({ path, content: value });
@@ -143,11 +150,10 @@ export function useEditorAutoSave({
         // Mark so the server echo is recognised as our own write, not an
         // external edit (which would falsely raise hasExternalUpdate).
         markSaved(value);
-        // Force clean after a successful write. Do NOT re-derive dirty from a
-        // live content-vs-baseline compare: an editor whose serialisation isn't
-        // byte-stable (TipTap's markdown round-trip) can spuriously report dirty
-        // and leave the editor stuck "Unsaved" / looping.
-        setDirty(false);
+        // Edits typed during the write stay unsaved, so an external update must
+        // raise a conflict rather than replace them. isEditorDirty compares the
+        // buffer or document snapshot just saved, never re-serialised Markdown.
+        setDirty(isEditorDirty());
         // The user's save wins; drop any stashed external content so the
         // "became clean" sync effect doesn't overwrite the editor with it.
         dismissExternalUpdate();
@@ -161,10 +167,13 @@ export function useEditorAutoSave({
       setDirty,
       dismissExternalUpdate,
       markSaved,
-      reconcileServerContent,
+      beginServerCheck,
       baselineRef,
+      getContent,
+      isEditorDirty,
     ],
   );
+  handleSaveRef.current = handleSave;
 
   // Auto-save is suppressed when read-only, the workspace is unreachable, or an
   // external-edit conflict is unresolved (user must pick Keep mine / Load latest
