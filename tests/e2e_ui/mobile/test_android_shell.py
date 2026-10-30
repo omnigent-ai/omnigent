@@ -25,6 +25,7 @@ the injected OS inset reach the layout's shared vars.
 
 from __future__ import annotations
 
+import httpx
 from playwright.sync_api import Page, ViewportSize, expect
 
 # A phone-sized viewport: the Android shell is a mobile surface, and the narrow
@@ -32,6 +33,7 @@ from playwright.sync_api import Page, ViewportSize, expect
 # ``[data-android-native]`` drawer rules this change adds). The
 # ``data-android-native`` tag itself is viewport-independent.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
+_UNFOLDED_VIEWPORT: ViewportSize = {"width": 840, "height": 900}
 
 # Minimal stand-in for the Android WebView bridge (``web/android``'s
 # ``NativeBridgeScript``). Runs before any app script on every navigation
@@ -132,6 +134,106 @@ def test_no_android_tag_or_fold_in_plain_browser(
     # The web app never injects --omnigent-android-safe-area-*, so with
     # env(safe-area-inset-top) also 0 here the shared inset stays 0.
     assert page.evaluate(_READ_SAFE_TOP_PX) == "0px"
+
+
+def test_android_unfolded_chat_scroll_fade_tracks_status_bar(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A scrolled chat on an unfolded Android screen fades below its status bar.
+
+    The Pixel Fold inner display crosses the 48rem breakpoint. Seed a long
+    assistant turn so the real transcript can scroll, then check the native
+    fade starts below the OS inset and server-switcher pill.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.set_viewport_size(_UNFOLDED_VIEWPORT)
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+
+    response = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_assistant_message",
+            "data": {
+                "agent": "hello_world",
+                "response_id": "android_statusbar_scroll",
+                "text": "\n\n".join(f"Older transcript line {index}" for index in range(80)),
+            },
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    page.goto(f"{base_url}/c/{session_id}")
+
+    expect(page.locator(".app-shell")).to_have_attribute("data-android-native", "true")
+    assistant_bubble = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
+    expect(assistant_bubble).to_be_visible()
+
+    page.evaluate(
+        "() => document.documentElement.style"
+        ".setProperty('--omnigent-android-safe-area-top', '48px')"
+    )
+    transcript = page.locator(".chat-scroll-fade")
+    scroll_top = transcript.evaluate(
+        "element => {"
+        "const scroller = [element, ...element.querySelectorAll('*')].find(candidate => {"
+        "const overflowY = getComputedStyle(candidate).overflowY;"
+        "return (overflowY === 'auto' || overflowY === 'scroll') && "
+        "candidate.scrollHeight > candidate.clientHeight + 1;"
+        "});"
+        "if (!scroller) return 0;"
+        "scroller.scrollTop = Math.min(240, scroller.scrollHeight - scroller.clientHeight);"
+        "return scroller.scrollTop;"
+        "}"
+    )
+    assert scroll_top > 0, "the long transcript did not scroll"
+
+    mask_image = transcript.evaluate("element => getComputedStyle(element).maskImage")
+    assert "81px" in mask_image and "113px" in mask_image, (
+        "the unfolded Android chat fade must follow the 48px status inset and "
+        f"33px switcher footprint; got {mask_image}"
+    )
+
+
+def test_android_scrolled_settings_page_masks_status_bar(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Settings content stays hidden in the status bar while scrolling.
+
+    Follow the phone-width Android journey into Settings / Appearance, scroll the
+    settings page, and verify its mask cuts off at the offset header's top edge.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param live_server: Base URL of the shared test server.
+    """
+    page.set_viewport_size(_MOBILE_VIEWPORT)
+    page.add_init_script(_ANDROID_SHELL_INIT_SCRIPT)
+    page.goto(f"{live_server}/settings/appearance")
+
+    expect(page.locator(".app-shell")).to_have_attribute("data-android-native", "true")
+    expect(page.get_by_role("heading", name="Appearance", exact=True)).to_be_visible()
+    page.evaluate(
+        "() => document.documentElement.style"
+        ".setProperty('--omnigent-android-safe-area-top', '40px')"
+    )
+
+    settings_page = page.locator(".settings-page-scroll")
+    expect(settings_page).to_be_visible()
+    scroll_top = settings_page.evaluate(
+        "element => { element.scrollTop = element.scrollHeight; return element.scrollTop; }"
+    )
+    assert scroll_top > 0, "Settings / Appearance did not have scrollable content"
+
+    mask_image = settings_page.evaluate("element => getComputedStyle(element).maskImage")
+    assert mask_image.count("32px") == 2, (
+        "the settings mask must hide the 40px status inset down to the header "
+        f"top 8px above it; got {mask_image}"
+    )
 
 
 # Bridge stub that also CAPTURES the notification-activation callback the SPA
