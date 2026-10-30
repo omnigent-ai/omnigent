@@ -12,6 +12,7 @@ import gzip
 import io
 import tarfile
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 
 from omnigent.skills.limits import MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
@@ -19,6 +20,17 @@ from omnigent.skills.limits import MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
 
 class SkillTarballError(Exception):
     """A stored skill tarball is not safe to unpack into a bundle."""
+
+
+@dataclass(frozen=True)
+class UnpackedSize:
+    """What a tarball becomes once a runner unpacks it: file bytes and entries."""
+
+    bytes: int
+    entries: int
+
+    def __add__(self, other: UnpackedSize) -> UnpackedSize:
+        return UnpackedSize(self.bytes + other.bytes, self.entries + other.entries)
 
 
 def _open(data: bytes) -> tarfile.TarFile:
@@ -36,9 +48,10 @@ def _check_member(member: tarfile.TarInfo) -> None:
         raise SkillTarballError(f"unsafe path: {member.name!r}")
 
 
-def validate_skill_tarball(data: bytes) -> None:
+def validate_skill_tarball(data: bytes) -> UnpackedSize:
     """Reject links, traversal, bombs, and a tarball without a root ``SKILL.md``.
 
+    :returns: Its unpacked size, as counted against the delivery budgets.
     :raises SkillTarballError: With a user-facing reason.
     """
     total = entries = 0
@@ -57,6 +70,18 @@ def validate_skill_tarball(data: bytes) -> None:
                 has_manifest = True
     if not has_manifest:
         raise SkillTarballError("skill tarball has no SKILL.md at its root")
+    return UnpackedSize(bytes=total, entries=entries)
+
+
+def unpacked_size(data: bytes) -> UnpackedSize:
+    """File bytes and entries of any tarball, such as an agent bundle, as a runner unpacks it."""
+    total = entries = 0
+    with _open(data) as tf:
+        for member in tf:
+            entries += 1
+            if member.isfile():
+                total += member.size
+    return UnpackedSize(bytes=total, entries=entries)
 
 
 def _prefix_parts(prefix: str) -> list[str]:

@@ -16,6 +16,7 @@ import io
 import logging
 import tarfile
 import uuid
+from pathlib import PurePosixPath
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -29,10 +30,20 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.skills.git_source import GitSourceError, repository_label
-from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_NAMES_PER_INSTALL
-from omnigent.skills.overlay import SkillTarballError, validate_skill_tarball
+from omnigent.skills.limits import (
+    MAX_INSTALLED_PER_OWNER,
+    MAX_NAMES_PER_INSTALL,
+    MAX_SOURCE_PATH_CHARS,
+)
+from omnigent.skills.overlay import SkillTarballError, UnpackedSize, validate_skill_tarball
 from omnigent.skills.policy import DEFAULT_POLICY, SkillPolicyError, SkillsMarketplacePolicy
-from omnigent.skills.service import FetchedCatalog, PackagedSkill, SkillFetcher, resolve_source
+from omnigent.skills.service import (
+    FetchedCatalog,
+    PackagedSkill,
+    ResolvedSource,
+    SkillFetcher,
+    resolve_source,
+)
 from omnigent.stores import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.skill_store import (
@@ -61,6 +72,8 @@ class SkillSourceObject(BaseModel):
     name: str
     created_by: str | None
     created_at: int
+    # The repository directory its catalog is indexed from; "" for the root.
+    path: str = ""
     # Listed in the server config: seeded at startup and not removable here.
     managed: bool = False
 
@@ -74,10 +87,14 @@ class SkillSourceList(BaseModel):
 
 
 class SkillSourceCreate(BaseModel):
-    """``source`` is ``owner/repo`` or a GitHub URL; ``ref`` a branch or tag."""
+    """``source`` is ``owner/repo`` or a GitHub URL; ``ref`` a branch or tag.
+
+    ``path`` is the directory to index; a ``/tree/<ref>/<dir>`` link supplies it too.
+    """
 
     source: str = Field(min_length=1, max_length=512)
     ref: str | None = Field(default=None, max_length=255)
+    path: str | None = Field(default=None, max_length=MAX_SOURCE_PATH_CHARS)
     name: str | None = Field(default=None, max_length=256)
 
 
@@ -97,6 +114,8 @@ class CatalogSkill(BaseModel):
 class SkillCatalogResponse(BaseModel):
     url: str
     ref: str | None
+    # The directory the catalog was indexed from; pass it back when installing.
+    path: str = ""
     commit: str | None
     skills: list[CatalogSkill]
     skipped: list[str]
@@ -105,6 +124,7 @@ class SkillCatalogResponse(BaseModel):
 class SkillCatalogRequest(BaseModel):
     source: str = Field(min_length=1, max_length=512)
     ref: str | None = Field(default=None, max_length=255)
+    path: str | None = Field(default=None, max_length=MAX_SOURCE_PATH_CHARS)
 
 
 class InstalledSkillObject(BaseModel):
@@ -121,7 +141,9 @@ class InstalledSkillObject(BaseModel):
     path: str
     scope: Literal["user", "org"]
     owner_user_id: str | None
+    # Unpacked size and file count, as counted against the delivery budgets.
     bundle_bytes: int
+    bundle_entries: int
     enabled: bool
     installed_by: str | None
     installed_at: int
@@ -141,6 +163,7 @@ class InstallSkillsRequest(BaseModel):
 
     source: str = Field(min_length=1, max_length=512)
     ref: str | None = Field(default=None, max_length=255)
+    path: str | None = Field(default=None, max_length=MAX_SOURCE_PATH_CHARS)
     names: list[str] = Field(min_length=1, max_length=MAX_NAMES_PER_INSTALL)
     scope: Literal["user", "org"] = "user"
 
@@ -158,7 +181,7 @@ class InstalledSkillContentResponse(BaseModel):
 
 def _source_object(source: SkillSource, policy: SkillsMarketplacePolicy) -> SkillSourceObject:
     return SkillSourceObject(
-        **source.__dict__, managed=policy.is_configured(source.url, source.ref)
+        **source.__dict__, managed=policy.is_configured(source.url, source.ref, source.path)
     )
 
 
@@ -176,6 +199,7 @@ def _skill_object(skill: InstalledSkill) -> InstalledSkillObject:
         scope=skill.scope,
         owner_user_id=skill.owner_user_id,
         bundle_bytes=skill.bundle_bytes,
+        bundle_entries=skill.bundle_entries,
         enabled=skill.enabled,
         installed_by=skill.installed_by,
         installed_at=skill.installed_at,
@@ -241,6 +265,7 @@ def _catalog_response(
     return SkillCatalogResponse(
         url=fetched.url,
         ref=fetched.ref,
+        path=fetched.path,
         commit=fetched.commit,
         skills=skills,
         skipped=list(fetched.skipped),
@@ -260,11 +285,24 @@ def seed_configured_sources(skill_store: SkillStore, policy: SkillsMarketplacePo
             skill_store.add_source(
                 url=source.url,
                 ref=source.ref,
-                name=source.name or repository_label(source.url),
+                path=source.path,
+                name=source.name or _source_label(source.url, source.path),
                 created_by=None,
             )
         except Exception:
             _logger.warning("could not seed skill source %s", source.url, exc_info=True)
+
+
+def _source_label(url: str, path: str) -> str:
+    """``owner/repo`` (or ``host/owner/repo``), with the indexed directory when there is one."""
+    label = repository_label(url)
+    return f"{label} ({path})" if path else label
+
+
+def _ancestors(path: str) -> list[str]:
+    """``""`` and every leading part of *path*: the source directories that can hold it."""
+    parts = PurePosixPath(path).parts
+    return ["/".join(parts[:depth]) for depth in range(len(parts) + 1)]
 
 
 async def _installed_among(
@@ -312,11 +350,11 @@ def create_skill_marketplace_router(
         finally:
             fetching.discard(account)
 
-    def resolve_allowed(source: str, ref: str | None) -> tuple[str, str | None]:
-        """``(clone_url, ref)`` for a source within ``allowed_sources``, before any fetch."""
-        url, ref = resolve_source(source, ref)
-        policy.require_allowed(url)
-        return url, ref
+    def resolve_allowed(source: str, ref: str | None, path: str | None) -> ResolvedSource:
+        """The repository, ref and directory for a source within ``allowed_sources``."""
+        resolved = resolve_source(source, ref, path)
+        policy.require_allowed(resolved.url)
+        return resolved
 
     async def refuse_when_full(user_id: str | None, scope: SkillScope, names: list[str]) -> None:
         """Save a clone when the principal is plainly full; the store's check is the authority."""
@@ -332,24 +370,29 @@ def create_skill_marketplace_router(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-    async def require_browsable(url: str, ref: str | None) -> None:
-        """With URL installs off, a repository must be a listed source to fetch from."""
+    async def require_browsable(url: str, ref: str | None, paths: list[str]) -> None:
+        """With URL installs off, the repository must be listed at one of *paths*."""
         if policy.allow_url_install:
             return
-        if await asyncio.to_thread(skill_store.find_source, url, ref) is None:
+
+        def listed() -> bool:
+            return any(skill_store.find_source(url, ref, path) is not None for path in paths)
+
+        if not await asyncio.to_thread(listed):
             raise OmnigentError(
                 "Installing from a URL is disabled on this server; "
                 "choose a repository from the sources list.",
                 code=ErrorCode.FORBIDDEN,
             )
 
-    def checked(skill: PackagedSkill) -> None:
+    def checked(skill: PackagedSkill) -> UnpackedSize:
         """Validate a tarball and its stored values before anything is written."""
         try:
-            validate_skill_tarball(skill.tarball)
+            size = validate_skill_tarball(skill.tarball)
             _check_metadata(skill.entry.name, skill.entry.display_name, skill.entry.description)
         except (SkillTarballError, SkillValueError) as exc:
             raise _invalid(exc) from None
+        return size
 
     # ── sources ──
 
@@ -377,15 +420,16 @@ def create_skill_marketplace_router(
         user_id = require_user(request, auth_provider)
         await _require_admin(user_id, permission_store)
         try:
-            url, ref = resolve_allowed(body.source, body.ref)
+            resolved = resolve_allowed(body.source, body.ref, body.path)
         except GitSourceError as exc:
             raise _invalid(exc) from None
         try:
             source = await asyncio.to_thread(
                 skill_store.add_source,
-                url=url,
-                ref=ref,
-                name=body.name or repository_label(url),
+                url=resolved.url,
+                ref=resolved.ref,
+                path=resolved.path,
+                name=body.name or _source_label(resolved.url, resolved.path),
                 created_by=user_id,
             )
         except SkillValueError as exc:
@@ -400,7 +444,7 @@ def create_skill_marketplace_router(
         source = await asyncio.to_thread(skill_store.get_source, source_id)
         if source is None:
             raise OmnigentError("Skill source not found", code=ErrorCode.NOT_FOUND)
-        if policy.is_configured(source.url, source.ref):
+        if policy.is_configured(source.url, source.ref, source.path):
             raise OmnigentError(
                 "This source is set in the server config and cannot be removed here.",
                 code=ErrorCode.FORBIDDEN,
@@ -422,7 +466,12 @@ def create_skill_marketplace_router(
             # A source added under a looser policy is refused once it is outside it.
             policy.require_allowed(source.url)
             fetched = await fetch(
-                user_id, fetcher(request).catalog, source.url, source.ref, refresh=refresh
+                user_id,
+                fetcher(request).catalog,
+                source.url,
+                source.ref,
+                path=source.path,
+                refresh=refresh,
             )
         except GitSourceError as exc:
             raise _invalid(exc) from None
@@ -435,9 +484,11 @@ def create_skill_marketplace_router(
         """The skills an arbitrary GitHub repository offers (the Add from URL path)."""
         user_id = require_user(request, auth_provider)
         try:
-            url, ref = resolve_allowed(body.source, body.ref)
-            await require_browsable(url, ref)
-            fetched = await fetch(user_id, fetcher(request).catalog, url, ref)
+            resolved = resolve_allowed(body.source, body.ref, body.path)
+            await require_browsable(resolved.url, resolved.ref, [resolved.path])
+            fetched = await fetch(
+                user_id, fetcher(request).catalog, resolved.url, resolved.ref, path=resolved.path
+            )
         except GitSourceError as exc:
             raise _invalid(exc) from None
         return _catalog_response(fetched, await _installed_among(skill_store, user_id, fetched))
@@ -472,21 +523,23 @@ def create_skill_marketplace_router(
             await _require_admin(user_id, permission_store)
         names = list(dict.fromkeys(body.names))
         try:
-            url, ref = resolve_allowed(body.source, body.ref)
-            await require_browsable(url, ref)
+            resolved = resolve_allowed(body.source, body.ref, body.path)
+            url, ref = resolved.url, resolved.ref
+            await require_browsable(url, ref, [resolved.path])
             await refuse_when_full(user_id, body.scope, names)
-            commit, packaged = await fetch(user_id, fetcher(request).package, url, ref, names)
+            commit, packaged = await fetch(
+                user_id, fetcher(request).package, url, ref, names, path=resolved.path
+            )
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        for skill in packaged:
-            checked(skill)
+        sizes = [checked(skill) for skill in packaged]
         # Every tarball is stored first; the rows then commit in one transaction
         # under the principal's lock, so a refusal leaves no row and no new object.
         items: list[SkillInstall] = []
         # Every location is unique to this request, so no other row can point at one.
         created: list[str] = []
         try:
-            for skill in packaged:
+            for skill, size in zip(packaged, sizes, strict=True):
                 location = _skill_location(skill.entry.name, body.scope, user_id)
                 created.append(location)
                 await asyncio.to_thread(artifact_store.put, location, skill.tarball)
@@ -500,7 +553,8 @@ def create_skill_marketplace_router(
                         commit=commit,
                         path=skill.entry.path,
                         bundle_location=location,
-                        bundle_bytes=len(skill.tarball),
+                        bundle_bytes=size.bytes,
+                        bundle_entries=size.entries,
                         user_invocable=skill.entry.user_invocable,
                     )
                 )
@@ -568,20 +622,26 @@ def create_skill_marketplace_router(
 
     @router.post("/installed-skills/{skill_id}/update", dependencies=mutating[:1])
     async def update_installed_skill(request: Request, skill_id: str) -> InstalledSkillObject:
-        """Refetch the skill from its repository at the same ref."""
+        """Refetch the skill from its directory in its repository, at the same ref."""
         user_id = require_user(request, auth_provider)
         skill = await _load(skill_id, user_id)
         await _require_can_mutate(skill, user_id, permission_store)
         try:
             policy.require_allowed(skill.source_url)
-            await require_browsable(skill.source_url, skill.ref)
+            # Any listed source whose directory holds the skill's.
+            await require_browsable(skill.source_url, skill.ref, _ancestors(skill.path))
             commit, packaged = await fetch(
-                user_id, fetcher(request).package, skill.source_url, skill.ref, [skill.name]
+                user_id,
+                fetcher(request).package,
+                skill.source_url,
+                skill.ref,
+                [skill.name],
+                path=skill.path,
             )
         except GitSourceError as exc:
             raise _invalid(exc) from None
         fresh = packaged[0]
-        checked(fresh)
+        size = checked(fresh)
         location = _skill_location(skill.name, skill.scope, skill.owner_user_id)
         await asyncio.to_thread(artifact_store.put, location, fresh.tarball)
         try:
@@ -590,7 +650,8 @@ def create_skill_marketplace_router(
                 skill.id,
                 commit=commit,
                 bundle_location=location,
-                bundle_bytes=len(fresh.tarball),
+                bundle_bytes=size.bytes,
+                bundle_entries=size.entries,
                 description=fresh.entry.description,
                 display_name=fresh.entry.display_name,
                 path=fresh.entry.path,

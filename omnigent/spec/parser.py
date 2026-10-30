@@ -64,7 +64,7 @@ from omnigent.spec.types import (
     ToolGroupsConfig,
     ToolsConfig,
 )
-from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
+from omnigent.spec.validator import is_valid_skill_name
 
 _log = logging.getLogger(__name__)
 
@@ -2714,11 +2714,6 @@ def skill_matches_names(spec: SkillSpec, names: Collection[str]) -> bool:
     return spec.name in names or (spec.display_name is not None and spec.display_name in names)
 
 
-def _is_valid_bundled_skill_name(name: str) -> bool:
-    """Whether *name* passes the bundled-skill name validation."""
-    return bool(_SKILL_NAME_PATTERN.match(name)) and len(name) <= _SKILL_NAME_MAX_LEN
-
-
 def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
     """
     Keep the frontmatter name of bundled skills whose directory is not a valid name.
@@ -2734,8 +2729,8 @@ def _with_legacy_skill_names(skills: list[SkillSpec]) -> list[SkillSpec]:
     return [
         replace(skill, name=skill.display_name, display_name=None)
         if skill.display_name is not None
-        and not _is_valid_bundled_skill_name(skill.name)
-        and _is_valid_bundled_skill_name(skill.display_name)
+        and not is_valid_skill_name(skill.name)
+        and is_valid_skill_name(skill.display_name)
         else skill
         for skill in skills
     ]

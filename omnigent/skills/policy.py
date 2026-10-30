@@ -11,6 +11,8 @@ also stops serving skills that were installed under a looser policy.
       sources:                 # seeded at startup, read-only in the UI
         - url: https://github.com/acme/skills
           ref: v1.4.0
+        - url: github.com/acme/monorepo
+          path: team-a         # index this directory instead of the root
       allowed_sources:         # host/owner/repo globs; empty = any
         - github.com/acme/*
         - github.acme.internal/*/*
@@ -18,6 +20,10 @@ also stops serving skills that were installed under a looser policy.
       credentials:             # sent only to a source both lists allow
         - match: github.acme.internal/*/*
           token_env: SKILLS_GHE_TOKEN
+      limits:                  # per clone; clones are sparse, so these bound
+        checkout_mb: 500       # the checked-out part of a repository
+        checkout_entries: 20000
+        clone_timeout_s: 300
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
-from omnigent.skills.git_source import GitSourceError, parse_github_source
+from omnigent.skills.git_source import GitSourceError, normalize_source_path, parse_github_source
+from omnigent.skills.limits import DEFAULT_CLONE_LIMITS, MIB, CloneLimits
 
 _logger = logging.getLogger(__name__)
 
@@ -48,6 +55,8 @@ class ConfiguredSource:
     url: str
     ref: str | None
     name: str | None
+    # The repository directory the catalog is indexed from; "" for the root.
+    path: str = ""
 
 
 @dataclass(frozen=True)
@@ -93,6 +102,7 @@ class SkillsMarketplacePolicy:
     allowed_sources: tuple[str, ...] | None = None
     allow_url_install: bool = True
     credentials: tuple[SourceCredential, ...] = ()
+    clone_limits: CloneLimits = DEFAULT_CLONE_LIMITS
 
     def allows(self, clone_url: str) -> bool:
         """Whether ``allowed_sources`` admits the repository."""
@@ -106,9 +116,9 @@ class SkillsMarketplacePolicy:
         if not self.allows(clone_url):
             raise SkillPolicyError(f"{clone_url} is not an allowed skill source on this server.")
 
-    def is_configured(self, url: str, ref: str | None) -> bool:
-        """Whether the operator listed this exact repository and ref."""
-        return any(s.url == url and s.ref == ref for s in self.sources)
+    def is_configured(self, url: str, ref: str | None, path: str = "") -> bool:
+        """Whether the operator listed this exact repository, ref and directory."""
+        return any(s.url == url and s.ref == ref and s.path == path for s in self.sources)
 
     def token_for(self, clone_url: str) -> str | None:
         """The token for a repository both ``allowed_sources`` and a credential match.
@@ -161,6 +171,7 @@ class SkillsMarketplacePolicy:
             allowed_sources=_parse_allowed_sources(raw.get("allowed_sources")),
             allow_url_install=allow_url_install,
             credentials=tuple(_parse_credentials(raw.get("credentials"))),
+            clone_limits=_parse_limits(raw.get("limits")),
         )
 
 
@@ -189,14 +200,51 @@ def _parse_sources(raw: Any) -> list[ConfiguredSource]:
             continue
         ref = item.get("ref")
         name = item.get("name")
+        raw_path = item.get("path")
+        try:
+            path = normalize_source_path(raw_path if isinstance(raw_path, str) else parsed.subpath)
+        except GitSourceError as exc:
+            _logger.warning("%s.sources entry %r: %s", CONFIG_KEY, entry, exc)
+            continue
         sources.append(
             ConfiguredSource(
                 url=parsed.clone_url,
                 ref=(str(ref).strip() or None) if ref is not None else parsed.ref,
                 name=name.strip() or None if isinstance(name, str) else None,
+                path=path,
             )
         )
     return sources
+
+
+# ``limits`` key -> (CloneLimits field, multiplier from the configured unit).
+_LIMIT_KEYS = {
+    "checkout_mb": ("checkout_bytes", MIB),
+    "checkout_entries": ("checkout_entries", 1),
+    "clone_timeout_s": ("timeout_s", 1),
+}
+
+
+def _parse_limits(raw: Any) -> CloneLimits:
+    """Operator overrides for one clone's budgets; a bad value keeps that default."""
+    if raw is None:
+        return DEFAULT_CLONE_LIMITS
+    if not isinstance(raw, Mapping):
+        _logger.warning("%s.limits must be a mapping; using the defaults", CONFIG_KEY)
+        return DEFAULT_CLONE_LIMITS
+    values: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in _LIMIT_KEYS:
+            _logger.warning("%s.limits.%s is not a known limit; ignoring it", CONFIG_KEY, key)
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+            _logger.warning(
+                "%s.limits.%s must be a positive number; using the default", CONFIG_KEY, key
+            )
+            continue
+        field, unit = _LIMIT_KEYS[key]
+        values[field] = int(value * unit) if field != "timeout_s" else float(value)
+    return CloneLimits(**values)
 
 
 def _parse_allowed_sources(raw: Any) -> tuple[str, ...] | None:

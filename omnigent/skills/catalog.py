@@ -17,7 +17,7 @@ import json
 import os
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
 from omnigent.skills.limits import (
@@ -30,10 +30,11 @@ from omnigent.skills.limits import (
     MAX_SKILL_MD_BYTES,
 )
 from omnigent.spec.parser import _parse_skill
+from omnigent.spec.validator import is_valid_skill_name
 
 MARKETPLACE_MANIFEST = ".claude-plugin/marketplace.json"
 SKILL_ROOTS = ("skills", ".agents/skills", ".claude/skills")
-# Portable command names become directory names in the launch overlay.
+# Marketplace plugin names; skill names follow the runner's own rule instead.
 _NAME_RE = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_NAME_CHARS}}}")
 
 
@@ -163,40 +164,56 @@ def _entries_under(
     for skill_dir in _candidate_skill_dirs(skills_dir, root, skipped):
         if not budget.take():
             return
-        rel = skill_dir.relative_to(root).as_posix()
-        manifest = skill_dir / "SKILL.md"
-        if manifest.is_symlink() or not _inside(root, manifest):
-            skipped.append(f"{rel}: SKILL.md is a link; not followed")
-            continue
-        if not _regular_file(manifest, MAX_SKILL_MD_BYTES):
-            skipped.append(f"{rel}: SKILL.md is missing, not a regular file, or too large")
-            continue
-        try:
-            spec = _parse_skill(manifest)
-        except Exception as exc:  # noqa: BLE001 — a bad SKILL.md drops one entry, not the catalog
-            skipped.append(f"{rel}: {exc}")
-            continue
-        if not _NAME_RE.fullmatch(spec.name):
-            skipped.append(f"{rel}: invalid command name")
-            continue
-        if len(spec.description) > MAX_DESCRIPTION_CHARS or len(rel) > MAX_PATH_CHARS:
-            skipped.append(f"{rel}: description or path is too long")
-            continue
-        display_name = spec.display_name
-        if display_name is not None and len(display_name) > MAX_DISPLAY_NAME_CHARS:
-            skipped.append(f"{rel}: display name is too long")
-            continue
-        yield CatalogEntry(
-            name=spec.name,
-            display_name=display_name,
-            description=spec.description,
-            path=str(PurePosixPath(rel)),
-            plugin=plugin,
-            user_invocable=spec.user_invocable,
+        entry = _entry(skill_dir, root, plugin, skipped)
+        if entry is not None:
+            yield entry
+
+
+def _entry(
+    skill_dir: Path, root: Path, plugin: str | None, skipped: list[str]
+) -> CatalogEntry | None:
+    """The catalog entry for one skill directory, or ``None`` with the reason in *skipped*."""
+    rel = skill_dir.relative_to(root).as_posix()
+    manifest = skill_dir / "SKILL.md"
+    if manifest.is_symlink() or not _inside(root, manifest):
+        skipped.append(f"{rel}: SKILL.md is a link; not followed")
+        return None
+    if not _regular_file(manifest, MAX_SKILL_MD_BYTES):
+        skipped.append(f"{rel}: SKILL.md is missing, not a regular file, or too large")
+        return None
+    try:
+        spec = _parse_skill(manifest)
+    except Exception as exc:  # noqa: BLE001 — a bad SKILL.md drops one entry, not the catalog
+        skipped.append(f"{rel}: {exc}")
+        return None
+    # The name becomes the skill's directory in every session's bundle, and
+    # one the runner refuses would fail the whole spec, not just this skill.
+    if not is_valid_skill_name(spec.name):
+        skipped.append(
+            f"{rel}: {spec.name!r} is not a valid skill name "
+            "(lowercase letters, digits and hyphens, at most 64 characters)"
         )
+        return None
+    if len(spec.description) > MAX_DESCRIPTION_CHARS or len(rel) > MAX_PATH_CHARS:
+        skipped.append(f"{rel}: description or path is too long")
+        return None
+    display_name = spec.display_name
+    if display_name is not None and len(display_name) > MAX_DISPLAY_NAME_CHARS:
+        skipped.append(f"{rel}: display name is too long")
+        return None
+    return CatalogEntry(
+        name=spec.name,
+        display_name=display_name,
+        description=spec.description,
+        path=str(PurePosixPath(rel)),
+        plugin=plugin,
+        user_invocable=spec.user_invocable,
+    )
 
 
-def index_checkout(root: Path, *, skipped: list[str] | None = None) -> list[CatalogEntry]:
+def index_checkout(
+    root: Path, *, skipped: list[str] | None = None, prefix: str = ""
+) -> list[CatalogEntry]:
     """Every skill under *root*, root-level layouts first, then marketplace plugins.
 
     The first occurrence of a name wins, so a root skill shadows a plugin's
@@ -204,6 +221,11 @@ def index_checkout(root: Path, *, skipped: list[str] | None = None) -> list[Cata
     *skipped* as human-readable lines. At most :data:`MAX_CATALOG_ENTRIES`
     manifests are opened, so a repository of ten thousand skills costs the
     same as one of five hundred.
+
+    :param prefix: Where *root* sits in the repository (a source's directory,
+        e.g. ``"team-a"``); entry paths are relative to the repository root.
+        A directory that is itself a skill (a link to one skill) is that
+        skill's catalog.
     """
     notes: list[str] = [] if skipped is None else skipped
     seen: set[str] = set()
@@ -215,8 +237,19 @@ def index_checkout(root: Path, *, skipped: list[str] | None = None) -> list[Cata
             if entry.name in seen:
                 continue
             seen.add(entry.name)
+            if prefix:
+                path = str(PurePosixPath(prefix, entry.path))
+                if len(path) > MAX_PATH_CHARS:
+                    notes.append(f"{path}: path is too long")
+                    continue
+                entry = replace(entry, path=path)
             out.append(entry)
 
+    manifest = root / "SKILL.md"
+    if prefix and (manifest.exists() or manifest.is_symlink()):
+        entry = _entry(root, root, None, notes)
+        add(iter([entry] if entry is not None else []))
+        return out
     for rel in SKILL_ROOTS:
         add(_entries_under(root / rel, root, None, notes, budget))
     if not budget.exhausted:

@@ -38,6 +38,7 @@ from omnigent.entities.skill import SkillScope
 from omnigent.stores.skill_store import (
     DEFAULT_PAGE,
     MAX_DELIVERY_BYTES_PER_SCOPE,
+    MAX_DELIVERY_ENTRIES_PER_SCOPE,
     MAX_DESCRIPTION_CHARS,
     MAX_DISPLAY_NAME_CHARS,
     MAX_INSTALLED_PER_OWNER,
@@ -46,6 +47,7 @@ from omnigent.stores.skill_store import (
     MAX_PAGE,
     MAX_PATH_CHARS,
     MAX_REF_CHARS,
+    MAX_SOURCE_PATH_CHARS,
     MAX_URL_CHARS,
     MAX_USER_ID_CHARS,
     InstallResult,
@@ -99,6 +101,25 @@ def _who(scope: SkillScope) -> str:
     return "everyone" if scope == "org" else "a user"
 
 
+def _check_delivery_budget(
+    bytes_after: int, entries_after: int, max_bytes: int, max_entries: int, what: str
+) -> None:
+    """Refuse a write that would leave a principal's enabled skills past what a runner unpacks.
+
+    :param what: How the message starts, e.g. ``"Installed skills for everyone"``.
+    :raises SkillQuotaError: When either total is over its budget.
+    """
+    if bytes_after > max_bytes:
+        raise SkillQuotaError(
+            f"{what} would exceed {max_bytes // (1024 * 1024)} MB unpacked together; "
+            "remove or disable some first."
+        )
+    if entries_after > max_entries:
+        raise SkillQuotaError(
+            f"{what} would exceed {max_entries} files together; remove or disable some first."
+        )
+
+
 def _source_entity(row: SqlSkillSource) -> SkillSource:
     return SkillSource(
         id=row.id,
@@ -107,6 +128,7 @@ def _source_entity(row: SqlSkillSource) -> SkillSource:
         name=row.name,
         created_by=row.created_by,
         created_at=row.created_at,
+        path=row.path,
     )
 
 
@@ -124,6 +146,7 @@ def _skill_entity(row: SqlInstalledSkill) -> InstalledSkill:
         owner_user_id=row.owner_user_id,
         bundle_location=row.bundle_location,
         bundle_bytes=row.bundle_bytes,
+        bundle_entries=row.bundle_entries,
         enabled=bool(row.enabled),
         user_invocable=bool(row.user_invocable),
         installed_by=row.installed_by,
@@ -143,12 +166,13 @@ def _chunks(values: Iterable[str], size: int) -> Iterable[list[str]]:
         yield batch
 
 
-def _source_identity(url: str, ref: str | None):  # type: ignore[no-untyped-def]  # Select
+def _source_identity(url: str, ref: str | None, path: str):  # type: ignore[no-untyped-def]  # Select
     """The lookup ``ux_skill_sources_identity`` serves."""
     return select(SqlSkillSource).where(
         SqlSkillSource.workspace_id == current_workspace_id(),
         SqlSkillSource.url == url,
         SqlSkillSource.ref == (DEFAULT_REF if ref is None else ref),
+        SqlSkillSource.path == path,
     )
 
 
@@ -165,21 +189,23 @@ class SqlAlchemySkillStore(SkillStore):
     # ── sources ──────────────────────────────────────────────────────────
 
     def add_source(
-        self, *, url: str, ref: str | None, name: str, created_by: str | None
+        self, *, url: str, ref: str | None, name: str, created_by: str | None, path: str = ""
     ) -> SkillSource:
         check_bound("url", url, MAX_URL_CHARS)
         check_bound("ref", ref, MAX_REF_CHARS)
+        check_bound("path", path, MAX_SOURCE_PATH_CHARS)
         check_bound("name", name, MAX_DISPLAY_NAME_CHARS)
         check_bound("created_by", created_by, MAX_USER_ID_CHARS)
 
         def write(session: Session) -> SkillSource:
-            existing = session.scalar(_source_identity(url, ref))
+            existing = session.scalar(_source_identity(url, ref, path))
             if existing is not None:
                 return _source_entity(existing)
             row = SqlSkillSource(
                 id=uuid.uuid4().hex,
                 url=url,
                 ref=DEFAULT_REF if ref is None else ref,
+                path=path,
                 name=name,
                 created_by=created_by,
                 created_at=now_epoch(),
@@ -194,9 +220,9 @@ class SqlAlchemySkillStore(SkillStore):
             # Another replica seeded the same source first; it is the one row.
             return run_write_transaction(self._session_immediate, "add_skill_source_retry", write)
 
-    def find_source(self, url: str, ref: str | None) -> SkillSource | None:
+    def find_source(self, url: str, ref: str | None, path: str = "") -> SkillSource | None:
         with self._session("find_skill_source") as session:
-            row = session.scalar(_source_identity(url, ref))
+            row = session.scalar(_source_identity(url, ref, path))
             return None if row is None else _source_entity(row)
 
     def list_sources(
@@ -255,6 +281,7 @@ class SqlAlchemySkillStore(SkillStore):
                         principal=principal,
                         installed_count=0,
                         enabled_bytes=0,
+                        enabled_entries=0,
                         created_at=now_epoch(),
                     )
                 )
@@ -311,9 +338,11 @@ class SqlAlchemySkillStore(SkillStore):
         installed_by: str | None,
         max_rows: int | None = None,
         max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> list[InstallResult]:
         max_rows = MAX_INSTALLED_PER_OWNER if max_rows is None else max_rows
         max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
+        max_entries = MAX_DELIVERY_ENTRIES_PER_SCOPE if max_entries is None else max_entries
         principal = principal_for(scope, owner_user_id)
         owner = owner_user_id if scope == "user" else None
         check_bound("owner_user_id", owner, MAX_USER_ID_CHARS)
@@ -350,19 +379,20 @@ class SqlAlchemySkillStore(SkillStore):
                     f"At most {max_rows} skills can be installed for {_who(scope)}; "
                     "remove some first."
                 )
-            # A replaced row keeps its enabled flag; only enabled bytes count.
+            # A replaced row keeps its enabled flag; only enabled skills count.
             after = lock.enabled_bytes
+            entries_after = lock.enabled_entries
             for item in items:
                 row = existing.get(item.name)
                 if row is None:
                     after += item.bundle_bytes
+                    entries_after += item.bundle_entries
                 elif row.enabled:
                     after += item.bundle_bytes - row.bundle_bytes
-            if after > max_bytes:
-                raise SkillQuotaError(
-                    f"Installed skills for {_who(scope)} would exceed "
-                    f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
-                )
+                    entries_after += item.bundle_entries - row.bundle_entries
+            _check_delivery_budget(
+                after, entries_after, max_bytes, max_entries, f"Installed skills for {_who(scope)}"
+            )
             now = now_epoch()
             results: list[InstallResult] = []
             for item in items:
@@ -396,11 +426,13 @@ class SqlAlchemySkillStore(SkillStore):
                 row.path = item.path
                 row.bundle_location = item.bundle_location
                 row.bundle_bytes = item.bundle_bytes
+                row.bundle_entries = item.bundle_entries
                 row.user_invocable = item.user_invocable
                 session.flush()
                 results.append(InstallResult(skill=_skill_entity(row), replaced_location=replaced))
             lock.installed_count += len(adding)
             lock.enabled_bytes = after
+            lock.enabled_entries = entries_after
             session.flush()
             return results
 
@@ -482,13 +514,16 @@ class SqlAlchemySkillStore(SkillStore):
         commit: str | None,
         bundle_location: str,
         bundle_bytes: int,
+        bundle_entries: int,
         description: str,
         display_name: str | None,
         path: str | None = None,
         user_invocable: bool = True,
         max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> InstallResult | None:
         max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
+        max_entries = MAX_DELIVERY_ENTRIES_PER_SCOPE if max_entries is None else max_entries
         check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
         check_bound("description", description, MAX_DESCRIPTION_CHARS)
         check_bound("bundle_location", bundle_location, MAX_LOCATION_CHARS)
@@ -502,15 +537,20 @@ class SqlAlchemySkillStore(SkillStore):
             replaced = row.bundle_location if row.bundle_location != bundle_location else None
             if row.enabled:
                 after = lock.enabled_bytes - row.bundle_bytes + bundle_bytes
-                if after > max_bytes:
-                    raise SkillQuotaError(
-                        f"Updating {row.name} would take the installed skills past "
-                        f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
-                    )
+                entries_after = lock.enabled_entries - row.bundle_entries + bundle_entries
+                _check_delivery_budget(
+                    after,
+                    entries_after,
+                    max_bytes,
+                    max_entries,
+                    f"Updating {row.name}: the installed skills",
+                )
                 lock.enabled_bytes = after
+                lock.enabled_entries = entries_after
             row.commit = commit
             row.bundle_location = bundle_location
             row.bundle_bytes = bundle_bytes
+            row.bundle_entries = bundle_entries
             row.description = description
             row.display_name = display_name
             row.user_invocable = user_invocable
@@ -523,9 +563,15 @@ class SqlAlchemySkillStore(SkillStore):
         return run_write_transaction(self._session_immediate, "update_installed_skill", write)
 
     def set_enabled(
-        self, skill_id: str, enabled: bool, *, max_bytes: int | None = None
+        self,
+        skill_id: str,
+        enabled: bool,
+        *,
+        max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> InstalledSkill | None:
         max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
+        max_entries = MAX_DELIVERY_ENTRIES_PER_SCOPE if max_entries is None else max_entries
 
         def write(session: Session) -> InstalledSkill | None:
             locked = self._locked_skill(session, skill_id)
@@ -534,14 +580,19 @@ class SqlAlchemySkillStore(SkillStore):
             lock, row = locked
             if enabled and not row.enabled:
                 after = lock.enabled_bytes + row.bundle_bytes
-                if after > max_bytes:
-                    raise SkillQuotaError(
-                        f"Enabling {row.name} would take the installed skills past "
-                        f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
-                    )
+                entries_after = lock.enabled_entries + row.bundle_entries
+                _check_delivery_budget(
+                    after,
+                    entries_after,
+                    max_bytes,
+                    max_entries,
+                    f"Enabling {row.name}: the installed skills",
+                )
                 lock.enabled_bytes = after
+                lock.enabled_entries = entries_after
             elif row.enabled and not enabled:
                 lock.enabled_bytes -= row.bundle_bytes
+                lock.enabled_entries -= row.bundle_entries
             row.enabled = enabled
             row.updated_at = now_epoch()
             session.flush()
@@ -559,6 +610,7 @@ class SqlAlchemySkillStore(SkillStore):
             lock.installed_count -= 1
             if row.enabled:
                 lock.enabled_bytes -= row.bundle_bytes
+                lock.enabled_entries -= row.bundle_entries
             session.delete(row)
             session.flush()
             return entity

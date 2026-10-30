@@ -9,6 +9,8 @@ export interface SkillSource {
   name: string;
   created_by: string | null;
   created_at: number;
+  /** Repository directory its catalog is indexed from; empty for the root. Absent on older servers. */
+  path?: string;
   /** Listed in the server config: seeded at startup and not removable here. */
   managed: boolean;
 }
@@ -29,6 +31,8 @@ export interface CatalogSkill {
 export interface SkillCatalog {
   url: string;
   ref: string | null;
+  /** Directory the catalog was indexed from; pass it back on install. Absent on older servers. */
+  path?: string;
   commit: string | null;
   skills: CatalogSkill[];
   skipped: string[];
@@ -139,6 +143,7 @@ export async function listInstalledSkills(
 export async function installSkills(input: {
   source: string;
   ref?: string | null;
+  path?: string | null;
   names: string[];
   scope?: SkillScope;
 }): Promise<InstalledSkill[]> {

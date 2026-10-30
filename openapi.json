@@ -3673,6 +3673,18 @@
             "title": "Names",
             "type": "array"
           },
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
           "ref": {
             "anyOf": [
               {
@@ -3760,6 +3772,11 @@
           "bundle_bytes": {
             "format": "int64",
             "title": "Bundle Bytes",
+            "type": "integer"
+          },
+          "bundle_entries": {
+            "format": "int64",
+            "title": "Bundle Entries",
             "type": "integer"
           },
           "commit": {
@@ -3884,6 +3901,7 @@
           "scope",
           "owner_user_id",
           "bundle_bytes",
+          "bundle_entries",
           "enabled",
           "installed_by",
           "installed_at",
@@ -10043,6 +10061,18 @@
       },
       "SkillCatalogRequest": {
         "properties": {
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
           "ref": {
             "anyOf": [
               {
@@ -10080,6 +10110,11 @@
               }
             ],
             "title": "Commit"
+          },
+          "path": {
+            "default": "",
+            "title": "Path",
+            "type": "string"
           },
           "ref": {
             "anyOf": [
@@ -10155,7 +10190,7 @@
         "type": "object"
       },
       "SkillSourceCreate": {
-        "description": "`source` is `owner/repo` or a GitHub URL; `ref` a branch or tag.",
+        "description": "`source` is `owner/repo` or a GitHub URL; `ref` a branch or tag.\n\n`path` is the directory to index; a `/tree/<ref>/<dir>` link supplies it too.",
         "properties": {
           "name": {
             "anyOf": [
@@ -10168,6 +10203,18 @@
               }
             ],
             "title": "Name"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
           },
           "ref": {
             "anyOf": [
@@ -10257,6 +10304,11 @@
           },
           "name": {
             "title": "Name",
+            "type": "string"
+          },
+          "path": {
+            "default": "",
+            "title": "Path",
             "type": "string"
           },
           "ref": {
@@ -14022,7 +14074,7 @@
     },
     "/v1/installed-skills/{skill_id}/update": {
       "post": {
-        "description": "Refetch the skill from its repository at the same ref.",
+        "description": "Refetch the skill from its directory in its repository, at the same ref.",
         "operationId": "update_installed_skill_v1_installed_skills__skill_id__update_post",
         "parameters": [
           {

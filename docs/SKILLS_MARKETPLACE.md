@@ -27,14 +27,24 @@ Two layouts are read:
 A root-level skill shadows a plugin skill of the same name. A skill whose
 frontmatter carries `user-invocable: false` installs and is delivered like any
 other, but is never offered in a slash menu, exactly as a bundled internal
-skill is not. Only GitHub
-repositories are supported, written as `owner/repo`, a `github.com` URL, or a
+skill is not. A skill's directory name is its command and must be a valid
+bundled skill name (lowercase letters, digits and hyphens, at most 64
+characters); one that is not is listed as skipped, since a runner would refuse
+the whole agent over it. Only GitHub
+repositories are supported, written as `owner/repo`, `host/owner/repo`, a
+`github.com` URL, or a
 URL on a GitHub Enterprise Server host the server knows (`GH_HOST`,
 `OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS`, or a host `gh` is signed in to),
 optionally at a branch or tag (`/tree/<ref>`, or the ref field in the UI). An
 Enterprise host is kept all the way to the clone URL and shown as
 `host/owner/repo`; a URL on an unknown host is refused, never rewritten onto
 github.com.
+
+A link into a directory (`/tree/<ref>/team-a`, or the `path` field of the
+API and of a configured source) makes that directory the catalog root, so a
+monorepo can keep each team's skills under its own folder. A link to one
+skill's directory lists just that skill. A source is one repository, ref and
+directory: the same repository at its root and at `team-a` are two sources.
 
 ## How a skill reaches a session
 
@@ -59,22 +69,27 @@ include them.
   it (a managed host, or the owner's own host); someone the session is
   shared with downloads the agent's own files without them, and sees the
   owner's installs, not their own, in that session's slash menu.
-- Each user can hold at most 200 installed skills and 100 MB of enabled
-  skill tarballs, and so can **Everyone**; the totals live on a lock row per
-  owner and every install, update, enable, disable and removal adjusts them
-  in the same transaction, so a check is one locked read, two requests
-  cannot overrun the budget on any engine, and a session's bundle (one
-  user's set plus Everyone's) always fits. An install of several skills is
-  all or nothing.
-  Delivery keeps a 200 MB backstop that answers with a message rather than
-  a thinner bundle.
+- Each user can hold at most 200 installed skills, and their enabled skills
+  at most 200 MB and 4,000 files unpacked; so can **Everyone**. Those budgets
+  are two fifths of what a runner unpacks from a session's bundle (500 MB and
+  10,000 entries), so one user's set plus Everyone's leaves room for the
+  agent's own files. The totals live on a lock row per owner and every
+  install, update, enable, disable and removal adjusts them in the same
+  transaction, so a check is one locked read and two requests cannot overrun
+  the budget on any engine. An install of several skills is all or nothing.
+  Delivery keeps a backstop that answers with a message rather than a
+  thinner bundle, including when the agent's files and its skills together
+  would exceed what the runner unpacks.
 - A session that runs a child agent gets installed skills under that child's
   own directory (`agents/<dir>/skills/`), under the child's `skills:` filter,
   since that is where the runner reads the child's skills from.
 - Before launch the menu follows runtime precedence: a bundled skill wins its
   name, then an installed skill, then a host skill of the same name.
-- Only administrators add or remove browsable sources. Deleting a source does
-  not remove skills already installed from it.
+- Only administrators add or remove browsable sources and install for
+  Everyone. The single local user of `omnigent server` is one: it signs in
+  as the reserved `local` user, which every database creates as an
+  administrator. Deleting a source
+  does not remove skills already installed from it.
 - Anyone can preview a repository by URL and install from it for themselves,
   unless `allow_url_install` is off.
 
@@ -95,6 +110,8 @@ skills_marketplace:
     - url: https://github.com/acme/skills
       ref: v1.4.0
       name: Acme skills    # optional
+    - url: github.com/acme/monorepo
+      path: team-a         # index this directory instead of the root
   allowed_sources:         # host/owner/repo globs; empty = any
     - github.com/acme/*
     - github.acme.internal/*/*
@@ -102,6 +119,10 @@ skills_marketplace:
   credentials:
     - match: github.acme.internal/*/*
       token_env: SKILLS_GHE_TOKEN
+  limits:                  # per clone; each key is optional
+    checkout_mb: 500
+    checkout_entries: 20000
+    clone_timeout_s: 300
 ```
 
 - `sources` are added to the browse list when the server starts (an existing
@@ -129,6 +150,9 @@ skills_marketplace:
   runner, a session or a user; what it can read on that host is whatever
   the token itself grants, so issue one scoped to read-only contents of the
   repositories you list. The file itself never holds a secret.
+- `limits` change one clone's budgets: what its checkout may occupy on disk
+  and in files and directories, and how long all of its git steps may take.
+  A value that is not a positive number keeps the default, with a warning.
 
 `GET /v1/info` reports `skills_marketplace.url_install` so the Settings page
 can hide the URL form.
@@ -138,7 +162,10 @@ can hide the URL form.
 Repositories are fetched the way `omnigent agent add` fetches them: a shallow
 clone with git hooks, submodules, credential prompts and LFS disabled, and the
 checkout is packed without following symlinks and without expanding `${VAR}`
-references. A skill is markdown and supporting files the harness reads; it
+references. The marketplace's clones are also partial and sparse
+(`--filter=blob:none`): a catalog checks out only the `SKILL.md` files and the
+marketplace manifest under its directory, and an install only the chosen
+skills' directories, so a large monorepo costs what those files cost. A skill is markdown and supporting files the harness reads; it
 runs with whatever the harness already allows. Every card and installed entry
 shows the repository and the commit it was taken from.
 
@@ -148,9 +175,12 @@ ssh or gpg settings, so neither git nor libcurl can find the operator's
 repository through the operator's credentials, only through a token the
 [operator policy](#operator-policy) scopes to it. A clone is killed once it
 occupies more than 500 MB on disk (allocated blocks, not just file sizes) or
-20,000 files and directories, and a checkout that crossed either budget just
-before finishing is refused the same way; each account has one fetch in
-flight at a time and the server two. Packaging limits are checked while packing, before
+20,000 files and directories, or runs past 300 seconds (all three are
+[configurable](#operator-policy)), and a checkout that crossed either budget
+just before finishing is refused the same way. git runs in its own process
+group, so a kill also stops the helpers that hold its pipes, and a transfer
+slower than 1 KB/s for 30 seconds fails rather than waiting out the timeout.
+Each account has one fetch in flight at a time and the server two. Packaging limits are checked while packing, before
 more is read: at most 20 skills per request, 20 MB and 2,000 files per
 skill, and 100 MB of compressed tarballs per request (the stored and
 delivered form). A catalog opens at most 500 manifests, whatever the
@@ -161,9 +191,15 @@ so the same skills give the same bytes and the runner's cache hits.
 Frontmatter is read with YAML anchors refused and a non-scalar `name` or
 `description` rejected rather than stringified, so a small manifest cannot
 expand into a large structure in the server's memory. An install stores its
-tarballs before writing rows; if a later store or the write is refused, the
-objects that request created are dropped, while an object an earlier row
-already points at is left alone.
+tarballs, each under a key of its own, before writing rows; if a later store
+or the write is refused, the objects that request created are dropped, and no
+other row can point at them.
+
+On Linux, a `linux_bwrap` sandbox mounts a private `/tmp`, which hides the
+directory a runner extracts a bundle into. Sandboxed tools are therefore
+granted each bundled skill's directory read-only, and a sandboxed Claude CLI
+the bundle's `skills/` and plugin manifest, so a skill's `scripts/` and
+references stay reachable. This holds for installed and bundled skills alike.
 
 ## API
 
@@ -176,7 +212,7 @@ Under `/v1`, mounted only when the feature is on:
 | `POST /skill-catalog` | Index any GitHub repository (the Add-from-URL path; a listed source only when `allow_url_install` is off) |
 | `GET/POST /installed-skills` | List (paged: `limit`, and `after` set to the previous page's `last_id`, an opaque cursor that survives the row's removal), and install by name from a repository |
 | `PATCH/DELETE /installed-skills/{id}` | Enable or disable, and remove |
-| `POST /installed-skills/{id}/update` | Refetch at the same ref |
+| `POST /installed-skills/{id}/update` | Refetch from the skill's directory at the same ref |
 | `GET /installed-skills/{id}/content` | The stored `SKILL.md` |
 
 `GET /v1/skills` lists installed skills alongside bundled and host skills, with

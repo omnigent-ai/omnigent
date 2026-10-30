@@ -111,6 +111,7 @@ export function useInstallSkills() {
     mutationFn: (input: {
       source: string;
       ref?: string | null;
+      path?: string | null;
       names: string[];
       scope?: SkillScope;
     }) => installSkills(input),

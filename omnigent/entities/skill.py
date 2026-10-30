@@ -16,6 +16,8 @@ class SkillSource:
     :param url: Clone URL, e.g. ``"https://github.com/acme/skills.git"``.
     :param ref: Branch or tag to fetch, or ``None`` for the default branch.
     :param name: Label shown in the UI, e.g. ``"Acme skills"``.
+    :param path: Directory inside the repository the catalog is indexed
+        from, e.g. ``"team-a"``; ``""`` for the repository root.
     :param created_by: User who added it, or ``None`` in single-user mode.
     :param created_at: Unix epoch seconds.
     """
@@ -26,6 +28,7 @@ class SkillSource:
     name: str
     created_by: str | None
     created_at: int
+    path: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,7 +46,9 @@ class InstalledSkill:
     :param scope: ``"user"`` for one user's install, ``"org"`` for everyone.
     :param owner_user_id: The installing user for a user-scoped row, else ``None``.
     :param bundle_location: Artifact-store key of the skill tarball.
-    :param bundle_bytes: Size of that tarball, counted against the owner's delivery budget.
+    :param bundle_bytes: Bytes of its files once unpacked, counted against the
+        owner's delivery budget.
+    :param bundle_entries: Files and directories in its tarball, for the same budget.
     :param enabled: Whether sessions receive it.
     :param user_invocable: Whether its own ``SKILL.md`` offers it to the user;
         an internal orchestration skill is delivered but never listed in a menu.
@@ -69,3 +74,4 @@ class InstalledSkill:
     installed_by: str | None
     installed_at: int
     updated_at: int | None
+    bundle_entries: int = 0

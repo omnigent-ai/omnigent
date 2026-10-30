@@ -146,3 +146,52 @@ def test_repository_key_and_configured_sources() -> None:
     )
     assert policy.is_configured("https://github.com/acme/skills.git", "v1")
     assert not policy.is_configured("https://github.com/acme/skills.git", None)
+
+
+def test_sources_keep_their_directory_and_accept_the_allowed_sources_form() -> None:
+    # host/owner/repo used to parse as owner "github.com", repo "acme", so the
+    # seeded source pointed at a repository that does not exist.
+    policy = SkillsMarketplacePolicy.from_config(
+        {
+            "sources": [
+                "github.com/acme/mono",
+                "https://github.com/acme/mono/tree/main/team-a",
+                {"url": "acme/mono", "path": "team-b/skills"},
+                {"url": "acme/mono", "path": "../etc"},
+            ]
+        }
+    )
+    assert [(s.url, s.ref, s.path) for s in policy.sources] == [
+        ("https://github.com/acme/mono.git", None, ""),
+        ("https://github.com/acme/mono.git", "main", "team-a"),
+        ("https://github.com/acme/mono.git", None, "team-b/skills"),
+    ]
+    assert policy.is_configured("https://github.com/acme/mono.git", "main", "team-a")
+    assert not policy.is_configured("https://github.com/acme/mono.git", "main")
+
+
+def test_clone_limits_are_operator_configurable(caplog: pytest.LogCaptureFixture) -> None:
+    from omnigent.skills.limits import DEFAULT_CLONE_LIMITS, MIB
+
+    assert SkillsMarketplacePolicy.from_config({}).clone_limits == DEFAULT_CLONE_LIMITS
+    with caplog.at_level(logging.WARNING):
+        policy = SkillsMarketplacePolicy.from_config(
+            {
+                "limits": {
+                    "checkout_mb": 2048,
+                    "checkout_entries": 200_000,
+                    "clone_timeout_s": 900,
+                    "clone_timeout": 1,
+                }
+            }
+        )
+    assert (
+        policy.clone_limits.checkout_bytes,
+        policy.clone_limits.checkout_entries,
+        policy.clone_limits.timeout_s,
+    ) == (2048 * MIB, 200_000, 900)
+    assert any("clone_timeout is not a known limit" in r.getMessage() for r in caplog.records)
+    # A value that is not a positive number keeps that default rather than lifting the bound.
+    for bad in (0, -1, True, "1000", None):
+        kept = SkillsMarketplacePolicy.from_config({"limits": {"checkout_entries": bad}})
+        assert kept.clone_limits.checkout_entries == DEFAULT_CLONE_LIMITS.checkout_entries

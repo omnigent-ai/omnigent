@@ -143,3 +143,32 @@ def test_oversized_or_multibyte_frontmatter_is_skipped(plain_repo: Path) -> None
     assert any(
         "skills/huge: SKILL.md is missing, not a regular file, or too large" in n for n in skipped
     )
+
+
+def test_a_name_the_runner_would_refuse_is_skipped(tmp_path: Path) -> None:
+    from tests._helpers.skill_repos import write_skill
+
+    # The runner validates bundled skill names as [a-z0-9-]{1,64}; one name it
+    # refuses fails the whole spec, so every session of that user would break.
+    repo = tmp_path / "repo"
+    write_skill(repo / "skills", "pdf-tools", "PDF tools")
+    write_skill(repo / "skills", "pdf_tools", "Underscored")
+    write_skill(repo / "skills", "Review", "Capitalised")
+    write_skill(repo / "skills", "a" * 65, "Too long")
+    skipped: list[str] = []
+    assert [e.name for e in index_checkout(repo, skipped=skipped)] == ["pdf-tools"]
+    assert len([note for note in skipped if "not a valid skill name" in note]) == 3
+
+
+def test_a_directory_is_indexed_as_its_own_catalog(tmp_path: Path) -> None:
+    from tests._helpers.skill_repos import write_skill
+
+    repo = tmp_path / "mono"
+    write_skill(repo / "team-a" / "skills", "lint", "Lint")
+    write_skill(repo / "team-b" / "skills", "deploy", "Deploy")
+    # Entry paths stay relative to the repository root, so packaging finds them.
+    entries = index_checkout(repo / "team-a", prefix="team-a")
+    assert [(e.name, e.path) for e in entries] == [("lint", "team-a/skills/lint")]
+    # A link to one skill's directory is that skill, not the catalog around it.
+    single = index_checkout(repo / "team-a" / "skills" / "lint", prefix="team-a/skills/lint")
+    assert [(e.name, e.path) for e in single] == [("lint", "team-a/skills/lint")]

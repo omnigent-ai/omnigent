@@ -43,6 +43,7 @@ def test_column_bounds_match_the_schema() -> None:
     assert _string_lengths(SqlSkillSource.__table__) == {
         "url": limits.MAX_URL_CHARS,
         "ref": limits.MAX_REF_CHARS,
+        "path": limits.MAX_SOURCE_PATH_CHARS,
         "name": limits.MAX_DISPLAY_NAME_CHARS,
         "created_by": limits.MAX_USER_ID_CHARS,
     }
@@ -55,3 +56,12 @@ def test_column_bounds_match_the_schema() -> None:
         *_string_lengths(SqlSkillSource.__table__).values(),
     )
     assert widest * 4 < STORED_VALUE_LIMIT_BYTES
+
+
+def test_delivery_budgets_fit_inside_what_a_runner_unpacks() -> None:
+    # A session's bundle carries two principals' skills plus the agent's own
+    # files, and the runner refuses the whole bundle past its unpack limits.
+    assert limits.MAX_DELIVERY_BYTES < limits.RUNNER_UNPACK_BYTES
+    assert limits.MAX_DELIVERY_ENTRIES < limits.RUNNER_UNPACK_ENTRIES
+    assert limits.MAX_SKILL_BYTES <= limits.MAX_DELIVERY_BYTES_PER_SCOPE
+    assert limits.MAX_SKILL_ENTRIES <= limits.MAX_DELIVERY_ENTRIES_PER_SCOPE

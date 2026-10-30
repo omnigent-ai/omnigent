@@ -169,6 +169,63 @@ async def _location(app: FastAPI, skill_id: str) -> str:
 
 
 @pytest.mark.asyncio
+async def test_a_source_directory_is_browsed_installed_and_updated(
+    db_uri: str, tmp_path: Path, runtime_init: None
+) -> None:
+    # A repository directory in the link was dropped, so skills under it could
+    # not be reached and a link to one skill showed the root catalog instead.
+    mono = tmp_path / "mono"
+    write_skill(mono / "skills", "root-only", "Root")
+    write_skill(mono / "team-a" / "skills", "lint", "Lint")
+    app, _ = _build(db_uri, tmp_path)
+    app.state.skill_fetcher = _fetcher(mono)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        created = await client.post(
+            "/v1/skill-sources", json={"source": "https://github.com/acme/mono/tree/main/team-a"}
+        )
+        assert created.status_code == 201, created.text
+        source = created.json()
+        assert (source["path"], source["ref"], source["name"]) == (
+            "team-a",
+            "main",
+            "acme/mono (team-a)",
+        )
+        # The root is a separate source of the same repository and ref.
+        root = await client.post("/v1/skill-sources", json={"source": "acme/mono", "ref": "main"})
+        assert root.json()["id"] != source["id"] and root.json()["path"] == ""
+
+        catalog = (await client.get(f"/v1/skill-sources/{source['id']}/catalog")).json()
+        assert catalog["path"] == "team-a"
+        assert [s["name"] for s in catalog["skills"]] == ["lint"]
+        installed = await client.post(
+            "/v1/installed-skills",
+            json={
+                "source": catalog["url"],
+                "ref": catalog["ref"],
+                "path": catalog["path"],
+                "names": ["lint"],
+            },
+        )
+        assert installed.status_code == 201, installed.text
+        row = installed.json()["data"][0]
+        assert row["path"] == "team-a/skills/lint"
+        updated = await client.post(f"/v1/installed-skills/{row['id']}/update")
+        assert updated.status_code == 200, updated.text
+
+        # A link to one skill's directory previews just that skill.
+        single = await client.post(
+            "/v1/skill-catalog",
+            json={"source": "https://github.com/acme/mono/tree/main/team-a/skills/lint"},
+        )
+        assert [s["name"] for s in single.json()["skills"]] == ["lint"]
+        bad = await client.post(
+            "/v1/skill-catalog", json={"source": "acme/mono", "path": "../etc"}
+        )
+        assert bad.status_code == 400
+
+
+@pytest.mark.asyncio
 async def test_preview_from_url_and_bad_sources(market) -> None:
     client, _app, _ = market
     preview = await client.post(
@@ -239,6 +296,7 @@ async def test_update_cleans_up_after_a_removal_or_another_update_wins(market) -
             commit=None,
             bundle_location="skills/rival.tar.gz",
             bundle_bytes=1,
+            bundle_entries=1,
             description="d",
             display_name=None,
         )
@@ -425,9 +483,32 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
 
 
 @pytest.mark.asyncio
-async def test_authorization_boundaries(
-    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None
+async def test_the_local_single_user_administers_the_marketplace(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # `omnigent server` builds a permission store even for its one local user,
+    # who is in no admins list: that user resolves to the reserved "local"
+    # identity, which the permissions migration creates as an administrator.
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    app, _ = _build(db_uri, tmp_path, auth=True)
+    app.state.skill_fetcher = _fetcher(repo)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        source = await client.post("/v1/skill-sources", json={"source": "acme/skills"})
+        assert source.status_code == 201, source.text
+        org = await client.post(
+            "/v1/installed-skills",
+            json={"source": "acme/skills", "names": ["review"], "scope": "org"},
+        )
+        assert org.status_code == 201, org.text
+        assert (await client.delete(f"/v1/skill-sources/{source.json()['id']}")).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_authorization_boundaries(
+    db_uri: str, tmp_path: Path, repo: Path, runtime_init: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
     app, _ = _build(db_uri, tmp_path, auth=True)
     app.state.skill_fetcher = _fetcher(repo)
     carol = {"X-Forwarded-Email": "carol@example.com"}
@@ -574,6 +655,49 @@ async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
 
 
 @pytest.mark.asyncio
+async def test_installs_and_delivery_hold_to_what_a_runner_unpacks(
+    market, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The runner unpacks a session's bundle within fixed byte and entry limits;
+    # a set of skills past them stopped every session from starting.
+    from omnigent.server import skill_injection
+    from omnigent.stores.skill_store import sqlalchemy_store
+
+    client, _app, artifact_store = market
+    review = (
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+    ).json()["data"][0]
+    # Counted unpacked: SKILL.md and notes.txt, and their bytes rather than the gzip's.
+    skill_md = "---\nname: review\ndescription: Review a diff\n---\nDo review.\n"
+    assert review["bundle_entries"] == 2
+    assert review["bundle_bytes"] == len(skill_md) + len("supporting file\n")
+
+    monkeypatch.setattr(sqlalchemy_store, "MAX_DELIVERY_ENTRIES_PER_SCOPE", 3)
+    over = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert over.status_code == 400 and "would exceed 3 files" in over.text
+    monkeypatch.setattr(sqlalchemy_store, "MAX_DELIVERY_ENTRIES_PER_SCOPE", 4)
+    assert (
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+        )
+    ).status_code == 201
+
+    # The agent's own files count too: the merged bundle must still unpack.
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
+    url = f"/v1/sessions/{session_id}/agent/contents"
+    assert (await client.get(url)).status_code == 200
+    monkeypatch.setattr(skill_injection, "RUNNER_UNPACK_ENTRIES", 4)
+    refused = await client.get(url)
+    assert refused.status_code == 400 and "exceed what a session can unpack" in refused.text
+
+
+@pytest.mark.asyncio
 async def test_a_fetch_in_flight_refuses_a_second_from_the_same_account(market) -> None:
     import asyncio
 
@@ -624,6 +748,7 @@ def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
             path=f"skills/s{i}",
             bundle_location=f"skills/s{i}.tar.gz",
             bundle_bytes=1,
+            bundle_entries=1,
         )
         for i in range(5)
     ]
@@ -707,6 +832,8 @@ def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: 
     install("off", "alice", enabled=False)
     install("own", "alice")  # collides with the bundle's own skill; the bundle wins
     install("deep", "alice")  # collides with a namespaced bundle skill; the bundle wins too
+    # A name the runner's validator refuses would fail the whole spec: it is skipped.
+    install("bad_name", "alice")
     bundle = skill_tarball(
         {
             "config.yaml": b"name: a\n",

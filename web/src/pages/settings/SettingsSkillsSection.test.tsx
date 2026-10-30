@@ -127,7 +127,8 @@ function script() {
       return json({ error: { message: "Administrator access required" } }, 403);
     if (url.startsWith("/v1/skill-sources/src1/catalog")) return json(catalog);
     if (url === "/v1/skill-catalog")
-      return json({ ...catalog, url: "https://github.com/other/repo.git" });
+      // A repository directory link: the catalog names the directory it indexed.
+      return json({ ...catalog, url: "https://github.com/other/repo.git", path: "team-a" });
     if (url === "/v1/installed-skills" && method === "POST") return json({ data: [review] }, 201);
     if (url === "/v1/installed-skills/sk1" && method === "PATCH")
       return json({ ...review, enabled: false });
@@ -298,6 +299,7 @@ describe("SettingsSkillsSection", () => {
         body: {
           source: "https://github.com/other/repo.git",
           ref: null,
+          path: "team-a",
           names: ["triage"],
           scope: "user",
         },

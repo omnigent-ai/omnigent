@@ -9,34 +9,46 @@ LFS pointers and leaves ``${VAR}`` references unexpanded.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import os
 import re
+import signal
 import subprocess
 import tarfile
 import tempfile
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
 from omnigent.git_providers import EnvInstances, Instances
 from omnigent.git_providers.github import GitHubProvider
+from omnigent.skills.limits import MAX_SOURCE_PATH_CHARS
 
-# ``owner/repo`` and ``github:`` shorthands mean github.com; a URL names its own
-# host, which must be github.com or a GitHub Enterprise host the server knows.
+# ``owner/repo`` and ``github:`` shorthands mean github.com; a URL, or a bare
+# ``host/owner/repo`` (the form ``allowed_sources`` uses; a GitHub owner has no
+# dot, so a dotted first segment is a host), names its own host, which must be
+# github.com or a GitHub Enterprise host the server knows.
 _GITHUB_SOURCE_RE = re.compile(
-    r"^(?:github:|https://(?P<host>[A-Za-z0-9.-]+)/)?"
+    r"^(?:github:|https://(?P<host>[A-Za-z0-9.-]+)/|(?P<bare_host>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/)?"
     r"(?P<owner>\w[\w.-]*)/(?P<repo>\w[\w.-]*?)(?:\.git)?"
     r"(?:/tree/(?P<tree_ref>[^/@]+))?(?P<subpath>(?:/\w[\w.-]*)*)/?(?:@(?P<name>[\w.-]+))?$"
 )
 DEFAULT_HOST = "github.com"
+# A repository directory: the same segments ``_GITHUB_SOURCE_RE`` accepts.
+_SOURCE_PATH_RE = re.compile(r"\w[\w.-]*(?:/\w[\w.-]*)*")
 
 LFS_POINTER = b"version https://git-lfs.github.com/spec/"
 
 CLONE_TIMEOUT_S = 300
 # How often the clone watchdog measures the checkout on disk.
 CHECKOUT_POLL_S = 0.25
+# How long to wait for git to exit once its process group has been killed.
+KILL_WAIT_S = 5.0
+# A transfer slower than 1 KB/s for 30 s fails instead of waiting out the timeout.
+_LOW_SPEED_CONFIG = ("-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30")
 # The git executable; tests point it at a script.
 GIT = "git"
 
@@ -79,7 +91,7 @@ def parse_github_source(source: str, *, instances: Instances | None = None) -> G
     m = _GITHUB_SOURCE_RE.match(source)
     if m is None:
         return None
-    host = (m["host"] or DEFAULT_HOST).lower()
+    host = (m["host"] or m["bare_host"] or DEFAULT_HOST).lower()
     if not GitHubProvider().matches_host(host, EnvInstances() if instances is None else instances):
         return None
     return GitHubSource(
@@ -89,6 +101,24 @@ def parse_github_source(source: str, *, instances: Instances | None = None) -> G
         name=m["name"],
         host=host,
     )
+
+
+def normalize_source_path(path: str | None) -> str:
+    """A repository directory in POSIX form, ``""`` for the root.
+
+    :raises GitSourceError: When it leaves the repository, uses characters a
+        GitHub path link cannot carry, or is too long to store.
+    """
+    cleaned = (path or "").strip().strip("/")
+    if not cleaned:
+        return ""
+    if not _SOURCE_PATH_RE.fullmatch(cleaned) or ".." in PurePosixPath(cleaned).parts:
+        raise GitSourceError(f"{cleaned!r} is not a directory inside the repository.")
+    if len(cleaned) > MAX_SOURCE_PATH_CHARS:
+        raise GitSourceError(
+            f"A source directory is limited to {MAX_SOURCE_PATH_CHARS} characters."
+        )
+    return cleaned
 
 
 def repository_label(clone_url: str) -> str:
@@ -185,20 +215,70 @@ def _over_budget(dest: Path, max_bytes: int | None, max_entries: int | None) -> 
     return None
 
 
+@dataclass(frozen=True)
+class SparseCheckout:
+    """Which parts of a partial clone's tree to check out.
+
+    :param patterns: Non-cone sparse-checkout patterns (gitignore syntax),
+        e.g. ``("/team-a/**/SKILL.md",)``.
+    :param expand: Called with the checkout once *patterns* are on disk; the
+        patterns it returns are checked out as well, before the clone returns.
+        Lets a caller index manifests first and then fetch only what it needs.
+    """
+
+    patterns: tuple[str, ...]
+    expand: Callable[[Path], Sequence[str]] | None = None
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """Kill git and every helper it started (``git-remote-https``, ``index-pack``).
+
+    A helper inherits git's pipes, so killing git alone leaves them open and a
+    later read never returns.
+    """
+    if os.name == "posix":
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    else:
+        proc.kill()
+
+
+def _drain_after_kill(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    """Collect what a killed git wrote, giving up after :data:`KILL_WAIT_S`."""
+    try:
+        return proc.communicate(timeout=KILL_WAIT_S)
+    except subprocess.TimeoutExpired:
+        # Something outside the group still holds a pipe: stop reading.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=KILL_WAIT_S)
+        return "", ""
+
+
 def _run_clone(
     cmd: list[str],
     env: dict[str, str],
     dest: Path,
     max_bytes: int | None,
     max_entries: int | None = None,
+    *,
+    deadline: float | None = None,
+    label: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run git, killing it once *dest* exceeds its byte or entry budget on disk.
 
     A shallow clone or a blob filter does not bound what the server writes,
     since the checkout may fetch what the filter omitted; the watchdog does,
     and the finished checkout is measured once more, so a clone that crosses
-    the budget and exits before the next poll is refused too.
+    the budget and exits before the next poll is refused too. git runs in its
+    own process group so a timeout kills its helpers with it.
 
+    :param deadline: ``time.monotonic()`` value to stop at; :data:`CLONE_TIMEOUT_S`
+        from now when ``None``.
+    :param label: What a timeout message names; the clone URL by default.
     :raises GitSourceError: When git is missing, the clone times out, or it
         exceeds a budget.
     """
@@ -209,26 +289,30 @@ def _run_clone(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            # Its own process group, so a kill reaches git's helpers too.
+            start_new_session=os.name == "posix",
         )
     except FileNotFoundError:
         raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
-    deadline = time.monotonic() + CLONE_TIMEOUT_S
+    deadline = time.monotonic() + CLONE_TIMEOUT_S if deadline is None else deadline
     refusal: str | None = None
+    timed_out = False
     while True:
         try:
             stdout, stderr = proc.communicate(timeout=CHECKOUT_POLL_S)
             break
         except subprocess.TimeoutExpired:
             refusal = _over_budget(dest, max_bytes, max_entries)
-            if refusal is not None or time.monotonic() > deadline:
-                proc.kill()
-                stdout, stderr = proc.communicate()
+            timed_out = time.monotonic() > deadline
+            if refusal is not None or timed_out:
+                _kill_process_group(proc)
+                stdout, stderr = _drain_after_kill(proc)
                 break
     refusal = refusal or _over_budget(dest, max_bytes, max_entries)
     if refusal is not None:
         raise GitSourceError(refusal)
-    if proc.returncode in (-9, 137) or time.monotonic() > deadline:
-        raise GitSourceError(f"Timed out cloning {cmd[-2]}.")
+    if timed_out or proc.returncode in (-9, 137):
+        raise GitSourceError(f"Timed out cloning {label or cmd[-2]}.")
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
@@ -241,6 +325,8 @@ def clone_github_source(
     token: str | None = None,
     max_bytes: int | None = None,
     max_entries: int | None = None,
+    sparse: SparseCheckout | None = None,
+    timeout_s: float | None = None,
 ) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts.
 
@@ -252,16 +338,24 @@ def clone_github_source(
     :param max_bytes: Kill or refuse the clone once the checkout holds more than
         this on disk; ``None`` for the developer's own CLI.
     :param max_entries: The same for files and directories together.
+    :param sparse: Check out only these parts of the tree, from a partial
+        (``--filter=blob:none``) clone, so a large monorepo costs what the
+        selected directories cost; ``None`` checks out the whole tree.
+    :param timeout_s: Wall-clock limit for every git step together;
+        :data:`CLONE_TIMEOUT_S` when ``None``.
     :raises GitSourceError: When git is missing, the clone times out, exceeds
         *max_bytes*, or git fails.
     """
-    cmd = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
-           "-c", "protocol.https.allow=always"]  # fmt: skip
+    base = [GIT, "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never",
+            "-c", "protocol.https.allow=always", *_LOW_SPEED_CONFIG]  # fmt: skip
     if isolated:
-        cmd += ["-c", "credential.helper="]
-    cmd += ["clone", "--depth", "1", "--no-recurse-submodules", "--quiet"]
+        base += ["-c", "credential.helper="]
+    cmd = [*base, "clone", "--depth", "1", "--no-recurse-submodules", "--quiet"]
+    if sparse is not None:
+        cmd += ["--filter=blob:none", "--no-checkout"]
     if ref:
         cmd += ["--branch", ref]
+    deadline = time.monotonic() + (CLONE_TIMEOUT_S if timeout_s is None else timeout_s)
     with tempfile.TemporaryDirectory(prefix="omnigent-git-home-") as home:
         env = (
             isolated_git_env(home)
@@ -270,7 +364,18 @@ def clone_github_source(
         )
         if token:
             env.update(auth_header_env(clone_url, token))
-        proc = _run_clone([*cmd, "--", clone_url, str(dest)], env, dest, max_bytes, max_entries)
+
+        def run(step: list[str]) -> subprocess.CompletedProcess[str]:
+            return _run_clone(
+                step, env, dest, max_bytes, max_entries, deadline=deadline, label=clone_url
+            )
+
+        proc = run([*cmd, "--", clone_url, str(dest)])
+        if proc.returncode == 0 and sparse is not None:
+            proc = _sparse_checkout(dest, base, sparse.patterns, run)
+            extra = sparse.expand(dest) if proc.returncode == 0 and sparse.expand else ()
+            if extra:
+                proc = _sparse_checkout(dest, base, (*sparse.patterns, *extra), run)
     if proc.returncode != 0:
         hint = (
             "\n(Only branch and tag names work as a ref, not commit SHAs.)"
@@ -278,6 +383,25 @@ def clone_github_source(
             else ""
         )
         raise GitSourceError(f"Could not clone {clone_url}: {proc.stderr.strip()}{hint}")
+
+
+def _sparse_checkout(
+    dest: Path,
+    base: list[str],
+    patterns: Sequence[str],
+    run: Callable[[list[str]], subprocess.CompletedProcess[str]],
+) -> subprocess.CompletedProcess[str]:
+    """Check out *patterns* of HEAD; the partial clone fetches just their blobs.
+
+    The pattern file and ``core.sparseCheckout`` are used directly rather than
+    ``git sparse-checkout``, whose non-cone flags differ between git releases.
+    """
+    info = dest / ".git" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "sparse-checkout").write_text("".join(f"{pattern}\n" for pattern in patterns))
+    return run(
+        [*base, "-C", str(dest), "-c", "core.sparseCheckout=true", "read-tree", "-mu", "HEAD"]
+    )
 
 
 def checkout_commit(checkout: Path) -> str | None:

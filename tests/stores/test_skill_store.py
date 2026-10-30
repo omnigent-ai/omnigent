@@ -29,6 +29,7 @@ def _item(name: str, **over) -> SkillInstall:  # type: ignore[no-untyped-def]  #
         "path": f"skills/{name}",
         "bundle_location": f"skills/{name}.tar.gz",
         "bundle_bytes": 10,
+        "bundle_entries": 3,
         "user_invocable": True,
     }
     fields.update(over)
@@ -117,11 +118,13 @@ def test_the_principal_row_keeps_its_totals_through_every_write(
             lock = session.get(SqlSkillPrincipal, (0, "user:alice"))
             rows = session.query(SqlInstalledSkill).filter_by(principal="user:alice").all()
             expected = (len(rows), sum(r.bundle_bytes for r in rows if r.enabled))
+            entries = sum(r.bundle_entries for r in rows if r.enabled)
             assert lock is not None and (lock.installed_count, lock.enabled_bytes) == expected
+            assert lock.enabled_entries == entries
             return expected
 
-    a = _install(store, "a", bundle_bytes=10)
-    b = _install(store, "b", bundle_bytes=20)
+    a = _install(store, "a", bundle_bytes=10, bundle_entries=4)
+    b = _install(store, "b", bundle_bytes=20, bundle_entries=7)
     assert totals() == (2, 30)
     store.set_enabled(b.id, False)
     assert totals() == (2, 10)
@@ -130,6 +133,7 @@ def test_the_principal_row_keeps_its_totals_through_every_write(
         commit=None,
         bundle_location="skills/a2.tar.gz",
         bundle_bytes=15,
+        bundle_entries=3,
         description="d",
         display_name=None,
     )
@@ -189,10 +193,21 @@ def test_a_batch_installs_all_or_nothing_within_the_budgets(store: SqlAlchemySki
             commit=None,
             bundle_location="skills/c2.tar.gz",
             bundle_bytes=95,
+            bundle_entries=3,
             description="d",
             display_name=None,
             max_bytes=100,
         )
+    # Past the entry budget: a runner's unpack limit counts files as well as bytes.
+    with pytest.raises(SkillQuotaError, match="exceed 10 files"):
+        store.install_many(
+            [_item("e", bundle_entries=5)],
+            scope="user",
+            owner_user_id="alice",
+            installed_by="alice",
+            max_entries=10,
+        )
+    assert store.find_for_user("alice", ["e"]) == []
     # A repeated name in one batch is refused before anything is written.
     with pytest.raises(SkillValueError, match="repeated"):
         store.install_many(
@@ -343,6 +358,7 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
         commit="c" * 40,
         bundle_location="skills/review-2.tar.gz",
         bundle_bytes=42,
+        bundle_entries=3,
         description="d2",
         display_name="Review",
         path="skills/moved/review",
@@ -364,6 +380,7 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
         commit="c" * 40,
         bundle_location="skills/review-2.tar.gz",
         bundle_bytes=42,
+        bundle_entries=3,
         description="d2",
         display_name="Review",
     )
@@ -383,6 +400,7 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
             commit=None,
             bundle_location="x",
             bundle_bytes=1,
+            bundle_entries=3,
             description="",
             display_name=None,
         )
@@ -443,6 +461,7 @@ def test_the_user_invocable_flag_is_stored_and_refetched(store: SqlAlchemySkillS
         commit="b" * 40,
         bundle_location="skills/orchestrate-2.tar.gz",
         bundle_bytes=10,
+        bundle_entries=3,
         description="now public",
         display_name=None,
         user_invocable=True,
@@ -486,6 +505,7 @@ def test_values_that_would_not_fit_are_rejected_before_writing(
             commit=None,
             bundle_location="x",
             bundle_bytes=1,
+            bundle_entries=3,
             description="z" * 1025,
             display_name=None,
         )

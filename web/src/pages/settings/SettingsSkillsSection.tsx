@@ -509,7 +509,7 @@ function CatalogGrid({
   );
   const installOne = (skill: CatalogSkill) =>
     install.mutate(
-      { source: catalog.url, ref: catalog.ref, names: [skill.name], scope },
+      { source: catalog.url, ref: catalog.ref, path: catalog.path, names: [skill.name], scope },
       {
         onSuccess: () => setJustInstalled((prev) => new Set(prev).add(`${skill.name}:${scope}`)),
       },

@@ -14,10 +14,24 @@ from dataclasses import dataclass
 
 from omnigent.entities import Agent, InstalledSkill
 from omnigent.runtime.agent_cache import AgentCache
-from omnigent.skills.limits import MAX_DELIVERY_BYTES, MAX_INSTALLED_PER_OWNER, MAX_PAGE
-from omnigent.skills.overlay import SkillTarballError, overlay_skills, validate_skill_tarball
+from omnigent.skills.limits import (
+    MAX_DELIVERY_BYTES,
+    MAX_DELIVERY_ENTRIES,
+    MAX_INSTALLED_PER_OWNER,
+    MAX_PAGE,
+    RUNNER_UNPACK_BYTES,
+    RUNNER_UNPACK_ENTRIES,
+)
+from omnigent.skills.overlay import (
+    SkillTarballError,
+    UnpackedSize,
+    overlay_skills,
+    unpacked_size,
+    validate_skill_tarball,
+)
 from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
 from omnigent.spec.types import AgentSpec
+from omnigent.spec.validator import is_valid_skill_name
 from omnigent.stores import ArtifactStore
 from omnigent.stores.skill_store import SkillStore
 
@@ -104,22 +118,29 @@ def with_installed_skills(
     name. A tarball that fails validation drops only itself, and so does a
     skill whose repository the server's policy no longer allows.
 
+    A name the runner's spec validator refuses is skipped, since one invalid
+    skill would fail the whole spec.
+
     :param target: The spec the session runs and its directory in the bundle;
         ``None`` means the root agent with no filter.
-    :raises SkillDeliveryError: When the skills exceed :data:`MAX_DELIVERED_SKILLS`
-        or :data:`MAX_DELIVERY_BYTES` together.
+    :raises SkillDeliveryError: When the skills exceed :data:`MAX_DELIVERED_SKILLS`,
+        :data:`MAX_DELIVERY_BYTES` or :data:`MAX_DELIVERY_ENTRIES` together, or
+        the merged bundle would exceed what a runner unpacks.
     """
     target = target or SessionTarget(None, "")
     installed = effective_installed_skills(skill_store, owner_id, policy=policy)
     reserved = {skill.name for skill in getattr(target.spec, "skills", None) or []}
     accepted: list[tuple[str, bytes]] = []
-    total = 0
+    total = UnpackedSize(0, 0)
     for skill in installed:
         if not skill_allowed(target.spec, skill.name) or skill.name in reserved:
             continue
+        if not is_valid_skill_name(skill.name):
+            _logger.warning("skipping installed skill %r (%s): invalid name", skill.name, skill.id)
+            continue
         try:
             tarball = artifact_store.get(skill.bundle_location)
-            validate_skill_tarball(tarball)
+            size = validate_skill_tarball(tarball)
         except (SkillTarballError, OSError, KeyError, ValueError):
             _logger.warning(
                 "skipping installed skill %s (%s): unreadable tarball",
@@ -128,13 +149,26 @@ def with_installed_skills(
                 exc_info=True,
             )
             continue
-        total += len(tarball)
-        if total > MAX_DELIVERY_BYTES:
+        total += size
+        if total.bytes > MAX_DELIVERY_BYTES or total.entries > MAX_DELIVERY_ENTRIES:
             raise SkillDeliveryError(
-                f"Installed skills exceed {MAX_DELIVERY_BYTES // (1024 * 1024)} MB together; "
-                "disable or remove some in Settings → Skills."
+                f"Installed skills exceed {MAX_DELIVERY_BYTES // (1024 * 1024)} MB or "
+                f"{MAX_DELIVERY_ENTRIES} files together; disable or remove some in "
+                "Settings → Skills."
             )
         accepted.append((skill.name, tarball))
+    if accepted:
+        try:
+            merged = unpacked_size(bundle_bytes) + total
+        except SkillTarballError:
+            # Not a readable archive: the overlay below falls back to serving it as is.
+            merged = total
+        if merged.bytes > RUNNER_UNPACK_BYTES or merged.entries > RUNNER_UNPACK_ENTRIES:
+            raise SkillDeliveryError(
+                "This agent's files and its installed skills together exceed what a "
+                f"session can unpack ({RUNNER_UNPACK_BYTES // (1024 * 1024)} MB, "
+                f"{RUNNER_UNPACK_ENTRIES} files); disable or remove some in Settings → Skills."
+            )
     try:
         return overlay_skills(bundle_bytes, accepted, reserved=reserved, prefix=target.prefix)
     except SkillTarballError:

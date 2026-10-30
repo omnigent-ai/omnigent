@@ -334,6 +334,7 @@ def test_clone_github_source_translates_git_failures(
         dest: Path,
         max_bytes: int | None,
         max_entries: int | None,
+        **_options: object,
     ) -> object:
         return subprocess.CompletedProcess(cmd, 128, "", "fatal: not found\n")
 

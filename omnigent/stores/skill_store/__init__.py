@@ -12,6 +12,7 @@ from omnigent.entities.skill import SkillScope
 from omnigent.skills.limits import (
     DEFAULT_PAGE,
     MAX_DELIVERY_BYTES_PER_SCOPE,
+    MAX_DELIVERY_ENTRIES_PER_SCOPE,
     MAX_DESCRIPTION_CHARS,
     MAX_DISPLAY_NAME_CHARS,
     MAX_INSTALLED_PER_OWNER,
@@ -20,6 +21,7 @@ from omnigent.skills.limits import (
     MAX_PAGE,
     MAX_PATH_CHARS,
     MAX_REF_CHARS,
+    MAX_SOURCE_PATH_CHARS,
     MAX_URL_CHARS,
     MAX_USER_ID_CHARS,
 )
@@ -27,6 +29,7 @@ from omnigent.skills.limits import (
 __all__ = [
     "DEFAULT_PAGE",
     "MAX_DELIVERY_BYTES_PER_SCOPE",
+    "MAX_DELIVERY_ENTRIES_PER_SCOPE",
     "MAX_DESCRIPTION_CHARS",
     "MAX_DISPLAY_NAME_CHARS",
     "MAX_INSTALLED_PER_OWNER",
@@ -35,6 +38,7 @@ __all__ = [
     "MAX_PAGE",
     "MAX_PATH_CHARS",
     "MAX_REF_CHARS",
+    "MAX_SOURCE_PATH_CHARS",
     "MAX_URL_CHARS",
     "MAX_USER_ID_CHARS",
     "InstallResult",
@@ -54,7 +58,7 @@ class SkillValueError(ValueError):
 
 
 class SkillQuotaError(SkillValueError):
-    """The write would take a principal past its row or byte budget; nothing was written."""
+    """The write would take a principal past its row, byte or entry budget; nothing was written."""
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,9 @@ class SkillInstall:
     commit: str | None
     path: str
     bundle_location: str
+    # Unpacked bytes and entries of the tarball, counted against the budgets.
     bundle_bytes: int
+    bundle_entries: int
     # From the skill's own frontmatter: false keeps it out of a user's menu
     # while it is still delivered to the agent.
     user_invocable: bool = True
@@ -118,13 +124,16 @@ class SkillStore(ABC):
 
     @abstractmethod
     def add_source(
-        self, *, url: str, ref: str | None, name: str, created_by: str | None
+        self, *, url: str, ref: str | None, name: str, created_by: str | None, path: str = ""
     ) -> SkillSource:
-        """Add a repository to browse; the same ``(url, ref)`` twice returns the existing row."""
+        """Add a repository (or a directory in one, *path*) to browse.
+
+        The same ``(url, ref, path)`` twice returns the existing row.
+        """
 
     @abstractmethod
-    def find_source(self, url: str, ref: str | None) -> SkillSource | None:
-        """The source for this exact ``(url, ref)``, if any."""
+    def find_source(self, url: str, ref: str | None, path: str = "") -> SkillSource | None:
+        """The source for this exact ``(url, ref, path)``, if any."""
 
     @abstractmethod
     def list_sources(
@@ -152,14 +161,15 @@ class SkillStore(ABC):
         installed_by: str | None,
         max_rows: int | None = None,
         max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> list[InstallResult]:
         """Record *items* for one principal in one transaction: all or nothing.
 
         A name the principal already has is replaced in place, keeping its id.
 
         :raises SkillQuotaError: When the principal would exceed *max_rows*
-            rows or *max_bytes* of enabled tarballs (the module limits when
-            ``None``); nothing is written.
+            rows, or *max_bytes* or *max_entries* across its enabled skills
+            unpacked (the module limits when ``None``); nothing is written.
         """
 
     def install(
@@ -178,6 +188,7 @@ class SkillStore(ABC):
         bundle_bytes: int,
         installed_by: str | None,
         user_invocable: bool = True,
+        bundle_entries: int = 1,
     ) -> InstalledSkill:
         """Record one skill (see :meth:`install_many`)."""
         item = SkillInstall(
@@ -190,6 +201,7 @@ class SkillStore(ABC):
             path=path,
             bundle_location=bundle_location,
             bundle_bytes=bundle_bytes,
+            bundle_entries=bundle_entries,
             user_invocable=user_invocable,
         )
         return self.install_many(
@@ -222,27 +234,34 @@ class SkillStore(ABC):
         commit: str | None,
         bundle_location: str,
         bundle_bytes: int,
+        bundle_entries: int,
         description: str,
         display_name: str | None,
         path: str | None = None,
         user_invocable: bool = True,
         max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> InstallResult | None:
         """Replace the stored package after a refetch; ``None`` when absent.
 
         The result names the tarball the row pointed at under the lock, so a
         caller drops what this write replaced and not what it read earlier.
 
-        :raises SkillQuotaError: When the new size would exceed the principal's budget.
+        :raises SkillQuotaError: When the new size would exceed the principal's budgets.
         """
 
     @abstractmethod
     def set_enabled(
-        self, skill_id: str, enabled: bool, *, max_bytes: int | None = None
+        self,
+        skill_id: str,
+        enabled: bool,
+        *,
+        max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> InstalledSkill | None:
         """Toggle whether sessions receive the skill; ``None`` when absent.
 
-        :raises SkillQuotaError: When enabling would exceed the principal's budget.
+        :raises SkillQuotaError: When enabling would exceed the principal's budgets.
         """
 
     @abstractmethod
