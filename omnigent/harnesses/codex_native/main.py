@@ -1318,15 +1318,16 @@ async def _prepare_codex_terminal(
         launched_terminal: LaunchedCodexTerminal | None = None
         try:
             await app_server.start()
+            codex_client_url = app_server.client_url
             if thread_id is None:
                 event_client = client_for_transport(
-                    codex_ws_url,
+                    codex_client_url,
                     client_name="omnigent-codex-native",
                 )
                 await event_client.connect()
             else:
                 event_client = await preload_codex_thread_for_resume(
-                    codex_ws_url,
+                    codex_client_url,
                     thread_id,
                     terminal_launch_args=codex_args,
                     cwd=Path.cwd(),
@@ -1343,7 +1344,7 @@ async def _prepare_codex_terminal(
                     bridge_dir,
                     CodexNativeBridgeState(
                         session_id=session_id,
-                        socket_path=codex_ws_url,
+                        socket_path=codex_client_url,
                         thread_id=thread_id,
                         codex_home=str(codex_home),
                         cwd=str(Path.cwd()),
@@ -1393,7 +1394,7 @@ async def _prepare_codex_terminal(
         tmux_target=launched_terminal.tmux_target,
         bridge_dir=bridge_dir,
         thread_id=thread_id,
-        app_server_url=codex_ws_url,
+        app_server_url=codex_client_url,
         app_server=app_server,
         event_client=event_client,
         reattached=False,

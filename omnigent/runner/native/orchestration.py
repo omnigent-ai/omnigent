@@ -5148,7 +5148,7 @@ async def _auto_create_codex_terminal(
         and not forwarder.done()
         and bridge_state is not None
         and bridge_state.thread_id == launch_config.external_session_id
-        and bridge_state.socket_path == app_server.listen_url
+        and bridge_state.socket_path == app_server.client_url
         and bridge_state.codex_home == str(app_server.codex_home)
     ):
         # The TUI is auxiliary: replacing it must not restart an active turn,
@@ -5701,11 +5701,12 @@ async def _auto_create_codex_terminal(
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
+    codex_client_url = app_server.client_url
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
     _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 
     event_client = CodexAppServerClient(
-        ws_url=codex_ws_url,
+        ws_url=codex_client_url,
         client_name="omnigent-codex-native-auto",
     )
     retained_resume_client: CodexAppServerClient | None = None
@@ -5716,7 +5717,7 @@ async def _auto_create_codex_terminal(
             for retry_delay_s in (*_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S, None):
                 try:
                     retained_resume_client = await preload_codex_thread_for_resume(
-                        codex_ws_url,
+                        codex_client_url,
                         launch_config.external_session_id,
                         terminal_launch_args=launch_config.terminal_launch_args,
                         cwd=Path(workspace),
@@ -5820,7 +5821,7 @@ async def _auto_create_codex_terminal(
                 # A resumed thread runs the rollout's effort, not the config pin.
                 try:
                     await apply_codex_thread_effort(
-                        codex_ws_url,
+                        codex_client_url,
                         launch_config.external_session_id,
                         launch_config.reasoning_effort,
                         model=_codex_launch.model,
@@ -5844,7 +5845,7 @@ async def _auto_create_codex_terminal(
                 bridge_dir,
                 CodexNativeBridgeState(
                     session_id=session_id,
-                    socket_path=codex_ws_url,
+                    socket_path=codex_client_url,
                     thread_id=launch_config.external_session_id,
                     codex_home=str(codex_home),
                     # The session workspace: without it the executor falls back
@@ -5904,7 +5905,7 @@ async def _auto_create_codex_terminal(
             _codex_discover_thread_and_forward(
                 session_id=session_id,
                 bridge_dir=bridge_dir,
-                codex_ws_url=codex_ws_url,
+                codex_ws_url=codex_client_url,
                 codex_home=codex_home,
                 workspace=workspace,
                 event_client=event_client,
@@ -5921,7 +5922,7 @@ async def _auto_create_codex_terminal(
             else _codex_forward_known_thread(
                 session_id=session_id,
                 bridge_dir=bridge_dir,
-                codex_ws_url=codex_ws_url,
+                codex_ws_url=codex_client_url,
                 thread_id=launch_config.external_session_id,
                 client=retained_resume_client,
                 app_server=app_server,

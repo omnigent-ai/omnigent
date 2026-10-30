@@ -167,7 +167,12 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
 
     from omnigent.harnesses.codex_native.app_server import NativeCodexLaunch
 
-    server = SimpleNamespace(start=AsyncMock(), close=AsyncMock(), codex_cli_version=(0, 156, 1))
+    server = SimpleNamespace(
+        start=AsyncMock(),
+        close=AsyncMock(),
+        codex_cli_version=(0, 156, 1),
+        client_url="ws://127.0.0.1:9877",
+    )
     preload = AsyncMock(side_effect=RuntimeError("stop after resume"))
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
     monkeypatch.setattr(
@@ -203,6 +208,7 @@ async def test_prepare_codex_terminal_resumes_with_launch_provider(
         )
 
     preload.assert_awaited_once()
+    assert preload.await_args.args[0] == server.client_url
     assert preload.await_args.kwargs["model_provider"] == expected_provider
     server.close.assert_awaited_once()
 
@@ -249,6 +255,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
         codex_home=tmp_path / "codex-home",
         remote_execution=None,
         tui_url="ws://127.0.0.1:9877",
+        client_url="ws://127.0.0.1:9876",
     )
     preload = AsyncMock(return_value=client)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)

@@ -380,8 +380,27 @@ def register_native_commands(cli: click.Group) -> None:
         default=None,
         metavar="SHARED_PATH",
         help=(
-            "Absolute working directory that exists at the same path on this host and "
-            "in the exec-server environment."
+            "Absolute working directory inside the exec-server environment. "
+            "It does not need to exist on this host."
+        ),
+    )
+    @click.option(
+        "--exec-server-command",
+        default=None,
+        metavar="COMMAND",
+        help=(
+            "Start this argv-parsed command before each Codex turn and stop it "
+            "after the turn. Requires --exec-server-url and --exec-cwd."
+        ),
+    )
+    @click.option(
+        "--exec-server-ready-timeout",
+        default=None,
+        type=click.FloatRange(min=0.0, min_open=True),
+        metavar="SECONDS",
+        help=(
+            "Maximum time for --exec-server-command to make the remote environment "
+            "ready (default: 600 seconds)."
         ),
     )
     @click.option(
@@ -401,6 +420,8 @@ def register_native_commands(cli: click.Group) -> None:
         smart_routing: bool,
         exec_server_url: str | None,
         exec_cwd: str | None,
+        exec_server_command: str | None,
+        exec_server_ready_timeout: float | None,
         local_execution: bool,
         codex_args: tuple[str, ...],
     ) -> None:
@@ -414,6 +435,8 @@ def register_native_commands(cli: click.Group) -> None:
         #     the first typed message picks the model.
         # :param exec_server_url: Optional Codex exec-server WebSocket URL.
         # :param exec_cwd: Absolute working directory inside the exec-server.
+        # :param exec_server_command: Optional turn-scoped exec-server launcher argv.
+        # :param exec_server_ready_timeout: Managed launcher readiness budget in seconds.
         # :param local_execution: Clear any saved exec-server binding.
         # :param codex_args: Pass-through args for ``codex`` before ``resume``.
         """Launch Codex with Omnigent.
@@ -453,6 +476,8 @@ def register_native_commands(cli: click.Group) -> None:
             execution_selection = resolve_execution_selection(
                 exec_server_url=exec_server_url,
                 exec_cwd=exec_cwd,
+                exec_server_command=exec_server_command,
+                exec_server_ready_timeout=exec_server_ready_timeout,
                 local_execution=local_execution,
             )
         except ValueError as exc:

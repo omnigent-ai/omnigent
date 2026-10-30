@@ -8910,6 +8910,7 @@ async def test_prepare_codex_terminal_closes_resources_when_cleanup_is_interrupt
         codex_home=tmp_path / "codex-home",
         remote_execution=None,
         tui_url="ws://127.0.0.1:9877",
+        client_url="ws://127.0.0.1:9877",
     )
     preload = AsyncMock(return_value=client)
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)

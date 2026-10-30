@@ -63,6 +63,23 @@ from tests.runner.helpers import NullServerClient
 _ROTATED_BRIDGE_ID = "5f1c0a9e7b2d4c36a8e4d1f0b9a72c15"
 
 
+class _FakeCodexClientUrl:
+    """Expose the client transports expected from a Codex app-server."""
+
+    listen_url: str | None
+
+    @property
+    def tui_url(self) -> str:
+        """Return the direct TUI URL used by unmanaged test servers."""
+        assert self.listen_url is not None
+        return self.listen_url
+
+    @property
+    def client_url(self) -> str:
+        """Return the lifecycle-aware URL used by non-TUI clients."""
+        return self.tui_url
+
+
 @pytest.mark.asyncio
 async def test_create_session_threads_cursor_bridge_dir_without_dead_guard_env(
     tmp_path: Path,
@@ -645,7 +662,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1169,7 +1186,7 @@ async def test_auto_create_codex_terminal_fork_clones_rollout_and_resumes(
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1476,7 +1493,7 @@ async def test_auto_create_codex_terminal_fork_builds_rollout_from_items_and_res
             patched_external_ids.append(json["external_session_id"])
             return httpx.Response(200, json={}, request=httpx.Request("PATCH", url))
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1723,7 +1740,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -1992,7 +2009,7 @@ async def test_auto_create_codex_terminal_fresh_launch_loads_relaunch_graph(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -2245,7 +2262,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
                 request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -5031,7 +5048,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -5271,7 +5288,7 @@ async def test_auto_create_codex_terminal_accepts_gateway_spelled_override(
                 request=httpx.Request("GET", url),
             )
 
-    class _FakeCodexAppServer:
+    class _FakeCodexAppServer(_FakeCodexClientUrl):
         """Minimal app-server object used by ``codex_terminal_env``."""
 
         codex_path = "/opt/codex/bin/codex"
@@ -5445,6 +5462,7 @@ async def test_codex_tui_recovery_preserves_live_control_plane(
     fake_server = SimpleNamespace(
         proc=SimpleNamespace(returncode=None),
         listen_url=server_url,
+        client_url=server_url,
         codex_home=tmp_path,
     )
     forwarder = asyncio.create_task(asyncio.Event().wait())

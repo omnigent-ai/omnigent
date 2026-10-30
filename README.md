@@ -309,6 +309,29 @@ omnigent codex \
   --exec-cwd /home/agent/universe
 ```
 
+Omnigent can also own a command that wakes the remote environment and exposes
+that URL. The command briefly primes thread creation or resume, then starts
+before each turn or standalone shell command. Overlapping work shares it; it
+stops after the last active request completes or fails:
+
+```bash
+omnigent codex \
+  --exec-server-url ws://127.0.0.1:43111 \
+  --exec-cwd /home/agent/universe \
+  --exec-server-command \
+    'remote-cli connect workspace-a -L 43111:127.0.0.1:43111 -- codex exec-server --listen ws://127.0.0.1:43111'
+```
+
+The command is parsed as argv, without a shell. Omnigent requires a successful
+Codex `environment/info` probe before forwarding the turn. The default readiness
+timeout is 600 seconds; change it with
+`--exec-server-ready-timeout`. A failed command rejects the turn instead of
+falling back to laptop execution. Closing the command after the turn also lets
+an external idle reaper stop the remote compute while the local Omnigent
+session and Codex thread remain alive. Give concurrently active managed
+sessions distinct local URLs or ports; their remote ports may be the same when
+they connect to different hosts.
+
 `--exec-cwd` is a path on the exec-server host; it does not need to exist on the
 laptop. Codex receives the environments in `[remote, local]` order on terminal
 and phone/web turns, so normal code work targets the remote checkout. Ask it to
@@ -320,8 +343,9 @@ The binding stays private to this host's Omnigent bridge and is reused on a
 same-host resume while that bridge is retained. It routes tools but does not
 copy `CODEX_HOME`, memory, or local workspace files into the remote cwd. If the
 remote exec server disconnects, local files are still local; there is no file
-sync between environments. After the Codex terminal stops, use
-`--local-execution` to return to a local-only session.
+sync between environments. A managed command is also retained on same-host
+resume. After the Codex terminal stops, use `--local-execution` to return to a
+local-only session.
 
 `omnigent agy` requires agy 1.1.13 or newer. When `GEMINI_API_KEY` is set,
 direct Gemini API authentication takes precedence over agy's saved OAuth login.

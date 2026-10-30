@@ -179,6 +179,16 @@ at phone width. Verify code work uses `remote`, then explicitly ask Codex to use
 URL or path. Resume without execution flags to preserve the binding, or resume
 with `--local-execution` to clear it.
 
+To verify managed wake/idle behavior, add `--exec-server-command '<command>'`
+where the command owns the tunnel and remote `codex exec-server`. Submit a turn
+while the remote environment is stopped: the turn must wait until
+`environment/info` succeeds. After `turn/completed` or `turn/failed`, verify the
+command and tunnel are gone. Stop the remote environment, submit another turn
+from Chat, and verify the same Codex thread resumes against the same remote
+workspace. Also send a Chat `!command` while the environment is stopped and
+verify it wakes remotely, then releases the command. A command failure must
+reject the request without executing locally.
+
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
@@ -1120,6 +1130,10 @@ checks do not prove live providers, browser rendering or thought-signature parit
   is resolved by the host running the Codex app-server, not by the phone or web
   browser. Treat a browser-only reply as insufficient evidence: inspect the
   tool output and confirm each host-specific marker is absent on the other host.
+- A managed exec-server command is turn-scoped, not session-scoped. Its process
+  and tunnel stop after the final active turn; the app-server, rollout, phone
+  session, and local memory remain on the Omnigent host. The next turn runs the
+  same saved command and waits for the remote environment to become usable.
 - Codex command hooks still run on the app-server host. Omnigent keeps the
   thread metadata cwd local while each environment carries its own cwd, so the
   remote path does not need a same-path laptop placeholder. A symlinked remote

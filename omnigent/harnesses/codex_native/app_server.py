@@ -51,10 +51,15 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.diagnostics import collect_codex_startup_diagnostics
 from omnigent.harnesses.codex_native.execution_environment import (
+    CODEX_REMOTE_ENVIRONMENT_ID,
     CodexRemoteExecution,
     codex_remote_environment_requests,
     configure_codex_execution_environments,
     read_remote_execution,
+)
+from omnigent.harnesses.codex_native.execution_lifecycle import (
+    ManagedExecServerController,
+    ManagedExecServerLifecycle,
 )
 from omnigent.harnesses.codex_native.launch_args import (
     _merge_tables,
@@ -155,6 +160,7 @@ _MODEL_DISCOVERY_STDERR_LINE_CHARS = 500
 _STDERR_CHUNK_LIMIT = 65536
 _UDS_WEBSOCKET_HANDSHAKE_URI = "ws://localhost/rpc"
 _MAX_WEBSOCKET_MESSAGE_SIZE_BYTES = 128 << 20
+_MAX_MANAGED_TERMINAL_TURNS = 512
 # hooks.json filename written into the private CODEX_HOME registering the
 # Omnigent policy hook. Codex discovers it as a ``user``-layer hook
 # source on every config load (see codex hooks ``discover_handlers``).
@@ -2112,6 +2118,89 @@ def _build_native_codex_app_server_argv(
     return [tagged_argv0, *launch_args, *overrides, "app-server", "--listen", listen_url]
 
 
+def _json_rpc_object(frame: str | bytes) -> dict[str, object] | None:
+    """Parse one text JSON-RPC frame without interpreting opaque binary traffic."""
+    if isinstance(frame, bytes):
+        return None
+    try:
+        payload = json.loads(frame)
+    except json.JSONDecodeError:
+        return None
+    return cast(dict[str, object], payload) if isinstance(payload, dict) else None
+
+
+def _json_rpc_id(payload: dict[str, object] | None) -> int | str | None:
+    if payload is None:
+        return None
+    request_id = payload.get("id")
+    return request_id if isinstance(request_id, (int, str)) else None
+
+
+def _managed_execution_request(
+    payload: dict[str, object] | None,
+) -> tuple[int | str, bool] | None:
+    """Return the request id and whether its lease lasts through a turn."""
+    if payload is None:
+        return None
+    method = payload.get("method")
+    if method not in {
+        "thread/start",
+        "thread/resume",
+        "thread/fork",
+        "thread/shellCommand",
+        "turn/start",
+    }:
+        return None
+    request_id = _json_rpc_id(payload)
+    return (request_id, method == "turn/start") if request_id is not None else None
+
+
+def _json_rpc_response_id(payload: dict[str, object] | None) -> int | str | None:
+    if payload is None or ("result" not in payload and "error" not in payload):
+        return None
+    return _json_rpc_id(payload)
+
+
+def _turn_start_response_turn_id(payload: dict[str, object] | None) -> str | None:
+    if payload is None or "error" in payload:
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    turn = result.get("turn")
+    if not isinstance(turn, dict):
+        return None
+    turn_id = turn.get("id")
+    return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
+def _terminal_turn_id(payload: dict[str, object] | None) -> str | None:
+    if payload is None or payload.get("method") not in {"turn/completed", "turn/failed"}:
+        return None
+    params = payload.get("params")
+    if not isinstance(params, dict):
+        return None
+    turn = params.get("turn")
+    if not isinstance(turn, dict):
+        return None
+    turn_id = turn.get("id")
+    return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
+def _remote_execution_error_response(request_id: int | str, error: Exception) -> str:
+    return json.dumps(
+        {
+            "id": request_id,
+            "error": {
+                "code": -32000,
+                "message": f"Remote execution environment unavailable: {error}",
+            },
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 @dataclass
 class CodexNativeAppServer:
     """
@@ -2219,6 +2308,12 @@ class CodexNativeAppServer:
     app_server_command: tuple[str, ...] = ()
     tui_listen_url: str | None = field(default=None, init=False)
     _tui_proxy_server: Server | None = field(default=None, init=False, repr=False)
+    execution_lifecycle: ManagedExecServerLifecycle | None = field(
+        default=None, init=False, repr=False
+    )
+    _managed_turn_leases: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _managed_terminal_turns: dict[str, None] = field(default_factory=dict, init=False, repr=False)
+    _managed_turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2565,6 +2660,16 @@ class CodexNativeAppServer:
             return self.tui_listen_url
         return self.listen_url or f"unix://{self.socket_path}"
 
+    @property
+    def client_url(self) -> str:
+        """Return the lifecycle-aware transport for non-TUI clients."""
+        if (
+            self.remote_execution is not None
+            and self.remote_execution.managed_exec_server is not None
+        ):
+            return self.tui_url
+        return self.listen_url or f"unix://{self.socket_path}"
+
     def project_tui_request(self, message: str | bytes) -> str | bytes:
         """Project TUI lifecycle requests onto the bound remote executor.
 
@@ -2624,32 +2729,173 @@ class CodexNativeAppServer:
                 compression=None,
             )
         async with connector as upstream:
+            pending_leases: dict[int | str, tuple[str, bool]] = {}
+            pending_lock = asyncio.Lock()
+            downstream_send_lock = asyncio.Lock()
+            downstream_closed = asyncio.Event()
 
             async def to_upstream() -> None:
-                async for frame in downstream:
-                    await upstream.send(self.project_tui_request(frame))
+                try:
+                    async for frame in downstream:
+                        projected = self.project_tui_request(frame)
+                        payload = _json_rpc_object(projected)
+                        managed_request = _managed_execution_request(payload)
+                        request_id = managed_request[0] if managed_request is not None else None
+                        lease: str | None = None
+                        lifecycle = self.execution_lifecycle
+                        if request_id is not None and lifecycle is not None:
+                            assert managed_request is not None
+                            try:
+                                lease = await lifecycle.acquire(self._probe_remote_execution)
+                            except Exception as exc:  # noqa: BLE001 - reject provisioning failures
+                                async with downstream_send_lock:
+                                    await downstream.send(
+                                        _remote_execution_error_response(request_id, exc)
+                                    )
+                                continue
+                            async with pending_lock:
+                                pending_leases[request_id] = (
+                                    lease,
+                                    managed_request[1],
+                                )
+                        try:
+                            await upstream.send(projected)
+                        except BaseException:
+                            if lease is not None and lifecycle is not None:
+                                assert request_id is not None
+                                async with pending_lock:
+                                    pending_leases.pop(request_id, None)
+                                await lifecycle.release(lease)
+                            raise
+                finally:
+                    downstream_closed.set()
 
             async def to_downstream() -> None:
                 async for frame in upstream:
-                    await downstream.send(frame)
+                    payload = _json_rpc_object(frame)
+                    response_id = _json_rpc_response_id(payload)
+                    if response_id is not None:
+                        async with pending_lock:
+                            pending_lease = pending_leases.pop(response_id, None)
+                        if pending_lease is not None:
+                            lease, retain_for_turn = pending_lease
+                            if not retain_for_turn:
+                                assert self.execution_lifecycle is not None
+                                await self.execution_lifecycle.release(lease)
+                            else:
+                                turn_id = _turn_start_response_turn_id(payload)
+                                if turn_id is None:
+                                    assert self.execution_lifecycle is not None
+                                    await self.execution_lifecycle.release(lease)
+                                else:
+                                    await self._bind_managed_turn(turn_id, lease)
+                    terminal_turn_id = _terminal_turn_id(payload)
+                    if terminal_turn_id is not None:
+                        await self._finish_managed_turn(terminal_turn_id)
+                    if not downstream_closed.is_set():
+                        try:
+                            async with downstream_send_lock:
+                                if not downstream_closed.is_set():
+                                    await downstream.send(frame)
+                        except ConnectionClosed:
+                            downstream_closed.set()
+                    if downstream_closed.is_set():
+                        async with pending_lock:
+                            if not pending_leases:
+                                return
 
-            tasks = {
-                asyncio.create_task(to_upstream(), name="codex-tui-proxy-to-app-server"),
-                asyncio.create_task(to_downstream(), name="codex-tui-proxy-to-terminal"),
-            }
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            for task in pending:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            for task in done:
-                task.result()
+            upstream_task = asyncio.create_task(
+                to_upstream(), name="codex-tui-proxy-to-app-server"
+            )
+            downstream_task = asyncio.create_task(
+                to_downstream(), name="codex-tui-proxy-to-terminal"
+            )
+            tasks = {upstream_task, downstream_task}
+            try:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+                if upstream_task in done and not downstream_task.done():
+                    async with pending_lock:
+                        drain_responses = bool(pending_leases)
+                    if drain_responses:
+                        await downstream_task
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                async with pending_lock:
+                    abandoned = [lease for lease, _ in pending_leases.values()]
+                    pending_leases.clear()
+                lifecycle = self.execution_lifecycle
+                if lifecycle is not None:
+                    for lease in abandoned:
+                        await lifecycle.release(lease)
+
+    async def _probe_remote_execution(self) -> None:
+        """Force Codex to initialize the configured environment before admitting a turn."""
+        binding = self.remote_execution
+        if binding is None:
+            raise RuntimeError("Codex remote execution binding is unavailable")
+        transport = self.listen_url or str(self.socket_path)
+        client = client_for_transport(transport, client_name="omnigent-exec-server-lifecycle")
+        await client.connect()
+        try:
+            # Probe the environment object loaded from environments.toml. Replacing
+            # it with environment/add would leave an existing thread holding the
+            # disconnected object while the manager points at the replacement.
+            await client.request(
+                "environment/info",
+                {"environmentId": CODEX_REMOTE_ENVIRONMENT_ID},
+            )
+        finally:
+            await client.close()
+
+    async def _bind_managed_turn(self, turn_id: str, lease: str) -> None:
+        """Associate an accepted turn with its managed-command lease."""
+        lifecycle = self.execution_lifecycle
+        if lifecycle is None:
+            return
+        release: str | None = None
+        async with self._managed_turn_lock:
+            if turn_id in self._managed_terminal_turns:
+                del self._managed_terminal_turns[turn_id]
+                release = lease
+            else:
+                existing = self._managed_turn_leases.get(turn_id)
+                if existing is None:
+                    self._managed_turn_leases[turn_id] = lease
+                elif existing != lease:
+                    release = lease
+        if release is not None:
+            await lifecycle.release(release)
+
+    async def _finish_managed_turn(self, turn_id: str) -> None:
+        """Release the lease once any proxy connection observes a terminal event."""
+        lifecycle = self.execution_lifecycle
+        if lifecycle is None:
+            return
+        async with self._managed_turn_lock:
+            lease = self._managed_turn_leases.pop(turn_id, None)
+            if lease is None:
+                self._managed_terminal_turns[turn_id] = None
+                while len(self._managed_terminal_turns) > _MAX_MANAGED_TERMINAL_TURNS:
+                    self._managed_terminal_turns.pop(next(iter(self._managed_terminal_turns)))
+        if lease is not None:
+            await lifecycle.release(lease)
 
     async def start_tui_execution_proxy(self) -> None:
         """Start the loopback TUI shim when this session has a remote binding."""
         if self.remote_execution is None or self._tui_proxy_server is not None:
             return
+        if (
+            self.remote_execution.managed_exec_server is not None
+            and self.execution_lifecycle is None
+        ):
+            self.execution_lifecycle = ManagedExecServerController(
+                self.remote_execution.managed_exec_server
+            )
         server = await serve(
             self._proxy_tui_connection,
             "127.0.0.1",
@@ -2670,10 +2916,14 @@ class CodexNativeAppServer:
         server = self._tui_proxy_server
         self._tui_proxy_server = None
         self.tui_listen_url = None
-        if server is None:
-            return
-        server.close()
-        await server.wait_closed()
+        if server is not None:
+            server.close()
+            await server.wait_closed()
+        lifecycle, self.execution_lifecycle = self.execution_lifecycle, None
+        if lifecycle is not None:
+            await lifecycle.close()
+        self._managed_turn_leases.clear()
+        self._managed_terminal_turns.clear()
 
     def _startup_snapshot_event(
         self, event_name: str, exc: Exception, **attributes: object

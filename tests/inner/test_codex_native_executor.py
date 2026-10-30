@@ -31,11 +31,11 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_startup_timeout,
     write_bridge_state,
 )
-from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.harnesses.codex_native.execution_environment import (
     CodexRemoteExecution,
     write_remote_execution,
 )
+from omnigent.harnesses.codex_native.shell_input import native_shell_authorization
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
 from omnigent.inner.executor import (
     ExecutorConfig,

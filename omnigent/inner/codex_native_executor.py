@@ -54,15 +54,15 @@ from omnigent.harnesses.codex_native.bridge import (
     reconcile_shell_command_state,
     update_active_turn_id,
 )
+from omnigent.harnesses.codex_native.execution_environment import (
+    codex_remote_environment_requests,
+    read_remote_execution,
+)
 from omnigent.harnesses.codex_native.shell_input import (
     native_shell_command_is_authorized,
 )
 from omnigent.harnesses.codex_native.shell_input import (
     shell_command_from_content as _shell_command_from_content,
-)
-from omnigent.harnesses.codex_native.execution_environment import (
-    codex_remote_environment_requests,
-    read_remote_execution,
 )
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import stat
 import tomllib
 from pathlib import Path
@@ -12,6 +13,7 @@ from omnigent.harnesses.codex_native.execution_environment import (
     CodexExecutionMode,
     CodexRemoteExecution,
     CodexRemoteExecutionConfigError,
+    ManagedExecServerConfig,
     apply_execution_selection,
     codex_remote_environment_requests,
     configure_codex_execution_environments,
@@ -58,7 +60,7 @@ def test_remote_execution_materializes_private_dual_environment_registry(
 
 
 def test_remote_turn_selects_remote_first_and_laptop_second(tmp_path: Path) -> None:
-    """One turn can use Arclet code tools and laptop-owned memory tools."""
+    """One turn can use remote code tools and host-local memory tools."""
     assert codex_remote_environment_requests(
         CodexRemoteExecution(
             exec_server_url="ws://127.0.0.1:43111",
@@ -102,6 +104,41 @@ def test_remote_execution_round_trips_privately_and_clears(tmp_path: Path) -> No
     assert not config_path.exists()
 
 
+@pytest.mark.posix_only
+def test_managed_remote_execution_round_trips_command_and_timeout(tmp_path: Path) -> None:
+    """Cold resume retains the command that can wake the same remote environment."""
+    bridge_dir = tmp_path / "bridge"
+    binding = CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd="/home/agent/workspace",
+        managed_exec_server=ManagedExecServerConfig(
+            command=(
+                "remote-cli",
+                "connect",
+                "pr-a",
+                "-L",
+                "43111:127.0.0.1:43111",
+                "codex",
+                "exec-server",
+                "--listen",
+                "ws://127.0.0.1:43111",
+            ),
+            ready_timeout_seconds=420.0,
+        ),
+    )
+
+    apply_execution_selection(bridge_dir, binding)
+
+    assert read_remote_execution(bridge_dir) == binding
+    assert json.loads((bridge_dir / "remote_execution.json").read_text(encoding="utf-8")) == {
+        "cwd": "/home/agent/workspace",
+        "exec_server_url": "ws://127.0.0.1:43111",
+        "managed_command": list(binding.managed_exec_server.command),
+        "ready_timeout_seconds": 420.0,
+        "schema": 1,
+    }
+
+
 def test_missing_remote_execution_preserves_legacy_local_mode(tmp_path: Path) -> None:
     """A session created before this feature remains local without migration."""
     assert read_remote_execution(tmp_path / "missing-bridge") is None
@@ -133,7 +170,58 @@ def test_remote_execution_selection_rejects_partial_or_unsafe_configuration(
         resolve_execution_selection(
             exec_server_url=url,
             exec_cwd=cwd,
+            exec_server_command=None,
+            exec_server_ready_timeout=None,
             local_execution=local,
+        )
+
+
+def test_managed_remote_execution_selection_parses_argv_without_a_shell() -> None:
+    """Quoted command arguments remain one argv element and never require shell parsing later."""
+    selection = resolve_execution_selection(
+        exec_server_url="ws://127.0.0.1:43111",
+        exec_cwd="/home/agent/workspace",
+        exec_server_command='remote-cli connect "PR A" -- codex exec-server',
+        exec_server_ready_timeout=420.0,
+        local_execution=False,
+    )
+
+    assert selection == CodexRemoteExecution(
+        exec_server_url="ws://127.0.0.1:43111",
+        cwd="/home/agent/workspace",
+        managed_exec_server=ManagedExecServerConfig(
+            command=("remote-cli", "connect", "PR A", "--", "codex", "exec-server"),
+            ready_timeout_seconds=420.0,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "timeout", "message"),
+    [
+        ("remote-cli connect pr-a", None, "--exec-server-url"),
+        ("   ", None, "non-empty"),
+        (None, 60.0, "--exec-server-command"),
+        ("remote-cli connect pr-a", 0.0, "greater than zero"),
+    ],
+)
+def test_managed_remote_execution_rejects_partial_configuration(
+    command: str | None,
+    timeout: float | None,
+    message: str,
+) -> None:
+    """A lifecycle command cannot be persisted without one complete remote binding."""
+    with pytest.raises(ValueError, match=message):
+        resolve_execution_selection(
+            exec_server_url=None
+            if command == "remote-cli connect pr-a" and timeout is None
+            else "ws://127.0.0.1:43111",
+            exec_cwd=None
+            if command == "remote-cli connect pr-a" and timeout is None
+            else "/home/agent/workspace",
+            exec_server_command=command,
+            exec_server_ready_timeout=timeout,
+            local_execution=False,
         )
 
 
