@@ -238,6 +238,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_background_work_running_cache,
+    _session_blocked_on_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -257,6 +258,7 @@ from omnigent.server.routes._sessions.helpers import (
     _antigravity_subagent_title,
     _await_settled_managed_launch,
     _background_work_running_for,
+    _blocked_on_for,
     _build_new_item,
     _build_policy_engine_from_spec,
     _child_session_summary_from_conversation,
@@ -1297,6 +1299,7 @@ def _build_session_list_item(
         background_work_running=_background_work_running_for(
             conv.id, conv.background_work_running, conv.runner_id
         ),
+        blocked_on=_blocked_on_for(conv.id, conv.blocked_on),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
@@ -8601,6 +8604,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
     _session_background_work_running_cache.pop(session_id, None)
+    _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
 

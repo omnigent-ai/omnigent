@@ -1730,6 +1730,21 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def set_blocked_on(self, conversation_id: str, blocked_on: str | None) -> None:
+        """
+        Persist why a running session's agent is parked on a terminal prompt.
+
+        Written by the replica that published the session's last status edge
+        so any replica's session list can show it as needing input. Must NOT
+        bump ``updated_at``.
+
+        :param conversation_id: Session/conversation identifier.
+        :param blocked_on: The reason, at most 128 characters, e.g.
+            ``"permission prompt"``, or ``None`` when not parked.
+        """
+        ...
+
+    @abstractmethod
     def replace_runner_id(
         self,
         conversation_id: str,
