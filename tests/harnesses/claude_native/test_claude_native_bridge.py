@@ -10857,19 +10857,31 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
 
 
-def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
+@pytest.mark.parametrize(
+    ("prompt", "description"),
+    [
+        ("Enter password to configure settings.\nPassword:", "a password"),
+        (
+            "No Claude Code installation found. Would you like to install it? [Y/n]:",
+            "installation confirmation",
+        ),
+    ],
+    ids=["password", "install-confirmation"],
+)
+def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    description: str,
 ) -> None:
     """
-    A launcher waiting for a password fails delivery as a terminal dialog within
-    two polls, instead of waiting out the budget and reaping the pane that holds
-    the prompt the person must answer.
+    A launcher waiting for an answer reports its prompt without reaping the pane.
     """
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
 
     def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
         captures.append(1)
-        return "Installing launcher...\nEnter password to configure settings.\nPassword:\n"
+        return f"Installing launcher...\n{prompt}\n"
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
     monkeypatch.setattr(
@@ -10883,9 +10895,9 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
             timeout_s=30.0,
         )
     assert str(raised.value).startswith(
-        "Claude Code's launch command is waiting for a password in its terminal"
+        f"Claude Code's launch command is waiting for {description} in its terminal"
     )
-    assert "Password:" in str(raised.value)
+    assert prompt in str(raised.value)
     assert len(captures) == 2
 
 
