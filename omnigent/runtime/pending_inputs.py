@@ -914,7 +914,14 @@ def resolve_matching_text(
         lost: list[DrainedInput] = []
         uncertain: list[DrainedInput] = []
         for _pending_id, entry in skipped_entries:
-            if entry.uncertain or entry.interrupted:
+            # Claude folds a plain prompt queued behind a "/"-led one at the next
+            # tool call but keeps the "/"-led prompt until the turn ends, so the
+            # older entry may still be recorded later.
+            if (
+                entry.uncertain
+                or entry.interrupted
+                or _collapse_whitespace(_content_text(entry.content)).startswith("/")
+            ):
                 uncertain.append(_drained_input(entry))
             else:
                 lost.append(_drained_input(entry))

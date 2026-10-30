@@ -55,6 +55,7 @@ from omnigent.harness_availability import (
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
 )
+from omnigent.harnesses.claude_native import PEER_MESSAGE_WAKE_KIND, PEER_MESSAGE_WAKE_TEXT
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -3069,7 +3070,21 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
-    if item.stable_id is not None and _drains_pending_inputs(item):
+    source_id = body.data.get("source_id")
+    is_peer_wake_marker = (
+        isinstance(source_id, str)
+        and source_id.strip().endswith(f":0:{PEER_MESSAGE_WAKE_KIND}")
+        and item.type == "message"
+        and isinstance(item.data, MessageData)
+        and item.data.role == "user"
+        and item.data.content == [{"type": "input_text", "text": PEER_MESSAGE_WAKE_TEXT}]
+    )
+    # Bridge-generated peer labels have no queued input; literal user text still does.
+    drains_pending_inputs = _drains_pending_inputs(item) and not is_peer_wake_marker
+    if is_peer_wake_marker and isinstance(item.data, MessageData):
+        # The wire marker is hidden so older servers also preserve pending uploads.
+        item = item.model_copy(update={"data": item.data.model_copy(update={"is_meta": False})})
+    if item.stable_id is not None and drains_pending_inputs:
         # A forwarder retry of a mirror already persisted under its source-derived
         # id: nothing to drain, persist or publish. Draining again could match a
         # NEWER identical queued message and mark everything queued in between
@@ -3078,7 +3093,7 @@ async def _persist_external_conversation_item_unlocked(
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
         if existing is not None:
             return existing.id
-    if _drains_pending_inputs(item) and STARTUP_LABEL in conv.labels:
+    if drains_pending_inputs and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry and fold the entry's file
@@ -3100,13 +3115,7 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
-    if (
-        item.type == "message"
-        and isinstance(item.data, MessageData)
-        and item.data.role == "user"
-        and not item.data.is_meta
-        and not _is_native_interrupt_record(item.data)
-    ):
+    if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
@@ -6421,6 +6430,7 @@ async def _forward_native_terminal_message(
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
+    native_shell_authorized: bool = False,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -6446,6 +6456,7 @@ async def _forward_native_terminal_message(
         ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
+    :param native_shell_authorized: Owner authorization for this shell delivery.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
@@ -6500,11 +6511,17 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    forward_options: dict[str, Any] = {}
+    if native_shell_authorized:
+        from omnigent.harnesses.codex_native.shell_input import CODEX_SHELL_AUTHORIZED_HEADER
+
+        forward_options["headers"] = {CODEX_SHELL_AUTHORIZED_HEADER: "1"}
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
             json=event,
             timeout=_CLAUDE_NATIVE_MESSAGE_TIMEOUT_S,
+            **forward_options,
         )
         _logger.info(
             "%s terminal message runner response: session=%s status=%s body=%s",
@@ -7933,6 +7950,7 @@ async def _dispatch_session_event_to_runner_impl(
     artifact_store: ArtifactStore | None,
     has_mcp_servers: bool = False,
     created_by: str | None = None,
+    native_shell_authorized: bool = False,
     runner_router: RunnerRouter | None = None,
     native_terminal_ready: bool = False,
     host_store: HostStore | None = None,
@@ -8001,6 +8019,7 @@ async def _dispatch_session_event_to_runner_impl(
         :func:`omnigent.runtime.pending_inputs.record` and applied
         to the item when the forwarder mirrors it back (see
         :func:`_persist_external_conversation_item`).
+    :param native_shell_authorized: Owner authorization for this shell delivery.
     :param runner_router: Router used to resolve the runner for the
         native-terminal parent-wake forward when a sub-agent fails to
         boot (see :func:`_persist_native_terminal_failure`). ``None``
@@ -8297,6 +8316,7 @@ async def _dispatch_session_event_to_runner_impl(
                 ),
                 input_delivery=input_delivery,
                 agent_revision=agent_revision,
+                native_shell_authorized=native_shell_authorized,
             )
             forwarded = True
             if pending_id is not None:
@@ -11766,6 +11786,7 @@ async def _create_session_from_existing_agent(
         )
 
     from omnigent.server.routes._session_harness_readiness import (
+        require_codex_plan_launch_support,
         validate_create_harness_readiness,
     )
 
@@ -11793,6 +11814,12 @@ async def _create_session_from_existing_agent(
         conversation_store=conversation_store,
         host_store=getattr(request.app.state, "host_store", None),
         parent=_parent_for_routing,
+    )
+    require_codex_plan_launch_support(
+        harness=selected_harness,
+        host_id=body.host_id,
+        labels=body.labels,
+        host_registry=getattr(request.app.state, "host_registry", None),
     )
 
     # Git worktree options (optional). Two modes on body.git:
