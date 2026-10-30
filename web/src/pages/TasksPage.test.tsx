@@ -11,11 +11,14 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TasksPage } from "./TasksPage";
+import { useViewerId } from "@/hooks/useViewerId";
 import * as hooks from "@/hooks/useScheduledTasks";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
 
 vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTasks: vi.fn(),
@@ -89,7 +92,10 @@ const mutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
 
-function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?: boolean } = {}) {
+function setTasks(
+  tasks: ScheduledTask[] | undefined,
+  state: { isLoading?: boolean; isError?: boolean } = {},
+) {
   vi.mocked(hooks.useScheduledTasks).mockReturnValue({
     data: tasks,
     isLoading: state.isLoading ?? false,
@@ -99,6 +105,8 @@ function setTasks(tasks: ScheduledTask[], state: { isLoading?: boolean; isError?
 }
 
 beforeEach(() => {
+  localStorage.clear();
+  vi.mocked(useViewerId).mockReturnValue(null);
   mutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
@@ -138,6 +146,36 @@ function renderPage(path = "/tasks", basename = "") {
 }
 
 describe("TasksPage list", () => {
+  it("waits for the first task load and keeps the guide's step through a failed refetch", () => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
+    const content = () => (
+      <MemoryRouter>
+        <CapabilitiesProvider info={SERVER_INFO_OFFLINE_FALLBACK}>
+          <TasksPage />
+        </CapabilitiesProvider>
+      </MemoryRouter>
+    );
+    setTasks(undefined, { isLoading: true });
+    const view = render(content());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    setTasks(undefined, { isError: true });
+    view.rerender(content());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    setTasks([]);
+    view.rerender(content());
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    const step = screen.getByText(/of .* · Make it yours/).textContent;
+    setTasks([], { isError: true });
+    view.rerender(content());
+    expect(screen.getByRole("dialog")).toBeVisible();
+    expect(screen.getByText(step!)).toBeVisible();
+    setTasks([]);
+    view.rerender(content());
+    expect(screen.getByText(step!)).toBeVisible();
+  });
+
   it("renders the title, subtitle and task rows with schedule text", () => {
     setTasks([task()]);
     renderPage();
@@ -478,8 +516,12 @@ describe("trigger templates", () => {
   });
 
   it.each(["jira", "slack", "github"])("opens the %s builder from the templates page", (source) => {
+    vi.mocked(useViewerId).mockReturnValue("alice");
     setTasks([]);
     renderWithSessionModes(TRIGGER_INFO, true);
+    expect(
+      screen.queryByRole("dialog", { name: "Introducing Automations" }),
+    ).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId(`suggestion-trigger-${source}`));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute(
       "data-initial-trigger",

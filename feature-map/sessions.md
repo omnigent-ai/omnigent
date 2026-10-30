@@ -192,8 +192,11 @@ menu → **Open in grid** and choose the pane and direction. Each pane has its o
 transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
-screen; drafts and terminal connections survive view changes. Shared-session
-terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
+screen; drafts and terminal connections survive view changes.
+Render failures in one chat or terminal show **Try again** in that view while
+cell controls, the other view and neighboring sessions stay usable. Clear the
+fault and retry to recover.
+Shared-session terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
 their `/grid/<id>` URL on the same desktop browser. All sessions in the open grid
@@ -528,6 +531,11 @@ plain `uv run pytest`, which starts a private server for the test.
   Layout combinations and malformed local storage have unit coverage in
   `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
   `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  Per-view render recovery, preserved neighboring drafts, usable cell controls
+  and independent chat/terminal retry have component coverage in
+  `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
+  exception into one chat or terminal, confirm the other views stay usable,
+  clear the fault, and choose **Try again** in the failed view.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`

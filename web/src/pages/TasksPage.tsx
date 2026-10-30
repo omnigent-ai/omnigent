@@ -11,7 +11,7 @@
  * endpoint.
  */
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   ArrowLeftIcon,
   ChevronDownIcon,
@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import {
   SCHEDULED_TASK_SUGGESTIONS,
@@ -68,6 +69,7 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 ];
 
 export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }) {
+  const newTaskButtonRef = useRef<HTMLButtonElement>(null);
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
@@ -235,6 +237,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
 
   return (
     <PageScroll contentClassName="px-4 md:px-6">
+      {tasks !== undefined && (
+        <AutomationsIntro onClose={() => newTaskButtonRef.current?.focus()} />
+      )}
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Automations</h1>
@@ -244,7 +249,12 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button data-testid="new-task-button" className="shrink-0" componentId="tasks.new">
+            <Button
+              ref={newTaskButtonRef}
+              data-testid="new-task-button"
+              className="shrink-0"
+              componentId="tasks.new"
+            >
               New automation
               <ChevronDownIcon className="size-4" />
             </Button>

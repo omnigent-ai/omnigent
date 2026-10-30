@@ -31,6 +31,7 @@ import {
 import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
+import { OpenInMenu } from "./OpenInMenu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import {
@@ -492,7 +493,7 @@ export function FilesPanel({
         fillHeight ? "flex h-full min-h-0 flex-col" : "flex min-h-0 flex-col",
       )}
     >
-      {/* Header — single row: [workingDir] [copy] [close?] */}
+      {/* Header — single row: [workingDir] [copy] [refresh] [close?] [open in] */}
       <div className="flex h-11 shrink-0 items-center gap-[2px] px-2">
         {flatView && <h2 className="shrink-0 pl-1 font-medium text-ui">Changes</h2>}
         {!flatView && workingDir && workspaceRoot && (
@@ -560,6 +561,7 @@ export function FilesPanel({
               <XIcon className="size-4" />
             </button>
           )}
+          {!flatView && workingDir && <OpenInMenu path={workingDir} directory />}
         </div>
       </div>
       {/* Content */}
