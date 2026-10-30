@@ -5,6 +5,8 @@ import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChange
 import type * as UseSessionModule from "@/hooks/useSession";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
+import type * as UseAgentsModule from "@/hooks/useAgents";
+import type { Agent } from "@/hooks/useAgents";
 import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as GoalApiModule from "@/lib/goalApi";
@@ -167,6 +169,13 @@ const { hostMcpQueryMock } = vi.hoisted(() => ({
 vi.mock("@/hooks/useHarnessInventory", async (importOriginal) => ({
   ...(await importOriginal<typeof UseHarnessInventoryModule>()),
   useHostMcpServers: hostMcpQueryMock,
+}));
+const { sessionAgentQueryMock } = vi.hoisted(() => ({
+  sessionAgentQueryMock: vi.fn(() => ({ data: undefined as Agent | undefined })),
+}));
+vi.mock("@/hooks/useAgents", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentsModule>()),
+  useSessionAgent: sessionAgentQueryMock,
 }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
   ...(await importOriginal<typeof RunnerHealthProviderModule>()),
@@ -3609,6 +3618,8 @@ describe("Composer MCP status command", () => {
     composerSessionSnapshot.hostId = null;
     hostMcpQueryMock.mockReset();
     hostMcpQueryMock.mockReturnValue({ data: [], isLoading: false, isError: false });
+    sessionAgentQueryMock.mockReset();
+    sessionAgentQueryMock.mockReturnValue({ data: undefined });
   });
 
   it("shows the effective session MCPs in a read-only panel", () => {
@@ -4103,15 +4114,23 @@ describe("Composer MCP status command", () => {
   });
 
   it.each([
-    { loadsUserSettings: undefined, agentDetailsLoading: false, userRowShown: true },
+    { loadsUserSettings: undefined, agentLoaded: true, userRowShown: true },
     // `skills: none` runs claude-sdk with no setting sources: only managed servers load.
-    { loadsUserSettings: false, agentDetailsLoading: false, userRowShown: false },
-    { loadsUserSettings: undefined, agentDetailsLoading: true, userRowShown: false },
+    { loadsUserSettings: false, agentLoaded: true, userRowShown: false },
+    // The session's agent is still loading, or its request failed.
+    { loadsUserSettings: undefined, agentLoaded: false, userRowShown: false },
   ])(
     "lists the host's Claude servers in a claude-sdk session: %j",
-    ({ loadsUserSettings, agentDetailsLoading, userRowShown }) => {
+    ({ loadsUserSettings, agentLoaded, userRowShown }) => {
       composerSessionSnapshot.hostId = "host_sdk";
       setComposerState({ boundAgentId: "agent_sdk", sessionHarness: "claude-sdk" });
+      const agent = {
+        id: "agent_sdk",
+        name: "SDK agent",
+        mcp_servers: [],
+        loads_user_settings: loadsUserSettings,
+      };
+      sessionAgentQueryMock.mockReturnValue({ data: agentLoaded ? agent : undefined });
       const hostRows = [
         {
           name: "corp-tools",
@@ -4134,19 +4153,7 @@ describe("Composer MCP status command", () => {
       hostMcpQueryMock.mockReturnValue({ data: hostRows, isLoading: false, isError: false });
       render(
         <MemoryRouter>
-          <Composer
-            {...composerProps({
-              agents: [
-                {
-                  id: "agent_sdk",
-                  name: "SDK agent",
-                  mcp_servers: [],
-                  loads_user_settings: loadsUserSettings,
-                },
-              ],
-              agentDetailsLoading,
-            })}
-          />
+          <Composer {...composerProps({ agents: [agent] })} />
         </MemoryRouter>,
       );
       fireEvent.change(textarea(), { target: { value: "/mcp" } });
@@ -4155,8 +4162,13 @@ describe("Composer MCP status command", () => {
       expect(screen.getByTestId("mcp-server-row-corp-tools")).toHaveTextContent("Connected");
       expect(screen.queryByTestId("mcp-server-row-linear") !== null).toBe(userRowShown);
       expect(screen.queryByTestId("mcp-server-row-codex-only")).toBeNull();
+      expect(screen.getByRole("link", { name: "Go to Settings" })).toHaveAttribute(
+        "href",
+        "/settings/harnesses/claude-native?host=host_sdk",
+      );
       // A hidden row awaiting sign-in does not keep the panel polling.
       expect(hostPollInterval(hostRows)).toBe(userRowShown ? 5000 : false);
+      expect(sessionAgentQueryMock).toHaveBeenCalledWith("conv_mcp");
     },
   );
 
