@@ -6585,6 +6585,20 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     return None if scrolled is None else _ComposerBox(scrolled, framed=False)
 
 
+def _composer_reads_clear(box: _ComposerBox | None) -> bool:
+    """
+    Return whether one burst of clearing keys is known to empty *box*.
+
+    True when the capture showed the box whole (both rules on screen) with
+    nothing after its glyph row but blank rows: the burst empties the glyph
+    row, and no hidden line is left for a paste to join.
+
+    :param box: The box :func:`_composer_box` read, or ``None``.
+    :returns: ``True`` when the box reads clear.
+    """
+    return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
+
+
 def _first_non_blank(lines: list[str], start: int, end: int) -> int:
     """Return the index of the first non-blank line in ``lines[start:end]``, else *end*."""
     return next((idx for idx in range(start, end) if lines[idx].strip()), end)
@@ -6615,20 +6629,6 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
     if any(_CLAUDE_PROMPT_GLYPH in line for line in lines):
         return None
     return rows
-
-
-def _composer_reads_clear(box: _ComposerBox | None) -> bool:
-    """
-    Return whether one burst of clearing keys is known to empty *box*.
-
-    True when the capture showed the box whole (both rules on screen) with
-    nothing after its glyph row but blank rows: the burst empties the glyph
-    row, and no hidden line is left for a paste to join.
-
-    :param box: The box :func:`_composer_box` read, or ``None``.
-    :returns: ``True`` when the box reads clear.
-    """
-    return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
 
 
 def _clear_composer(socket_path: str, tmux_target: str) -> None:
