@@ -576,6 +576,9 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
   const lookups = [];
   const dnsTable = {
     "lvh.me": ["127.0.0.1"],
+    "localtest.me": ["127.0.0.1"],
+    "127.0.0.1.nip.io": ["127.0.0.1"],
+    "169-254-169-254.nip.io": ["169.254.169.254"],
     "rebind.example": ["93.184.215.14"],
     "example.com": ["93.184.215.14"],
     "cdn.example.net": ["93.184.215.15"],
@@ -640,14 +643,39 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
           const url = `${resourceType === "webSocket" ? "ws" : "http"}://${host}:5173/x`;
           const ip = host === "[::1]" ? "::1" : "127.0.0.1";
           const local = { webContentsId: idOf("local"), resourceType, url, ip };
-          assert.equal(await registry.shouldCancelAgentRequest(local), false, url);
-          assert.equal(await registry.shouldCancelAgentResponse(local), false, url);
+          const label = `${resourceType} ${url}`;
+          assert.equal(
+            await registry.shouldCancelAgentRequest(local),
+            false,
+            `${label}: local request`,
+          );
+          assert.equal(
+            await registry.shouldCancelAgentResponse(local),
+            false,
+            `${label}: local response`,
+          );
           const worker = { ...local, webContentsId: undefined };
-          assert.equal(await registry.shouldCancelAgentRequest(worker, partition), false);
-          assert.equal(await registry.shouldCancelAgentResponse(worker, partition), false);
+          assert.equal(
+            await registry.shouldCancelAgentRequest(worker, partition),
+            false,
+            `${label}: worker request`,
+          );
+          assert.equal(
+            await registry.shouldCancelAgentResponse(worker, partition),
+            false,
+            `${label}: worker response`,
+          );
           const remote = { ...local, webContentsId: idOf("remote") };
-          assert.equal(await registry.shouldCancelAgentRequest(remote), true);
-          assert.equal(await registry.shouldCancelAgentResponse(remote), true);
+          assert.equal(
+            await registry.shouldCancelAgentRequest(remote),
+            true,
+            `${label}: remote request`,
+          );
+          assert.equal(
+            await registry.shouldCancelAgentResponse(remote),
+            true,
+            `${label}: remote response`,
+          );
         }),
       ),
     );
@@ -709,7 +737,7 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     entry.view.webContents.close = () => assert.fail("network enforcement must keep the view");
     const webContentsId = idOf("conv_1");
     await Promise.all(
-      ["xhr", "script", "image", "stylesheet", "font", "media", "ping", "other", "webSocket"].map(
+      ["xhr", "script", "image", "stylesheet", "font", "media", "ping", "other"].map(
         async (resourceType) => {
           await Promise.all(
             [
@@ -725,13 +753,17 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
               );
             }),
           );
-          const url =
-            resourceType === "webSocket" ? "wss://example.com/live" : "https://example.com/x.js";
+          const url = "https://example.com/x.js";
           const request = { webContentsId, url, resourceType };
-          assert.equal(await registry.shouldCancelAgentRequest(request), false);
+          assert.equal(
+            await registry.shouldCancelAgentRequest(request),
+            false,
+            `${resourceType}: public URL ${url}`,
+          );
           assert.equal(
             await registry.shouldCancelAgentResponse({ ...request, ip: "93.184.215.14" }),
             false,
+            `${resourceType}: public connected IP for ${url}`,
           );
           await Promise.all(
             ["127.0.0.1", "192.168.1.1", "169.254.169.254", undefined].map(async (ip) => {
@@ -767,6 +799,18 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     open("conv_1", context);
     assert.equal(await registry.shouldCancelAgentRequest(local, partition), false);
     assert.equal(await registry.shouldCancelAgentResponse(local, partition), false);
+    registry.openOrNavigate("browser-tab:conv_1:t1", null);
+    assert.equal(
+      await registry.shouldCancelAgentRequest(local, partition),
+      true,
+      "a never-navigated tab is public-only",
+    );
+    open("browser-tab:conv_1:t1", context);
+    assert.equal(
+      await registry.shouldCancelAgentRequest(local, partition),
+      false,
+      "eligible navigation grants worker loopback access",
+    );
     open("browser-tab:conv_1:t1", null);
     // Dedicated, shared, and service workers may report zero or no view ID.
     await Promise.all(
@@ -794,6 +838,141 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentRequest(publicRequest, partition), false);
     assert.equal(await registry.shouldCancelAgentResponse(publicRequest, partition), false);
     assert.deepEqual(lookups, []);
+  });
+
+  it("preflights unsafe methods and WebSockets to private-resolving names in the owning partition", async () => {
+    const { registry, lookups, idOf } = makeNetworkGuardRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const aliases = ["localtest.me", "127.0.0.1.nip.io", "169-254-169-254.nip.io"];
+    const methods = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+    const expectedLookups = [];
+    await Promise.all(
+      aliases.flatMap((hostname) =>
+        methods.flatMap((method) =>
+          ["xhr", "ping", "webSocket"].map(async (resourceType) => {
+            const preflighted = resourceType === "webSocket" || !["GET", "HEAD"].includes(method);
+            if (preflighted) expectedLookups.push(hostname);
+            const url = `${resourceType === "webSocket" ? "ws" : "http"}://${hostname}/request`;
+            const request = { webContentsId: idOf("conv_1"), url, method, resourceType };
+            assert.equal(
+              await registry.shouldCancelAgentRequest(request),
+              preflighted,
+              `${method} ${resourceType} ${hostname}`,
+            );
+            assert.equal(
+              await registry.shouldCancelAgentResponse({
+                ...request,
+                ip: hostname.startsWith("169") ? "169.254.169.254" : "127.0.0.1",
+              }),
+              true,
+              `${method} ${resourceType} ${hostname}: private response`,
+            );
+          }),
+        ),
+      ),
+    );
+    assert.deepEqual(lookups.map((lookup) => lookup.hostname).sort(), expectedLookups.sort());
+    assert.ok(lookups.every((lookup) => lookup.partition === agentPartition("w-test", "conv_1")));
+    assert.equal(
+      await registry.shouldCancelAgentRequest({
+        webContentsId: idOf("conv_1"),
+        url: "https://example.com/post",
+        method: "POST",
+        resourceType: "xhr",
+      }),
+      false,
+      "public unsafe methods remain available",
+    );
+    const worker = { url: "http://localtest.me/post", method: "POST", resourceType: "xhr" };
+    assert.equal(
+      await registry.shouldCancelAgentRequest(worker, agentPartition("w-test", "conv_1")),
+      true,
+      "worker POST uses its partition resolver",
+    );
+    assert.deepEqual(lookups.at(-1), {
+      hostname: "localtest.me",
+      partition: agentPartition("w-test", "conv_1"),
+    });
+  });
+
+  it("rechecks DNS for WebSocket upgrades without an IP while missing HTTP endpoints fail closed", async () => {
+    let addresses = ["93.184.215.14"];
+    const resolvedPartitions = [];
+    const { registry, idOf } = makeNetworkGuardRegistry({
+      resolveHost: async (_hostname, partition) => {
+        resolvedPartitions.push(partition);
+        return addresses;
+      },
+    });
+    registry.openOrNavigate("conv_1", "https://example.com/", undefined, { agent: true });
+    const socket = {
+      webContentsId: idOf("conv_1"),
+      url: "wss://example.com/live",
+      resourceType: "webSocket",
+      statusCode: 101,
+    };
+    assert.equal(
+      await registry.shouldCancelAgentRequest(socket),
+      false,
+      "public WebSocket preflight",
+    );
+    assert.equal(
+      await registry.shouldCancelAgentResponse(socket),
+      false,
+      "a public upgrade can omit its IP",
+    );
+    assert.equal(resolvedPartitions.length, 2, "DNS is checked before and after the handshake");
+    addresses = ["127.0.0.1"];
+    assert.equal(
+      await registry.shouldCancelAgentResponse(socket),
+      true,
+      "rebinding seen by the response resolver is rejected",
+    );
+    assert.ok(
+      resolvedPartitions.every((partition) => partition === agentPartition("w-test", "conv_1")),
+    );
+    addresses = ["169.254.169.254"];
+    assert.equal(
+      await registry.shouldCancelAgentResponse({
+        ...socket,
+        url: "ws://169-254-169-254.nip.io/live",
+      }),
+      true,
+      "a public-only view refuses metadata-resolving WebSocket upgrades",
+    );
+    addresses = ["192.168.1.1"];
+    assert.equal(
+      await registry.shouldCancelAgentResponse(socket),
+      true,
+      "LAN-resolving upgrades are rejected",
+    );
+    addresses = ["93.184.215.14"];
+    assert.equal(
+      await registry.shouldCancelAgentResponse({ ...socket, ip: "127.0.0.1" }),
+      true,
+      "an available private endpoint is still rejected",
+    );
+    assert.equal(
+      await registry.shouldCancelAgentResponse({ ...socket, resourceType: "xhr" }),
+      true,
+      "HTTP responses still need an IP",
+    );
+    const beforeLiterals = resolvedPartitions.length;
+    await Promise.all(
+      ["127.0.0.1", "192.168.1.1", "169.254.169.254"].map(async (host) => {
+        assert.equal(
+          await registry.shouldCancelAgentResponse({ ...socket, url: `ws://${host}/live` }),
+          true,
+          `public-only WebSocket literal ${host}`,
+        );
+      }),
+    );
+    assert.equal(resolvedPartitions.length, beforeLiterals, "private literals fail before DNS");
+    assert.equal(
+      await registry.shouldCancelAgentResponse({ ...socket, statusCode: 200 }),
+      true,
+      "only an actual upgrade uses the DNS fallback",
+    );
   });
 
   it("cancels an agent response whose connected address is internal or missing", async () => {

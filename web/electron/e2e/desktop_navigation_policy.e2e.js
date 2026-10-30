@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const http = require("node:http");
+const { createHash } = require("node:crypto");
 const {
   desktopDepsAvailable,
   launchDesktop,
@@ -302,6 +303,8 @@ it(
           document.body.appendChild(image);
           const socket = new WebSocket("ws://localhost:" + ${port} + "/?kind=websocket");
           socket.onerror = () => {};
+          const privateNameSocket = new WebSocket("ws://lvh.me:" + ${port} + "/?kind=private-name-websocket");
+          privateNameSocket.onerror = () => {};
           const workerCode = "fetch(" + ${JSON.stringify(JSON.stringify(privateUrl + "?kind=dedicated-worker"))} + ").catch(() => {});";
           window.policyDedicatedWorker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" })));
           const sharedCode = "onconnect = () => { fetch(" + ${JSON.stringify(JSON.stringify(privateUrl + "?kind=shared-worker"))} + ").catch(() => {}); };";
@@ -315,6 +318,7 @@ it(
             "xhr",
             "image",
             "websocket",
+            "private-name-websocket",
             "dedicated-worker",
             "shared-worker",
             "service-worker",
@@ -348,6 +352,7 @@ it(
         "xhr",
         "image",
         "websocket",
+        "private-name-websocket",
         "dedicated-worker",
         "shared-worker",
         "service-worker",
@@ -468,7 +473,66 @@ it(
     await new Promise((resolve) => {
       fixture.listen(0, "127.0.0.1", resolve);
     });
-    const previewUrl = `http://127.0.0.1:${fixture.address().port}/`;
+    const previewUrl = `http://localhost:${fixture.address().port}/`;
+    const corsRequests = [];
+    const corsFixture = http.createServer((request, response) => {
+      corsRequests.push({ method: request.method, headers: request.headers });
+      response.setHeader("Access-Control-Allow-Origin", "*");
+      response.setHeader("Access-Control-Allow-Methods", "GET, POST");
+      response.setHeader("Access-Control-Allow-Headers", "content-type");
+      response.setHeader("Cache-Control", "public, max-age=3600");
+      if (request.method === "OPTIONS") response.writeHead(204).end();
+      else response.end("cors-ok");
+    });
+    corsFixture.on("upgrade", (request, socket) => {
+      const accept = createHash("sha1")
+        .update(request.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        .digest("base64");
+      socket.write(
+        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      let buffered = Buffer.alloc(0);
+      // This fixture echoes one short masked text frame, then closes the socket.
+      socket.on("data", (chunk) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        if (buffered.length < 2) return;
+        const length = buffered[1] & 0x7f;
+        if (buffered[0] !== 0x81 || !(buffered[1] & 0x80) || length > 125) {
+          socket.destroy();
+          return;
+        }
+        if (buffered.length < length + 6) return;
+        const payload = Buffer.from(buffered.subarray(6, length + 6));
+        for (let index = 0; index < length; index++) payload[index] ^= buffered[2 + (index % 4)];
+        socket.end(Buffer.concat([Buffer.from([0x81, length]), payload]));
+      });
+      socket.on("error", () => {});
+    });
+    await new Promise((resolve) => {
+      corsFixture.listen(0, "127.0.0.1", resolve);
+    });
+    const corsUrl = `http://127.0.0.1:${corsFixture.address().port}/allowed-cors`;
+    const socketUrl = `ws://127.0.0.1:${corsFixture.address().port}/echo`;
+    const observeAllowed = path.join(scratch, "observe-allowed.cjs");
+    fs.writeFileSync(
+      observeAllowed,
+      `
+      const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
+      const create = mod.createBrowserViewRegistry;
+      global.allowedNetworkResponses = [];
+      mod.createBrowserViewRegistry = (opts) => {
+        const registry = create(opts);
+        const response = registry.shouldCancelAgentResponse.bind(registry);
+        registry.shouldCancelAgentResponse = async (details, partition) => {
+          const cancel = await response(details, partition);
+          global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
+            resourceType: details.resourceType, statusCode: details.statusCode, cancel });
+          return cancel;
+        };
+        return registry;
+      };
+    `,
+    );
     const hostId = "a".repeat(32);
     let backend;
     let desktop;
@@ -493,6 +557,7 @@ it(
         serverUrl: backend.serverUrl,
         recordDir,
         env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
+        preload: [observeAllowed],
       });
       const { window, electronApp } = desktop;
       let sessionIsLocal = true;
@@ -550,6 +615,88 @@ it(
         return entry.view.webContents.executeJavaScript("document.body.innerText");
       }, backend.sessionId);
       assert.match(content, /Localhost preview works/);
+      const allowed = await electronApp.evaluate(
+        async (_electron, { sessionId, corsUrl: requestUrl, socketUrl: echoUrl }) => {
+          const entry = global.omnigentTestBrowserRegistries[0].get(sessionId);
+          return entry.view.webContents.executeJavaScript(`
+          (async () => {
+            const get = await fetch(${JSON.stringify(requestUrl)} + "?method=get", { mode: "cors" });
+            const getText = await get.text();
+            const repeatedGet = await fetch(${JSON.stringify(requestUrl)} + "?method=get", { mode: "cors" });
+            const repeatedGetText = await repeatedGet.text();
+            const post = await fetch(${JSON.stringify(requestUrl)} + "?method=post", {
+              mode: "cors", method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+            });
+            const postText = await post.text();
+            const echo = await new Promise((resolve, reject) => {
+              const socket = new WebSocket(${JSON.stringify(echoUrl)});
+              const timeout = setTimeout(() => { socket.close(); reject(new Error("echo timed out")); }, 10000);
+              socket.onopen = () => socket.send("allowed-echo");
+              socket.onmessage = (event) => { clearTimeout(timeout); resolve(event.data); socket.close(); };
+              socket.onerror = () => { clearTimeout(timeout); reject(new Error("echo failed")); };
+            });
+            return { getText, repeatedGetText, postText, echo };
+          })()
+        `);
+        },
+        { sessionId: backend.sessionId, corsUrl, socketUrl },
+      );
+      assert.deepEqual(allowed, {
+        getText: "cors-ok",
+        repeatedGetText: "cors-ok",
+        postText: "cors-ok",
+        echo: "allowed-echo",
+      });
+      assert.equal(
+        corsRequests.filter((request) => request.method === "OPTIONS").length,
+        1,
+        "only the JSON POST needs a CORS preflight",
+      );
+      const preflight = corsRequests.find((request) => request.method === "OPTIONS");
+      assert.equal(
+        preflight.headers["access-control-request-headers"],
+        "content-type",
+        "main-process Cache-Control edits do not add a CORS request header",
+      );
+      const responses = await electronApp.evaluate(() => global.allowedNetworkResponses);
+      assert.equal(
+        corsRequests.filter((request) => request.method === "GET").length,
+        2,
+        "cacheable CORS responses still reach the server twice",
+      );
+      for (const url of [corsUrl + "?method=get", corsUrl + "?method=post"]) {
+        assert.ok(
+          responses.some(
+            (response) =>
+              response.url === url &&
+              response.ip === "127.0.0.1" &&
+              response.statusCode === 200 &&
+              !response.cancel,
+          ),
+          JSON.stringify({ url, responses }),
+        );
+      }
+      assert.ok(
+        responses.some(
+          (response) =>
+            response.url === socketUrl && response.statusCode === 101 && !response.cancel,
+        ),
+        "allowed WebSocket upgrade completes even when Electron omits its IP",
+      );
+      const getResponses = responses.filter((response) => response.url === corsUrl + "?method=get");
+      assert.equal(getResponses.length, 2, "both cacheable fetches complete the response guard");
+      assert.ok(
+        getResponses.every(
+          (response) =>
+            response.ip === "127.0.0.1" && response.statusCode === 200 && !response.cancel,
+        ),
+        JSON.stringify(getResponses),
+      );
+      fs.mkdirSync(recordDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(recordDir, "allowed-network-evidence.json"),
+        JSON.stringify({ allowed, corsRequests, responses }, null, 2),
+      );
       const loadsBeforeMove = previewLoads;
       sessionIsLocal = false;
       const moved = await action(backend.sessionId);
@@ -580,6 +727,10 @@ it(
         fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
       }
       if (backend) await backend.close();
+      corsFixture.closeAllConnections();
+      await new Promise((resolve) => {
+        corsFixture.close(resolve);
+      });
       fixture.closeAllConnections();
       await new Promise((resolve) => {
         fixture.close(resolve);

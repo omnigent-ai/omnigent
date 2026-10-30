@@ -2622,6 +2622,9 @@ describe("browser permission wiring", () => {
         ],
         "installed once per partition, for all network request types",
       );
+      for (const [, filter] of ses.installs) {
+        assert.equal(filter.types, undefined, "all resource types reach each network hook");
+      }
       // Round-trip through JSON so objects from main.js's vm realm compare.
       const decide = (kind, details, session = ses, view = agent) =>
         new Promise((resolve) => {

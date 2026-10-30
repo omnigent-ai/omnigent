@@ -28,8 +28,8 @@ const {
 const DEFAULT_CAP = 10;
 const DOCUMENT_RESOURCE_TYPES = new Set(["mainFrame", "subFrame", "object"]);
 
-// WebSocket handshakes use the same host and connected-address rules as HTTP.
-function agentRequestPolicyUrl(url) {
+// Map WebSocket handshakes onto the HTTP URL rules.
+function httpUrlForWebSocket(url) {
   return url.replace(/^ws(s?):/, "http$1:");
 }
 
@@ -420,80 +420,90 @@ function createBrowserViewRegistry({
     });
   }
 
-  // DNS-aware check for an agent's first hop. openOrNavigate stays synchronous
-  // (literal checks only), so browserIpc awaits this before it: a name that
-  // resolves internally fails with an error instead of creating a blank view.
-  function checkAgentNavigationFor(
-    conversationId,
-    url,
-    agentContext,
-    partition = agentPartition(partitionScope, conversationId),
-  ) {
+  function checkAgentNavigationWithPolicy(url, { allowLocalhost, partition }) {
     return checkAgentNavigation(url, {
-      allowLocalhost: allowsLocalhost(agentContext),
+      allowLocalhost,
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
 
-  function agentLockedEntryFor(webContentsId, partition) {
+  // The IPC first hop uses the same partition resolver as network preflight.
+  function checkAgentNavigationFor(conversationId, url, agentContext) {
+    return checkAgentNavigationWithPolicy(url, {
+      allowLocalhost: allowsLocalhost(agentContext),
+      partition: agentPartition(partitionScope, conversationId),
+    });
+  }
+
+  function entryForWebContents(webContentsId) {
     for (const entry of entries.values()) {
-      let id;
       try {
-        id = entry.view.webContents.id;
+        if (entry.view.webContents.id === webContentsId) return entry;
       } catch {
         continue; // destroyed
       }
-      if (id === webContentsId) return entry.agentNavLocked ? entry : null;
     }
-    if (!partition) return null;
-    // Workers may lack a view ID. Shared partitions use their strictest owner;
-    // orphaned workers retain public-only access after the last view closes.
-    const owners = [...entries.values()].filter(
-      (entry) => agentPartition(partitionScope, entry.conversationId) === partition,
-    );
-    const publicOnly = { conversationId: "", agentContext: null };
-    const restrictive = owners.find(
-      (entry) => !entry.agentNavLocked || !allowsLocalhost(entry.agentContext),
-    );
-    if (restrictive) return restrictive.agentNavLocked ? restrictive : publicOnly;
-    return owners[0] ?? publicOnly;
+    return null;
   }
 
-  // SECURITY (SSRF): enforce URL rules on every network request. Documents
-  // also resolve DNS before sending; subresources use the connected IP below
-  // to avoid a separate DNS lookup on every script, image, or fetch.
+  function requestPolicyFor(webContentsId, partition) {
+    const entry = entryForWebContents(webContentsId);
+    if (entry) {
+      return entry.agentNavLocked
+        ? {
+            allowLocalhost: allowsLocalhost(entry.agentContext),
+            conversationId: entry.conversationId,
+            partition: partition ?? agentPartition(partitionScope, entry.conversationId),
+          }
+        : null;
+    }
+    if (!partition) return null;
+    // Workers may lack a registered view. Every partition owner must grant
+    // loopback; orphaned workers and partitions with blank tabs are public-only.
+    const owners = [...entries.values()].filter(
+      (owner) => agentPartition(partitionScope, owner.conversationId) === partition,
+    );
+    return {
+      allowLocalhost:
+        owners.length > 0 &&
+        owners.every((owner) => owner.agentNavLocked && allowsLocalhost(owner.agentContext)),
+      partition,
+    };
+  }
+
+  // Documents, unsafe methods, and WebSockets resolve DNS before sending.
+  // Safe subresources use URL rules, then the connected-IP response check.
+  // Missing resource metadata gets document preflight as a fail-safe.
   async function shouldCancelAgentRequest(
-    { webContentsId, url, resourceType = "mainFrame" },
+    { webContentsId, url, resourceType = "mainFrame", method = "GET" },
     partition,
   ) {
-    const entry = agentLockedEntryFor(webContentsId, partition);
-    if (!entry) return false;
-    const policyUrl = agentRequestPolicyUrl(url);
-    const verdict = DOCUMENT_RESOURCE_TYPES.has(resourceType)
-      ? await checkAgentNavigationFor(
-          entry.conversationId,
-          policyUrl,
-          entry.agentContext,
-          partition,
-        )
-      : isAgentNavigationAllowed(policyUrl, {
-          allowLocalhost: allowsLocalhost(entry.agentContext),
-        });
+    const policy = requestPolicyFor(webContentsId, partition);
+    if (!policy) return false;
+    const policyUrl = httpUrlForWebSocket(url);
+    const needsDns =
+      DOCUMENT_RESOURCE_TYPES.has(resourceType) ||
+      resourceType === "webSocket" ||
+      policyUrl !== url ||
+      !["GET", "HEAD"].includes(method.toUpperCase());
+    const verdict = needsDns
+      ? await checkAgentNavigationWithPolicy(policyUrl, policy)
+      : isAgentNavigationAllowed(policyUrl, policy);
     if (verdict.ok) return false;
-    sendToRenderer("browser-nav-blocked", {
-      conversationId: entry.conversationId,
-      url,
-      error: verdict.error,
-    });
+    if (policy.conversationId) {
+      sendToRenderer("browser-nav-blocked", {
+        conversationId: policy.conversationId,
+        url,
+        error: verdict.error,
+      });
+    }
     return true;
   }
 
-  // Wired to webRequest.onBeforeSendHeaders. A pure HTTP-cache hit reports no
-  // connected address (Chromium's HttpCache::Transaction::GetRemoteEndpoint),
-  // so agent requests skip cache reads (`no-cache`, per http_cache_util's
-  // GetLoadFlagsForExtraHeaders) and every response checked below carries one.
+  // Cache hits can omit the connected IP, so guarded HTTP requests bypass
+  // cache reads with no-cache while preserving the page's existing directives.
   function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
-    if (!agentLockedEntryFor(webContentsId, partition)) return {};
+    if (!requestPolicyFor(webContentsId, partition)) return {};
     const headers = {};
     const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
     for (const [name, value] of Object.entries(requestHeaders ?? {})) {
@@ -512,30 +522,35 @@ function createBrowserViewRegistry({
     return { requestHeaders: { ...headers, "Cache-Control": [...directives.values()].join(", ") } };
   }
 
-  // Check Chromium's connected endpoint to catch DNS rebinding.
-  // Electron 42 supplies details.ip despite stale typings.
-  async function shouldCancelAgentResponse({ webContentsId, url, ip }, partition) {
-    const entry = agentLockedEntryFor(webContentsId, partition);
-    if (!entry) return false;
-    const policyUrl = agentRequestPolicyUrl(url);
-    const verdict = isAgentConnectionAllowed(policyUrl, ip, {
-      allowLocalhost: allowsLocalhost(entry.agentContext),
-    });
+  // Electron 42 supplies HTTP details.ip despite stale typings. WebSocket
+  // upgrades omit it, so their DNS preflight is repeated at the response.
+  async function shouldCancelAgentResponse(
+    { webContentsId, url, ip, resourceType, statusCode },
+    partition,
+  ) {
+    const policy = requestPolicyFor(webContentsId, partition);
+    if (!policy) return false;
+    const policyUrl = httpUrlForWebSocket(url);
+    const verdict =
+      !ip && resourceType === "webSocket" && statusCode === 101
+        ? await checkAgentNavigationWithPolicy(policyUrl, policy)
+        : isAgentConnectionAllowed(policyUrl, ip, policy);
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const requestPartition = partition ?? agentPartition(partitionScope, entry.conversationId);
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(policyUrl, requestPartition), (hostname) =>
-        resolveHost(hostname, requestPartition),
+      (await isProxyAddress(ip, await resolveProxy(policyUrl, policy.partition), (hostname) =>
+        resolveHost(hostname, policy.partition),
       ));
     if (proxied) return false;
-    sendToRenderer("browser-nav-blocked", {
-      conversationId: entry.conversationId,
-      url,
-      error: verdict.error,
-    });
+    if (policy.conversationId) {
+      sendToRenderer("browser-nav-blocked", {
+        conversationId: policy.conversationId,
+        url,
+        error: verdict.error,
+      });
+    }
     return true;
   }
 
