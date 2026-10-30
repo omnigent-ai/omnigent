@@ -17,6 +17,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from omnigent.native import _native_forwarder_health
 from tests.harnesses.codex_native.forwarder._support import (
     _posted_cumulative_tokens,
     _usage_event,
@@ -376,7 +377,11 @@ def test_forwarder_registers_subagent_activity_before_child_events(
     activity_method: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A native spawn activity creates the child before its events arrive."""
+    """A native spawn activity creates the child before its events arrive.
+
+    The child's mirror posts also keep the parent session active, since the
+    child runs in the parent's pane."""
+    _native_forwarder_health.clear()
     workspace = tmp_path / "read-only-workspace"
     workspace.mkdir(mode=0o555)
     monkeypatch.chdir(workspace)
@@ -413,6 +418,16 @@ def test_forwarder_registers_subagent_activity_before_child_events(
         },
     ]
 
+    omnigent_handler = _make_omnigent_handler(posted)
+    parent_activity_at_child_posts: list[float | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_child/events":
+            parent_activity_at_child_posts.append(
+                _native_forwarder_health._last_post_at_by_session.get("conv_parent")
+            )
+        return omnigent_handler(request)
+
     async def run() -> None:
         await codex_native_forwarder.supervise_forwarder(
             base_url="http://127.0.0.1:8000",
@@ -422,7 +437,7 @@ def test_forwarder_registers_subagent_activity_before_child_events(
             app_server_url=str(tmp_path / "app-server.sock"),
             thread_id="thread_parent",
             client=codex_client,  # type: ignore[arg-type]
-            ap_transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+            ap_transport=httpx.MockTransport(handler),
         )
 
     asyncio.run(run())
@@ -442,6 +457,10 @@ def test_forwarder_registers_subagent_activity_before_child_events(
         and body.get("type") == "external_session_status"
     ]
     assert statuses == ["running", "idle", "running", "failed"]
+    # Only child posts follow the first one, so each later read sees a newer stamp.
+    assert len(parent_activity_at_child_posts) == 6
+    assert None not in parent_activity_at_child_posts
+    assert parent_activity_at_child_posts == sorted(set(parent_activity_at_child_posts))
     assert read_bridge_state(tmp_path) == parent_state
     assert list(workspace.iterdir()) == []
 
