@@ -237,11 +237,14 @@ describe("mobile sidebar drawer keyboard inset", () => {
   });
 });
 
-/** Dispatch a single-finger touch event on `target` at `time` ms. */
-function touch(target: Element, type: string, x: number, time: number): void {
+/** Dispatch a touch event with `fingers` touches down on `target` at `time` ms. */
+function touch(target: Element, type: string, x: number, time: number, fingers = 1): void {
   const event = new Event(type, { bubbles: true, cancelable: true });
   Object.defineProperty(event, "touches", {
-    value: type === "touchend" ? [] : [{ clientX: x, clientY: 300 }],
+    value:
+      type === "touchend"
+        ? []
+        : Array.from({ length: fingers }, () => ({ clientX: x, clientY: 300 })),
   });
   Object.defineProperty(event, "timeStamp", { value: time });
   act(() => {
@@ -267,10 +270,10 @@ describe("mobile sidebar drawer swipe to close", () => {
 
   function renderDrawer() {
     const onClose = vi.fn();
-    renderSidebar({ onClose });
+    const { setOpen } = renderSidebar({ onClose });
     const drawer = screen.getByRole("complementary", { name: "Conversations" });
     drawer.getBoundingClientRect = () => ({ width: 400 }) as DOMRect;
-    return { onClose, drawer };
+    return { onClose, drawer, setOpen };
   }
 
   it("follows the finger and closes once released past a third of its width", () => {
@@ -302,6 +305,28 @@ describe("mobile sidebar drawer swipe to close", () => {
 
     expect(onClose).not.toHaveBeenCalled();
     expect(drawer.style.transform).toBe("");
+  });
+
+  it("drops the drag when a second finger lands, so the drawer can still close", () => {
+    stubMobileLayout(true);
+    const { onClose, drawer, setOpen } = renderDrawer();
+
+    touch(drawer, "touchstart", 300, 0);
+    touch(drawer, "touchmove", 270, 80);
+    touch(drawer, "touchmove", 250, 160);
+    expect(drawer.style.transform).toBe("translateX(-12.5%)");
+
+    touch(drawer, "touchstart", 250, 200, 2);
+    touch(drawer, "touchend", 0, 260);
+
+    expect(drawer.style.transform).toBe("");
+    expect(onClose).not.toHaveBeenCalled();
+
+    setOpen(false);
+
+    expect(drawer).toHaveAttribute("data-collapsed", "true");
+    expect(drawer.style.transform).toBe("");
+    expect(screen.getByTestId("sidebar-scrim").style.opacity).toBe("");
   });
 
   it("ignores the swipe in the desktop layout", () => {

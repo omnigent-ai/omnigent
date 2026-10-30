@@ -405,6 +405,12 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
+**Closing the mobile drawer by swipe:** at phone width, open the sidebar with
+the header's Open sidebar button or, in the iOS app, a right swipe from the
+left edge. Swipe left on the drawer or the dimmed chat strip beside it; past a
+third of the drawer's width or after a quick flick it closes on the current
+chat, otherwise it springs back. Settings and desktop widths don't use it.
+
 **Arclet sessions:** Fork in the header, sidebar menus, or message actions opens
 the clone dialog with a new Arclet sandbox as its only host; connected hosts
 and other sandbox providers are not offered. The repository prefills from the
@@ -561,9 +567,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
 - **`mobile-drawer-swipe`:**
-  `tests/e2e_ui/mobile/test_sidebar_swipe_to_close.py::test_swipe_left_closes_open_drawer`,
-  `tests/e2e_ui/mobile/test_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`.
-  These touch-drive desktop Chromium at a phone viewport with a stubbed iOS bridge.
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_swipe_left_closes_open_drawer`,
+  `tests/browser_ui/chat/test_mobile_sidebar_swipe_to_close.py::test_drawer_stays_open_for_scroll_and_short_drag`.
+  These touch-drive the built SPA in desktop Chromium at a phone viewport with
+  mocked APIs and a stubbed iOS bridge. Thresholds, multi-touch and long-press
+  hand-off are covered in `web/src/hooks/useSidebarSwipeToClose.test.tsx`.
 - **`archive`:**
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,

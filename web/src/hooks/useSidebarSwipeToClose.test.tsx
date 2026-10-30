@@ -49,10 +49,18 @@ function setup(enabled = true) {
   return { ...view, onDragProgress, onSettle };
 }
 
-/** Dispatch a single-finger touch event at `time` ms; returns the event. */
-function touch(target: Element, type: string, x: number, y: number, time: number): Event {
+/** Dispatch a touch event with `fingers` touches down at `time` ms; returns the event. */
+function touch(
+  target: Element,
+  type: string,
+  x: number,
+  y: number,
+  time: number,
+  fingers = 1,
+): Event {
   const event = new Event(type, { bubbles: true, cancelable: true });
-  const touches = type === "touchend" || type === "touchcancel" ? [] : [{ clientX: x, clientY: y }];
+  const lifted = type === "touchend" || type === "touchcancel";
+  const touches = lifted ? [] : Array.from({ length: fingers }, () => ({ clientX: x, clientY: y }));
   Object.defineProperty(event, "touches", { value: touches });
   Object.defineProperty(event, "timeStamp", { value: time });
   target.dispatchEvent(event);
@@ -81,7 +89,8 @@ describe("useSidebarSwipeToClose", () => {
   it("tracks the finger and closes once the drag passes a third of the drawer", () => {
     const { getByTestId, onDragProgress, onSettle } = setup();
 
-    const { moves, end } = swipe(getByTestId("row"), { dx: -150 });
+    // Slow enough (~0.19 px/ms) that only the distance can close it.
+    const { moves, end } = swipe(getByTestId("row"), { dx: -150, steps: 10, stepMs: 80 });
 
     expect(onDragProgress).toHaveBeenCalledWith(1 - 60 / DRAWER_WIDTH);
     expect(onDragProgress).toHaveBeenCalledWith(1 - 150 / DRAWER_WIDTH);
@@ -119,7 +128,7 @@ describe("useSidebarSwipeToClose", () => {
   it("starts from the scrim over the exposed chat strip", () => {
     const { getByTestId, onSettle } = setup();
 
-    swipe(getByTestId("scrim"), { x: 350, dx: -200 });
+    swipe(getByTestId("scrim"), { x: 350, dx: -200, steps: 10, stepMs: 80 });
 
     expect(onSettle).toHaveBeenCalledExactlyOnceWith(true);
   });
@@ -139,12 +148,17 @@ describe("useSidebarSwipeToClose", () => {
   });
 
   it("leaves horizontally scrollable content and touches outside the drawer alone", () => {
-    const { getByTestId, onSettle } = setup();
+    const { getByTestId, onDragProgress, onSettle } = setup();
 
-    swipe(getByTestId("scroller-content"), { dx: -150 });
-    swipe(getByTestId("outside"), { dx: -150 });
+    const scroller = swipe(getByTestId("scroller-content"), { dx: -150 });
+    const outside = swipe(getByTestId("outside"), { dx: -150 });
 
+    expect(onDragProgress).not.toHaveBeenCalled();
     expect(onSettle).not.toHaveBeenCalled();
+    for (const { moves, end } of [scroller, outside]) {
+      expect(moves.some((move) => move.defaultPrevented)).toBe(false);
+      expect(end.defaultPrevented).toBe(false);
+    }
   });
 
   it("does nothing while disabled", () => {
@@ -154,6 +168,25 @@ describe("useSidebarSwipeToClose", () => {
 
     expect(onDragProgress).not.toHaveBeenCalled();
     expect(onSettle).not.toHaveBeenCalled();
+  });
+
+  it("settles by distance and stops tracking when a second finger lands mid-drag", () => {
+    const { getByTestId, onDragProgress, onSettle } = setup();
+    const row = getByTestId("row");
+
+    touch(row, "touchstart", 200, 100, 0);
+    touch(row, "touchmove", 170, 100, 80);
+    touch(row, "touchmove", 140, 100, 160);
+    touch(row, "touchstart", 140, 100, 200, 2);
+
+    expect(onDragProgress).toHaveBeenLastCalledWith(null);
+    expect(onSettle).toHaveBeenCalledExactlyOnceWith(false);
+
+    touch(row, "touchmove", 60, 100, 240, 2);
+    touch(row, "touchend", 0, 0, 300);
+
+    expect(onDragProgress).toHaveBeenLastCalledWith(null);
+    expect(onSettle).toHaveBeenCalledTimes(1);
   });
 
   it("settles by distance when the system cancels the touch mid-drag", () => {

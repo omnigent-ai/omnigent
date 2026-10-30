@@ -935,8 +935,9 @@ function SidebarImpl({
   const scrimRef = useRef<HTMLButtonElement>(null);
   const [closeSwipeProgress, setCloseSwipeProgress] = useState<number | null>(null);
   const mobileLayout = useIsMobileViewport();
+  const closeSwipeEnabled = open && mobileLayout && !inSettings && dragProgress == null;
   useSidebarSwipeToClose({
-    enabled: open && mobileLayout && !inSettings && dragProgress == null,
+    enabled: closeSwipeEnabled,
     drawerRef,
     scrimRef,
     holdMs: TOUCH_SENSOR_OPTIONS.activationConstraint.delay,
@@ -945,7 +946,7 @@ function SidebarImpl({
       if (close) onClose();
     },
   });
-  const liveDragProgress = dragProgress ?? closeSwipeProgress;
+  const liveDragProgress = dragProgress ?? (closeSwipeEnabled ? closeSwipeProgress : null);
 
   // While the iOS edge-swipe is dragging, the overlay is on-screen and
   // interactive even though `open` hasn't flipped yet — treat a live drag as

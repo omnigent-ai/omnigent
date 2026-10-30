@@ -81,6 +81,8 @@ export function useSidebarSwipeToClose({
     };
 
     const onTouchStart = (event: TouchEvent) => {
+      // A second finger ends the current drag where it is, like a cancel.
+      if (dragging) settle(null);
       reset();
       if (event.touches.length !== 1) return;
       const drawer = drawerRef.current;
