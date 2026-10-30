@@ -212,6 +212,15 @@ when the context exits.
   ping helper can end before the sender, so `ended_by` alone does not identify
   the close cause.
 
+  `helper_outcomes` is a JSON object containing each receive, sender and ping
+  helper's observed state: `pending`, `cancelled`, `completed`, or
+  `error:<exception type>`. `receive_close_code` preserves a completed receive
+  helper's peer-close code even when a sender error is raised first.
+  `asgi_client_state` and `asgi_application_state` distinguish a peer disconnect
+  from an application close. These observations precede route cleanup; they
+  contain no exception messages or close reasons and do not change which error
+  the route handles. A pending receiver has not yet observed the peer's close.
+
   During a rollout, queries should accept both `closed` (older servers) and
   `disconnected`, and allow missing close details on older `closed` rows.
   Update queries that select only `closed` to use `disconnected` after the
@@ -252,7 +261,10 @@ when the context exits.
   the outage still fails the turn. `held_host_offline` means the session's
   user-run host went offline too; the disconnect sweep holds the turn
   (`runner_disconnect_held_host_offline` / `runner_disconnect_hold_ended`) and
-  the reconnect restarts the relay. The
+  the reconnect restarts the relay. When the host returns without the runner,
+  the hold ends `host_back_relaunched` if the server relaunched the runner
+  (the turn fails as `runner_interrupted`, not redelivered) or
+  `host_back_without_runner` if the relaunch was not acknowledged. The
   `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected

@@ -42,6 +42,7 @@ vi.mock("./CodeViewer", () => ({
     viewMode,
     markdownSourceFallback,
     searchOpen,
+    wrapLines,
     onDirtyChange,
   }: {
     path: string;
@@ -49,6 +50,7 @@ vi.mock("./CodeViewer", () => ({
     viewMode: string;
     markdownSourceFallback?: boolean;
     searchOpen?: boolean;
+    wrapLines?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => {
     codeViewerRenders({ path, position });
@@ -58,6 +60,7 @@ vi.mock("./CodeViewer", () => ({
         data-view-mode={viewMode}
         data-markdown-source={String(!!markdownSourceFallback)}
         data-search-open={String(!!searchOpen)}
+        data-wrap-lines={String(!!wrapLines)}
       >
         <button type="button" aria-label="make dirty" onClick={() => onDirtyChange?.(true)} />
         {viewMode === "editor" && (
@@ -242,6 +245,7 @@ interface RenderProps {
   position?: { line: number; column?: number };
   open?: boolean;
   mediaActive?: boolean;
+  viewport?: "desktop" | "mobile";
   path?: string;
   /**
    * Initial URL search string (without leading "?"), e.g. "diff=1" or
@@ -271,6 +275,7 @@ function viewerTree({
   position,
   open = false,
   mediaActive,
+  viewport,
   path = "file1.py",
   initialSearch = "",
   onClose = vi.fn(),
@@ -290,6 +295,7 @@ function viewerTree({
           position={position}
           open={open}
           mediaActive={mediaActive}
+          viewport={viewport}
           conversationId="conv_1"
           path={path}
           onClose={onClose}
@@ -1711,10 +1717,8 @@ describe("FileViewer split-toggle width gating", () => {
 
 // ── View settings "⋯" menu ──────────────────────────────────────────────────
 //
-// Find, Download, and the diff-only toggles (wrap lines, hide whitespace) are
-// folded into one "View settings" overflow menu to save toolbar width. The
-// toggles keep the menu open and drive props on the diff viewer; the diff-only
-// items are hidden outside diff view. Radix menus open on pointerdown.
+// Find, Download, Wrap lines and the diff-only whitespace toggle share one
+// overflow menu. Toggles keep it open; Radix menus open on pointerdown.
 
 describe("FileViewer view-settings menu", () => {
   beforeEach(() => {
@@ -1724,14 +1728,69 @@ describe("FileViewer view-settings menu", () => {
   const openSettingsMenu = () =>
     fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
 
-  it("offers Find and Download but no diff toggles outside diff view", () => {
+  it("offers Find, Download and Wrap lines but no whitespace toggle in a code file", () => {
     render(viewerTree({ open: true }));
     openSettingsMenu();
     expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
-    // Wrap / whitespace are diff-only — absent when the source view is showing.
-    expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+    // Hiding whitespace changes only means something in the diff view.
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
+  });
+
+  it("toggling Wrap lines in a code file flips the code viewer's wrapLines prop", () => {
+    render(viewerTree({ open: true }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-wrap-lines", "false");
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-wrap-lines", "true");
+    // The toggle keeps the menu open, so it can be flipped straight back.
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-wrap-lines", "false");
+  });
+
+  it("shares the wrap choice between the code view and the diff view", async () => {
+    const first = render(viewerTree({ open: true }));
+    openSettingsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Wrap lines" }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-wrap-lines", "true");
+
+    first.unmount();
+    render(viewerTree({ open: true, initialSearch: "diff=1" }));
+    expect(await screen.findByTestId("diff-viewer")).toHaveAttribute("data-wrap-lines", "true");
+  });
+
+  it.each(["notes.md", "photo.png"])(
+    "omits Wrap lines for %s, which does not open in Monaco",
+    (path) => {
+      render(viewerTree({ open: true, path }));
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
+    },
+  );
+
+  it("offers Wrap lines for a deleted file only in the diff view", async () => {
+    const changed = vi.mocked(useWorkspaceChangedFiles);
+    const original = changed.getMockImplementation();
+    const entry = { path: "file1.py", name: "file1.py", bytes: 0, modified_at: null };
+    changed.mockReturnValue({
+      data: { available: true, data: [{ ...entry, status: "deleted" }] },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    try {
+      const first = render(viewerTree({ open: true }));
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
+      first.unmount();
+
+      render(viewerTree({ open: true, initialSearch: "diff=1" }));
+      expect(await screen.findByTestId("diff-viewer")).toBeInTheDocument();
+      openSettingsMenu();
+      expect(screen.getByRole("menuitem", { name: "Wrap lines" })).toBeInTheDocument();
+    } finally {
+      changed.mockImplementation(original!);
+    }
   });
 
   it("offers the file manager reveal for a file on this machine", async () => {
@@ -2176,9 +2235,44 @@ describe("FileViewer video files", () => {
       },
     } as ReturnType<typeof useWorkspaceChangedFiles>);
     renderViewer({ open: true, path: "demo.webm" });
-    expect(useFileContent).toHaveBeenCalledWith("conv_1", null);
+    expect(useFileContent).toHaveBeenCalledWith("conv_1", null, { visible: true });
     expect(useFileDiff).toHaveBeenCalledWith("conv_1", null, { requested: false });
     expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+  });
+});
+
+describe("FileViewer content refresh", () => {
+  afterEach(() => vi.mocked(useFileContent).mockReset());
+
+  it.each([
+    { name: "open in the active viewport", open: true, visible: true },
+    { name: "closed", open: false, visible: false },
+    { name: "in a hidden rail", open: true, mediaActive: false, visible: false },
+    { name: "in the inactive viewport", open: true, viewport: "mobile" as const, visible: false },
+  ])("refreshes only while on screen: $name", ({ open, mediaActive, viewport, visible }) => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    renderViewer({ open, mediaActive, viewport, path: "notes.md" });
+    expect(useFileContent).toHaveBeenLastCalledWith("conv_1", "notes.md", { visible });
+  });
+
+  it("says when a refresh failed and the shown content may be stale", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: "last loaded", path: "notes.md", encoding: "utf-8" },
+      isRefetchError: true,
+      error: new Error("404 Not Found"),
+    } as ReturnType<typeof useFileContent>);
+    const { rerender } = renderViewer({ open: true, path: "notes.md" });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Couldn't refresh this file (404 Not Found). Showing the last loaded version.",
+    );
+
+    // A later successful refresh clears the notice.
+    vi.mocked(useFileContent).mockReturnValue({
+      data: { content: "back", path: "notes.md", encoding: "utf-8" },
+    } as ReturnType<typeof useFileContent>);
+    rerender(viewerTree({ open: true, path: "notes.md" }));
+    expect(screen.queryByText(/Couldn't refresh this file/)).toBeNull();
   });
 });
 
@@ -2443,6 +2537,25 @@ describe("large Markdown file routing", () => {
       expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-markdown-source", "false");
     },
   );
+
+  it.each([
+    { size: "large", content: large, monaco: true },
+    { size: "small", content: "# Small", monaco: false },
+  ])("offers Wrap lines in $size Markdown source only when it opens in Monaco", (c) => {
+    writeFileViewPreferences({
+      diffActive: false,
+      diffLayout: "unified",
+      previewableViewMode: "source",
+      hideWhitespace: false,
+      wrapLines: false,
+    });
+    setContent(c.content);
+    render(viewerTree({ open: true, path: `${c.size}.md` }));
+    expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
+    expect(!!screen.queryByRole("menuitem", { name: "Wrap lines" })).toBe(c.monaco);
+  });
 
   it.each([true, false])(
     "keeps the initial editor across size-changing saves (large=%s)",

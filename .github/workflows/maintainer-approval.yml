@@ -42,7 +42,7 @@ jobs:
       pull-requests: read
       actions: read
       statuses: write  # invalidate readiness before granting a dependency exemption
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out approval evaluator
