@@ -1343,10 +1343,12 @@ describe("index.css electron-mac sidebar header", () => {
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
-  it("orders the cluster Collapse, Search, Settings left-to-right", () => {
-    // The DOM order is Search → Settings → toggle (tab order follows
-    // importance), so the toggle is reordered visually rather than moved.
-    expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
+  it("keeps Collapse and Search by the lights and docks Back/Forward at the sidebar's edge", () => {
+    // The toggle comes first in the DOM, so nothing reorders the cluster.
+    expect(stripActionsRule).not.toMatch(/order:/);
+    expect(cssSource).toMatch(
+      /\.app-shell\[data-sidebar-open\]\s+\.electron-sidebar-header-actions\s+\[data-testid="history-navigation-buttons"\]\s*\{[^}]*margin-left:\s*auto/,
+    );
   });
 
   it("pushes the settings sidebar's Back row below the lights", () => {

@@ -846,6 +846,9 @@ html[data-electron-mac] {
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
 }
+html[data-electron-mac][data-electron-full-screen] {
+  --mac-traffic-light-width: 12px;
+}
 @media (min-width: 48rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
   .app-shell:not([data-sidebar-open]) .canvas-page-heading {
@@ -938,17 +941,28 @@ html[data-electron-mac] .electron-sidebar-header-actions {
   z-index: 51;
   display: flex;
   align-items: center;
-
-  /* Read Collapse · Search · Settings outward from the window controls: pull
-   * the cluster's last button (the toggle) to the front. */
-  & > * > *:last-child {
-    order: -1;
-  }
+}
+/* Keep Collapse and Search beside the traffic lights while the sidebar is open,
+ * and dock only the Back/Forward pair at its right edge. */
+html[data-electron-mac] .app-shell[data-sidebar-open] .electron-sidebar-header-actions {
+  right: calc(100% - var(--app-sidebar-width) + 0.75rem);
+}
+html[data-electron-mac]
+  .app-shell[data-sidebar-open]
+  .electron-sidebar-header-actions
+  > [data-testid="sidebar-header-actions"] {
+  width: 100%;
+}
+html[data-electron-mac]
+  .app-shell[data-sidebar-open]
+  .electron-sidebar-header-actions
+  [data-testid="history-navigation-buttons"] {
+  margin-left: auto;
 }
 /* Clear the fixed native-control area plus the font-relative action cluster
  * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+  padding-left: calc(var(--mac-traffic-light-width) + 5rem + 16px);
 }
 /* A maximized rail reaches the same window corner while the sidebar is closed.
  * Once the sidebar opens, the rail starts to its right and needs no clearance. */
