@@ -29,6 +29,7 @@ to recognize a new feature or advertise new protocol fields.
   Reuse its harness, model, permissions and attachment controls. Create fresh context in the
   source session's environment; a create from peer B attaches under root A but uses
   B's execution environment. Sending the first message creates the session.
+  Its opening task supplies the initial title; users can rename it from the row.
   Canceling leaves the ordinary new-session draft and preferences untouched.
 - **R3:** Open peers in the main conversation or as persistent group-scoped side
   tabs. Side tabs have their own transcript, attachments, drafts, queue and model

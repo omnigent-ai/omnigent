@@ -536,6 +536,7 @@ describe("related session composer", () => {
       const body = JSON.parse(vi.mocked(authenticatedFetch).mock.calls[0]![1]!.body as string);
       expect(body).toMatchObject({
         related_to_session_id: "conv_source_peer",
+        title: "Review this API",
         agent_id: "ag_native",
         model_override: "sonnet",
         reasoning_effort: "high",

@@ -120,7 +120,7 @@ import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
-import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { recordOptimisticTitle, synthesizeOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   MAX_SANDBOX_REPOS,
@@ -5991,7 +5991,13 @@ export function NewChatLandingScreen({
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
         const createPayload = JSON.stringify({
-          ...(relatedSession ? { related_to_session_id: relatedSession.source.id } : {}),
+          ...(relatedSession
+            ? {
+                related_to_session_id: relatedSession.source.id,
+                // ponytail: name manual peers from their task; sidebar rename can refine it.
+                title: synthesizeOptimisticTitle(initialPrompt) ?? "New session",
+              }
+            : {}),
           ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
           // Config-seeded agent on a `project_id` create: omitted so the
           // server default-fills it from the project config.
