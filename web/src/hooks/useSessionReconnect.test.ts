@@ -542,6 +542,18 @@ describe("useSessionReconnect", () => {
       expect(toast.error).toHaveBeenCalledExactlyOnceWith(
         "The sandbox didn't come online. Try Reconnect host again.",
       );
+
+      // Retrying after the timeout gets its own full deadline.
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(retrySession).toHaveBeenCalledTimes(2);
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_ONLINE_GRACE_MS - 1));
+      expect(result.current.sandboxStarting).toBe(true);
+      expect(toast.error).toHaveBeenCalledOnce();
+      act(() => vi.advanceTimersByTime(1));
+      expect(result.current.sandboxStarting).toBe(false);
+      expect(toast.error).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();
     }
