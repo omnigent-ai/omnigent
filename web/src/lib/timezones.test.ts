@@ -16,6 +16,9 @@ describe("schedule timezones", () => {
     ["2023-03-25", "America/Asuncion", "2023-03-26T03:59:59.000Z"],
     ["2027-10-30", "Asia/Beirut", "2027-10-30T21:59:59.000Z"],
     ["2009-06-19", "Asia/Dhaka", "2009-06-19T16:59:59.000Z"],
+    ["0002-06-10", "UTC", "0002-06-10T23:59:59.000Z"],
+    ["0020-06-10", "UTC", "0020-06-10T23:59:59.000Z"],
+    ["9999-12-31", "Pacific/Kiritimati", "9999-12-31T09:59:59.000Z"],
   ])("ends %s in %s at %s", (day, timezone, expected) => {
     const date = endOfDayInTimezone(day, timezone)!;
     expect(date.toISOString()).toBe(expected);

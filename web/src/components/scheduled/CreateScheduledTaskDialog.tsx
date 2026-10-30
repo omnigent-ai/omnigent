@@ -625,15 +625,13 @@ export function CreateScheduledTaskDialog({
             timezone={timezone}
             onTimezoneChange={setTimezone}
             model={schedule}
-            onChange={(next) => {
-              setScheduleUnsupported(false);
-              setSchedule(next);
-            }}
+            onChange={setSchedule}
+            onRecurrenceSelect={() => setScheduleUnsupported(false)}
             onSelectOpenChange={handleSelectOpenChange}
           />
           {scheduleUnsupported && (
             <p className="text-sm text-destructive" role="alert">
-              This schedule can&apos;t be edited in this form yet.
+              This schedule can&apos;t be edited in this form yet. Choose a frequency to replace it.
             </p>
           )}
 

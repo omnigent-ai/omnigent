@@ -509,7 +509,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     expect(input.permissionMode).toBe("bypassPermissions");
   });
 
-  it("blocks update when the existing RRULE cannot be represented by the form", () => {
+  it("blocks update when the existing RRULE cannot be represented by the form", async () => {
     render(
       <CreateScheduledTaskDialog
         open
@@ -519,6 +519,17 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     );
     expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "After" }));
+    fireEvent.change(screen.getByLabelText("Occurrences"), { target: { value: "3" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("This schedule can't be edited");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    expect(updateMutateAsync).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByTestId("schedule-preset-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Every hour" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.rrule).toBe("FREQ=HOURLY;BYMINUTE=0;COUNT=3");
   });
 });
 
@@ -1004,6 +1015,10 @@ describe("CreateScheduledTaskDialog submit", () => {
     fireEvent.keyDown(screen.getByLabelText("Schedule ends"), { key: "Enter" });
     fireEvent.click(await screen.findByRole("option", { name: "On date" }));
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    for (const value of ["0002-06-10", "0020-06-10", "0203-06-10"]) {
+      fireEvent.change(screen.getByLabelText("End date"), { target: { value } });
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    }
     fireEvent.change(screen.getByLabelText("End date"), { target: { value: "2027-06-10" } });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));

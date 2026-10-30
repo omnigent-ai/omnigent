@@ -75,11 +75,15 @@ export function endOfDayInTimezone(day: string, timezone: string): Date | null {
   if (!formatter) return null;
   // Bracket all IANA offsets and search the date boundary, not a possibly ambiguous wall time.
   const secondsPerDay = 86400;
+  const dateKey = Number(day.replaceAll("-", ""));
   let before = target / 1000 - 2 * secondsPerDay;
   let after = target / 1000 + 3 * secondsPerDay;
   while (after - before > 1) {
     const middle = Math.floor((before + after) / 2);
-    if (calendarDate(formatter, new Date(middle * 1000)) <= day) before = middle;
+    const middleDateKey = Number(
+      calendarDate(formatter, new Date(middle * 1000)).replaceAll("-", ""),
+    );
+    if (middleDateKey <= dateKey) before = middle;
     else after = middle;
   }
   const result = new Date(before * 1000);

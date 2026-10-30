@@ -661,7 +661,10 @@ def test_scheduled_task_custom_schedule_round_trip(page: Page, live_server: str)
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_hidden()
     response = httpx.get(f"{live_server}/v1/scheduled-tasks/{task['id']}", timeout=10.0)
     response.raise_for_status()
-    assert response.json()["rrule"].endswith(";UNTIL=20300610T155959Z")
+    assert response.json()["rrule"] == (
+        "FREQ=MONTHLY;INTERVAL=2;BYMONTHDAY=1,15;BYHOUR=23;BYMINUTE=37;UNTIL=20300610T155959Z"
+    )
+    assert response.json()["timezone"] == "Asia/Singapore"
 
 
 def test_scheduled_task_model_effort_controls_visible_for_capable_agent(

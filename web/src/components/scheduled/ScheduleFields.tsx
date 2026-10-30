@@ -78,12 +78,14 @@ export function ScheduleFields({
   timezone,
   onTimezoneChange,
   onSelectOpenChange,
+  onRecurrenceSelect,
 }: {
   model: ScheduleModel;
   onChange: (next: ScheduleModel) => void;
   timezone: string;
   onTimezoneChange: (timezone: string) => void;
   onSelectOpenChange?: (open: boolean) => void;
+  onRecurrenceSelect?: () => void;
 }) {
   const [customOpen, setCustomOpen] = useState(false);
   const [draft, setDraft] = useState(model);
@@ -124,6 +126,7 @@ export function ScheduleFields({
       onSelectOpenChange?.(true);
     }
     onChange(next);
+    if (value !== "custom") onRecurrenceSelect?.();
   }
 
   function changeEnd(value: string) {
@@ -300,6 +303,7 @@ export function ScheduleFields({
                 disabled={draftError !== null}
                 onClick={() => {
                   onChange(draft);
+                  onRecurrenceSelect?.();
                   changeCustomOpen(false);
                 }}
               >
