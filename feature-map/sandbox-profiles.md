@@ -22,6 +22,8 @@ Omnigent stores the provider/profile revision and trusted execution identity.
   a newer offered revision. Starting/cloning requires an authorized choice.
 - Message-action branch clones, sidebar clone actions and the error-card fork
   action use this same profile-enabled fork dialog.
+- Reconnect → Clone uses the same searchable, capped picker and source-profile
+  default when a sandbox destination supports profiles.
 - Settings has no sandbox editor. `/settings/sandboxes` falls back to General.
 
 ## Driving it with the repro environment

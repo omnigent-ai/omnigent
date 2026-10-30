@@ -142,6 +142,10 @@ exact revision, then configure **this launcher instance**. Both run synchronousl
 in worker threads. Bound all external calls with timeouts, response-size limits
 and bounded pagination. Discovery and selection must not allocate infrastructure.
 
+Each provider may return at most 1,000 unique profiles. Omnigent loads and sorts
+the complete authorized catalog before applying search and pagination; the
+20-result picker cap limits the response, not the work performed by the provider.
+
 | Provider result | Omnigent behavior |
 | --- | --- |
 | Empty catalog | No available profiles; launch remains blocked. |
@@ -187,6 +191,7 @@ profile. Retry after an error or select an ordinary connected host to continue.
 | Side chat | Keep the source's profile and runner; reject unrelated runner adoption. |
 | Existing host reuse | Authorize the controller's actual assignment, check ownership and profile compatibility, then accept it for the session. |
 | Restart / wake | Reauthorize the exact saved revision. Never upgrade an existing session to the current catalog revision. |
+| Daemon recovery inside a profiled sandbox | Replace a stale runner atomically on the same host, retaining its profile. Failed launches restore the previous binding. A fresh persisted heartbeat blocks replacement for up to 90 seconds after an ungraceful disconnect; retry after it expires. Ordinary deployments retain their existing recovery behavior. |
 | Missing sandbox replacement | Reauthorize the saved revision before allocating a replacement. |
 | Last session deleted | Its labels are deleted; capable controllers retain the sandbox assignment. |
 | Host deletion | Existing host metadata marks deletion; surviving sessions can bind an authorized replacement. |

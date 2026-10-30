@@ -130,7 +130,11 @@ def _require(catalog, session_id, host_id, **kwargs):
     host_id = uuid_to_bytes(host_id).hex()
     store = catalog._store.conversations
     if store.get_conversation(session_id) is None:
-        store.create_conversation(conversation_id=session_id)
+        store.create_conversation(
+            conversation_id=session_id,
+            host_id=host_id if kwargs.get("bind", True) else None,
+            workspace="/workspace" if kwargs.get("bind", True) else None,
+        )
     catalog.require_session_host(session_id, host_id, **kwargs)
     if kwargs.get("bind", True):
         _bind(catalog, session_id, host_id)

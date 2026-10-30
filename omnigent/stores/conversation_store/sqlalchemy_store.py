@@ -113,6 +113,7 @@ from omnigent.stores.conversation_store import (
     SessionActivity,
     SessionConnectivity,
     pinned_label_key,
+    runner_seen_is_fresh,
 )
 from omnigent.stores.conversation_store.overrides import (
     decode_session_overrides as _decode_session_overrides,
@@ -4547,6 +4548,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str | None = None,
         git_branch: str | None = None,
         expected_binding: ProfileHostBinding | None = None,
+        replace_stale_runner: bool = False,
     ) -> ProfileHostBinding:
         host_id = uuid_to_bytes(host_id).hex()
 
@@ -4558,10 +4560,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if meta is None:
                 raise ConversationNotFoundError(f"conversation {conversation_id!r} does not exist")
-            if not self._can_bind_profile_host(session, meta.host_id, host_id) or (
-                runner_id is not None and meta.runner_id is not None
-            ):
+            if not self._can_bind_profile_host(session, meta.host_id, host_id):
                 raise ValueError("The session binding changed; retry the request")
+            if runner_id is not None and meta.runner_id is not None:
+                if (
+                    not replace_stale_runner
+                    or expected_binding is None
+                    or meta.host_id != host_id
+                    or meta.runner_id != expected_binding.runner_id
+                ):
+                    raise ValueError("The session binding changed; retry the request")
+                if runner_seen_is_fresh(meta.runner_last_seen):
+                    raise ValueError(
+                        "The previous runner is still connected; retry after disconnect"
+                    )
             with self._profile_label_session(session) as labels:
                 saved = profile_from_labels(
                     _fetch_labels(labels, conversation_id, keys=PROFILE_LABEL_KEYS)
@@ -4575,6 +4587,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.host_id, meta.workspace = host_id, workspace
             if runner_id is not None:
                 meta.runner_id = runner_id
+                meta.runner_last_seen = None
             return previous
 
         return run_write_transaction(self._session_immediate, "bind_profiled_host", write)

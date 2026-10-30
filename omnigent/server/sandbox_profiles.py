@@ -245,6 +245,16 @@ class SandboxProfileCatalog:
         except ValueError as exc:
             raise _invalid_reference(exc) from exc
 
+    def admit_runner_connection(self, runner_id: str) -> bool:
+        """Fence delegated reconnects against stale profiled-runner replacement."""
+        if not self.managed_providers():
+            return True
+        from omnigent.db.utils import now_epoch
+
+        conversations = self._store.conversations
+        conversations.touch_runner_liveness([runner_id], now_epoch())
+        return bool(conversations.get_runner_host_ids(runner_id))
+
     def reassign_runner(
         self,
         conversation: Conversation,
@@ -494,4 +504,19 @@ class SandboxProfileCatalog:
         if not bind:
             return
         if session_snapshot is None and host_snapshot is not None:
-            self.bind_session(session_id, host_snapshot)
+            conversations = self._store.conversations
+            binding = conversations.get_profile_host_binding(session_id)
+            if binding.host_id != (host.host_id if host else host_id) or binding.workspace is None:
+                raise HTTPException(status_code=409, detail="The session binding changed; retry")
+            snapshot = self.validate_snapshot(host_snapshot, user_id=user_id)
+            try:
+                conversations.bind_profiled_host(
+                    session_id,
+                    host_id,
+                    binding.workspace,
+                    snapshot,
+                    git_branch=binding.git_branch,
+                    expected_binding=binding,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc

@@ -27,7 +27,9 @@ async def test_controller_recovers_after_last_session_deleted_and_restart(env: _
     assert public["id"] == "build" and public["revision"] == env.profile["revision"]
     assert "user_id" not in public and "workspace_id" not in public
     assert any(context.sandbox_id == sandbox_id for context, _ in env.recording.selections)
-    target = env.conversations.create_conversation(agent_id=env.agent_id)
+    target = env.conversations.create_conversation(
+        agent_id=env.agent_id, host_id=host_id, workspace="/workspace"
+    )
     env.catalog.require_session_host(
         target.id, host_id, user_id=_OWNER, sandbox_provider="company"
     )

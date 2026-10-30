@@ -4739,6 +4739,9 @@ def create_app(
             auth_provider=auth_provider,
             runner_exit_reports=runner_exit_reports,
             resolve_managed_runner_owner=_resolve_managed_runner_owner,
+            admit_managed_runner=(
+                sandbox_profiles.admit_runner_connection if sandbox_profiles is not None else None
+            ),
             mint_managed_runner_token=(
                 _mint_managed_runner_token if runner_account_store is not None else None
             ),

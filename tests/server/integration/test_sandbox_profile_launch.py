@@ -46,6 +46,131 @@ from tests.server.integration._sandbox_profile_support import env as env
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.mark.parametrize("mode", ["profile", "ordinary", "flag-off"])
+@pytest.mark.parametrize("launch_fails", [False, True])
+async def test_daemon_clear_then_launch_recovers_offline_runner(
+    env, monkeypatch, mode, launch_fails
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
+
+    if mode == "profile":
+        session_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+        host_id = env.conversations.get_conversation(session_id).host_id
+    else:
+        if mode == "flag-off":
+            env.app.state.sandbox_profiles = None
+        host_id = uuid.uuid4().hex
+        env.hosts.upsert_on_connect(host_id, "ordinary-host", _OWNER)
+        response = await env.client.post("/v1/sessions", json={"agent_id": env.agent_id})
+        assert response.status_code == 201, response.text
+        session_id = response.json()["id"]
+        env.conversations.set_host_id(session_id, host_id, "/workspace")
+        monkeypatch.setattr(
+            env.conversations,
+            "bind_profiled_host",
+            Mock(side_effect=AssertionError("Ordinary recovery must use the legacy binding")),
+        )
+    env.conversations.replace_runner_id(session_id, "offline-runner")
+    registry = env.app.state.profile_test_hosts
+    registry.register(
+        host_id=host_id,
+        ws=AsyncMock(),
+        owner=_OWNER,
+        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="host"),
+    )
+
+    async def valid_workspace(**kwargs):
+        return kwargs["workspace"]
+
+    frames = []
+
+    def launch(conn, raw):
+        frame = decode_host_frame(raw)
+        assert isinstance(frame, HostLaunchRunnerFrame)
+        frames.append(frame)
+        conn.pending_launches[frame.request_id].set_result(
+            {"status": "failed", "error": "spawn failed"}
+            if launch_fails
+            else {"status": "started"}
+        )
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._workspace_validation.validate_workspace", valid_workspace
+    )
+    monkeypatch.setattr(registry, "send_text", launch)
+    cleared = await env.client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
+    assert cleared.status_code == (400 if mode == "profile" else 200), cleared.text
+    response = await env.client.post(
+        f"/v1/hosts/{host_id}/runners",
+        json={"session_id": session_id, "workspace": "/workspace"},
+    )
+    assert response.status_code == (502 if launch_fails else 200), response.text
+    [frame] = frames
+    assert frame.superseded_runner_ids == (("offline-runner",) if mode == "profile" else ())
+    current = env.conversations.get_conversation(session_id)
+    if launch_fails:
+        assert current.runner_id == ("offline-runner" if mode == "profile" else None)
+        assert current.host_id == (host_id if mode == "profile" else None)
+    else:
+        assert current.runner_id == response.json()["runner_id"] != "offline-runner"
+        assert current.host_id == host_id
+    assert env.app.state.sandbox_profiles is None or env.catalog.get_session_snapshot(
+        session_id
+    ) == (env.profile if mode == "profile" else None)
+
+
+@pytest.mark.parametrize("race", ["local-live", "fresh-heartbeat", "new-binding"])
+async def test_profile_runner_replacement_rejects_live_or_changed_binding(env, monkeypatch, race):
+    from omnigent.db.utils import now_epoch
+
+    session_id = await env.settled(await env.create("json", sandbox_profile_id="build"))
+    env.conversations.replace_runner_id(session_id, "old-runner")
+    before = env.conversations.get_profile_host_binding(session_id)
+    registry = env.app.state.profile_test_hosts
+    registry.register(
+        host_id=before.host_id,
+        ws=AsyncMock(),
+        owner=_OWNER,
+        hello=HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="host"),
+    )
+    if race == "local-live":
+        env.app.state.tunnel_registry = env.app.state.profile_test_tunnels
+        register_test_runner(env.app, "old-runner", harnesses=["codex"], owner=_OWNER)
+    else:
+        bind = env.conversations.bind_profiled_host
+
+        def raced_binding(*args, **kwargs):
+            if kwargs.get("runner_id") is not None:
+                if race == "fresh-heartbeat":
+                    env.conversations.touch_runner_liveness(["old-runner"], now=now_epoch())
+                else:
+                    env.conversations.replace_runner_id(session_id, "concurrent-runner")
+            return bind(*args, **kwargs)
+
+        monkeypatch.setattr(env.conversations, "bind_profiled_host", raced_binding)
+
+    async def valid_workspace(**kwargs):
+        return kwargs["workspace"]
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._workspace_validation.validate_workspace", valid_workspace
+    )
+    send = Mock(side_effect=AssertionError("No launch after stale/live binding rejection"))
+    monkeypatch.setattr(registry, "send_text", send)
+    response = await env.client.post(
+        f"/v1/hosts/{before.host_id}/runners",
+        json={"session_id": session_id, "workspace": "/workspace"},
+    )
+    assert response.status_code == 409, response.text
+    expected = (
+        dataclasses.replace(before, runner_id="concurrent-runner")
+        if race == "new-binding"
+        else before
+    )
+    assert env.conversations.get_profile_host_binding(session_id) == expected
+    send.assert_not_called()
+
+
 @pytest.mark.parametrize("conflicting_host", [False, True])
 async def test_ordinary_runner_replacement_with_large_history_in_mixed_deployment(
     env, monkeypatch, conflicting_host

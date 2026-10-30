@@ -335,7 +335,9 @@ Open a Canvas session outside the loaded sidebar pages to see its current host
 status and live session updates, including when the app is embedded.
 
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
-in the chat; the dialog shows the command for this situation (for example
+in the chat. Its **Clone** tab uses the shared fork form, including the searchable
+sandbox-profile picker and source-profile default for participating providers.
+The dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
 when a local session is stranded). In the desktop app, **Reconnect host** acts
 directly for this machine or a recognized Arca host; Arca's connect console

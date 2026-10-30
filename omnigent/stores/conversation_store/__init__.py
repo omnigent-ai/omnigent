@@ -1856,8 +1856,9 @@ class ConversationStore(ABC):
         runner_id: str | None = None,
         git_branch: str | None = None,
         expected_binding: ProfileHostBinding | None = None,
+        replace_stale_runner: bool = False,
     ) -> ProfileHostBinding:
-        """Bind host/profile together, optionally reserving an unbound runner."""
+        """Bind host/profile; stale replacement requires the expected binding on the same host."""
         raise NotImplementedError
 
     def rollback_profiled_host(

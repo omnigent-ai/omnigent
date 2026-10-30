@@ -1361,6 +1361,15 @@ def create_hosts_router(
                         profile_binding = await asyncio.to_thread(
                             conversation_store.get_profile_host_binding, body.session_id
                         )
+                        tunnels = getattr(request.app.state, "tunnel_registry", None)
+                        if (
+                            profile_binding.runner_id is not None
+                            and tunnels is not None
+                            and tunnels.get(profile_binding.runner_id) is not None
+                        ):
+                            raise HTTPException(
+                                status_code=409, detail="The previous runner is still connected"
+                            )
                         await asyncio.to_thread(
                             conversation_store.bind_profiled_host,
                             body.session_id,
@@ -1370,6 +1379,7 @@ def create_hosts_router(
                             runner_id=runner_id,
                             git_branch=git_branch,
                             expected_binding=profile_binding,
+                            replace_stale_runner=True,
                         )
                     except ValueError as exc:
                         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1427,8 +1437,11 @@ def create_hosts_router(
                     if target.conv.inference_snapshot
                     else None
                 ),
-                # The session had no runner bound, so nothing is superseded.
-                superseded_runner_ids=(),
+                superseded_runner_ids=(
+                    (profile_binding.runner_id,)
+                    if profile_binding is not None and profile_binding.runner_id is not None
+                    else ()
+                ),
             )
         )
         try:
