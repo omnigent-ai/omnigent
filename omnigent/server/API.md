@@ -622,7 +622,9 @@ already uploaded or registered an agent. The response is the full
     After native submission, recovery restores receipt matching without resending
     the prompt: a missing acknowledgement cannot prove it was not executed.
     `interrupt` and `stop_session` cancel inputs that have not been submitted,
-    keeping them out of runner recovery history and forks.
+    keeping them out of runner recovery history and forks. An `interrupt`
+    response lists them in `discarded_inputs`, so a client can offer them for
+    resending.
 
     To include files, send `multipart/form-data` with the same JSON request in a
     `metadata` part and repeated `initial_files` file parts. Upload validation,
@@ -1123,6 +1125,9 @@ Request body matches `SessionEventInput`:
 202 Accepted
 {"queued": true}                            # regular queued item events
 {"queued": false}                           # "interrupt" and status/control bypasses
+{"queued": false, "discarded_inputs": [{"pending_id": "pending_...", "content": [...], "initial": true}]}
+                                            # "interrupt" that cancelled unsent startup inputs;
+                                            # "initial" marks the create's initial_input
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
 [{"queued": false, "item_id": "item_..."}, ...] # top-level event array

@@ -84,6 +84,11 @@ export function retireSessionDraft(conversationId: string): SessionDraft | undef
   return draft;
 }
 
+/** Join draft texts with a blank line, skipping empty parts. */
+export function joinDraftText(...parts: string[]): string {
+  return parts.filter((part) => part.trim() !== "").join("\n\n");
+}
+
 /** Merge a failed temporary session's unsent input back into its source draft. */
 export function recoverFailedSessionDraft<T extends { message: string; files: File[] }>(
   originalDraft: T,
@@ -92,12 +97,9 @@ export function recoverFailedSessionDraft<T extends { message: string; files: Fi
   if (temporaryConversationId === undefined) return originalDraft;
   const temporaryDraft = retireSessionDraft(temporaryConversationId);
   if (temporaryDraft === undefined) return originalDraft;
-  const message = [originalDraft.message, temporaryDraft.text]
-    .filter((part) => part.trim() !== "")
-    .join("\n\n");
   return {
     ...originalDraft,
-    message,
+    message: joinDraftText(originalDraft.message, temporaryDraft.text),
     files: [...originalDraft.files, ...temporaryDraft.files],
   };
 }
