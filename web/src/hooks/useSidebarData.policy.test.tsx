@@ -629,3 +629,30 @@ it.each([false, true])(
     expect(fetchMock).not.toHaveBeenCalled();
   },
 );
+
+it.each(["created", "updated"] as const)(
+  "retains %s pages and cursors when Custom is selected or reordered",
+  async (baseOrdering) => {
+    groupingUi = true;
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: baseOrdering }));
+    const { result } = renderHook(useSidebarData, { wrapper });
+    await waitFor(() => expect(result.current.mine.isSuccess).toBe(true));
+    await act(async () => {
+      await result.current.mine.fetchNextPage();
+    });
+    await waitFor(() => expect(result.current.mine.data?.pages[0].data).toHaveLength(2));
+    const data = result.current.mine.data;
+    const sortBy = result.current.sortBy;
+    const customOrder = { baseOrdering, ids: ["mine-older", "mine"], startedAt: 100 };
+    fetchMock.mockClear();
+    act(() => result.current.updateView({ ordering: "custom", customOrder }));
+    expect(result.current.sortBy).toBe(sortBy);
+    expect(result.current.mine.data).toBe(data);
+    act(() =>
+      result.current.updateView({ customOrder: { ...customOrder, ids: ["mine", "mine-older"] } }),
+    );
+    act(() => result.current.updateView({ ordering: baseOrdering }));
+    expect(result.current.mine.data).toBe(data);
+    expect(fetchMock).not.toHaveBeenCalled();
+  },
+);

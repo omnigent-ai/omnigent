@@ -7,6 +7,7 @@ import {
   computeNextActiveOverride,
   conversationDisplayLabel,
   dedupeConversationsById,
+  extendSidebarCustomOrder,
   filterConversations,
   getConversationIconKind,
   groupConversations,
@@ -790,4 +791,50 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   // With the pointer outside, arrival order still must not show through.
   expect(first).toEqual(["c", "b", "a"]);
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
+});
+
+it.each(["created", "updated"] as const)(
+  "keeps Custom fixed over %s, adding new sessions above and history below",
+  (baseOrdering) => {
+    const row = (id: string, createdAt: number) => conversation(id, id, new Date(createdAt * 1000));
+    const order = { baseOrdering, ids: ["a", "unloaded", "b"], startedAt: 100 };
+    const rows = [row("b", 20), row("a", 10), row("history", 1), row("new", 110)];
+    const sortBy = baseOrdering === "created" ? "created_at" : "updated_at";
+    const sorted = sortConversations(rows, null, null, sortBy, order);
+    expect(sorted.map((session) => session.id)).toEqual(["new", "a", "b", "history"]);
+    const saved = extendSidebarCustomOrder(order, sorted);
+    expect(saved.ids).toEqual(["new", "a", "unloaded", "b", "history"]);
+    expect(extendSidebarCustomOrder(saved, sorted)).toBe(saved);
+    expect(
+      sortConversations(
+        [
+          row("unloaded", 50),
+          ...rows.map((session) => ({ ...session, updated_at: 1000 - session.created_at })),
+        ],
+        null,
+        null,
+        sortBy,
+        saved,
+      ).map((session) => session.id),
+    ).toEqual(saved.ids);
+    expect(
+      sortConversations([rows[0]], null, null, sortBy, saved).map((session) => session.id),
+    ).toEqual(["b"]);
+    expect(order.ids).toEqual(["a", "unloaded", "b"]);
+  },
+);
+
+it("seeds an empty Custom list from server timestamps before loading older pages", () => {
+  const empty = { baseOrdering: "updated" as const, ids: [], startedAt: 0 };
+  expect(extendSidebarCustomOrder(empty, [])).toBe(empty);
+  const first = extendSidebarCustomOrder(empty, [
+    conversation("a", "A", new Date(10_000), { updatedAt: new Date(100_000) }),
+  ]);
+  expect(first.startedAt).toBe(100);
+  expect(
+    extendSidebarCustomOrder(first, [
+      conversation("new", "New", new Date(101_000)),
+      conversation("history", "History", new Date(90_000)),
+    ]).ids,
+  ).toEqual(["new", "a", "history"]);
 });

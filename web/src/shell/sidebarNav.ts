@@ -2,6 +2,7 @@ import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -211,6 +212,32 @@ export function filterConversations(
   });
 }
 
+/** Keep saved positions; prepend new sessions and append newly loaded history. */
+export function extendSidebarCustomOrder(
+  order: SidebarCustomOrder,
+  orderedRows: readonly Conversation[],
+): SidebarCustomOrder {
+  const known = new Set(order.ids);
+  const newer: string[] = [];
+  const older: string[] = [];
+  for (const row of orderedRows) {
+    if (known.has(row.id)) continue;
+    known.add(row.id);
+    (row.created_at >= order.startedAt ? newer : older).push(row.id);
+  }
+  if (newer.length === 0 && older.length === 0) return order;
+  // ponytail: retain unloaded IDs; fetch them explicitly if full-history restoration is needed.
+  return {
+    ...order,
+    ids: [...newer, ...order.ids, ...older],
+    // Use server timestamps so a skewed device clock cannot misclassify new sessions.
+    startedAt:
+      order.ids.length > 0
+        ? order.startedAt
+        : orderedRows.reduce((latest, row) => Math.max(latest, row.created_at, row.updated_at), 0),
+  };
+}
+
 // Newest first; equal timestamps fall back to id, so arrival order never shows.
 // Freeze update timestamps for the active chat and hovered list; creation
 // timestamps stay immutable, including when the selected order changes.
@@ -219,6 +246,7 @@ export function sortConversations(
   activeOverride: ActiveChatOverride | null,
   frozenKeys?: Map<string, number> | null,
   sortBy: SessionSortBy = "updated_at",
+  customOrder?: SidebarCustomOrder,
 ): Conversation[] {
   const effective = (c: Conversation): number => {
     const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
@@ -226,7 +254,14 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
+  const ordered = [...conversations].sort(
+    (a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id),
+  );
+  if (!customOrder) return ordered;
+  const positions = new Map(
+    extendSidebarCustomOrder(customOrder, ordered).ids.map((id, index) => [id, index]),
+  );
+  return ordered.sort((a, b) => positions.get(a.id)! - positions.get(b.id)!);
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

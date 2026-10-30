@@ -143,6 +143,56 @@ def test_harness_grouping_persists_across_reload(
     )
 
 
+def test_custom_order_commits_on_drop_and_survives_grouping_and_reload(
+    page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Custom retains Created's order until a drop; new sessions precede it."""
+    _open_view_submenu(page, "session-ordering-menu")
+    page.get_by_role("menuitemradio", name="Created", exact=True).click()
+    page.keyboard.press("Escape")
+    rows = page.locator("li[data-sidebar-session-id]").get_by_role("link")
+    initial = ["Idle session", "Awaiting session", "Running session"]
+    expect(rows).to_have_text(initial)
+    source = page.get_by_role("link", name="Running session").bounding_box()
+    target = page.get_by_role("link", name="Idle session").bounding_box()
+    assert source and target
+    page.mouse.move(source["x"] + 30, source["y"] + source["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(target["x"] + 30, target["y"] + target["height"] / 2, steps=10)
+    expect(page.locator('[data-session-order-over="true"]')).to_have_attribute(
+        "data-sidebar-session-id", _IDLE
+    )
+    expect(rows).to_have_text(initial)
+    page.mouse.up()
+    reordered = ["Running session", "Idle session", "Awaiting session"]
+    expect(rows).to_have_text(reordered)
+    _open_view_submenu(page, "session-ordering-menu")
+    expect(page.get_by_role("menuitemradio", name="Custom")).to_be_checked()
+    page.keyboard.press("Escape")
+
+    for row in _ROWS:
+        monkeypatch.setitem(row, "status", "running")
+        monkeypatch.setitem(row, "pending_elicitations_count", 0)
+    for grouping in ("Status", "Harness", "Created", "Updated"):
+        _open_view_submenu(page, "session-grouping-menu")
+        page.get_by_role("menuitemradio", name=grouping, exact=True).click()
+        page.keyboard.press("Escape")
+        page.reload()
+        expect(rows).to_have_text(reordered)
+
+    monkeypatch.setattr(
+        f"{__name__}._ROWS",
+        [*_ROWS, _row(f"{4:032x}", "New session", created_at=time(), updated_at=time())],
+    )
+    page.reload()
+    expect(rows).to_have_text(["New session", *reordered])
+    _enable_grouping_ui(page, False)
+    page.reload()
+    expect(rows).to_have_text(
+        ["New session", "Running session", "Awaiting session", "Idle session"]
+    )
+
+
 def test_grouping_and_show_toggles_persist_across_reload(
     page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

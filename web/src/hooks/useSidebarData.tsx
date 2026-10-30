@@ -13,6 +13,7 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
+  sidebarBaseOrdering,
   writeSidebarViewPreferences,
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
@@ -50,12 +51,13 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
     ? storedView
     : DEFAULT_SIDEBAR_VIEW;
-  const sortBy: SessionSortBy = view.ordering === "created" ? "created_at" : "updated_at";
+  const sortBy: SessionSortBy =
+    sidebarBaseOrdering(view) === "created" ? "created_at" : "updated_at";
   const updateView = useCallback(
     (patch: Partial<SidebarViewPreferences>) => {
       const next = { ...storedView, ...patch };
       writeSidebarViewPreferences(next);
-      if (next.ordering !== storedView.ordering) {
+      if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(storedView)) {
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
           void client.invalidateQueries({ queryKey, refetchType: "none" });
@@ -65,7 +67,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
               (key[0] === "conversations"
                 ? (key[5] ?? "updated_at")
                 : parseProjectSessionsQueryKey(key).sortBy) ===
-              (next.ordering === "created" ? "created_at" : "updated_at"),
+              (sidebarBaseOrdering(next) === "created" ? "created_at" : "updated_at"),
           });
         }
         void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
