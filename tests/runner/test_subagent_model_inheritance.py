@@ -258,6 +258,7 @@ async def test_kimi_cli_default_blocks_parent_model_inheritance(
     monkeypatch: pytest.MonkeyPatch, harness: str
 ) -> None:
     """An omitted Kimi model stays on the CLI default instead of parent Opus."""
+    _stub_worker_launchable(monkeypatch)
     bodies = await _dispatch_without_model(
         monkeypatch,
         agent_spec=_spec_with_worker(harness),
