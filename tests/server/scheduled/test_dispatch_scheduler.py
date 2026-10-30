@@ -6,7 +6,7 @@ import asyncio
 import logging
 import threading
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -225,14 +225,28 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
     loop = asyncio.get_running_loop()
 
     failed_once = False
+    renewing = asyncio.Event()
+    clock_advanced = threading.Event()
 
     def renew(run_id, *, now, lease_seconds):
-        nonlocal failed_once
-        if transient_failure and not failed_once and now() == task.next_run_at + 30:
-            failed_once = True
-            raise RuntimeError("temporary database outage")
-        result = original_renew(run_id, now=now, lease_seconds=lease_seconds)
-        if now() == task.next_run_at + 30:
+        def renewal_time():
+            nonlocal failed_once
+            timestamp = now()
+            if transient_failure and not failed_once and timestamp == task.next_run_at + 30:
+                failed_once = True
+                raise RuntimeError("temporary database outage")
+            return timestamp
+
+        # Advance the clock while a heartbeat is already in flight.
+        if started.is_set() and not clock_advanced.is_set():
+            loop.call_soon_threadsafe(renewing.set)
+            assert clock_advanced.wait(10)
+        result = original_renew(run_id, now=renewal_time, lease_seconds=lease_seconds)
+        if (
+            result is not None
+            and result.lease_expires_at == task.next_run_at + 150
+            and (failed_once or not transient_failure)
+        ):
             loop.call_soon_threadsafe(renewed.set)
         return result
 
@@ -250,7 +264,9 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
     try:
         await scheduler.poll_once()
         await asyncio.wait_for(started.wait(), 10)
+        await asyncio.wait_for(renewing.wait(), 10)
         clock.advance(30)
+        clock_advanced.set()
         await asyncio.wait_for(renewed.wait(), 10)
         assert store.list_runs(task.id)[0][0].lease_expires_at == task.next_run_at + 150
         release.set()
@@ -262,6 +278,7 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
         await scheduler.poll_once()
         assert store.list_runs(task.id)[0][0].status == "running"
     finally:
+        clock_advanced.set()
         await scheduler.stop()
 
 
@@ -2150,6 +2167,47 @@ async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) 
     assert (lease.run.id, lease.run.host_id) == (run.id, new_host)
 
 
+async def test_a_continue_task_runs_where_its_session_host_is_not_the_workspace_owner(
+    store,
+) -> None:
+    """Replica A holds the session's host and B owns the workspace key. Once the
+    first run records the session, its host is pinned, so A claims every run."""
+    task = _task(store, "continue_unpinned", session_mode="continue")
+    assert task.host_id is None
+    session_host = uuid.uuid4().hex
+    assert (
+        store.adopt_session(task.id, uuid.uuid4().hex, snapshot=task, host_id=session_host)
+        == "adopted"
+    )
+    task = store.get(task.id)
+    clock = FakeClock(task.created_at + 60)
+    fired = {"a": AsyncMock(), "b": AsyncMock()}
+
+    def replica(name, owns):
+        async def owned_hosts(keys):
+            return [key for key in keys if owns(key)]
+
+        return PersistentTaskScheduler(
+            store, fired[name], AsyncMock(), owned_hosts=owned_hosts, now=clock.now
+        )
+
+    a = replica("a", lambda key: key == session_host)
+    b = replica("b", lambda key: key == str(task.workspace_id))
+    run = await b.run_now(task)
+    await b.poll_once()
+    await _drain(b)
+    await a.poll_once()
+    await _drain(a)
+
+    fired["b"].assert_not_awaited()
+    [(snapshot, lease)] = [call.args for call in fired["a"].await_args_list]
+    assert (snapshot.session_id, lease.run.id, lease.run.host_id) == (
+        task.session_id,
+        run.id,
+        session_host,
+    )
+
+
 async def test_claim_checks_ownership_once_per_page_with_workspace_fallback(store) -> None:
     host_id = uuid.uuid4().hex
     with workspace_scope(42):
@@ -2230,3 +2288,128 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
     assert len(_events(caplog, "scheduled_task_operation_failed")) == 1
     with workspace_scope(7):
         assert store.list_runs(task.id)[0][0].status == "failed"
+
+
+# Every read a poll makes to find work; none may run while dispatch is paused.
+_DISPATCH_READS = (
+    "list_uninitialized_tasks",
+    "list_due_tasks",
+    "list_pending_runs",
+    "list_expired_starting_runs",
+    "purge_deleted_tasks",
+)
+
+
+async def test_paused_dispatch_reads_nothing_and_resumes_without_catching_up(
+    store, monkeypatch
+) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 7200)
+    enabled = False
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(lease.run)
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(
+        store,
+        fire,
+        AsyncMock(),
+        dispatch_enabled=lambda: enabled,
+        now=clock.now,
+        poll_seconds=3600,
+    )
+    await scheduler.start()
+    try:
+        with monkeypatch.context() as paused:
+            for name in _DISPATCH_READS:
+                paused.setattr(store, name, Mock(side_effect=AssertionError(name)))
+            await scheduler.poll_once()
+        # Run now records the request but leaves it for a later poll.
+        requested = await scheduler.run_now(task)
+        assert requested.status == "scheduled"
+        assert fired == []
+        assert scheduler._recovery is None
+        assert store.get(task.id).next_run_at == task.next_run_at
+
+        enabled = True
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+
+    # The overdue occurrence runs once, not once per missed hour, plus the request.
+    scheduled = [run for run in fired if not run.trigger_key.startswith("manual:")]
+    assert [run.scheduled_at for run in scheduled] == [task.next_run_at]
+    assert [run.id for run in fired if run.trigger_key.startswith("manual:")] == [requested.id]
+    assert store.get(task.id).next_run_at > clock.now()
+
+
+async def test_failing_dispatch_check_keeps_dispatching(store, caplog) -> None:
+    task = _task(store)
+    clock = FakeClock(task.next_run_at + 60)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append(snapshot.id)
+        await lease.finish("running")
+
+    def broken_check() -> bool:
+        raise RuntimeError("flag service unavailable")
+
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), dispatch_enabled=broken_check, now=clock.now
+    )
+    with caplog.at_level(logging.ERROR, logger=_SCHEDULER_LOGGER):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+
+    assert fired == [task.id]
+    assert "Could not check whether dispatch is enabled" in caplog.text
+
+
+async def test_live_poll_interval_overrides_poll_seconds(store, monkeypatch) -> None:
+    polls = 0
+    polled = asyncio.Event()
+
+    async def poll_once() -> None:
+        nonlocal polls
+        polls += 1
+        if polls == 3:
+            polled.set()
+
+    # With poll_seconds alone the loop would wait an hour after its first poll.
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), poll_interval=lambda: 0.01, poll_seconds=3600
+    )
+    monkeypatch.setattr(scheduler, "poll_once", poll_once)
+    await scheduler.start()
+    try:
+        await asyncio.wait_for(polled.wait(), 10)
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [0.0, -1.0, float("nan"), float("inf"), RuntimeError("flag service unavailable")],
+    ids=["zero", "negative", "nan", "infinite", "raises"],
+)
+def test_unusable_poll_interval_waits_poll_seconds(store, caplog, reading) -> None:
+    readings = [reading, 7.0]
+
+    def poll_interval() -> float:
+        value = readings.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(), poll_interval=poll_interval, poll_seconds=30
+    )
+    with caplog.at_level(logging.WARNING, logger=_SCHEDULER_LOGGER):
+        assert scheduler._next_poll_delay() == 30
+    assert caplog.records
+    # Only that wait falls back; the next reading applies again.
+    assert scheduler._next_poll_delay() == 7.0

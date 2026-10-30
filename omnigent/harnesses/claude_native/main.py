@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import importlib.resources
 import json
 import logging
 import os
@@ -257,6 +258,14 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# Gateway catalogs can reject Claude's canonical refusal fallback.
+# Keep the original model and refusal instead of switching to an unservable id.
+_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
+# Claude Code sources this script before every Bash command. The pane's
+# TMUX/TMUX_PANE point at Omnigent's private tmux server, so without the scrub a
+# tool's `tmux kill-session` or `kill-server` ends Claude itself.
+_CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
+_CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -469,16 +478,23 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
-def _ambient_env_is_non_anthropic_gateway() -> bool:
+def _ambient_env_is_non_anthropic_gateway(configured_base_url: str | None = None) -> bool:
     """Whether managed settings or the process env route through a gateway.
 
     Used as the ``claude_config is None`` counterpart to
     :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
     set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
     fingerprint must treat the env as a non-canonical endpoint.
+
+    :param configured_base_url: Optional launch override for the ambient URL;
+        managed settings still take precedence.
     """
     managed_base_url, _ = managed_claude_gateway_signal()
-    base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    base_url = managed_base_url or (
+        configured_base_url
+        if configured_base_url is not None
+        else os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    )
     if not base_url:
         return False
     host = (urlparse(base_url).hostname or "").lower()
@@ -1553,6 +1569,18 @@ def native_claude_auth_env_unset(
     return ()
 
 
+def claude_tool_env_file() -> str:
+    """
+    Return the packaged script Claude Code sources before each Bash command.
+
+    :returns: Absolute script path, e.g.
+        ``"/opt/omnigent/omnigent/resources/scripts/claude_tool_env.sh"``.
+    """
+    return str(
+        importlib.resources.files("omnigent.resources.scripts").joinpath(_CLAUDE_TOOL_ENV_SCRIPT)
+    )
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
@@ -1560,11 +1588,14 @@ def build_native_claude_terminal_env(
     Build env overrides for a native Claude Code terminal process.
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
-    loads them on demand, disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing, and
-    disables the in-TUI feedback surveys, which a web-driven session
-    cannot see or answer (see
-    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
+    loads them on demand, keeps Bash tool commands off Omnigent's private
+    tmux server (see :data:`_CLAUDE_CODE_ENV_FILE_ENV`), disables Claude
+    Code's agent view so the terminal stays pinned to the session the
+    Omnigent UI is showing, and disables the in-TUI feedback surveys,
+    which a web-driven session cannot see or answer (see
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
+    endpoints keep the selected model when it refuses, since their catalogs
+    may not serve Claude Code's canonical refusal-fallback target.
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1582,6 +1613,16 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    configured_base_url = (
+        claude_config.env.get(_UCODE_CLAUDE_BASE_URL_ENV) if claude_config is not None else None
+    )
+    if _ambient_env_is_non_anthropic_gateway(configured_base_url):
+        terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
+    # A user-provided env file keeps priority; it replaces the tmux scrub.
+    if _CLAUDE_CODE_ENV_FILE_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_ENV_FILE_ENV
+    ):
+        terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
@@ -7059,13 +7100,18 @@ def _websocket_connect(
     import websockets
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+    from omnigent.session_host import session_routing_headers
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this attach client
     # is not a browser. Set on a copy so the caller's dict (which also
     # carries auth headers and may be reused) is not mutated here.
-    handshake_headers = {**headers, "Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
+    handshake_headers = {
+        **headers,
+        **session_routing_headers(attach_url),
+        "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
+    }
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the

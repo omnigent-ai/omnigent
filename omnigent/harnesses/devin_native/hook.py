@@ -18,10 +18,9 @@ is that subprocess. It has three jobs:
    server-side (the POST parks until a human answers) and comes back as a hard
    ALLOW/DENY.
 
-#. **Mirror Devin's own consent prompt.** ``PermissionRequest`` fires when Devin
-   would show its TUI approval prompt. Rather than stranding that prompt in a
-   pane the web user may not be looking at, it is republished as an Omnigent
-   elicitation and the user's answer is relayed back.
+#. **Mirror interactive prompts.** ``PermissionRequest`` carries approvals;
+   ``PreToolUse`` carries ``ask_user_question``. Both become web elicitations,
+   with question answers returned through Devin's ``updatedInput`` contract.
 
 Kept deliberately import-light: it runs on every tool call, so it must not pull
 in the runner or server stacks.
@@ -37,6 +36,7 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.harnesses.devin_native.questions import answered_question_input, question_payload
 from omnigent.native.native_policy_hook import (
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
@@ -179,40 +179,18 @@ def _devin_output_for_policy_verdict(
     return verdict
 
 
-def _mirror_permission_request(
-    payload: _JsonObject,
+def _post_elicitation(
+    body: _JsonObject,
     *,
     server_url: str,
     session_id: str,
+    endpoint: str,
 ) -> _JsonObject | None:
-    """Publish Devin's approval prompt to the web UI and await the verdict.
-
-    POSTs to the session's ``/hooks/permission-request`` endpoint, which raises
-    an Omnigent elicitation (rendering the web UI's approval card) and
-    long-polls until the user answers. The endpoint replies in Claude Code's
-    ``hookSpecificOutput.decision.behavior`` shape, translated here into Devin's
-    ``{"decision": "approve"|"deny"}``.
-
-    Returns ``None`` on any failure or timeout, which Devin reads as "no
-    opinion" and falls back to its own TUI prompt — the correct fail-ask
-    behavior for an unreachable or unattended web UI. Note this is a *consent*
-    mirror, not an enforcement gate: enforcement already happened in
-    ``PreToolUse``, which fails closed.
-
-    The launch-time bearer dies with the ~1h Databricks OAuth lifetime, so a
-    lapsed-token signal re-mints once and retries; without that, every approval
-    card after the first hour would degrade to the terminal prompt that this
-    mirror exists to avoid.
-    """
-    tool_name = payload.get("tool_name")
-    if not isinstance(tool_name, str) or not tool_name:
-        return None
-    url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/hooks/permission-request"
+    """Wait for a web answer, refreshing expired auth once; defer on failure."""
+    url = f"{server_url.rstrip('/')}/v1/sessions/{session_id}/hooks/{endpoint}"
     timeout = httpx.Timeout(_PERMISSION_READ_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     headers = policy_hook_request_headers()
     reauth = policy_hook_reauth(server_url, headers)
-    # Identify the requesting harness and retain one id across an auth retry.
-    body = {**payload, "_omnigent_elicitation_id": f"elicit_devin_{secrets.token_hex(16)}"}
     try:
         for attempt in range(2):
             with httpx.Client(headers=headers, timeout=timeout) as client:
@@ -222,7 +200,7 @@ def _mirror_permission_request(
                     if refreshed:
                         headers = refreshed
                         print(
-                            "omnigent devin permission-request hook: Omnigent auth "
+                            f"omnigent devin {endpoint} hook: Omnigent auth "
                             "expired; re-minted token and retrying",
                             file=sys.stderr,
                         )
@@ -231,17 +209,40 @@ def _mirror_permission_request(
                 if not response.content:
                     # Endpoint timed out waiting for a human — defer to the TUI.
                     return None
-                body = response.json()
+                result = response.json()
                 break
         else:  # pragma: no cover — the loop always breaks or returns
             return None
     except (httpx.HTTPError, ValueError) as exc:
         print(
-            f"omnigent devin permission-request hook: {exc}; deferring to the Devin prompt",
+            f"omnigent devin {endpoint} hook: {exc}; deferring to the Devin prompt",
             file=sys.stderr,
         )
         return None
-    if not isinstance(body, dict):
+    return result if isinstance(result, dict) else None
+
+
+def _mirror_permission_request(
+    payload: _JsonObject,
+    *,
+    server_url: str,
+    session_id: str,
+) -> _JsonObject | None:
+    """Mirror consent and translate the web verdict to Devin's decision shape.
+
+    An unreachable server leaves Devin's TUI prompt authoritative. The separate
+    PreToolUse policy gate has already enforced any policy denial.
+    """
+    tool_name = payload.get("tool_name")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    body = _post_elicitation(
+        {**payload, "_omnigent_elicitation_id": f"elicit_devin_{secrets.token_hex(16)}"},
+        server_url=server_url,
+        session_id=session_id,
+        endpoint="permission-request",
+    )
+    if body is None:
         return None
     specific = body.get("hookSpecificOutput")
     decision = specific.get("decision") if isinstance(specific, dict) else None
@@ -255,6 +256,58 @@ def _mirror_permission_request(
             output["reason"] = reason
         return output
     return None
+
+
+def _mirror_user_question(
+    payload: _JsonObject,
+    *,
+    server_url: str,
+    session_id: str,
+) -> _JsonObject | None:
+    """Collect native question answers in Chat before Devin opens its picker."""
+    tool_input = payload.get("tool_input")
+    questions = question_payload(tool_input)
+    if questions is None or not isinstance(tool_input, dict):
+        return None
+    result = _post_elicitation(
+        {
+            "elicitation_id": f"elicit_devin_question_{secrets.token_hex(16)}",
+            "agent": "Devin",
+            "operation_type": "question",
+            "message": "Devin is asking a question",
+            "policy_name": "devin_native_ask_question",
+            "ask_user_question": questions,
+        },
+        server_url=server_url,
+        session_id=session_id,
+        endpoint="native-permission-request",
+    )
+    if result is None:
+        return None
+    action = result.get("action")
+    if not isinstance(action, str) or action not in {"accept", "decline", "cancel"}:
+        return None
+    specific: _JsonObject = {
+        "hookEventName": _PRE_TOOL_USE,
+        "permissionDecision": "deny",
+        "permissionDecisionReason": "The user canceled the question.",
+    }
+    if action == "accept":
+        content = result.get("content")
+        if not isinstance(content, dict):
+            specific["permissionDecisionReason"] = "No readable question answers were received."
+        else:
+            try:
+                updated_input = answered_question_input(tool_input, content)
+            except ValueError as exc:
+                specific["permissionDecisionReason"] = str(exc)
+            else:
+                specific = {
+                    "hookEventName": _PRE_TOOL_USE,
+                    "permissionDecision": "allow",
+                    "updatedInput": updated_input,
+                }
+    return {"hookSpecificOutput": specific}
 
 
 def _record_event(bridge_dir: Path | None, payload: _JsonObject) -> None:
@@ -341,6 +394,12 @@ def main(argv: list[str] | None = None) -> int:
         verdict = _evaluate_policy(
             hook_event, payload, server_url=server_url, session_id=session_id
         )
+        if (
+            verdict is None
+            and hook_event == _PRE_TOOL_USE
+            and payload.get("tool_name") == "ask_user_question"
+        ):
+            verdict = _mirror_user_question(payload, server_url=server_url, session_id=session_id)
         return _emit(_devin_output_for_policy_verdict(hook_event, verdict))
     return 0
 

@@ -88,6 +88,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert isinstance(data["databricks_features"], bool)
     assert isinstance(data["managed_sandboxes_enabled"], bool)
     assert data["features"] == {
+        "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
@@ -99,6 +100,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "grid_sessions_display_ui": False,
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
+        "session_orchestration": True,
+        "codex_plan_at_launch": True,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
@@ -110,6 +113,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["archive_worktree_cleanup"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
+    # Gates the automation dialog's Session control; older servers reject the fields.
+    assert data["scheduled_task_session_modes"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # Gates the web's /clear for native sessions; older servers reject it.
@@ -118,6 +123,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Browser-posted despite its prefix; runner-only events stay unadvertised.
     assert "external_btw_dismiss" in data["session_event_types"]
     assert "external_output_text_delta" not in data["session_event_types"]
+    # This app wires no project store, so automations cannot take a project.
+    assert data["scheduled_task_projects"] is False
+    # This app wires no scheduled-task store, so it has no automations to offer.
+    assert data["automations_enabled"] is False
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
@@ -130,6 +139,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).agent_config_edit is False
     del data["session_event_types"]
     assert ServerInfoResponse.model_validate(data).session_event_types == []
+    del data["automations_enabled"]
+    assert ServerInfoResponse.model_validate(data).automations_enabled is False
 
 
 async def test_info_disables_config_edit_for_unsupported_store(

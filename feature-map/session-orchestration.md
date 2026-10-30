@@ -15,9 +15,12 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   Chat/Terminal header rechecks access when opened, hides attribution during the
   lookup, and links to the creator when accessible; otherwise it says "Created by
   another session". `sys_session_list` and `sys_session_get_info` expose
-  `created_by_session_id` so managers can identify their workers across restarts.
+  `created_by_session_id` so managers can identify their workers across restarts;
+  `sys_session_list` with `include_archived` also lists archived workers, each
+  marked `archived`.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
-  creates, even if an enable is also listed. Restart every server replica to
+  creates, even if an enable is also listed, and hides the Automations page's
+  trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
@@ -26,9 +29,11 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
   the sender private restores eligibility.
-- `scheduled`: newly scheduled runs, their forks and children cannot use the new sends
-  or independent creates. Ordinary scheduling, child work and reads stay available.
-  An owner can still message a long-lived private manager directly.
+- `scheduled`: scheduled runs, their forks and children use the new sends and
+  independent creates like any private session their owner owns, so an
+  automation can message the owner's other sessions or start workers. The
+  Automations page's Jira/Slack/GitHub trigger templates rely on this: their
+  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -43,10 +48,17 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   the native MCP relay supplies the tools.
 - In a session with creation tools enabled, ask for a worker with
   `sys_session_create` and `placement="same_host"` or `placement="managed"`.
+  Pass `sandbox_provider`, `sandbox_profile_id`, and `sandbox_profile_revision`
+  to choose an authorized profile/revision from the
+  [provider catalog](../docs/extending/provider_profiles.md).
 - Use the existing Share dialog to share the sender or receiver, then repeat.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
+- On Automations, pick the *Jira tickets*, *Slack messages*, or *GitHub issues*
+  chip, fill in the trigger builder, and save: the hourly automation's kept
+  session starts one worker per new match with `sys_session_create`. Covered by
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
 
 ## Driving it with the repro environment
 
@@ -88,8 +100,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   legacy keyless routing and refusal before writes on the wrong replica. A tunnel
   loss after workspace validation leaves one discoverable worker and reports
   uncertainty without retrying creation. Queue tests check refusal before saving
-  and replay after sharing. Scheduled-origin tests include full forks after
-  schedule-history deletion.
+  and replay after sharing. Scheduled-origin tests cover sends and
+  creates from a scheduled run, its full fork after schedule-history deletion,
+  and its children.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager and repeat: the tool must report refusal and the
@@ -158,11 +171,10 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   that POST remains uncertain. Timeouts,
   other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
-  survives deletion of the schedule and full forks. Forking a scheduled run to
-  continue interactively intentionally keeps the orchestration restriction in v1.
-  Sessions predating this marker may have no recoverable scheduling origin and
-  remain eligible. There is no historical backfill in this version; deployments
-  requiring that exclusion can keep the kill switch set pending classification.
+  survives deletion of the schedule and full forks. It no longer limits
+  orchestration: an unattended run messages and creates sessions under the same
+  owner, privacy and sharing checks as an interactive turn. The release flag
+  still turns all orchestration off.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
 - The server enforces the flag even though tool schemas are discoverable while
