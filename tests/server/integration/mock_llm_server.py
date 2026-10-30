@@ -930,6 +930,8 @@ class MockState:
     def __init__(self) -> None:
         self.queues: dict[str, _ResponseQueue] = {}
         self.captured_requests: list[dict] = []
+        # Anthropic Messages requests with the beta flags their headers carried.
+        self.captured_message_requests: list[dict] = []
         self.request_count: int = 0
         self.pending_gates: list[QueuedResponse] = []
         # Ids ``GET /v1/models`` reports; see ``POST /mock/served_models``.
@@ -1099,6 +1101,7 @@ class MockState:
         if record_evidence:
             _record_evidence("reset", accepted_at_ns=_time_mod.time_ns())
         self.captured_requests.clear()
+        self.captured_message_requests.clear()
         self.request_count = 0
         self.served_models = []
 
@@ -1187,6 +1190,22 @@ async def create_response(
     )
 
 
+def _anthropic_betas(request: Request, body: object) -> list[str]:
+    """Return the beta flags an Anthropic client sent, e.g. ``["context-1m-2025-08-07"]``.
+
+    SDKs send them in the ``anthropic-beta`` header; a ``betas`` body field is kept too.
+    """
+    flags = [
+        flag.strip()
+        for header in request.headers.getlist("anthropic-beta")
+        for flag in header.split(",")
+        if flag.strip()
+    ]
+    if isinstance(body, dict) and isinstance(body.get("betas"), list):
+        flags += [flag for flag in body["betas"] if isinstance(flag, str)]
+    return flags
+
+
 @app.post("/v1/messages", response_model=None)
 async def create_message(
     request: Request,
@@ -1206,6 +1225,9 @@ async def create_message(
         accepted_at_ns = _time_mod.time_ns()
         _state.request_count += 1
         _state.captured_requests.append(parsed)
+        _state.captured_message_requests.append(
+            {"body": parsed, "betas": _anthropic_betas(request, parsed)}
+        )
         queue = _state.resolve_queue_for_request(parsed)
         qr = queue.next()
 
@@ -1595,6 +1617,25 @@ async def get_requests(key: str | None = None) -> dict[str, list]:
         r for r in _state.captured_requests if isinstance(r, dict) and r.get("model") == key
     ]
     return {"requests": filtered}
+
+
+@app.get("/mock/message_requests")
+async def get_message_requests(key: str | None = None) -> dict[str, list]:
+    """Return captured Anthropic Messages requests with their beta flags.
+
+    Each entry is ``{"body": <request body>, "betas": [<flag>, ...]}``.
+
+    :param key: When set, only return requests whose ``model`` field
+        matches this key.
+    """
+    requests = _state.captured_message_requests
+    if key is not None:
+        requests = [
+            entry
+            for entry in requests
+            if isinstance(entry["body"], dict) and entry["body"].get("model") == key
+        ]
+    return {"requests": requests}
 
 
 @app.get("/gate/pending")
